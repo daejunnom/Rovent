@@ -2,7 +2,9 @@
 //! The initializer/export producer is independent of the executable source.
 //! No metadata from an old initializer is edited or issued by this module.
 use super::{Config, Result};
+#[cfg(target_os = "linux")]
 use cap_fs_ext::DirExt;
+#[cfg(target_os = "linux")]
 use cap_std::fs::Dir;
 use rz_experiments::{
     ArtifactRef, ManifestError, PalsArtifactDomainV5, PalsEngineModeV5, PalsModelBackendV3,
@@ -12,13 +14,16 @@ use rz_experiments::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 const DOMAIN: &str = "rz-explicit-gpu-inflight-content-bound-input/1";
+#[cfg(target_os = "linux")]
 const MAX_BYTES: u64 = 18 << 30;
 
 #[derive(Deserialize)]
@@ -533,7 +538,10 @@ mod tests {
         assert!(!absolute_plain(Path::new("/root/.ssh/assets")));
         assert!(!absolute_plain(Path::new("/root/credentials/assets")));
         assert!(!absolute_plain(Path::new("/root/.env/assets")));
+        #[cfg(unix)]
         assert!(absolute_plain(Path::new("/private/validation-assets")));
+        #[cfg(windows)]
+        assert!(!absolute_plain(Path::new("/private/validation-assets")));
     }
     #[test]
     fn expired_prerequisite_does_not_receive_a_new_deadline() {

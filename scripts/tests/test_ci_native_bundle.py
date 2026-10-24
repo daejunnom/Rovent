@@ -322,7 +322,8 @@ class NativeBundleTests(unittest.TestCase):
         arena = bundle.tomllib.loads((Path(__file__).resolve().parents[2]
             / 'crates/rz-arena/Cargo.toml').read_text(encoding='utf-8'))
         self.assertEqual(arena['features']['native-validation-diagnostics'],
-                         ['rz-uci/pals-adaptive-diagnostics'])
+                         ['rz-uci/pals-adaptive-diagnostics',
+                          'rz-uci/native-validation-diagnostics'])
         self.assertEqual(arena['features'].get('default', []), [])
         self.assertEqual(next(t for t in arena['bin'] if t['name'] == 'rz-rovent-native')
                          ['required-features'], ['pals-collection-onnx'])
