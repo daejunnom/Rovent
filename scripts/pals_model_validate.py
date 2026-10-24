@@ -18,10 +18,34 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import MappingProxyType
 
 sys.dont_write_bytecode = True
 from managed_storage import checked, StorageError
 from managed_outputs import OutputLease, canonical_catalog, publish_runtime
+
+
+_CPU_STAGE_DEPENDENCIES = MappingProxyType({
+    "venv_seconds": (),
+    "torch_install_seconds": ("venv_seconds",),
+    "reference_install_seconds": ("venv_seconds",),
+    "model_tests_seconds": ("torch_install_seconds", "reference_install_seconds"),
+    "device_packing_export_seconds": ("reference_install_seconds",),
+    "device_packing_files_seconds": ("device_packing_export_seconds",),
+    "device_packing_rust_body_seconds": ("device_packing_files_seconds",),
+    "initialize_seconds": ("torch_install_seconds",),
+    "preparation_check_seconds": ("initialize_seconds", "reference_install_seconds"),
+    "private_verifier_seconds": ("preparation_check_seconds",),
+    "export_seconds": ("initialize_seconds", "reference_install_seconds"),
+    "numeric_seconds": ("export_seconds",),
+    "rust_fixtures_seconds": ("numeric_seconds",),
+    "runtime_preservation_seconds": ("reference_install_seconds",),
+})
+
+
+def cpu_stage_dependencies():
+    """Read-only dependencies consumed by the actual managed CPU plan."""
+    return _CPU_STAGE_DEPENDENCIES
 
 
 def run(command, *, cwd, environment, seconds=300):
@@ -57,7 +81,9 @@ class ValidationStages:
     def passed(self, name):
         return self.results.get(name, {}).get("status") == "passed"
 
-    def perform(self, name, operation, *, requires=()):
+    def perform(self, name, operation, *, requires=None):
+        if requires is None:
+            requires = cpu_stage_dependencies().get(name, ())
         if name in self.results or any(dep not in self.results for dep in requires):
             raise ValueError("unique stage and already registered dependencies required")
         result = {"status": "blocked", "depends_on": list(requires), "executed": False}
@@ -252,15 +278,14 @@ def main():
             controller.perform("torch_install_seconds", lambda: run([
                 str(python), "-m", "pip", "install", "torch==2.8.0",
                 "--index-url", "https://download.pytorch.org/whl/cpu"],
-                cwd=source, environment=environment, seconds=600), requires=("venv_seconds",))
+                cwd=source, environment=environment, seconds=600))
             controller.perform("reference_install_seconds", lambda: run([
                 str(python), "-m", "pip", "install", "numpy==2.2.6", "onnx==1.19.0",
-                "onnxruntime==1.22.0"], cwd=source, environment=environment), requires=("venv_seconds",))
+                "onnxruntime==1.22.0"], cwd=source, environment=environment))
             environment["PYTHONPATH"] = str(package / "src")
             controller.perform("model_tests_seconds", lambda: run([
                 str(python), "-m", "unittest", "discover", "-s", str(package / "tests"), "-v"],
-                cwd=source, environment=environment, seconds=600),
-                requires=("torch_install_seconds", "reference_install_seconds"))
+                cwd=source, environment=environment, seconds=600))
             # Weight-free static packing is a separate branch. It never creates
             # an ORT Session/provider/Run or authorizes a later GPU execution.
             packing = output / "device-packing"
@@ -271,7 +296,7 @@ def main():
                 str(python), "-c",
                 "from rz_pals_model.device_packing_artifacts import export_device_packing_artifact\n"
                 "import sys\nexport_device_packing_artifact(sys.argv[1])\n",
-                str(packing)], cwd=source, environment=environment), requires=("reference_install_seconds",))
+                str(packing)], cwd=source, environment=environment))
 
             def inspect_packing():
                 for name, asset_path in packing_files.items():
@@ -286,14 +311,13 @@ def main():
                         sha = hashlib.file_digest(handle, "sha256").hexdigest()
                     packing_pins[name] = {"bytes": size, "sha256": sha}
 
-            controller.perform("device_packing_files_seconds", inspect_packing,
-                               requires=("device_packing_export_seconds",))
+            controller.perform("device_packing_files_seconds", inspect_packing)
             controller.perform("device_packing_rust_body_seconds", lambda: run([
                 "cargo", "run", "--locked", "-p", "rz-eval", "--features", "onnx,contracts",
                 "--example", "device_packing_graph_check", "--quiet", "--",
                 str(packing_files["device-packing.json"]), str(packing_files["device_public_pack.onnx"]),
                 packing_pins["device-packing.json"]["sha256"], packing_pins["device_public_pack.onnx"]["sha256"]],
-                cwd=source, environment=environment, seconds=300), requires=("device_packing_files_seconds",))
+                cwd=source, environment=environment, seconds=300))
             if controller.passed("device_packing_rust_body_seconds"):
                 receipt["device_packing_static_interop"] = {
                     "assets": packing_pins, "scope": "python_artifact_rust_fixed_body_check_only",
@@ -303,8 +327,7 @@ def main():
             initialization = output / "initialization"
             export = output / "export-pc"
             controller.perform("initialize_seconds", lambda: run(cli + ["init", "--seed", str(args.seed),
-                "--output", str(initialization)], cwd=source, environment=environment),
-                requires=("torch_install_seconds",))
+                "--output", str(initialization)], cwd=source, environment=environment))
             checkpoint = initialization / "untrained.pt"
             if dataset_run:
                 controller.perform("preparation_check_seconds", lambda: run([
@@ -314,7 +337,7 @@ def main():
                     "--checkpoint", str(checkpoint), "--output", str(output / "preparation-check.json"),
                     "--max-records", "256", "--max-wall-time-ms", "120000", "--max-output-bytes", "1048576",
                     "--threads", "2", "--batch-size", "1", "--require-masked-value"],
-                    cwd=source, environment=environment), requires=("initialize_seconds", "reference_install_seconds"))
+                    cwd=source, environment=environment))
                 if verifier_binary:
                     def private_verifier():
                         with checkpoint.open("rb") as stream:
@@ -330,18 +353,16 @@ def main():
                             "--baseline-depth", "1", "--requested-depth", "2", "--max-nodes-per-check", "4096",
                             "--max-task-wall-time-ms", "5000", "--max-cpu-output-bytes", "65536"],
                             cwd=source, environment=environment, seconds=150)
-                    controller.perform("private_verifier_seconds", private_verifier,
-                                       requires=("preparation_check_seconds",))
+                    controller.perform("private_verifier_seconds", private_verifier)
             export_command = cli + ["export", "--checkpoint", str(checkpoint), "--output", str(export), "--layout", args.layout]
             if rules_profile:
                 export_command += ["--rules-profile-json", str(rules_profile)]
-            controller.perform("export_seconds", lambda: run(export_command, cwd=source, environment=environment),
-                               requires=("initialize_seconds", "reference_install_seconds"))
+            controller.perform("export_seconds", lambda: run(export_command, cwd=source, environment=environment))
             controller.perform("numeric_seconds", lambda: run(cli + ["numeric-check", "--checkpoint", str(checkpoint),
-                "--export", str(export)], cwd=source, environment=environment), requires=("export_seconds",))
+                "--export", str(export)], cwd=source, environment=environment))
             controller.perform("rust_fixtures_seconds", lambda: run(cli + ["rust-fixtures", "--checkpoint", str(checkpoint),
                 "--export", str(export), "--output", str(output / "rust-fixtures.json")],
-                cwd=source, environment=environment), requires=("numeric_seconds",))
+                cwd=source, environment=environment))
 
             def preserve_runtime():
                 runtime_path = subprocess.check_output([str(python), "-c",
@@ -353,7 +374,7 @@ def main():
                 receipt["runtime"] = {"path": str(runtime_asset), "sha256": runtime_sha256,
                     "bytes": runtime_asset.stat().st_size, "storage": "external_shared_content_addressed_store"}
 
-            controller.perform("runtime_preservation_seconds", preserve_runtime, requires=("reference_install_seconds",))
+            controller.perform("runtime_preservation_seconds", preserve_runtime)
             check_inputs(full=True)
             controller.require_complete()
             receipt["status"] = "success"

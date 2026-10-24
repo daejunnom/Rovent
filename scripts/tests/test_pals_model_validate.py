@@ -1,13 +1,19 @@
 """CPU validation dependencies only; no installer, engine, model or owner runs."""
 from pathlib import Path
-import ast
+import argparse
+import contextlib
+import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from pals_model_validate import ValidationStages, ValidationStagesFailed
+import pals_model_validate as wrapper
+from pals_model_validate import ValidationStages, ValidationStagesFailed, cpu_stage_dependencies
 from managed_storage import StorageError
 
 
@@ -128,22 +134,11 @@ class ValidationStageTests(unittest.TestCase):
 
 
 class ActualCpuPlanTests(unittest.TestCase):
-    """Check critical command dependencies without dispatching the real plan."""
-    def setUp(self):
-        self.tree = ast.parse((Path(__file__).resolve().parents[1] / "pals_model_validate.py").read_text(encoding="utf-8"))
-        self.main = next(node for node in self.tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
-        self.dependencies = {}
-        for node in ast.walk(self.main):
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "controller"
-                    and node.func.attr == "perform"):
-                name = ast.literal_eval(node.args[0])
-                required = next((ast.literal_eval(kw.value) for kw in node.keywords if kw.arg == "requires"), ())
-                self.dependencies[name] = required
-
+    """Read the dependency data used by production; do not inspect source shape."""
     def ancestors(self, stage):
+        dependencies = cpu_stage_dependencies()
         result = set()
-        for prerequisite in self.dependencies[stage]:
+        for prerequisite in dependencies[stage]:
             result.add(prerequisite)
             result.update(self.ancestors(prerequisite))
         return result
@@ -163,17 +158,96 @@ class ActualCpuPlanTests(unittest.TestCase):
         self.assertNotIn("torch_install_seconds", prerequisites)
         self.assertNotIn("initialize_seconds", prerequisites)
 
-    def test_owner_acquisition_is_covered_by_original_finally(self):
-        def calls(node, method):
-            return [child for child in ast.walk(node) if isinstance(child, ast.Call)
-                    and isinstance(child.func, ast.Attribute) and child.func.attr == method
-                    and isinstance(child.func.value, ast.Name) and child.func.value.id == "output_lease"]
-        acquisitions = calls(self.main, "acquire")
-        self.assertEqual(len(acquisitions), 1)
-        protected = [node for node in ast.walk(self.main) if isinstance(node, ast.Try)
-                     and acquisitions[0] in [child for item in node.body for child in ast.walk(item)]
-                     and any(calls(item, "finish") for item in node.finalbody)]
-        self.assertEqual(len(protected), 1)
+    def test_actual_plan_data_drives_failure_propagation(self):
+        stages = ValidationStages({"stages": {}}, lambda: None)
+        observed = []
+        failures = {"model_tests_seconds", "device_packing_rust_body_seconds", "private_verifier_seconds"}
+        for name in cpu_stage_dependencies():
+            def operation(name=name):
+                observed.append(name)
+                if name in failures:
+                    raise subprocess.CalledProcessError(1, [name])
+            stages.perform(name, operation)
+        self.assertTrue(stages.passed("export_seconds"))
+        self.assertTrue(stages.passed("numeric_seconds"))
+        self.assertTrue(stages.passed("rust_fixtures_seconds"))
+        self.assertTrue(failures.issubset(observed))
+        with self.assertRaises(ValidationStagesFailed):
+            stages.require_complete()
+        with self.assertRaises(TypeError):
+            cpu_stage_dependencies()["export_seconds"] = ("model_tests_seconds",)
+
+
+class OwnerBoundaryTests(unittest.TestCase):
+    """Exercise main with fake external I/O; no source bytes or owner are read."""
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="pals-validation-boundary-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.output = self.root / "output"
+        self.scratch = self.root / "scratch"
+        self.scratch.mkdir()
+        output = self.output
+        class FakeLease:
+            def __init__(self):
+                self.record = None
+                self.calls = []
+                self.acquire_error = None
+            def acquire(self):
+                self.calls.append(("acquire",))
+                output.mkdir()
+                self.record = {"state": "active"}
+                if self.acquire_error is not None:
+                    raise self.acquire_error
+                return self
+            def check_budget(self):
+                self.calls.append(("budget",))
+            def finish(self, **values):
+                self.calls.append(("finish", values))
+                self.record = {"state": "retained"}
+        self.lease = FakeLease()
+        self.args = argparse.Namespace(output=self.output, seed=1, runtime_store=self.root / "runtime",
+            source_commit="1" * 40, source_dirty=False, layout="separate_pc", rules_profile_json=None,
+            dataset_run=None, dataset_receipt_sha256=None, dataset_encoder_source_sha256=None,
+            verifier_cpu_binary=None, verifier_cpu_binary_sha256=None)
+
+    def patched_boundaries(self, *, source_error=None):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(wrapper.argparse.ArgumentParser, "parse_args", return_value=self.args))
+        stack.enter_context(mock.patch.object(wrapper, "OutputLease", return_value=self.lease))
+        stack.enter_context(mock.patch.object(wrapper, "checked", side_effect=lambda path: Path(path).absolute()))
+        stack.enter_context(mock.patch.object(wrapper, "input_identity", return_value=(1, 2, 3, 1, 7, 8, 9)))
+        stack.enter_context(mock.patch.object(Path, "glob", return_value=iter(())))
+        stack.enter_context(mock.patch.object(Path, "read_bytes", return_value=b"synthetic fixture bytes", side_effect=source_error))
+        stack.enter_context(mock.patch.object(wrapper, "run", side_effect=subprocess.CalledProcessError(1, ["fake venv"])))
+        stack.enter_context(mock.patch.object(wrapper.subprocess, "run", side_effect=AssertionError("real subprocess forbidden")))
+        stack.enter_context(mock.patch.object(wrapper.subprocess, "check_output", side_effect=AssertionError("real subprocess forbidden")))
+        stack.enter_context(mock.patch.dict(os.environ, {"TMPDIR": str(self.scratch), "CARGO_TARGET_DIR": str(self.root / "target")}))
+        return stack
+
+    def test_returned_stage_failure_finishes_original_fake_lease_once(self):
+        with self.patched_boundaries(), self.assertRaises(ValidationStagesFailed):
+            wrapper.main()
+        self.assertEqual(self.lease.calls, [("acquire",), ("finish", {
+            "status": "failed", "tree_gone": "outer_managed_supervisor_only"})])
+        receipt = json.loads((self.output / "validation.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["stage_results"]["venv_seconds"]["status"], "failed")
+        self.assertEqual(receipt["stage_results"]["numeric_seconds"]["status"], "blocked")
+
+    def test_partial_acquire_failure_still_attempts_original_finish(self):
+        self.lease.acquire_error = RuntimeError("fake acquire failed after record")
+        with self.patched_boundaries(), self.assertRaisesRegex(RuntimeError, "after record"):
+            wrapper.main()
+        self.assertEqual(self.lease.calls, [("acquire",), ("finish", {
+            "status": "failed", "tree_gone": "outer_managed_supervisor_only"})])
+
+    def test_source_preparation_failure_never_acquires_owner(self):
+        with self.patched_boundaries(source_error=OSError("synthetic source unavailable")), self.assertRaises(OSError):
+            wrapper.main()
+        self.assertEqual(self.lease.calls, [])
+        self.assertIsNone(self.lease.record)
+        self.assertFalse(self.output.exists())
 
 
 if __name__ == "__main__":
