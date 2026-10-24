@@ -46,9 +46,10 @@ enum Event {
     Finished(bool, Instant),
     Joined(Instant),
 }
+type ActualCudaOwner = ([u8; 32], [u8; 32], [u8; 32], [u8; 32]);
 struct State {
     active: Option<(RoleTicketEnvelope, ExecutionId)>,
-    owner: Option<([u8; 32], [u8; 32], [u8; 32], [u8; 32])>,
+    owner: Option<ActualCudaOwner>,
     events: Vec<Event>,
 }
 struct Inner {
@@ -183,6 +184,10 @@ impl GpuLifecycleTrace {
             }
         }
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "records one backend completion event without changing its evidence fields"
+    )]
     pub fn backend_completed(
         &self,
         ticket: RoleTicketEnvelope,
