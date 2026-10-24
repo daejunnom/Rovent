@@ -434,7 +434,12 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/Cargo.toml"),
             source!("crates/rz-uci/examples/virtual_review_gpu_inflight_validation.rs"),
             source!("crates/rz-uci/examples/virtual_review_warm_numeric_capture.rs"),
-            source!("crates/rz-uci/examples/virtual_review_warm_numeric_capture/gpu_inflight_validation.rs"),
+            source!(
+                "crates/rz-uci/examples/virtual_review_warm_numeric_capture/gpu_inflight_validation.rs"
+            ),
+            source!(
+                "crates/rz-uci/examples/virtual_review_warm_numeric_capture/gpu_numerical_prerequisite.rs"
+            ),
             source!("crates/rz-uci/build.rs"),
             source!("crates/rz-uci/examples/pals_continuation_diagnostic.rs"),
             source!("crates/rz-uci/examples/rovent_external_probe.rs"),
@@ -671,7 +676,12 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/Cargo.toml"),
             source!("crates/rz-uci/examples/virtual_review_gpu_inflight_validation.rs"),
             source!("crates/rz-uci/examples/virtual_review_warm_numeric_capture.rs"),
-            source!("crates/rz-uci/examples/virtual_review_warm_numeric_capture/gpu_inflight_validation.rs"),
+            source!(
+                "crates/rz-uci/examples/virtual_review_warm_numeric_capture/gpu_inflight_validation.rs"
+            ),
+            source!(
+                "crates/rz-uci/examples/virtual_review_warm_numeric_capture/gpu_numerical_prerequisite.rs"
+            ),
             source!("crates/rz-uci/src/pals_adaptive/manager/collection/origin.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/goal_local.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/nnuec.rs"),

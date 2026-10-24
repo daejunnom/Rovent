@@ -454,6 +454,16 @@ fn load_kind(
     profiles: &Path,
     kind: VirtualReviewArtifactKind,
 ) -> Result<PalsVirtualReviewOnnxBackend> {
+    load_kind_from_sources(config, profiles, kind, None, None)
+}
+
+fn load_kind_from_sources(
+    config: &Config,
+    profiles: &Path,
+    kind: VirtualReviewArtifactKind,
+    owned_sources: Option<Arc<dyn rz_eval::pals_onnx::virtual_review::VirtualReviewOwnedSources>>,
+    source_metadata: Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<PalsVirtualReviewOnnxBackend> {
     let mut selected = PalsOnnxConfig::cpu();
     selected.intra_threads = 1;
     selected.cache_public_memory = kind == VirtualReviewArtifactKind::ApproxWarm;
@@ -486,7 +496,11 @@ fn load_kind(
                 return Err("explicit CUDA0 FP32/TF32-off finite arena required".into());
             }
             let bundle = config.cuda_bundle.as_ref().ok_or("CUDA bundle absent")?;
-            let bytes = asset::read_bounded(bundle, 64 * 1024)?;
+            let bytes = if let Some((bundle_bytes, _)) = source_metadata.as_ref() {
+                bundle_bytes.clone()
+            } else {
+                asset::read_bounded(bundle, 64 * 1024)?
+            };
             if Some(sha(&bytes)) != config.cuda_bundle_sha256 {
                 return Err("CUDA bundle byte pin differs".into());
             }
@@ -509,16 +523,26 @@ fn load_kind(
                 device_id: config.gpu_device_id,
                 arena_bytes: config.gpu_arena_bytes,
             };
-            let policy = PalsCudaControlPolicy::from_virtual_review_inventory(
-                config
-                    .cuda_inventory
-                    .as_ref()
-                    .ok_or("Warm V3 inventory absent")?,
-                config
-                    .cuda_inventory_sha256
-                    .as_deref()
-                    .ok_or("Warm inventory pin absent")?,
-            )?;
+            let policy = if let Some((_, inventory_bytes)) = source_metadata.as_ref() {
+                PalsCudaControlPolicy::from_virtual_review_inventory_bytes(
+                    inventory_bytes,
+                    config
+                        .cuda_inventory_sha256
+                        .as_deref()
+                        .ok_or("Warm inventory pin absent")?,
+                )?
+            } else {
+                PalsCudaControlPolicy::from_virtual_review_inventory(
+                    config
+                        .cuda_inventory
+                        .as_ref()
+                        .ok_or("Warm V3 inventory absent")?,
+                    config
+                        .cuda_inventory_sha256
+                        .as_deref()
+                        .ok_or("Warm inventory pin absent")?,
+                )?
+            };
             (
                 cache.cuda_bundle(
                     config
@@ -541,40 +565,52 @@ fn load_kind(
         return Err("actual ORT pin differs".into());
     }
     selected.validate_execution_selection(runtime.native_loading_profile(), policy.is_some())?;
-    let backend = match (policy, kind) {
-        (Some(policy), VirtualReviewArtifactKind::Fresh) => {
-            PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
-                &config.export_manifest,
-                &config.export_manifest_sha256,
-                runtime,
-                selected,
-                policy,
-                profiles,
-            )?
-        }
-        (None, VirtualReviewArtifactKind::Fresh) => PalsVirtualReviewOnnxBackend::load(
-            &config.export_manifest,
+    let backend = if let Some(sources) = owned_sources {
+        PalsVirtualReviewOnnxBackend::load_owned_sources(
+            sources,
             &config.export_manifest_sha256,
             runtime,
             selected,
-        )?,
-        (Some(policy), VirtualReviewArtifactKind::ApproxWarm) => {
-            PalsVirtualReviewOnnxBackend::load_warm_with_cuda_control_policy(
+            VirtualReviewExecutionMode::Deployment,
+            kind,
+            policy.map(|policy| (policy, profiles.to_path_buf())),
+        )?
+    } else {
+        match (policy, kind) {
+            (Some(policy), VirtualReviewArtifactKind::Fresh) => {
+                PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
+                    &config.export_manifest,
+                    &config.export_manifest_sha256,
+                    runtime,
+                    selected,
+                    policy,
+                    profiles,
+                )?
+            }
+            (None, VirtualReviewArtifactKind::Fresh) => PalsVirtualReviewOnnxBackend::load(
                 &config.export_manifest,
                 &config.export_manifest_sha256,
                 runtime,
                 selected,
-                policy,
-                profiles,
-            )?
-        }
-        (None, VirtualReviewArtifactKind::ApproxWarm) => {
-            PalsVirtualReviewOnnxBackend::load_approx_warm(
-                &config.export_manifest,
-                &config.export_manifest_sha256,
-                runtime,
-                selected,
-            )?
+            )?,
+            (Some(policy), VirtualReviewArtifactKind::ApproxWarm) => {
+                PalsVirtualReviewOnnxBackend::load_warm_with_cuda_control_policy(
+                    &config.export_manifest,
+                    &config.export_manifest_sha256,
+                    runtime,
+                    selected,
+                    policy,
+                    profiles,
+                )?
+            }
+            (None, VirtualReviewArtifactKind::ApproxWarm) => {
+                PalsVirtualReviewOnnxBackend::load_approx_warm(
+                    &config.export_manifest,
+                    &config.export_manifest_sha256,
+                    runtime,
+                    selected,
+                )?
+            }
         }
     };
     if backend.validator_present()

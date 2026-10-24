@@ -2,6 +2,10 @@
 use super::*;
 use rz_eval::pals_onnx::virtual_review::native_validation_diagnostics::GpuLifecycleTrace;
 
+#[path = "gpu_numerical_prerequisite.rs"]
+mod numerical_prerequisite;
+use numerical_prerequisite::ContentBoundValidation;
+
 const VALIDATION_DOMAIN: &str = "rz-pals-v3-typed-gpu-inflight-plan/1";
 
 fn cases(
@@ -151,8 +155,9 @@ fn cases(
     Ok(())
 }
 
-fn execute_validation(config: Config) -> Result<()> {
+fn execute_validation(input: ContentBoundValidation) -> Result<()> {
     let started = Instant::now();
+    let config = input.execution.clone();
     if !(1..=600).contains(&config.deadline_seconds)
         || config.cleanup_seconds != 30
         || config.process_epoch == 0
@@ -210,6 +215,14 @@ fn execute_validation(config: Config) -> Result<()> {
     }
     let until = started + Duration::from_secs(config.deadline_seconds);
     let cleanup_until = until + Duration::from_secs(config.cleanup_seconds);
+    // Prior independent current-executor math; never this run's future receipt.
+    let mut prerequisite = Some(Arc::new(input.prepare(until)?));
+    let prerequisite_observation = prerequisite
+        .as_ref()
+        .ok_or("prerequisite absent")?
+        .observation
+        .clone();
+    let factory_prerequisite = Arc::clone(prerequisite.as_ref().ok_or("prerequisite absent")?);
     let trace = GpuLifecycleTrace::new();
     let mut owner = Output::create(&config.output_root)?;
     let loaded = Arc::new(Mutex::new(None));
@@ -223,8 +236,18 @@ fn execute_validation(config: Config) -> Result<()> {
                 if Instant::now() >= until {
                     return Err("original deadline before load".into());
                 }
-                let mut backend =
-                    load_kind(&factory_config, &profiles, VirtualReviewArtifactKind::Fresh)?;
+                factory_prerequisite.recheck(until)?;
+                let model_sources: Arc<
+                    dyn rz_eval::pals_onnx::virtual_review::VirtualReviewOwnedSources,
+                > = factory_prerequisite.clone();
+                let control_metadata = factory_prerequisite.cuda_metadata()?;
+                let mut backend = load_kind_from_sources(
+                    &factory_config,
+                    &profiles,
+                    VirtualReviewArtifactKind::Fresh,
+                    Some(model_sources),
+                    Some(control_metadata),
+                )?;
                 backend.enable_gpu_lifecycle_validation(factory_trace)?;
                 let metadata = json!({"model_epoch":hex(backend.model_epoch()),"backend":hex(backend.backend_digest())});
                 let clock = ContractSystemClock::with_origin(
@@ -247,7 +270,7 @@ fn execute_validation(config: Config) -> Result<()> {
     ))?;
     let mut startup_failed = false;
     // Install before any preparation; exact same Arc reaches both owner layers.
-    let work = (|| -> Result<()> {
+    let mut work = (|| -> Result<()> {
         checked(service.enable_gpu_lifecycle_validation(trace.clone()))?;
         let clock = match next(&service, until)? {
             TicketNativeEvent::Ready { clock } => clock,
@@ -301,19 +324,42 @@ fn execute_validation(config: Config) -> Result<()> {
         std::thread::sleep(Duration::from_millis(1));
     }
     while service.poll().is_some() {}
+    let mut prerequisite_error = None;
+    if joined && !service.is_quarantined() {
+        if let Err(error) = prerequisite
+            .as_ref()
+            .ok_or("prerequisite absent")?
+            .recheck(cleanup_until)
+        {
+            prerequisite_error = Some(error.to_string());
+            if work.is_ok() {
+                work = Err(error);
+            } else {
+                eprintln!("secondary prerequisite recheck failure: {error}");
+            }
+        }
+    }
     let receipt = trace.receipt();
     let pass = work.is_ok()
         && joined
         && cleanup_error.is_none()
         && !service.is_quarantined()
         && receipt["status"] == "Observed";
-    let report=owner.write("gpu-inflight-validation.json",&json!({"schema":"rz-explicit-gpu-inflight-validation-run/1",
+    let prerequisite_retained_until_process_exit = !pass;
+    if prerequisite_retained_until_process_exit {
+        if let Some(held) = prerequisite.take() {
+            std::mem::forget(held);
+        }
+    }
+    let report=owner.write("gpu-inflight-validation.json",&json!({"schema":"rz-explicit-gpu-inflight-validation-run/2",
         "source_components":config.source_components,"weights":config.checkpoint_sha256,"export":config.export_manifest_sha256,
         "provider":config.provider,"cudnn_conv_search":config.cudnn_conv_search,"runtime":config.runtime_library_sha256,
         "validation_option":"--gpu-inflight-validation=host-ort-v1","plan_sha256":config.plan_sha256,
         "status":if pass{"Observed"}else{"FailedOrNotObserved"},"work_primary":work.as_ref().err().map(|e|e.to_string()),
         "cleanup_error":cleanup_error,"joined":joined,"quarantined":service.is_quarantined(),"trace":receipt,
         "whole_product_UCI_acceptance":false,"numerical_acceptance":false,"performance_evidence":false,
+        "prerequisite_content_admission":prerequisite_observation,"prerequisite_recheck_error":prerequisite_error,
+        "prerequisite_retained_until_original_process_exit":prerequisite_retained_until_process_exit,
         "process_exit_evidence":"requires_original_external_owner_exit_EOF_and_cgroup_observation"}));
     if let Err(error) = work {
         if let Err(secondary) = report {
@@ -324,7 +370,12 @@ fn execute_validation(config: Config) -> Result<()> {
         }
         return Err(error);
     }
-    report?;
+    if let Err(error) = report {
+        if let Some(held) = prerequisite.take() {
+            std::mem::forget(held);
+        }
+        return Err(error);
+    }
     if !pass {
         return Err(
             "required actual host-CUDA-Run cancel/late/fence/drain case not observed or incomplete"
