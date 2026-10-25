@@ -292,16 +292,19 @@ class DriverLookupTests(unittest.TestCase):
         self.assertFalse(evidence["cu_init_performed"])
         self.assertFalse(evidence["model_executed"])
         self.assertFalse(evidence["linker_settings_changed"])
+        self.assertTrue(evidence["output_eof_observed"])
         spawn.assert_called_once()
 
     def test_missing_driver_signal_and_incomplete_cleanup_are_not_success(self):
-        for index, result in enumerate(((125, True, None), (-11, True, None),
-                                        (0, False, None), (0, True, "budget failure"))):
+        for index, result in enumerate(((125, True, None), (-11, True, None), (124, True, None),
+                                        (0, False, None), (0, "unknown", None),
+                                        (0, True, "budget failure"))):
             self.receipt = self.root / f"failure-{index}.json"
             with self.subTest(result=result):
                 evidence, _ = self.probe(result=result)
                 self.assertEqual(evidence["status"], "lookup_or_supervision_failed")
                 self.assertEqual(evidence["tree_gone"], result[1])
+                self.assertFalse(evidence["output_eof_observed"])
                 self.assertTrue(Path(evidence["log"]).is_file())
 
     def test_raised_supervisor_preserves_unknown_ownership(self):
@@ -310,10 +313,9 @@ class DriverLookupTests(unittest.TestCase):
         self.assertEqual(evidence["tree_gone"], "unknown")
         self.assertEqual(evidence["child_spawned"], "unknown")
 
-    def test_invalid_or_oversized_probe_output_is_not_admitted(self):
+    def test_bounded_decode_and_format_failures_preserve_unknown_observation(self):
         valid = {"status": "available", "resolved_path": self.driver}
-        values = (b"not JSON", b"{}", b"[]", b"\xff", b"x" * (64 * 1024 + 1),
-                  json.dumps({**valid, "status": "unavailable"}).encode(),
+        values = (b"", b"not JSON", b"{}", b"[]", b"\xff",
                   json.dumps({**valid, "resolved_path": "libcuda.so.1"}).encode(),
                   json.dumps({**valid, "resolved_path": self.driver + " (deleted)"}).encode(),
                   json.dumps({**valid, "extra": True}).encode(),
@@ -323,7 +325,41 @@ class DriverLookupTests(unittest.TestCase):
             self.receipt = self.root / f"invalid-{index}.json"
             with self.subTest(index=index):
                 evidence, _ = self.probe(data=data)
-                self.assertEqual(evidence["status"], "invalid_probe_output")
+                self.assertEqual(evidence["status"], "observation_unknown")
+                self.assertEqual(evidence["exit_code"], 0)
+                self.assertIs(evidence["tree_gone"], True)
+                self.assertIsNone(evidence["supervisor_error"])
+                self.assertTrue(evidence["output_eof_observed"])
+                self.assertNotIn("resolved_path", evidence)
+                self.assertEqual(Path(evidence["log"]).read_bytes(), data)
+
+    def test_explicit_failed_observation_is_not_softened_to_unknown(self):
+        for index, status in enumerate(("unavailable", "failed", "error")):
+            self.receipt = self.root / f"reported-failure-{index}.json"
+            with self.subTest(status=status):
+                evidence, _ = self.probe(data=json.dumps({
+                    "status": status, "error_type": "OSError"}).encode())
+                self.assertEqual(evidence["status"], "lookup_reported_failure")
+                self.assertEqual(evidence["reported_status"], status)
+                self.assertTrue(evidence["output_eof_observed"])
+                self.assertNotIn("resolved_path", evidence)
+
+    def test_oversized_and_unreadable_probe_output_remain_failures(self):
+        evidence, _ = self.probe(data=b"x" * (64 * 1024 + 1))
+        self.assertEqual(evidence["status"], "invalid_probe_output")
+        self.assertFalse(evidence["output_eof_observed"])
+        self.receipt = self.root / "unreadable-output.json"
+        original_open = Path.open
+        def open_log(path, mode="r", *args, **kwargs):
+            if path == self.receipt.with_name(self.receipt.name + ".driver-lookup.log") and mode == "rb":
+                raise OSError("synthetic unreadable probe output")
+            return original_open(path, mode, *args, **kwargs)
+        with mock.patch.object(Path, "open", autospec=True, side_effect=open_log):
+            evidence, _ = self.probe()
+        self.assertEqual(evidence["status"], "probe_output_io_failed")
+        self.assertEqual(evidence["output_error_type"], "OSError")
+        self.assertTrue(evidence["tree_gone"])
+        self.assertFalse(evidence["output_eof_observed"])
 
     def test_expired_lookup_never_spawns_and_existing_log_is_not_overwritten(self):
         evidence, spawn = self.probe(remaining=0)
@@ -378,6 +414,21 @@ class DriverLookupTests(unittest.TestCase):
                      hashlib.sha256(files[name]).hexdigest()]
         return argv
 
+    def closed_probe(self, **overrides):
+        return {"status": "available", "tree_gone": True, "exit_code": 0,
+                "supervisor_error": None, "output_eof_observed": True, **overrides}
+
+    def captured_probe(self, data, result=(0, True, None)):
+        check = wrapper.check_colab_driver_lookup
+        def observe(*args):
+            def run(_argv, _cwd, _env, _timeout, budget):
+                budget()
+                os.write(1, data)
+                return result
+            with mock.patch.object(wrapper, "run_group", side_effect=run):
+                return check(*args)
+        return observe
+
     def execute(self, argv, probe, *, prepared_at=2, lookup_completed_at=None,
                 native_completed_at=3, lifecycle_error=None, resource_error=None,
                 post_resource_error=None, native_error=None, native_result=(0, True, None),
@@ -404,9 +455,10 @@ class DriverLookupTests(unittest.TestCase):
             budgets[0] += 1
             if budgets[0] > 1 and output_budget_error_after_preflight is not None:
                 raise output_budget_error_after_preflight
-        def lookup_driver(*_args):
+        def lookup_driver(*args):
+            observation = probe(*args) if callable(probe) else probe
             advance_to(lookup_completed_at)
-            return probe
+            return observation
         def run_native(*_args):
             advance_to(native_completed_at)
             if native_error is not None:
@@ -543,18 +595,70 @@ class DriverLookupTests(unittest.TestCase):
             'type': 'KeyboardInterrupt', 'message': 'synthetic finish cancellation'})
 
     def test_failed_probe_blocks_model_even_after_whole_window_expires(self):
-        code, receipt, lookup, native = self.execute(self.model_argv(),
-            {"status": "lookup_or_supervision_failed", "tree_gone": False}, lookup_completed_at=101)
-        lookup.assert_called_once()
-        native.assert_not_called()
-        self.assertEqual(code, 125)
-        self.assertEqual(receipt["status"], "host_driver_lookup_failed_no_model_spawned")
-        self.assertFalse(receipt["tree_gone"])
-        self.assertFalse(receipt["child_spawned"])
+        cases = (
+            (b"not JSON", (125, True, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (-11, True, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (124, True, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (0, False, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (0, "unknown", None), "lookup_or_supervision_failed"),
+            (b"not JSON", (0, True, "budget failure"), "lookup_or_supervision_failed"),
+            (b"x" * (64 * 1024 + 1), (0, True, None), "invalid_probe_output"),
+            (b'{"status":"unavailable"}', (0, True, None), "lookup_reported_failure"),
+        )
+        for index, (data, result, status) in enumerate(cases):
+            self.receipt = self.root / f"blocked-model-{index}.json"
+            with self.subTest(status=status, result=result):
+                code, receipt, lookup, native = self.execute(self.model_argv(),
+                    self.captured_probe(data, result), lookup_completed_at=101)
+                lookup.assert_called_once()
+                native.assert_not_called()
+                self.assertEqual(code, 125)
+                self.assertEqual(receipt["status"], "host_driver_lookup_failed_no_model_spawned")
+                self.assertEqual(receipt["host_driver_lookup"]["status"], status)
+                self.assertEqual(receipt["tree_gone"], result[1])
+                self.assertFalse(receipt["child_spawned"])
+                self.assertFalse(receipt["producer_dispatch_attempted"])
+
+    def test_unknown_probe_requires_original_closure_and_complete_output_before_dispatch(self):
+        cases = ({"exit_code": None}, {"exit_code": 125}, {"tree_gone": "unknown"},
+                 {"supervisor_error": "original supervision failure"},
+                 {"output_eof_observed": False}, {"status": "probe_output_io_failed"})
+        for index, changed in enumerate(cases):
+            self.receipt = self.root / f"incomplete-observation-{index}.json"
+            with self.subTest(changed=changed):
+                code, receipt, _, native = self.execute(self.model_argv(),
+                    self.closed_probe(status="observation_unknown") | changed)
+                native.assert_not_called()
+                self.assertEqual(code, 125)
+                self.assertFalse(receipt["producer_dispatch_attempted"])
+
+    def test_malformed_closed_probe_output_dispatches_original_model_command(self):
+        for index, data in enumerate((b"not JSON", b"\xff")):
+            self.receipt = self.root / f"unknown-observation-{index}.json"
+            argv = self.model_argv()
+            flag = lambda name: argv[argv.index("--" + name) + 1]
+            expected = [flag(name) for name in ("binary", "export", "export-sha256", "runtime",
+                        "runtime-sha256", "fixtures", "model-report", "provider", "runtime-cache", "cuda-bundle")]
+            with self.subTest(data=data):
+                code, receipt, lookup, native = self.execute(argv, self.captured_probe(data),
+                    lookup_completed_at=8, native_completed_at=9)
+                native.assert_called_once()
+                self.assertEqual(native.call_args.args[0], expected)
+                self.assertEqual(native.call_args.args[3], 92)
+                self.assertIs(lookup.call_args.args[2], native.call_args.args[2])
+                observation = receipt["host_driver_lookup"]
+                self.assertEqual(observation["status"], "observation_unknown")
+                self.assertTrue(observation["output_eof_observed"])
+                self.assertNotIn("resolved_path", observation)
+                self.assertEqual(Path(observation["log"]).read_bytes(), data)
+                self.assertTrue(receipt["producer_dispatch_attempted"])
+                self.assertTrue(receipt["producer_result_observed"])
+                self.assertEqual(code, 0)
+                self.assertEqual(receipt["status"], "completed_observed_profile")
 
     def test_successful_probe_cost_is_charged_to_original_model_window(self):
         code, receipt, lookup, native = self.execute(self.model_argv(),
-            {"status": "available", "tree_gone": True}, lookup_completed_at=8, native_completed_at=9)
+            self.closed_probe(), lookup_completed_at=8, native_completed_at=9)
         lookup.assert_called_once()
         native.assert_called_once()
         self.assertEqual(native.call_args.args[3], 92)
@@ -563,14 +667,17 @@ class DriverLookupTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "completed_observed_profile")
 
     def test_successful_probe_cannot_restart_an_expired_original_model_window(self):
-        code, receipt, lookup, native = self.execute(self.model_argv(),
-            {"status": "available", "tree_gone": True}, lookup_completed_at=101)
-        lookup.assert_called_once()
-        native.assert_not_called()
-        self.assertEqual(code, 124)
-        self.assertEqual(receipt["status"], "preparation_deadline_expired")
-        self.assertTrue(receipt["tree_gone"])
-        self.assertFalse(receipt["child_spawned"])
+        for index, status in enumerate(("available", "observation_unknown")):
+            self.receipt = self.root / f"expired-model-window-{index}.json"
+            with self.subTest(status=status):
+                code, receipt, lookup, native = self.execute(self.model_argv(),
+                    self.closed_probe(status=status), lookup_completed_at=101)
+                lookup.assert_called_once()
+                native.assert_not_called()
+                self.assertEqual(code, 124)
+                self.assertEqual(receipt["status"], "preparation_deadline_expired")
+                self.assertTrue(receipt["tree_gone"])
+                self.assertFalse(receipt["child_spawned"])
 
     def test_planning_cpu_and_strict_local_do_not_run_host_lookup(self):
         cases = (("cuda", "colab-observed", False),

@@ -262,7 +262,8 @@ def check_colab_driver_lookup(receipt_path, cwd, environment, remaining, budget)
     evidence = {"soname": "libcuda.so.1", "status": "unknown",
                 "same_environment_as_native_child": True, "cu_init_performed": False,
                 "model_executed": False, "linker_settings_changed": False,
-                "tree_gone": True, "child_spawned": False, "exit_code": None}
+                "tree_gone": True, "child_spawned": False, "exit_code": None,
+                "output_eof_observed": False}
     if remaining <= 0:
         evidence["status"] = "deadline_expired"
         return evidence
@@ -298,25 +299,38 @@ def check_colab_driver_lookup(receipt_path, cwd, environment, remaining, budget)
             os.close(original)
     evidence.update(exit_code=code, tree_gone=gone, child_spawned=True,
                     log=str(log), supervisor_error=failure)
-    if not gone or failure is not None or code != 0:
+    if gone is not True or failure is not None or type(code) is not int or code != 0:
         evidence["status"] = "lookup_or_supervision_failed"
         return evidence
-    if log.stat().st_size > 64 * 1024:
-        evidence["status"] = "invalid_probe_output"
-        return evidence
     try:
+        if log.stat().st_size > 64 * 1024:
+            evidence["status"] = "invalid_probe_output"
+            return evidence
         with log.open("rb") as stream:
             data = stream.read(64 * 1024 + 1)
-        if len(data) > 64 * 1024:
-            raise ValueError("driver lookup log exceeds finite bound")
+    except OSError as error:
+        evidence.update(status="probe_output_io_failed", output_error_type=type(error).__name__)
+        return evidence
+    if len(data) > 64 * 1024:
+        evidence["status"] = "invalid_probe_output"
+        return evidence
+    evidence["output_eof_observed"] = True
+    try:
         value = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+        if (isinstance(value, dict) and isinstance(value.get("status"), str)
+                and value["status"] != "available"):
+            evidence.update(status="lookup_reported_failure", reported_status=value["status"])
+            return evidence
         path = value["resolved_path"]
         if (set(value) != {"status", "resolved_path"} or value["status"] != "available"
                 or not isinstance(path, str) or not Path(path).is_absolute()
                 or not Path(path).name.startswith("libcuda.so") or path.endswith(" (deleted)")):
             raise ValueError("invalid driver lookup observation")
-    except (OSError, ValueError, KeyError, TypeError, UnicodeError):
-        evidence["status"] = "invalid_probe_output"
+    except (ValueError, KeyError, TypeError, UnicodeError) as error:
+        # The original probe has exited and its bounded output was read to EOF.
+        # An undecodable observation cannot establish driver availability; the
+        # native model child still performs its actual loading/provider checks.
+        evidence.update(status="observation_unknown", observation_error_type=type(error).__name__)
     else:
         evidence.update(status="available", resolved_path=path)
     return evidence
@@ -544,7 +558,13 @@ def main():
                         lambda: check_colab_output_budget(args))
                     receipt["tree_gone"] = receipt["host_driver_lookup"]["tree_gone"]
                     remaining = args.seconds - (time.monotonic() - started)
-                if receipt.get("host_driver_lookup", {}).get("status", "available") != "available":
+                probe = receipt.get("host_driver_lookup")
+                if probe is not None and not (
+                        probe.get("status") in ("available", "observation_unknown")
+                        and type(probe.get("exit_code")) is int and probe["exit_code"] == 0
+                        and probe.get("tree_gone") is True
+                        and probe.get("supervisor_error", "unknown") is None
+                        and probe.get("output_eof_observed") is True):
                     receipt.update(exit_code=125, status="host_driver_lookup_failed_no_model_spawned")
                     remaining = None
                 elif sys.platform != "linux" or remaining <= 0:
