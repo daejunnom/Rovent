@@ -2,9 +2,9 @@
 
 The real strict parent/D/Repair/semantic factories are used. Build, launch,
 physical heads and Rules descriptors are explicitly synthetic caller facts.
-The twenty literal reviewed Rust sources are read only to exercise a new
-scoped synthetic review profile; no compiler, process, Rules replay, model or
-training runs. Historical two-file allow-lists remain unchanged.
+Static twenty-path byte-custody inputs exercise a scoped synthetic profile;
+the live checkout is not read. No compiler, process, Rules replay, model or
+training runs. Historical literal review banks and allow-lists remain unchanged.
 Known is conditional fixture coverage only. The usual engine path observes
 publication at the next D, which stays not_examined. These bytes do not prove
 execution of the narrow ordinary branch/role-limit path that can be known.
@@ -14,7 +14,6 @@ review registry; no production source pin or enrollment is changed.
 import copy
 import hashlib
 import json
-from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -30,17 +29,17 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
-    IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
-    IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
-    idle_archive_fixture_manifest as fixture_manifest,
-    idle_archive_fixture_review_scope as fixture_review_scope,
-    read_idle_archive_fixture_sources as read_reviewed_fixture_sources,
+    SYNTHETIC_CUSTODY_SOURCE_ID as FIXTURE_SOURCE_ID,
+    SYNTHETIC_CUSTODY_TRANSITION_PINS as FIXTURE_TRANSITION_PINS,
+    SYNTHETIC_CUSTODY_COMPILED_FACT as FIXTURE_COMPILED_FACT,
+    synthetic_custody_fixture_manifest as fixture_manifest,
+    synthetic_custody_fixture_review_scope as fixture_review_scope,
+    synthetic_custody_fixture_sources,
 )
 
 
-# Independent live-fixture pins, deliberately separate from historical table
-# preservation and from production enrollment. Unknown successors still fail.
+# Historical literal banks exercise table preservation and unknown-successor
+# rejection. Ordinary custody fixtures below do not match a checkout to them.
 REVIEWED_PRE_LINT_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 374235, "sha256": "b86af1f0e55f55add0d4cca277772f8d1c8edf3b3d93d147629c4ab6f881103a"},
@@ -69,7 +68,7 @@ REVIEWED_CONTROLLED_FALLBACK_SOURCE_PINS = {
         "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 }
 
-# Independently pinned final live-binding pair; not copied from a consumer table.
+# Independently pinned historical live-binding pair; not a current-run pin.
 REVIEWED_LIVE_BINDING_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 396086, "sha256": "004db31f9be5133bd1925b373e6df60e97da3d50979a7eb5a031b1dad4ca397b"},
@@ -149,7 +148,7 @@ class SlotFixture(RepairFixture):
             if (type(value) is list and len(value) == 2
                     and value[0] == training.CHECKED_SOURCE_DOMAIN
                     and type(value[1]) is dict and type(value[1].get("native")) is dict):
-                value[1]["native"]["search_implementation_sha256"] = SYNTHETIC_COMPILED_FACT
+                value[1]["native"]["search_implementation_sha256"] = FIXTURE_COMPILED_FACT
             return original_bytes(value)
 
         with patch.object(fixtures, "frozen_fixture_bytes", side_effect=with_synthetic_compiled_fact):
@@ -202,11 +201,10 @@ class SlotFixture(RepairFixture):
             "origin_rules_state_sha256": None, "origin_rules_identity_observation": "unknown", "kind": "Repair",
             "line": self.lineages[1]["counterexample"], "value": None, "completed_depth": 0, "scope": "Unknown",
             "white_score_perspective": True, "critical": False, "source_cpu_profile_sha256": self.source["cpu_profile_sha256"]}
-        repo = Path(__file__).resolve().parents[4]
-        source_raws = read_reviewed_fixture_sources(repo)
+        source_raws = synthetic_custody_fixture_sources()
         self.engine_raw, self.native_raw = (source_raws[path] for path in slot_witness._SOURCE_PATHS)
         self.manifest = fixture_manifest()
-        self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": REVIEWED_SOURCE_COMMIT,
+        self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": FIXTURE_SOURCE_ID,
             "actual_build_exit_code": 0, "source_verified_before_and_after_build": True,
             "binary": {"bytes": 32, "sha256": self.source["implementation_sha256"]},
             "compiler_artifact": {"reason": "compiler-artifact", "target": {"name": "pals_collect"},
@@ -668,7 +666,7 @@ class NativeSlotRepairTests(unittest.TestCase):
 
     def test_known_unique_chain_is_factual_conditional_and_all_targets_false(self):
         original_source = json.loads(self.fixture.source_raw)[1]
-        self.assertEqual(original_source["native"]["search_implementation_sha256"], SYNTHETIC_COMPILED_FACT)
+        self.assertEqual(original_source["native"]["search_implementation_sha256"], FIXTURE_COMPILED_FACT)
         self.assertEqual(original_source, self.fixture.source)
         checked = self.fixture.admit_slot()
         self.assertEqual(checked.status, "known")
@@ -680,7 +678,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["initial_repair_native_request"], [1, 4])
         self.assertEqual(body["publication_native_request"], [1, 5])
         self.assertEqual(body["captured_input_revision"], 2)
-        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], REVIEWED_TRANSITION_PINS)
+        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], FIXTURE_TRANSITION_PINS)
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
         self.assertFalse(body["before_dispatch_witness_claimed"])
@@ -810,11 +808,12 @@ class NativeSlotRepairTests(unittest.TestCase):
                 with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
                     slot_witness._source_review(values, self.fixture.source)
 
-    def test_current_review_is_one_literal_pair_and_rejects_historical_hybrids(self):
-        self.assertEqual(REVIEWED_SOURCE_COMMIT, "afceff25bd3168fe2891f9cb37bb791875f6bf88")
+    def test_synthetic_custody_profile_is_scoped_and_rejects_historical_hybrids(self):
+        from native_source_review_fixture import IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT
+        self.assertNotEqual(FIXTURE_SOURCE_ID, IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT)
         observed = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
-        self.assertEqual(observed, REVIEWED_TRANSITION_PINS)
+        self.assertEqual(observed, FIXTURE_TRANSITION_PINS)
         # This new synthetic bank does not extend the product's historical
         # two-file allow-list. Its complete helper profile is scoped to this
         # test and remains necessary on every verify() call.
@@ -851,7 +850,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(proof["component_pins"], {
             row["path"]: {name: row[name] for name in ("bytes", "sha256")}
             for row in self.fixture.manifest["files"]})
-        self.assertEqual(proof["compiled_search_implementation_sha256"], SYNTHETIC_COMPILED_FACT)
+        self.assertEqual(proof["compiled_search_implementation_sha256"], FIXTURE_COMPILED_FACT)
         self.assertIs(proof["execution_authorized"], False)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CURRENT_SOURCE_PINS), REVIEWED_CURRENT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_PRE_LINT_SOURCE_PINS), REVIEWED_PRE_LINT_SOURCE_PINS)

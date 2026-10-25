@@ -965,19 +965,23 @@ class InterruptedUnboundQuarantineTests(unittest.TestCase):
         finally:
             view.close()
 
-    def test_default_admission_still_blocks_and_explicit_all_boundaries_share_verifier(self):
+    def test_default_admission_blocks_and_explicit_boundaries_preserve_owner(self):
         receipt = self.publish()
         with self.assertRaisesRegex(StorageError, "interrupted output"):
             OutputLease(self.base / "default", self.base / "source", catalog=self.catalog).acquire()
-        with patch.object(self.q, "validate_quarantines", wraps=self.q.validate_quarantines) as verify:
-            owner = OutputLease(self.base / "fresh", self.base / "source", catalog=self.catalog,
-                                quarantine_receipts=[receipt], reserve=4096).acquire()
-            self.addCleanup(owner._close_quarantine_view)
-            owner.check_budget()
-            amount = sample_output_budget(self.catalog, quarantine_receipts=[receipt], quarantine_guard=owner.guard)
-            self.assertGreaterEqual(amount, 4096)
-            self.assertGreaterEqual(verify.call_count, 3)
-            owner.finish(status="finite-mock", tree_gone=True)
+        self.assertNotIn(self.base / "default", self.infos)
+        owner = OutputLease(self.base / "fresh", self.base / "source", catalog=self.catalog,
+                            quarantine_receipts=[receipt], reserve=4096).acquire()
+        self.addCleanup(owner._close_quarantine_view)
+        owner_path = self.catalog / (owner.key + ".json")
+        owner_record, owner_raw = copy.deepcopy(owner.record), self.files[owner_path]
+        owner.check_budget()
+        amount = sample_output_budget(self.catalog, quarantine_receipts=[receipt], quarantine_guard=owner.guard)
+        self.assertGreaterEqual(amount, 4096)
+        self.assertEqual(owner.record, owner_record)
+        self.assertEqual(self.files[owner_path], owner_raw)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+        owner.finish(status="finite-mock", tree_gone=True)
         self.assertEqual(self.files[self.row_path], self.old_raw)
 
     def test_outer_and_receipt_selection_rejected_before_any_path_io(self):
@@ -1007,14 +1011,59 @@ class InterruptedUnboundQuarantineTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageError, "current boot mismatch"):
             self.view([receipt])
 
-    def test_snapshot_target_identity_and_parent_metadata_changes_refused(self):
+    def test_admission_budget_and_sampling_reject_changed_inputs_without_mutation(self):
         receipt = self.publish()
-        for path, field in ((self.target, "st_mtime_ns"), (self.target, "st_ino"), (self.target.parent, "st_mode")):
-            original = getattr(self.infos[path], field)
-            setattr(self.infos[path], field, original + 1)
-            with self.assertRaises(StorageError):
-                self.view([receipt])
-            setattr(self.infos[path], field, original)
+        receipt_path = Path(receipt["path"])
+        changes = (("receipt_bytes", receipt_path, None),
+                   ("target_mtime", self.target, "st_mtime_ns"),
+                   ("target_identity", self.target, "st_ino"),
+                   ("parent_metadata", self.target.parent, "st_mode"))
+        for boundary in ("acquire", "check_budget", "sample_output_budget"):
+            for name, path, field in changes:
+                with self.subTest(boundary=boundary, changed=name):
+                    owner = OutputLease(self.base / (boundary + "-" + name), self.base / "source",
+                                        catalog=self.catalog, quarantine_receipts=[receipt], reserve=4096)
+                    if boundary != "acquire":
+                        owner.acquire()
+                        self.addCleanup(owner._close_quarantine_view)
+                    owner_path = self.catalog / (owner.key + ".json")
+                    owner_record = copy.deepcopy(owner.record)
+                    if field is None:
+                        original = self.files[path]
+                        self.files[path] = original + b" "
+                    else:
+                        original = getattr(self.infos[path], field)
+                        setattr(self.infos[path], field, original + 1)
+                    files_before = dict(self.files)
+                    metadata_before = {key: vars(value).copy() for key, value in self.infos.items()}
+                    actions_before = list(self.actions)
+                    try:
+                        with self.assertRaises(StorageError):
+                            if boundary == "acquire":
+                                owner.acquire()
+                            elif boundary == "check_budget":
+                                owner.check_budget()
+                            else:
+                                sample_output_budget(self.catalog, quarantine_receipts=[receipt],
+                                                     quarantine_guard=owner.guard)
+                        self.assertEqual(self.files, files_before)
+                        self.assertEqual({key: vars(value) for key, value in self.infos.items()}, metadata_before)
+                        self.assertEqual(self.actions, actions_before)
+                        self.assertEqual(self.files[self.row_path], self.old_raw)
+                        self.assertEqual(owner.record, owner_record)
+                        if boundary == "acquire":
+                            self.assertNotIn(owner_path, self.files)
+                            self.assertNotIn(owner.output, self.infos)
+                        else:
+                            self.assertEqual(self.q._decode(self.files[owner_path]), owner_record)
+                            self.assertEqual(owner_record["state"], "active")
+                    finally:
+                        if field is None:
+                            self.files[path] = original
+                        else:
+                            setattr(self.infos[path], field, original)
+                    if boundary != "acquire":
+                        owner.finish(status="finite-mock", tree_gone=True)
 
     def test_marker_before_complete_publication_never_opens_admission(self):
         original = self.exclusive

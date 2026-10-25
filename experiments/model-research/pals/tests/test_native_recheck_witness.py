@@ -1,13 +1,14 @@
 """Synthetic source/build/event wiring only; no actual compiler/child proof.
 
-The whole positive fixture reads the independently pinned reviewed Rust sources,
-then uses the public strict-loader, Repair, Rules, anchor and whole factories.
+The whole positive fixture uses static synthetic source-custody bytes, then
+uses the public strict-loader, Repair, Rules, anchor and whole factories.
 Its build/process/Rules/CPU records are synthetic caller observations, never
 evidence that a compiler, child, model, loss, optimizer or chess replay executed.
 Production gates and historical literal profiles are never patched here. New
 banks use the separate private registry only in a scoped test context, with
-fourteen literal reviewed pins and a synthetic compiled fact. They never enroll
-current file hashes or claim an actual compiler artifact.
+explicit unit byte pins and a synthetic compiled fact. They never read or
+enroll current file hashes or claim an actual compiler artifact. Historical
+literal reviewed banks remain separate and unchanged.
 """
 import copy
 import json
@@ -27,14 +28,14 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
-    IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
-    IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS as REVIEWED_COMPONENT_PINS,
-    IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 as REVIEWED_CLOSURE_SHA256,
-    IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
-    idle_archive_fixture_manifest as fixture_manifest,
-    idle_archive_fixture_review_scope as fixture_review_scope,
-    read_idle_archive_fixture_sources as read_reviewed_fixture_sources,
+    SYNTHETIC_CUSTODY_SOURCE_ID as FIXTURE_SOURCE_ID,
+    SYNTHETIC_CUSTODY_TRANSITION_PINS as FIXTURE_TRANSITION_PINS,
+    SYNTHETIC_CUSTODY_COMPONENT_PINS as FIXTURE_COMPONENT_PINS,
+    SYNTHETIC_CUSTODY_CLOSURE_SHA256 as FIXTURE_CLOSURE_SHA256,
+    SYNTHETIC_CUSTODY_COMPILED_FACT as FIXTURE_COMPILED_FACT,
+    synthetic_custody_fixture_manifest as fixture_manifest,
+    synthetic_custody_fixture_review_scope as fixture_review_scope,
+    synthetic_custody_fixture_sources,
 )
 
 
@@ -1052,7 +1053,7 @@ class SyntheticWholeRecheckFixture:
         cpu_sha = byte_pin(canonical(cpu_config))["sha256"]
         self.source["cpu_profile_sha256"] = cpu_sha
         native_source = self.source["native"]
-        native_source["search_implementation_sha256"] = SYNTHETIC_COMPILED_FACT
+        native_source["search_implementation_sha256"] = FIXTURE_COMPILED_FACT
         native_source["cpu_task_source"] = {"configuration": cpu_config,
             "implementation_sha256": self.source["implementation_sha256"], "cpu_profile_sha256": cpu_sha}
         registry = native_source["independent_registry"]
@@ -1074,13 +1075,12 @@ class SyntheticWholeRecheckFixture:
         producer["registration_sha256"] = byte_pin(self.registration_raw)["sha256"]
         self.roster = frozen.seal_roster({"version": frozen.ROSTER_DOMAIN, "game_producers": [producer]})
         self.producer = producer
-        repo = Path(__file__).resolve().parents[4]
-        reviewed_sources = read_reviewed_fixture_sources(repo)
+        reviewed_sources = synthetic_custody_fixture_sources()
         self.source_raws = {name: reviewed_sources[path] for path, name in
-            zip(REVIEWED_TRANSITION_PINS, ("engine_source", "native_source"))}
+            zip(FIXTURE_TRANSITION_PINS, ("engine_source", "native_source"))}
         manifest = fixture_manifest()
         self.source_raws["source_manifest"] = canonical(manifest)
-        build = {"schema": witness.BUILD_SCHEMA, "source_commit": REVIEWED_SOURCE_COMMIT,
+        build = {"schema": witness.BUILD_SCHEMA, "source_commit": FIXTURE_SOURCE_ID,
                  "actual_build_exit_code": 0, "source_verified_before_and_after_build": True,
                  "binary": {"bytes": 17, "sha256": self.source["implementation_sha256"]},
                  "source_manifest": byte_pin(self.source_raws["source_manifest"]),
@@ -1432,11 +1432,11 @@ class NativeRecheckPublicWholeTests(unittest.TestCase):
             self.assertEqual(original["artifacts"][witness.TRACE_ARTIFACT], byte_pin(fixture.trace_raw))
             self.assertEqual(set(original["artifacts"]), set(fixture.assets) - {"receipt.json"})
             source_review = fixture.anchor.admission()["source_observation"]
-            self.assertEqual(source_review["reviewed_transition_sources"], REVIEWED_TRANSITION_PINS)
+            self.assertEqual(source_review["reviewed_transition_sources"], FIXTURE_TRANSITION_PINS)
             closure = source_review["reviewed_transition_closure"]
-            self.assertEqual(closure["component_pins"], REVIEWED_COMPONENT_PINS)
-            self.assertEqual(closure["closure_sha256"], REVIEWED_CLOSURE_SHA256)
-            self.assertEqual(closure["compiled_search_implementation_sha256"], SYNTHETIC_COMPILED_FACT)
+            self.assertEqual(closure["component_pins"], FIXTURE_COMPONENT_PINS)
+            self.assertEqual(closure["closure_sha256"], FIXTURE_CLOSURE_SHA256)
+            self.assertEqual(closure["compiled_search_implementation_sha256"], FIXTURE_COMPILED_FACT)
             self.assertIs(closure["historical_metadata_only"], True)
             self.assertIs(closure["execution_authorized"], False)
             self.assertEqual(fixture.repaired_check.rules_receipt()["claimed_line"]["claim_truth"], "unknown")

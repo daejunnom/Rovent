@@ -17,7 +17,7 @@ from rz_pals_model import native_recheck_witness as native
 from rz_pals_model import verifier_producer as legacy
 from test_strategic_verifier_query import QueryFixture
 from test_native_recheck_witness import SyntheticWholeRecheckFixture
-from native_source_review_fixture import idle_archive_fixture_review_scope as fixture_review_scope
+from native_source_review_fixture import synthetic_custody_fixture_review_scope as fixture_review_scope
 
 
 class MaskedUtilityFixture:

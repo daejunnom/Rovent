@@ -5,6 +5,10 @@ Reading the checkout only confirms those literal pins; it cannot register a
 successor. The compiled fact is deliberately synthetic caller metadata. No
 compiler, native process, Rules replay, training or GPU execution is certified.
 Historical receipts and the production review registry remain unchanged.
+
+The separate SYNTHETIC_CUSTODY helpers below serve ordinary byte-custody
+unit tests without reading a checkout. They are not reviewed Rust sources,
+independent-reference acceptance, product enrollment, or execution evidence.
 """
 import copy
 from contextlib import contextmanager
@@ -482,6 +486,63 @@ class FeedbackObservationFixtureTests(_fixture_unittest.TestCase):
                             lane=lane)
             self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
         self.assertEqual([factory("default_disabled") for factory in factories], prior)
+
+
+# Independent static unit bytes. Keep all historical literal banks intact.
+# The paths model a complete logical closure; their content is deliberately not
+# Rust implementation text, and this ID does not name a Git commit.
+_SYNTHETIC_CUSTODY_PATHS = (*FEEDBACK_OBSERVATION_REVIEWED_COMPONENT_PINS,
+    "crates/rz-search/src/pals/engine/idle_archive.rs",
+    "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs",
+    "crates/rz-search/src/pals/engine/preparing_root.rs",
+    "crates/rz-search/src/pals/review_context.rs",
+    "crates/rz-search/src/pals/engine/adaptive_root.rs",
+    "crates/rz-search/src/pals/store/archive.rs",
+)
+_SYNTHETIC_CUSTODY_BYTES = {
+    path: ("synthetic byte-custody unit input only; not Rust source: " + path + "\n").encode("utf-8")
+    for path in _SYNTHETIC_CUSTODY_PATHS}
+SYNTHETIC_CUSTODY_COMPONENT_PINS = {
+    path: {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    for path, raw in _SYNTHETIC_CUSTODY_BYTES.items()}
+SYNTHETIC_CUSTODY_TRANSITION_PINS = {
+    path: copy.deepcopy(SYNTHETIC_CUSTODY_COMPONENT_PINS[path]) for path in _SYNTHETIC_CUSTODY_PATHS[:2]}
+SYNTHETIC_CUSTODY_SOURCE_ID = hashlib.sha256(b"synthetic-byte-custody-unit-source-id-v1").hexdigest()[:40]
+SYNTHETIC_CUSTODY_COMPILED_FACT = hashlib.sha256(b"synthetic-byte-custody-unit-compiled-fact-v1").hexdigest()
+
+
+def synthetic_custody_fixture_sources():
+    """Static unit bytes only; never observe, hash, or enroll a live checkout."""
+    return dict(_SYNTHETIC_CUSTODY_BYTES)
+
+
+def synthetic_custody_fixture_manifest():
+    return {"source_commit": SYNTHETIC_CUSTODY_SOURCE_ID,
+        "files": [{"path": path, **copy.deepcopy(pin)}
+                  for path, pin in SYNTHETIC_CUSTODY_COMPONENT_PINS.items()]}
+
+
+def synthetic_custody_fixture_profile(lane):
+    if lane not in ("default_disabled", "legacy_single_reply"):
+        raise ValueError("explicit synthetic custody unit lane required")
+    from rz_pals_model.generation_data import digest
+    return {"schema": "rz-pals-native-reviewed-transition-profile/1",
+        "review_id": "synthetic-byte-custody-unit-v1-" + lane, "lane": lane,
+        "transition_sources": copy.deepcopy(SYNTHETIC_CUSTODY_TRANSITION_PINS),
+        "component_pins": copy.deepcopy(SYNTHETIC_CUSTODY_COMPONENT_PINS),
+        "compiled_search_implementation_sha256": SYNTHETIC_CUSTODY_COMPILED_FACT,
+        "closure_sha256": digest("rz-pals-native-reviewed-transition-closure/1", SYNTHETIC_CUSTODY_COMPONENT_PINS)}
+
+
+SYNTHETIC_CUSTODY_CLOSURE_SHA256 = synthetic_custody_fixture_profile("default_disabled")["closure_sha256"]
+
+
+@contextmanager
+def synthetic_custody_fixture_review_scope(lane):
+    """Scoped unit-only registry; never a persistent reviewed-source enrollment."""
+    profile = synthetic_custody_fixture_profile(lane)
+    with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (profile,)):
+        yield profile
 
 
 # A distinct test-local idle-archive successor at the explicit product source

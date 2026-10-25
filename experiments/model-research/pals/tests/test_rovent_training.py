@@ -1,19 +1,19 @@
 """Tiny parameter/state inventories; never model weights or training proof."""
 import copy
-import ast
 import importlib.abc
 import math
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 class NeuralImportsForbidden(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if (fullname.split(".")[0] in {"torch", "numpy", "onnx", "onnxruntime"}
-                or fullname in {"rz_pals_model.model", "rz_pals_model.training", "rz_pals_model.nonzero_training",
-                                "rz_pals_model.nnuec_reference"}):
+                or fullname in {"rz_pals_model.model", "rz_pals_model.training", "rz_pals_model.nonzero_training"}):
             raise AssertionError("model/optimizer import forbidden in trainer preparation tests")
 
 
@@ -96,6 +96,22 @@ def inventory_fixture(recipe, membership):
 
 
 class RoventTrainingPreparationTests(unittest.TestCase):
+    def test_windows_name_comparison_uses_birthtime_but_fd_keeps_changetime(self):
+        common = dict(st_dev=1, st_ino=2, st_mode=0o100600, st_nlink=1,
+                      st_size=8, st_mtime_ns=20, st_birthtime_ns=10)
+        held = SimpleNamespace(**common, st_ctime_ns=30)
+        named = SimpleNamespace(**common, st_ctime_ns=10)
+        changed = SimpleNamespace(**common, st_ctime_ns=31)
+        with patch.object(cli.os, "name", "nt"):
+            self.assertEqual(cli._stamp(held, named_comparison=True),
+                             cli._stamp(named, named_comparison=True))
+            self.assertNotEqual(cli._stamp(held), cli._stamp(changed))
+            for field in ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns"):
+                replaced = SimpleNamespace(**vars(named))
+                setattr(replaced, field, getattr(replaced, field) + 1)
+                self.assertNotEqual(cli._stamp(held, named_comparison=True),
+                                    cli._stamp(replaced, named_comparison=True))
+
     def setUp(self):
         self.guard = NeuralImportsForbidden()
         sys.meta_path.insert(0, self.guard)
@@ -119,12 +135,10 @@ class RoventTrainingPreparationTests(unittest.TestCase):
         self.assertEqual(training.membership_digest(prototype), expected)
 
     def test_current_guard_uses_independent_reference_metadata_and_exact_parameter_spec(self):
-        # Read only the independent reference's literal; no model module is
-        # imported or initialized in this preparation suite.
-        source = Path(training.__file__).with_name("nnuec_v2_reference.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        semantics = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "SEMANTICS" for target in node.targets))
+        # The independent scalar reference imports only the standard library;
+        # importing its public metadata constructs no weights or model. Its
+        # assignment/declaration shape is not part of the training contract.
+        from rz_pals_model.nnuec_v2_reference import SEMANTICS as semantics
         current = membership_v2_fixture()
         self.assertEqual(current["nnuec_semantics"], semantics)
         metadata = {"schema": "rz-nnuec-torch-metadata/1", "model_schema": "rz-nnuec-fp32-v2",

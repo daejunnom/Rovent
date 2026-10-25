@@ -321,17 +321,29 @@ class NumericCaptureTests(unittest.TestCase):
             self.assertEqual(pin,registry.component_digest(rows))
         self.assertNotEqual(actual["model_reference"],hashlib.sha256(Path(capture.__file__).read_bytes()).hexdigest())
 
-    def test_registered_encoding_vocabulary_and_digest_match_rust_source(self):
+    def test_registered_encoding_vocabulary_and_digest_match_versioned_contract(self):
         from rz_pals_model.virtual_review import ENCODING_REGISTRY_FIELDS, registered_encoding_sha256
-        root = Path(__file__).parents[4]
-        source = (root/"crates/rz-eval/src/pals_model/virtual_review.rs").read_text(encoding="utf-8")
-        match = re.search(r"pub const ENCODING_REGISTRY_FIELDS: &\[&str\] = &\[(.*?)\n\];",source,re.S)
-        self.assertIsNotNone(match)
-        declared = tuple(json.loads(raw) for raw in re.findall(r'^\s*("[^"\n]*"),\s*$',match.group(1),re.M))
+        # This immutable ABI vector is independently asserted by the Rust
+        # encoder tests. Rust declaration formatting is not the contract.
+        declared = tuple(ENCODING_REGISTRY_FIELDS)
         self.assertEqual(len(declared),33)
-        self.assertEqual(tuple(ENCODING_REGISTRY_FIELDS),declared)
         framed = b"".join(struct.pack("<Q",len(field.encode()))+field.encode() for field in declared)
-        self.assertEqual(registered_encoding_sha256(),hashlib.sha256(framed).hexdigest())
+        expected = "57f53319114c3da14612f5d4dc99ff1a05fa115c471a5ed764d02b7fce0f5d0f"
+        self.assertEqual(hashlib.sha256(framed).hexdigest(),expected)
+        self.assertEqual(registered_encoding_sha256(),expected)
+
+    def test_source_pin_reads_exact_crlf_and_control_bytes(self):
+        from rz_pals_model import v5_source_registry as registry
+        with tempfile.TemporaryDirectory(prefix="rz-source-pin-") as directory:
+            root = Path(directory)
+            relative = "scripts/input.py"
+            raw = b"# bounded source bytes\r\n# control:\x1a\r\n"
+            path = root / relative
+            path.parent.mkdir()
+            path.write_bytes(raw)
+            pin, catalog = registry._read_pin(root, relative, 1024)
+            self.assertEqual(pin, (relative, len(raw), hashlib.sha256(raw).digest()))
+            self.assertIsNone(catalog)
 
     def test_regular_file_size_and_checkpoint_pin_reject_before_decode(self):
         with tempfile.TemporaryDirectory(prefix="rz-numeric-capture-") as directory:

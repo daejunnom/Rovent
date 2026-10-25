@@ -65,8 +65,14 @@ def _plain_chain(path, *, directory=False):
     return detail
 
 
-def _stamp(detail):
-    return detail.st_dev, detail.st_ino, detail.st_size, detail.st_mtime_ns, detail.st_ctime_ns
+def _stamp(detail, *, named_comparison=False):
+    # Windows path stat reports creation time as ctime, while fstat reports
+    # ChangeTime. Compare their common birthtime across FD/name observations;
+    # retain ChangeTime for comparisons of the held FD before/after reading.
+    timestamp = (getattr(detail, "st_birthtime_ns", detail.st_ctime_ns)
+                 if named_comparison and os.name == "nt" else detail.st_ctime_ns)
+    return (detail.st_dev, detail.st_ino, detail.st_mode, detail.st_nlink,
+            detail.st_size, detail.st_mtime_ns, timestamp)
 
 
 def _pin(value):
@@ -104,7 +110,8 @@ def read_pinned_json(pin, budget):
     budget.reserve_input(before.st_size)
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
-        if _stamp(os.fstat(stream.fileno())) != _stamp(before):
+        held = os.fstat(stream.fileno())
+        if _stamp(held, named_comparison=True) != _stamp(before, named_comparison=True):
             raise ValueError("preparation metadata identity changed before read")
         blocks, total, hasher = [], 0, hashlib.sha256()
         while True:
@@ -118,7 +125,7 @@ def read_pinned_json(pin, budget):
             blocks.append(block)
             hasher.update(block)
         if (total != pin["bytes"] or hasher.hexdigest() != pin["sha256"]
-                or _stamp(os.fstat(stream.fileno())) != _stamp(before)
+                or _stamp(os.fstat(stream.fileno())) != _stamp(held)
                 or _stamp(_plain_chain(path)) != _stamp(before)):
             raise ValueError("preparation metadata hash/identity mismatch")
     return strict_json(b"".join(blocks).decode("utf-8", "strict"))
