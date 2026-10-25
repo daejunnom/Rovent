@@ -66,6 +66,8 @@ SPECS = (
 )
 WARM = ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
         'pals-adaptive,onnx-cpu,experimental-io-binding')
+RUNTIME_LOADER_SPEC = ('rz-eval', 'example', 'runtime_loader_check', 'onnx')
+RUNTIME_LOADER_SUCCESS = 'SAME_HEAD_RUNTIME_LOADER_ELF_AND_SOURCE_PROVENANCE_VERIFIED'
 # This standalone example calls the CUDA-enabled eval backend directly. Its
 # required features do not certify the separate engine/native_bootstrap path.
 FUNCTIONAL_SPECS = (
@@ -346,12 +348,18 @@ def stream_child(argv):
         selector.close()
 
 
-def cleanup_compiler_outputs(root, artifact, receipt):
+def cleanup_compiler_outputs(root, artifact, receipt, *,
+                             success_status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
+                             bundle_filename='native-validation-binaries.tar.gz'):
     """Retire only this fresh build's regenerable folders after custody closes."""
     from managed_storage import remove_tree, write_record
-    require(receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED'
+    require((success_status, bundle_filename) in (
+        ('SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED', 'native-validation-binaries.tar.gz'),
+        (RUNTIME_LOADER_SUCCESS, 'runtime-loader-diagnostic-binaries.tar.gz')),
+        'ClosedCompileCleanupProfile')
+    require(receipt['status'] == success_status
             and all(row.get('original_tree_cleanup_verified') is True for row in receipt['commands'])
-            and file_pin(artifact / 'native-validation-binaries.tar.gz', ARTIFACT_CAP) == receipt['binary_bundle'],
+            and file_pin(artifact / bundle_filename, ARTIFACT_CAP) == receipt['binary_bundle'],
             'VerifiedBundleAndTreeClosureBeforeCleanup')
     names = ('target-native', 'target-warm', 'target-diagnostic', 'cargo-home', 'tmp', 'private-elf')
     # No model, source, original external asset or failure evidence is listed.
@@ -500,6 +508,44 @@ def build_selected_targets(build, *, cargo, env, metadata, source, private, spec
                           'role': 'optional_warm_validation' if spec == warm else ('diagnostic_auxiliary' if name == 'pals_continuation_diagnostic' else 'native_validation')}
 
 
+def build_runtime_loader_target(build, *, cargo, env, metadata, source, private,
+                                registered_paths, binaries, failures, failure_check):
+    """One model-free diagnostic ELF; the full13 and all runtime work are separate."""
+    require(not binaries and not failures, 'FreshRuntimeLoaderTargetResult')
+    build_selected_targets(build, cargo=cargo, env=env, metadata=metadata, source=source,
+                           private=private, specs=(RUNTIME_LOADER_SPEC,),
+                           registered_paths=registered_paths, binaries=binaries, failures=failures,
+                           failure_check=failure_check, warm=None)
+    if failures:
+        require(not binaries and len(failures) == 1, 'SingleRuntimeLoaderTargetFailure')
+        return
+    require(set(binaries) == {RUNTIME_LOADER_SPEC[2]}, 'SingleRuntimeLoaderTargetRoster')
+    row = binaries[RUNTIME_LOADER_SPEC[2]]
+    require(row['cargo_metadata_required_features'] == ['onnx'], 'RuntimeLoaderRequiredOnnxFeature')
+    row.update(role='runtime_loader_diagnostic',
+               compiled_capability_scope='model_free_runtime_loader_only_no_session_model_NN_or_runtime_acceptance')
+
+
+def preserve_runtime_loader_sources(artifact, source, expected_head, rows, controls,
+                                    lock, lock_pin, lock_meta):
+    """Save actual source/lock provenance without querying another target or loading ORT."""
+    pins = [{key: row[key] for key in ('path', 'bytes', 'sha256')} for row in rows]
+    write_json(artifact / 'source-file-pins.json', {
+        'schema': 'rovezero.ci-runtime-loader-source-pins/1',
+        'source_commit': expected_head, 'files': pins})
+    write_json(artifact / 'git-source-provenance.json', {
+        'schema': 'rovezero.ci-runtime-loader-source-provenance/1',
+        'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls})
+    lock.seek(0)
+    with (artifact / 'Cargo.lock').open('xb') as target:
+        shutil.copyfileobj(lock, target, 65536)
+        target.flush()
+        os.fsync(target.fileno())
+    require(same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat()),
+            'BundledLockOriginalFDChanged')
+    require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
+
+
 def selected_elf_payload(binaries):
     sizes = [row['pin']['bytes'] for row in binaries.values()]
     require(sizes and all(type(size) is int and 0 < size <= ELF_CAP for size in sizes)
@@ -557,7 +603,11 @@ def write_json(path, value):
         os.fsync(stream.fileno())
 
 
-def run(source, root, expected_head, seconds):
+def run(source, root, expected_head, seconds, *, profile='native-validation'):
+    require(profile in ('native-validation', 'runtime-loader-only'), 'ExplicitBuildProfile')
+    loader_only = profile == 'runtime-loader-only'
+    success_status = RUNTIME_LOADER_SUCCESS if loader_only else 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED'
+    bundle_filename = 'runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'native-validation-binaries.tar.gz'
     require(sys.platform == 'linux' and platform.machine() in ('x86_64', 'AMD64')
             and re.fullmatch('[a-f0-9]{40}', expected_head)
             and 1 <= seconds <= MAX_BUILD_SECONDS, 'LinuxFiniteBuildProfile')
@@ -582,7 +632,8 @@ def run(source, root, expected_head, seconds):
         # reserved original process group before returning an unsuccessful row.
         raise KeyboardInterrupt('OwnedBuildCancelled')
     signal.signal(signal.SIGTERM, cancelled)
-    receipt = {'schema': 'rovezero.ci-cpu-validation-bundle/1', 'status': 'FAILED_NOT_ADMITTED',
+    receipt = {'schema': 'rovezero.ci-runtime-loader-diagnostic/1' if loader_only else 'rovezero.ci-cpu-validation-bundle/1',
+               'status': 'FAILED_NOT_ADMITTED',
                'source_commit': expected_head, 'commands': build.commands,
                'resource': {'cpu_affinity_actual': affinity, 'build_jobs': 2, 'seconds': seconds,
                             'child_affinity_guard': 'isolated_wrapper_exact_readback_before_exec',
@@ -592,8 +643,12 @@ def run(source, root, expected_head, seconds):
                'optimizer_updates': 0, 'mapped_image': None, 'numerical_or_runtime_acceptance': None,
                'host': {'machine': platform.machine(), 'libc_observed': platform.libc_ver(),
                         'glibc_compatibility_claim': None},
-               'metadata_getter_scope': 'static_source_inventory_core5_registry_rules_only',
+               'metadata_getter_scope': 'source_and_selected_Cargo_provenance_only_no_ELF_execution' if loader_only else 'static_source_inventory_core5_registry_rules_only',
                'binaries': {}, 'target_failures': []}
+    if loader_only:
+        receipt.update(diagnostic_profile=profile, diagnostic_binary_executed=False,
+                       runtime_loaded=False, model_loaded=False, session_created=False,
+                       full_native_bundle_admitted=False)
     receipt['uploaded_command_log_directory'] = 'command-logs'
     env = {key: os.environ[key] for key in ('PATH', 'HOME', 'RUSTUP_HOME') if key in os.environ}
     for folder in ('cargo-home', 'tmp'):
@@ -614,7 +669,8 @@ def run(source, root, expected_head, seconds):
         tree = build.command('git-source-roster', [tools['git'], 'ls-tree', '-r', '-z', '--full-tree', 'HEAD', '--',
                              *sorted(SINGLETONS), *PREFIXES, CONTROL], env)
         rows, controls = source_inventory(source, tree)
-        components = component_inventory(strict_json((source / 'crates/rz-experiments/src/pals_source_inventory_v5.json').read_bytes()), rows)
+        if not loader_only:
+            components = component_inventory(strict_json((source / 'crates/rz-experiments/src/pals_source_inventory_v5.json').read_bytes()), rows)
         lock, lock_pin, lock_meta, _ = pinned_file(source / 'Cargo.lock')
         toolchain = tomllib.loads((source / 'rust-toolchain.toml').read_text())
         require(toolchain['toolchain']['channel'] == '1.96.0', 'RegisteredRustToolchain')
@@ -625,10 +681,16 @@ def run(source, root, expected_head, seconds):
         metadata = strict_json(build.command('cargo-metadata', [tools['cargo'], 'metadata', '--locked', '--no-deps',
                                                              '--no-default-features', '--format-version', '1'], env))
         require(metadata['workspace_root'] == str(source), 'ActualCargoWorkspace')
-        manifest = tomllib.loads((source / 'crates/rz-uci/Cargo.toml').read_text())
-        warm, receipt['warm_status'] = warm_spec(manifest, {r['path'] for r in rows})
-        selected_specs = SPECS + ((warm,) if warm else ())
-        validate_functional_specs(selected_specs)
+        if loader_only:
+            warm = None
+            selected_specs = (RUNTIME_LOADER_SPEC,)
+            preserve_runtime_loader_sources(artifact, source, expected_head, rows, controls,
+                                            lock, lock_pin, lock_meta)
+        else:
+            manifest = tomllib.loads((source / 'crates/rz-uci/Cargo.toml').read_text())
+            warm, receipt['warm_status'] = warm_spec(manifest, {r['path'] for r in rows})
+            selected_specs = SPECS + ((warm,) if warm else ())
+            validate_functional_specs(selected_specs)
 
         def recheck_registered_inputs():
             require(source_inventory(source, tree) == (rows, controls)
@@ -638,97 +700,112 @@ def run(source, root, expected_head, seconds):
         receipt['requested_targets'] = [list(spec) for spec in selected_specs]
         # Reuse Cargo fingerprints, but catch only a verified closed ordinary
         # compiler exit. Validation, storage, timeout and shared-input errors abort.
-        build_selected_targets(build, cargo=tools['cargo'], env=env, metadata=metadata,
-                               source=source, private=private, specs=selected_specs,
-                               registered_paths={r['path'] for r in rows}, binaries=receipt['binaries'],
-                               failures=receipt['target_failures'], failure_check=recheck_registered_inputs, warm=warm)
+        target_arguments = dict(cargo=tools['cargo'], env=env, metadata=metadata,
+                                source=source, private=private, registered_paths={r['path'] for r in rows},
+                                binaries=receipt['binaries'], failures=receipt['target_failures'],
+                                failure_check=recheck_registered_inputs)
+        if loader_only:
+            build_runtime_loader_target(build, **target_arguments)
+        else:
+            build_selected_targets(build, **target_arguments, specs=selected_specs, warm=warm)
         if receipt['target_failures']:
             recheck_registered_inputs()
             require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                     'HeadChangedDuringBuild')
             if receipt['binaries']:
-                _, partial_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'],
-                                                          'partial-native-validation-binaries.tar.gz')
+                partial_filename = 'partial-runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'partial-native-validation-binaries.tar.gz'
+                _, partial_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'], partial_filename)
                 receipt['partial_binary_bundle'] = partial_pin
-                receipt['partial_binary_bundle_file'] = 'partial-native-validation-binaries.tar.gz'
+                receipt['partial_binary_bundle_file'] = partial_filename
                 receipt['partial_bundle_scope'] = 'successful_targets_only_failed_full_bundle_not_admitted'
-            raise RuntimeError('RequiredCargoTargetsFailed')
+            raise RuntimeError('RequiredRuntimeLoaderTargetFailed' if loader_only else 'RequiredCargoTargetsFailed')
         require(set(receipt['binaries']) == {spec[2] for spec in selected_specs}, 'CompleteSelectedTargetRoster')
         if warm:
             receipt['warm_status'] = 'BUILT_SAME_HEAD_NOT_EXECUTED_OR_NUMERICALLY_ADMITTED'
-        compiled = strict_json(build.command('compiled-source-inventory', [str(private / 'rz-pals-adaptive'), '--source-inventory'], env))
-        require(compiled == {'domain': 'rz-pals-compiled-source-registration-v5/1', 'source_commit': expected_head,
-                             'components': components, 'neural_execution': False, 'training_execution': False}, 'CompiledInventorySourceMismatch')
-        rovent = strict_json(build.command('rovent-build-metadata', [str(private / 'rz-rovent'), '--build-capabilities-json'], env))
-        validate_rovent_build_metadata(rovent, expected_head, components)
-        receipt['rovent_build_binding'] = {
-            'ELF': receipt['binaries']['rz-rovent']['pin'],
-            'metadata': rovent,
-            'registered_components_independently_matched': True,
-            'private_component_digests': 'observed_only_not_independently_recomputed',
-            'scope': 'same_actual_ELF_compile_metadata_no_runtime_model_or_execution_authority'}
-        native = strict_json(build.command('native-source-pins', [str(private / 'virtual_review_numeric_capture'), '--source-pins'], env))
-        require(native == {name: components[name] for name in CORE5}, 'NativeCore5SourceMismatch')
-        registry = strict_json(build.command('static-model-registry', [str(private / 'virtual_review_numeric_capture'), '--model-registry'], env))
-        validate_registry(registry)
-        receipt['static_registry_binding'] = {
-            'capture_ELF': receipt['binaries']['virtual_review_numeric_capture']['pin'],
-            'registered_source_core5': native,
-            'registered_semantic_sha256': registry['model_semantic_sha256'],
-            'registered_encoding_sha256': registry['encoding_sha256'],
-            'scope': 'same_actual_ELF_public_registry_methods_and_compiled_source_pins_no_numerical_authority'}
-        rules = strict_json(build.command('rules-descriptor', [str(private / 'pals_rules_descriptor'), '--model-profile=virtual_review_v1'], env))
-        require(rules.get('schema') == 'rovezero.pals-rules-descriptor.v3'
-                and rules.get('rules_input_profile') == 'rz-pals-rules-virtual-review-v1'
-                and rules.get('config', {}).get('profile') == 'virtual_review_v1'
-                and rules.get('learned_input_compatibility') == 'unverified_declaration_only'
-                and rules.get('bounds') == {'max_records': 64, 'max_anchors': 4, 'max_line_plies': 256,
-                                            'line_buckets': [8, 16, 32, 64, 128, 256], 'max_candidates': 256,
-                                            'token_budgets': [128, 256, 512], 'root_anchor': 0}, 'StaticRulesDescriptorProfile')
-        semantic = hashlib.sha256()
-        for field in rules['semantic_fields']:
-            encoded = field.encode('utf-8')
-            semantic.update(len(encoded).to_bytes(8, 'little') + encoded)
-        encoder = hashlib.sha256(b'rz-pals-virtual-rules-encoder-source/1\0')
-        for name, logical in (
-                ('pals_native.rs', 'crates/rz-uci/src/pals_native.rs'),
-                ('pals_native/virtual_encoding.rs', 'crates/rz-uci/src/pals_native/virtual_encoding.rs'),
-                ('pals_native/virtual_selected_input.rs', 'crates/rz-uci/src/pals_native/virtual_selected_input.rs'),
-                ('pals_native/ticketed/virtual_bridge.rs', 'crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs'),
-                ('rz-eval/pals_model/virtual_review.rs', 'crates/rz-eval/src/pals_model/virtual_review.rs')):
-            stream, _, _, _ = pinned_file(source / logical, 16 << 20)
-            with stream:
-                raw = stream.read()
-            encoded = name.encode()
-            encoder.update(len(encoded).to_bytes(8, 'little') + encoded)
-            encoder.update(len(raw).to_bytes(8, 'little') + raw)
-        require(rules.get('rules_input_semantic_sha256') == semantic.hexdigest()
-                and rules.get('rules_encoder_source_sha256') == encoder.hexdigest(), 'StaticRulesDescriptorSourceFraming')
-        recheck_registered_inputs()
-        require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
-                'HeadChangedDuringBuild')
-        pins = [{key: row[key] for key in ('path', 'bytes', 'sha256')} for row in rows]
-        for name, value in (('source-file-pins.json', {'schema': 'rovezero.ci-native-source-pins/1',
-                                                     'source_commit': expected_head, 'files': pins, 'source_components': components}),
-                            ('git-source-provenance.json', {'schema': 'rovezero.ci-git-source-provenance/1',
-                                                            'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls}),
-                            ('compiled-source-inventory.json', compiled), ('native-source-pins.json', native),
-                            ('static-model-registry.json', registry), ('rules-descriptor.json', rules)):
-            write_json(artifact / name, value)
-        lock.seek(0)
-        with (artifact / 'Cargo.lock').open('xb') as target:
-            shutil.copyfileobj(lock, target, 65536)
-            target.flush()
-            os.fsync(target.fileno())
-        require(same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat()),
-                'BundledLockOriginalFDChanged')
-        require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
-        bundle, bundle_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'],
-                                                       'native-validation-binaries.tar.gz')
-        receipt.update(status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
-                       source_files=len(rows), component_count=len(components), source_components=components,
-                       Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
-                        binary_bundle=bundle_pin, metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
+        if loader_only:
+            recheck_registered_inputs()
+            require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
+                    'HeadChangedDuringBuild')
+            write_json(artifact / 'cargo-metadata.json', metadata)
+            bundle, bundle_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'], bundle_filename)
+            receipt.update(status=success_status, source_files=len(rows),
+                           Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
+                           binary_bundle=bundle_pin, binary_bundle_file=bundle_filename,
+                           metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
+        else:
+            compiled = strict_json(build.command('compiled-source-inventory', [str(private / 'rz-pals-adaptive'), '--source-inventory'], env))
+            require(compiled == {'domain': 'rz-pals-compiled-source-registration-v5/1', 'source_commit': expected_head,
+                                 'components': components, 'neural_execution': False, 'training_execution': False}, 'CompiledInventorySourceMismatch')
+            rovent = strict_json(build.command('rovent-build-metadata', [str(private / 'rz-rovent'), '--build-capabilities-json'], env))
+            validate_rovent_build_metadata(rovent, expected_head, components)
+            receipt['rovent_build_binding'] = {
+                'ELF': receipt['binaries']['rz-rovent']['pin'],
+                'metadata': rovent,
+                'registered_components_independently_matched': True,
+                'private_component_digests': 'observed_only_not_independently_recomputed',
+                'scope': 'same_actual_ELF_compile_metadata_no_runtime_model_or_execution_authority'}
+            native = strict_json(build.command('native-source-pins', [str(private / 'virtual_review_numeric_capture'), '--source-pins'], env))
+            require(native == {name: components[name] for name in CORE5}, 'NativeCore5SourceMismatch')
+            registry = strict_json(build.command('static-model-registry', [str(private / 'virtual_review_numeric_capture'), '--model-registry'], env))
+            validate_registry(registry)
+            receipt['static_registry_binding'] = {
+                'capture_ELF': receipt['binaries']['virtual_review_numeric_capture']['pin'],
+                'registered_source_core5': native,
+                'registered_semantic_sha256': registry['model_semantic_sha256'],
+                'registered_encoding_sha256': registry['encoding_sha256'],
+                'scope': 'same_actual_ELF_public_registry_methods_and_compiled_source_pins_no_numerical_authority'}
+            rules = strict_json(build.command('rules-descriptor', [str(private / 'pals_rules_descriptor'), '--model-profile=virtual_review_v1'], env))
+            require(rules.get('schema') == 'rovezero.pals-rules-descriptor.v3'
+                    and rules.get('rules_input_profile') == 'rz-pals-rules-virtual-review-v1'
+                    and rules.get('config', {}).get('profile') == 'virtual_review_v1'
+                    and rules.get('learned_input_compatibility') == 'unverified_declaration_only'
+                    and rules.get('bounds') == {'max_records': 64, 'max_anchors': 4, 'max_line_plies': 256,
+                                                'line_buckets': [8, 16, 32, 64, 128, 256], 'max_candidates': 256,
+                                                'token_budgets': [128, 256, 512], 'root_anchor': 0}, 'StaticRulesDescriptorProfile')
+            semantic = hashlib.sha256()
+            for field in rules['semantic_fields']:
+                encoded = field.encode('utf-8')
+                semantic.update(len(encoded).to_bytes(8, 'little') + encoded)
+            encoder = hashlib.sha256(b'rz-pals-virtual-rules-encoder-source/1\0')
+            for name, logical in (
+                    ('pals_native.rs', 'crates/rz-uci/src/pals_native.rs'),
+                    ('pals_native/virtual_encoding.rs', 'crates/rz-uci/src/pals_native/virtual_encoding.rs'),
+                    ('pals_native/virtual_selected_input.rs', 'crates/rz-uci/src/pals_native/virtual_selected_input.rs'),
+                    ('pals_native/ticketed/virtual_bridge.rs', 'crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs'),
+                    ('rz-eval/pals_model/virtual_review.rs', 'crates/rz-eval/src/pals_model/virtual_review.rs')):
+                stream, _, _, _ = pinned_file(source / logical, 16 << 20)
+                with stream:
+                    raw = stream.read()
+                encoded = name.encode()
+                encoder.update(len(encoded).to_bytes(8, 'little') + encoded)
+                encoder.update(len(raw).to_bytes(8, 'little') + raw)
+            require(rules.get('rules_input_semantic_sha256') == semantic.hexdigest()
+                    and rules.get('rules_encoder_source_sha256') == encoder.hexdigest(), 'StaticRulesDescriptorSourceFraming')
+            recheck_registered_inputs()
+            require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
+                    'HeadChangedDuringBuild')
+            pins = [{key: row[key] for key in ('path', 'bytes', 'sha256')} for row in rows]
+            for name, value in (('source-file-pins.json', {'schema': 'rovezero.ci-native-source-pins/1',
+                                                         'source_commit': expected_head, 'files': pins, 'source_components': components}),
+                                ('git-source-provenance.json', {'schema': 'rovezero.ci-git-source-provenance/1',
+                                                                'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls}),
+                                ('compiled-source-inventory.json', compiled), ('native-source-pins.json', native),
+                                ('static-model-registry.json', registry), ('rules-descriptor.json', rules)):
+                write_json(artifact / name, value)
+            lock.seek(0)
+            with (artifact / 'Cargo.lock').open('xb') as target:
+                shutil.copyfileobj(lock, target, 65536)
+                target.flush()
+                os.fsync(target.fileno())
+            require(same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat()),
+                    'BundledLockOriginalFDChanged')
+            require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
+            bundle, bundle_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'],
+                                                           'native-validation-binaries.tar.gz')
+            receipt.update(status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
+                           source_files=len(rows), component_count=len(components), source_components=components,
+                           Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
+                            binary_bundle=bundle_pin, metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
         build.budget()
     except BaseException as error:
         receipt['status'] = 'FAILED_NOT_ADMITTED'
@@ -763,14 +840,18 @@ def run(source, root, expected_head, seconds):
                     receipt['status'] = 'FAILED_NOT_ADMITTED'
                     receipt['log_preservation_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
                     break
-        if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED':
+        if receipt['status'] == success_status:
             receipt['regenerable_cleanup'] = {'journal': 'compile-cleanup.json',
                 'acceptance': 'terminal journal is required separately from build success'}
         write_json(artifact / 'build-receipt.json', receipt)
         require(tree_size(artifact) <= ARTIFACT_CAP, 'Artifact512MiBCap')
-        if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED':
+        if receipt['status'] == success_status:
             try:
-                cleanup_compiler_outputs(root, artifact, receipt)
+                if loader_only:
+                    cleanup_compiler_outputs(root, artifact, receipt, success_status=success_status,
+                                             bundle_filename=bundle_filename)
+                else:
+                    cleanup_compiler_outputs(root, artifact, receipt)
             except (OSError, RuntimeError) as error:
                 receipt['status'] = 'FAILED_NOT_ADMITTED'
                 receipt['cleanup_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
@@ -780,7 +861,7 @@ def run(source, root, expected_head, seconds):
             with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
                 output.write('artifact_ready=true\n')
     print(json.dumps({'status': receipt['status'], 'artifact': str(artifact), 'source_commit': expected_head}))
-    return 0 if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED' else 1
+    return 0 if receipt['status'] == success_status else 1
 
 
 if __name__ == '__main__':
@@ -792,5 +873,6 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--expected-head', required=True)
     parser.add_argument('--timeout', type=int, default=2700)
+    parser.add_argument('--profile', choices=('native-validation', 'runtime-loader-only'), default='native-validation')
     args = parser.parse_args()
-    sys.exit(run(args.source_root, args.output_root, args.expected_head, args.timeout))
+    sys.exit(run(args.source_root, args.output_root, args.expected_head, args.timeout, profile=args.profile))

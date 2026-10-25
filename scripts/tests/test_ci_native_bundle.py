@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import io
 import json
@@ -590,6 +591,176 @@ class NativeBundleTests(unittest.TestCase):
         registry['model_semantic_sha256'] = 'not-an-actual-registry-digest'
         with self.assertRaisesRegex(RuntimeError, 'StaticRegistryGetterOutput'):
             bundle.validate_registry(registry)
+
+
+class RuntimeLoaderBundleTests(unittest.TestCase):
+    """Single-target CI production path with a fake supervisor; no Cargo runs."""
+
+    logical = 'crates/rz-eval/examples/runtime_loader_check.rs'
+    spec = ('rz-eval', 'example', 'runtime_loader_check', 'onnx')
+
+    def metadata(self, source, target_root, required=('onnx',)):
+        target = {'name': self.spec[2], 'kind': ['example'], 'crate_types': ['bin'],
+                  'src_path': str(source / self.logical), 'edition': '2024',
+                  'required-features': list(required)}
+        metadata = {'workspace_root': str(source), 'packages': [{
+            'name': 'rz-eval', 'id': 'SYNTHETIC_LOADER_PACKAGE',
+            'manifest_path': str(source / 'crates/rz-eval/Cargo.toml'), 'targets': [target]}]}
+        output = target_root / 'release/examples/runtime_loader_check'
+        messages = [{'reason': 'compiler-artifact', 'package_id': 'SYNTHETIC_LOADER_PACKAGE',
+                     'target': copy.deepcopy(target), 'executable': str(output),
+                     'profile': {'test': False}, 'features': ['onnx']},
+                    {'reason': 'build-finished', 'success': True}]
+        return metadata, messages, output
+
+    def test_loader_cargo_admission_uses_only_its_source_kind_and_features(self):
+        self.assertEqual(bundle.RUNTIME_LOADER_SPEC, self.spec)
+        source, target_root = Path('/synthetic-loader-source'), Path('/synthetic-loader-target')
+        metadata, messages, output = self.metadata(source, target_root)
+
+        def admit(value, registered=None):
+            raw = b'\n'.join(json.dumps(row).encode() for row in value)
+            return bundle.cargo_artifact(raw, metadata, source, target_root, self.spec,
+                                        {self.logical} if registered is None else registered)
+
+        self.assertEqual(admit(messages)[0], output)
+        for label, change in (
+                ('kind', lambda rows: rows[0]['target'].update(kind=['bin'])),
+                ('source', lambda rows: rows[0]['target'].update(src_path=str(source / 'other.rs'))),
+                ('feature', lambda rows: rows[0].update(features=[])),
+                ('default', lambda rows: rows[0]['features'].append('default')),
+                ('release-path', lambda rows: rows[0].update(executable=str(target_root / 'other')))):
+            altered = copy.deepcopy(messages)
+            change(altered)
+            with self.subTest(change=label), self.assertRaises(RuntimeError):
+                admit(altered)
+        with self.assertRaises(RuntimeError):
+            admit(messages, registered=set())
+
+    def run_fixture(self, *, result=(0, True, None), required=('onnx',), profile='runtime-loader-only'):
+        temporary = tempfile.TemporaryDirectory(prefix='ci-runtime-loader-fixture-')
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name).resolve()
+        source, root = base / 'source', base / 'RoveZero' / 'owned'
+        source.mkdir()
+        source_file = source / self.logical
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b'// synthetic source; not compiled\n')
+        (source / 'Cargo.lock').write_bytes(b'synthetic lock\n')
+        (source / 'rust-toolchain.toml').write_text('[toolchain]\nchannel="1.96.0"\n', encoding='utf-8')
+        rows = [{'path': self.logical, **bundle.file_pin(source_file)}]
+        controls = {'synthetic_control': {'bytes': 1, 'sha256': 'a' * 64}}
+        metadata, messages, output = self.metadata(source, root / 'target-native', required)
+        head, dispatched = '19' * 20, []
+
+        def supervise(wrapper, cwd, env, seconds, check):
+            argv = wrapper[wrapper.index('--internal-command') + 1:]
+            dispatched.append(list(argv))
+            if argv[1:3] == ['rev-parse', 'HEAD']:
+                raw = (head + '\n').encode()
+            elif argv[1:2] == ['ls-tree']:
+                raw = b'synthetic roster\n'
+            elif argv[1:2] == ['--version']:
+                raw = (Path(argv[0]).name + ' 1.96.0 synthetic\n').encode()
+            elif argv[1:2] == ['metadata']:
+                raw = json.dumps(metadata).encode()
+            elif argv[1:2] == ['build']:
+                self.assertEqual(argv[argv.index('--example') + 1], self.spec[2])
+                self.assertEqual(argv[argv.index('--features') + 1], 'onnx')
+                if result != (0, True, None):
+                    os.write(2, b'synthetic original loader compiler failure\n')
+                    return result
+                output.parent.mkdir(parents=True)
+                output.write_bytes(b'\x7fELF-synthetic-fixture-never-executed')
+                raw = b'\n'.join(json.dumps(row).encode() for row in messages)
+            else:
+                raise AssertionError('unrelated target/getter dispatched')
+            os.write(1, raw)
+            return 0, True, None
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {'RUNNER_TEMP': str(base), 'GITHUB_OUTPUT': ''}))
+            stack.enter_context(patch.object(bundle.sys, 'platform', 'linux'))
+            stack.enter_context(patch.object(bundle.platform, 'machine', return_value='x86_64'))
+            stack.enter_context(patch.object(bundle.platform, 'libc_ver', return_value=('synthetic', '0')))
+            stack.enter_context(patch.object(bundle.os, 'sched_getaffinity', return_value={0, 1}, create=True))
+            stack.enter_context(patch.object(bundle.os, 'sched_setaffinity', create=True))
+            stack.enter_context(patch.object(bundle.signal, 'signal'))
+            stack.enter_context(patch.object(bundle.shutil, 'which', side_effect=lambda name: '/synthetic/' + name))
+            stack.enter_context(patch.object(bundle, 'source_inventory', return_value=(rows, controls)))
+            stack.enter_context(patch.object(bundle, 'run_group', side_effect=supervise))
+            for name in ('component_inventory', 'warm_spec', 'validate_functional_specs',
+                         'validate_registry', 'validate_rovent_build_metadata'):
+                stack.enter_context(patch.object(bundle, name,
+                    side_effect=AssertionError('unrelated full-bundle admission requested')))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(patch.object(bundle.sys, 'stderr', io.StringIO()))
+            code = bundle.run(source, root, head, 60, **({} if profile is None else {'profile': profile}))
+        receipt = json.loads((root / 'artifact/build-receipt.json').read_bytes())
+        return code, root, receipt, dispatched
+
+    def test_loader_profile_builds_one_target_without_other_binaries_or_getters(self):
+        code, root, receipt, dispatched = self.run_fixture()
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt['schema'], 'rovezero.ci-runtime-loader-diagnostic/1')
+        self.assertEqual(receipt['status'], bundle.RUNTIME_LOADER_SUCCESS)
+        self.assertEqual(receipt['requested_targets'], [list(self.spec)])
+        self.assertEqual(set(receipt['binaries']), {self.spec[2]})
+        self.assertEqual(receipt['binaries'][self.spec[2]]['cargo_metadata_required_features'], ['onnx'])
+        self.assertEqual(len([row for row in dispatched if row[1:2] == ['build']]), 1)
+        for flag in ('diagnostic_binary_executed', 'runtime_loaded', 'model_loaded',
+                     'session_created', 'full_native_bundle_admitted', 'neural_execution',
+                     'gpu_execution', 'training_execution'):
+            self.assertIs(receipt[flag], False)
+        artifact = root / 'artifact'
+        archive = artifact / 'runtime-loader-diagnostic-binaries.tar.gz'
+        self.assertEqual(receipt['binary_bundle'], bundle.file_pin(archive))
+        self.assertFalse((artifact / 'native-validation-binaries.tar.gz').exists())
+        with tarfile.open(archive, 'r:gz') as packed:
+            self.assertEqual(packed.getnames(), ['bin/runtime_loader_check'])
+        for name in ('compiled-source-inventory.json', 'native-source-pins.json',
+                     'static-model-registry.json', 'rules-descriptor.json'):
+            self.assertFalse((artifact / name).exists())
+        self.assertEqual(json.loads((artifact / 'source-file-pins.json').read_bytes())['schema'],
+                         'rovezero.ci-runtime-loader-source-pins/1')
+        self.assertEqual(json.loads((artifact / 'git-source-provenance.json').read_bytes())['schema'],
+                         'rovezero.ci-runtime-loader-source-provenance/1')
+
+    def test_loader_compiler_failure_preserves_logs_without_admitting_an_archive(self):
+        code, root, receipt, _ = self.run_fixture(result=(7, True, None))
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertEqual(receipt['binaries'], {})
+        self.assertEqual(len(receipt['target_failures']), 1)
+        self.assertEqual(receipt['target_failures'][0]['target'], list(self.spec))
+        self.assertEqual(receipt['target_failures'][0]['exit_code'], 7)
+        self.assertEqual(receipt['target_failures'][0]['stdout_pin'],
+                         {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()})
+        artifact = root / 'artifact'
+        self.assertEqual((artifact / 'command-logs/build-runtime_loader_check.stderr').read_bytes(),
+                         b'synthetic original loader compiler failure\n')
+        self.assertNotIn('binary_bundle', receipt)
+        self.assertNotIn('partial_binary_bundle', receipt)
+        self.assertEqual(list(artifact.glob('*binaries.tar.gz')), [])
+
+    def test_loader_required_feature_mismatch_preserves_failure_not_partial_admission(self):
+        code, root, receipt, _ = self.run_fixture(required=())
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertEqual(receipt['binaries'][self.spec[2]]['cargo_metadata_required_features'], [])
+        self.assertNotIn('binary_bundle', receipt)
+        self.assertNotIn('partial_binary_bundle', receipt)
+        self.assertEqual(list((root / 'artifact').glob('*binaries.tar.gz')), [])
+        self.assertIs(receipt['full_native_bundle_admitted'], False)
+
+    def test_omitted_profile_remains_the_existing_native_bundle_path(self):
+        code, _root, receipt, dispatched = self.run_fixture(profile=None)
+        self.assertEqual(code, 1)  # The synthetic source deliberately has no full catalog.
+        self.assertEqual(receipt['schema'], 'rovezero.ci-cpu-validation-bundle/1')
+        self.assertNotIn('diagnostic_profile', receipt)
+        self.assertFalse(any(row[1:2] == ['build'] for row in dispatched))
+        self.assertNotIn(self.spec, bundle.SPECS)
+        bundle.validate_functional_specs(bundle.SPECS)
 
 
 if __name__ == '__main__':
