@@ -24,7 +24,8 @@ import zipfile
 import managed_output_preservation_session as legacy
 import managed_output_quarantine as custody
 import managed_output_quarantine_transition as transitions
-from managed_storage import GiB, StorageError, checked, read_record_snapshot, tree_size, write_record
+from managed_storage import (GiB, StorageError, checked, read_record_snapshot,
+                             reject_credential_names, tree_size, write_record)
 from storage_guard import CatalogGuard, lifetime
 
 SCHEMA = "rovezero.unattributed-output-preservation.v1"
@@ -39,6 +40,17 @@ MAX_CENTRAL_DIRECTORY = 4 << 20
 MAX_SECONDS = 30
 SOURCE_ROLES = (*legacy.SOURCE_ROLES, "unattributed")
 _TOKEN = object()
+
+
+class ObservationExpired(StorageError):
+    """A finite storage observation did not complete; no NN result is implied."""
+    code = "StorageObservationExpired"
+    failure_scope = "storage_observation"
+
+    def __init__(self, deadline, observed):
+        super().__init__("unattributed-preservation: original finite observation expired")
+        self.deadline_monotonic = deadline
+        self.observed_monotonic = observed
 
 
 def need(value, reason):
@@ -153,7 +165,9 @@ class _Held:
         return fd
 
     def tick(self):
-        need(time.monotonic() < self.until, "original finite observation expired")
+        observed = time.monotonic()
+        if not observed < self.until:
+            raise ObservationExpired(self.until, observed)
 
     def _mounts(self):
         self.tick()
@@ -191,6 +205,23 @@ class _Held:
         self.tick()
         path = checked(Path(path))
         parent = self.directory(path.parent)
+        return self._open_file_at(path, maximum, parent, expected=expected, root_owned=root_owned)
+
+    def _open_file_at(self, path, maximum, parent, *, expected=None, root_owned=False):
+        """Open one child of this observation's already held directory.
+
+        Corpus traversal supplies a real scandir basename and this exact FD.
+        Do not rescan every path ancestor for every child: the held directory
+        FD/name checks and final ancestor/roster checks remain authoritative.
+        """
+        self.tick()
+        path = Path(path)
+        reject_credential_names(path)
+        known_parent = self.directories.get(path.parent)
+        need(path.is_absolute() and known_parent is not None
+             and type(parent) is int and known_parent[0] == parent,
+             "child file requires this observation's exact held parent")
+        need(self.directory(path.parent) == parent, "held child parent changed")
         fd = self._own(os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent))
         info = os.fstat(fd)
         stamp = custody._stamp(info)
@@ -332,7 +363,8 @@ class _Tree:
         need(len(names) + len(self.entries) <= MAX_ENTRIES, "bounded corpus entries required")
         for name in sorted(names):
             held.tick()
-            current, rel = checked(path / name), relative / name
+            current, rel = path / name, relative / name
+            reject_credential_names(current)
             info = os.stat(name, dir_fd=fd, follow_symlinks=False)
             need(info.st_dev == device, "cross-device corpus entry")
             if stat.S_ISDIR(info.st_mode):
@@ -341,7 +373,7 @@ class _Tree:
                 self._walk(current, child, rel, device, seen, reserve)
             else:
                 need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "corpus links/special entries forbidden")
-                child, stamp = held.open_file(current, reserve)
+                child, stamp = held._open_file_at(current, reserve, fd)
                 need(stamp == custody._stamp(info), "corpus file open race")
                 need(tuple(stamp[:2]) not in seen, "corpus file alias")
                 seen.add(tuple(stamp[:2]))

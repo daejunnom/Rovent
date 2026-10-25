@@ -580,21 +580,69 @@ class TransitionTests(unittest.TestCase):
         self.assertTrue(final["admission_ready"])
         self.assert_originals_unchanged()
 
-    def test_output_lease_and_held_guard_sampler_share_current_tip_verifier(self):
+    def test_output_lease_and_sampler_reject_changed_transition_inputs_without_mutation(self):
         first = self.move(self.anchor())["receipt"]
         with self.assertRaisesRegex(StorageError, "interrupted output"):
             outputs.OutputLease(self.base / "legacy", self.base / "source", catalog=self.catalog).acquire()
-        with patch.object(successor, "validate_transitions", wraps=successor.validate_transitions) as verify:
-            owner = outputs.OutputLease(self.base / "new-run", self.base / "source", catalog=self.catalog,
-                reserve=4096, quarantine_transition_receipts=[first]).acquire()
-            self.addCleanup(owner._close_quarantine_view)
-            owner.check_budget()
-            with patch.object(v1, "original_custody_gate", side_effect=AssertionError("no gate reacquire")):
-                self.assertGreater(outputs.sample_output_budget(self.catalog, quarantine_guard=owner.guard,
-                    quarantine_transition_receipts=[first]), 4096)
-            self.assertGreaterEqual(verify.call_count, 3)
-            owner.finish(status="mock-finite", tree_gone=True)
+        owner = outputs.OutputLease(self.base / "new-run", self.base / "source", catalog=self.catalog,
+            reserve=4096, quarantine_transition_receipts=[first]).acquire()
+        self.addCleanup(owner._close_quarantine_view)
+        owner_path = self.catalog / (owner.key + ".json")
+        owner_record, owner_raw = copy.deepcopy(owner.record), self.files[owner_path]
+        owner.check_budget()
+        with patch.object(v1, "original_custody_gate", side_effect=AssertionError("no gate reacquire")):
+            self.assertGreater(outputs.sample_output_budget(self.catalog, quarantine_guard=owner.guard,
+                quarantine_transition_receipts=[first]), 4096)
+        self.assertEqual(owner.record, owner_record)
+        self.assertEqual(self.files[owner_path], owner_raw)
+        owner.finish(status="mock-finite", tree_gone=True)
         self.assert_originals_unchanged()
+
+        # Each boundary gets its own closed in-memory fixture: a rejected held
+        # view remains failed, and must not be revived just for the next case.
+        for boundary in ("acquire", "check_budget", "sample_output_budget"):
+            for changed in ("receipt_bytes", "target_identity", "publisher_source"):
+                with self.subTest(boundary=boundary, changed=changed):
+                    case = type(self)("runTest")
+                    try:
+                        case.setUp()
+                        tip = case.move(case.anchor())["receipt"]
+                        candidate = outputs.OutputLease(case.base / "candidate", case.base / "source",
+                            catalog=case.catalog, reserve=4096, quarantine_transition_receipts=[tip])
+                        if boundary != "acquire":
+                            candidate.acquire()
+                            case.addCleanup(candidate._close_quarantine_view)
+                        if changed == "receipt_bytes":
+                            case.files[Path(tip["path"])] += b" "
+                        elif changed == "target_identity":
+                            case.infos[case.target].st_ino += 1
+                        else:
+                            case.change_source()
+                        files_before = dict(case.files)
+                        metadata_before = {path: vars(info).copy() for path, info in case.infos.items()}
+                        actions_before = list(case.actions)
+                        record_before = copy.deepcopy(candidate.record)
+                        dependent_execution = []
+                        with self.assertRaises(StorageError):
+                            if boundary == "acquire":
+                                candidate.acquire()
+                            elif boundary == "check_budget":
+                                candidate.check_budget()
+                            else:
+                                outputs.sample_output_budget(case.catalog, quarantine_guard=candidate.guard,
+                                    quarantine_transition_receipts=[tip])
+                            dependent_execution.append("consume_unverified_transition")
+                        self.assertEqual(dependent_execution, [])
+                        self.assertEqual(candidate.record, record_before)
+                        self.assertEqual(case.files, files_before)
+                        self.assertEqual({path: vars(info) for path, info in case.infos.items()}, metadata_before)
+                        self.assertEqual(case.actions, actions_before)
+                        if boundary == "acquire":
+                            self.assertNotIn(candidate.output, case.infos)
+                            self.assertNotIn(candidate.catalog / (candidate.key + ".json"), case.files)
+                        case.assert_originals_unchanged()
+                    finally:
+                        case.doCleanups()
 
     def test_selector_mutex_outer_and_registry_overlap_refuse_before_mutation(self):
         with patch.object(outputs, "checked", side_effect=AssertionError("no path IO")) as read:

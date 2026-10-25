@@ -309,6 +309,36 @@ class UnattributedInventoryTests(unittest.TestCase):
         finally:
             held.close(sys.exc_info()[1])
 
+    def test_corpus_child_requires_its_actual_held_parent_fd(self):
+        held = policy._Held(30, time.monotonic() + 30)
+        try:
+            parent = held.directory(self.targets[0])
+            other = held.directory(self.targets[1])
+            path = self.targets[0] / "result.txt"
+            with self.assertRaisesRegex(StorageError, "exact held parent"):
+                held._open_file_at(path, 1 << 20, other)
+            fd, _ = held._open_file_at(path, 1 << 20, parent)
+            self.assertEqual(os.read(fd, 1024), path.read_bytes())
+            held.check()
+        finally:
+            held.close(sys.exc_info()[1])
+
+    def test_corpus_child_rejects_parent_replacement_before_open(self):
+        parent = self.root / "held-corpus-parent"
+        parent.mkdir(mode=0o700)
+        path = parent / "input.txt"
+        path.write_bytes(b"same bytes do not prove the same parent")
+        held = policy._Held(30, time.monotonic() + 30)
+        try:
+            parent_fd = held.directory(parent)
+            parent.rename(self.root / "preserved-corpus-parent")
+            parent.mkdir(mode=0o700)
+            path.write_bytes(b"same bytes do not prove the same parent")
+            with self.assertRaisesRegex(StorageError, "held directory"):
+                held._open_file_at(path, 1 << 20, parent_fd)
+        finally:
+            held.close(sys.exc_info()[1])
+
     def test_held_ancestor_replacement_is_rejected_with_identical_payload(self):
         parent = self.root / "held-ancestor"
         parent.mkdir(mode=0o700)
@@ -346,8 +376,12 @@ class UnattributedInventoryTests(unittest.TestCase):
         held = policy._Held(30, selection.original_hard_until)
         try:
             with patch.object(policy.time, "monotonic", return_value=held.until):
-                with self.assertRaisesRegex(StorageError, "expired"):
+                with self.assertRaises(policy.ObservationExpired) as caught:
                     held.tick()
+                self.assertIsInstance(caught.exception, StorageError)
+                self.assertEqual(caught.exception.failure_scope, "storage_observation")
+                self.assertEqual(caught.exception.deadline_monotonic, held.until)
+                self.assertEqual(caught.exception.observed_monotonic, held.until)
         finally:
             held.close()
 
