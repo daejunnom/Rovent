@@ -45,6 +45,21 @@ pub(super) struct ProcessDeviceAdmission {
     released: bool,
 }
 impl ProcessDeviceAdmission {
+    pub(super) fn acquire_for_dispatch(
+        device: &str,
+        cancel: &AtomicBool,
+        execution_deadline: Instant,
+        whole_deadline: Instant,
+    ) -> Result<Option<Self>, ArenaError> {
+        check(
+            !cancel.load(Ordering::Acquire)
+                && Instant::now() < execution_deadline
+                && Instant::now() < whole_deadline,
+            "original device dispatch cancelled or expired before reservation",
+        )?;
+        Self::acquire(device)
+    }
+
     pub(super) fn acquire(device: &str) -> Result<Option<Self>, ArenaError> {
         if device == "cpu" {
             return Ok(None);
@@ -1455,11 +1470,6 @@ pub(super) fn run(
             !registration.require_total_quota || total_scope.verified,
             "strict total-resource profile lacks verified original parent-and-child enclosing cgroup caps",
         )?;
-        owner.device_admission = ProcessDeviceAdmission::acquire(
-            spec["device"]
-                .as_str()
-                .ok_or_else(|| invalid("explicit training device"))?,
-        )?;
         validate_predecessor(&registration, &spec, &recipe, previous.as_deref())?;
         if registration.action == "export" {
             let original = previous
@@ -1712,6 +1722,30 @@ pub(super) fn run(
             .max_output_bytes
             .checked_sub(control_limit)
             .ok_or_else(|| invalid("combined output reserve"))?;
+        // The RPC broker only checks metadata and cannot execute GPU work.
+        // Reserve after all external preflight, immediately before the first
+        // GPU-capable supervisor invocation. Once that call is attempted, an
+        // Err may follow a partial spawn: process=None is not release proof.
+        {
+            let mut slot = owner
+                .lock()
+                .map_err(|_| invalid("owner poisoned before device dispatch"))?;
+            let held = slot
+                .as_mut()
+                .ok_or_else(|| invalid("owner missing before device dispatch"))?;
+            check(
+                held.device_admission.is_none(),
+                "original device reservation already present before dispatch",
+            )?;
+            held.device_admission = ProcessDeviceAdmission::acquire_for_dispatch(
+                registration.resources_policy["device"]
+                    .as_str()
+                    .ok_or_else(|| invalid("explicit training device"))?,
+                &cancel,
+                launch.execution_deadline,
+                launch.whole_deadline,
+            )?;
+        }
         process = Some(supervise_numerical_input_in_original_window(
             &launch.interpreter,
             &args,
@@ -2195,5 +2229,80 @@ fn validate_predecessor(
             }
         }
         _ => Err(invalid("unsupported original checkpoint mode")),
+    }
+}
+
+#[cfg(test)]
+mod process_device_admission_tests {
+    use super::*;
+
+    static TEST_SLOTS: Mutex<()> = Mutex::new(());
+
+    // These are private logical slots, never CUDA devices or runtime probes.
+    #[test]
+    fn cancelled_or_expired_dispatch_does_not_reserve_a_device() {
+        let _serial = TEST_SLOTS.lock().unwrap();
+        let cases = [
+            ("test:rovent-training-cancelled", true, false, false),
+            ("test:rovent-training-execution-expired", false, true, false),
+            ("test:rovent-training-whole-expired", false, false, true),
+        ];
+        for (device, cancelled, execution_expired, whole_expired) in cases {
+            let now = Instant::now();
+            let future = now + Duration::from_secs(60);
+            assert!(
+                ProcessDeviceAdmission::acquire_for_dispatch(
+                    device,
+                    &AtomicBool::new(cancelled),
+                    if execution_expired { now } else { future },
+                    if whole_expired { now } else { future },
+                )
+                .is_err()
+            );
+            let mut available = ProcessDeviceAdmission::acquire(device)
+                .unwrap()
+                .expect("never-dispatched slot must remain available");
+            available.release_confirmed().unwrap();
+        }
+    }
+
+    #[test]
+    fn attempted_dispatch_keeps_unknown_reservation_after_owner_drop() {
+        let _serial = TEST_SLOTS.lock().unwrap();
+        let device = "test:rovent-training-attempted-unknown";
+        {
+            let until = Instant::now() + Duration::from_secs(60);
+            let _reservation = ProcessDeviceAdmission::acquire_for_dispatch(
+                device,
+                &AtomicBool::new(false),
+                until,
+                until,
+            )
+            .unwrap()
+            .expect("logical dispatch reservation");
+            assert!(ProcessDeviceAdmission::acquire(device).is_err());
+        }
+        assert!(ProcessDeviceAdmission::acquire(device).is_err());
+    }
+
+    #[test]
+    fn only_confirmed_release_reopens_a_dispatched_slot() {
+        let _serial = TEST_SLOTS.lock().unwrap();
+        let device = "test:rovent-training-confirmed-release";
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut reservation = ProcessDeviceAdmission::acquire_for_dispatch(
+            device,
+            &AtomicBool::new(false),
+            until,
+            until,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ProcessDeviceAdmission::acquire(device).is_err());
+        reservation.release_confirmed().unwrap();
+        assert!(reservation.release_confirmed().is_err());
+        let mut next = ProcessDeviceAdmission::acquire(device).unwrap().unwrap();
+        next.release_confirmed().unwrap();
+        assert!(ProcessDeviceAdmission::acquire("cpu").unwrap().is_none());
     }
 }

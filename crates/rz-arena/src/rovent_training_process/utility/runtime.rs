@@ -1684,7 +1684,7 @@ pub fn run_rovent_utility_from_cli(
             dependency_directories: Vec::new(),
             control_written: 0,
             control_limit,
-            device_admission: linux::ProcessDeviceAdmission::acquire(&window.device)?,
+            device_admission: None,
         };
         *custody
             .held
@@ -1876,6 +1876,37 @@ pub fn run_rovent_utility_from_cli(
             MAX_TENSOR,
             registration.max_artifact_files,
         )?;
+        let original_input = OriginalProcessInput {
+            bytes: &startup_raw,
+            window: OriginalProcessWindow::new(
+                request.original_started(),
+                request.execution_deadline(),
+                request.whole_deadline(),
+            )?,
+        };
+        // The broker only authenticates metadata/RPC and checkpoint publication.
+        // Keep preparation failures outside device admission. After this first
+        // GPU-capable supervisor call is attempted, process=None cannot prove
+        // that no child was issued, so the original custody retains the slot.
+        {
+            let mut slot = custody
+                .held
+                .lock()
+                .map_err(|_| invalid("custody poisoned before device dispatch"))?;
+            let held = slot
+                .as_mut()
+                .ok_or_else(|| invalid("custody absent before device dispatch"))?;
+            require(
+                held.device_admission.is_none(),
+                "utility device reservation already present before dispatch",
+            )?;
+            held.device_admission = linux::ProcessDeviceAdmission::acquire_for_dispatch(
+                &window.device,
+                &cancel,
+                request.execution_deadline(),
+                request.whole_deadline(),
+            )?;
+        }
         custody.process = Some(
             supervise_rovent_training_numerical_input_in_original_window(
                 &interpreter_fd,
@@ -1889,14 +1920,7 @@ pub fn run_rovent_utility_from_cli(
                 },
                 Some(&cancel),
                 &artifact_watch,
-                OriginalProcessInput {
-                    bytes: &startup_raw,
-                    window: OriginalProcessWindow::new(
-                        request.original_started(),
-                        request.execution_deadline(),
-                        request.whole_deadline(),
-                    )?,
-                },
+                original_input,
                 &mut verify_image,
                 OriginalNumericalEnvironment::Fp32Tf32Off,
             )?,

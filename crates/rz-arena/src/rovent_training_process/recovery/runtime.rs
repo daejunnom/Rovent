@@ -1748,7 +1748,6 @@ pub fn run_rovent_training_recovered(
             checkpoint.as_deref(),
             reclamation.as_ref(),
         )?;
-        owner.device_admission = linux::ProcessDeviceAdmission::acquire(&spec.device)?;
         let mut export_request = None;
         if let Some(pin) = &reg.export_request {
             let request = load(pin, owner, &launch.read_budget)?;
@@ -1999,6 +1998,27 @@ pub fn run_rovent_training_recovered(
             MAX_CHECKPOINT,
             reg.max_artifact_files,
         )?;
+        // The broker owns metadata/RPC and checkpoint publication, not GPU work.
+        // Reserve only after preflight and keep the same owner through any
+        // supervisor error: process=None is not proof that no child was issued.
+        {
+            let mut slot = shared_held
+                .lock()
+                .map_err(|_| invalid("custody poisoned before device dispatch"))?;
+            let owner = slot
+                .as_mut()
+                .ok_or_else(|| invalid("custody missing before device dispatch"))?;
+            check(
+                owner.device_admission.is_none(),
+                "current device reservation already present before dispatch",
+            )?;
+            owner.device_admission = linux::ProcessDeviceAdmission::acquire_for_dispatch(
+                &spec.device,
+                &cancel,
+                launch.execution_deadline,
+                launch.whole_deadline,
+            )?;
+        }
         process = Some(
             supervise_rovent_training_numerical_input_in_original_window(
                 &launch.interpreter,
