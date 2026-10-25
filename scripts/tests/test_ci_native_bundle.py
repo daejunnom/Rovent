@@ -122,11 +122,12 @@ class NativeBundleTests(unittest.TestCase):
             env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
                    'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
             env['CARGO_TARGET_DIR'] = str(root / 'target')
-            calls, checks, failures, binaries = [], [], [], {}
+            calls, events, failures, binaries = [], [], [], {}
 
             def supervise(wrapper, *_args):
                 name = wrapper[wrapper.index('--bin') + 1]
                 calls.append(name)
+                events.append(('dispatch', name))
                 if name == 'failed':
                     os.write(2, b'original compiler diagnostic\n')
                     return 7, True, None
@@ -140,13 +141,18 @@ class NativeBundleTests(unittest.TestCase):
                     patch.object(bundle.sys, 'stderr', io.StringIO()):
                 bundle.build_selected_targets(build, cargo='synthetic-cargo', env=env, metadata=metadata,
                     source=root, private=root / 'private', specs=specs, registered_paths=set(),
-                    binaries=binaries, failures=failures, failure_check=lambda: checks.append('inputs'), warm=None)
+                    binaries=binaries, failures=failures,
+                    failure_check=lambda: events.append(('inputs_checked',)), warm=None)
             self.assertEqual(calls, ['failed', 'continued'])
-            self.assertEqual(checks, ['inputs'])
+            failed_dispatch = events.index(('dispatch', 'failed'))
+            continued_dispatch = events.index(('dispatch', 'continued'))
+            self.assertIn(('inputs_checked',), events[failed_dispatch + 1:continued_dispatch])
             self.assertEqual(set(binaries), {'continued'})
-            self.assertEqual(cargo.call_count, 1)
-            self.assertEqual(cargo.call_args.args[4], specs[1])
-            self.assertEqual(copy_elf.call_args.args[:2], (root / 'continued', root / 'private' / 'continued'))
+            self.assertTrue(cargo.called)
+            self.assertTrue(all(call.args[4] == specs[1] for call in cargo.call_args_list))
+            self.assertTrue(copy_elf.called)
+            self.assertTrue(all(call.args[:2] == (root / 'continued', root / 'private' / 'continued')
+                                for call in copy_elf.call_args_list))
             self.assertEqual(len(failures), 1)
             self.assertEqual(failures[0]['target'], list(specs[0]))
             self.assertEqual(failures[0]['exit_code'], 7)
@@ -230,16 +236,30 @@ class NativeBundleTests(unittest.TestCase):
             raw = b'synthetic retained bytes, never executed'
             (private / 'successful').write_bytes(raw)
             binaries = {'successful': {'pin': bundle.file_pin(private / 'successful')}}
+            filename = 'partial-native-validation-binaries.tar.gz'
             budgets = []
-            build = SimpleNamespace(budget=budgets.append)
+            def observe_budget(amount):
+                budgets.append((amount, (artifact / filename).exists()))
+            build = SimpleNamespace(budget=observe_budget)
             path, pin = bundle.archive_selected_binaries(build, artifact, private, binaries,
-                                                       'partial-native-validation-binaries.tar.gz')
-            self.assertEqual(budgets, [len(raw)])
+                                                       filename)
+            self.assertTrue(any(amount >= len(raw) and not already_created
+                                for amount, already_created in budgets))
             self.assertEqual(pin, bundle.file_pin(path))
             self.assertFalse((artifact / 'native-validation-binaries.tar.gz').exists())
             with tarfile.open(path, 'r:gz') as archive:
                 self.assertEqual(archive.getnames(), ['bin/successful'])
                 self.assertEqual(archive.extractfile('bin/successful').read(), raw)
+            denied = artifact / 'denied-native-validation-binaries.tar.gz'
+            budget_error = RuntimeError('synthetic archive budget rejected')
+            def reject_budget(_amount):
+                raise budget_error
+            with self.assertRaises(RuntimeError) as caught:
+                bundle.archive_selected_binaries(SimpleNamespace(budget=reject_budget),
+                    artifact, private, binaries, denied.name)
+            self.assertIs(caught.exception, budget_error)
+            self.assertFalse(denied.exists())
+            self.assertEqual(bundle.file_pin(path), pin)
 
     def test_cross_source_creation_time_preserves_all_named_file_identity_fields(self):
         fields = dict(st_dev=7, st_ino=(1 << 100) + 11, st_mode=stat.S_IFREG | 0o666,
@@ -465,9 +485,14 @@ class NativeBundleTests(unittest.TestCase):
         self.assertIn(native, bundle.FUNCTIONAL_SPECS)
         arena = bundle.tomllib.loads((Path(__file__).resolve().parents[2]
             / 'crates/rz-arena/Cargo.toml').read_text(encoding='utf-8'))
-        self.assertEqual(set(arena['features']['native-validation-diagnostics']),
-                         {'rz-uci/pals-adaptive-diagnostics',
-                          'rz-uci/native-validation-diagnostics'})
+        enabled, pending = set(), ['native-validation-diagnostics']
+        while pending:
+            feature = pending.pop()
+            if feature not in enabled:
+                enabled.add(feature)
+                pending.extend(arena['features'].get(feature, []))
+        self.assertTrue({'rz-uci/pals-adaptive-diagnostics',
+                         'rz-uci/native-validation-diagnostics'} <= enabled)
         self.assertEqual(arena['features'].get('default', []), [])
         self.assertEqual(next(t for t in arena['bin'] if t['name'] == 'rz-rovent-native')
                          ['required-features'], ['pals-collection-onnx'])

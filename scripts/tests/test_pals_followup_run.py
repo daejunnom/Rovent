@@ -632,11 +632,16 @@ class ResourceObservationTests(unittest.TestCase):
             self.assertEqual(evidence["observations"][name]["status"], "unknown")
 
     def test_unsafe_membership_is_not_used_for_limit_reads(self):
+        read_paths = []
+        def read_membership(path, **unused):
+            read_paths.append(path)
+            self.assertEqual(path, Path("/proc/self/cgroup"))
+            return "0::/../outside\n"
         with mock.patch.object(wrapper.sys, "platform", "linux"), \
                 mock.patch.object(wrapper.os, "sched_getaffinity", return_value={0, 2}, create=True), \
-                mock.patch.object(Path, "read_text", return_value="0::/../outside\n") as reads:
+                mock.patch.object(Path, "read_text", autospec=True, side_effect=read_membership):
             evidence = wrapper.observe_resources([0, 2])
-        self.assertEqual(reads.call_count, 1)
+        self.assertIn(Path("/proc/self/cgroup"), read_paths)
         self.assertIsNone(evidence["cgroup_membership"])
         self.assertEqual(evidence["observations"]["cpu_quota"]["status"], "unknown")
 

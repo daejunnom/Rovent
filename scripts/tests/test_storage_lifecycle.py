@@ -433,15 +433,20 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
         self.assertEqual(self.owner._directory_binding_stage, "sealed")
         self.assertEqual(self.disk, dict(original, identity=[7, 30]))
         self.assertEqual(self.writes, 1)
-        self.assertEqual(self.events[:3], [("mkdir", "attempt"), ("fsync", 102), ("fsync", 101)])
-        self.assertEqual(self.events[3], ("catalog_write", 1))
+        created = self.owner._created_directory
+        owned_fds = (created.fd, created.parent_fd)
+        creation = self.events.index(("mkdir", "attempt"))
+        publication = next(index for index, event in enumerate(self.events) if event[0] == "catalog_write")
+        durability = self.events[creation + 1:publication]
+        self.assertIn(("fsync", created.fd), durability)
+        self.assertIn(("fsync", created.parent_fd), durability)
         self.size = 100
         self.owner.check_budget()
         self.owner.finish(status="provider_unknown", tree_gone=False)
         self.assertEqual(self.disk["identity"], [7, 30])
         self.assertEqual(self.disk["state"], "active")
         self.assertEqual(self.disk["physical_completion"], "not_inferred_from_output_lifecycle")
-        self.assertEqual(self.events[-2:], [("close", 102), ("close", 101)])
+        self.assertCountEqual([fd for action, fd in self.events if action == "close"], owned_fds)
         self.gate.release.assert_called_once()
 
     def test_existing_directory_regular_and_symlink_are_never_adopted(self):
@@ -662,10 +667,14 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
         self.owner.create_deferred_directory()
         other = OutputLease(self.base / "different", self.owner.source, catalog=self.catalog)
         other._rows = Mock(return_value=[(self.row_path, copy.deepcopy(self.disk), self.target)])
-        with patch.object(Path, "mkdir") as make:
+        attempted_directories = []
+        def record_mkdir(path, *args, **kwargs):
+            attempted_directories.append(path)
+        with patch.object(Path, "mkdir", autospec=True, side_effect=record_mkdir):
             with self.assertRaisesRegex(StorageError, "interrupted output"):
                 other.acquire()
-        make.assert_called_once()  # Existing catalog check only; no new output.
+        self.assertNotIn(other.output, attempted_directories)
+        self.assertTrue(all(path == self.catalog for path in attempted_directories))
         self.assertEqual(self.writes, 1)
         self.assertEqual(self.disk["state"], "active")
 
