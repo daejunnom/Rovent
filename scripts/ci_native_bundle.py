@@ -605,6 +605,33 @@ def archive_selected_binaries(build, artifact, private, binaries, filename):
     return bundle, file_pin(bundle, ARTIFACT_CAP)
 
 
+def preserve_partial_binary_bundle(build, artifact, private, receipt, filename):
+    """Keep verified targets once; callers must first recheck shared inputs."""
+    if not receipt['binaries']:
+        return
+    build.budget()
+    if 'partial_binary_bundle' in receipt:
+        require(receipt['partial_binary_bundle_file'] == filename
+                and file_pin(artifact / filename, ARTIFACT_CAP) == receipt['partial_binary_bundle'],
+                'PreservedPartialBundleChanged')
+        build.budget()
+        return
+    _, partial_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'], filename)
+    build.budget()
+    receipt.update(partial_binary_bundle=partial_pin, partial_binary_bundle_file=filename,
+                   partial_bundle_scope='successful_targets_only_failed_full_bundle_not_admitted')
+
+
+def require_native_bundle_verdicts(build, artifact, private, receipt):
+    """Apply aggregate verdicts only after the final shared source/lock proofs."""
+    metadata_verified = all(row['status'] == 'verified' for row in receipt['metadata_getters'].values())
+    if not metadata_verified:
+        preserve_partial_binary_bundle(build, artifact, private, receipt,
+                                       'partial-native-validation-binaries.tar.gz')
+    require(not receipt['target_failures'], 'RequiredCargoTargetsFailed')
+    require(metadata_verified, 'RequiredStaticMetadataFailed')
+
+
 def write_json(path, value):
     raw = (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + '\n').encode()
     require(len(raw) <= 4 << 20, 'SmallMetadata4MiBCap')
@@ -813,12 +840,8 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
             head_label = 'git-head-final' if loader_only else 'git-head-before-static-getters'
             require(build.command(head_label, [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                     'HeadChangedDuringBuild')
-            if receipt['binaries']:
-                partial_filename = 'partial-runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'partial-native-validation-binaries.tar.gz'
-                _, partial_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'], partial_filename)
-                receipt['partial_binary_bundle'] = partial_pin
-                receipt['partial_binary_bundle_file'] = partial_filename
-                receipt['partial_bundle_scope'] = 'successful_targets_only_failed_full_bundle_not_admitted'
+            partial_filename = 'partial-runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'partial-native-validation-binaries.tar.gz'
+            preserve_partial_binary_bundle(build, artifact, private, receipt, partial_filename)
             if loader_only:
                 raise RuntimeError('RequiredRuntimeLoaderTargetFailed')
         else:
@@ -884,10 +907,6 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
                                                                 'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls})):
                 write_json(artifact / name, value)
                 receipt.setdefault('metadata', {})[name] = file_pin(artifact / name)
-            # These actual source proofs also describe independently built
-            # private ELFs in a failed full bundle; they grant no admission.
-            require(not receipt['target_failures'], 'RequiredCargoTargetsFailed')
-            require(all(row['status'] == 'verified' for row in getters.values()), 'RequiredStaticMetadataFailed')
             lock.seek(0)
             with (artifact / 'Cargo.lock').open('xb') as target:
                 shutil.copyfileobj(lock, target, 65536)
@@ -896,6 +915,10 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
             require(same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat()),
                     'BundledLockOriginalFDChanged')
             require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
+            # Source/lock and the final original command are verified before a
+            # getter-local failure can preserve private ELFs. Shared custody,
+            # storage, timeout or unresolved-tree errors never enter this path.
+            require_native_bundle_verdicts(build, artifact, private, receipt)
             bundle, bundle_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'],
                                                            'native-validation-binaries.tar.gz')
             receipt.update(status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',

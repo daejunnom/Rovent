@@ -238,11 +238,14 @@ class NativeBundleTests(unittest.TestCase):
             binaries = {'successful': {'pin': bundle.file_pin(private / 'successful')}}
             filename = 'partial-native-validation-binaries.tar.gz'
             budgets = []
-            def observe_budget(amount):
+            def observe_budget(amount=0):
                 budgets.append((amount, (artifact / filename).exists()))
             build = SimpleNamespace(budget=observe_budget)
-            path, pin = bundle.archive_selected_binaries(build, artifact, private, binaries,
-                                                       filename)
+            receipt = {'status': 'FAILED_NOT_ADMITTED', 'binaries': binaries,
+                       'target_failures': ['synthetic closed compiler failure'],
+                       'metadata_getters': {'getter': {'status': 'blocked_missing_target'}}}
+            bundle.preserve_partial_binary_bundle(build, artifact, private, receipt, filename)
+            path, pin = artifact / filename, receipt['partial_binary_bundle']
             self.assertTrue(any(amount >= len(raw) and not already_created
                                 for amount, already_created in budgets))
             self.assertEqual(pin, bundle.file_pin(path))
@@ -250,6 +253,13 @@ class NativeBundleTests(unittest.TestCase):
             with tarfile.open(path, 'r:gz') as archive:
                 self.assertEqual(archive.getnames(), ['bin/successful'])
                 self.assertEqual(archive.extractfile('bin/successful').read(), raw)
+            with patch.object(bundle, 'archive_selected_binaries',
+                              side_effect=AssertionError('existing partial must not be recreated')), \
+                    self.assertRaisesRegex(RuntimeError, 'RequiredCargoTargetsFailed'):
+                bundle.require_native_bundle_verdicts(build, artifact, private, receipt)
+            self.assertEqual(receipt['partial_binary_bundle'], pin)
+            self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+            self.assertNotIn('binary_bundle', receipt)
             denied = artifact / 'denied-native-validation-binaries.tar.gz'
             budget_error = RuntimeError('synthetic archive budget rejected')
             def reject_budget(_amount):
@@ -260,6 +270,10 @@ class NativeBundleTests(unittest.TestCase):
             self.assertIs(caught.exception, budget_error)
             self.assertFalse(denied.exists())
             self.assertEqual(bundle.file_pin(path), pin)
+            path.write_bytes(b'changed retained archive')
+            with self.assertRaisesRegex(RuntimeError, 'PreservedPartialBundleChanged'):
+                bundle.preserve_partial_binary_bundle(build, artifact, private, receipt, filename)
+            self.assertEqual(receipt['partial_binary_bundle'], pin)
 
     def test_cross_source_creation_time_preserves_all_named_file_identity_fields(self):
         fields = dict(st_dev=7, st_ino=(1 << 100) + 11, st_mode=stat.S_IFREG | 0o666,
@@ -630,6 +644,19 @@ class NativeBundleTests(unittest.TestCase):
                 self.assertEqual((root / 'logs/native-source-pins.stdout').read_bytes(), raw)
                 self.assertEqual((root / 'logs/native-source-pins.stderr').read_bytes(),
                                  b'original getter diagnostic\n')
+                receipt = {'status': 'FAILED_NOT_ADMITTED', 'binaries': binaries,
+                           'target_failures': [], 'metadata_getters': results}
+                with self.assertRaisesRegex(RuntimeError, 'RequiredStaticMetadataFailed'):
+                    bundle.require_native_bundle_verdicts(build, artifact, private, receipt)
+                partial = artifact / 'partial-native-validation-binaries.tar.gz'
+                self.assertEqual(receipt['partial_binary_bundle'], bundle.file_pin(partial))
+                self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+                self.assertEqual(results['native-source-pins']['status'], status)
+                self.assertNotIn('binary_bundle', receipt)
+                self.assertFalse((artifact / 'native-validation-binaries.tar.gz').exists())
+                with tarfile.open(partial, 'r:gz') as archive:
+                    self.assertEqual(archive.getnames(), ['bin/synthetic-getter'])
+                    self.assertEqual(archive.extractfile('bin/synthetic-getter').read(), target.read_bytes())
 
     def test_metadata_getter_propagates_shared_input_failure_before_next_dispatch(self):
         for code in (0, 7):
