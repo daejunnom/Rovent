@@ -27,6 +27,9 @@ pub mod registration;
 pub mod retirement;
 #[path = "nnuec_v2_review.rs"]
 pub mod review;
+#[cfg(feature = "nnuec-scalar-diagnostics")]
+#[path = "nnuec_v2_scalar_diagnostic.rs"]
+pub mod scalar_diagnostic;
 #[path = "nnuec_v2_utility.rs"]
 pub mod utility;
 #[path = "nnuec_v2_utility_capture.rs"]

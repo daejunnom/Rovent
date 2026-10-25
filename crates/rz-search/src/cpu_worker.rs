@@ -1158,8 +1158,16 @@ pub struct CpuWorkerSliceTiming {
     analyze_returned_at: Instant,
     report_ready_at: Instant,
     resume_admission_and_restore: Option<Duration>,
+    #[cfg(feature = "nnuec-scalar-diagnostics")]
+    nnuec_scalar: Option<crate::cpu_value::nnuec::v2::scalar_diagnostic::SliceObservation>,
 }
 impl CpuWorkerSliceTiming {
+    #[cfg(feature = "nnuec-scalar-diagnostics")]
+    pub fn nnuec_scalar(
+        &self,
+    ) -> Option<crate::cpu_value::nnuec::v2::scalar_diagnostic::SliceObservation> {
+        self.nnuec_scalar
+    }
     pub fn run_started_at(&self) -> Instant {
         self.run_started_at
     }
@@ -1576,6 +1584,11 @@ impl CpuWorker {
                 };
                 let admitted_at = command.command.admitted_at;
                 let mut rejected_controls = None;
+                #[cfg(feature = "nnuec-scalar-diagnostics")]
+                let diagnostic_resume_command = matches!(
+                    &command.command.original,
+                    CpuCommand::Resume(_) | CpuCommand::ResumeWithReply(_, _)
+                );
                 let (grant, accepted_command, reciprocal_reply) = match command.command.original {
                     CpuCommand::Begin(job, grant) => {
                         let fresh_eligible = !worker_shutdown.load(Ordering::Acquire)
@@ -1738,6 +1751,11 @@ impl CpuWorker {
                     let mut first_publication = true;
                     let mut resume_admission_and_restore = None;
                     let mut invoked = false;
+                    #[cfg(feature = "nnuec-scalar-diagnostics")]
+                    let diagnostic_before = (task.token.is_some(), engine.paused_stack_snapshot());
+                    #[cfg(feature = "nnuec-scalar-diagnostics")]
+                    let diagnostic =
+                        crate::cpu_value::nnuec::v2::scalar_diagnostic::Invocation::begin();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         CpuSliceControl::new(grant.node_credit, lease, task.job.mailbox.clone())
                             .and_then(|control| match &task.nnuec_capture {
@@ -1825,6 +1843,16 @@ impl CpuWorker {
                         analyze_returned_at,
                         report_ready_at: analyze_returned_at,
                         resume_admission_and_restore,
+                        #[cfg(feature = "nnuec-scalar-diagnostics")]
+                        nnuec_scalar: Some(
+                            crate::cpu_value::nnuec::v2::scalar_diagnostic::SliceObservation {
+                                scalar: diagnostic.finish(),
+                                resume_command: diagnostic_resume_command,
+                                prior_token_present: diagnostic_before.0,
+                                before: diagnostic_before.1,
+                                after: engine.paused_stack_snapshot(),
+                            },
+                        ),
                     });
                     let panicked = result.is_err();
                     let mut result = result.unwrap_or_else(|_| {
@@ -2577,6 +2605,8 @@ mod owner_clock_tests {
             analyze_returned_at: started + Duration::from_millis(100),
             report_ready_at: started + Duration::from_millis(102),
             resume_admission_and_restore: None,
+            #[cfg(feature = "nnuec-scalar-diagnostics")]
+            nnuec_scalar: None,
         };
         assert_eq!(timing.return_processing(), Duration::from_millis(2));
         assert_eq!(timing.resume_admission_and_restore(), None);

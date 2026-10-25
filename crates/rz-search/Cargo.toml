@@ -8,6 +8,8 @@ description = "RoveZero deterministic PUCT accounting and time control"
 
 [features]
 experimental-batch = []
+# Explicit raw NNUEC scalar observation only; no evaluator/search behavior.
+nnuec-scalar-diagnostics = []
 default = []
 experimental-puct = []
 experimental-search-buffers = []

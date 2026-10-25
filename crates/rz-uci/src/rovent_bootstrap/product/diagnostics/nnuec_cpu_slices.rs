@@ -102,6 +102,21 @@ impl RoventLifecycleDiagnostics {
                 for record in records {
                     row.settled_slice = Some(record);
                     write_slice_row(&mut io::stderr().lock(), &row, &mut state)?;
+                    #[cfg(feature = "native-validation-diagnostics")]
+                    if let Some(actual) = record.nnuec_scalar() {
+                        // Separate raw domain; the /1 slice and ACK rows are unchanged.
+                        // The same existing stream cap and reserved final seat apply.
+                        let scalar = serde_json::json!({
+                            "domain":"rz-rovent-nnuec-native-scalar-slice-observation/1",
+                            "event":"original_settled_slice_numeric_observation",
+                            "input_lock_sha256":hex(self.lock),"implementation_sha256":hex(self.implementation),
+                            "root_admission_sha256":row.root_admission_sha256,"source_status":status,
+                            "original_settled_slice":record,"numeric":actual,
+                            "accepted_critic_chain_observed":null,"conditional_scalar_value_observed":null,
+                            "physical_completion_attested":false,"execution_authorized":false,
+                            "token_or_job_authority_issued":false,"performance_evidence":false,"full_acceptance_issued":false});
+                        write_slice_row(&mut io::stderr().lock(), &scalar, &mut state)?;
+                    }
                 }
             }
             Ok::<(), &'static str>(())

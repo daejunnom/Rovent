@@ -96,7 +96,16 @@ impl V2CpuValue {
         if let Some(capture) = capture {
             capture.observe(&self.model, &self.bound, &state.local, position, &numeric);
         }
-        Ok(numeric.frontier_score())
+        let score = numeric.frontier_score();
+        #[cfg(feature = "nnuec-scalar-diagnostics")]
+        super::scalar_diagnostic::record(
+            self.binding,
+            self.bound.provenance(),
+            numeric.raw_outputs[0].to_bits(),
+            numeric.value.to_bits(),
+            score,
+        );
+        Ok(score)
     }
 
     /// Observe the existing value/WDL/utility head without granting its utility

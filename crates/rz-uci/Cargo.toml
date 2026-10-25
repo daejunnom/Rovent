@@ -73,7 +73,7 @@ search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-f
 onnx-cuda = ["onnx-cpu"]
 pals-adaptive = ["dep:rz-experiments", "rz-experiments/pals-content-admission", "search-work-receipts"]
 pals-adaptive-diagnostics = ["pals-adaptive", "onnx-cpu"]
-native-validation-diagnostics = ["pals-adaptive-diagnostics", "rz-eval/native-validation-diagnostics"]
+native-validation-diagnostics = ["pals-adaptive-diagnostics", "rz-eval/native-validation-diagnostics", "rz-search/nnuec-scalar-diagnostics"]
 
 [dependencies]
 rz-search.workspace = true

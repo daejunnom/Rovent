@@ -330,6 +330,9 @@ pub(crate) struct SettledSlice {
     accounting_after_settlement: Option<SettlementObservation>,
     worker_resume_admission_and_restore_ns: Option<u64>,
     worker_return_processing_ns: Option<u64>,
+    #[cfg(feature = "native-validation-diagnostics")]
+    #[serde(skip)]
+    nnuec_scalar: Option<serde_json::Value>,
 }
 impl From<&AdaptiveCpuSliceObservation> for SettledSlice {
     fn from(value: &AdaptiveCpuSliceObservation) -> Self {
@@ -398,8 +401,46 @@ impl From<&AdaptiveCpuSliceObservation> for SettledSlice {
             worker_return_processing_ns: value
                 .worker_timing
                 .and_then(|t| ns(t.return_processing())),
+            #[cfg(feature = "native-validation-diagnostics")]
+            nnuec_scalar: value
+                .worker_timing
+                .and_then(|timing| timing.nnuec_scalar())
+                .map(scalar_observation),
         }
     }
+}
+#[cfg(feature = "native-validation-diagnostics")]
+impl SettledSlice {
+    pub(crate) fn nnuec_scalar(&self) -> Option<&serde_json::Value> {
+        self.nnuec_scalar.as_ref()
+    }
+}
+#[cfg(feature = "native-validation-diagnostics")]
+fn scalar_observation(
+    value: rz_search::cpu_value::nnuec::v2::scalar_diagnostic::SliceObservation,
+) -> serde_json::Value {
+    use serde_json::json;
+    let sample = |value: rz_search::cpu_value::nnuec::v2::scalar_diagnostic::Sample| {
+        json!({
+        "binding_sha256":hex(value.binding),"full_view_sha256":hex(Digest(value.full_view)),
+        "view_seal_sha256":hex(Digest(value.view_seal)),"record_scope_sha256":hex(Digest(value.record_scope)),
+        "generation":value.generation,"raw_value_f32_bits":value.raw_value_bits,
+        "scaled_value_f32_bits":value.scaled_value_bits,"returned_frontier_score_i32":value.returned_frontier_score})
+    };
+    let stack = |value: rz_search::cpu::CpuPausedStackSnapshot| {
+        json!({
+        "owner_id":value.owner_id,"tokens_resumed":value.tokens_resumed,
+        "tokens_retained":value.tokens_retained,"replayed_consumed_work":value.replayed_consumed_work,
+        "complete":value.complete})
+    };
+    json!({"scope":"actual_private_worker_score_returns_not_semantic_acceptance",
+        "successful_score_returns":value.scalar.map(|value|value.successful_score_returns),
+        "diagnostic_incomplete":value.scalar.map(|value|value.incomplete),
+        "first":value.scalar.and_then(|value|value.first).map(sample),
+        "last":value.scalar.and_then(|value|value.last).map(sample),
+        "resume_command":value.resume_command,"prior_token_present":value.prior_token_present,
+        "stack_before":value.before.map(stack),"stack_after":value.after.map(stack),
+        "new_forward_inferred_from_resume":false,"token_or_job_authority_issued":false})
 }
 fn ns(value: Duration) -> Option<u64> {
     u64::try_from(value.as_nanos()).ok()
