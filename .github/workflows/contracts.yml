@@ -13,7 +13,9 @@ permissions:
 
 concurrency:
   group: workspace-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  # Preserve bounded in-flight validation and its artifacts when a follow-up
+  # source fix is pushed. The same goal still has only one active run.
+  cancel-in-progress: false
 
 jobs:
   runtime-loader-diagnostic:
