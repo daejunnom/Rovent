@@ -61,6 +61,10 @@ name = "pals_model_check"
 required-features = ["onnx", "contracts"]
 
 [[example]]
+name = "runtime_loader_check"
+required-features = ["onnx"]
+
+[[example]]
 name = "virtual_review_numeric_capture"
 required-features = ["onnx", "contracts"]
 
