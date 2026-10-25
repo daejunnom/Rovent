@@ -3,6 +3,7 @@ from pathlib import Path
 import contextlib
 import ctypes
 import errno
+import hashlib
 import io
 import json
 import mmap
@@ -409,6 +410,71 @@ class WindowsRetirementUnsupportedTests(unittest.TestCase):
 
 
 class RetirementFailureReportingTests(unittest.TestCase):
+    def test_selected_code_facades_reject_foreign_proof_before_fd_or_effect_checks(self):
+        # Opposite-kind instances deliberately have no live state. Rejection
+        # must precede check(), plan access, cleanup, or any effect boundary.
+        for foreign_type, audit, retire in (
+                (retirement.PreparedNormalDeferredSelectedNativeCode,
+                 retirement.audit_prepared_normal_deferred_selected_numeric_code,
+                 retirement.retire_prepared_normal_deferred_selected_numeric_code),
+                (retirement.PreparedNormalDeferredSelectedNumericCode,
+                 retirement.audit_prepared_normal_deferred_selected_native_code,
+                 retirement.retire_prepared_normal_deferred_selected_native_code)):
+            foreign = object.__new__(foreign_type)
+            with self.subTest(foreign=foreign_type.__name__):
+                with self.assertRaises(StorageError):
+                    audit(foreign)
+                with self.assertRaises(StorageError):
+                    retire(foreign, borrowed_live_view=None, source_pack=None,
+                           actual_originals=None, same_guard=None)
+
+    def test_selected_code_decode_and_profile_failures_close_accepted_inputs_once(self):
+        class HeldInputs:
+            until = 1
+
+            def __init__(self):
+                self.closed_with = []
+
+            def check(self):
+                pass
+
+            def close(self, primary=None):
+                self.closed_with.append(primary)
+                return primary
+
+        for proof_type, retire, other_profile in (
+                (retirement.PreparedNormalDeferredSelectedNumericCode,
+                 retirement.retire_prepared_normal_deferred_selected_numeric_code,
+                 retirement.review.NATIVE_CODE_PROFILE),
+                (retirement.PreparedNormalDeferredSelectedNativeCode,
+                 retirement.retire_prepared_normal_deferred_selected_native_code,
+                 retirement.review.NUMERIC_CODE_PROFILE)):
+            for boundary, raw in (("decode", b"{"),
+                                  ("profile", json.dumps({"profile": other_profile}).encode("utf-8"))):
+                with self.subTest(proof=proof_type.__name__, boundary=boundary):
+                    inputs = HeldInputs()
+                    selected = {"path": "/fixture/selected-code-plan.json", "bytes": len(raw),
+                                "sha256": hashlib.sha256(raw).hexdigest()}
+                    prepared = proof_type(retirement._NUMERIC_PREPARED_TOKEN,
+                        _inputs=inputs, _plan=raw, _pin=selected, _path=Path("/fixture/selected-code"),
+                        _keeper={}, _research={}, _pid=os.getpid(), _hard_until=inputs.until,
+                        _closed=False, _consumed=False)
+                    with patch.object(retirement, "_numeric_borrowed_view") as effect_guard:
+                        with self.assertRaises((StorageError, ValueError)) as caught:
+                            retire(prepared, borrowed_live_view=None, source_pack=None,
+                                   actual_originals=None, same_guard=None)
+                        effect_guard.assert_not_called()
+                    self.assertEqual(len(inputs.closed_with), 1)
+                    self.assertIs(inputs.closed_with[0], caught.exception)
+                    self.assertIs(prepared._closed, True)
+                    self.assertIs(prepared._consumed, True)
+                    evidence = caught.exception.code_cache_retirement
+                    self.assertEqual(evidence["plan"], selected)
+                    self.assertIs(evidence["journal"], None)
+                    self.assertEqual(evidence["logical_removed_bytes"], 0)
+                    self.assertIs(evidence["partial"], False)
+                    self.assertIs(evidence["physical_completion_attested"], False)
+
     def test_report_failure_preserves_partial_json_when_original_exception_str_fails(self):
         class BrokenDetail(StorageError):
             def __str__(self):

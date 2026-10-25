@@ -823,7 +823,7 @@ def _numeric_borrowed_view(view, source_pack, originals, guard, catalog):
     return guard_module
 
 
-def _numeric_keeper(inputs, plan, expected, archive_member):
+def _selected_code_keeper(inputs, plan, expected, archive_member, spec):
     """Use the existing CI ZIP and original canonical-code reader; create no archive."""
     stream = inputs.open(plan["artifact"], review.ARCHIVE_CAP)
     with zipfile.ZipFile(stream) as archive:
@@ -835,14 +835,14 @@ def _numeric_keeper(inputs, plan, expected, archive_member):
               and receipt.get("source_commit") == plan["source_commit"]
               and all(receipt.get(name) is False for name in ("neural_execution", "gpu_execution", "training_execution")),
               "original selected-code source evidence required; no runtime authority")
-        selected = receipt["binaries"]["virtual_review_numeric_capture"]
+        selected = receipt["binaries"][spec["target"]]
         code = plan["code"][0]
         _need({key: selected["pin"][key] for key in ("bytes", "sha256")}
               == {key: code[key] for key in ("bytes", "sha256")}
-              and selected.get("requested_features") == ["onnx", "contracts"],
-              "same direct selected numeric target bytes and features")
+              and selected.get("requested_features") == list(spec["requested_features"]),
+              "same direct selected code target bytes and features")
         commands = [row for row in receipt["commands"]
-                    if row.get("label") == "build-virtual_review_numeric_capture"]
+                    if row.get("label") == "build-" + spec["target"]]
         _need(len(commands) == 1 and type(commands[0].get("exit_code")) is int and commands[0]["exit_code"] == 0
               and commands[0].get("original_tree_cleanup_verified") is True
               and commands[0].get("supervisor_error") is None, "original selected compiler command closure")
@@ -850,9 +850,14 @@ def _numeric_keeper(inputs, plan, expected, archive_member):
               "actual original canonical code bundle member required")
     review.canonical_code(inputs, plan["artifact"], archive_member, expected)
     return {"artifact": plan["artifact"], "source_commit": plan["source_commit"],
-            "target": "virtual_review_numeric_capture", "original_compiler_exit": 0,
+            "target": spec["target"], "original_compiler_exit": 0,
             "producer_status_observed": receipt.get("status"), "full_bundle_or_runtime_admission_issued": False,
             "canonical_code_member_verified": True, "new_archive_created": False}
+
+
+def _numeric_keeper(inputs, plan, expected, archive_member):
+    return _selected_code_keeper(inputs, plan, expected, archive_member,
+        review._normal_deferred_selected_code_spec(review.NUMERIC_CODE_PROFILE))
 
 
 def _numeric_open_raw_evidence(inputs, pin):
@@ -908,7 +913,7 @@ def _numeric_raw_evidence(inputs, plan):
     return result
 
 
-class PreparedNormalDeferredSelectedNumericCode:
+class _PreparedNormalDeferredSelectedCode:
     """Current-process held data proof only. A saved audit JSON cannot recreate it."""
     __slots__ = ("_inputs", "_plan", "_pin", "_path", "_keeper", "_research", "_pid",
                  "_hard_until", "_closed", "_consumed")
@@ -919,13 +924,13 @@ class PreparedNormalDeferredSelectedNumericCode:
             object.__setattr__(self, key, value)
 
     def __setattr__(self, name, value):
-        raise StorageError("prepared numeric-code proof is immutable")
+        raise StorageError("prepared selected-code proof is immutable")
 
     def __copy__(self):
-        raise StorageError("prepared numeric-code proof is not transferable")
+        raise StorageError("prepared selected-code proof is not transferable")
 
     def __deepcopy__(self, memo):
-        raise StorageError("prepared numeric-code proof is not transferable")
+        raise StorageError("prepared selected-code proof is not transferable")
 
     def check(self):
         _need(not self._closed and os.getpid() == self._pid
@@ -939,7 +944,21 @@ class PreparedNormalDeferredSelectedNumericCode:
         return primary
 
 
-def prepare_normal_deferred_selected_numeric_code(plan_pin, *, hard_until, seconds=300):
+class PreparedNormalDeferredSelectedNumericCode(_PreparedNormalDeferredSelectedCode):
+    __slots__ = ()
+
+
+class PreparedNormalDeferredSelectedNativeCode(_PreparedNormalDeferredSelectedCode):
+    __slots__ = ()
+
+
+def _selected_code_proof_type(profile):
+    review._normal_deferred_selected_code_spec(profile)
+    return (PreparedNormalDeferredSelectedNumericCode if profile == review.NUMERIC_CODE_PROFILE
+            else PreparedNormalDeferredSelectedNativeCode)
+
+
+def _prepare_normal_deferred_selected_code(plan_pin, *, profile, hard_until, seconds=300):
     """Perform expensive readonly keeper/hash work before the caller opens its view."""
     _need(sys.platform == "linux" and type(hard_until) in (int, float)
           and time.monotonic() < hard_until <= time.monotonic() + 600,
@@ -947,7 +966,8 @@ def prepare_normal_deferred_selected_numeric_code(plan_pin, *, hard_until, secon
     inputs = _Inputs(seconds)
     inputs.until = min(inputs.until, hard_until)
     try:
-        plan, catalog, code, expected, archive_member = review.read_normal_deferred_selected_numeric_code_plan(inputs, plan_pin)
+        spec = review._normal_deferred_selected_code_spec(profile)
+        plan, catalog, code, expected, archive_member = review._read_normal_deferred_selected_code_plan(inputs, plan_pin, profile)
         inputs.directory(catalog, controlled=True)
         row_stream = inputs.open(plan["record_pin"], 8192)
         row = review.decode(row_stream.read(8193))
@@ -969,7 +989,7 @@ def prepare_normal_deferred_selected_numeric_code(plan_pin, *, hard_until, secon
             inputs.open(pin, review.ELF_CAP)
         if plan["duplicate_keeper"] is not None:
             inputs.open(plan["duplicate_keeper"], review.ELF_CAP)
-        keeper = _numeric_keeper(inputs, plan, expected, archive_member)
+        keeper = _selected_code_keeper(inputs, plan, expected, archive_member, spec)
         research = _numeric_raw_evidence(inputs, plan)
         target_inode = _inode(info)
         _need(all(_inode(item["before"]) != target_inode for name, item in inputs.files.items() if name != path),
@@ -981,13 +1001,23 @@ def prepare_normal_deferred_selected_numeric_code(plan_pin, *, hard_until, secon
                       and not external.is_relative_to(catalog) and not catalog.is_relative_to(external),
                       "keepers must be outside original output and catalog")
         inputs.check()
-        return PreparedNormalDeferredSelectedNumericCode(_NUMERIC_PREPARED_TOKEN,
+        return _selected_code_proof_type(profile)(_NUMERIC_PREPARED_TOKEN,
             _inputs=inputs, _plan=_encode(plan), _pin=dict(plan_pin), _path=path,
             _keeper=keeper, _research=research, _pid=os.getpid(), _hard_until=inputs.until,
             _closed=False, _consumed=False)
     except BaseException as primary:
         inputs.close(primary)
         raise
+
+
+def prepare_normal_deferred_selected_numeric_code(plan_pin, *, hard_until, seconds=300):
+    return _prepare_normal_deferred_selected_code(plan_pin, profile=review.NUMERIC_CODE_PROFILE,
+        hard_until=hard_until, seconds=seconds)
+
+
+def prepare_normal_deferred_selected_native_code(plan_pin, *, hard_until, seconds=300):
+    return _prepare_normal_deferred_selected_code(plan_pin, profile=review.NATIVE_CODE_PROFILE,
+        hard_until=hard_until, seconds=seconds)
 
 
 def _numeric_target_row(plan, row):
@@ -1010,10 +1040,11 @@ def _numeric_producer_state(rows, protected_keys):
                 row["state"] == "active" and row["key"] in protected_keys for _, row, _ in rows)}
 
 
-def audit_prepared_normal_deferred_selected_numeric_code(prepared):
-    _need(type(prepared) is PreparedNormalDeferredSelectedNumericCode, "actual live prepared FD proof required")
+def _audit_prepared_normal_deferred_selected_code(prepared, profile):
+    _need(type(prepared) is _selected_code_proof_type(profile), "actual matching-profile live prepared FD proof required")
     prepared.check()
-    return {"schema": "rovezero.normal-deferred-selected-numeric-code-audit.v1",
+    _need(review.decode(prepared._plan)["profile"] == profile, "prepared code profile changed")
+    return {"schema": "rovezero." + profile + "-audit.v1",
             "status": "READONLY_FD_AND_KEEPERS_VERIFIED_NO_RETIREMENT_AUTHORITY",
             "plan": dict(prepared._pin), "keeper": prepared._keeper, "research": prepared._research,
             "deletion_performed": False, "retirement_authority_issued": False,
@@ -1022,23 +1053,33 @@ def audit_prepared_normal_deferred_selected_numeric_code(prepared):
             "physical_completion_attested": False}
 
 
-def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_live_view,
+def audit_prepared_normal_deferred_selected_numeric_code(prepared):
+    return _audit_prepared_normal_deferred_selected_code(prepared, review.NUMERIC_CODE_PROFILE)
+
+
+def audit_prepared_normal_deferred_selected_native_code(prepared):
+    return _audit_prepared_normal_deferred_selected_code(prepared, review.NATIVE_CODE_PROFILE)
+
+
+def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowed_live_view,
         source_pack, actual_originals, same_guard):
     """One effect attempt with a caller-owned view; never acquire/renew/close its gate."""
-    _need(type(prepared) is PreparedNormalDeferredSelectedNumericCode and not prepared._consumed,
+    _need(type(prepared) is _selected_code_proof_type(profile) and not prepared._consumed,
           "one actual live preparation, never an audit JSON or automatic retry")
     object.__setattr__(prepared, "_consumed", True)
     inputs, journal, first, result = prepared._inputs, None, None, None
-    plan = review.decode(prepared._plan)
+    plan = None
     path = prepared._path
     attempt = {"unlink_attempted": False, "unlink_returned": False, "directory_fsynced": False}
-    evidence = {"schema": "rovezero.normal-deferred-selected-numeric-code-failure.v1",
+    evidence = {"schema": "rovezero." + profile + "-failure.v1",
         "status": "FAILED_OR_PARTIAL_PRESERVED", "plan": dict(prepared._pin),
         "last_attempt": attempt, "journal": None, "journal_path": None, "logical_removed_bytes": 0,
         "no_unprotected_active_producers": None, "protected_active_row_count": None,
         "physical_completion_attested": False, "physical_space_reclaimed": "unknown",
         "vhd_return": "unknown", "observation_limits": list(_LIMITS)}
     try:
+        plan = review.decode(prepared._plan)
+        _need(plan["profile"] == profile, "prepared code profile changed")
         prepared.check()
         catalog = _path(plan["catalog"])
         current_guard = _numeric_borrowed_view(borrowed_live_view, source_pack, actual_originals, same_guard, catalog)
@@ -1050,7 +1091,7 @@ def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_
         _need(producer_state["no_unprotected_active_producers"], "unprotected active producer blocks code retirement")
         matches = [item for item in rows if item[1]["key"] == plan["key"]]
         _need(len(matches) == 1 and plan["key"] not in borrowed_live_view.keys,
-              "exact unprotected original numeric output required")
+              "exact unprotected original selected code output required")
         record_path, row, output = matches[0]
         _need(str(record_path) == plan["record_pin"]["path"] and str(output) == plan["output"], "canonical target paths changed")
         _numeric_target_row(plan, row)
@@ -1062,7 +1103,7 @@ def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_
         targets = {_inode(inputs.files[path]["before"]),
                    _inode(inputs.directories[output][1]), _inode(inputs.directories[path.parent][1])}
         census = _process_census(targets, inputs.fds() | {same_guard.stream.fileno()}, inputs.tick)
-        header = {"schema": "rovezero.normal-deferred-selected-numeric-code-journal.v1", "event": "preflight_complete",
+        header = {"schema": "rovezero." + profile + "-journal.v1", "event": "preflight_complete",
             "plan": dict(prepared._pin), "key": plan["key"], "record_pin": plan["record_pin"],
             "code": plan["code"], "artifact": plan["artifact"], "research": plan["research"],
             "census": census, **producer_state, "physical_completion_attested": False, "observation_limits": list(_LIMITS)}
@@ -1108,7 +1149,7 @@ def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_
         _need(borrowed_live_view.rows() == rows, "original rows/history changed after leaf retirement")
         inputs.check(); same_guard.assert_held()
         journal.append({"event": "complete", "retired_files": 1})
-        result = {"schema": "rovezero.normal-deferred-selected-numeric-code-result.v1",
+        result = {"schema": "rovezero." + profile + "-result.v1",
             "status": "CODE_CACHE_RETIRED", "plan": dict(prepared._pin), "journal": journal.pin(),
             "retired_files": [plan["code"][0]["relative"]], "logical_removed_bytes": plan["code"][0]["bytes"],
             **producer_state,
@@ -1142,6 +1183,20 @@ def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_
     if first is not None:
         try: first.code_cache_retirement = evidence
         except BaseException: pass
-        _note(first, "one exact numeric-code attempt; partial effects preserved, no retry or owner/view reissue")
+        _note(first, "one exact selected-code attempt; partial effects preserved, no retry or owner/view reissue")
         raise first
     return result
+
+
+def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_live_view,
+        source_pack, actual_originals, same_guard):
+    return _retire_prepared_normal_deferred_selected_code(prepared, profile=review.NUMERIC_CODE_PROFILE,
+        borrowed_live_view=borrowed_live_view, source_pack=source_pack,
+        actual_originals=actual_originals, same_guard=same_guard)
+
+
+def retire_prepared_normal_deferred_selected_native_code(prepared, *, borrowed_live_view,
+        source_pack, actual_originals, same_guard):
+    return _retire_prepared_normal_deferred_selected_code(prepared, profile=review.NATIVE_CODE_PROFILE,
+        borrowed_live_view=borrowed_live_view, source_pack=source_pack,
+        actual_originals=actual_originals, same_guard=same_guard)

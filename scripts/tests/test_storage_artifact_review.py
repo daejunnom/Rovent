@@ -40,21 +40,25 @@ class NumericCodePlanDeclarationTests(unittest.TestCase):
     def raw_pin(path, payload):
         return {"path": path, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
 
-    def plan(self, label):
+    def plan(self, label, *, native=False):
         data = label.encode("utf-8")
         root = "/fixture-" + label
         catalog, output = root + "/catalog", root + "/inputs/candidate-" + label
         key = hashlib.sha256(output.encode("utf-8")).hexdigest()
         code = b"synthetic code declaration " + data
-        keeper = self.raw_pin(root + "/inputs/keeper-" + label + "/" + review.NUMERIC_CODE_RELATIVE, code)
-        return {"schema": review.NUMERIC_CODE_PLAN_SCHEMA, "profile": review.NUMERIC_CODE_PROFILE,
+        relative = "selected-native/rz-rovent-native" if native else review.NUMERIC_CODE_RELATIVE
+        tar_member = "bin/rz-rovent-native" if native else review.NUMERIC_CODE_TAR_MEMBER
+        schema = review.NATIVE_CODE_PLAN_SCHEMA if native else review.NUMERIC_CODE_PLAN_SCHEMA
+        profile = review.NATIVE_CODE_PROFILE if native else review.NUMERIC_CODE_PROFILE
+        keeper = self.raw_pin(root + "/inputs/keeper-" + label + "/" + relative, code)
+        return {"schema": schema, "profile": profile,
             "source_commit": hashlib.sha1(b"synthetic source " + data).hexdigest(),
             "catalog": catalog, "key": key, "output": output,
             "output_identity": [len(data) + 1, sum(data) + 1],
             "record_pin": self.raw_pin(catalog + "/" + key + ".json", b"synthetic record " + data),
             "artifact": self.raw_pin(root + "/canonical.zip", b"synthetic archive " + data),
             "archive_member": "fixture-binaries.tar.gz",
-            "code": [{"relative": review.NUMERIC_CODE_RELATIVE, "tar_member": review.NUMERIC_CODE_TAR_MEMBER,
+            "code": [{"relative": relative, "tar_member": tar_member,
                       "bytes": len(code), "sha256": hashlib.sha256(code).hexdigest()}],
             "research": self.raw_pin(root + "/research.zip", b"synthetic research " + data),
             "raw_evidence": [{"pin": self.raw_pin(root + "/reports/result.stderr", b"synthetic raw " + data),
@@ -78,6 +82,44 @@ class NumericCodePlanDeclarationTests(unittest.TestCase):
                 self.assertEqual(value, original)
                 self.assertIs(proposal["retirement_authority_issued"], False)
                 self.assertIs(proposal["deletion_performed"], False)
+
+    def test_native_plan_is_explicit_and_numeric_prepare_remains_strict(self):
+        numeric = self.plan("numeric-explicit")
+        native = self.plan("native-explicit", native=True)
+        self.assertEqual(native["profile"], "normal-deferred-selected-native-code")
+        self.assertEqual(native["schema"], "rovezero.normal-deferred-selected-native-code-plan.v1")
+        for value, prepare, other in (
+                (numeric, review.prepare_normal_deferred_selected_numeric_code_plan,
+                 review.prepare_normal_deferred_selected_native_code_plan),
+                (native, review.prepare_normal_deferred_selected_native_code_plan,
+                 review.prepare_normal_deferred_selected_numeric_code_plan)):
+            with self.subTest(profile=value["profile"]):
+                original = copy.deepcopy(value)
+                proposal = prepare(value)
+                self.assertEqual(proposal["status"], "PLAN_DATA_PREPARED")
+                self.assertEqual(proposal["plan"], original)
+                self.assertEqual(proposal["required_inputs"], [])
+                self.assertIs(proposal["retirement_authority_issued"], False)
+                self.assertIs(proposal["deletion_performed"], False)
+                self.assertEqual(value, original)
+                with self.assertRaises(StorageError):
+                    other(value)
+
+    def test_profile_schema_and_code_kind_cannot_be_mixed(self):
+        numeric = self.plan("numeric-kind")
+        native = self.plan("native-kind", native=True)
+        for original, other, prepare in (
+                (numeric, native, review.prepare_normal_deferred_selected_numeric_code_plan),
+                (native, numeric, review.prepare_normal_deferred_selected_native_code_plan)):
+            for field in ("schema", "profile", "relative", "tar_member"):
+                with self.subTest(profile=original["profile"], mixed_field=field):
+                    mixed = copy.deepcopy(original)
+                    if field in ("relative", "tar_member"):
+                        mixed["code"][0][field] = other["code"][0][field]
+                    else:
+                        mixed[field] = other[field]
+                    with self.assertRaises(StorageError):
+                        prepare(mixed)
 
     def test_empty_raw_evidence_requires_empty_hash_and_other_payloads_stay_positive(self):
         value = self.plan("empty-evidence")
@@ -143,11 +185,11 @@ lease.finish(status="fixture_original_children_closed",tree_gone=True)
                      "research": pin(self.research)}
         self.plan_path = self.base / "plan.json"
 
-    def write_canonical(self, raw, *, duplicate=False):
+    def write_canonical(self, raw, *, duplicate=False, member="bin/rz-rovent-native"):
         tar_raw = io.BytesIO()
         with tarfile.open(fileobj=tar_raw, mode="w:gz") as tar:
             for _ in range(2 if duplicate else 1):
-                item = tarfile.TarInfo("bin/rz-rovent-native")
+                item = tarfile.TarInfo(member)
                 item.size = len(raw)
                 tar.addfile(item, io.BytesIO(raw))
         with zipfile.ZipFile(self.artifact, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -258,6 +300,68 @@ lease.finish(status="fixture_original_children_closed",tree_gone=True)
             self.plan["artifact"] = pin(self.artifact)
             with self.assertRaises(StorageError):
                 self.audit()
+
+    def test_selected_code_keeper_preserves_numeric_compatibility_and_explicit_native_features(self):
+        import storage_code_retirement as retirement
+
+        raw = self.code.read_bytes()
+        source_commit = hashlib.sha1(b"bounded keeper source fixture").hexdigest()
+        profiles = (review.NUMERIC_CODE_PROFILE, review.NATIVE_CODE_PROFILE)
+        declared_features = {
+            review.NUMERIC_CODE_PROFILE: ("onnx", "contracts"),
+            review.NATIVE_CODE_PROFILE: ("pals-collection-onnx", "native-cuda", "native-validation-diagnostics"),
+        }
+        for profile, other_profile in (profiles, profiles[::-1]):
+            spec = review._normal_deferred_selected_code_spec(profile)
+            other = review._normal_deferred_selected_code_spec(other_profile)
+            self.assertEqual(spec["requested_features"], declared_features[profile])
+            target = {"relative": spec["relative"], "tar_member": spec["tar_member"],
+                      "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+            expected = {target["tar_member"]: target}
+            plan = {**self.plan, "schema": spec["schema"], "profile": profile,
+                    "source_commit": source_commit, "code": [target]}
+
+            def write_keeper(features):
+                self.write_canonical(raw, member=spec["tar_member"])
+                with zipfile.ZipFile(self.artifact, "a") as archive:
+                    bundle_bytes = archive.getinfo(plan["archive_member"]).file_size
+                    receipt = {"schema": "rovezero.ci-cpu-validation-bundle/1",
+                        "source_commit": source_commit, "status": "FAILED_UNRELATED_GETTER_FIXTURE",
+                        "neural_execution": False, "gpu_execution": False, "training_execution": False,
+                        "binaries": {spec["target"]: {"pin": {"bytes": len(raw), "sha256": target["sha256"]},
+                                                       "requested_features": features}},
+                        "commands": [{"label": "build-" + spec["target"], "exit_code": 0,
+                                      "original_tree_cleanup_verified": True, "supervisor_error": None}],
+                        "binary_bundle": {"bytes": bundle_bytes}}
+                    archive.writestr("build-receipt.json", json.dumps(receipt))
+                plan["artifact"] = pin(self.artifact)
+
+            with self.subTest(profile=profile, keeper="matching"):
+                write_keeper(list(spec["requested_features"]))
+                before = self.artifact.read_bytes()
+                with review.Inputs(30) as inputs:
+                    if profile == review.NUMERIC_CODE_PROFILE:
+                        result = retirement._numeric_keeper(inputs, plan, expected, plan["archive_member"])
+                    else:
+                        result = retirement._selected_code_keeper(inputs, plan, expected, plan["archive_member"], spec)
+                self.assertEqual(result["target"], spec["target"])
+                self.assertIs(result["canonical_code_member_verified"], True)
+                self.assertIs(result["new_archive_created"], False)
+                self.assertIs(result["full_bundle_or_runtime_admission_issued"], False)
+                self.assertEqual(self.artifact.read_bytes(), before)
+                if profile == review.NATIVE_CODE_PROFILE:
+                    with review.Inputs(30) as inputs:
+                        with self.assertRaises((StorageError, KeyError)):
+                            retirement._numeric_keeper(inputs, plan, expected, plan["archive_member"])
+
+            with self.subTest(profile=profile, keeper="other-kind-features"):
+                write_keeper(list(other["requested_features"]))
+                before = self.artifact.read_bytes()
+                with review.Inputs(30) as inputs:
+                    with self.assertRaises(StorageError):
+                        retirement._selected_code_keeper(inputs, plan, expected, plan["archive_member"], spec)
+                self.assertEqual(self.artifact.read_bytes(), before)
+                self.assertEqual(self.code.read_bytes(), raw)
 
     def test_candidate_hardlink_is_not_a_private_elf(self):
         try:

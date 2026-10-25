@@ -35,6 +35,10 @@ NUMERIC_CODE_PROFILE = "normal-deferred-selected-numeric-code"
 NUMERIC_CODE_PLAN_SCHEMA = "rovezero.normal-deferred-selected-numeric-code-plan.v1"
 NUMERIC_CODE_RELATIVE = "selected-numeric/virtual_review_numeric_capture"
 NUMERIC_CODE_TAR_MEMBER = "bin/virtual_review_numeric_capture"
+NATIVE_CODE_PROFILE = "normal-deferred-selected-native-code"
+NATIVE_CODE_PLAN_SCHEMA = "rovezero.normal-deferred-selected-native-code-plan.v1"
+NATIVE_CODE_RELATIVE = "selected-native/rz-rovent-native"
+NATIVE_CODE_TAR_MEMBER = "bin/rz-rovent-native"
 
 
 def need(value, message):
@@ -295,16 +299,31 @@ def _numeric_raw_pin(value, maximum, *, allow_empty=False):
     return value
 
 
-def prepare_normal_deferred_selected_numeric_code_plan(value):
+def _normal_deferred_selected_code_spec(profile):
+    if profile == NUMERIC_CODE_PROFILE:
+        schema, relative, member, target, features = (NUMERIC_CODE_PLAN_SCHEMA, NUMERIC_CODE_RELATIVE,
+            NUMERIC_CODE_TAR_MEMBER, "virtual_review_numeric_capture", ("onnx", "contracts"))
+    else:
+        need(profile == NATIVE_CODE_PROFILE, "explicit normal deferred selected code profile required")
+        schema, relative, member, target, features = (NATIVE_CODE_PLAN_SCHEMA, NATIVE_CODE_RELATIVE,
+            NATIVE_CODE_TAR_MEMBER, "rz-rovent-native",
+            ("pals-collection-onnx", "native-cuda", "native-validation-diagnostics"))
+    need(target in CODE_NAMES, "registered CI selected code target required")
+    return {"profile": profile, "schema": schema, "relative": relative, "tar_member": member,
+            "target": target, "requested_features": features}
+
+
+def _prepare_normal_deferred_selected_code_plan(value, profile):
     """Prepare closed plan data; current View/FD/owner checks own admission."""
+    spec = _normal_deferred_selected_code_spec(profile)
     names = ("schema", "profile", "source_commit", "catalog", "key", "output", "output_identity",
              "record_pin", "artifact", "archive_member", "code", "research", "raw_evidence",
              "protected_reference_pins", "duplicate_keeper")
     fields(value, names)
-    need(value["schema"] == NUMERIC_CODE_PLAN_SCHEMA and value["profile"] == NUMERIC_CODE_PROFILE
+    need(value["schema"] == spec["schema"] and value["profile"] == spec["profile"]
          and type(value["source_commit"]) is str
          and re.fullmatch("[0-9a-f]{40}", value["source_commit"]) is not None
-         and value["source_commit"] != "0" * 40, "explicit selected numeric source/profile required")
+         and value["source_commit"] != "0" * 40, "explicit selected code source/profile required")
     paths = {}
     for name in ("catalog", "output"):
         text = value[name]
@@ -326,10 +345,10 @@ def prepare_normal_deferred_selected_numeric_code_plan(value):
          and all(type(item) is int and item > 0 for item in identity), "actual output identity required")
     code = value["code"]
     need(type(code) is list and len(code) == 1 and type(code[0]) is dict,
-         "one explicit selected numeric ELF required")
+         "one explicit selected code ELF required")
     fields(code[0], ("relative", "tar_member", "bytes", "sha256"))
-    need(code[0]["relative"] == NUMERIC_CODE_RELATIVE and code[0]["tar_member"] == NUMERIC_CODE_TAR_MEMBER
-         and "virtual_review_numeric_capture" in CODE_NAMES, "one registered selected numeric code kind only")
+    need(code[0]["relative"] == spec["relative"] and code[0]["tar_member"] == spec["tar_member"],
+         "one registered selected code kind matching its explicit profile required")
     candidate = str(output / member_name(code[0]["relative"]))
     _numeric_raw_pin({"path": candidate, "bytes": code[0]["bytes"], "sha256": code[0]["sha256"]}, ELF_CAP)
     missing = []
@@ -377,7 +396,7 @@ def prepare_normal_deferred_selected_numeric_code_plan(value):
             relative = reference.relative_to(output.parent)
             need(len(relative.parts) == 3 and relative.parts[1] in
                  ("selected-native", "selected-numeric", "selected-numerical-gate", "selected4", "private-elf")
-                 and relative.name in CODE_NAMES, "model/runtime payloads are not numeric retirement inputs")
+                 and relative.name in CODE_NAMES, "model/runtime payloads are not selected code retirement inputs")
             need(pin["path"] not in reference_paths and pin["path"] != candidate,
                  "candidate is a current protected reference or reference path is duplicated")
             reference_paths.add(pin["path"])
@@ -389,24 +408,40 @@ def prepare_normal_deferred_selected_numeric_code_plan(value):
              and not location.is_relative_to(output) and not location.is_relative_to(catalog),
              "optional duplicate keeper must be a distinct external same-content ELF")
     proposed = copy.deepcopy(value)
-    return {"schema": "rovezero.normal-deferred-selected-numeric-code-proposal.v1",
+    return {"schema": "rovezero." + profile + "-proposal.v1",
             "status": "PLAN_DATA_PREPARED" if not missing else "ACTUAL_INPUT_PINS_REQUIRED",
-            "profile": NUMERIC_CODE_PROFILE, "required_inputs": sorted(missing),
+            "profile": profile, "required_inputs": sorted(missing),
             "plan": proposed if not missing else None, "proposed_plan": proposed,
             "retirement_authority_issued": False, "deletion_performed": False,
             "owner_created_or_recovered": False, "physical_completion_attested": False}
 
 
-def read_normal_deferred_selected_numeric_code_plan(inputs, plan_pin):
+def prepare_normal_deferred_selected_numeric_code_plan(value):
+    return _prepare_normal_deferred_selected_code_plan(value, NUMERIC_CODE_PROFILE)
+
+
+def prepare_normal_deferred_selected_native_code_plan(value):
+    return _prepare_normal_deferred_selected_code_plan(value, NATIVE_CODE_PROFILE)
+
+
+def _read_normal_deferred_selected_code_plan(inputs, plan_pin, profile):
     """Read a complete data plan; live FD/View/owner checks remain mandatory."""
     plan = decode(inputs.open(plan_pin, INVENTORY_CAP).read(INVENTORY_CAP + 1))
-    proposal = prepare_normal_deferred_selected_numeric_code_plan(plan)
-    need(not proposal["required_inputs"], "actual selected numeric retirement input pins are incomplete")
+    proposal = _prepare_normal_deferred_selected_code_plan(plan, profile)
+    need(not proposal["required_inputs"], "actual selected code retirement input pins are incomplete")
     catalog = checked(Path(plan["catalog"]))
     need(catalog.is_dir() and (catalog / "catalog.lock").is_file(), "existing original catalog gate required")
     code = plan["code"]
     expected = {code[0]["tar_member"]: code[0]}
     return plan, catalog, code, expected, plan["archive_member"]
+
+
+def read_normal_deferred_selected_numeric_code_plan(inputs, plan_pin):
+    return _read_normal_deferred_selected_code_plan(inputs, plan_pin, NUMERIC_CODE_PROFILE)
+
+
+def read_normal_deferred_selected_native_code_plan(inputs, plan_pin):
+    return _read_normal_deferred_selected_code_plan(inputs, plan_pin, NATIVE_CODE_PROFILE)
 
 
 def audit_code_cache(plan_pin, *, seconds=300):
