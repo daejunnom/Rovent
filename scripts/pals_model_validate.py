@@ -38,7 +38,10 @@ _CPU_STAGE_DEPENDENCIES = MappingProxyType({
     "private_verifier_seconds": ("preparation_check_seconds",),
     "export_seconds": ("initialize_seconds", "reference_install_seconds"),
     "numeric_seconds": ("export_seconds",),
-    "rust_fixtures_seconds": ("numeric_seconds",),
+    # Fixture generation reads the checkpoint/export, not numeric-check's
+    # verdict. Preserve a failed comparison while collecting independent raw
+    # reference outputs; neither result admits the other as numerically valid.
+    "rust_fixtures_seconds": ("export_seconds",),
     "runtime_preservation_seconds": ("reference_install_seconds",),
 })
 
@@ -48,9 +51,26 @@ def cpu_stage_dependencies():
     return _CPU_STAGE_DEPENDENCIES
 
 
+class CommandNotStarted(RuntimeError):
+    """Popen reported that this executable could not be started."""
+    def __init__(self, command, error):
+        super().__init__(str(error))
+        self.command = list(command)
+        self.original_error_type = type(error).__name__
+        self.errno = error.errno
+
+
 def run(command, *, cwd, environment, seconds=300):
     started = time.monotonic()
-    subprocess.run(command, cwd=cwd, env=environment, check=True, timeout=seconds)
+    try:
+        subprocess.run(command, cwd=cwd, env=environment, check=True, timeout=seconds)
+    except (FileNotFoundError, PermissionError) as error:
+        # Popen reaps its failed exec child before reporting these errors. A
+        # missing cwd or arbitrary I/O error is not executable-start evidence.
+        if (error.filename != os.fspath(command[0])
+                or error.filename == os.fspath(cwd)):
+            raise
+        raise CommandNotStarted(command, error) from error
     return time.monotonic() - started
 
 
@@ -69,7 +89,8 @@ class ValidationStages:
     """Record real dependencies inside one shared managed CPU execution scope.
 
     A returned nonzero test/gate is a failed result, not a prerequisite for an
-    unrelated model command. Timeout, storage failure, or changed registered
+    unrelated model command. A failed executable start is also local to that
+    command. Timeout, storage failure, or changed registered
     inputs make this shared execution scope unsafe for further commands. The
     outer managed supervisor remains the sole process-tree closure authority.
     """
@@ -112,9 +133,12 @@ class ValidationStages:
             self.shared_failure = name
             result.update(status="failed", failure_scope="shared_managed_execution",
                           error_type=type(error).__name__, error=str(error)[:2048])
-        except (subprocess.CalledProcessError, ValueError) as error:
+        except (subprocess.CalledProcessError, CommandNotStarted, ValueError) as error:
             result.update(status="failed", failure_scope="stage",
                           error_type=type(error).__name__, error=str(error)[:2048])
+            if isinstance(error, CommandNotStarted):
+                result.update(command_exec_started=False, original_error_type=error.original_error_type,
+                              errno=error.errno)
             if isinstance(error, subprocess.CalledProcessError):
                 result["returncode"] = error.returncode
                 if error.returncode < 0:

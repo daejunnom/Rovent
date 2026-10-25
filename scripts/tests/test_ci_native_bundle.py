@@ -64,6 +64,10 @@ class NativeBundleTests(unittest.TestCase):
         # No subprocess/ELF runs: exercise the actual log/receipt boundary with
         # supervisor outcomes, including exit 0 with an unclosed process tree.
         for code, gone, failure in ((0, True, None),
+                                    (7, True, None),
+                                    (124, True, None),
+                                    (130, True, None),
+                                    (-15, True, None),
                                     (125, True, 'OriginalWholeBuildDeadline'),
                                     (0, False, None)):
             with self.subTest(code=code, gone=gone), tempfile.TemporaryDirectory() as temporary:
@@ -81,6 +85,15 @@ class NativeBundleTests(unittest.TestCase):
                     if code == 0 and gone is True and failure is None:
                         self.assertEqual(build.command('synthetic', ['no-executable'], env),
                                          b'synthetic command output\n')
+                    elif code == 7:
+                        with self.assertRaises(bundle.CommandExitFailure) as caught:
+                            build.command('synthetic', ['no-executable'], env)
+                        self.assertIs(caught.exception.row, build.commands[0])
+                        self.assertEqual(caught.exception.row['exit_code'], 7)
+                        self.assertEqual(caught.exception.row['stdout_pin']['bytes'],
+                                         len(b'synthetic command output\n'))
+                        self.assertEqual(caught.exception.row['stderr_pin'],
+                                         {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()})
                     else:
                         with self.assertRaisesRegex(RuntimeError, 'CommandOrOriginalTreeClosureFailed:synthetic'):
                             build.command('synthetic', ['no-executable'], env)
@@ -96,6 +109,136 @@ class NativeBundleTests(unittest.TestCase):
                 self.assertEqual(terminal['supervisor_error'], failure)
                 self.assertEqual(build.commands[0]['exit_code'], code)
                 self.assertEqual(build.commands[0]['original_tree_cleanup_verified'], gone)
+
+    def test_closed_target_exit_preserves_empty_stdout_and_builds_next_target(self):
+        specs = (('synthetic', 'bin', 'failed', 'feature'),
+                 ('synthetic', 'bin', 'continued', 'feature'))
+        metadata = {'packages': [{'name': 'synthetic', 'targets': [
+            {'name': name, 'kind': ['bin'], 'required-features': ['feature']} for _, _, name, _ in specs]}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = bundle.Build(root, root, 60)
+            env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                   'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
+            env['CARGO_TARGET_DIR'] = str(root / 'target')
+            calls, checks, failures, binaries = [], [], [], {}
+
+            def supervise(wrapper, *_args):
+                name = wrapper[wrapper.index('--bin') + 1]
+                calls.append(name)
+                if name == 'failed':
+                    os.write(2, b'original compiler diagnostic\n')
+                    return 7, True, None
+                os.write(1, b'synthetic compiler report\n')
+                return 0, True, None
+
+            copied = {'private_copy': {'bytes': 13, 'sha256': 'a' * 64}}
+            with patch.object(bundle, 'run_group', supervise), \
+                    patch.object(bundle, 'cargo_artifact', return_value=(root / 'continued', {'target': 'continued'})) as cargo, \
+                    patch.object(bundle, 'copy_cargo_elf', return_value=copied) as copy_elf, \
+                    patch.object(bundle.sys, 'stderr', io.StringIO()):
+                bundle.build_selected_targets(build, cargo='synthetic-cargo', env=env, metadata=metadata,
+                    source=root, private=root / 'private', specs=specs, registered_paths=set(),
+                    binaries=binaries, failures=failures, failure_check=lambda: checks.append('inputs'), warm=None)
+            self.assertEqual(calls, ['failed', 'continued'])
+            self.assertEqual(checks, ['inputs'])
+            self.assertEqual(set(binaries), {'continued'})
+            self.assertEqual(cargo.call_count, 1)
+            self.assertEqual(cargo.call_args.args[4], specs[1])
+            self.assertEqual(copy_elf.call_args.args[:2], (root / 'continued', root / 'private' / 'continued'))
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0]['target'], list(specs[0]))
+            self.assertEqual(failures[0]['exit_code'], 7)
+            self.assertIs(failures[0]['original_tree_cleanup_verified'], True)
+            self.assertIsNone(failures[0]['supervisor_error'])
+            self.assertEqual(failures[0]['stdout_pin'], {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()})
+            self.assertEqual(failures[0]['stderr_pin'],
+                             {'bytes': len(b'original compiler diagnostic\n'),
+                              'sha256': hashlib.sha256(b'original compiler diagnostic\n').hexdigest()})
+            self.assertEqual((root / 'logs' / 'build-failed.stderr').read_bytes(), b'original compiler diagnostic\n')
+
+    def test_shared_command_failures_do_not_dispatch_later_target(self):
+        specs = (('synthetic', 'bin', 'first', 'feature'), ('synthetic', 'bin', 'later', 'feature'))
+        for result in ((124, True, None), (130, True, None), (-15, True, None),
+                       (0, False, None), (1, True, 'ActualFreeSpaceReserve')):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT', 'CARGO_TARGET_DIR')}
+                failures, binaries, calls = [], {}, []
+
+                def supervise(wrapper, *_args):
+                    calls.append(wrapper[wrapper.index('--bin') + 1])
+                    os.write(2, b'preserved shared failure\n')
+                    return result
+
+                with patch.object(bundle, 'run_group', supervise), \
+                        patch.object(bundle, 'cargo_artifact') as cargo, \
+                        patch.object(bundle.sys, 'stderr', io.StringIO()):
+                    with self.assertRaises(RuntimeError) as caught:
+                        bundle.build_selected_targets(build, cargo='synthetic-cargo', env=env, metadata={},
+                            source=root, private=root / 'private', specs=specs, registered_paths=set(),
+                            binaries=binaries, failures=failures, failure_check=lambda: None, warm=None)
+                self.assertNotIsInstance(caught.exception, bundle.CommandExitFailure)
+                self.assertEqual(calls, ['first'])
+                self.assertEqual((build.commands[0]['exit_code'], build.commands[0]['original_tree_cleanup_verified'],
+                                  build.commands[0]['supervisor_error']), result)
+                self.assertEqual(failures, [])
+                self.assertEqual(binaries, {})
+                cargo.assert_not_called()
+                self.assertEqual((root / 'logs' / 'build-first.stderr').read_bytes(), b'preserved shared failure\n')
+
+    def test_closed_target_failure_does_not_hide_changed_shared_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = bundle.Build(root, root, 60)
+            env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                   'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT', 'CARGO_TARGET_DIR')}
+            failures, binaries = [], {}
+            mutation = RuntimeError('synthetic original source/lock mutation')
+
+            def supervise(*_args):
+                os.write(2, b'original failed compiler\n')
+                return 7, True, None
+
+            def fail_inputs():
+                raise mutation
+
+            with patch.object(bundle, 'run_group', supervise), \
+                    patch.object(bundle, 'cargo_artifact') as cargo, \
+                    patch.object(bundle.sys, 'stderr', io.StringIO()):
+                with self.assertRaises(RuntimeError) as caught:
+                    bundle.build_selected_targets(build, cargo='synthetic-cargo', env=env, metadata={},
+                        source=root, private=root / 'private',
+                        specs=(('synthetic', 'bin', 'first', 'feature'), ('synthetic', 'bin', 'later', 'feature')),
+                        registered_paths=set(), binaries=binaries, failures=failures,
+                        failure_check=fail_inputs, warm=None)
+            self.assertIs(caught.exception, mutation)
+            self.assertEqual(len(build.commands), 1)
+            self.assertEqual(failures[0]['exit_code'], 7)
+            self.assertEqual(binaries, {})
+            cargo.assert_not_called()
+
+    def test_partial_archive_contains_only_verified_successes_under_separate_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact, private = root / 'artifact', root / 'private'
+            artifact.mkdir()
+            private.mkdir()
+            raw = b'synthetic retained bytes, never executed'
+            (private / 'successful').write_bytes(raw)
+            binaries = {'successful': {'pin': bundle.file_pin(private / 'successful')}}
+            budgets = []
+            build = SimpleNamespace(budget=budgets.append)
+            path, pin = bundle.archive_selected_binaries(build, artifact, private, binaries,
+                                                       'partial-native-validation-binaries.tar.gz')
+            self.assertEqual(budgets, [len(raw)])
+            self.assertEqual(pin, bundle.file_pin(path))
+            self.assertFalse((artifact / 'native-validation-binaries.tar.gz').exists())
+            with tarfile.open(path, 'r:gz') as archive:
+                self.assertEqual(archive.getnames(), ['bin/successful'])
+                self.assertEqual(archive.extractfile('bin/successful').read(), raw)
 
     def test_cross_source_creation_time_preserves_all_named_file_identity_fields(self):
         fields = dict(st_dev=7, st_ino=(1 << 100) + 11, st_mode=stat.S_IFREG | 0o666,

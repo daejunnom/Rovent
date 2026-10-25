@@ -59,13 +59,17 @@ class ValidationStageTests(unittest.TestCase):
         self.assertEqual(self.stages.results["export"]["blocked_by"], ["initialize"])
         self.assertFalse(self.stages.results["export"]["executed"])
 
-    def test_numeric_failure_does_not_publish_passing_fixture_or_hide_failure(self):
-        self.failed_gate("numeric")
-        self.assertFalse(self.stages.perform("rust_fixtures", self.operation("fixtures"), requires=("numeric",)))
-        self.assertTrue(self.stages.perform("runtime_asset", self.operation("runtime")))
-        self.assertNotIn("numeric", self.receipt["stages"])
-        self.assertNotIn("rust_fixtures", self.receipt["stages"])
-        self.assertIn("runtime_asset", self.receipt["stages"])
+    def test_numeric_failure_preserves_independent_reference_outputs_and_failure(self):
+        for name in cpu_stage_dependencies():
+            operation = self.operation(name, subprocess.CalledProcessError(1, [name])
+                                       if name == "numeric_seconds" else None)
+            self.stages.perform(name, operation)
+        self.assertFalse(self.stages.passed("numeric_seconds"))
+        self.assertTrue(self.stages.passed("rust_fixtures_seconds"))
+        self.assertTrue(self.stages.passed("runtime_preservation_seconds"))
+        self.assertNotIn("numeric_seconds", self.receipt["stages"])
+        self.assertEqual(self.stages.results["numeric_seconds"]["returncode"], 1)
+        self.assertIn("rust_fixtures_seconds", self.calls)
         with self.assertRaises(ValidationStagesFailed):
             self.stages.require_complete()
 
@@ -94,6 +98,33 @@ class ValidationStageTests(unittest.TestCase):
                 self.assertFalse(stages.perform("first", self.operation("first", error)))
                 self.assertFalse(stages.perform("second", self.operation("must_not_run")))
                 self.assertEqual(stages.results["first"]["failure_scope"], "shared_managed_execution")
+
+    def test_missing_executable_keeps_independent_command_without_claiming_execution(self):
+        command = ["/absent/cargo", "run"]
+        for error in (FileNotFoundError(2, "missing executable", command[0]),
+                      PermissionError(13, "executable denied", command[0])):
+            with self.subTest(error=type(error).__name__):
+                stages = ValidationStages({"stages": {}}, lambda: None)
+                with mock.patch.object(wrapper.subprocess, "run", side_effect=error):
+                    self.assertFalse(stages.perform("packing_reader", lambda: wrapper.run(
+                        command, cwd="/registered/source", environment={})))
+                self.assertTrue(stages.perform("neural", self.operation("neural")))
+                result = stages.results["packing_reader"]
+                self.assertFalse(result["command_exec_started"])
+                self.assertEqual(result["failure_scope"], "stage")
+                self.assertEqual(result["original_error_type"], type(error).__name__)
+
+    def test_missing_cwd_is_not_reported_as_executable_start_failure(self):
+        error = FileNotFoundError(2, "missing cwd", "/missing/source")
+        for command in (["/registered/cargo"], ["/missing/source"]):
+            with self.subTest(command=command):
+                stages = ValidationStages({"stages": {}}, lambda: None)
+                with mock.patch.object(wrapper.subprocess, "run", side_effect=error):
+                    self.assertFalse(stages.perform("first", lambda: wrapper.run(
+                        command, cwd="/missing/source", environment={})))
+                self.assertFalse(stages.perform("second", self.operation("must_not_run")))
+                self.assertEqual(stages.results["first"]["error_type"], "FileNotFoundError")
+                self.assertEqual(stages.results["second"]["failure_scope"], "shared_managed_execution")
 
     def test_changed_registered_input_never_dispatches_a_command(self):
         def changed():
@@ -150,7 +181,8 @@ class ActualCpuPlanTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.assertFalse(self.ancestors(stage) & unrelated)
         self.assertIn("initialize_seconds", self.ancestors("numeric_seconds"))
-        self.assertIn("numeric_seconds", self.ancestors("rust_fixtures_seconds"))
+        self.assertIn("export_seconds", self.ancestors("rust_fixtures_seconds"))
+        self.assertNotIn("numeric_seconds", self.ancestors("rust_fixtures_seconds"))
 
     def test_actual_weight_free_packing_does_not_require_model_initialization(self):
         prerequisites = self.ancestors("device_packing_rust_body_seconds")

@@ -371,6 +371,13 @@ def cleanup_compiler_outputs(root, artifact, receipt):
     return journal
 
 
+class CommandExitFailure(RuntimeError):
+    """A nonzero command with bounded logs and a verified closed original tree."""
+    def __init__(self, row):
+        super().__init__('ClosedCommandExitFailed:' + row['label'])
+        self.row = row
+
+
 class Build:
     def __init__(self, root, source, seconds):
         self.root, self.source = root, source
@@ -443,9 +450,13 @@ class Build:
                 else 'command_or_original_tree_failed',
                 exit_code=code, original_tree_cleanup_verified=gone,
                 supervisor_error=None if failure is None else str(failure)[:2048])
-        require(code == 0 and gone is True and failure is None, 'CommandOrOriginalTreeClosureFailed:' + label)
+        # The shared supervisor also uses 124/130 for timeout/cancellation even
+        # when its original tree was drained. Those are never target-local.
+        require(type(code) is int and code >= 0 and code not in (124, 130)
+                and gone is True and failure is None,
+                'CommandOrOriginalTreeClosureFailed:' + label)
         check()
-        stream, row['stdout_pin'], before, _ = pinned_file(out, LOG_CAP)
+        stream, row['stdout_pin'], before, _ = pinned_file(out, LOG_CAP, allow_empty=code != 0)
         with stream:
             raw = stream.read()
             require(same_file_identity(before, os.fstat(stream.fileno()), out.lstat()), 'CommandStdoutFDChanged')
@@ -453,7 +464,40 @@ class Build:
         row['stderr_bytes'] = err.stat().st_size
         stream, row['stderr_pin'], _, _ = pinned_file(err, LOG_CAP, allow_empty=True)
         stream.close()
+        if code != 0:
+            raise CommandExitFailure(row)
         return raw
+
+
+def build_selected_targets(build, *, cargo, env, metadata, source, private, specs,
+                           registered_paths, binaries, failures, failure_check, warm):
+    """Continue only independent Cargo exits; custody/input failures still abort."""
+    for spec in specs:
+        package, kind, name, features = spec
+        argv = [cargo, 'build', '--locked', '--release', '--no-default-features',
+                '-p', package, '--features', features, '--' + kind, name, '--message-format=json-render-diagnostics']
+        try:
+            raw = build.command('build-' + name, argv, env)
+        except CommandExitFailure as error:
+            row = error.row
+            failures.append({'target': list(spec), 'command_label': row['label'],
+                             'exit_code': row['exit_code'],
+                             'original_tree_cleanup_verified': row['original_tree_cleanup_verified'],
+                             'supervisor_error': row['supervisor_error'],
+                             'stdout_pin': dict(row['stdout_pin']), 'stderr_pin': dict(row['stderr_pin'])})
+            # A closed failing compiler does not excuse changed shared inputs.
+            failure_check()
+            continue
+        output, compiled = cargo_artifact(raw, metadata, source, Path(env['CARGO_TARGET_DIR']),
+                                          spec, registered_paths)
+        copy_result = copy_cargo_elf(output, private / name, build.budget)
+        required = next(t.get('required-features', []) for p in metadata['packages'] if p['name'] == package
+                        for t in p['targets'] if t['name'] == name and t['kind'] == [kind])
+        binaries[name] = {'pin': copy_result['private_copy'], 'cargo_copy': copy_result,
+                          'compiler_artifact': compiled, 'requested_features': features.split(','),
+                          'cargo_metadata_required_features': required,
+                          'compiled_capability_scope': 'standalone_eval_warm_capture_only_not_engine_native_bootstrap_acceptance' if spec == warm else 'explicit_cargo_target_only_runtime_not_admitted',
+                          'role': 'optional_warm_validation' if spec == warm else ('diagnostic_auxiliary' if name == 'pals_continuation_diagnostic' else 'native_validation')}
 
 
 def selected_elf_payload(binaries):
@@ -482,6 +526,26 @@ class BoundedArchiveWriter:
 
     def tell(self):
         return self.written
+
+
+def archive_selected_binaries(build, artifact, private, binaries, filename):
+    """Preserve only verified private copies, without granting bundle admission."""
+    total = selected_elf_payload(binaries)
+    build.budget(total)
+    bundle = artifact / filename
+    compressed_cap = ARTIFACT_CAP - tree_size(artifact) - (16 << 20)
+    require(compressed_cap > 0, 'CompressedArchiveMetadataReserve')
+    with bundle.open('xb') as raw, tarfile.open(fileobj=BoundedArchiveWriter(raw, compressed_cap),
+                                              mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+        for name in sorted(binaries):
+            stream, actual, before, _ = pinned_file(private / name, ELF_CAP)
+            with stream:
+                require(actual == {k: binaries[name]['pin'][k] for k in ('bytes', 'sha256')}, 'PreBundlePrivatePin')
+                info = tarfile.TarInfo('bin/' + name)
+                info.size, info.mode = actual['bytes'], 0o700
+                archive.addfile(info, stream)
+                require(same_file_identity(before, os.fstat(stream.fileno()), (private / name).lstat()), 'BundleMemberFDChanged')
+    return bundle, file_pin(bundle, ARTIFACT_CAP)
 
 
 def write_json(path, value):
@@ -528,7 +592,8 @@ def run(source, root, expected_head, seconds):
                'optimizer_updates': 0, 'mapped_image': None, 'numerical_or_runtime_acceptance': None,
                'host': {'machine': platform.machine(), 'libc_observed': platform.libc_ver(),
                         'glibc_compatibility_claim': None},
-               'metadata_getter_scope': 'static_source_inventory_core5_registry_rules_only', 'binaries': {}}
+               'metadata_getter_scope': 'static_source_inventory_core5_registry_rules_only',
+               'binaries': {}, 'target_failures': []}
     receipt['uploaded_command_log_directory'] = 'command-logs'
     env = {key: os.environ[key] for key in ('PATH', 'HOME', 'RUSTUP_HOME') if key in os.environ}
     for folder in ('cargo-home', 'tmp'):
@@ -564,22 +629,31 @@ def run(source, root, expected_head, seconds):
         warm, receipt['warm_status'] = warm_spec(manifest, {r['path'] for r in rows})
         selected_specs = SPECS + ((warm,) if warm else ())
         validate_functional_specs(selected_specs)
-        for spec in selected_specs:
-            package, kind, name, features = spec
-            # Reuse Cargo's fingerprinted dependencies, retaining separate invocations
-            # and exact feature admission. Copy each target privately before the next build.
-            argv = [tools['cargo'], 'build', '--locked', '--release', '--no-default-features',
-                    '-p', package, '--features', features, '--' + kind, name, '--message-format=json-render-diagnostics']
-            output, compiled = cargo_artifact(build.command('build-' + name, argv, env), metadata, source,
-                                              Path(env['CARGO_TARGET_DIR']), spec, {r['path'] for r in rows})
-            copy_result = copy_cargo_elf(output, private / name, build.budget)
-            required = next(t.get('required-features', []) for p in metadata['packages'] if p['name'] == package
-                            for t in p['targets'] if t['name'] == name and t['kind'] == [kind])
-            receipt['binaries'][name] = {'pin': copy_result['private_copy'], 'cargo_copy': copy_result,
-                                         'compiler_artifact': compiled, 'requested_features': features.split(','),
-                                         'cargo_metadata_required_features': required,
-                                         'compiled_capability_scope': 'standalone_eval_warm_capture_only_not_engine_native_bootstrap_acceptance' if spec == warm else 'explicit_cargo_target_only_runtime_not_admitted',
-                                         'role': 'optional_warm_validation' if spec == warm else ('diagnostic_auxiliary' if name == 'pals_continuation_diagnostic' else 'native_validation')}
+
+        def recheck_registered_inputs():
+            require(source_inventory(source, tree) == (rows, controls)
+                    and same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat())
+                    and file_pin(source / 'Cargo.lock') == lock_pin, 'SourceOrLockChangedDuringBuild')
+
+        receipt['requested_targets'] = [list(spec) for spec in selected_specs]
+        # Reuse Cargo fingerprints, but catch only a verified closed ordinary
+        # compiler exit. Validation, storage, timeout and shared-input errors abort.
+        build_selected_targets(build, cargo=tools['cargo'], env=env, metadata=metadata,
+                               source=source, private=private, specs=selected_specs,
+                               registered_paths={r['path'] for r in rows}, binaries=receipt['binaries'],
+                               failures=receipt['target_failures'], failure_check=recheck_registered_inputs, warm=warm)
+        if receipt['target_failures']:
+            recheck_registered_inputs()
+            require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
+                    'HeadChangedDuringBuild')
+            if receipt['binaries']:
+                _, partial_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'],
+                                                          'partial-native-validation-binaries.tar.gz')
+                receipt['partial_binary_bundle'] = partial_pin
+                receipt['partial_binary_bundle_file'] = 'partial-native-validation-binaries.tar.gz'
+                receipt['partial_bundle_scope'] = 'successful_targets_only_failed_full_bundle_not_admitted'
+            raise RuntimeError('RequiredCargoTargetsFailed')
+        require(set(receipt['binaries']) == {spec[2] for spec in selected_specs}, 'CompleteSelectedTargetRoster')
         if warm:
             receipt['warm_status'] = 'BUILT_SAME_HEAD_NOT_EXECUTED_OR_NUMERICALLY_ADMITTED'
         compiled = strict_json(build.command('compiled-source-inventory', [str(private / 'rz-pals-adaptive'), '--source-inventory'], env))
@@ -630,9 +704,7 @@ def run(source, root, expected_head, seconds):
             encoder.update(len(raw).to_bytes(8, 'little') + raw)
         require(rules.get('rules_input_semantic_sha256') == semantic.hexdigest()
                 and rules.get('rules_encoder_source_sha256') == encoder.hexdigest(), 'StaticRulesDescriptorSourceFraming')
-        require(source_inventory(source, tree) == (rows, controls)
-                and same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat())
-                and file_pin(source / 'Cargo.lock') == lock_pin, 'SourceOrLockChangedDuringBuild')
+        recheck_registered_inputs()
         require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                 'HeadChangedDuringBuild')
         pins = [{key: row[key] for key in ('path', 'bytes', 'sha256')} for row in rows]
@@ -651,26 +723,12 @@ def run(source, root, expected_head, seconds):
         require(same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat()),
                 'BundledLockOriginalFDChanged')
         require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
-        members = sorted(receipt['binaries'])
-        total = selected_elf_payload(receipt['binaries'])
-        build.budget(total)
-        bundle = artifact / 'native-validation-binaries.tar.gz'
-        compressed_cap = ARTIFACT_CAP - tree_size(artifact) - (16 << 20)
-        require(compressed_cap > 0, 'CompressedArchiveMetadataReserve')
-        with bundle.open('xb') as raw, tarfile.open(fileobj=BoundedArchiveWriter(raw, compressed_cap),
-                                                  mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
-            for name in members:
-                stream, actual, before, _ = pinned_file(private / name, ELF_CAP)
-                with stream:
-                    require(actual == {k: receipt['binaries'][name]['pin'][k] for k in ('bytes', 'sha256')}, 'PreBundlePrivatePin')
-                    info = tarfile.TarInfo('bin/' + name)
-                    info.size, info.mode = actual['bytes'], 0o700
-                    archive.addfile(info, stream)
-                    require(same_file_identity(before, os.fstat(stream.fileno()), (private / name).lstat()), 'BundleMemberFDChanged')
+        bundle, bundle_pin = archive_selected_binaries(build, artifact, private, receipt['binaries'],
+                                                       'native-validation-binaries.tar.gz')
         receipt.update(status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
                        source_files=len(rows), component_count=len(components), source_components=components,
                        Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
-                       binary_bundle=file_pin(bundle, ARTIFACT_CAP), metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
+                        binary_bundle=bundle_pin, metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
         build.budget()
     except BaseException as error:
         receipt['status'] = 'FAILED_NOT_ADMITTED'
@@ -685,12 +743,22 @@ def run(source, root, expected_head, seconds):
             logs.mkdir(mode=0o700)
             for path in sorted((root / 'logs').iterdir()):
                 try:
-                    stream, _, before, _ = pinned_file(path, LOG_CAP, allow_empty=True)
+                    stream, log_pin, before, _ = pinned_file(path, LOG_CAP, allow_empty=True)
                     with stream, (logs / path.name).open('xb') as target:
                         shutil.copyfileobj(stream, target, 65536)
                         target.flush()
                         os.fsync(target.fileno())
                         require(same_file_identity(before, os.fstat(stream.fileno()), path.lstat()), 'ClosedCommandLogFDChanged')
+                    # This existing closed-log preservation also covers timeout
+                    # or cancellation rows that stopped before command pinning.
+                    for row in build.commands:
+                        for channel in ('stdout', 'stderr'):
+                            if row[channel] == path.name:
+                                require(channel + '_pin' not in row or row[channel + '_pin'] == log_pin,
+                                        'ClosedCommandLogPinChanged')
+                                row[channel + '_pin'] = log_pin
+                                if channel == 'stderr':
+                                    row['stderr_bytes'] = log_pin['bytes']
                 except (OSError, RuntimeError) as error:
                     receipt['status'] = 'FAILED_NOT_ADMITTED'
                     receipt['log_preservation_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
