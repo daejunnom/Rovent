@@ -1,5 +1,6 @@
 """Real bounded temp archives/owners; no ELF execution, models, GPU, or real cleanup."""
 from pathlib import Path
+import copy
 import hashlib
 import gzip
 import io
@@ -30,6 +31,76 @@ def pin(path):
 def dump(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
     return pin(path)
+
+
+class NumericCodePlanDeclarationTests(unittest.TestCase):
+    """Pure DTOs only; no filesystem, owner, View or producer is created."""
+
+    @staticmethod
+    def raw_pin(path, payload):
+        return {"path": path, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+
+    def plan(self, label):
+        data = label.encode("utf-8")
+        root = "/fixture-" + label
+        catalog, output = root + "/catalog", root + "/inputs/candidate-" + label
+        key = hashlib.sha256(output.encode("utf-8")).hexdigest()
+        code = b"synthetic code declaration " + data
+        keeper = self.raw_pin(root + "/inputs/keeper-" + label + "/" + review.NUMERIC_CODE_RELATIVE, code)
+        return {"schema": review.NUMERIC_CODE_PLAN_SCHEMA, "profile": review.NUMERIC_CODE_PROFILE,
+            "source_commit": hashlib.sha1(b"synthetic source " + data).hexdigest(),
+            "catalog": catalog, "key": key, "output": output,
+            "output_identity": [len(data) + 1, sum(data) + 1],
+            "record_pin": self.raw_pin(catalog + "/" + key + ".json", b"synthetic record " + data),
+            "artifact": self.raw_pin(root + "/canonical.zip", b"synthetic archive " + data),
+            "archive_member": "fixture-binaries.tar.gz",
+            "code": [{"relative": review.NUMERIC_CODE_RELATIVE, "tar_member": review.NUMERIC_CODE_TAR_MEMBER,
+                      "bytes": len(code), "sha256": hashlib.sha256(code).hexdigest()}],
+            "research": self.raw_pin(root + "/research.zip", b"synthetic research " + data),
+            "raw_evidence": [{"pin": self.raw_pin(root + "/reports/result.stderr", b"synthetic raw " + data),
+                              "member": "raw/result.stderr"}],
+            "protected_reference_pins": [dict(keeper)], "duplicate_keeper": dict(keeper)}
+
+    def test_plan_preserves_distinct_declared_inputs_without_retirement_authority(self):
+        plans = [self.plan("alpha"), self.plan("beta")]
+        for field in ("catalog", "output", "source_commit", "output_identity"):
+            self.assertNotEqual(plans[0][field], plans[1][field])
+        self.assertNotEqual(plans[0]["code"][0]["sha256"], plans[1]["code"][0]["sha256"])
+        self.assertNotEqual(plans[0]["duplicate_keeper"]["sha256"], plans[1]["duplicate_keeper"]["sha256"])
+        for value in plans:
+            with self.subTest(output=value["output"]):
+                original = copy.deepcopy(value)
+                proposal = review.prepare_normal_deferred_selected_numeric_code_plan(value)
+                self.assertEqual(proposal["status"], "PLAN_DATA_PREPARED")
+                self.assertEqual(proposal["required_inputs"], [])
+                self.assertEqual(proposal["plan"], original)
+                self.assertEqual(proposal["proposed_plan"], original)
+                self.assertEqual(value, original)
+                self.assertIs(proposal["retirement_authority_issued"], False)
+                self.assertIs(proposal["deletion_performed"], False)
+
+    def test_empty_raw_evidence_requires_empty_hash_and_other_payloads_stay_positive(self):
+        value = self.plan("empty-evidence")
+        raw_path = value["raw_evidence"][0]["pin"]["path"]
+        value["raw_evidence"][0]["pin"] = self.raw_pin(raw_path, b"")
+        proposal = review.prepare_normal_deferred_selected_numeric_code_plan(value)
+        self.assertEqual(proposal["plan"]["raw_evidence"], value["raw_evidence"])
+        self.assertIs(proposal["retirement_authority_issued"], False)
+        self.assertIs(proposal["deletion_performed"], False)
+        wrong_hash = copy.deepcopy(value)
+        wrong_hash["raw_evidence"][0]["pin"]["sha256"] = hashlib.sha256(b"not empty").hexdigest()
+        with self.assertRaises(StorageError):
+            review.prepare_normal_deferred_selected_numeric_code_plan(wrong_hash)
+        for field in ("code", "artifact", "research", "record_pin"):
+            with self.subTest(positive_payload=field):
+                empty_payload = copy.deepcopy(value)
+                if field == "code":
+                    empty_payload["code"][0].update(bytes=0, sha256=hashlib.sha256(b"").hexdigest())
+                    empty_payload["duplicate_keeper"] = None
+                else:
+                    empty_payload[field] = self.raw_pin(empty_payload[field]["path"], b"")
+                with self.assertRaises(StorageError):
+                    review.prepare_normal_deferred_selected_numeric_code_plan(empty_payload)
 
 
 class ArtifactReviewTests(unittest.TestCase):

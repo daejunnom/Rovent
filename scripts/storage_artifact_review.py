@@ -7,6 +7,7 @@ signal processes, adopt quarantine records, or modify catalog rows.
 from __future__ import annotations
 
 import contextlib
+import copy
 import gzip
 import hashlib
 import json
@@ -30,6 +31,10 @@ ARCHIVE_CAP = 512 << 20
 MAX_FILES = 512
 CODE_NAMES = {spec[2] for spec in FUNCTIONAL_SPECS}
 HEX = re.compile(r"[0-9a-f]{64}\Z")
+NUMERIC_CODE_PROFILE = "normal-deferred-selected-numeric-code"
+NUMERIC_CODE_PLAN_SCHEMA = "rovezero.normal-deferred-selected-numeric-code-plan.v1"
+NUMERIC_CODE_RELATIVE = "selected-numeric/virtual_review_numeric_capture"
+NUMERIC_CODE_TAR_MEMBER = "bin/virtual_review_numeric_capture"
 
 
 def need(value, message):
@@ -270,6 +275,138 @@ def read_code_plan(inputs, plan_pin):
     raw_pin(plan["research"], RESEARCH_CAP)
     raw_pin(plan["artifact"], ARCHIVE_CAP)
     return plan, catalog, code, expected, archive_member
+
+
+def _numeric_raw_pin(value, maximum, *, allow_empty=False):
+    """Pure POSIX declaration checks; the held-FD readers own actual admission."""
+    fields(value, ("path", "bytes", "sha256"))
+    need(type(value["path"]) is str and "\\" not in value["path"]
+         and not any(ord(c) < 32 for c in value["path"]), "plain POSIX raw pin path required")
+    path = PurePosixPath(value["path"])
+    need(path.is_absolute() and str(path) == value["path"] and ".." not in path.parts,
+         "canonical absolute POSIX raw pin path required")
+    need(type(allow_empty) is bool, "explicit raw evidence empty-file policy required")
+    need(type(value["bytes"]) is int and (0 if allow_empty else 1) <= value["bytes"] <= maximum
+         and type(value["sha256"]) is str and HEX.fullmatch(value["sha256"]) is not None
+         and value["sha256"] != "0" * 64, "actual bounded bytes/hash required; no placeholder pins")
+    if value["bytes"] == 0:
+        need(value["sha256"] == hashlib.sha256(b"").hexdigest(), "actual empty raw evidence SHA required")
+    no_secret(value["path"])
+    return value
+
+
+def prepare_normal_deferred_selected_numeric_code_plan(value):
+    """Prepare closed plan data; current View/FD/owner checks own admission."""
+    names = ("schema", "profile", "source_commit", "catalog", "key", "output", "output_identity",
+             "record_pin", "artifact", "archive_member", "code", "research", "raw_evidence",
+             "protected_reference_pins", "duplicate_keeper")
+    fields(value, names)
+    need(value["schema"] == NUMERIC_CODE_PLAN_SCHEMA and value["profile"] == NUMERIC_CODE_PROFILE
+         and type(value["source_commit"]) is str
+         and re.fullmatch("[0-9a-f]{40}", value["source_commit"]) is not None
+         and value["source_commit"] != "0" * 40, "explicit selected numeric source/profile required")
+    paths = {}
+    for name in ("catalog", "output"):
+        text = value[name]
+        need(type(text) is str and "\\" not in text and not any(ord(c) < 32 for c in text),
+             "plain selected catalog/output path required")
+        path = PurePosixPath(text)
+        need(path.is_absolute() and str(path) == text and ".." not in path.parts
+             and str(path) != "/", "canonical selected catalog/output path required")
+        no_secret(text)
+        paths[name] = path
+    catalog, output = paths["catalog"], paths["output"]
+    need(not output.is_relative_to(catalog) and not catalog.is_relative_to(output)
+         and output.parent.name == "inputs", "distinct registered input output/catalog required")
+    need(type(value["key"]) is str and HEX.fullmatch(value["key"]) is not None
+         and value["key"] == hashlib.sha256(str(output).encode()).hexdigest(),
+         "canonical selected output key must derive from its actual normalized path")
+    identity = value["output_identity"]
+    need(type(identity) is list and len(identity) == 2
+         and all(type(item) is int and item > 0 for item in identity), "actual output identity required")
+    code = value["code"]
+    need(type(code) is list and len(code) == 1 and type(code[0]) is dict,
+         "one explicit selected numeric ELF required")
+    fields(code[0], ("relative", "tar_member", "bytes", "sha256"))
+    need(code[0]["relative"] == NUMERIC_CODE_RELATIVE and code[0]["tar_member"] == NUMERIC_CODE_TAR_MEMBER
+         and "virtual_review_numeric_capture" in CODE_NAMES, "one registered selected numeric code kind only")
+    candidate = str(output / member_name(code[0]["relative"]))
+    _numeric_raw_pin({"path": candidate, "bytes": code[0]["bytes"], "sha256": code[0]["sha256"]}, ELF_CAP)
+    missing = []
+    for name, maximum in (("record_pin", 8192), ("artifact", ARCHIVE_CAP), ("research", RESEARCH_CAP)):
+        pin = value[name]
+        if pin is None:
+            missing.append(name)
+        else:
+            _numeric_raw_pin(pin, maximum)
+    record_path = str(catalog / (value["key"] + ".json"))
+    if value["record_pin"] is not None:
+        need(value["record_pin"]["path"] == record_path, "actual selected canonical row raw pin required")
+    if value["archive_member"] is None:
+        missing.append("archive_member")
+    else:
+        member_name(value["archive_member"])
+    evidence = value["raw_evidence"]
+    if evidence is None:
+        missing.append("raw_evidence")
+    else:
+        need(type(evidence) is list and 1 <= len(evidence) <= 32, "explicit original raw evidence required")
+        members, evidence_paths, total = set(), set(), 0
+        for item in evidence:
+            fields(item, ("pin", "member"))
+            pin = _numeric_raw_pin(item["pin"], RESEARCH_CAP, allow_empty=True)
+            member = member_name(item["member"])
+            need(member not in members | {"inventory.json", "original/catalog-row.json"}
+                 and pin["path"] not in evidence_paths and pin["path"] != record_path,
+                 "distinct original raw evidence, separate from canonical row, required")
+            members.add(member)
+            evidence_paths.add(pin["path"])
+            total += pin["bytes"]
+        need(total <= RESEARCH_CAP, "original raw evidence exceeds unchanged32MiB research bound")
+    references = value["protected_reference_pins"]
+    if references is None:
+        missing.append("protected_reference_pins")
+    else:
+        need(type(references) is list and 1 <= len(references) <= 32,
+             "nonempty explicit current protected input references required")
+        reference_paths = set()
+        for pin in references:
+            _numeric_raw_pin(pin, ELF_CAP)
+            reference = PurePosixPath(pin["path"])
+            need(reference.is_relative_to(output.parent), "protected references are registered code inputs only")
+            relative = reference.relative_to(output.parent)
+            need(len(relative.parts) == 3 and relative.parts[1] in
+                 ("selected-native", "selected-numeric", "selected-numerical-gate", "selected4", "private-elf")
+                 and relative.name in CODE_NAMES, "model/runtime payloads are not numeric retirement inputs")
+            need(pin["path"] not in reference_paths and pin["path"] != candidate,
+                 "candidate is a current protected reference or reference path is duplicated")
+            reference_paths.add(pin["path"])
+    if value["duplicate_keeper"] is not None:
+        keeper = _numeric_raw_pin(value["duplicate_keeper"], ELF_CAP)
+        location = PurePosixPath(keeper["path"])
+        need({key: keeper[key] for key in ("bytes", "sha256")} ==
+             {key: code[0][key] for key in ("bytes", "sha256")}
+             and not location.is_relative_to(output) and not location.is_relative_to(catalog),
+             "optional duplicate keeper must be a distinct external same-content ELF")
+    proposed = copy.deepcopy(value)
+    return {"schema": "rovezero.normal-deferred-selected-numeric-code-proposal.v1",
+            "status": "PLAN_DATA_PREPARED" if not missing else "ACTUAL_INPUT_PINS_REQUIRED",
+            "profile": NUMERIC_CODE_PROFILE, "required_inputs": sorted(missing),
+            "plan": proposed if not missing else None, "proposed_plan": proposed,
+            "retirement_authority_issued": False, "deletion_performed": False,
+            "owner_created_or_recovered": False, "physical_completion_attested": False}
+
+
+def read_normal_deferred_selected_numeric_code_plan(inputs, plan_pin):
+    """Read a complete data plan; live FD/View/owner checks remain mandatory."""
+    plan = decode(inputs.open(plan_pin, INVENTORY_CAP).read(INVENTORY_CAP + 1))
+    proposal = prepare_normal_deferred_selected_numeric_code_plan(plan)
+    need(not proposal["required_inputs"], "actual selected numeric retirement input pins are incomplete")
+    catalog = checked(Path(plan["catalog"]))
+    need(catalog.is_dir() and (catalog / "catalog.lock").is_file(), "existing original catalog gate required")
+    code = plan["code"]
+    expected = {code[0]["tar_member"]: code[0]}
+    return plan, catalog, code, expected, plan["archive_member"]
 
 
 def audit_code_cache(plan_pin, *, seconds=300):

@@ -16,6 +16,9 @@ disk/VHD space-return proof.
 """
 from __future__ import annotations
 
+import ast
+import __future__
+import contextlib
 import errno
 import hashlib
 import json
@@ -24,6 +27,8 @@ from pathlib import Path
 import stat
 import sys
 import time
+from types import CodeType, FunctionType, MethodType, ModuleType
+import zipfile
 
 import storage_artifact_review as review
 from managed_storage import GiB, StorageError, checked, read_record_snapshot
@@ -677,5 +682,466 @@ def retire_code_cache(plan_pin, *, seconds=300):
             pass
         _note(first, "retirement evidence preserved: journal=" + str(evidence["journal_path"])
               + "; logical_removed_bytes=" + str(removed) + "; no automatic retry or owner reissue")
+        raise first
+    return result
+
+
+_NUMERIC_PREPARED_TOKEN = object()
+
+
+def _numeric_source_function(module, name):
+    value = vars(module).get(name)
+    _need(type(module) is ModuleType and type(value) is FunctionType
+          and value.__globals__ is vars(module)
+          and value.__code__.co_filename == module.__file__, "actual source function required: " + name)
+    return value
+
+
+def _numeric_normalized_code(code):
+    return code.replace(co_flags=code.co_flags & ~__future__.annotations.compiler_flag,
+        co_consts=tuple(_numeric_normalized_code(value) if type(value) is CodeType else value
+                        for value in code.co_consts))
+
+
+def _numeric_attest_source(pack, originals):
+    _need(type(pack) is tuple and len(pack) == 3, "actual borrowed source pack required")
+    module, held, pin = pack
+    review.raw_pin(pin, 128 << 10)
+    _need(type(module) is ModuleType and module.__file__ == pin["path"]
+          and type(held) is tuple and len(held) == 3,
+          "same actual source module/FD/path required")
+    _need(any(type(item) is tuple and len(item) == 3 and item[0] == held[0]
+              and item[1] is held[1] and item[2] is held[2] for item in originals.held),
+          "borrowed source FD must belong to actual Originals")
+    import fcntl
+    _need(type(held[0]) is int and held[0] >= 0
+          and fcntl.fcntl(held[0], fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY,
+          "actual readonly borrowed source FD required")
+    before = _file_identity(held[2])
+    _need(before == _file_identity(os.fstat(held[0])) == _file_identity(held[1].lstat())
+          and held[2].st_size == pin["bytes"], "borrowed source FD/name changed")
+    raw = os.pread(held[0], pin["bytes"] + 1, 0)
+    _need((len(raw), hashlib.sha256(raw).hexdigest()) == (pin["bytes"], pin["sha256"]),
+          "actual borrowed source raw pin changed")
+    tree = ast.parse(raw)
+    code = compile(raw, module.__file__, "exec", dont_inherit=True)
+    compiled = {value.co_name: value for value in code.co_consts if type(value) is CodeType}
+    definitions = {node.name: node for node in tree.body
+                   if type(node) in (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)}
+    for name, definition in definitions.items():
+        wanted, actual = compiled[name], vars(module).get(name)
+        if type(definition) in (ast.FunctionDef, ast.AsyncFunctionDef):
+            candidate = actual
+            if definition.decorator_list:
+                decorators = definition.decorator_list
+                decorator = decorators[0]
+                stdlib_contextmanager = (type(decorator) is ast.Name and decorator.id == "contextmanager"
+                    and vars(module).get("contextmanager") is contextlib.contextmanager) or (
+                    type(decorator) is ast.Attribute and decorator.attr == "contextmanager"
+                    and type(decorator.value) is ast.Name and decorator.value.id == "contextlib"
+                    and vars(module).get("contextlib") is contextlib)
+                _need(len(decorators) == 1 and stdlib_contextmanager,
+                      "only the original explicit stdlib contextmanager decorator is supported")
+                wrapped = getattr(actual, "__wrapped__", None)
+                expected_wrapper = contextlib.contextmanager(FunctionType(wanted, vars(module), name))
+                _need(type(actual) is FunctionType and actual.__globals__ is vars(contextlib)
+                      and actual.__code__ is expected_wrapper.__code__
+                      and actual.__closure__ is not None and len(actual.__closure__) == 1
+                      and actual.__closure__[0].cell_contents is wrapped,
+                      "actual stdlib contextmanager wrapper and original closure required")
+                candidate = wrapped
+            _need(type(candidate) is FunctionType and candidate.__globals__ is vars(module)
+                  and _numeric_normalized_code(candidate.__code__) == _numeric_normalized_code(wanted),
+                  "borrowed source function missing/replaced: " + name)
+        else:
+            _need(type(actual) is type and actual.__module__ == module.__name__,
+                  "borrowed source class missing/replaced: " + name)
+            names = {node.name for node in definition.body
+                     if type(node) in (ast.FunctionDef, ast.AsyncFunctionDef)}
+            for method in (value for value in wanted.co_consts
+                           if type(value) is CodeType and value.co_name in names):
+                member = vars(actual).get(method.co_name)
+                if type(member) in (staticmethod, classmethod):
+                    member = member.__func__
+                choices = (member.fget, member.fset, member.fdel) if type(member) is property else (member,)
+                _need(any(type(choice) is FunctionType and choice.__globals__ is vars(module)
+                          and _numeric_normalized_code(choice.__code__) == _numeric_normalized_code(method)
+                          for choice in choices),
+                      "borrowed source method code changed: " + name + "." + method.co_name)
+    for node in ast.parse(raw).body:
+        if type(node) is ast.Assign and len(node.targets) == 1 and type(node.targets[0]) is ast.Name:
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            _need(vars(module).get(node.targets[0].id) == value, "borrowed source literal changed")
+    _need(before == _file_identity(os.fstat(held[0])) == _file_identity(held[1].lstat()),
+          "borrowed source changed during code validation")
+    return module
+
+
+def _numeric_originals_current(originals):
+    method = getattr(originals, "recheck", None)
+    original = vars(type(originals)).get("recheck")
+    _need(type(method) is MethodType and method.__self__ is originals
+          and method.__func__ is original and type(original) is FunctionType
+          and original.__globals__.get("Originals") is type(originals)
+          and original.__code__.co_filename == original.__globals__.get("__file__")
+          and type(originals.held) is list, "actual source-owned Originals required; never JSON")
+    method()
+
+
+def _numeric_borrowed_view(view, source_pack, originals, guard, catalog):
+    """Check the common G/W public surface; never create/close/renew a view."""
+    _numeric_originals_current(originals)
+    policy = _numeric_attest_source(source_pack, originals)
+    _need(type(view) is policy.CatalogView and type(view.selection) is policy.UnattributedSelection
+          and view.guard is guard and type(guard) is policy.CatalogGuard
+          and Path(view.catalog) == catalog and Path(guard.path) == catalog / "catalog.lock"
+          and view.closed is False and view.failed is False and policy.MAX_SECONDS == 30
+          and time.monotonic() < view.until <= time.monotonic() + 30,
+          "same live typed policy view, original guard and finite until required")
+    _need(source_pack[2] == view.selection.sources["unattributed"], "current source7 cohort source pin required")
+    for name in ("rows", "checked_usage", "check", "selection_document"):
+        method = getattr(view, name)
+        _need(type(method) is MethodType and method.__self__ is view
+              and method.__func__ is vars(policy.CatalogView)[name], "original policy bound method required")
+    guard_init = vars(type(guard)).get("__init__")
+    _need(type(guard_init) is FunctionType, "actual original guard type required")
+    namespace = guard_init.__globals__
+    guard_module = sys.modules.get(namespace.get("__name__"))
+    _need(type(guard_module) is ModuleType and vars(guard_module) is namespace
+          and guard_module.CatalogGuard is type(guard), "same actual source7 guard module")
+    guard_pin = view.selection.sources["guard"]
+    _, guard_held = originals.read(guard_pin, body=False, maximum=128 << 10)
+    _numeric_attest_source((guard_module, guard_held, guard_pin), originals)
+    guard.assert_held()
+    document = view.selection_document()
+    _need(document.get("retirement_authority") is False and document.get("old_owner_reissued") is False
+          and document.get("original_rows_unchanged") is True
+          and document.get("product_deadline_extended") is False, "observation is not borrowed owner authority")
+    return guard_module
+
+
+def _numeric_keeper(inputs, plan, expected, archive_member):
+    """Use the existing CI ZIP and original canonical-code reader; create no archive."""
+    stream = inputs.open(plan["artifact"], review.ARCHIVE_CAP)
+    with zipfile.ZipFile(stream) as archive:
+        entries = review.zip_entries(archive, 1 << 30)
+        _need("build-receipt.json" in entries and entries["build-receipt.json"].file_size <= 4 << 20,
+              "actual CI producer receipt required")
+        receipt = review.decode(archive.read("build-receipt.json"))
+        _need(receipt.get("schema") == "rovezero.ci-cpu-validation-bundle/1"
+              and receipt.get("source_commit") == plan["source_commit"]
+              and all(receipt.get(name) is False for name in ("neural_execution", "gpu_execution", "training_execution")),
+              "original selected-code source evidence required; no runtime authority")
+        selected = receipt["binaries"]["virtual_review_numeric_capture"]
+        code = plan["code"][0]
+        _need({key: selected["pin"][key] for key in ("bytes", "sha256")}
+              == {key: code[key] for key in ("bytes", "sha256")}
+              and selected.get("requested_features") == ["onnx", "contracts"],
+              "same direct selected numeric target bytes and features")
+        commands = [row for row in receipt["commands"]
+                    if row.get("label") == "build-virtual_review_numeric_capture"]
+        _need(len(commands) == 1 and type(commands[0].get("exit_code")) is int and commands[0]["exit_code"] == 0
+              and commands[0].get("original_tree_cleanup_verified") is True
+              and commands[0].get("supervisor_error") is None, "original selected compiler command closure")
+        _need(archive_member in entries and entries[archive_member].file_size == receipt["binary_bundle"]["bytes"],
+              "actual original canonical code bundle member required")
+    review.canonical_code(inputs, plan["artifact"], archive_member, expected)
+    return {"artifact": plan["artifact"], "source_commit": plan["source_commit"],
+            "target": "virtual_review_numeric_capture", "original_compiler_exit": 0,
+            "producer_status_observed": receipt.get("status"), "full_bundle_or_runtime_admission_issued": False,
+            "canonical_code_member_verified": True, "new_archive_created": False}
+
+
+def _numeric_open_raw_evidence(inputs, pin):
+    """Only this explicit profile admits a genuinely empty original log FD."""
+    review._numeric_raw_pin(pin, review.RESEARCH_CAP, allow_empty=True)
+    if pin["bytes"]:
+        return inputs.open(pin, review.RESEARCH_CAP)
+    inputs.tick()
+    path = _path(pin["path"])
+    if path in inputs.files:
+        _need(inputs.files[path]["pin"] == pin, "one raw evidence FD cannot replace its original pin")
+    else:
+        parent = inputs.directory(path.parent)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        try:
+            stream = os.fdopen(fd, "rb")
+        except BaseException as error:
+            try:
+                os.close(fd)
+            except BaseException as cleanup:
+                _note(error, "untransferred empty evidence FD close also failed: " + _describe(cleanup))
+            raise
+        item = {"path": path, "stream": stream, "before": None, "pin": dict(pin)}
+        inputs.files[path] = item
+        before = os.fstat(stream.fileno())
+        item["before"] = before
+        _need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+              and before.st_uid == os.geteuid() and before.st_mode & 0o022 == 0
+              and before.st_size == 0, "actual empty ordinary owner-controlled evidence required")
+    import fcntl
+    stream = inputs.files[path]["stream"]
+    _need(fcntl.fcntl(stream.fileno(), fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY,
+          "actual readonly raw evidence FD required")
+    inputs.hash_file(path)  # Also checks empty SHA, EOF, original FD/name/stat.
+    stream.seek(0)
+    return stream
+
+
+def _numeric_raw_evidence(inputs, plan):
+    result = review.research(inputs, plan["research"])
+    required = [{"pin": plan["record_pin"], "member": "original/catalog-row.json"}, *plan["raw_evidence"]]
+    stream = inputs.open(plan["research"], review.RESEARCH_CAP)
+    with zipfile.ZipFile(stream) as archive:
+        for item in required:
+            member = review.member_name(item["member"])
+            pin = item["pin"]
+            original = (_numeric_open_raw_evidence(inputs, pin) if item in plan["raw_evidence"]
+                        else inputs.open(pin, review.RESEARCH_CAP))
+            raw = original.read(pin["bytes"] + 1)
+            _need(len(raw) == pin["bytes"] and archive.read(member) == raw,
+                  "research keeper must preserve exact original row and raw evidence")
+    inputs.check()
+    return result
+
+
+class PreparedNormalDeferredSelectedNumericCode:
+    """Current-process held data proof only. A saved audit JSON cannot recreate it."""
+    __slots__ = ("_inputs", "_plan", "_pin", "_path", "_keeper", "_research", "_pid",
+                 "_hard_until", "_closed", "_consumed")
+
+    def __init__(self, token, **values):
+        _need(token is _NUMERIC_PREPARED_TOKEN, "only live FD preparation may issue this proof")
+        for key, value in values.items():
+            object.__setattr__(self, key, value)
+
+    def __setattr__(self, name, value):
+        raise StorageError("prepared numeric-code proof is immutable")
+
+    def __copy__(self):
+        raise StorageError("prepared numeric-code proof is not transferable")
+
+    def __deepcopy__(self, memo):
+        raise StorageError("prepared numeric-code proof is not transferable")
+
+    def check(self):
+        _need(not self._closed and os.getpid() == self._pid
+              and self._inputs.until <= self._hard_until, "same original live FD preparation only")
+        self._inputs.check()
+
+    def close(self, primary=None):
+        if not self._closed:
+            object.__setattr__(self, "_closed", True)
+            return self._inputs.close(primary)
+        return primary
+
+
+def prepare_normal_deferred_selected_numeric_code(plan_pin, *, hard_until, seconds=300):
+    """Perform expensive readonly keeper/hash work before the caller opens its view."""
+    _need(sys.platform == "linux" and type(hard_until) in (int, float)
+          and time.monotonic() < hard_until <= time.monotonic() + 600,
+          "original finite native Linux preparation window required")
+    inputs = _Inputs(seconds)
+    inputs.until = min(inputs.until, hard_until)
+    try:
+        plan, catalog, code, expected, archive_member = review.read_normal_deferred_selected_numeric_code_plan(inputs, plan_pin)
+        inputs.directory(catalog, controlled=True)
+        row_stream = inputs.open(plan["record_pin"], 8192)
+        row = review.decode(row_stream.read(8193))
+        _numeric_target_row(plan, row)
+        output = _path(plan["output"])
+        inputs.directory(output, controlled=True)
+        _need(list(_inode(os.fstat(inputs.directories[output][0]))) == plan["output_identity"]
+              and not os.path.lexists(output / ".rovezero-output.json"), "original deferred-directory format required")
+        target = code[0]
+        path = _path(output / target["relative"])
+        inputs.directory(path.parent, controlled=True)
+        stream = inputs.open({"path": str(path), "bytes": target["bytes"], "sha256": target["sha256"]}, review.ELF_CAP)
+        info = inputs.files[path]["before"]
+        _need(stream.read(4) == b"\x7fELF" and info.st_mode & 0o222 == 0,
+              "selected candidate must be actual readonly ELF")
+        inputs.candidates.add(path)
+        for pin in plan["protected_reference_pins"]:
+            _need(Path(pin["path"]) != path, "candidate is a declared current reference")
+            inputs.open(pin, review.ELF_CAP)
+        if plan["duplicate_keeper"] is not None:
+            inputs.open(plan["duplicate_keeper"], review.ELF_CAP)
+        keeper = _numeric_keeper(inputs, plan, expected, archive_member)
+        research = _numeric_raw_evidence(inputs, plan)
+        target_inode = _inode(info)
+        _need(all(_inode(item["before"]) != target_inode for name, item in inputs.files.items() if name != path),
+              "candidate aliases keeper/control/current reference inode")
+        for name in ("artifact", "research", "duplicate_keeper"):
+            if plan[name] is not None:
+                external = _path(plan[name]["path"])
+                _need(not external.is_relative_to(output) and not output.is_relative_to(external)
+                      and not external.is_relative_to(catalog) and not catalog.is_relative_to(external),
+                      "keepers must be outside original output and catalog")
+        inputs.check()
+        return PreparedNormalDeferredSelectedNumericCode(_NUMERIC_PREPARED_TOKEN,
+            _inputs=inputs, _plan=_encode(plan), _pin=dict(plan_pin), _path=path,
+            _keeper=keeper, _research=research, _pid=os.getpid(), _hard_until=inputs.until,
+            _closed=False, _consumed=False)
+    except BaseException as primary:
+        inputs.close(primary)
+        raise
+
+
+def _numeric_target_row(plan, row):
+    _need(type(row) is dict and row.get("schema") == "rovezero.managed-output.v1"
+          and row.get("key") == plan["key"] and row.get("output") == plan["output"]
+          and row.get("identity") == plan["output_identity"] and row.get("state") == "retained"
+          and row.get("tree_gone") is True and row.get("deferred") is True
+          and row.get("budget_error") is None, "same original normal retained/deferred row required")
+
+
+def _numeric_original_owner_dead(guard, row, now):
+    return (_numeric_source_function(guard, "reboot_proves_dead")(row.get("lifetime"), now)
+            or _numeric_source_function(guard, "owner_proven_dead")(row.get("pid"), row.get("lifetime"), now))
+
+
+def _numeric_producer_state(rows, protected_keys):
+    return {"no_unprotected_active_producers": not any(
+                row["state"] == "active" and row["key"] not in protected_keys for _, row, _ in rows),
+            "protected_active_row_count": sum(
+                row["state"] == "active" and row["key"] in protected_keys for _, row, _ in rows)}
+
+
+def audit_prepared_normal_deferred_selected_numeric_code(prepared):
+    _need(type(prepared) is PreparedNormalDeferredSelectedNumericCode, "actual live prepared FD proof required")
+    prepared.check()
+    return {"schema": "rovezero.normal-deferred-selected-numeric-code-audit.v1",
+            "status": "READONLY_FD_AND_KEEPERS_VERIFIED_NO_RETIREMENT_AUTHORITY",
+            "plan": dict(prepared._pin), "keeper": prepared._keeper, "research": prepared._research,
+            "deletion_performed": False, "retirement_authority_issued": False,
+            "still_required": ["first_actual_borrowed_current_view", "no_unprotected_active_producers", "original_owner_death",
+                               "initial_and_final_current_proc_census", "durable_intent_and_parent_fsync"],
+            "physical_completion_attested": False}
+
+
+def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_live_view,
+        source_pack, actual_originals, same_guard):
+    """One effect attempt with a caller-owned view; never acquire/renew/close its gate."""
+    _need(type(prepared) is PreparedNormalDeferredSelectedNumericCode and not prepared._consumed,
+          "one actual live preparation, never an audit JSON or automatic retry")
+    object.__setattr__(prepared, "_consumed", True)
+    inputs, journal, first, result = prepared._inputs, None, None, None
+    plan = review.decode(prepared._plan)
+    path = prepared._path
+    attempt = {"unlink_attempted": False, "unlink_returned": False, "directory_fsynced": False}
+    evidence = {"schema": "rovezero.normal-deferred-selected-numeric-code-failure.v1",
+        "status": "FAILED_OR_PARTIAL_PRESERVED", "plan": dict(prepared._pin),
+        "last_attempt": attempt, "journal": None, "journal_path": None, "logical_removed_bytes": 0,
+        "no_unprotected_active_producers": None, "protected_active_row_count": None,
+        "physical_completion_attested": False, "physical_space_reclaimed": "unknown",
+        "vhd_return": "unknown", "observation_limits": list(_LIMITS)}
+    try:
+        prepared.check()
+        catalog = _path(plan["catalog"])
+        current_guard = _numeric_borrowed_view(borrowed_live_view, source_pack, actual_originals, same_guard, catalog)
+        inputs.until = min(inputs.until, borrowed_live_view.until)
+        prepared.check()
+        rows, usage = borrowed_live_view.checked_usage()
+        producer_state = _numeric_producer_state(rows, borrowed_live_view.keys)
+        evidence.update(producer_state)
+        _need(producer_state["no_unprotected_active_producers"], "unprotected active producer blocks code retirement")
+        matches = [item for item in rows if item[1]["key"] == plan["key"]]
+        _need(len(matches) == 1 and plan["key"] not in borrowed_live_view.keys,
+              "exact unprotected original numeric output required")
+        record_path, row, output = matches[0]
+        _need(str(record_path) == plan["record_pin"]["path"] and str(output) == plan["output"], "canonical target paths changed")
+        _numeric_target_row(plan, row)
+        _need(not os.path.lexists(output / ".rovezero-output.json"), "original deferred marker absence changed")
+        original = review.decode(inputs.open(plan["record_pin"], 8192).read(8193))
+        _need(original == row, "actual canonical row differs from held original bytes")
+        now = _numeric_source_function(current_guard, "lifetime")()
+        _need(_numeric_original_owner_dead(current_guard, row, now), "original owner death not proven; no adoption")
+        targets = {_inode(inputs.files[path]["before"]),
+                   _inode(inputs.directories[output][1]), _inode(inputs.directories[path.parent][1])}
+        census = _process_census(targets, inputs.fds() | {same_guard.stream.fileno()}, inputs.tick)
+        header = {"schema": "rovezero.normal-deferred-selected-numeric-code-journal.v1", "event": "preflight_complete",
+            "plan": dict(prepared._pin), "key": plan["key"], "record_pin": plan["record_pin"],
+            "code": plan["code"], "artifact": plan["artifact"], "research": plan["research"],
+            "census": census, **producer_state, "physical_completion_attested": False, "observation_limits": list(_LIMITS)}
+        reserved = len(_encode(header)) + 1024 + 16384
+        _need(reserved <= _JOURNAL_CAP and usage + reserved <= 18 * GiB
+              and all(usage + reserved <= item[1]["catalog_limit_bytes"] for item in rows)
+              and _tree_bytes(output, inputs) + reserved <= row["reserved_bytes"], "original journal/output/18GiB budget required")
+        name = ".rovezero-code-retirement-" + prepared._pin["sha256"] + ".jsonl"
+        evidence["journal_path"] = str(output / name)
+        journal = _Journal(inputs, output, name, reserved)
+        journal.append(header)
+        os.fsync(inputs.directory(output))
+        journal.append({"event": "unlink_intent", "relative": plan["code"][0]["relative"]})
+        # Exactly one final current boundary; no whole inventory/hash/census per chunk.
+        prepared.check()
+        _numeric_borrowed_view(borrowed_live_view, source_pack, actual_originals, same_guard, catalog)
+        final_rows, final_usage = borrowed_live_view.checked_usage()
+        final_producer_state = _numeric_producer_state(final_rows, borrowed_live_view.keys)
+        evidence.update(final_producer_state)
+        _need(final_rows == rows and final_producer_state == producer_state
+              and final_producer_state["no_unprotected_active_producers"], "original catalog rows/history or protected producers changed")
+        _need(_numeric_source_function(current_guard, "lifetime")() == now
+              and _numeric_original_owner_dead(current_guard, row, now), "original owner or observer lifetime changed")
+        _need(final_usage + max(0, reserved - journal.written) <= 18 * GiB
+              and all(final_usage + max(0, reserved - journal.written) <= item[1]["catalog_limit_bytes"] for item in rows)
+              and _tree_bytes(output, inputs) + max(0, reserved - journal.written) <= row["reserved_bytes"],
+              "original final journal/output/18GiB budget required")
+        inputs.hash_file(path)
+        _process_census(targets, inputs.fds() | {same_guard.stream.fileno(), journal.fd}, inputs.tick)
+        inputs.check(); same_guard.assert_held(); journal.check()
+        _need(borrowed_live_view.rows() == rows
+              and _numeric_source_function(current_guard, "lifetime")() == now
+              and _numeric_original_owner_dead(current_guard, row, now),
+              "final original rows/history/owner changed after census")
+        attempt["unlink_attempted"] = True
+        os.unlink(path.name, dir_fd=inputs.directories[path.parent][0])
+        attempt["unlink_returned"] = True
+        inputs.deleted.add(path)
+        os.fsync(inputs.directories[path.parent][0])
+        attempt["directory_fsynced"] = True
+        inputs.check_file(path)
+        journal.append({"event": "unlinked_directory_fsynced", "logical_removed_bytes": plan["code"][0]["bytes"]})
+        _need(borrowed_live_view.rows() == rows, "original rows/history changed after leaf retirement")
+        inputs.check(); same_guard.assert_held()
+        journal.append({"event": "complete", "retired_files": 1})
+        result = {"schema": "rovezero.normal-deferred-selected-numeric-code-result.v1",
+            "status": "CODE_CACHE_RETIRED", "plan": dict(prepared._pin), "journal": journal.pin(),
+            "retired_files": [plan["code"][0]["relative"]], "logical_removed_bytes": plan["code"][0]["bytes"],
+            **producer_state,
+            "original_row_unchanged": True, "reservations_changed": False, "expiry_changed": False,
+            "borrowed_guard_or_view_closed": False, "physical_completion_attested": False,
+            "physical_space_reclaimed": "unknown", "vhd_return": "unknown", "observation_limits": list(_LIMITS)}
+    except BaseException as error:
+        first = error
+        if journal is not None:
+            try:
+                journal.append({"event": "failed_or_partial_preserved", "type": type(error).__name__[:128],
+                                "detail": _describe(error), "last_attempt": attempt})
+            except BaseException as secondary:
+                _note(first, "partial retirement journal also failed: " + _describe(secondary))
+    finally:
+        if journal is not None:
+            try:
+                evidence["journal"] = journal.pin()
+            except BaseException as error:
+                if first is None: first = error
+                else: _note(first, "retirement journal pin also failed: " + _describe(error))
+            try:
+                journal.close()
+            except BaseException as error:
+                if first is None: first = error
+                else: _note(first, "retirement journal close also failed: " + _describe(error))
+        if attempt["unlink_returned"]:
+            evidence["logical_removed_bytes"] = plan["code"][0]["bytes"]
+        evidence["partial"] = bool(attempt["unlink_attempted"])
+        first = prepared.close(first)
+    if first is not None:
+        try: first.code_cache_retirement = evidence
+        except BaseException: pass
+        _note(first, "one exact numeric-code attempt; partial effects preserved, no retry or owner/view reissue")
         raise first
     return result
