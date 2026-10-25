@@ -457,10 +457,13 @@ class TransitionTests(unittest.TestCase):
             self.view([anchor])
         self.now["process_birth"] = "new-maintainer-same-boot"
         original_partial = self.files[Path(artifact["path"])]
-        with patch.object(successor.os, "fsync") as sync:
+        synced_paths = []
+        def record_sync(fd):
+            synced_paths.append(self.fd_paths[fd])
+        with patch.object(successor.os, "fsync", side_effect=record_sync):
             result = self.move(anchor, partial=[artifact])
-            self.assertEqual(sync.call_count, 2)
-            self.assertNotEqual(sync.call_args_list[0].args[0], sync.call_args_list[1].args[0])
+        self.assertIn(Path(artifact["path"]), synced_paths)
+        self.assertIn(self.registry, synced_paths)
         self.assertTrue(result["admission_ready"])
         self.assertEqual(self.files[Path(artifact["path"])], original_partial)
         self.assertEqual(sum(name == Path(artifact["path"]).name for name in self.actions), 1)
