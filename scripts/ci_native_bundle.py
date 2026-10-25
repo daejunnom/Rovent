@@ -99,15 +99,25 @@ def validate_functional_specs(specs):
     require(specs == SPECS or specs == SPECS + (WARM,), 'ClosedFunctionalBundleSpecRoster')
 
 
-def strict_json(raw):
+class MetadataMismatch(RuntimeError):
+    """A closed static getter's bytes do not satisfy its own metadata contract."""
+
+
+def metadata_require(value, code):
+    if not value:
+        raise MetadataMismatch(code)
+
+
+def strict_json(raw, *, error_type=RuntimeError):
     def unique(pairs):
         value = {}
         for key, item in pairs:
-            require(key not in value, 'DuplicateJsonKey')
+            if key in value:
+                raise error_type('DuplicateJsonKey')
             value[key] = item
         return value
     return json.loads(raw, object_pairs_hook=unique,
-                      parse_constant=lambda _: (_ for _ in ()).throw(RuntimeError('NonfiniteJson')))
+                      parse_constant=lambda _: (_ for _ in ()).throw(error_type('NonfiniteJson')))
 
 
 def identity(meta, *, creation_time=False):
@@ -277,7 +287,7 @@ def cargo_artifact(raw, metadata, source, target_root, spec, registered_paths):
 
 
 def validate_registry(value):
-    require(value.get('schema') == 'rz-pals-report-model-registry-query/1'
+    metadata_require(type(value) is dict and value.get('schema') == 'rz-pals-report-model-registry-query/1'
             and value.get('model_profile') == 'virtual_review_v1'
             and value.get('registry_methods') == [
                 'PalsModelProfile::VirtualReviewV1.registered_semantics_sha256',
@@ -294,7 +304,7 @@ def validate_rovent_build_metadata(value, expected_head, components):
     fields = {'domain', 'source_commit', 'source_components', 'target_os', 'target_arch',
               'onnx_cpu_compiled', 'onnx_cuda_compiled', 'native_runtime_loaded',
               'native_model_loaded', 'neural_execution_observed'}
-    require(type(value) is dict and set(value) == fields
+    metadata_require(type(value) is dict and set(value) == fields
             and value['domain'] == 'rz-rovent-build-capabilities/1'
             and value['source_commit'] == expected_head
             and value['target_os'] == 'linux' and value['target_arch'] == 'x86_64'
@@ -304,7 +314,7 @@ def validate_rovent_build_metadata(value, expected_head, components):
             'StaticRoventBuildMetadata')
     observed = value['source_components']
     private = {'rovent_bootstrap', 'rovent_process_boundary'}
-    require(type(observed) is dict and set(observed) == set(components) | private
+    metadata_require(type(observed) is dict and set(observed) == set(components) | private
             and all(observed[name] == digest for name, digest in components.items())
             and all(type(observed[name]) is str and re.fullmatch('[a-f0-9]{64}', observed[name])
                     for name in private), 'StaticRoventRegisteredSourceMismatch')
@@ -402,7 +412,7 @@ class Build:
             require(shutil.disk_usage(self.root).free >= extra + (16 << 20), 'ActualFreeSpaceReserve')
             self.next_scan = now + 5
 
-    def command(self, label, argv, env):
+    def command(self, label, argv, env, *, allow_empty_stdout=False):
         self.budget()
         out, err = self.root / 'logs' / (label + '.stdout'), self.root / 'logs' / (label + '.stderr')
         row = {'label': label, 'argv': argv, 'cwd': str(self.source), 'stdout': out.name, 'stderr': err.name}
@@ -464,7 +474,8 @@ class Build:
                 and gone is True and failure is None,
                 'CommandOrOriginalTreeClosureFailed:' + label)
         check()
-        stream, row['stdout_pin'], before, _ = pinned_file(out, LOG_CAP, allow_empty=code != 0)
+        stream, row['stdout_pin'], before, _ = pinned_file(
+            out, LOG_CAP, allow_empty=code != 0 or allow_empty_stdout)
         with stream:
             raw = stream.read()
             require(same_file_identity(before, os.fstat(stream.fileno()), out.lstat()), 'CommandStdoutFDChanged')
@@ -603,6 +614,95 @@ def write_json(path, value):
         os.fsync(stream.fileno())
 
 
+def collect_metadata_getter(build, *, artifact, private, binaries, results, label,
+                            target, arguments, env, validate, failure_check, publish_metadata=True):
+    """Preserve one getter verdict; shared custody and lifetime errors still abort."""
+    result = {'target': target, 'status': 'blocked_missing_target'}
+    results[label] = result
+    if target not in binaries:
+        return None
+    result['status'] = 'preparing'
+    failure_check()
+    stream, actual, before, _ = pinned_file(private / target, ELF_CAP)
+    with stream:
+        require(actual == {key: binaries[target]['pin'][key] for key in ('bytes', 'sha256')}
+                and same_file_identity(before, os.fstat(stream.fileno()), (private / target).lstat()),
+                'StaticGetterPrivateElfChanged:' + label)
+    try:
+        raw = build.command(label, [str(private / target), *arguments], env,
+                            allow_empty_stdout=True)
+    except CommandExitFailure as error:
+        row = error.row
+        require(type(row['exit_code']) is int and row['exit_code'] > 0
+                and row['exit_code'] not in (124, 130)
+                and row['original_tree_cleanup_verified'] is True
+                and row['supervisor_error'] is None, 'StaticGetterClosedOrdinaryExitRequired')
+        result.update(status='failed_command', command_label=row['label'], exit_code=row['exit_code'],
+                      stdout_pin=dict(row['stdout_pin']), stderr_pin=dict(row['stderr_pin']),
+                      error={'type': type(error).__name__, 'message': str(error)[:2048]})
+        failure_check()
+        return None
+    row = build.commands[-1]
+    result.update(status='raw_captured', command_label=row['label'], exit_code=row['exit_code'],
+                  stdout_pin=dict(row['stdout_pin']), stderr_pin=dict(row['stderr_pin']))
+    failure_check()
+    try:
+        value = strict_json(raw, error_type=MetadataMismatch)
+        validate(value)
+        # Formatting is a property of these returned bytes, not a storage error.
+        json.dumps(value, allow_nan=False)
+    except (MetadataMismatch, ValueError, UnicodeError) as error:
+        result.update(status='failed_metadata',
+                      error={'type': type(error).__name__, 'message': str(error)[:2048]})
+        return None
+    if publish_metadata:
+        output = artifact / (label + '.json')
+        write_json(output, value)  # IO/budget/custody failures are never getter-local.
+        result.update(metadata_file=output.name, metadata_pin=file_pin(output))
+    result['status'] = 'verified'
+    return value
+
+
+def rules_encoder_source_digest(source):
+    """Read shared registered sources outside the getter-verdict error boundary."""
+    encoder = hashlib.sha256(b'rz-pals-virtual-rules-encoder-source/1\0')
+    for name, logical in (
+            ('pals_native.rs', 'crates/rz-uci/src/pals_native.rs'),
+            ('pals_native/virtual_encoding.rs', 'crates/rz-uci/src/pals_native/virtual_encoding.rs'),
+            ('pals_native/virtual_selected_input.rs', 'crates/rz-uci/src/pals_native/virtual_selected_input.rs'),
+            ('pals_native/ticketed/virtual_bridge.rs', 'crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs'),
+            ('rz-eval/pals_model/virtual_review.rs', 'crates/rz-eval/src/pals_model/virtual_review.rs')):
+        stream, _, before, _ = pinned_file(source / logical, 16 << 20)
+        with stream:
+            raw = stream.read()
+            require(same_file_identity(before, os.fstat(stream.fileno()), (source / logical).lstat()),
+                    'RulesEncoderOriginalFDChanged')
+        encoded = name.encode()
+        encoder.update(len(encoded).to_bytes(8, 'little') + encoded)
+        encoder.update(len(raw).to_bytes(8, 'little') + raw)
+    return encoder.hexdigest()
+
+
+def validate_rules_descriptor(value, encoder_sha256):
+    metadata_require(type(value) is dict and value.get('schema') == 'rovezero.pals-rules-descriptor.v3'
+                     and value.get('rules_input_profile') == 'rz-pals-rules-virtual-review-v1'
+                     and type(value.get('config')) is dict and value['config'].get('profile') == 'virtual_review_v1'
+                     and value.get('learned_input_compatibility') == 'unverified_declaration_only'
+                     and value.get('bounds') == {'max_records': 64, 'max_anchors': 4, 'max_line_plies': 256,
+                                                'line_buckets': [8, 16, 32, 64, 128, 256], 'max_candidates': 256,
+                                                'token_budgets': [128, 256, 512], 'root_anchor': 0}
+                     and type(value.get('semantic_fields')) is list
+                     and all(type(field) is str for field in value['semantic_fields']),
+                     'StaticRulesDescriptorProfile')
+    semantic = hashlib.sha256()
+    for field in value['semantic_fields']:
+        encoded = field.encode('utf-8')
+        semantic.update(len(encoded).to_bytes(8, 'little') + encoded)
+    metadata_require(value.get('rules_input_semantic_sha256') == semantic.hexdigest()
+                     and value.get('rules_encoder_source_sha256') == encoder_sha256,
+                     'StaticRulesDescriptorSourceFraming')
+
+
 def run(source, root, expected_head, seconds, *, profile='native-validation'):
     require(profile in ('native-validation', 'runtime-loader-only'), 'ExplicitBuildProfile')
     loader_only = profile == 'runtime-loader-only'
@@ -710,7 +810,8 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
             build_selected_targets(build, **target_arguments, specs=selected_specs, warm=warm)
         if receipt['target_failures']:
             recheck_registered_inputs()
-            require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
+            head_label = 'git-head-final' if loader_only else 'git-head-before-static-getters'
+            require(build.command(head_label, [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                     'HeadChangedDuringBuild')
             if receipt['binaries']:
                 partial_filename = 'partial-runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'partial-native-validation-binaries.tar.gz'
@@ -718,9 +819,11 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
                 receipt['partial_binary_bundle'] = partial_pin
                 receipt['partial_binary_bundle_file'] = partial_filename
                 receipt['partial_bundle_scope'] = 'successful_targets_only_failed_full_bundle_not_admitted'
-            raise RuntimeError('RequiredRuntimeLoaderTargetFailed' if loader_only else 'RequiredCargoTargetsFailed')
-        require(set(receipt['binaries']) == {spec[2] for spec in selected_specs}, 'CompleteSelectedTargetRoster')
-        if warm:
+            if loader_only:
+                raise RuntimeError('RequiredRuntimeLoaderTargetFailed')
+        else:
+            require(set(receipt['binaries']) == {spec[2] for spec in selected_specs}, 'CompleteSelectedTargetRoster')
+        if warm and warm[2] in receipt['binaries']:
             receipt['warm_status'] = 'BUILT_SAME_HEAD_NOT_EXECUTED_OR_NUMERICALLY_ADMITTED'
         if loader_only:
             recheck_registered_inputs()
@@ -733,54 +836,44 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
                            binary_bundle=bundle_pin, binary_bundle_file=bundle_filename,
                            metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
         else:
-            compiled = strict_json(build.command('compiled-source-inventory', [str(private / 'rz-pals-adaptive'), '--source-inventory'], env))
-            require(compiled == {'domain': 'rz-pals-compiled-source-registration-v5/1', 'source_commit': expected_head,
-                                 'components': components, 'neural_execution': False, 'training_execution': False}, 'CompiledInventorySourceMismatch')
-            rovent = strict_json(build.command('rovent-build-metadata', [str(private / 'rz-rovent'), '--build-capabilities-json'], env))
-            validate_rovent_build_metadata(rovent, expected_head, components)
-            receipt['rovent_build_binding'] = {
-                'ELF': receipt['binaries']['rz-rovent']['pin'],
-                'metadata': rovent,
-                'registered_components_independently_matched': True,
-                'private_component_digests': 'observed_only_not_independently_recomputed',
-                'scope': 'same_actual_ELF_compile_metadata_no_runtime_model_or_execution_authority'}
-            native = strict_json(build.command('native-source-pins', [str(private / 'virtual_review_numeric_capture'), '--source-pins'], env))
-            require(native == {name: components[name] for name in CORE5}, 'NativeCore5SourceMismatch')
-            registry = strict_json(build.command('static-model-registry', [str(private / 'virtual_review_numeric_capture'), '--model-registry'], env))
-            validate_registry(registry)
-            receipt['static_registry_binding'] = {
-                'capture_ELF': receipt['binaries']['virtual_review_numeric_capture']['pin'],
-                'registered_source_core5': native,
-                'registered_semantic_sha256': registry['model_semantic_sha256'],
-                'registered_encoding_sha256': registry['encoding_sha256'],
-                'scope': 'same_actual_ELF_public_registry_methods_and_compiled_source_pins_no_numerical_authority'}
-            rules = strict_json(build.command('rules-descriptor', [str(private / 'pals_rules_descriptor'), '--model-profile=virtual_review_v1'], env))
-            require(rules.get('schema') == 'rovezero.pals-rules-descriptor.v3'
-                    and rules.get('rules_input_profile') == 'rz-pals-rules-virtual-review-v1'
-                    and rules.get('config', {}).get('profile') == 'virtual_review_v1'
-                    and rules.get('learned_input_compatibility') == 'unverified_declaration_only'
-                    and rules.get('bounds') == {'max_records': 64, 'max_anchors': 4, 'max_line_plies': 256,
-                                                'line_buckets': [8, 16, 32, 64, 128, 256], 'max_candidates': 256,
-                                                'token_budgets': [128, 256, 512], 'root_anchor': 0}, 'StaticRulesDescriptorProfile')
-            semantic = hashlib.sha256()
-            for field in rules['semantic_fields']:
-                encoded = field.encode('utf-8')
-                semantic.update(len(encoded).to_bytes(8, 'little') + encoded)
-            encoder = hashlib.sha256(b'rz-pals-virtual-rules-encoder-source/1\0')
-            for name, logical in (
-                    ('pals_native.rs', 'crates/rz-uci/src/pals_native.rs'),
-                    ('pals_native/virtual_encoding.rs', 'crates/rz-uci/src/pals_native/virtual_encoding.rs'),
-                    ('pals_native/virtual_selected_input.rs', 'crates/rz-uci/src/pals_native/virtual_selected_input.rs'),
-                    ('pals_native/ticketed/virtual_bridge.rs', 'crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs'),
-                    ('rz-eval/pals_model/virtual_review.rs', 'crates/rz-eval/src/pals_model/virtual_review.rs')):
-                stream, _, _, _ = pinned_file(source / logical, 16 << 20)
-                with stream:
-                    raw = stream.read()
-                encoded = name.encode()
-                encoder.update(len(encoded).to_bytes(8, 'little') + encoded)
-                encoder.update(len(raw).to_bytes(8, 'little') + raw)
-            require(rules.get('rules_input_semantic_sha256') == semantic.hexdigest()
-                    and rules.get('rules_encoder_source_sha256') == encoder.hexdigest(), 'StaticRulesDescriptorSourceFraming')
+            getters = receipt['metadata_getters'] = {}
+
+            def getter(label, target, arguments, validate, *, publish_metadata=True):
+                return collect_metadata_getter(build, artifact=artifact, private=private,
+                    binaries=receipt['binaries'], results=getters, label=label, target=target,
+                    arguments=arguments, env=env, validate=validate,
+                    failure_check=recheck_registered_inputs, publish_metadata=publish_metadata)
+
+            getter('compiled-source-inventory', 'rz-pals-adaptive', ['--source-inventory'],
+                lambda value: metadata_require(value == {
+                    'domain': 'rz-pals-compiled-source-registration-v5/1', 'source_commit': expected_head,
+                    'components': components, 'neural_execution': False, 'training_execution': False},
+                    'CompiledInventorySourceMismatch'))
+            rovent = getter('rovent-build-metadata', 'rz-rovent', ['--build-capabilities-json'],
+                            lambda value: validate_rovent_build_metadata(value, expected_head, components),
+                            publish_metadata=False)  # The original receipt binding owns this parsed value.
+            if rovent is not None:
+                receipt['rovent_build_binding'] = {
+                    'ELF': receipt['binaries']['rz-rovent']['pin'],
+                    'metadata': rovent,
+                    'registered_components_independently_matched': True,
+                    'private_component_digests': 'observed_only_not_independently_recomputed',
+                    'scope': 'same_actual_ELF_compile_metadata_no_runtime_model_or_execution_authority'}
+            native = getter('native-source-pins', 'virtual_review_numeric_capture', ['--source-pins'],
+                lambda value: metadata_require(value == {name: components[name] for name in CORE5},
+                                               'NativeCore5SourceMismatch'))
+            registry = getter('static-model-registry', 'virtual_review_numeric_capture', ['--model-registry'],
+                              validate_registry)
+            if native is not None and registry is not None:
+                receipt['static_registry_binding'] = {
+                    'capture_ELF': receipt['binaries']['virtual_review_numeric_capture']['pin'],
+                    'registered_source_core5': native,
+                    'registered_semantic_sha256': registry['model_semantic_sha256'],
+                    'registered_encoding_sha256': registry['encoding_sha256'],
+                    'scope': 'same_actual_ELF_public_registry_methods_and_compiled_source_pins_no_numerical_authority'}
+            encoder = rules_encoder_source_digest(source) if 'pals_rules_descriptor' in receipt['binaries'] else None
+            getter('rules-descriptor', 'pals_rules_descriptor', ['--model-profile=virtual_review_v1'],
+                   lambda value: validate_rules_descriptor(value, encoder))
             recheck_registered_inputs()
             require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                     'HeadChangedDuringBuild')
@@ -788,10 +881,13 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
             for name, value in (('source-file-pins.json', {'schema': 'rovezero.ci-native-source-pins/1',
                                                          'source_commit': expected_head, 'files': pins, 'source_components': components}),
                                 ('git-source-provenance.json', {'schema': 'rovezero.ci-git-source-provenance/1',
-                                                                'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls}),
-                                ('compiled-source-inventory.json', compiled), ('native-source-pins.json', native),
-                                ('static-model-registry.json', registry), ('rules-descriptor.json', rules)):
+                                                                'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls})):
                 write_json(artifact / name, value)
+                receipt.setdefault('metadata', {})[name] = file_pin(artifact / name)
+            # These actual source proofs also describe independently built
+            # private ELFs in a failed full bundle; they grant no admission.
+            require(not receipt['target_failures'], 'RequiredCargoTargetsFailed')
+            require(all(row['status'] == 'verified' for row in getters.values()), 'RequiredStaticMetadataFailed')
             lock.seek(0)
             with (artifact / 'Cargo.lock').open('xb') as target:
                 shutil.copyfileobj(lock, target, 65536)

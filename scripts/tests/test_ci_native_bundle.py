@@ -573,10 +573,126 @@ class NativeBundleTests(unittest.TestCase):
             with self.subTest(name=name, case='outside-source'), self.assertRaises(RuntimeError):
                 check(foreign_messages, actual_metadata=foreign_metadata)
 
+    def test_independent_metadata_getter_preserves_failed_verdict_and_next_result(self):
+        for name, code, raw, status in (
+                ('closed-exit', 7, b'', 'failed_command'),
+                ('wrong-metadata', 0, b'{"native":false}\n', 'failed_metadata'),
+                ('empty', 0, b'', 'failed_metadata'),
+                ('malformed', 0, b'{"native":\n', 'failed_metadata')):
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                artifact, private = root / 'artifact', root / 'private'
+                artifact.mkdir()
+                private.mkdir()
+                target = private / 'synthetic-getter'
+                target.write_bytes(b'\x7fELF-synthetic-getter-never-executed')
+                binaries = {target.name: {'pin': bundle.file_pin(target)}}
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
+                results, events = {}, []
+
+                def supervise(wrapper, *_args):
+                    argument = wrapper[-1]
+                    events.append(('dispatch', argument))
+                    if argument == '--native':
+                        os.write(1, raw)
+                        os.write(2, b'original getter diagnostic\n')
+                        return code, True, None
+                    self.assertEqual(argument, '--registry')
+                    os.write(1, b'{"registry":"independent"}\n')
+                    return 0, True, None
+
+                common = dict(artifact=artifact, private=private, binaries=binaries, results=results,
+                              target=target.name, env=env,
+                              failure_check=lambda: events.append(('inputs_checked',)))
+                with patch.object(bundle, 'run_group', supervise), \
+                        patch.object(bundle.sys, 'stderr', io.StringIO()):
+                    first = bundle.collect_metadata_getter(build, label='native-source-pins',
+                        arguments=['--native'], validate=lambda value: bundle.metadata_require(
+                            value.get('native') is True, 'SyntheticNativeVerdict'), **common)
+                    second = bundle.collect_metadata_getter(build, label='static-model-registry',
+                        arguments=['--registry'], validate=lambda value: bundle.metadata_require(
+                            value == {'registry': 'independent'}, 'SyntheticRegistryVerdict'), **common)
+                self.assertIsNone(first)
+                self.assertEqual(results['native-source-pins']['status'], status)
+                self.assertEqual(second, {'registry': 'independent'})
+                self.assertEqual(results['static-model-registry']['status'], 'verified')
+                first_dispatch = events.index(('dispatch', '--native'))
+                second_dispatch = events.index(('dispatch', '--registry'))
+                self.assertIn(('inputs_checked',), events[first_dispatch + 1:second_dispatch])
+                self.assertFalse((artifact / 'native-source-pins.json').exists())
+                self.assertEqual(json.loads((artifact / 'static-model-registry.json').read_bytes()), second)
+                self.assertEqual(results['static-model-registry']['metadata_pin'],
+                                 bundle.file_pin(artifact / 'static-model-registry.json'))
+                self.assertEqual(results['native-source-pins']['stdout_pin'],
+                                 {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
+                self.assertEqual((root / 'logs/native-source-pins.stdout').read_bytes(), raw)
+                self.assertEqual((root / 'logs/native-source-pins.stderr').read_bytes(),
+                                 b'original getter diagnostic\n')
+
+    def test_metadata_getter_propagates_shared_input_failure_before_next_dispatch(self):
+        for code in (0, 7):
+            with self.subTest(exit_code=code), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                artifact, private = root / 'artifact', root / 'private'
+                artifact.mkdir()
+                private.mkdir()
+                target = private / 'synthetic-getter'
+                target.write_bytes(b'\x7fELF-synthetic-getter-never-executed')
+                binaries = {target.name: {'pin': bundle.file_pin(target)}}
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
+                results, dispatched = {}, []
+                mutation = RuntimeError('synthetic original shared input changed')
+
+                def check_inputs():
+                    if dispatched:
+                        raise mutation
+
+                def supervise(wrapper, *_args):
+                    dispatched.append(wrapper[-1])
+                    os.write(1, b'{"native":true}\n')
+                    return code, True, None
+
+                common = dict(artifact=artifact, private=private, binaries=binaries, results=results,
+                              target=target.name, env=env, validate=lambda value: None,
+                              failure_check=check_inputs)
+                with patch.object(bundle, 'run_group', supervise), \
+                        patch.object(bundle.sys, 'stderr', io.StringIO()), \
+                        self.assertRaises(RuntimeError) as caught:
+                    bundle.collect_metadata_getter(build, label='native-source-pins',
+                        arguments=['--native'], **common)
+                    bundle.collect_metadata_getter(build, label='static-model-registry',
+                        arguments=['--registry'], **common)
+                self.assertIs(caught.exception, mutation)
+                self.assertNotIn('--registry', dispatched)
+                self.assertNotIn('static-model-registry', results)
+                self.assertNotEqual(results['native-source-pins']['status'], 'blocked_missing_target')
+                self.assertFalse((artifact / 'native-source-pins.json').exists())
+                self.assertEqual((root / 'logs/native-source-pins.stdout').read_bytes(), b'{"native":true}\n')
+
     def test_strict_metadata_rejects_duplicate_keys_and_nonfinite_values(self):
         for raw in (b'{"x":1,"x":2}', b'{"x":NaN}'):
             with self.assertRaises(RuntimeError):
                 bundle.strict_json(raw)
+        fields = ['state', 'history\U0001f642']
+        framed = b''.join(len(raw).to_bytes(8, 'little') + raw
+                          for raw in (field.encode('utf-8') for field in fields))
+        encoder = 'ab' * 32
+        descriptor = {'schema': 'rovezero.pals-rules-descriptor.v3',
+            'rules_input_profile': 'rz-pals-rules-virtual-review-v1',
+            'config': {'profile': 'virtual_review_v1'},
+            'learned_input_compatibility': 'unverified_declaration_only',
+            'bounds': {'max_records': 64, 'max_anchors': 4, 'max_line_plies': 256,
+                       'line_buckets': [8, 16, 32, 64, 128, 256], 'max_candidates': 256,
+                       'token_budgets': [128, 256, 512], 'root_anchor': 0},
+            'semantic_fields': fields, 'rules_input_semantic_sha256': hashlib.sha256(framed).hexdigest(),
+            'rules_encoder_source_sha256': encoder}
+        bundle.validate_rules_descriptor(descriptor, encoder)
+        with self.assertRaisesRegex(bundle.MetadataMismatch, 'StaticRulesDescriptorSourceFraming'):
+            bundle.validate_rules_descriptor(dict(descriptor, rules_input_semantic_sha256='0' * 64), encoder)
 
     def test_rovent_compile_metadata_cannot_claim_native_execution_or_replace_registered_sources(self):
         components = {'uci': 'ab' * 32, 'rules': 'cd' * 32}
