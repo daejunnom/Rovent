@@ -193,7 +193,7 @@ class ActualCpuPlanTests(unittest.TestCase):
     def test_actual_plan_data_drives_failure_propagation(self):
         stages = ValidationStages({"stages": {}}, lambda: None)
         observed = []
-        failures = {"model_tests_seconds", "device_packing_rust_body_seconds", "private_verifier_seconds"}
+        failures = {"model_tests_seconds", "device_packing_rust_body_seconds", "preparation_check_seconds"}
         for name in cpu_stage_dependencies():
             def operation(name=name):
                 observed.append(name)
@@ -203,6 +203,8 @@ class ActualCpuPlanTests(unittest.TestCase):
         self.assertTrue(stages.passed("export_seconds"))
         self.assertTrue(stages.passed("numeric_seconds"))
         self.assertTrue(stages.passed("rust_fixtures_seconds"))
+        self.assertTrue(stages.passed("private_verifier_seconds"))
+        self.assertEqual(stages.results["preparation_check_seconds"]["failure_scope"], "stage")
         self.assertTrue(failures.issubset(observed))
         with self.assertRaises(ValidationStagesFailed):
             stages.require_complete()

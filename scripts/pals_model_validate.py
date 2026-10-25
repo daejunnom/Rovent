@@ -35,7 +35,9 @@ _CPU_STAGE_DEPENDENCIES = MappingProxyType({
     "device_packing_rust_body_seconds": ("device_packing_files_seconds",),
     "initialize_seconds": ("torch_install_seconds",),
     "preparation_check_seconds": ("initialize_seconds", "reference_install_seconds"),
-    "private_verifier_seconds": ("preparation_check_seconds",),
+    # This producer revalidates its own collection, checkpoint and CPU ELF.
+    # It does not consume preparation-check's separate row/mask verdict.
+    "private_verifier_seconds": ("initialize_seconds", "reference_install_seconds"),
     "export_seconds": ("initialize_seconds", "reference_install_seconds"),
     "numeric_seconds": ("export_seconds",),
     # Fixture generation reads the checkpoint/export, not numeric-check's
