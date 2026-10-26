@@ -12,6 +12,9 @@
 //! Supply explicit checkpoint/request paths, byte lengths and SHA-256 pins,
 //! plus finite --work-ms and --cleanup-ms limits. Output is a bounded JSON
 //! diagnostic receipt; source provenance and final OS closure stay with the caller.
+//! Optional --context-mutations diagnostic_v1 adds separate C arithmetic and
+//! failure-atomicity observations for quiet_start. It issues no new Bound/ACK
+//! and does not certify current accepted-C lineage or performance.
 
 #![forbid(unsafe_code)]
 
@@ -162,6 +165,7 @@ struct Arguments {
     request: RawPin,
     work_ms: u64,
     cleanup_ms: u64,
+    context_mutations: bool,
 }
 fn forbidden_input_name(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
@@ -259,10 +263,11 @@ fn argument_pin(path: String, size: String, digest: String, maximum: usize) -> R
 fn arguments() -> Result<Arguments> {
     let values: Vec<String> = std::env::args().skip(1).collect();
     need(
-        values.len() == 16,
+        values.len() == 16 || values.len() == 18,
         "CLI",
         "use --checkpoint PATH --checkpoint-bytes N --checkpoint-sha256 SHA --request PATH --request-bytes N --request-sha256 SHA --work-ms N --cleanup-ms N",
     )?;
+    // The original eight flags remain required. C arithmetic is opt-in.
     let names = [
         "--checkpoint",
         "--checkpoint-bytes",
@@ -272,6 +277,7 @@ fn arguments() -> Result<Arguments> {
         "--request-sha256",
         "--work-ms",
         "--cleanup-ms",
+        "--context-mutations",
     ];
     let mut map = std::collections::BTreeMap::new();
     for pair in values.chunks_exact(2) {
@@ -283,7 +289,7 @@ fn arguments() -> Result<Arguments> {
         )?;
     }
     need(
-        map.len() == names.len(),
+        names[..8].iter().all(|name| map.contains_key(name)),
         "CLI",
         "all explicit flags are required",
     )?;
@@ -298,6 +304,16 @@ fn arguments() -> Result<Arguments> {
         "CLI",
         "finite work/cleanup bounds outside this numeric profile",
     )?;
+    let context_mutations = match map.get("--context-mutations") {
+        None => false,
+        Some(&"diagnostic_v1") => true,
+        Some(_) => {
+            return Err(ProbeError::new(
+                "CLI",
+                "--context-mutations requires diagnostic_v1",
+            ));
+        }
+    };
     Ok(Arguments {
         checkpoint: argument_pin(
             map["--checkpoint"].into(),
@@ -313,6 +329,7 @@ fn arguments() -> Result<Arguments> {
         )?,
         work_ms,
         cleanup_ms,
+        context_mutations,
     })
 }
 fn read_pinned(pin: &RawPin) -> Result<Vec<u8>> {
@@ -568,6 +585,8 @@ struct CaseResult {
     comparisons: Vec<Comparison>,
     error: Option<ProbeError>,
     cleanup_errors: Vec<ProbeError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_mutation_diagnostic: Option<ContextMutationDiagnostic>,
 }
 impl CaseResult {
     fn new(case: &CaseInput) -> Self {
@@ -586,6 +605,7 @@ impl CaseResult {
             record_scope_sha256: None,
             numeric_context_sha256: None,
             context_nonzero: None,
+            context_mutation_diagnostic: None,
             local_changed: false,
             deltas_applied: 0,
             owned_restores: 0,
@@ -718,6 +738,534 @@ fn rebuild(
     record.canonical_readouts += 1;
     check_work(until, "CanonicalForwardResult")?;
     Ok(output)
+}
+
+// This diagnostic observes immutable C arithmetic only. It never rebinds a
+// mutated Context to the admitted View/Bound or issues installation authority.
+#[derive(Serialize)]
+struct ContextMutationDiagnostic {
+    schema: &'static str,
+    scope: &'static str,
+    status: &'static str,
+    direct_forwards_completed: usize,
+    original_context_preserved: Option<bool>,
+    accepted_c_lineage_verified: bool,
+    mutated_bound_created: bool,
+    performance_evidence: bool,
+    steps: Vec<ContextMutationStep>,
+    rejections: Vec<ContextMutationRejection>,
+    error: Option<ProbeError>,
+}
+impl ContextMutationDiagnostic {
+    fn new() -> Self {
+        Self {
+            schema: "rovent.nnuec-context-mutation-diagnostic/1",
+            scope: "actual_checkpoint_immutable_context_arithmetic_only",
+            status: "running",
+            direct_forwards_completed: 0,
+            original_context_preserved: None,
+            accepted_c_lineage_verified: false,
+            mutated_bound_created: false,
+            performance_evidence: false,
+            steps: Vec::new(),
+            rejections: Vec::new(),
+            error: None,
+        }
+    }
+}
+#[derive(Serialize)]
+struct ContextMutationStep {
+    operation: String,
+    context_sha256: String,
+    line_count: usize,
+    edge_count: usize,
+    accumulator_bits_sha256: String,
+    raw_rebuild_accumulator_bits_sha256: String,
+    output_bits_sha256: String,
+    raw_rebuild_output_bits_sha256: String,
+    raw_rebuild_equal: bool,
+    stored_contribution_rebuild_equal: bool,
+    seal_matches_original: bool,
+    numeric_matches_original: bool,
+}
+#[derive(Serialize)]
+struct ContextMutationRejection {
+    operation: String,
+    observed_error: String,
+    original_context_sha256: String,
+    original_accumulator_and_output_preserved: Option<bool>,
+}
+#[derive(Clone)]
+struct ContextLineInput {
+    id: u64,
+    anchor: Position,
+    moves: Vec<BoardMove>,
+    kind: v2::LineKind,
+}
+#[derive(Clone)]
+struct ContextState {
+    context: Arc<v2::Context>,
+    lines: Vec<ContextLineInput>,
+    edges: Vec<v2::Edge>,
+}
+#[derive(PartialEq, Eq)]
+struct ContextObserved {
+    seal: String,
+    accumulator: Vec<u32>,
+    output: Vec<u8>,
+    numeric: Vec<u8>,
+    lines: usize,
+    edges: usize,
+}
+fn context_bits_digest(values: &[u32]) -> String {
+    let mut hash = Sha256::new();
+    for value in values {
+        hash.update(value.to_le_bytes());
+    }
+    hex(hash.finalize())
+}
+fn observe_context(
+    model: &Model,
+    context: &v2::Context,
+    root: &Position,
+    until: Instant,
+    diagnostic: &mut ContextMutationDiagnostic,
+) -> Result<ContextObserved> {
+    check_work(until, "ContextObserveBefore")?;
+    let board = model
+        .board(root)
+        .map_err(|e| ProbeError::new("ContextBoard", e))?;
+    let local = model
+        .local(root)
+        .map_err(|e| ProbeError::new("ContextLocal", e))?;
+    check_work(until, "ContextForwardBefore")?;
+    let output = model
+        .forward(&board, context, &local, root)
+        .map_err(|e| ProbeError::new("ContextForward", e))?;
+    diagnostic.direct_forwards_completed += 1;
+    check_work(until, "ContextForwardResult")?;
+    // Exclude the order-sensitive seal only from this separately named numeric
+    // comparison. The actual output and its actual seal are also retained.
+    let mut numeric_only = output.clone();
+    numeric_only.context_sha256.clear();
+    Ok(ContextObserved {
+        seal: context
+            .sha256()
+            .map_err(|e| ProbeError::new("ContextSeal", e))?,
+        accumulator: context.values().iter().map(|v| v.to_bits()).collect(),
+        output: output_bits(&output)?,
+        numeric: output_bits(&numeric_only)?,
+        lines: context.line_count(),
+        edges: context.edge_count(),
+    })
+}
+fn verify_context_state(
+    model: &Model,
+    state: &ContextState,
+    root: &Position,
+    until: Instant,
+    operation: &str,
+    baseline: Option<&ContextObserved>,
+    diagnostic: &mut ContextMutationDiagnostic,
+) -> Result<ContextObserved> {
+    check_work(until, "ContextRawRebuildBefore")?;
+    let mut rebuilt = model.empty_context();
+    for line in &state.lines {
+        check_work(until, "ContextRawLineBefore")?;
+        let encoded = model
+            .encode_line(&line.anchor, &line.moves, line.kind)
+            .map_err(|e| ProbeError::new("ContextRawLine", e))?;
+        rebuilt = model
+            .with_line(&rebuilt, line.id, encoded)
+            .map_err(|e| ProbeError::new("ContextRawInsert", e))?;
+    }
+    for edge in &state.edges {
+        check_work(until, "ContextRawEdgeBefore")?;
+        rebuilt = model
+            .with_edge(&rebuilt, *edge)
+            .map_err(|e| ProbeError::new("ContextRawEdge", e))?;
+    }
+    let stored_rebuild = model
+        .rebuild_context(&state.context)
+        .map_err(|e| ProbeError::new("ContextStoredContributionRebuild", e))?;
+    let actual = observe_context(model, &state.context, root, until, diagnostic)?;
+    let expected = observe_context(model, &rebuilt, root, until, diagnostic)?;
+    let raw_equal = actual == expected;
+    let stored_equal = actual.accumulator
+        == stored_rebuild
+            .values()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+        && actual.seal
+            == stored_rebuild
+                .sha256()
+                .map_err(|e| ProbeError::new("ContextStoredSeal", e))?;
+    let original = baseline.unwrap_or(&actual);
+    diagnostic.steps.push(ContextMutationStep {
+        operation: operation.into(),
+        context_sha256: actual.seal.clone(),
+        line_count: actual.lines,
+        edge_count: actual.edges,
+        accumulator_bits_sha256: context_bits_digest(&actual.accumulator),
+        raw_rebuild_accumulator_bits_sha256: context_bits_digest(&expected.accumulator),
+        output_bits_sha256: hex(Sha256::digest(&actual.output)),
+        raw_rebuild_output_bits_sha256: hex(Sha256::digest(&expected.output)),
+        raw_rebuild_equal: raw_equal,
+        stored_contribution_rebuild_equal: stored_equal,
+        seal_matches_original: actual.seal == original.seal,
+        numeric_matches_original: actual.accumulator == original.accumulator
+            && actual.numeric == original.numeric,
+    });
+    need(
+        raw_equal && stored_equal,
+        "ContextNumericMismatch",
+        "actual immutable C differs from raw-input or stored-contribution rebuild",
+    )?;
+    check_work(until, "ContextComparisonAcceptance")?;
+    Ok(actual)
+}
+fn verify_context_rejection(
+    model: &Model,
+    state: &ContextState,
+    root: &Position,
+    until: Instant,
+    operation: &str,
+    diagnostic: &mut ContextMutationDiagnostic,
+    action: impl FnOnce() -> std::result::Result<
+        Arc<v2::Context>,
+        rz_search::cpu_value::nnuec::NnuecError,
+    >,
+) -> Result<()> {
+    let before = observe_context(model, &state.context, root, until, diagnostic)?;
+    let error = match action() {
+        Err(error) => error,
+        Ok(_) => return Err(ProbeError::new("ContextExpectedRejection", operation)),
+    };
+    // Preserve the actual rejection even if the following observation expires.
+    // An unobserved preservation check remains null, never an invented true.
+    diagnostic.rejections.push(ContextMutationRejection {
+        operation: operation.into(),
+        observed_error: error.to_string().chars().take(2048).collect(),
+        original_context_sha256: before.seal.clone(),
+        original_accumulator_and_output_preserved: None,
+    });
+    let after = observe_context(model, &state.context, root, until, diagnostic)?;
+    let preserved = before == after;
+    diagnostic
+        .rejections
+        .last_mut()
+        .unwrap()
+        .original_accumulator_and_output_preserved = Some(preserved);
+    need(
+        preserved,
+        "ContextFailureAtomicity",
+        "rejected change modified the original C",
+    )
+}
+fn run_context_mutations(
+    model: &Model,
+    bound: &BoundNnuecReviewContext,
+    view: &rz_search::pals::review_context::ReviewView,
+    root: &Position,
+    until: Instant,
+    diagnostic: &mut ContextMutationDiagnostic,
+) -> Result<()> {
+    check_work(until, "ContextMutationAdmission")?;
+    let local = model
+        .local(root)
+        .map_err(|e| ProbeError::new("ContextInputLocal", e))?;
+    let reference = model
+        .reference_input(bound.context(), &local, root)
+        .map_err(|e| ProbeError::new("ContextReferenceInput", e))?;
+    need(
+        reference.context_lines.len() == view.records().len()
+            && bound.context_source_snapshots().len() == view.records().len(),
+        "ContextSourceRows",
+        "same admitted source rows required",
+    )?;
+    let mut lines = Vec::new();
+    for (index, record) in view.records().iter().enumerate() {
+        check_work(until, "ContextSourceRow")?;
+        need(
+            reference.context_lines[index].id == index as u64
+                && view.records_metadata()[index].source_line_offset == 0,
+            "ContextSourceRows",
+            "diagnostic raw encode requires original, unre-based rows",
+        )?;
+        let original = bound
+            .context()
+            .line(index as u64)
+            .ok_or_else(|| ProbeError::new("ContextSourceRows", "actual context line absent"))?;
+        lines.push(ContextLineInput {
+            id: index as u64,
+            anchor: Position::from_snapshot(
+                &bound.context_source_snapshots()[index],
+                Default::default(),
+            )
+            .map_err(|e| ProbeError::new("ContextSourceAnchor", e))?,
+            moves: record.line.clone(),
+            kind: original.kind(),
+        });
+    }
+    let edges = reference
+        .context_edges
+        .iter()
+        .map(|edge| {
+            Ok(v2::Edge {
+                source: edge.source,
+                target: edge.target,
+                kind: v2::EdgeKind::try_from(edge.kind)
+                    .map_err(|e| ProbeError::new("ContextEdgeKind", e))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let original = ContextState {
+        context: Arc::clone(bound.context()),
+        lines,
+        edges,
+    };
+    let baseline =
+        verify_context_state(model, &original, root, until, "original", None, diagnostic)?;
+    let edge = *original.edges.last().ok_or_else(|| {
+        ProbeError::new("ContextMutationAdmission", "one actual relation required")
+    })?;
+    let target = original
+        .lines
+        .iter()
+        .position(|line| line.id == edge.target)
+        .ok_or_else(|| {
+            ProbeError::new("ContextMutationAdmission", "actual relation target absent")
+        })?;
+    let mut changed = original.clone();
+    changed.lines[target].kind = match changed.lines[target].kind {
+        v2::LineKind::Repair => v2::LineKind::Counterexample,
+        _ => v2::LineKind::Repair,
+    };
+    let line = &changed.lines[target];
+    let replacement = model
+        .encode_line(&line.anchor, &line.moves, line.kind)
+        .map_err(|e| ProbeError::new("ContextReplacementEncode", e))?;
+    changed.context = model
+        .with_line(&original.context, edge.target, replacement)
+        .map_err(|e| ProbeError::new("ContextReplace", e))?;
+    verify_context_state(
+        model,
+        &changed,
+        root,
+        until,
+        "replace_line_kind",
+        Some(&baseline),
+        diagnostic,
+    )?;
+    changed.context = model
+        .with_line(
+            &changed.context,
+            edge.target,
+            Arc::clone(original.context.line(edge.target).unwrap()),
+        )
+        .map_err(|e| ProbeError::new("ContextReplaceUndo", e))?;
+    changed.lines = original.lines.clone();
+    let undone = verify_context_state(
+        model,
+        &changed,
+        root,
+        until,
+        "replace_line_undo",
+        Some(&baseline),
+        diagnostic,
+    )?;
+    need(
+        undone == baseline,
+        "ContextReplaceUndo",
+        "inverse replacement must restore original C",
+    )?;
+    let mut removed = original.clone();
+    removed.context = model
+        .without_edge(&removed.context, edge)
+        .map_err(|e| ProbeError::new("ContextRemoveEdge", e))?;
+    removed.edges.pop();
+    verify_context_state(
+        model,
+        &removed,
+        root,
+        until,
+        "remove_last_edge",
+        Some(&baseline),
+        diagnostic,
+    )?;
+    removed.context = model
+        .with_edge(&removed.context, edge)
+        .map_err(|e| ProbeError::new("ContextRestoreEdge", e))?;
+    removed.edges.push(edge);
+    let undone = verify_context_state(
+        model,
+        &removed,
+        root,
+        until,
+        "restore_last_edge",
+        Some(&baseline),
+        diagnostic,
+    )?;
+    need(
+        undone == baseline,
+        "ContextRestoreEdge",
+        "last-edge inverse must restore original order and C",
+    )?;
+    let mut isolated = original.clone();
+    let last =
+        isolated.lines.last().cloned().ok_or_else(|| {
+            ProbeError::new("ContextMutationAdmission", "actual last line absent")
+        })?;
+    let incident = original
+        .edges
+        .iter()
+        .copied()
+        .filter(|edge| edge.source == last.id || edge.target == last.id)
+        .collect::<Vec<_>>();
+    for edge in incident.iter().rev() {
+        check_work(until, "ContextIsolateEdge")?;
+        isolated.context = model
+            .without_edge(&isolated.context, *edge)
+            .map_err(|e| ProbeError::new("ContextIsolateEdge", e))?;
+    }
+    isolated
+        .edges
+        .retain(|edge| edge.source != last.id && edge.target != last.id);
+    isolated.context = model
+        .without_line(&isolated.context, last.id)
+        .map_err(|e| ProbeError::new("ContextRemoveIsolatedLine", e))?;
+    isolated.lines.pop();
+    verify_context_state(
+        model,
+        &isolated,
+        root,
+        until,
+        "remove_isolated_last_line",
+        Some(&baseline),
+        diagnostic,
+    )?;
+    isolated.context = model
+        .with_line(
+            &isolated.context,
+            last.id,
+            Arc::clone(original.context.line(last.id).unwrap()),
+        )
+        .map_err(|e| ProbeError::new("ContextRestoreIsolatedLine", e))?;
+    isolated.lines.push(last);
+    for edge in &incident {
+        check_work(until, "ContextRestoreIncidentEdge")?;
+        isolated.context = model
+            .with_edge(&isolated.context, *edge)
+            .map_err(|e| ProbeError::new("ContextRestoreIncidentEdge", e))?;
+        isolated.edges.push(*edge);
+    }
+    let restored = verify_context_state(
+        model,
+        &isolated,
+        root,
+        until,
+        "restore_isolated_line_and_edges",
+        Some(&baseline),
+        diagnostic,
+    )?;
+    // Re-added incident edges may have a new insertion order/seal. Numeric
+    // equality is required; exact seal restoration is reported, not invented.
+    need(
+        restored.accumulator == baseline.accumulator && restored.numeric == baseline.numeric,
+        "ContextRestoreIsolatedLine",
+        "line/edge inverse must restore actual numeric C",
+    )?;
+    let ids = original
+        .lines
+        .iter()
+        .map(|line| line.id)
+        .collect::<Vec<_>>();
+    let empty = model
+        .without_bundle(&original.context, &ids)
+        .map_err(|e| ProbeError::new("ContextRemoveClosedBundle", e))?;
+    verify_context_state(
+        model,
+        &ContextState {
+            context: empty,
+            lines: Vec::new(),
+            edges: Vec::new(),
+        },
+        root,
+        until,
+        "remove_closed_bundle",
+        Some(&baseline),
+        diagnostic,
+    )?;
+    verify_context_rejection(
+        model,
+        &original,
+        root,
+        until,
+        "duplicate_edge",
+        diagnostic,
+        || model.with_edge(&original.context, edge),
+    )?;
+    verify_context_rejection(
+        model,
+        &original,
+        root,
+        until,
+        "connected_line_removal",
+        diagnostic,
+        || model.without_line(&original.context, edge.target),
+    )?;
+    verify_context_rejection(
+        model,
+        &original,
+        root,
+        until,
+        "dangling_bundle_removal",
+        diagnostic,
+        || model.without_bundle(&original.context, &[edge.source]),
+    )?;
+    verify_context_rejection(
+        model,
+        &original,
+        root,
+        until,
+        "duplicate_bundle_ids",
+        diagnostic,
+        || model.without_bundle(&original.context, &[edge.source, edge.source]),
+    )?;
+    let target_line = &original.lines[target];
+    let wrong_move = target_line
+        .anchor
+        .legal_moves()
+        .into_iter()
+        .find(|movement| Some(movement) != target_line.moves.first())
+        .ok_or_else(|| {
+            ProbeError::new(
+                "ContextWrongFirstMove",
+                "no alternate actual legal first move",
+            )
+        })?;
+    let wrong_first = model
+        .encode_line(&target_line.anchor, &[wrong_move], target_line.kind)
+        .map_err(|e| ProbeError::new("ContextWrongFirstMove", e))?;
+    verify_context_rejection(
+        model,
+        &original,
+        root,
+        until,
+        "replacement_first_move_mismatch",
+        diagnostic,
+        || model.with_line(&original.context, edge.target, wrong_first),
+    )?;
+    let after = observe_context(model, &original.context, root, until, diagnostic)?;
+    diagnostic.original_context_preserved = Some(after == baseline);
+    need(
+        after == baseline,
+        "ContextOriginalPreservation",
+        "original admitted C changed",
+    )?;
+    diagnostic.status = "context_mutation_and_failure_atomicity_verified";
+    Ok(())
 }
 
 fn check_cleanup(
@@ -942,6 +1490,7 @@ fn run_case(
     model: &Arc<Model>,
     until: Instant,
     cleanup_until: Instant,
+    context_mutations: bool,
 ) -> CaseResult {
     let mut record = CaseResult::new(case);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1081,6 +1630,16 @@ fn run_case(
         record.context_nonzero = Some(bound.context().values().iter().any(|v| *v != 0.0));
         // Same public constructor used by the original UCI deferred-value and
         // adaptive-port paths. No worker install ACK or PALS consume is issued.
+        if context_mutations && case.coverage == "quiet_start" {
+            let mut diagnostic = ContextMutationDiagnostic::new();
+            let result = run_context_mutations(model, &bound, &view, &root, until, &mut diagnostic);
+            if let Err(error) = &result {
+                diagnostic.status = "failed";
+                diagnostic.error = Some(error.clone());
+            }
+            record.context_mutation_diagnostic = Some(diagnostic);
+            result?;
+        }
         let evaluator =
             V2CpuValue::from_bound(Arc::clone(model), Arc::clone(&bound), &stores, seal)
                 .map_err(|e| ProbeError::new("NativeValueInstall", e))?;
@@ -1236,7 +1795,7 @@ fn execute(record: &mut Report) -> Result<()> {
     record.declared_library_source = Some(input.declared_library_source.clone());
     record.status = "running".into();
     for case in &input.cases {
-        let result = run_case(case, &model, until, cleanup_until);
+        let result = run_case(case, &model, until, cleanup_until, args.context_mutations);
         let passed = result.status == "numeric_and_owned_undo_verified";
         record.cases.push(result);
         if !passed {
