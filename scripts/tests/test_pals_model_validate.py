@@ -269,6 +269,37 @@ class OwnerBoundaryTests(unittest.TestCase):
         self.assertEqual(receipt["stage_results"]["venv_seconds"]["status"], "failed")
         self.assertEqual(receipt["stage_results"]["numeric_seconds"]["status"], "blocked")
 
+    def test_missing_private_verifier_preserves_independent_neural_stages(self):
+        self.args.dataset_run = self.root / "collection"
+        self.args.dataset_receipt_sha256 = "2" * 64
+        self.args.dataset_encoder_source_sha256 = "3" * 64
+        self.args.verifier_cpu_binary = self.root / "missing-verifier"
+        self.args.verifier_cpu_binary_sha256 = "4" * 64
+        runtime = self.root / "runtime-fixture.so"
+        runtime.write_bytes(b"small source-only runtime fixture")
+        commands = []
+
+        def run_without_process(command, **_options):
+            commands.append(command)
+            return 0.0
+
+        with self.patched_boundaries(), \
+                mock.patch.object(wrapper, "run", side_effect=run_without_process), \
+                mock.patch.object(wrapper.subprocess, "check_output", return_value=str(runtime)), \
+                mock.patch.object(wrapper, "publish_runtime", return_value=(runtime, "5" * 64)), \
+                self.assertRaises(ValidationStagesFailed):
+            wrapper.main()
+
+        receipt = json.loads((self.output / "validation.json").read_text(encoding="utf-8"))
+        stages = receipt["stage_results"]
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(stages["private_verifier_seconds"]["failure_scope"], "stage")
+        self.assertEqual(stages["private_verifier_seconds"]["error_type"], "ValueError")
+        for name in ("initialize_seconds", "export_seconds", "numeric_seconds"):
+            self.assertEqual(stages[name]["status"], "passed")
+        self.assertFalse(any("rz_pals_model.verifier_producer" in command for command in commands))
+        self.assertEqual(sum(call[0] == "finish" for call in self.lease.calls), 1)
+
     def test_partial_acquire_failure_still_attempts_original_finish(self):
         self.lease.acquire_error = RuntimeError("fake acquire failed after record")
         with self.patched_boundaries(), self.assertRaisesRegex(RuntimeError, "after record"):

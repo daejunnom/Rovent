@@ -208,8 +208,6 @@ def main():
     rules_profile = checked(args.rules_profile_json) if args.rules_profile_json else None
     dataset_run = checked(args.dataset_run) if args.dataset_run else None
     verifier_binary = checked(args.verifier_cpu_binary) if args.verifier_cpu_binary else None
-    if verifier_binary and (not verifier_binary.is_file() or not 1 <= verifier_binary.stat().st_size <= 1024**3):
-        parser.error("private verifier dispatcher must be a bounded regular executable")
     if args.layout == "shared_pc_if" and rules_profile is None:
         parser.error("shared_pc_if requires a registered Rules descriptor")
     if rules_profile and (not rules_profile.is_file() or rules_profile.stat().st_size > 64 * 1024):
@@ -366,6 +364,9 @@ def main():
                     cwd=source, environment=environment))
                 if verifier_binary:
                     def private_verifier():
+                        if (not verifier_binary.is_file()
+                                or not 1 <= verifier_binary.stat().st_size <= 1024**3):
+                            raise ValueError("private verifier dispatcher must be a bounded regular executable")
                         with checkpoint.open("rb") as stream:
                             checkpoint_sha = hashlib.file_digest(stream, "sha256").hexdigest()
                         run([str(python), "-B", "-m", "rz_pals_model.verifier_producer",
