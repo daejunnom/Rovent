@@ -7,6 +7,7 @@ complete.  A real current-source7/history/journal integration remains required.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import io
 import json
@@ -227,6 +228,135 @@ class UnattributedInventoryTests(unittest.TestCase):
             return_value={role: self.source_paths[role] for role in policy.legacy.SOURCE_ROLES}))
         stack.enter_context(patch.object(policy.transitions, "_layout", return_value=({}, 0, {})))
         return stack
+
+    def _observation_owner(self, name):
+        owner = outputs.OutputLease(self.root / name, self.source, catalog=self.catalog,
+            reserve=1 << 18, unattributed_preservation=self.selection()).acquire()
+        def close_inputs_only():
+            try:
+                owner._close_preservation_journal()
+            finally:
+                try:
+                    owner._close_created_directory()
+                finally:
+                    try:
+                        owner._close_quarantine_view()
+                    finally:
+                        owner.guard.release()
+        self.addCleanup(close_inputs_only)
+        return owner
+
+    def _view_fds(self, view):
+        fds = tuple(view.inventory.held.fds) + tuple(view.inventory.history.held.fds)
+        self.assertTrue(fds, "the fixture must hold actual observation inputs")
+        for fd in fds:
+            os.fstat(fd)
+        return fds
+
+    def _assert_closed_fds(self, fds):
+        # Check before another observer opens files: the OS may then reuse the
+        # descriptor numbers, which would not mean the old observation survived.
+        for fd in fds:
+            with self.assertRaises(OSError) as caught:
+                os.fstat(fd)
+            self.assertEqual(caught.exception.errno, errno.EBADF)
+
+    def test_replacement_retires_actual_input_fds_before_new_observation(self):
+        with self._history_patches():
+            owner = self._observation_owner("fd-replacement")
+            old = owner._quarantine_view
+            old_fds = self._view_fds(old)
+            guard_stream = owner.guard.stream
+            journal = owner._preservation_journal
+            journal_identity = policy.custody._did(os.fstat(journal.fd))
+            original_record = copy.deepcopy(owner.record)
+            row_path = self.catalog / (owner.key + ".json")
+            original_row = row_path.read_bytes()
+            observe = policy.observe_fresh_output
+            # This independent input shares a pathname with an observation
+            # source, but has its own owner and must survive view retirement.
+            with self.source_paths["guard"].open("rb") as retained_input:
+                retained_identity = policy.custody._stamp(os.fstat(retained_input.fileno()))
+                def next_observation(*args, **kwargs):
+                    self._assert_closed_fds(old_fds)
+                    owner.guard.assert_held()
+                    self.assertIs(owner.guard.stream, guard_stream)
+                    self.assertIs(owner._preservation_journal, journal)
+                    self.assertEqual(policy.custody._did(os.fstat(journal.fd)), journal_identity)
+                    self.assertEqual(owner.record, original_record)
+                    self.assertEqual(row_path.read_bytes(), original_row)
+                    self.assertEqual(policy.custody._stamp(os.fstat(retained_input.fileno())),
+                                     retained_identity)
+                    return observe(*args, **kwargs)
+                with patch.object(policy, "observe_fresh_output", side_effect=next_observation):
+                    owner.check_budget()
+                self.assertEqual(policy.custody._stamp(os.fstat(retained_input.fileno())),
+                                 retained_identity)
+            self.assertTrue(old._closed)
+            self.assertIsNot(owner._quarantine_view, old)
+            self.assertEqual(owner.record, original_record)
+            self.assertEqual(row_path.read_bytes(), original_row)
+
+    def test_old_observation_close_failure_preserves_original_error_and_owner(self):
+        with self._history_patches():
+            owner = self._observation_owner("fd-close-failure")
+            old = owner._quarantine_view
+            old_fds = self._view_fds(old)
+            close = old.close
+            failure = OSError(errno.EIO, "injected observation close failure")
+            original_record = copy.deepcopy(owner.record)
+            row_path = self.catalog / (owner.key + ".json")
+            original_row = row_path.read_bytes()
+            journal = owner._preservation_journal
+            def close_then_fail(primary=None):
+                close(primary)
+                raise failure
+            with patch.object(old, "close", side_effect=close_then_fail), \
+                 patch.object(policy, "observe_fresh_output",
+                              side_effect=AssertionError("failed close cannot admit a replacement")):
+                with self.assertRaises(OSError) as caught:
+                    owner.check_budget()
+            self.assertIs(caught.exception, failure)
+            self._assert_closed_fds(old_fds)
+            self.assertIsNone(owner._quarantine_view)
+            self.assertIs(owner._preservation_journal, journal)
+            owner.guard.assert_held()
+            self.assertEqual(owner.record, original_record)
+            self.assertEqual(row_path.read_bytes(), original_row)
+
+    def test_new_observation_failure_during_finish_releases_only_owned_inputs(self):
+        with self._history_patches():
+            owner = self._observation_owner("fd-new-observation-failure")
+            old_fds = self._view_fds(owner._quarantine_view)
+            partial_fds = []
+            failure = OSError(errno.EIO, "injected new inventory failure")
+            row_path = self.catalog / (owner.key + ".json")
+            original_row = row_path.read_bytes()
+            original_record = copy.deepcopy(owner.record)
+            observe = policy.observe_fresh_output
+            def next_observation(*args, **kwargs):
+                self._assert_closed_fds(old_fds)
+                return observe(*args, **kwargs)
+            def fail_inventory(held, *args, **kwargs):
+                held.read(self.items[0]["marker"], policy.MAX_METADATA)
+                partial_fds.extend(held.fds)
+                raise failure
+            with self.source_paths["guard"].open("rb") as retained_input:
+                retained_identity = policy.custody._stamp(os.fstat(retained_input.fileno()))
+                with patch.object(policy, "observe_fresh_output", side_effect=next_observation), \
+                     patch.object(policy, "_inventory", side_effect=fail_inventory):
+                    with self.assertRaises(OSError) as caught:
+                        owner.finish(status="must_not_be_published", tree_gone=True)
+                self.assertIs(caught.exception, failure)
+                self.assertTrue(partial_fds)
+                self._assert_closed_fds(partial_fds)
+                self.assertEqual(policy.custody._stamp(os.fstat(retained_input.fileno())),
+                                 retained_identity)
+            self.assertIsNone(owner._quarantine_view)
+            self.assertIsNone(owner._preservation_journal)
+            self.assertIsNone(owner.guard.stream)
+            self.assertEqual(owner.record, original_record)
+            self.assertEqual(row_path.read_bytes(), original_row)
 
     def test_new_output_journal_and_old_rows_unchanged_with_explicit_mocked_history(self):
         original = {Path(item["catalog"]["path"]): Path(item["catalog"]["path"]).read_bytes()

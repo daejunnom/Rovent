@@ -215,14 +215,15 @@ class OutputLease:
         if self.unattributed_preservation is not None:
             from managed_output_unattributed_preservation import observe_fresh_output
             previous, self._quarantine_view = self._quarantine_view, None
-            try:
-                self._quarantine_view = observe_fresh_output(self.catalog,
-                    self.unattributed_preservation, self.guard, output=self.output,
-                    source=self.source, producer_record=self.record)
-                return self._quarantine_view.rows()
-            finally:
-                if previous is not None:
-                    previous.close(sys.exc_info()[1])
+            # Retire only the superseded observation's input FDs before the
+            # next full corpus/history observation. The lease keeps its guard
+            # and append journal; a failed replacement has no old-view fallback.
+            if previous is not None:
+                previous.close()
+            self._quarantine_view = observe_fresh_output(self.catalog,
+                self.unattributed_preservation, self.guard, output=self.output,
+                source=self.source, producer_record=self.record)
+            return self._quarantine_view.rows()
         rows = _catalog_rows(self.catalog)
         if self._preservation_enabled:
             from managed_output_preservation_session import observe_new_output
