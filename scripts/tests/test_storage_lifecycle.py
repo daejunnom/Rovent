@@ -419,13 +419,48 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
 
     def assert_sticky_failure(self, primary):
         self.assertIs(self.owner._directory_binding_error, primary)
-        count = self.writes
+        record, record_before = self.owner.record, copy.deepcopy(self.owner.record)
+        disk, size, count = copy.deepcopy(self.disk), self.size, self.writes
+        named, named_before = self.named_child, copy.deepcopy(vars(self.named_child)) if self.named_child is not None else None
+        parent, parent_before = self.named_parent, copy.deepcopy(vars(self.named_parent))
+        cap = self.owner._created_directory
+        fds = (cap.fd, cap.parent_fd) if cap is not None else ()
+        opened = [fd for fd in fds if fd is not None]
+        closed, releases = self.fake_os.close.call_count, self.gate.release.call_count
+        self.gate.assert_held()
+        self.assertTrue(self.held)
+        self.assertTrue(all(fd in self.fd_info for fd in opened))
+        with self.assertRaises(StorageError) as before_finish:
+            self.owner.check_budget()
+        self.assertIs(before_finish.exception.__cause__, primary)
+        self.assertEqual(self.gate.release.call_count, releases)
+        self.assertEqual(self.fake_os.close.call_count, closed)
+        if cap is not None:
+            self.assertEqual((cap.fd, cap.parent_fd), fds)
+        self.assertEqual((self.owner.record, self.disk, self.size, self.writes),
+                         (record_before, disk, size, count))
         with self.assertRaises(StorageError) as blocked:
             self.owner.finish(status="completed", tree_gone=True)
         self.assertIs(blocked.exception.__cause__, primary)
+        self.assertIs(self.owner._directory_binding_error, primary)
+        self.assertIs(self.owner.record, record)
+        self.assertEqual(self.owner.record, record_before)
+        self.assertEqual(self.disk, disk)
+        self.assertEqual(self.size, size)
         self.assertEqual(self.writes, count)
         self.assertEqual(self.disk["state"], "active")
-        self.assertFalse(self.gate.release.called)
+        self.assertIs(self.named_child, named)
+        if named is not None:
+            self.assertEqual(vars(self.named_child), named_before)
+        self.assertIs(self.named_parent, parent)
+        self.assertEqual(vars(self.named_parent), parent_before)
+        self.assertIs(self.owner._created_directory, cap)
+        if cap is not None:
+            self.assertIsNone(cap.fd)
+            self.assertIsNone(cap.parent_fd)
+        self.assertCountEqual([call.args[0] for call in self.fake_os.close.call_args_list[closed:]], opened)
+        self.assertEqual(self.gate.release.call_count, releases + 1)
+        self.fake_os.unlink.assert_not_called()
 
     def test_seal_precedes_payload_and_only_identity_changes(self):
         original = copy.deepcopy(self.disk)
@@ -481,16 +516,45 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
     def test_directory_and_parent_replacement_block_budget_and_finish(self):
         self.owner.create_deferred_directory()
         original = copy.deepcopy(self.disk)
+        cap = self.owner._created_directory
+        fds = (cap.fd, cap.parent_fd)
         self.named_child = self.info(99)
-        for action in (self.owner.check_budget, lambda: self.owner.finish(status="completed", tree_gone=True)):
-            with self.assertRaisesRegex(StorageError, "directory changed"):
-                action()
+        replacement = self.named_child
+        with self.assertRaisesRegex(StorageError, "directory changed"):
+            self.owner.check_budget()
         self.assertEqual(self.disk, original)
-        self.named_child = self.fd_info[102]
+        self.assertEqual((cap.fd, cap.parent_fd), fds)
+        self.gate.release.assert_not_called()
         self.named_parent = self.info(98)
+        replacement_parent = self.named_parent
         with self.assertRaisesRegex(StorageError, "parent changed"):
             self.owner.check_budget()
         self.assertEqual(self.disk, original)
+        self.assertEqual((cap.fd, cap.parent_fd), fds)
+        self.gate.assert_held()
+        self.gate.release.assert_not_called()
+        self.fake_os.close.assert_not_called()
+        primary = []
+        actual_check = self.owner.check_budget
+        def check():
+            try:
+                actual_check()
+            except StorageError as error:
+                primary.append(error)
+                raise
+        with patch.object(self.owner, "check_budget", side_effect=check):
+            with self.assertRaises(StorageError) as failure:
+                self.owner.finish(status="completed", tree_gone=True)
+        self.assertIs(failure.exception, primary[0])
+        self.assertEqual(self.disk, original)
+        self.assertIs(self.named_child, replacement)
+        self.assertIs(self.named_parent, replacement_parent)
+        self.assertIs(self.owner._created_directory, cap)
+        self.assertIsNone(cap.fd)
+        self.assertIsNone(cap.parent_fd)
+        self.assertCountEqual([call.args[0] for call in self.fake_os.close.call_args_list], fds)
+        self.gate.release.assert_called_once()
+        self.fake_os.unlink.assert_not_called()
 
     def test_parent_fstat_failure_keeps_fd_owned_and_close_preserves_primary(self):
         primary = OSError("parent fstat failed")
@@ -610,6 +674,55 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
         self.assertIs(failure.exception, self.write_error)
         self.assertIn("close also failed", failure.exception.__notes__[0])
         self.gate.release.assert_called_once()
+
+    def test_initial_finish_storage_failure_closes_original_resources_without_rewriting(self):
+        self.owner.create_deferred_directory()
+        cap = self.owner._created_directory
+        opened = [cap.fd, cap.parent_fd]
+        record, disk = self.owner.record, copy.deepcopy(self.disk)
+        named, named_before = self.named_child, copy.deepcopy(vars(self.named_child))
+        writes = self.writes
+        primary = StorageError("initial preservation budget observation unavailable")
+        journal, view = Mock(), Mock()
+        self.owner._preservation_journal, self.owner._quarantine_view = journal, view
+        with patch.object(self.owner, "check_budget", side_effect=primary):
+            with self.assertRaises(StorageError) as failure:
+                self.owner.finish(status="must_remain_unpublished", tree_gone=True)
+        self.assertIs(failure.exception, primary)
+        self.assertIs(self.owner.record, record)
+        self.assertEqual(self.disk, disk)
+        self.assertEqual(self.writes, writes)
+        self.assertIs(self.named_child, named)
+        self.assertEqual(vars(self.named_child), named_before)
+        self.assertIs(self.owner._created_directory, cap)
+        self.assertIsNone(cap.fd)
+        self.assertIsNone(cap.parent_fd)
+        self.assertCountEqual([call.args[0] for call in self.fake_os.close.call_args_list], opened)
+        journal.close.assert_called_once_with(primary)
+        view.close.assert_called_once_with(primary)
+        self.gate.release.assert_called_once()
+        self.fake_os.unlink.assert_not_called()
+
+    def test_nondeferred_lifetime_failure_precedes_directories_rows_and_guard_acquire(self):
+        target, catalog = self.base / "unused-output", self.base / "unused-catalog"
+        owner = OutputLease(target, self.owner.source, catalog=catalog, deferred=False)
+        owner._rows = Mock(return_value=[])
+        primary = OSError("current owner lifetime unavailable")
+        with patch("managed_outputs.lifetime", side_effect=primary) as observe, \
+                patch.object(Path, "mkdir") as mkdir, \
+                patch("managed_outputs.write_record") as write:
+            with self.assertRaises(OSError) as failure:
+                owner.acquire()
+        self.assertIs(failure.exception, primary)
+        observe.assert_called_once_with()
+        mkdir.assert_not_called()
+        write.assert_not_called()
+        owner._rows.assert_not_called()
+        self.gate.acquire.assert_not_called()
+        self.gate.release.assert_not_called()
+        self.assertIsNone(owner.record)
+        self.assertFalse(target.exists())
+        self.assertFalse(catalog.exists())
 
     def test_descriptor_close_failure_does_not_mask_recorded_budget_error(self):
         self.owner.create_deferred_directory()
@@ -760,15 +873,24 @@ class CreatedDirectoryLinuxFilesystemTests(unittest.TestCase):
                 message = "parent changed" if replace_parent else "directory changed"
                 with self.assertRaisesRegex(StorageError, message):
                     owner.check_budget()
+                cap = owner._created_directory
+                opened = os.fstat(cap.fd)
+                self.assertEqual([opened.st_dev, opened.st_ino], original_identity)
+                self.assertIsNotNone(cap.parent_fd)
+                self.assertIsNotNone(owner.guard.stream)
+                self.assertEqual(pin(row_path), original_pin)
+                self.assertEqual((original_path / "original.txt").read_bytes(), b"keep original")
+                self.assertEqual((owner.output / "replacement.txt").read_bytes(), b"keep replacement")
                 with self.assertRaisesRegex(StorageError, message):
                     owner.finish(status="must_not_finish", tree_gone=True)
                 self.assertEqual(pin(row_path), original_pin)
                 self.assertEqual(json.loads(row_path.read_text())["state"], "active")
-                opened = os.fstat(owner._created_directory.fd)
-                self.assertEqual([opened.st_dev, opened.st_ino], original_identity)
+                self.assertIs(owner._created_directory, cap)
+                self.assertIsNone(cap.fd)
+                self.assertIsNone(cap.parent_fd)
+                self.assertIsNone(owner.guard.stream)
                 self.assertEqual((original_path / "original.txt").read_bytes(), b"keep original")
                 self.assertEqual((owner.output / "replacement.txt").read_bytes(), b"keep replacement")
-                # Cleanup closes only these original FDs/gate; it never calls finish.
 
     def test_real_same_boot_recovery_rejects_bound_active_row(self):
         owner, _, row_path = self.lease("same-boot")

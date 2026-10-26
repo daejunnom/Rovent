@@ -303,6 +303,7 @@ class OutputLease:
         return sum(tree_size(target, allow_disappearing=allow_disappearing) for _, _, target in rows)
 
     def acquire(self):
+        owner_lifetime = lifetime() if not self.deferred else None
         self.catalog.mkdir(parents=True, exist_ok=True)
         self.guard.acquire()
         try:
@@ -329,7 +330,8 @@ class OutputLease:
                 "identity": None if self.deferred else identity(self.output), "token": uuid.uuid4().hex,
                 "deferred": self.deferred,
                 "outer_supervisor": self.outer,
-                "source": str(self.source), "pid": os.getpid(), "lifetime": lifetime(),
+                "source": str(self.source), "pid": os.getpid(),
+                "lifetime": lifetime() if self.deferred else owner_lifetime,
                 "state": "active", "created_ns": now,
                 "review_after_ns": now + self.days * 86400 * 10**9,
                 "reserved_bytes": self.reserve, "catalog_limit_bytes": self.total_limit,
@@ -512,17 +514,17 @@ class OutputLease:
         # never promoted to a provider's physical completion fence.
         error = None
         try:
-            self.check_budget()
-        except OutputBudgetError as exc:
-            error = exc
-        self.record = {**self.record, "state": "retained" if tree_gone is True else "active",
-                       "status": "failed_output_budget" if error else str(status), "producer_status": str(status),
-                       "tree_gone": tree_gone, "finished_ns": time.time_ns(),
-                       "budget_error": str(error) if error else None,
-                       "physical_completion": "not_inferred_from_output_lifecycle"}
-        if self.deferred and self._created_directory is None and self.output.exists():
-            self.record["identity"] = identity(self.output)
-        try:
+            try:
+                self.check_budget()
+            except OutputBudgetError as exc:
+                error = exc
+            self.record = {**self.record, "state": "retained" if tree_gone is True else "active",
+                           "status": "failed_output_budget" if error else str(status), "producer_status": str(status),
+                           "tree_gone": tree_gone, "finished_ns": time.time_ns(),
+                           "budget_error": str(error) if error else None,
+                           "physical_completion": "not_inferred_from_output_lifecycle"}
+            if self.deferred and self._created_directory is None and self.output.exists():
+                self.record["identity"] = identity(self.output)
             self._write()
             try:
                 self.check_budget()  # Terminal metadata itself consumes bytes.
