@@ -54,6 +54,20 @@ def cpu_stage_dependencies():
     return _CPU_STAGE_DEPENDENCIES
 
 
+def cpu_source_cohorts(source, package):
+    """Bind source integrity to the stages that actually consume those files."""
+    shared = [source / "scripts/pals_model_validate.py",
+              source / "crates/rz-eval/src/pals_model.rs",
+              source / "crates/rz-eval/Cargo.toml"]
+    shared.extend(sorted((package / "src/rz_pals_model").glob("*.py")))
+    packing = tuple(source / logical for logical in (
+        "crates/rz-eval/examples/device_packing_graph_check.rs",
+        "crates/rz-eval/src/pals_onnx/device_packing_admission.rs",
+        "crates/rz-eval/src/pals_onnx/device_packing_graph.rs",
+        "crates/rz-eval/src/pals_onnx.rs"))
+    return tuple(shared), MappingProxyType({"device_packing_rust_body_seconds": packing})
+
+
 class CommandNotStarted(RuntimeError):
     """Popen reported that this executable could not be started."""
     def __init__(self, command, error):
@@ -313,12 +327,7 @@ def main():
             ["git", "diff", "--quiet", "--no-ext-diff"], cwd=source, check=False).returncode != 0
         receipt["source_commit_method"] = "local_git"
     package = source / "experiments/model-research/pals"
-    source_files = [Path(__file__).resolve(), source / "crates/rz-eval/src/pals_model.rs",
-                    source / "crates/rz-eval/Cargo.toml",
-                    source / "crates/rz-eval/src/pals_onnx/device_packing_admission.rs",
-                    source / "crates/rz-eval/src/pals_onnx/device_packing_graph.rs",
-                    source / "crates/rz-eval/src/pals_onnx.rs"]
-    source_files.extend(sorted((package / "src/rz_pals_model").glob("*.py")))
+    source_files, stage_source_paths = cpu_source_cohorts(source, package)
     receipt["source_files"], source_identities = {}, {}
     for path in source_files:
         relative = str(path.relative_to(source)).replace("\\", "/")
@@ -408,7 +417,7 @@ def main():
                              packing_pins["device-packing.json"]["sha256"], packing_pins["device_public_pack.onnx"]["sha256"]],
                             cwd=source, environment=environment, seconds=300),
                 receipt=receipt, name="device_packing_rust_body_seconds", source=source,
-                paths=lambda: [source / "crates/rz-eval/examples/device_packing_graph_check.rs"]))
+                paths=lambda: stage_source_paths["device_packing_rust_body_seconds"]))
             if controller.passed("device_packing_rust_body_seconds"):
                 receipt["device_packing_static_interop"] = {
                     "assets": packing_pins, "scope": "python_artifact_rust_fixed_body_check_only",

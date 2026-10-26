@@ -279,6 +279,73 @@ class ActualCpuPlanTests(unittest.TestCase):
             cpu_stage_dependencies()["export_seconds"] = ("model_tests_seconds",)
 
 
+class ActualCpuSourceCohortTests(unittest.TestCase):
+    """Use the production cohort and scheduler; no model, compiler or owner runs."""
+    def actual_cohort_case(self, fault):
+        receipt, observed = {"stages": {}}, []
+        branch = "device_packing_rust_body_seconds"
+        with tempfile.TemporaryDirectory(prefix="pals-actual-source-cohort-") as temporary:
+            source = Path(temporary)
+            package = source / "experiments/model-research/pals"
+            python_sources = package / "src/rz_pals_model"
+            python_sources.mkdir(parents=True)
+            (python_sources / "model.py").write_bytes(b"shared model unit input\n")
+            shared, staged = wrapper.cpu_source_cohorts(source, package)
+            packing = staged[branch]
+            for path in (*shared, *packing):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(("unit input: " + path.relative_to(source).as_posix() + "\n").encode())
+            original = wrapper._stage_source_snapshot(source, lambda: shared)
+            if fault == "missing":
+                packing[1].unlink()
+
+            def check_shared():
+                if wrapper._stage_source_snapshot(source, lambda: shared) != original:
+                    raise OSError("registered shared source changed")
+
+            stages = ValidationStages(receipt, check_shared)
+            for name in cpu_stage_dependencies():
+                def operation(name=name):
+                    observed.append(name)
+                    if name != branch:
+                        return
+                    def packing_operation():
+                        if fault == "changed":
+                            packing[1].write_bytes(b"changed packing unit input\n")
+                        elif fault == "shared_changed":
+                            shared[0].write_bytes(b"changed shared unit input\n")
+                    return wrapper.run_with_stage_sources(packing_operation, receipt=receipt,
+                        name=branch, source=source, paths=lambda: packing)
+                stages.perform(name, operation)
+            if fault != "shared_changed":
+                self.assertEqual(wrapper._stage_source_snapshot(source, lambda: shared), original)
+        return stages, receipt, observed
+
+    def test_actual_packing_source_failure_keeps_independent_neural_stages(self):
+        for fault in ("missing", "changed"):
+            with self.subTest(fault=fault):
+                stages, receipt, observed = self.actual_cohort_case(fault)
+                branch = "device_packing_rust_body_seconds"
+                self.assertEqual(stages.results[branch]["failure_scope"], "stage")
+                self.assertEqual(stages.results[branch]["error_type"], "StageSourceInputFailure")
+                self.assertEqual(receipt["stage_source_files"][branch]["status"], "failed")
+                self.assertIsNone(stages.shared_failure)
+                for name in ("initialize_seconds", "export_seconds", "numeric_seconds"):
+                    self.assertTrue(stages.passed(name))
+                    self.assertIn(name, observed)
+                with self.assertRaises(ValidationStagesFailed):
+                    stages.require_complete()
+
+    def test_actual_shared_source_change_still_blocks_neural_dispatch(self):
+        stages, receipt, observed = self.actual_cohort_case("shared_changed")
+        self.assertIsNotNone(stages.shared_failure)
+        self.assertFalse(stages.results["initialize_seconds"]["executed"])
+        self.assertNotIn("initialize_seconds", observed)
+        self.assertFalse(stages.passed("numeric_seconds"))
+        with self.assertRaises(ValidationStagesFailed):
+            stages.require_complete()
+
+
 class OwnerBoundaryTests(unittest.TestCase):
     """Exercise main with fake external I/O; no source bytes or owner are read."""
     def setUp(self):
