@@ -126,7 +126,11 @@ impl VirtualReviewPhaseTrace {
         if first {
             // An API return is not a physical GPU completion/fence claim.
             self.record(
-                if ok { "first_run_returned_ok" } else { "first_run_returned_error" },
+                if ok {
+                    "first_run_returned_ok"
+                } else {
+                    "first_run_returned_error"
+                },
                 role,
                 None,
             );
@@ -1613,10 +1617,11 @@ impl PalsVirtualReviewOnnxBackend {
                 .validation_trace
                 .as_ref()
                 .and_then(|trace| trace.enter_ort(native_validation_diagnostics::RunGraph::Public));
-            let values=ort::inputs!["anchor_board"=>&a.anchor_board,"anchor_metadata"=>&a.anchor_metadata,"anchor_mask"=>&a.anchor_mask,"records"=>&a.records,"record_anchor"=>&a.record_anchor,"record_line_tokens"=>&a.record_line_tokens,"record_line_mask"=>&a.record_line_mask,"record_mask"=>&a.record_mask];
+            let values = ort::inputs!["anchor_board"=>&a.anchor_board,"anchor_metadata"=>&a.anchor_metadata,"anchor_mask"=>&a.anchor_mask,"records"=>&a.records,"record_anchor"=>&a.record_anchor,"record_line_tokens"=>&a.record_line_tokens,"record_line_mask"=>&a.record_line_mask,"record_mask"=>&a.record_mask];
             let first_phase_run = self.phase_trace.first_run_entered("public");
             let result = self.public.as_mut().expect("public").run(values);
-            self.phase_trace.first_run_returned(first_phase_run, "public", result.is_ok());
+            self.phase_trace
+                .first_run_returned(first_phase_run, "public", result.is_ok());
             #[cfg(feature = "native-validation-diagnostics")]
             if let Some(span) = validation_run {
                 span.returned(result.is_ok());
@@ -1729,7 +1734,8 @@ impl PalsVirtualReviewOnnxBackend {
             self.shared_pc.as_mut().expect("P/C")
         };
         let result = session.run(values);
-        self.phase_trace.first_run_returned(first_phase_run, phase_role, result.is_ok());
+        self.phase_trace
+            .first_run_returned(first_phase_run, phase_role, result.is_ok());
         #[cfg(feature = "native-validation-diagnostics")]
         if let Some(span) = validation_run {
             span.returned(result.is_ok());
