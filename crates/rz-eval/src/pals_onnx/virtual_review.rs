@@ -28,6 +28,112 @@ pub const PUBLIC_LAYOUT: &str = "virtual_review_public_v1";
 pub const SHARED_LAYOUT: &str = "virtual_review_shared_pc_if_v1";
 pub const WARM_LAYOUT: &str = "virtual_review_shared_pc_if_approx_warm_v1";
 
+/// Best-effort host phase evidence only. This owns no native resource and never
+/// grants a provider fence, numerical result, memory measurement or retry.
+/// The explicit environment switch is read once per backend load, not per Run.
+struct VirtualReviewPhaseTrace {
+    origin: Option<std::time::Instant>,
+    provider: &'static str,
+    emitted: u8,
+    first_run_graphs: u8,
+}
+impl VirtualReviewPhaseTrace {
+    fn new(provider: Provider) -> Self {
+        let enabled = std::env::var_os("RZ_PALS_VIRTUAL_REVIEW_PHASE_TRACE")
+            .is_some_and(|value| value == "1");
+        Self {
+            origin: enabled.then(std::time::Instant::now),
+            provider: match provider {
+                Provider::Cpu => "cpu",
+                Provider::Cuda { .. } => "cuda",
+            },
+            emitted: 0,
+            first_run_graphs: 0,
+        }
+    }
+    fn role(role: &str) -> &'static str {
+        match role {
+            "public" => "public",
+            "shared_pc" => "shared_pc",
+            "shared_warm" => "shared_warm",
+            "validator" => "validator",
+            _ => "other",
+        }
+    }
+    fn record(&mut self, phase: &'static str, role: &'static str, serialized_bytes: Option<usize>) {
+        use std::io::Write;
+        let Some(origin) = self.origin else {
+            return;
+        };
+        if self.emitted >= 32 {
+            return;
+        }
+        self.emitted += 1;
+        // Fixed identifiers and scalar metadata only. No asset path, model,
+        // tensor, error payload or new output file is retained by this channel.
+        #[derive(Serialize)]
+        struct Record {
+            schema: &'static str,
+            ordinal: u8,
+            phase: &'static str,
+            graph_role: &'static str,
+            configured_backend_provider: &'static str,
+            elapsed_ns: u128,
+            serialized_bytes: Option<usize>,
+            physical_completion: &'static str,
+            performance_evidence_eligible: bool,
+        }
+        let record = Record {
+            schema: "rz-pals-virtual-review-host-phases/1",
+            ordinal: self.emitted,
+            phase,
+            graph_role: role,
+            configured_backend_provider: self.provider,
+            elapsed_ns: origin.elapsed().as_nanos(),
+            serialized_bytes,
+            physical_completion: "unknown",
+            performance_evidence_eligible: false,
+        };
+        // This distinct stderr prefix cannot become the stdout numeric status.
+        // A missing/partial line is missing evidence, never a backend failure.
+        let mut stderr = std::io::stderr().lock();
+        if write!(stderr, "RZ_PALS_VIRTUAL_REVIEW_PHASE_JSON=").is_ok()
+            && serde_json::to_writer(&mut stderr, &record).is_ok()
+        {
+            let _ = writeln!(stderr);
+        }
+        let _ = stderr.flush();
+    }
+    fn first_run_entered(&mut self, role: &'static str) -> bool {
+        if self.origin.is_none() {
+            return false;
+        }
+        let bit = match role {
+            "public" => 1,
+            "shared_pc" => 2,
+            "validator" => 4,
+            "shared_warm" => 8,
+            _ => return false,
+        };
+        if self.first_run_graphs & bit != 0 {
+            return false;
+        }
+        self.first_run_graphs |= bit;
+        self.record("first_run_entered", role, None);
+        true
+    }
+    fn first_run_returned(&mut self, first: bool, role: &'static str, ok: bool) {
+        if first {
+            // An API return is not a physical GPU completion/fence claim.
+            self.record(
+                if ok { "first_run_returned_ok" } else { "first_run_returned_error" },
+                role,
+                None,
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VirtualReviewExecutionMode {
     Deployment,
@@ -506,6 +612,7 @@ pub struct PalsVirtualReviewOnnxBackend {
     // A CUDA unknown-completion path must retain this Arc, not just tensors.
     sources: Option<Arc<dyn VirtualReviewOwnedSources>>,
     initialization: Arc<[PalsGraphPlacement]>,
+    phase_trace: VirtualReviewPhaseTrace,
     #[cfg(feature = "native-validation-diagnostics")]
     validation_trace: Option<native_validation_diagnostics::GpuLifecycleTrace>,
 }
@@ -768,6 +875,8 @@ impl PalsVirtualReviewOnnxBackend {
         warm: bool,
         profile_directory: Option<VirtualReviewProfileDirectory>,
     ) -> Result<Self, BackendError> {
+        let mut phase_trace = VirtualReviewPhaseTrace::new(config.provider);
+        phase_trace.record("backend_load_entered", "other", None);
         config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
         #[cfg(not(feature = "experimental-io-binding"))]
         if warm && matches!(config.provider, Provider::Cuda { .. }) {
@@ -889,13 +998,41 @@ impl PalsVirtualReviewOnnxBackend {
                 sha256: digest,
                 serialized_bytes: data.len() as u64,
             });
-            let (session, placement, applied) = load_session(
+            let role = VirtualReviewPhaseTrace::role(&graph.role);
+            let serialized_bytes = data.len();
+            phase_trace.record("session_load_entered", role, Some(serialized_bytes));
+            let loaded = load_session(
                 data,
                 config,
                 &graph.role,
                 graph_audit.map(|(p, r)| (p, r.as_path())),
-            )?;
-            manifest.validate_session(&session, graph)?;
+            );
+            // The unchanged load_session owns the Vec and drops it on every
+            // normal Ok/Err return (explicitly just after commit_from_memory).
+            // This is an after-return observation, not the exact release time,
+            // nor evidence that ORT native/prepacked/allocator storage is freed.
+            phase_trace.record(
+                "serialized_vec_released_after_loader_return",
+                role,
+                Some(serialized_bytes),
+            );
+            let (session, placement, applied) = match loaded {
+                Ok(value) => {
+                    phase_trace.record("session_load_returned_ok", role, None);
+                    value
+                }
+                Err(error) => {
+                    phase_trace.record("session_load_returned_error", role, None);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = manifest.validate_session(&session, graph) {
+                phase_trace.record("session_interface_returned_error", role, None);
+                return Err(error);
+            }
+            // Actual Session settings and the existing initialization/interface
+            // gates returned successfully. No kernel/placement/fence is inferred.
+            phase_trace.record("session_settings_and_interface_validated", role, None);
             applied_session_settings.push(applied);
             if let Some(placement) = placement {
                 placements.push(placement);
@@ -958,6 +1095,7 @@ impl PalsVirtualReviewOnnxBackend {
             warm,
             seeds,
             sources: Some(sources),
+            phase_trace,
             #[cfg(feature = "native-validation-diagnostics")]
             validation_trace: None,
         })
@@ -1475,7 +1613,10 @@ impl PalsVirtualReviewOnnxBackend {
                 .validation_trace
                 .as_ref()
                 .and_then(|trace| trace.enter_ort(native_validation_diagnostics::RunGraph::Public));
-            let result=self.public.as_mut().expect("public").run(ort::inputs!["anchor_board"=>&a.anchor_board,"anchor_metadata"=>&a.anchor_metadata,"anchor_mask"=>&a.anchor_mask,"records"=>&a.records,"record_anchor"=>&a.record_anchor,"record_line_tokens"=>&a.record_line_tokens,"record_line_mask"=>&a.record_line_mask,"record_mask"=>&a.record_mask]);
+            let values=ort::inputs!["anchor_board"=>&a.anchor_board,"anchor_metadata"=>&a.anchor_metadata,"anchor_mask"=>&a.anchor_mask,"records"=>&a.records,"record_anchor"=>&a.record_anchor,"record_line_tokens"=>&a.record_line_tokens,"record_line_mask"=>&a.record_line_mask,"record_mask"=>&a.record_mask];
+            let first_phase_run = self.phase_trace.first_run_entered("public");
+            let result = self.public.as_mut().expect("public").run(values);
+            self.phase_trace.first_run_returned(first_phase_run, "public", result.is_ok());
             #[cfg(feature = "native-validation-diagnostics")]
             if let Some(span) = validation_run {
                 span.returned(result.is_ok());
@@ -1553,6 +1694,8 @@ impl PalsVirtualReviewOnnxBackend {
         }
         #[cfg(feature = "experimental-io-binding")]
         if self.warm && matches!(self.config.provider, Provider::Cuda { .. }) {
+            // CUDA Warm uses its separate I/O binding path, without this direct
+            // Session.run trace. Missing phase rows imply neither no Run nor failure.
             return self.run_bound_warm(input);
         }
         let a = self.active.as_ref().expect("input owned");
@@ -1572,12 +1715,21 @@ impl PalsVirtualReviewOnnxBackend {
             .validation_trace
             .as_ref()
             .and_then(|trace| trace.enter_ort(native_validation_diagnostics::RunGraph::Private));
+        let phase_role = if input.role == PalsRole::Validator {
+            "validator"
+        } else if self.warm {
+            "shared_warm"
+        } else {
+            "shared_pc"
+        };
+        let first_phase_run = self.phase_trace.first_run_entered(phase_role);
         let session = if input.role == PalsRole::Validator {
             self.validator.as_mut().expect("V admitted")
         } else {
             self.shared_pc.as_mut().expect("P/C")
         };
         let result = session.run(values);
+        self.phase_trace.first_run_returned(first_phase_run, phase_role, result.is_ok());
         #[cfg(feature = "native-validation-diagnostics")]
         if let Some(span) = validation_run {
             span.returned(result.is_ok());
