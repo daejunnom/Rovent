@@ -50,6 +50,73 @@ class ValidationStageTests(unittest.TestCase):
         self.assertIsNone(self.stages.shared_failure)
         self.assertEqual(self.stages.results["packing_rust"]["failure_scope"], "stage")
 
+    def source_stage_case(self, branch, *, missing=False, shared_change=False, error=None):
+        receipt, observed = {"stages": {}}, []
+        with tempfile.TemporaryDirectory(prefix="pals-stage-sources-") as temporary:
+            source = Path(temporary)
+            shared = source / "model.py"
+            branch_source = source / "branch.py"
+            shared.write_bytes(b"shared model input")
+            branch_source.write_bytes(b"branch input")
+            shared_identity = wrapper.input_identity(shared)
+            if missing:
+                branch_source.unlink()
+
+            def check_shared():
+                if wrapper.input_identity(shared) != shared_identity:
+                    raise OSError("registered shared model source changed")
+
+            stages = ValidationStages(receipt, check_shared)
+            for name in cpu_stage_dependencies():
+                def operation(name=name):
+                    observed.append(name)
+                    if name != branch:
+                        return
+
+                    def branch_operation():
+                        (shared if shared_change else branch_source).write_bytes(b"changed source input")
+                        if error is not None:
+                            raise error
+
+                    return wrapper.run_with_stage_sources(branch_operation, receipt=receipt,
+                        name=name, source=source, paths=lambda: [branch_source])
+                stages.perform(name, operation)
+        return stages, receipt, observed
+
+    def test_branch_source_change_or_absence_keeps_neural_stages(self):
+        for branch in ("model_tests_seconds", "device_packing_rust_body_seconds"):
+            for missing in (False, True):
+                with self.subTest(branch=branch, missing=missing):
+                    stages, receipt, observed = self.source_stage_case(branch, missing=missing)
+                    self.assertEqual(stages.results[branch]["failure_scope"], "stage")
+                    self.assertEqual(stages.results[branch]["error_type"], "StageSourceInputFailure")
+                    self.assertEqual(receipt["stage_source_files"][branch]["status"], "failed")
+                    self.assertIsNone(stages.shared_failure)
+                    for name in ("initialize_seconds", "export_seconds", "numeric_seconds"):
+                        self.assertTrue(stages.passed(name))
+                        self.assertIn(name, observed)
+                    with self.assertRaises(ValidationStagesFailed):
+                        stages.require_complete()
+
+    def test_shared_source_change_still_blocks_neural_stages(self):
+        stages, _, observed = self.source_stage_case("model_tests_seconds", shared_change=True)
+        self.assertIsNotNone(stages.shared_failure)
+        self.assertFalse(stages.results["initialize_seconds"]["executed"])
+        self.assertNotIn("initialize_seconds", observed)
+        self.assertFalse(stages.passed("export_seconds"))
+        with self.assertRaises(ValidationStagesFailed):
+            stages.require_complete()
+
+    def test_stage_source_error_does_not_hide_timeout_storage_or_unknown_io(self):
+        for error in (subprocess.TimeoutExpired(["branch"], 1), StorageError("shared storage"),
+                      PermissionError("unknown source I/O")):
+            with self.subTest(error=type(error).__name__):
+                stages, receipt, observed = self.source_stage_case("model_tests_seconds", error=error)
+                self.assertEqual(stages.results["model_tests_seconds"]["failure_scope"], "shared_managed_execution")
+                self.assertEqual(stages.results["model_tests_seconds"]["error_type"], type(error).__name__)
+                self.assertEqual(receipt["stage_source_files"]["model_tests_seconds"]["operation_error"]["type"], type(error).__name__)
+                self.assertNotIn("initialize_seconds", observed)
+
     def test_real_failed_prerequisite_blocks_only_its_consumers(self):
         self.failed_gate("initialize")
         self.assertFalse(self.stages.perform("export", self.operation("export"), requires=("initialize",)))

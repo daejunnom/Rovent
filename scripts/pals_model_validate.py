@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -81,6 +82,70 @@ def input_identity(path):
     value = path.lstat()
     return (value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
             value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+class StageSourceInputFailure(ValueError):
+    """A known unavailable or changed source input belongs to its own stage."""
+
+
+def _stage_source_snapshot(source, paths):
+    try:
+        selected = tuple(sorted(paths()))
+        if not selected:
+            raise StageSourceInputFailure("stage source cohort is empty")
+        observed = {}
+        for path in selected:
+            try:
+                relative = path.relative_to(source).as_posix()
+            except ValueError as error:
+                raise StageSourceInputFailure("stage source is outside the checkout") from error
+            before = input_identity(path)
+            if not stat.S_ISREG(before[2]):
+                raise StageSourceInputFailure("stage source must be a regular file")
+            raw = path.read_bytes()
+            if input_identity(path) != before or len(raw) != before[4]:
+                raise StageSourceInputFailure("stage source changed while being read")
+            observed[relative] = (before, hashlib.sha256(raw).hexdigest())
+        return observed
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise StageSourceInputFailure("stage source is unavailable") from error
+
+
+def run_with_stage_sources(operation, *, receipt, name, source, paths):
+    """Seal only this branch's source inputs around its operation, not another NN stage."""
+    record = {"status": "registering", "files": {}}
+    receipt.setdefault("stage_source_files", {})[name] = record
+    try:
+        before = _stage_source_snapshot(source, paths)
+    except BaseException as error:
+        record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+        raise
+    record.update(status="registered", files={path: value[1] for path, value in before.items()})
+    primary = None
+    try:
+        return operation()
+    except BaseException as error:
+        primary = error
+        record["operation_error"] = {"type": type(error).__name__, "error": str(error)[:2048]}
+        if isinstance(error, subprocess.CalledProcessError):
+            record["operation_error"]["returncode"] = error.returncode
+        raise
+    finally:
+        try:
+            if _stage_source_snapshot(source, paths) != before:
+                raise StageSourceInputFailure("stage source cohort changed during execution")
+        except StageSourceInputFailure as error:
+            record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+            if primary is None:
+                raise
+            # Never replace an original timeout/cancel/unknown failure with a local input error.
+            BaseException.add_note(primary, "stage source verification also failed: " + str(error))
+        except BaseException as error:
+            # Unknown I/O/storage still propagates to the shared-scope controller.
+            record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+            raise
+        else:
+            record["status"] = "verified"
 
 
 class ValidationStagesFailed(RuntimeError):
@@ -250,12 +315,10 @@ def main():
     package = source / "experiments/model-research/pals"
     source_files = [Path(__file__).resolve(), source / "crates/rz-eval/src/pals_model.rs",
                     source / "crates/rz-eval/Cargo.toml",
-                    source / "crates/rz-eval/examples/device_packing_graph_check.rs",
                     source / "crates/rz-eval/src/pals_onnx/device_packing_admission.rs",
                     source / "crates/rz-eval/src/pals_onnx/device_packing_graph.rs",
                     source / "crates/rz-eval/src/pals_onnx.rs"]
     source_files.extend(sorted((package / "src/rz_pals_model").glob("*.py")))
-    source_files.extend(sorted((package / "tests").glob("*.py")))
     receipt["source_files"], source_identities = {}, {}
     for path in source_files:
         relative = str(path.relative_to(source)).replace("\\", "/")
@@ -307,9 +370,11 @@ def main():
                 str(python), "-m", "pip", "install", "numpy==2.2.6", "onnx==1.19.0",
                 "onnxruntime==1.22.0"], cwd=source, environment=environment))
             environment["PYTHONPATH"] = str(package / "src")
-            controller.perform("model_tests_seconds", lambda: run([
-                str(python), "-m", "unittest", "discover", "-s", str(package / "tests"), "-v"],
-                cwd=source, environment=environment, seconds=600))
+            controller.perform("model_tests_seconds", lambda: run_with_stage_sources(
+                lambda: run([str(python), "-m", "unittest", "discover", "-s", str(package / "tests"), "-v"],
+                            cwd=source, environment=environment, seconds=600),
+                receipt=receipt, name="model_tests_seconds", source=source,
+                paths=lambda: [path for path in (package / "tests").iterdir() if path.suffix == ".py"]))
             # Weight-free static packing is a separate branch. It never creates
             # an ORT Session/provider/Run or authorizes a later GPU execution.
             packing = output / "device-packing"
@@ -336,12 +401,14 @@ def main():
                     packing_pins[name] = {"bytes": size, "sha256": sha}
 
             controller.perform("device_packing_files_seconds", inspect_packing)
-            controller.perform("device_packing_rust_body_seconds", lambda: run([
-                "cargo", "run", "--locked", "-p", "rz-eval", "--features", "onnx,contracts",
-                "--example", "device_packing_graph_check", "--quiet", "--",
-                str(packing_files["device-packing.json"]), str(packing_files["device_public_pack.onnx"]),
-                packing_pins["device-packing.json"]["sha256"], packing_pins["device_public_pack.onnx"]["sha256"]],
-                cwd=source, environment=environment, seconds=300))
+            controller.perform("device_packing_rust_body_seconds", lambda: run_with_stage_sources(
+                lambda: run(["cargo", "run", "--locked", "-p", "rz-eval", "--features", "onnx,contracts",
+                             "--example", "device_packing_graph_check", "--quiet", "--",
+                             str(packing_files["device-packing.json"]), str(packing_files["device_public_pack.onnx"]),
+                             packing_pins["device-packing.json"]["sha256"], packing_pins["device_public_pack.onnx"]["sha256"]],
+                            cwd=source, environment=environment, seconds=300),
+                receipt=receipt, name="device_packing_rust_body_seconds", source=source,
+                paths=lambda: [source / "crates/rz-eval/examples/device_packing_graph_check.rs"]))
             if controller.passed("device_packing_rust_body_seconds"):
                 receipt["device_packing_static_interop"] = {
                     "assets": packing_pins, "scope": "python_artifact_rust_fixed_body_check_only",
