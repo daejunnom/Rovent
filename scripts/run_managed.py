@@ -63,11 +63,17 @@ def main(*, output_preservation=None) -> int:
     try:
         manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose,
                                output_preservation=output_preservation)
+        if output_preservation is None:
+            # Detect an existing catalog failure before acquiring a build
+            # owner: its finalizer would sample the same catalog again.
+            sample_output_budget()
         manager.acquire()
         try:
             environment = manager.environment()
             if output_preservation is not None:
-                manager.sample_output_budget()  # Must succeed before any payload child is launched.
+                manager.sample_output_budget()
+            # The same budget is still sampled while the child runs; the
+            # earlier check is not a waiver for a later failure.
         except BaseException as error:
             # This try ends before run_group: no payload child was dispatched.
             # Keep the first failure if original-owner cleanup also fails.

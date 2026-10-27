@@ -118,11 +118,15 @@ class StorageTests(unittest.TestCase):
             with patch.object(run_managed, "canonical_root", return_value=self.root):
                 with patch.object(run_managed.shutil, "which", return_value=sys.executable):
                     with patch.object(run_managed, "run_group", side_effect=original_supervisor):
-                        with patch.object(outputs, "identity", return_value=[193, 11]) as identity_call:
+                        # Admission sees the original identity; it changes
+                        # only after the child was dispatched.
+                        with patch.object(outputs, "identity", side_effect=[[67, 11], [193, 11]]) as identity_call:
                             with patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]):
                                 with patch.object(sys, "stderr", error_stream):
                                     self.assertEqual(run_managed.main(), 125)
-        identity_call.assert_called_once_with(checked(target))
+        self.assertEqual(identity_call.call_count, 2)
+        self.assertEqual(identity_call.call_args_list[0].args, (checked(target),))
+        self.assertEqual(identity_call.call_args_list[1].args, (checked(target),))
         self.assertEqual(len(original_errors), 1)
         self.assertEqual(finished, [{"exit_code": 125, "tree_gone": False,
                                      "supervisor_error": "live output identity changed"}])
@@ -132,6 +136,49 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(json.loads(lines[1]), original_errors[0].managed_output_identity_observation)
         self.assertEqual(record.read_bytes(), raw)
         self.assertEqual(payload.read_bytes(), b"original retained evidence")
+
+    def test_default_output_budget_failure_is_detected_before_child_dispatch(self):
+        import run_managed
+        original = StorageError("pre-existing output accounting failure")
+        manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
+                                  finish=Mock(return_value={}), root=self.root,
+                                  source=self.source, total_limit=12 << 30)
+        with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+             patch.object(run_managed, "canonical_root", return_value=self.root), \
+             patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+             patch.object(run_managed, "sample_output_budget", side_effect=original) as sample, \
+             patch.object(run_managed, "run_group") as dispatch, \
+             patch.object(run_managed, "_emit_storage_failure_observation") as observed, \
+             patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+             patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(run_managed.main(), 125)
+        sample.assert_called_once_with()
+        dispatch.assert_not_called()
+        manager.acquire.assert_not_called()
+        manager.finish.assert_not_called()
+        observed.assert_called_once_with(original)
+        self.assertEqual(original.args, ("pre-existing output accounting failure",))
+
+    def test_default_output_budget_is_still_sampled_during_execution(self):
+        import run_managed
+        manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
+                                  finish=Mock(return_value={}), root=self.root,
+                                  source=self.source, total_limit=12 << 30)
+        def supervise(_command, _source, _environment, _timeout, check_budget):
+            check_budget()
+            return 0, True, None
+        with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+             patch.object(run_managed, "canonical_root", return_value=self.root), \
+             patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+             patch.object(run_managed, "sample_output_budget", side_effect=[0, 0]) as sample, \
+             patch.object(run_managed, "tree_size", return_value=0), \
+             patch.object(run_managed, "run_group", side_effect=supervise) as dispatch, \
+             patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+             patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(run_managed.main(), 0)
+        self.assertEqual(sample.call_count, 2)
+        dispatch.assert_called_once()
+        manager.finish.assert_called_once_with(exit_code=0, tree_gone=True, supervisor_error=None)
 
     def test_run_managed_closes_original_owner_for_every_pre_dispatch_failure(self):
         import run_managed
