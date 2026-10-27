@@ -714,7 +714,10 @@ mod tests {
         let (ticket, _) = start(&mut session, "go nodes 1");
         let active = session.active_ticket();
         let invalid = PreparedSearchBinding::prepare(
-            &GoLimits::default(),
+            &GoLimits {
+                white_time_ms: Some(1000),
+                ..GoLimits::default()
+            },
             SideToMove::White,
             now,
             settings(),
@@ -1231,8 +1234,17 @@ mod tests {
     fn direct_limits_are_revalidated_and_oversized_nodes_are_not_clamped() {
         let now = Instant::now();
         let (ticket, _) = start(&mut session(), "go nodes 1");
+        assert!(
+            SearchBinding::new(
+                ticket.clone(),
+                &GoLimits::default(),
+                SideToMove::White,
+                now,
+                settings(),
+            )
+            .is_ok()
+        );
         for limits in [
-            GoLimits::default(),
             GoLimits {
                 nodes: Some(0),
                 ..GoLimits::default()
