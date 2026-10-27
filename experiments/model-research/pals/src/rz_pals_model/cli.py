@@ -18,6 +18,8 @@ def main(argv=None):
     export.add_argument("--include-validator", action="store_true")
     export.add_argument("--layout", choices=("separate_pc", "shared_pc_if", "virtual_review_shared_pc_if_v1"), default="separate_pc")
     export.add_argument("--rules-profile-json")
+    export.add_argument("--max-export-bytes", type=int,
+                        help="optional serialized-write cap for virtual review export; excludes journals and logs")
     check = commands.add_parser("numeric-check")
     check.add_argument("--checkpoint", required=True)
     check.add_argument("--export", required=True)
@@ -50,6 +52,11 @@ def main(argv=None):
     generation.add_argument("--frozen-pc-sha256")
     generation.add_argument("--model-epoch", type=int)
     args = parser.parse_args(argv)
+    if args.command == "export" and args.max_export_bytes is not None:
+        if args.max_export_bytes <= 0:
+            parser.error("--max-export-bytes must be positive")
+        if args.layout != "virtual_review_shared_pc_if_v1":
+            parser.error("--max-export-bytes requires the virtual review layout")
     if args.command == "train-generation":
         # This branch remains usable without importing Torch or any optimizer.
         from .generation_training import main as validate_generation
@@ -63,13 +70,15 @@ def main(argv=None):
         result = matmul_flops(ModelConfig.for_profile(args.profile), args.role, args.records, args.candidates, args.divergences, args.batch)
     else:
         import torch
-        from .artifacts import export_checkpoint, initialize_checkpoint, numeric_check, rust_fixtures
+        from .artifacts import ExportWriteBudget, export_checkpoint, initialize_checkpoint, numeric_check, rust_fixtures
         torch.set_num_threads(2)
         torch.set_num_interop_threads(1)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         if args.command == "init": result = initialize_checkpoint(args.output, args.seed, args.profile)
-        elif args.command == "export": result = export_checkpoint(args.checkpoint, args.output, args.include_validator, args.layout, args.rules_profile_json)
+        elif args.command == "export":
+            options = {} if args.max_export_bytes is None else {"output_guard": ExportWriteBudget(args.max_export_bytes)}
+            result = export_checkpoint(args.checkpoint, args.output, args.include_validator, args.layout, args.rules_profile_json, **options)
         elif args.command == "rust-fixtures": result = rust_fixtures(args.checkpoint, args.export, args.output)
         elif args.command == "train-step-smoke":
             from .nonzero_training import run_train_step_smoke
