@@ -561,22 +561,29 @@ class DefaultBranchTests(unittest.TestCase):
 
     def test_run_managed_none_keeps_original_sampler_with_legacy_manager_consumer(self):
         import run_managed
+        observations = {"dispatched": False, "before": False, "during": False}
+        def sample():
+            observations["during" if observations["dispatched"] else "before"] = True
+            return 0
         manager = types.SimpleNamespace(acquire=lambda: None, environment=lambda: {},
             finish=lambda **arguments: {"fixture_only": True}, root=Path.cwd(),
             source=Path.cwd(), total_limit=12 * GiB)
         def supervisor(command, source, environment, timeout, check_budget):
+            self.assertTrue(observations["before"], "budget must be sampled before dispatch")
+            observations["dispatched"] = True
             check_budget()
             return 0, True, None  # Mock component scope, no actual child/closure witness.
         with patch.object(run_managed, "ManagedBuild", return_value=manager), \
              patch.object(run_managed, "canonical_root", return_value=Path.cwd()), \
              patch.object(run_managed.shutil, "which", return_value=sys.executable), \
              patch.object(run_managed, "tree_size", return_value=0), \
-             patch.object(run_managed, "sample_output_budget", return_value=0) as original_sampler, \
+             patch.object(run_managed, "sample_output_budget", side_effect=sample) as original_sampler, \
              patch.object(run_managed, "run_group", side_effect=supervisor), \
              patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
              patch.object(sys, "stderr", io.StringIO()):
             self.assertEqual(run_managed.main(), 0)
-        original_sampler.assert_called_once_with()
+        original_sampler.assert_called_with()
+        self.assertTrue(observations["during"], "budget must be sampled during execution")
         self.assertFalse(hasattr(manager, "sample_output_budget"))
 
 
