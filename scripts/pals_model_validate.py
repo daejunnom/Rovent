@@ -162,6 +162,70 @@ def run_with_stage_sources(operation, *, receipt, name, source, paths):
             record["status"] = "verified"
 
 
+def run_with_rules_profile(operation, *, receipt, path):
+    """Register and bind the export-only Rules input to its execution."""
+    record = {"status": "registering"}
+    receipt["rules_profile_verification"] = record
+
+    try:
+        path = checked(path)
+        identity = input_identity(path)
+        if not stat.S_ISREG(identity[2]) or not 1 <= identity[4] <= 64 * 1024:
+            raise StageSourceInputFailure("Rules descriptor must be a bounded regular file")
+        raw = path.read_bytes()
+        if len(raw) != identity[4] or input_identity(path) != identity:
+            raise StageSourceInputFailure("Rules descriptor changed while being registered")
+        digest = hashlib.sha256(raw).hexdigest()
+        receipt["rules_profile"] = {"sha256": digest, "bytes": len(raw)}
+    except (FileNotFoundError, NotADirectoryError) as error:
+        failure = StageSourceInputFailure("registered Rules descriptor unavailable")
+        record.update(status="failed", error_type=type(failure).__name__, error=str(failure))
+        raise failure from error
+    except BaseException as error:
+        record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+        raise
+
+    def check():
+        try:
+            if (input_identity(path) != identity
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+                    or input_identity(path) != identity):
+                raise StageSourceInputFailure("registered Rules descriptor changed")
+        except (FileNotFoundError, NotADirectoryError) as error:
+            raise StageSourceInputFailure("registered Rules descriptor unavailable") from error
+
+    try:
+        check()
+    except BaseException as error:
+        record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+        raise
+    record["status"] = "registered"
+    primary = None
+    try:
+        return operation(path)
+    except BaseException as error:
+        primary = error
+        record["operation_error"] = {"type": type(error).__name__, "error": str(error)[:2048]}
+        if isinstance(error, subprocess.CalledProcessError):
+            record["operation_error"]["returncode"] = error.returncode
+        raise
+    finally:
+        try:
+            check()
+        except StageSourceInputFailure as error:
+            record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+            if primary is None:
+                raise
+            BaseException.add_note(primary, "Rules descriptor verification also failed: " + str(error))
+        except BaseException as error:
+            record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+            if primary is not None:
+                BaseException.add_note(error, "export also failed: " + str(primary))
+            raise
+        else:
+            record["status"] = "verified"
+
+
 class ValidationStagesFailed(RuntimeError):
     """Independent results were preserved, but required validation is incomplete."""
 
@@ -284,13 +348,11 @@ def main():
     output = checked(args.output)
     runtime_store = checked(args.runtime_store or
                             canonical_catalog().parent.parent / "cache" / "pals-cpu-runtime")
-    rules_profile = checked(args.rules_profile_json) if args.rules_profile_json else None
+    rules_profile = args.rules_profile_json
     dataset_run = checked(args.dataset_run) if args.dataset_run else None
     verifier_binary = checked(args.verifier_cpu_binary) if args.verifier_cpu_binary else None
     if args.layout == "shared_pc_if" and rules_profile is None:
         parser.error("shared_pc_if requires a registered Rules descriptor")
-    if rules_profile and (not rules_profile.is_file() or rules_profile.stat().st_size > 64 * 1024):
-        parser.error("Rules descriptor must be a bounded regular file")
     if runtime_store and (runtime_store.is_relative_to(source) or source.is_relative_to(runtime_store)):
         parser.error("runtime store must be outside the checkout")
     if output.is_relative_to(source) or source.is_relative_to(output) or output.exists():
@@ -304,12 +366,6 @@ def main():
                "provider": "cpu", "gpu_validation": "not_run", "stages": {}}
     receipt["seed"] = args.seed
     receipt["layout"] = args.layout
-    rules_identity = input_identity(rules_profile) if rules_profile else None
-    if rules_profile:
-        receipt["rules_profile"] = {"sha256": hashlib.sha256(rules_profile.read_bytes()).hexdigest(),
-                                    "bytes": rules_profile.stat().st_size}
-        if input_identity(rules_profile) != rules_identity:
-            raise OSError("registered Rules descriptor changed while being registered")
     if dataset_run:
         receipt["preparation_dataset"] = {
             "receipt_sha256": args.dataset_receipt_sha256,
@@ -348,14 +404,10 @@ def main():
         if any(input_identity(source / relative) != original
                for relative, original in source_identities.items()):
             raise OSError("validation source changed during the registered run")
-        if rules_profile and input_identity(rules_profile) != rules_identity:
-            raise OSError("registered Rules descriptor changed during validation")
         if full:
             if any(hashlib.sha256((source / relative).read_bytes()).hexdigest() != digest
                    for relative, digest in receipt["source_files"].items()):
                 raise OSError("validation source bytes changed during the registered run")
-            if rules_profile and hashlib.sha256(rules_profile.read_bytes()).hexdigest() != receipt["rules_profile"]["sha256"]:
-                raise OSError("registered Rules descriptor bytes changed during validation")
             check_inputs()
 
     receipt["stage_failure_policy"] = "dependency_scoped_cpu_validation_v1"
@@ -458,9 +510,14 @@ def main():
                             cwd=source, environment=environment, seconds=150)
                     controller.perform("private_verifier_seconds", private_verifier)
             export_command = cli + ["export", "--checkpoint", str(checkpoint), "--output", str(export), "--layout", args.layout]
-            if rules_profile:
-                export_command += ["--rules-profile-json", str(rules_profile)]
-            controller.perform("export_seconds", lambda: run(export_command, cwd=source, environment=environment))
+            def export_model():
+                if rules_profile:
+                    return run_with_rules_profile(
+                        lambda path: run(export_command + ["--rules-profile-json", str(path)],
+                                         cwd=source, environment=environment),
+                        receipt=receipt, path=rules_profile)
+                return run(export_command, cwd=source, environment=environment)
+            controller.perform("export_seconds", export_model)
             controller.perform("numeric_seconds", lambda: run(cli + ["numeric-check", "--checkpoint", str(checkpoint),
                 "--export", str(export)], cwd=source, environment=environment))
             controller.perform("rust_fixtures_seconds", lambda: run(cli + ["rust-fixtures", "--checkpoint", str(checkpoint),

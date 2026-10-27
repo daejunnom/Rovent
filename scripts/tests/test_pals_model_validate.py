@@ -379,14 +379,17 @@ class OwnerBoundaryTests(unittest.TestCase):
             dataset_run=None, dataset_receipt_sha256=None, dataset_encoder_source_sha256=None,
             verifier_cpu_binary=None, verifier_cpu_binary_sha256=None)
 
-    def patched_boundaries(self, *, source_error=None):
+    def patched_boundaries(self, *, source_error=None, source_reader=None):
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.object(wrapper.argparse.ArgumentParser, "parse_args", return_value=self.args))
         stack.enter_context(mock.patch.object(wrapper, "OutputLease", return_value=self.lease))
         stack.enter_context(mock.patch.object(wrapper, "checked", side_effect=lambda path: Path(path).absolute()))
         stack.enter_context(mock.patch.object(wrapper, "input_identity", return_value=(1, 2, 3, 1, 7, 8, 9)))
         stack.enter_context(mock.patch.object(Path, "glob", return_value=iter(())))
-        stack.enter_context(mock.patch.object(Path, "read_bytes", return_value=b"synthetic fixture bytes", side_effect=source_error))
+        if source_reader is None:
+            stack.enter_context(mock.patch.object(Path, "read_bytes", return_value=b"synthetic fixture bytes", side_effect=source_error))
+        else:
+            stack.enter_context(mock.patch.object(Path, "read_bytes", autospec=True, side_effect=source_reader))
         stack.enter_context(mock.patch.object(wrapper, "run", side_effect=subprocess.CalledProcessError(1, ["fake venv"])))
         stack.enter_context(mock.patch.object(wrapper.subprocess, "run", side_effect=AssertionError("real subprocess forbidden")))
         stack.enter_context(mock.patch.object(wrapper.subprocess, "check_output", side_effect=AssertionError("real subprocess forbidden")))
@@ -433,6 +436,101 @@ class OwnerBoundaryTests(unittest.TestCase):
             self.assertEqual(stages[name]["status"], "passed")
         self.assertFalse(any("rz_pals_model.verifier_producer" in command for command in commands))
         self.assertEqual(sum(call[0] == "finish" for call in self.lease.calls), 1)
+
+    def test_changed_rules_profile_only_blocks_its_export_dependents(self):
+        profile = self.root / "rules-profile.json"
+        profile.write_bytes(b"original rules descriptor")
+        self.args.rules_profile_json = profile
+        runtime = self.root / "runtime-fixture.so"
+        runtime.write_bytes(b"small source-only runtime fixture")
+        read_bytes = Path.read_bytes
+        real_identity = wrapper.input_identity
+        commands = []
+
+        def read_fixture(path):
+            return read_bytes(path) if path == profile else b"synthetic fixture bytes"
+
+        def run_without_process(command, **_options):
+            commands.append(command)
+            if "export" in command:
+                profile.write_bytes(b"changed rules descriptor")
+            return 0.0
+
+        def observe_identity(path):
+            if path == profile:
+                return real_identity(path)
+            return (1, 2, 3, 1, 7, 8, 9)
+
+        with self.patched_boundaries(source_reader=read_fixture), \
+                mock.patch.object(wrapper, "input_identity", side_effect=observe_identity), \
+                mock.patch.object(wrapper, "run", side_effect=run_without_process), \
+                mock.patch.object(wrapper.subprocess, "check_output", return_value=str(runtime)), \
+                mock.patch.object(wrapper, "publish_runtime", return_value=(runtime, "5" * 64)), \
+                self.assertRaises(ValidationStagesFailed):
+            wrapper.main()
+
+        receipt = json.loads((self.output / "validation.json").read_text(encoding="utf-8"))
+        stages = receipt["stage_results"]
+        self.assertEqual(stages["initialize_seconds"]["status"], "passed")
+        self.assertEqual(stages["export_seconds"]["failure_scope"], "stage")
+        self.assertEqual(stages["export_seconds"]["error_type"], "StageSourceInputFailure")
+        self.assertEqual(receipt["rules_profile_verification"]["status"], "failed")
+        self.assertFalse(stages["numeric_seconds"]["executed"])
+        self.assertEqual(stages["runtime_preservation_seconds"]["status"], "passed")
+        self.assertEqual(sum(call[0] == "finish" for call in self.lease.calls), 1)
+
+    def test_missing_rules_profile_does_not_block_independent_runtime(self):
+        profile = self.root / "missing-rules-profile.json"
+        self.args.rules_profile_json = profile
+        runtime = self.root / "runtime-fixture.so"
+        runtime.write_bytes(b"small source-only runtime fixture")
+        real_identity = wrapper.input_identity
+
+        def observe_identity(path):
+            if path == profile:
+                return real_identity(path)
+            return (1, 2, 3, 1, 7, 8, 9)
+
+        with self.patched_boundaries(), \
+                mock.patch.object(wrapper, "input_identity", side_effect=observe_identity), \
+                mock.patch.object(wrapper, "run", return_value=0.0), \
+                mock.patch.object(wrapper.subprocess, "check_output", return_value=str(runtime)), \
+                mock.patch.object(wrapper, "publish_runtime", return_value=(runtime, "5" * 64)), \
+                self.assertRaises(ValidationStagesFailed):
+            wrapper.main()
+
+        receipt = json.loads((self.output / "validation.json").read_text(encoding="utf-8"))
+        stages = receipt["stage_results"]
+        self.assertEqual(stages["initialize_seconds"]["status"], "passed")
+        self.assertEqual(stages["export_seconds"]["failure_scope"], "stage")
+        self.assertEqual(stages["export_seconds"]["error_type"], "StageSourceInputFailure")
+        self.assertFalse(stages["numeric_seconds"]["executed"])
+        self.assertEqual(stages["runtime_preservation_seconds"]["status"], "passed")
+        self.assertEqual(sum(call[0] == "finish" for call in self.lease.calls), 1)
+
+    def test_rules_postcheck_io_error_preserves_original_export_failure(self):
+        profile = self.root / "rules-profile.json"
+        profile.write_bytes(b"original rules descriptor")
+        real_identity = wrapper.input_identity
+        reads = 0
+        receipt = {}
+
+        def observe_identity(path):
+            nonlocal reads
+            reads += 1
+            if reads == 5:
+                raise OSError("postcheck I/O failed")
+            return real_identity(path)
+
+        def failed_export(_path):
+            raise subprocess.CalledProcessError(7, ["fake export"])
+
+        with mock.patch.object(wrapper, "input_identity", side_effect=observe_identity), \
+                self.assertRaisesRegex(OSError, "postcheck I/O failed") as failure:
+            wrapper.run_with_rules_profile(failed_export, receipt=receipt, path=profile)
+        self.assertIsInstance(failure.exception.__context__, subprocess.CalledProcessError)
+        self.assertEqual(receipt["rules_profile_verification"]["operation_error"]["returncode"], 7)
+        self.assertEqual(receipt["rules_profile_verification"]["error_type"], "OSError")
 
     def test_partial_acquire_failure_still_attempts_original_finish(self):
         self.lease.acquire_error = RuntimeError("fake acquire failed after record")
