@@ -170,6 +170,56 @@ fn assert_typed_error(out: &ContractSessionOutcome<Snapshot>, code: ErrorCode) {
 }
 
 #[test]
+fn default_go_announces_registered_limits_and_stop_uses_restricted_root() {
+    for (command, expected_move) in [("go", "e2e4"), ("go searchmoves d2d4", "d2d4")] {
+        let mut owner = owner(fixture_scope());
+        let mut session = session();
+        let started = line(&mut owner, &mut session, command);
+        assert!(started.session.accepted, "{started:?}");
+        assert_eq!(
+            started.session.protocol,
+            [
+                "info string go uses configured resource wall at most 30000 ms and simulation limit 128"
+            ]
+        );
+        assert!(matches!(
+            started.session.effects.as_slice(),
+            [Effect::Start { .. }]
+        ));
+        let stopped = line(&mut owner, &mut session, "stop");
+        assert_eq!(
+            stopped.session.protocol,
+            [format!("bestmove {expected_move}")]
+        );
+        assert!(owner.active_ticket().is_none());
+        assert!(
+            line(&mut owner, &mut session, "stop")
+                .session
+                .protocol
+                .is_empty()
+        );
+    }
+
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+        .unwrap();
+    let started = line(&mut owner, &mut session, "go searchmoves d2d4");
+    assert!(started.session.accepted, "{started:?}");
+    assert_eq!(
+        started.session.protocol,
+        [
+            "info string go uses configured resource wall at most 30000 ms; other search limits follow the registered engine profile"
+        ]
+    );
+    assert_eq!(
+        line(&mut owner, &mut session, "stop").session.protocol,
+        ["bestmove d2d4"]
+    );
+}
+
+#[test]
 fn rejected_restrictions_and_unregistered_goals_preserve_common_authority_and_budget() {
     let mut owner = owner(fixture_scope());
     let mut session = session();

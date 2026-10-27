@@ -484,6 +484,19 @@ impl ContractSessionOwner {
                 };
                 match built {
                     Ok(current) => {
+                        if limits.uses_default_resource_limits() {
+                            let wall_ms = self.settings.untimed_limit.as_millis();
+                            let notice = match current.binding.node_budget_semantics() {
+                                NodeBudgetSemantics::LegacySimulations => format!(
+                                    "info string go uses configured resource wall at most {wall_ms} ms and simulation limit {}",
+                                    self.settings.max_simulations
+                                ),
+                                NodeBudgetSemantics::RoventPositionVisits => format!(
+                                    "info string go uses configured resource wall at most {wall_ms} ms; other search limits follow the registered engine profile"
+                                ),
+                            };
+                            out.session.protocol.push(notice);
+                        }
                         self.current = Some(current);
                         out.session.effects.push(Effect::Start {
                             ticket,

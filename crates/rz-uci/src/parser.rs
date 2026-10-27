@@ -70,6 +70,21 @@ pub struct GoLimits {
     pub ponder: bool,
 }
 
+impl GoLimits {
+    /// No UCI stop criterion was supplied; the configured resource profile
+    /// remains a finite execution boundary and must be reported to the GUI.
+    pub(crate) fn uses_default_resource_limits(&self) -> bool {
+        !self.infinite
+            && !self.ponder
+            && self.movetime_ms.is_none()
+            && self.white_time_ms.is_none()
+            && self.black_time_ms.is_none()
+            && self.nodes.is_none()
+            && self.depth_plies.is_none()
+            && self.mate_moves.is_none()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Uci,
@@ -480,18 +495,6 @@ fn parse_go(
     if limits.infinite && (limits.ponder || limits.movetime_ms.is_some() || has_clock) {
         return Err(ParseError::Malformed(
             "infinite cannot be combined with ponder or time limits",
-        ));
-    }
-    if !limits.infinite
-        && !limits.ponder
-        && limits.movetime_ms.is_none()
-        && !has_clock
-        && limits.nodes.is_none()
-        && limits.depth_plies.is_none()
-        && limits.mate_moves.is_none()
-    {
-        return Err(ParseError::Malformed(
-            "go requires a finite limit or infinite",
         ));
     }
     Ok(Command::Go(limits))

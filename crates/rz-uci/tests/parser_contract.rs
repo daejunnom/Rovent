@@ -223,12 +223,12 @@ fn searchmoves_rejects_empty_malformed_repeated_and_unbounded_lists() {
             "{movement:?}"
         );
     }
-    // A root restriction does not provide a search termination condition.
     assert_eq!(
         parse_default("go searchmoves e2e4"),
-        Err(ParseError::Malformed(
-            "go requires a finite limit or infinite"
-        ))
+        Ok(Command::Go(GoLimits {
+            searchmoves: Some(vec!["e2e4".into()]),
+            ..GoLimits::default()
+        }))
     );
     let bounded = ParserLimits {
         max_legal_moves: 2,
@@ -291,6 +291,7 @@ fn depth_and_mate_reject_zero_overflow_bad_decimals_and_duplicate_fields() {
 
 #[test]
 fn go_parses_each_supported_budget_mode_without_losing_units() {
+    assert_eq!(parse_default("go"), Ok(Command::Go(GoLimits::default())));
     assert_eq!(
         parse_default("go movetime 150 nodes 23"),
         Ok(Command::Go(GoLimits {
@@ -332,7 +333,6 @@ fn go_parses_each_supported_budget_mode_without_losing_units() {
 #[test]
 fn go_rejects_conflicts_missing_fields_duplicates_and_overflow() {
     for line in [
-        "go",
         "go movetime",
         "go nodes 0",
         "go movestogo 0 wtime 1 btime 1",

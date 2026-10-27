@@ -580,17 +580,6 @@ fn validate_limits(
             "infinite cannot combine with ponder or time limits",
         ));
     }
-    if !limits.infinite
-        && limits.movetime_ms.is_none()
-        && !has_clock
-        && limits.nodes.is_none()
-        && limits.depth_plies.is_none()
-        && limits.mate_moves.is_none()
-    {
-        return Err(BuildSearchError::InvalidGo(
-            "go needs a finite limit or infinite",
-        ));
-    }
     Ok(())
 }
 
@@ -1068,6 +1057,36 @@ mod tests {
         binding.cancel();
         let out = session.handle_line("stop");
         assert_eq!(out.protocol, ["bestmove b2b3"]);
+    }
+
+    #[test]
+    fn default_go_and_restricted_default_go_use_registered_resource_wall() {
+        let now = Instant::now();
+        for command in ["go", "go searchmoves b2b3"] {
+            let mut session = session();
+            let binding = binding(&mut session, command, now);
+            assert_eq!(binding.budget_kind(), BudgetKind::ResourceWall);
+            assert_eq!(binding.budget().allocation, settings().untimed_limit);
+            assert_eq!(
+                binding.control().max_simulations,
+                settings().max_simulations
+            );
+            assert!(binding.progress(&mut session, "b2b3", now).accepted);
+            let stopped = session.handle_line("stop");
+            assert_eq!(stopped.protocol, ["bestmove b2b3"]);
+            assert!(
+                binding
+                    .complete(
+                        &mut session,
+                        SearchCompletion::Completed {
+                            bestmove: Some("b2b3".into()),
+                        },
+                        now,
+                    )
+                    .protocol
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
