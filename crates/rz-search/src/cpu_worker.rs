@@ -490,7 +490,7 @@ pub struct CpuSliceReport {
     pub controls: Option<ControlSnapshot>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CpuJobTermination {
     pub job: CpuJobId,
     pub owner: CpuWorkerId,
@@ -548,6 +548,8 @@ struct CreditAccount {
     terminal: bool,
     quarantine: bool,
     owner: Option<CpuWorkerId>,
+    // Exact original owner terminal, retained only for the queued-Resume race.
+    terminated_owner: Option<Arc<CpuJobTermination>>,
 }
 
 /// Root-scoped single manager writer. Unknown failure retains reservation;
@@ -585,6 +587,7 @@ pub struct SettledCpuSlice {
     actual_work: CpuWork,
     admission_rejected: bool,
     terminal: bool,
+    terminated_owner: Option<Arc<CpuJobTermination>>,
 }
 impl SettledCpuSlice {
     pub fn ledger_identity(&self) -> &CpuLedgerIdentity {
@@ -601,6 +604,12 @@ impl SettledCpuSlice {
     }
     pub fn terminal(&self) -> bool {
         self.terminal
+    }
+    /// The same ledger accepted this exact paused-owner terminal before this
+    /// later queued grant returned a definite no-work rejection. An arbitrary
+    /// older JobTerminated cannot be paired with this opaque settlement.
+    pub fn terminated_owner_receipt(&self) -> Option<&CpuJobTermination> {
+        self.terminated_owner.as_deref()
     }
 }
 
@@ -690,6 +699,7 @@ impl CpuCreditLedger {
                 terminal: false,
                 quarantine: false,
                 owner: None,
+                terminated_owner: None,
             },
         );
         Ok(())
@@ -889,6 +899,14 @@ impl CpuCreditLedger {
                 .expect("successful settlement has known work"),
             admission_rejected: report.admission_rejected,
             terminal: report.terminal,
+            terminated_owner: report
+                .admission_rejected
+                .then(|| {
+                    self.jobs
+                        .get(&report.grant.job)
+                        .and_then(|account| account.terminated_owner.clone())
+                })
+                .flatten(),
         })
     }
     /// Roll back only a command proved not to have entered its worker queue.
@@ -980,6 +998,7 @@ impl CpuCreditLedger {
                 "CPU paused termination is not attested",
             ));
         }
+        account.terminated_owner = Some(Arc::new(termination.clone()));
         account.terminal = true;
         Ok(())
     }

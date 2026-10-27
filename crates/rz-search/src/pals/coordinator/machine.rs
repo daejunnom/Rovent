@@ -1449,6 +1449,50 @@ impl<V, Q> RefinementMachine<V, Q> {
         evidence: Digest,
         reason: &'static str,
     ) -> Result<ClosedFrame, CoordinatorError> {
+        self.retire_cpu_owner(id, termination, None, evidence, reason)
+    }
+    /// A canceled paused owner can retire before its already-queued Resume
+    /// returns a definite no-work rejection. Only the ledger's opaque settled
+    /// receipt for that newer bound grant permits closing the waiting frame.
+    /// Neither receipt alone refunds credit or accepts a search value.
+    pub fn retire_rejected_cpu_resume(
+        &mut self,
+        id: FrameId,
+        termination: &crate::cpu_worker::CpuJobTermination,
+        rejected: &crate::cpu_worker::SettledCpuSlice,
+        evidence: Digest,
+        reason: &'static str,
+    ) -> Result<ClosedFrame, CoordinatorError> {
+        self.retire_cpu_owner(id, termination, Some(rejected), evidence, reason)
+    }
+    fn retire_cpu_owner(
+        &mut self,
+        id: FrameId,
+        termination: &crate::cpu_worker::CpuJobTermination,
+        rejected: Option<&crate::cpu_worker::SettledCpuSlice>,
+        evidence: Digest,
+        reason: &'static str,
+    ) -> Result<ClosedFrame, CoordinatorError> {
+        let execution = match rejected {
+            Some(settled) => {
+                let grant = settled.grant();
+                if settled.terminated_owner_receipt() != Some(termination)
+                    || !settled.admission_rejected()
+                    || settled.terminal()
+                    || settled.actual_work() != crate::cpu::CpuWork::default()
+                    || grant.job != termination.job
+                    || grant.owner != termination.owner
+                    || grant.execution.epoch != termination.last_execution.epoch
+                    || grant.execution.sequence <= termination.last_execution.sequence
+                {
+                    return Err(CoordinatorError::IdentityMismatch(
+                        "terminated CPU owner and settled rejected Resume",
+                    ));
+                }
+                grant.execution
+            }
+            None => termination.last_execution,
+        };
         // A real terminal owner receipt may retire a cancelled parent even
         // while its child is still running. Joined waiters retain that child;
         // an orphan remains visible for manager cancellation/physical drain.
@@ -1456,7 +1500,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         let frame = self.match_frame_mut(id)?;
         let expected = StepExecution::Cpu {
             job: termination.job,
-            execution: termination.last_execution,
+            execution,
         };
         if !(matches!(frame.phase, FramePhase::Suspended | FramePhase::Ready)
             || frame.phase == FramePhase::Waiting(expected))

@@ -1918,6 +1918,9 @@ struct OwnBinding<Q> {
     last_yield_ack: u64,
     requested_yield: Option<(u64, Instant)>,
     pending_slice: Option<CpuSliceReport>,
+    // A prior paused stack may terminate before an already-enqueued Resume
+    // returns its definite no-work report. Retain both original obligations.
+    queued_resume_termination: Option<CpuJobTermination>,
     validator_reviewed_execution: Option<ExecutionId>,
     reciprocal: Option<reciprocal::OwnReciprocalCustody>,
     // Linear custody of the same grant in the root's common-node controller.
@@ -4882,6 +4885,23 @@ where
         // opaque success receipt, before any later semantic CPU publication.
         let mut changed = self.flush_frontier_native()?;
         for index in 0..self.own.len() {
+            if self.own[index]
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.queued_resume_termination.is_some())
+            {
+                // These two original receipts are one retirement obligation.
+                // Generic raw publication cannot consume just one side while
+                // an archive transfer/frontier settlement is still pending.
+                if self.own[index]
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.pending_slice.is_some())
+                {
+                    changed |= self.retire_queued_resume_after_owner_termination(index)?;
+                }
+                continue;
+            }
             if !self.driver.semantic_owner_available() {
                 break;
             }
@@ -5435,8 +5455,14 @@ where
                         "CPU receipt original question binding",
                     ));
                 }
+                let rejected_after_owner_termination = binding.queued_resume_termination.is_some()
+                    && report.admission_rejected
+                    && report.actual_work == Some(rz_search::cpu::CpuWork::default())
+                    && !report.terminal
+                    && !report.continuation_retained;
                 if let Err(error) = &report.result {
-                    if error.value_authority_stop().is_none()
+                    if !rejected_after_owner_termination
+                        && error.value_authority_stop().is_none()
                         && !self.failures.iter().any(|failure| {
                             matches!(failure, AdaptiveManagerError::Cpu(CpuWorkerError::Cpu(_)))
                         })
@@ -5508,6 +5534,16 @@ where
                         accounting,
                         timing,
                     );
+                }
+                if binding.queued_resume_termination.is_some() {
+                    // The real terminal already discarded the OLD paused
+                    // token; this newer queued grant has only now settled.
+                    // Preserve both original reports until their joint close.
+                    binding.pending_slice = Some(report);
+                    self.own[slot].binding = Some(binding);
+                    return self
+                        .retire_queued_resume_after_owner_termination(slot)
+                        .map(|_| ());
                 }
                 // Original worker boundaries only. Queue delivery, paused
                 // residence and manager processing are outside these scopes.
@@ -5818,7 +5854,7 @@ where
                     self.phase = ManagerPhase::Quarantined;
                     return Err(error.into());
                 }
-                let Some(binding) = self.own[slot].binding.take() else {
+                let Some(mut binding) = self.own[slot].binding.take() else {
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::JobTerminated(termination));
                     self.phase = ManagerPhase::Quarantined;
@@ -5836,6 +5872,30 @@ where
                     return Err(AdaptiveManagerError::Invalid(
                         "CPU token termination owner mismatch",
                     ));
+                }
+                if termination.last_execution != binding.grant.execution {
+                    let usage = self.native_ledger()?.usage(binding.envelope.id)?;
+                    if binding.queued_resume_termination.is_some()
+                        || termination.last_execution.epoch != binding.grant.execution.epoch
+                        || termination.last_execution.sequence >= binding.grant.execution.sequence
+                        || usage.1 != binding.grant.node_credit
+                        || usage.2
+                    {
+                        self.own[slot].binding = Some(binding);
+                        self.quarantined_cpu_receipts
+                            .push(CpuWorkerEvent::JobTerminated(termination));
+                        self.phase = ManagerPhase::Quarantined;
+                        return Err(AdaptiveManagerError::Invalid(
+                            "CPU termination does not precede its outstanding Resume",
+                        ));
+                    }
+                    // The ledger accepted the old stack's actual terminal but
+                    // intentionally retained the newer reservation. Its owner
+                    // must still return that queued command's original report.
+                    binding.resume_pending = false;
+                    binding.queued_resume_termination = Some(termination);
+                    self.own[slot].binding = Some(binding);
+                    return Ok(());
                 }
                 if let Some(report) = binding.pending_slice {
                     self.defer(DeferredCommit::OwnRaw {
@@ -5875,6 +5935,105 @@ where
             }
         }
         Ok(())
+    }
+    fn retire_queued_resume_after_owner_termination(
+        &mut self,
+        slot: usize,
+    ) -> Result<bool, AdaptiveManagerError> {
+        if !self.driver.semantic_owner_available() {
+            return Ok(false);
+        }
+        let binding = self.own[slot]
+            .binding
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "terminated queued Resume binding",
+            ))?;
+        let termination =
+            binding
+                .queued_resume_termination
+                .as_ref()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "original paused owner terminal",
+                ))?;
+        let report = binding
+            .pending_slice
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "original queued Resume report",
+            ))?;
+        let settled = binding
+            .semantic_settlement
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "queued Resume ledger settlement",
+            ))?;
+        if binding.native_frontier.is_some() || self.pending_frontier_for(binding.envelope.id) {
+            return Ok(false);
+        }
+        if !report.admission_rejected
+            || report.actual_work != Some(rz_search::cpu::CpuWork::default())
+            || report.result.is_ok()
+            || report.terminal
+            || report.continuation_retained
+            || settled.grant() != binding.grant
+            || settled.ledger_identity() != &self.native_ledger()?.identity()
+            || settled.terminated_owner_receipt() != Some(termination)
+            || binding.reciprocal.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "terminated owner requires its settled no-work Resume rejection",
+            ));
+        }
+        // Reserve every deferred seat before changing Search or releasing the
+        // binding. Capacity failure leaves the two original reports in custody.
+        let slots = 2 + usize::from(!binding.feedback_forwarded);
+        if self
+            .deferred
+            .len()
+            .checked_add(slots)
+            .is_none_or(|sum| sum > 128)
+        {
+            return Ok(false);
+        }
+        self.deferred
+            .try_reserve(slots)
+            .map_err(|_| AdaptiveManagerError::Capacity("terminated Resume handoff"))?;
+        let closed = if binding.feedback_forwarded {
+            None
+        } else {
+            Some(self.machine.retire_rejected_cpu_resume(
+                binding.work.frame,
+                termination,
+                settled,
+                receipt_digest(b"cpu-queued-resume-discard", report.grant.execution),
+                "CPU owner terminated before queued Resume",
+            )?)
+        };
+        let mut binding = self.own[slot]
+            .binding
+            .take()
+            .expect("validated original binding");
+        let report = binding
+            .pending_slice
+            .take()
+            .expect("retained original report");
+        let termination = binding
+            .queued_resume_termination
+            .take()
+            .expect("retained original terminal");
+        self.deferred.push_back(DeferredCommit::OwnRaw {
+            work: binding.work.clone(),
+            report,
+        });
+        self.deferred.push_back(DeferredCommit::TokenDiscard {
+            work: binding.work,
+            termination,
+        });
+        if let Some(closed) = closed {
+            self.deferred.push_back(DeferredCommit::Closed(closed));
+        }
+        Ok(true)
     }
     fn observe_yield_ack_latency(
         &mut self,
@@ -7523,6 +7682,7 @@ where
             last_yield_ack: 0,
             requested_yield: None,
             pending_slice: None,
+            queued_resume_termination: None,
             validator_reviewed_execution: None,
             reciprocal: None,
             native_frontier,

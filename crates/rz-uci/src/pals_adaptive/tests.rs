@@ -282,6 +282,7 @@ struct DriverFixture {
     expected_cpu: BTreeMap<u16, CpuReport>,
     actual_cpu: Vec<CpuSliceReport>,
     fail_raw_once: bool,
+    semantic_owner_busy: bool,
     fail_role_once: bool,
     fail_after_role_consumption_once: bool,
     #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -390,6 +391,9 @@ impl DriverFixture {
     }
 }
 impl AdaptiveSearchDriver<u64> for DriverFixture {
+    fn semantic_owner_available(&self) -> bool {
+        !self.semantic_owner_busy
+    }
     fn frontier_native_capacity(
         &mut self,
         requested: u64,
@@ -948,6 +952,7 @@ fn fixture_with_registered_role_limit(
         expected_cpu,
         actual_cpu: Vec::new(),
         fail_raw_once: false,
+        semantic_owner_busy: false,
         fail_role_once: false,
         fail_after_role_consumption_once: false,
         #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -2707,6 +2712,7 @@ mod adaptive_partial_feedback {
                 expected_cpu: BTreeMap::new(),
                 actual_cpu: Vec::new(),
                 fail_raw_once: false,
+                semantic_owner_busy: false,
                 fail_role_once: false,
                 fail_after_role_consumption_once: false,
                 #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -3362,4 +3368,129 @@ fn diagnostic_actual_native_queue_admissions_keep_other_pending_question_identit
     assert!(receipt.permits_archive_close());
     assert_eq!(receipt.pending_tickets, 0);
     assert_eq!(receipt.native_cpu_reserved, 0);
+}
+
+#[test]
+fn canceled_paused_owner_retains_queued_resume_until_its_actual_no_work_settlement() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::OwnCpuResume, true, 1);
+    facts.child_gate.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.own[0].binding.is_some()
+    });
+    // Read one original reliable receipt without allowing the manager to
+    // immediately schedule its next slice in the same tick.
+    let take = |manager: &Manager| loop {
+        if let Some(event) = manager.own[0].worker.as_ref().unwrap().try_event().unwrap() {
+            break event;
+        }
+        assert!(
+            Instant::now() < until,
+            "original CPU receipt did not arrive"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    let CpuWorkerEvent::Slice(first) = take(&manager) else {
+        panic!("first original CPU invocation must return its slice");
+    };
+    assert!(first.continuation_retained && !first.terminal);
+    let spent = first.cumulative_nodes;
+    manager.own_event(0, CpuWorkerEvent::Slice(first)).unwrap();
+    assert!(manager.own[0].binding.as_ref().unwrap().resume_pending);
+    let sequence = manager.issue_control().unwrap();
+    manager.own[0]
+        .binding
+        .as_ref()
+        .unwrap()
+        .controls
+        .request_cancel(sequence)
+        .unwrap();
+    let CpuWorkerEvent::JobTerminated(termination) = take(&manager) else {
+        panic!("same paused owner must return its actual token discard");
+    };
+    // Keep that real event unread by the manager while admitting the newer
+    // same-owner command. This deterministically exercises the two-message
+    // order also possible when cancel wins just before the owner dequeues it.
+    manager.resume_cpu(0, 1, Duration::from_millis(8)).unwrap();
+    let current = manager.own[0].binding.as_ref().unwrap().grant;
+    assert!(current.execution.sequence > termination.last_execution.sequence);
+    assert_eq!(
+        manager.native_cpu_usage().unwrap(),
+        (spent, current.node_credit)
+    );
+    let CpuWorkerEvent::Slice(rejected) = take(&manager) else {
+        panic!("queued Resume must return its separate original receipt");
+    };
+    assert_eq!(rejected.grant, current);
+    assert!(rejected.admission_rejected && !rejected.terminal && !rejected.continuation_retained);
+    assert_eq!(
+        rejected.actual_work,
+        Some(rz_search::cpu::CpuWork::default())
+    );
+    manager.begin_shutdown(until).unwrap();
+    manager
+        .own_event(0, CpuWorkerEvent::JobTerminated(termination))
+        .unwrap();
+    assert!(
+        manager.own[0]
+            .binding
+            .as_ref()
+            .unwrap()
+            .queued_resume_termination
+            .is_some()
+    );
+    assert_eq!(
+        manager.native_cpu_usage().unwrap(),
+        (spent, current.node_credit)
+    );
+    assert!(!manager.shutdown_receipt().unwrap().permits_archive_close());
+    manager.driver_mut().semantic_owner_busy = true;
+    manager
+        .own_event(0, CpuWorkerEvent::Slice(rejected))
+        .unwrap();
+    // The same original pair survives normal archive/semantic-owner waiting.
+    // Neither a generic raw flush nor a new manager may consume only one side.
+    manager.flush_deferred().unwrap();
+    let held = manager.own[0].binding.as_ref().unwrap();
+    assert!(held.queued_resume_termination.is_some() && held.pending_slice.is_some());
+    assert_eq!(manager.native_cpu_usage().unwrap(), (spent, 0));
+    assert!(!manager.shutdown_receipt().unwrap().permits_archive_close());
+    let proof = held.semantic_settlement.as_ref().unwrap();
+    assert_eq!(
+        proof.terminated_owner_receipt(),
+        held.queued_resume_termination.as_ref()
+    );
+    let mut stale = held.queued_resume_termination.as_ref().unwrap().clone();
+    stale.last_execution.sequence = stale.last_execution.sequence.saturating_sub(1);
+    assert!(
+        manager
+            .machine
+            .retire_rejected_cpu_resume(
+                held.work.frame,
+                &stale,
+                proof,
+                Digest([88; 32]),
+                "stale terminal"
+            )
+            .is_err()
+    );
+    assert!(manager.machine.frame(held.work.frame).is_some());
+    manager.driver_mut().semantic_owner_busy = false;
+    manager.flush_deferred().unwrap();
+    assert!(manager.own[0].binding.is_none());
+    assert_eq!(manager.native_cpu_usage().unwrap(), (spent, 0));
+    let receipt = shutdown(&mut manager, until);
+    assert!(receipt.permits_archive_close());
+    assert_eq!(receipt.native_cpu_reserved, 0);
+    assert!(manager.failures().next().is_none());
+    assert!(
+        manager.driver().actual_cpu.is_empty(),
+        "cancel cannot publish a late score"
+    );
+    assert!(
+        manager
+            .driver()
+            .raw_cpu_receipts
+            .contains(&current.execution)
+    );
 }
