@@ -56,11 +56,11 @@ def cpu_stage_dependencies():
 
 def cpu_source_cohorts(source, package):
     """Bind source integrity to the stages that actually consume those files."""
-    shared = [source / "scripts/pals_model_validate.py",
-              source / "crates/rz-eval/src/pals_model.rs",
-              source / "crates/rz-eval/Cargo.toml"]
+    shared = [source / "scripts/pals_model_validate.py"]
     shared.extend(sorted((package / "src/rz_pals_model").glob("*.py")))
     packing = tuple(source / logical for logical in (
+        "crates/rz-eval/src/pals_model.rs",
+        "crates/rz-eval/Cargo.toml",
         "crates/rz-eval/examples/device_packing_graph_check.rs",
         "crates/rz-eval/src/pals_onnx/device_packing_admission.rs",
         "crates/rz-eval/src/pals_onnx/device_packing_graph.rs",

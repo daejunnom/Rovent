@@ -298,6 +298,8 @@ class ActualCpuSourceCohortTests(unittest.TestCase):
             original = wrapper._stage_source_snapshot(source, lambda: shared)
             if fault == "missing":
                 packing[1].unlink()
+            elif fault == "rust_model_missing":
+                (source / "crates/rz-eval/src/pals_model.rs").unlink()
 
             def check_shared():
                 if wrapper._stage_source_snapshot(source, lambda: shared) != original:
@@ -322,7 +324,7 @@ class ActualCpuSourceCohortTests(unittest.TestCase):
         return stages, receipt, observed
 
     def test_actual_packing_source_failure_keeps_independent_neural_stages(self):
-        for fault in ("missing", "changed"):
+        for fault in ("missing", "changed", "rust_model_missing"):
             with self.subTest(fault=fault):
                 stages, receipt, observed = self.actual_cohort_case(fault)
                 branch = "device_packing_rust_body_seconds"
