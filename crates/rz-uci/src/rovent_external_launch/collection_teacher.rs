@@ -311,3 +311,395 @@ impl RoventCollectionTeacherOwner {
         self.worker.take_diagnostics_after_join()
     }
 }
+
+/// A teacher worker bound to the original /2 Collection capability. Its
+/// source descriptors and actual attached root stay alive until physical exit.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventCollectionTeacherOwnerV2 {
+    launch: PreparedRoventExternalLaunch,
+    worker: CollectionTeacherWorker,
+    admission: Option<crate::pals_adaptive::RoventCollectionRootAdmissionV2>,
+    custody: Option<crate::rovent_bootstrap::RoventCollectionTeacherSourceCustody>,
+    frozen_actor: Digest,
+    source_index: usize,
+}
+
+/// A post-spawn rejection retains the actual worker and its original source
+/// so the caller can request shutdown and collect physical drain evidence.
+/// The caller retains the borrowed permit in both variants.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub enum RoventCollectionTeacherSpawnRejectionV2 {
+    BeforeSpawn {
+        cause: CheckerError,
+        admission: crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    },
+    AfterSpawn {
+        cause: CheckerError,
+        owner: RoventCollectionTeacherOwnerV2,
+    },
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventCollectionTeacherOwnerV2 {
+    /// Obtain the source bundle inside this method from the opaque real root.
+    /// A caller cannot supply a replacement executable or cwd. The caller must
+    /// separately bind `source_index` and `frozen_actor` to its frozen corpus
+    /// registration; the permit alone is not teacher-label authority. The
+    /// borrowed permit remains with its caller if pre-spawn admission fails.
+    #[allow(clippy::too_many_arguments)]
+    // Not exported for product use until the session wires root revoke to
+    // worker shutdown and preserves the subsequent physical drain evidence.
+    pub(crate) fn spawn(
+        admission: crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+        source_index: usize,
+        control: &crate::rovent_bootstrap::RoventStartupControl,
+        collection_owner: u32,
+        frozen_actor: Digest,
+        clock: ExternalWorkerClock,
+        startup_deadline: Instant,
+        cleanup_ceiling: Instant,
+        cancel: &AtomicBool,
+        permit: &CollectionProcessPermit,
+    ) -> Result<Self, RoventCollectionTeacherSpawnRejectionV2> {
+        let created: Result<Self, CheckerError> = (|| {
+            let root = admission.root_admission();
+            let original = root
+                .owner()
+                .v2()
+                .ok_or(invalid("teacher /2 lock missing"))?;
+            let preload = admission.native_origin().collection_preload();
+            let original_preload = admission
+                .native_origin()
+                .sources()
+                .verify_collection_v2_origin()
+                .map_err(|_| invalid("teacher /2 original preload"))?;
+            let admission_limit = clock
+                .origin
+                .checked_add(std::time::Duration::from_nanos(
+                    root.admission_deadline().at.0,
+                ))
+                .ok_or(invalid("teacher /2 admission deadline overflow"))?;
+            let root_cleanup_limit = clock
+                .origin
+                .checked_add(std::time::Duration::from_nanos(
+                    root.cleanup_deadline().at.0,
+                ))
+                .ok_or(invalid("teacher /2 cleanup deadline overflow"))?;
+            if !Arc::ptr_eq(preload, original_preload)
+                || !preload.matches_input_lock_v2(original)
+                || !Arc::ptr_eq(
+                    &control.cancellation,
+                    &root.original_context().control.cancellation,
+                )
+                || !std::ptr::eq(
+                    Arc::as_ptr(&control.cancellation),
+                    cancel as *const AtomicBool,
+                )
+                || control.until > admission_limit
+                || control.cleanup_until > root_cleanup_limit
+                || startup_deadline > control.until
+                || cleanup_ceiling > control.cleanup_until
+                || !root
+                    .original_context()
+                    .accepts()
+                    .map_err(|_| invalid("teacher /2 root revoked"))?
+                || frozen_actor == Digest([0; 32])
+                || clock.domain != root.runtime_clock().domain()
+                || clock.origin != root.runtime_clock().origin()
+                || cancel.load(Ordering::Acquire)
+                || Instant::now() >= startup_deadline
+            {
+                return Err(invalid("teacher /2 source/root/control/clock mismatch"));
+            }
+            root.descriptor()
+                .verify_against(original)
+                .map_err(|_| invalid("teacher /2 descriptor"))?;
+            let root_digest = root
+                .descriptor()
+                .digest()
+                .map_err(|_| invalid("teacher /2 root digest"))?;
+            let root_budget = root
+                .descriptor()
+                .root_budget_digest()
+                .map_err(|_| invalid("teacher /2 budget digest"))?;
+            if root_budget != admission.root_budget() {
+                return Err(invalid("teacher /2 budget mismatch"));
+            }
+            let sources = preload
+                .teacher_sources(source_index, control)
+                .map_err(|_| invalid("teacher /2 source custody"))?;
+            let (index, launch, _profile, executable, working_directory, custody) =
+                sources.into_parts();
+            if index != source_index
+                || !custody.matches_preload(preload)
+                || !launch
+                    .original_lock_owner_v2()
+                    .is_some_and(|owner| Arc::ptr_eq(owner, original))
+                || launch.profile().purpose != ExternalEnginePurpose::Teacher
+                || launch
+                    .input_lock_sha256
+                    .as_deref()
+                    .map(digest)
+                    .transpose()?
+                    != Some(root.startup_lock_digest())
+            {
+                return Err(invalid("teacher /2 original source owner mismatch"));
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (
+                    executable,
+                    working_directory,
+                    collection_owner,
+                    clock,
+                    cleanup_ceiling,
+                    permit,
+                    custody,
+                    root_digest,
+                );
+                Err(CheckerError::Unsupported(
+                    "collection teacher requires Linux pinned ELF",
+                ))
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let root_cleanup = clock
+                    .origin
+                    .checked_add(std::time::Duration::from_nanos(
+                        root.cleanup_deadline().at.0,
+                    ))
+                    .ok_or(invalid("teacher /2 cleanup deadline overflow"))?;
+                let hard = clock
+                    .origin
+                    .checked_add(std::time::Duration::from_nanos(root.hard_deadline().at.0))
+                    .ok_or(invalid("teacher /2 hard deadline overflow"))?;
+                let config = launch.configuration()?;
+                let profile_cleanup = hard
+                    .checked_add(config.shutdown_grace)
+                    .ok_or(invalid("teacher /2 profile cleanup overflow"))?;
+                let cleanup_ceiling = cleanup_ceiling.min(root_cleanup).min(profile_cleanup);
+                let pin = ExternalLaunchPin::from_owned_descriptors(executable, working_directory)?;
+                let registration = TeacherWorkerRegistration {
+                    collection_owner,
+                    authority: root.authority(),
+                    original_deadline: root.hard_deadline(),
+                    input_lock: root.startup_lock_digest(),
+                    root_admission: root_digest,
+                    root_budget,
+                    frozen_actor,
+                };
+                if !root
+                    .original_context()
+                    .accepts()
+                    .map_err(|_| invalid("teacher /2 root revoked"))?
+                    || cancel.load(Ordering::Acquire)
+                {
+                    return Err(invalid("teacher /2 revoked before worker startup"));
+                }
+                let worker = CollectionTeacherWorker::spawn_in_process_scope(
+                    config,
+                    launch.profile().engine,
+                    registration,
+                    clock,
+                    startup_deadline,
+                    cleanup_ceiling,
+                    pin,
+                    permit.clone(),
+                )?;
+                let owner = Self {
+                    launch,
+                    worker,
+                    admission: Some(admission.clone()),
+                    custody: Some(custody),
+                    frozen_actor,
+                    source_index,
+                };
+                Ok(owner)
+            }
+        })();
+        let owner = match created {
+            Ok(owner) => owner,
+            Err(cause) => {
+                return Err(RoventCollectionTeacherSpawnRejectionV2::BeforeSpawn {
+                    cause,
+                    admission,
+                });
+            }
+        };
+        let validity = owner
+            .admission()
+            .root_admission()
+            .original_context()
+            .accepts();
+        let cause = match validity {
+            Ok(true) if !cancel.load(Ordering::Acquire) => return Ok(owner),
+            Ok(_) => invalid("teacher /2 revoked during worker startup"),
+            Err(_) => invalid("teacher /2 root authority unavailable after worker startup"),
+        };
+        owner.worker.request_shutdown(Instant::now());
+        Err(RoventCollectionTeacherSpawnRejectionV2::AfterSpawn { cause, owner })
+    }
+
+    pub fn worker(&self) -> &CollectionTeacherWorker {
+        &self.worker
+    }
+    pub fn source_index(&self) -> usize {
+        self.source_index
+    }
+    pub fn launch(&self) -> &PreparedRoventExternalLaunch {
+        &self.launch
+    }
+    pub fn admission(&self) -> &crate::pals_adaptive::RoventCollectionRootAdmissionV2 {
+        self.admission.as_ref().expect("live teacher /2 admission")
+    }
+    pub fn verified_startup(&self) -> Result<Option<VerifiedRoventExternalStartup>, CheckerError> {
+        let Some(startup) = self.worker.startup_report() else {
+            return Ok(None);
+        };
+        let observed_uci = startup.result?;
+        if observed_uci.name != self.launch.profile().expected_uci_name {
+            return Err(invalid("collection teacher actual UCI name"));
+        }
+        let attempt = startup
+            .attempt
+            .ok_or(invalid("collection teacher startup attempt absent"))?;
+        let external = attempt
+            .external
+            .ok_or(invalid("collection teacher startup process absent"))?;
+        if external.request_id != 0
+            || external.partial_report.is_some()
+            || !reusable(external.process)
+        {
+            return Err(invalid("collection teacher startup physical evidence"));
+        }
+        Ok(Some(VerifiedRoventExternalStartup {
+            canonical_sha256: self.launch.canonical_sha256.clone(),
+            capability_sha256: self.launch.capability_sha256.clone(),
+            input_lock_sha256: self
+                .launch
+                .input_lock_sha256
+                .clone()
+                .ok_or(invalid("collection teacher startup lock absent"))?,
+            observed_uci,
+            process: external
+                .process
+                .process_identity
+                .ok_or(invalid("collection teacher process identity"))?,
+        }))
+    }
+    pub fn submit(&mut self, job: TeacherJob) -> Result<TeacherDispatch, CheckerError> {
+        let root = self.admission().root_admission();
+        let scope = job.input_scope;
+        if !root
+            .original_context()
+            .accepts()
+            .map_err(|_| invalid("teacher /2 root revoked"))?
+            || scope.authority != root.authority()
+            || scope.root_admission
+                != root
+                    .descriptor()
+                    .digest()
+                    .map_err(|_| invalid("teacher /2 root digest"))?
+            || scope.input_lock != root.startup_lock_digest()
+            || scope.root_budget != self.admission().root_budget()
+            || scope.frozen_actor != self.frozen_actor
+            || job.original_deadline.clock != root.hard_deadline().clock
+            || job.original_deadline.at > root.hard_deadline().at
+        {
+            return Err(invalid("teacher /2 job differs from original live root"));
+        }
+        self.launch
+            .require_query(job.constraint, job.root_moves.is_some())?;
+        self.worker.submit(job)
+    }
+    pub fn validate_completion(
+        &self,
+        completion: &TeacherCompletion,
+        dispatch: &TeacherDispatch,
+    ) -> Result<(), CheckerError> {
+        if !self
+            .admission()
+            .root_admission()
+            .original_context()
+            .accepts()
+            .map_err(|_| invalid("teacher /2 root revoked"))?
+            || !completion.matches_submission(dispatch)
+            || dispatch.input_scope().input_lock
+                != self.admission().root_admission().startup_lock_digest()
+            || dispatch.input_scope().root_budget != self.admission().root_budget()
+            || dispatch.input_scope().authority != self.admission().root_admission().authority()
+            || dispatch.input_scope().root_admission
+                != self
+                    .admission()
+                    .root_admission()
+                    .descriptor()
+                    .digest()
+                    .map_err(|_| invalid("teacher /2 root digest"))?
+            || dispatch.input_scope().frozen_actor != self.frozen_actor
+        {
+            return Err(invalid(
+                "collection teacher completion lacks original private dispatch",
+            ));
+        }
+        if let Ok(outcome) = completion.result() {
+            let report = &outcome.report;
+            let declared = self.launch.profile();
+            let attempt = completion
+                .attempt()
+                .ok_or(invalid("collection teacher successful attempt absent"))?;
+            let external = attempt
+                .external
+                .as_ref()
+                .ok_or(invalid("collection teacher physical receipt absent"))?;
+            if report.profile != declared.engine
+                || report.purpose != ExternalEnginePurpose::Teacher
+                || report.raw.identity != declared.identity
+                || report.raw.observed_uci.name != declared.expected_uci_name
+                || report.requested != dispatch.constraint()
+                || completion.issued_constraint() != Some(report.issued)
+                || completion.issued_go() != Some(report.issued_go.as_str())
+                || completion.go_issue() != rz_search::external_cpu::ExternalGoIssue::Issued
+                || !report.readiness_barrier_completed
+                || report.raw.request_id == 0
+                || external.request_id != report.raw.request_id
+                || external.partial_report.as_ref() != Some(&report.raw)
+                || attempt.elapsed != report.raw.elapsed
+                || external.process.process_identity != Some(dispatch.process_identity())
+                || !reusable(external.process)
+            {
+                return Err(invalid(
+                    "collection teacher raw/private physical provenance mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub fn try_join(&mut self) -> Option<Result<CheckerShutdown, CheckerError>> {
+        self.worker.try_join()
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl Drop for RoventCollectionTeacherOwnerV2 {
+    fn drop(&mut self) {
+        // The lower worker requests shutdown on drop. Until its process and
+        // pipes are demonstrably closed, quarantine the original source and
+        // admission rather than releasing their lifetime with an unknown owner.
+        let closed = self.worker.process_after_join().is_some_and(|p| {
+            p.exit_observed
+                && p.stdout_drained
+                && p.stderr_drained
+                && p.cleanup_complete
+                && !p.quarantined
+                && !p.ownership_lost
+        });
+        if !closed {
+            if let Some(custody) = self.custody.take() {
+                std::mem::forget(custody);
+            }
+            if let Some(admission) = self.admission.take() {
+                std::mem::forget(admission);
+            }
+        }
+    }
+}

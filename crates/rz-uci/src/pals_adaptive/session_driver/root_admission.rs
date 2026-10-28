@@ -26,6 +26,17 @@ fn v2_declares_own_researcher(
         )
 }
 
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+fn v2_declares_external_researcher(
+    mode: rz_contracts::rovent::ExecutionMode,
+    researcher: Option<&rz_experiments::RoventResearcher>,
+) -> bool {
+    mode.has_native_r()
+        && matches!(researcher,
+            Some(rz_experiments::RoventResearcher::External { profile })
+                if profile.purpose == rz_experiments::RoventExternalPurpose::ResearchChecker)
+}
+
 #[cfg(all(test, feature = "pals-adaptive"))]
 mod v2_topology_tests {
     use super::v2_declares_own_researcher;
@@ -64,11 +75,36 @@ mod v2_topology_tests {
             assert!(v2_declares_own_researcher(mode, Some(&own)));
             assert!(!v2_declares_own_researcher(mode, Some(&external)));
             assert!(!v2_declares_own_researcher(mode, None));
+            #[cfg(feature = "onnx-cpu")]
+            {
+                assert!(super::v2_declares_external_researcher(
+                    mode,
+                    Some(&external)
+                ));
+                assert!(!super::v2_declares_external_researcher(mode, Some(&own)));
+                assert!(!super::v2_declares_external_researcher(mode, None));
+            }
         }
         for mode in [ExecutionMode::CpuPc, ExecutionMode::HybridPc] {
             assert!(!v2_declares_own_researcher(mode, Some(&own)));
             assert!(!v2_declares_own_researcher(mode, Some(&external)));
             assert!(!v2_declares_own_researcher(mode, None));
+            #[cfg(feature = "onnx-cpu")]
+            assert!(!super::v2_declares_external_researcher(
+                mode,
+                Some(&external)
+            ));
+        }
+        #[cfg(feature = "onnx-cpu")]
+        {
+            let mut teacher = external.clone();
+            if let RoventResearcher::External { profile } = &mut teacher {
+                profile.purpose = RoventExternalPurpose::Teacher;
+            }
+            assert!(!super::v2_declares_external_researcher(
+                ExecutionMode::CpuPcr,
+                Some(&teacher),
+            ));
         }
     }
 }
@@ -107,6 +143,25 @@ where
     ) -> Digest {
         let mut hash = Sha256::new();
         hash.update(b"rz-rovent-pcr-startup-root-policy/1\0");
+        hash.update(implementation.0);
+        hash.update(lock.canonical_sha256.as_bytes());
+        hash.update([match policy {
+            crate::rovent_root_admission::RoventRootAdmissionPolicy::ExactRegistered => 0,
+            crate::rovent_root_admission::RoventRootAdmissionPolicy::DynamicGo => 1,
+        }]);
+        hash.update(include_bytes!("root_admission.rs"));
+        Digest(hash.finalize().into())
+    }
+
+    /// Same implementation identity used by the /2 policy at registration.
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn rovent_root_policy_implementation_digest_v2(
+        implementation: Digest,
+        lock: &rz_experiments::RoventInputLockV2,
+        policy: crate::rovent_root_admission::RoventRootAdmissionPolicy,
+    ) -> Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-pcr-startup-root-policy/2\0");
         hash.update(implementation.0);
         hash.update(lock.canonical_sha256.as_bytes());
         hash.update([match policy {
@@ -215,10 +270,20 @@ where
             || self.rovent_root_policy_v2.is_some()
             || self.closed.load(Ordering::Acquire)
             || self.rovent_collection_origin.is_some()
-            || !v2_declares_own_researcher(
-                lock.manifest.engine.mode,
-                lock.manifest.engine.researcher.as_ref(),
-            )
+            || {
+                let own = v2_declares_own_researcher(
+                    lock.manifest.engine.mode,
+                    lock.manifest.engine.researcher.as_ref(),
+                );
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let external = v2_declares_external_researcher(
+                    lock.manifest.engine.mode,
+                    lock.manifest.engine.researcher.as_ref(),
+                );
+                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                let external = false;
+                !own && !external
+            }
             || profile_lock != lock.canonical_sha256
             || profile.mode != lock.manifest.engine.mode
             || profile.maximum_goal_plies != lock.manifest.engine.search.registered_max_chess_plies
@@ -256,13 +321,28 @@ where
                 "root policy cannot change after physical work",
             ));
         }
-        if owners.researcher_source.is_profiled_external()
-            || owners.external.is_some()
-            || owners.cpu.is_empty()
-        {
+        let own_ready = v2_declares_own_researcher(
+            lock.manifest.engine.mode,
+            lock.manifest.engine.researcher.as_ref(),
+        ) && !owners.researcher_source.is_profiled_external()
+            && owners.external.is_none()
+            && !owners.cpu.is_empty();
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let external_ready = v2_declares_external_researcher(
+            lock.manifest.engine.mode,
+            lock.manifest.engine.researcher.as_ref(),
+        ) && owners.external.is_none()
+            && owners.cpu.is_empty()
+            && matches!(&owners.researcher_source,
+                SessionResearcherSource::ProfiledExternalV2(source)
+                    if source.same_original_lock(lock)
+                        && source.ready_for_root_policy_registration());
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let external_ready = false;
+        if !own_ready && !external_ready {
             return Err(failure(
                 "RoventStartupPolicy",
-                "V2 own-R requires the original native CPU researcher",
+                "V2 researcher requires its original ready native or pinned external owner",
             ));
         }
         let ready = owners
@@ -275,16 +355,11 @@ where
         {
             return Err(SearchSessionFailure::physical_completion_unknown());
         }
-        let mut hash = Sha256::new();
-        hash.update(b"rz-rovent-pcr-startup-root-policy/2\0");
-        hash.update(self.options.implementation.0);
-        hash.update(lock.canonical_sha256.as_bytes());
-        hash.update([match policy {
-            crate::rovent_root_admission::RoventRootAdmissionPolicy::ExactRegistered => 0,
-            crate::rovent_root_admission::RoventRootAdmissionPolicy::DynamicGo => 1,
-        }]);
-        hash.update(include_bytes!("root_admission.rs"));
-        self.options.implementation = Digest(hash.finalize().into());
+        self.options.implementation = Self::rovent_root_policy_implementation_digest_v2(
+            self.options.implementation,
+            lock,
+            policy,
+        );
         self.rovent_root_policy_v2 = Some(RoventPcrRootPolicyV2 { owner, policy });
         Ok(())
     }

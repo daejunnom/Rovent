@@ -2,13 +2,14 @@
 //! No internal CPU worker, ledger or adaptive native controller is created.
 use super::*;
 
-pub struct ProfiledExternalManagerAdmissionRejection<Q, B, D>
+pub struct ProfiledExternalManagerAdmissionRejection<Q, B, D, L = rz_experiments::RoventInputLock>
 where
     B: TicketNativeBackend<ReviewView, Q>,
+    L: profiled_external_source::ExternalManagerLock,
 {
     pub error: AdaptiveManagerError,
     pub sources: AdaptiveManagerSources<Q, B, D>,
-    pub external: ProfiledExternalManagerSource,
+    pub external: ProfiledExternalManagerSource<L>,
     pub continuation: Option<AdaptiveSequenceContinuation>,
 }
 
@@ -131,6 +132,42 @@ where
     > {
         self.inner
             .into_profiled_process_parts()
+            .map_err(|rejected| ProfiledExternalPersistentRejection {
+                error: rejected.error,
+                manager: Self {
+                    inner: rejected.manager,
+                },
+            })
+    }
+
+    /// Return the original V2 source only after the same physical root fence.
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v2_persistent_parts(
+        self,
+    ) -> Result<
+        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
+        ProfiledExternalPersistentRejection<Q, B, D>,
+    > {
+        self.inner
+            .into_profiled_v2_persistent_parts()
+            .map_err(|rejected| ProfiledExternalPersistentRejection {
+                error: rejected.error,
+                manager: Self {
+                    inner: rejected.manager,
+                },
+            })
+    }
+
+    /// Return the original V2 source only after the process-close proof.
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v2_process_parts(
+        self,
+    ) -> Result<
+        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
+        ProfiledExternalPersistentRejection<Q, B, D>,
+    > {
+        self.inner
+            .into_profiled_v2_process_parts()
             .map_err(|rejected| ProfiledExternalPersistentRejection {
                 error: rejected.error,
                 manager: Self {
@@ -299,6 +336,13 @@ where
         mode: AdaptiveCloseMode,
     ) -> Result<ProfiledExternalPersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>>
     {
+        if !matches!(&self.researcher, ResearcherResources::ProfiledExternal(source) if matches!(source.as_ref(), researcher_resources::ProfiledExternalSource::V1(_)))
+        {
+            return Err(AdaptivePersistentRejection {
+                error: AdaptiveManagerError::Invalid("profiled owner is not V1"),
+                manager: self,
+            });
+        }
         let receipt = match self.profiled_shutdown_receipt() {
             Ok(receipt)
                 if self.phase == ManagerPhase::Finished
@@ -333,9 +377,91 @@ where
         let ResearcherResources::ProfiledExternal(external) = self.researcher else {
             unreachable!("receipt checked exact profiled source kind")
         };
+        let researcher_resources::ProfiledExternalSource::V1(external) = *external else {
+            unreachable!("version checked before extraction")
+        };
         Ok(ProfiledExternalPersistentParts {
             native: self.native,
-            external: *external,
+            external,
+            driver: self.driver,
+            continuation,
+            receipt,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v2_persistent_parts(
+        self,
+    ) -> Result<
+        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
+        AdaptivePersistentRejection<Q, B, D>,
+    > {
+        self.into_profiled_v2_settled_parts(AdaptiveCloseMode::RootQuiesce)
+    }
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v2_process_parts(
+        self,
+    ) -> Result<
+        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
+        AdaptivePersistentRejection<Q, B, D>,
+    > {
+        self.into_profiled_v2_settled_parts(AdaptiveCloseMode::ProcessShutdown)
+    }
+    #[allow(clippy::result_large_err)]
+    fn into_profiled_v2_settled_parts(
+        self,
+        mode: AdaptiveCloseMode,
+    ) -> Result<
+        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
+        AdaptivePersistentRejection<Q, B, D>,
+    > {
+        if !matches!(&self.researcher, ResearcherResources::ProfiledExternal(source) if matches!(source.as_ref(), researcher_resources::ProfiledExternalSource::V2(_)))
+        {
+            return Err(AdaptivePersistentRejection {
+                error: AdaptiveManagerError::Invalid("profiled owner is not V2"),
+                manager: self,
+            });
+        }
+        let receipt = match self.profiled_shutdown_receipt() {
+            Ok(receipt)
+                if self.phase == ManagerPhase::Finished
+                    && self.close_mode == mode
+                    && match mode {
+                        AdaptiveCloseMode::RootQuiesce => receipt.permits_root_reuse(),
+                        AdaptiveCloseMode::ProcessShutdown => receipt.permits_archive_close(),
+                    } =>
+            {
+                receipt
+            }
+            Ok(_) => {
+                return Err(AdaptivePersistentRejection {
+                    error: AdaptiveManagerError::PhysicalUnknown,
+                    manager: self,
+                });
+            }
+            Err(error) => {
+                return Err(AdaptivePersistentRejection {
+                    error,
+                    manager: self,
+                });
+            }
+        };
+        let continuation = AdaptiveSequenceContinuation {
+            authority: self.registration.authority,
+            next_request: self.registry.next_request_sequence(),
+            next_job: self.next_job,
+            next_execution: self.next_execution,
+            next_control: self.next_control,
+        };
+        let ResearcherResources::ProfiledExternal(external) = self.researcher else {
+            unreachable!("receipt checked exact profiled source kind")
+        };
+        let researcher_resources::ProfiledExternalSource::V2(external) = *external else {
+            unreachable!("version checked before extraction")
+        };
+        Ok(ProfiledExternalPersistentParts {
+            native: self.native,
+            external,
             driver: self.driver,
             continuation,
             receipt,
@@ -354,13 +480,83 @@ where
         ProfiledExternalExecutionManager<Q, B, D>,
         ProfiledExternalManagerAdmissionRejection<Q, B, D>,
     > {
+        Self::new_profiled_external_any_retaining(
+            registration,
+            clock,
+            limits,
+            sources,
+            researcher_resources::ProfiledExternalSource::V1(external),
+            continuation,
+        )
+        .map_err(|(error, sources, external, continuation)| {
+            let researcher_resources::ProfiledExternalSource::V1(external) = external else {
+                unreachable!("original V1 source retained")
+            };
+            ProfiledExternalManagerAdmissionRejection {
+                error,
+                sources,
+                external,
+                continuation,
+            }
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn new_profiled_external_v2_retaining(
+        registration: AdaptiveManagerRegistration,
+        clock: ContractSystemClock,
+        limits: AdaptiveExecutionLimits,
+        sources: AdaptiveManagerSources<Q, B, D>,
+        external: ProfiledExternalManagerSource<rz_experiments::RoventInputLockV2>,
+        continuation: Option<AdaptiveSequenceContinuation>,
+    ) -> Result<
+        ProfiledExternalExecutionManager<Q, B, D>,
+        ProfiledExternalManagerAdmissionRejection<Q, B, D, rz_experiments::RoventInputLockV2>,
+    > {
+        Self::new_profiled_external_any_retaining(
+            registration,
+            clock,
+            limits,
+            sources,
+            researcher_resources::ProfiledExternalSource::V2(external),
+            continuation,
+        )
+        .map_err(|(error, sources, external, continuation)| {
+            let researcher_resources::ProfiledExternalSource::V2(external) = external else {
+                unreachable!("original V2 source retained")
+            };
+            ProfiledExternalManagerAdmissionRejection {
+                error,
+                sources,
+                external,
+                continuation,
+            }
+        })
+    }
+
+    #[allow(clippy::result_large_err, clippy::type_complexity)]
+    fn new_profiled_external_any_retaining(
+        registration: AdaptiveManagerRegistration,
+        clock: ContractSystemClock,
+        limits: AdaptiveExecutionLimits,
+        sources: AdaptiveManagerSources<Q, B, D>,
+        external: researcher_resources::ProfiledExternalSource,
+        continuation: Option<AdaptiveSequenceContinuation>,
+    ) -> Result<
+        ProfiledExternalExecutionManager<Q, B, D>,
+        (
+            AdaptiveManagerError,
+            AdaptiveManagerSources<Q, B, D>,
+            researcher_resources::ProfiledExternalSource,
+            Option<AdaptiveSequenceContinuation>,
+        ),
+    > {
         let prepared = (|| -> Result<_, AdaptiveManagerError> {
             limits.validate()?;
             registration
                 .endpoints
                 .validate()
                 .map_err(|_| AdaptiveManagerError::Invalid("profiled external endpoint policy"))?;
-            let root = external.root_admission();
             let source = external.current_source();
             let endpoint = if registration.endpoints.execution_use == CpuExecutionUse::Collection {
                 registration.endpoints.cpu_t
@@ -371,11 +567,11 @@ where
                 || sources.external.is_some()
                 || registration.native_cpu_node_limit != 0
                 || endpoint != CpuEndpoint::ExternalUci
-                || registration.authority != root.authority()
+                || registration.authority != external.root_authority()
                 || source.authority() != registration.authority
-                || clock.domain() != root.runtime_clock().domain()
-                || clock.origin() != root.runtime_clock().origin()
-                || registration.hard_deadline != root.original_context().control.deadline
+                || clock.domain() != external.root_runtime_clock().domain()
+                || clock.origin() != external.root_runtime_clock().origin()
+                || registration.hard_deadline != external.root_original_context().control.deadline
                 || ![128, 256, 512].contains(&registration.token_budget)
                 || sources.native.pending_capacity() != limits.role_tickets_max
                 || sources.native.command_capacity() != limits.worker_commands_max
@@ -413,14 +609,14 @@ where
             let deadline = cpu_clock
                 .deadline_at(registration.hard_deadline)
                 .map_err(|_| AdaptiveManagerError::Deadline)?;
-            if deadline != root.hard_deadline() {
+            if deadline != external.root_hard_deadline() {
                 return Err(AdaptiveManagerError::Invalid(
                     "profiled original hard deadline",
                 ));
             }
             let cleanup_boundary = Some(CleanupBoundary::admit(
                 registration.hard_deadline,
-                root.original_context().shutdown_deadline,
+                external.root_original_context().shutdown_deadline,
             )?);
             // Fallible root replacement retains these same native/external
             // owners on every error; it never issues a replacement source.
@@ -488,12 +684,7 @@ where
         ) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                return Err(ProfiledExternalManagerAdmissionRejection {
-                    error,
-                    sources,
-                    external,
-                    continuation,
-                });
+                return Err((error, sources, external, continuation));
             }
         };
         let (next_job, next_execution, next_control) =

@@ -117,20 +117,22 @@ impl ProfiledExternalShutdownReceipt {
     }
 }
 
-pub struct ProfiledExternalPersistentParts<Q, B, D>
+pub struct ProfiledExternalPersistentParts<Q, B, D, L = rz_experiments::RoventInputLock>
 where
     B: TicketNativeBackend<ReviewView, Q>,
+    L: profiled_external_source::ExternalManagerLock,
 {
     pub(super) native: TicketedNativeService<ReviewView, Q, B>,
-    pub(super) external: profiled_external_source::ProfiledExternalManagerSource,
+    pub(super) external: profiled_external_source::ProfiledExternalManagerSource<L>,
     pub(super) driver: D,
     pub(super) continuation: AdaptiveSequenceContinuation,
     pub(super) receipt: ProfiledExternalShutdownReceipt,
 }
 
-impl<Q, B, D> ProfiledExternalPersistentParts<Q, B, D>
+impl<Q, B, D, L> ProfiledExternalPersistentParts<Q, B, D, L>
 where
     B: TicketNativeBackend<ReviewView, Q>,
+    L: profiled_external_source::ExternalManagerLock,
 {
     pub fn receipt(&self) -> &ProfiledExternalShutdownReceipt {
         &self.receipt
@@ -139,7 +141,7 @@ where
         self,
     ) -> (
         TicketedNativeService<ReviewView, Q, B>,
-        profiled_external_source::ProfiledExternalManagerSource,
+        profiled_external_source::ProfiledExternalManagerSource<L>,
         D,
         AdaptiveSequenceContinuation,
         ProfiledExternalShutdownReceipt,

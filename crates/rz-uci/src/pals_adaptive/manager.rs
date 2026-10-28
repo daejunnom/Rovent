@@ -121,7 +121,8 @@ use researcher_resources::{NativeResearcherResources, ResearcherResources};
 mod profiled_external_source;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use profiled_external_source::{
-    ProfiledExternalManagerSource, ProfiledExternalSourceRejection,
+    ExternalManagerLock, ExternalManagerRoot, ProfiledExternalManagerSource,
+    ProfiledExternalSourceRejection,
 };
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod profiled_external_receipt;
@@ -770,6 +771,18 @@ pub trait AdaptiveSearchDriver<Q> {
         Err(AdaptiveManagerError::ProfiledExternal(
             rz_search::cpu_checker::CheckerError::Unsupported(
                 "driver has no original profiled external source registration",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration_v2(
+        &self,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no original V2 profiled external source registration",
             ),
         ))
     }
@@ -2114,6 +2127,16 @@ where
     pub error: AdaptiveManagerError,
     pub manager: AdaptiveExecutionManager<Q, B, D>,
 }
+/// A session already owns the original manager in a Box.  A rejected transfer
+/// returns that very allocation instead of materializing the whole manager on
+/// the caller's stack or changing its physical ownership.
+pub(crate) struct AdaptiveBoxedPersistentRejection<Q, B, D>
+where
+    B: TicketNativeBackend<ReviewView, Q>,
+{
+    pub error: AdaptiveManagerError,
+    pub manager: Box<AdaptiveExecutionManager<Q, B, D>>,
+}
 /// Admission owns the actual process/session and engines. Every failed check
 /// returns this complete source bundle rather than dropping physical owners.
 pub struct AdaptiveManagerSources<Q, B, D>
@@ -2697,19 +2720,84 @@ where
     ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>> {
         self.into_settled_parts(AdaptiveCloseMode::ProcessShutdown)
     }
-    // Owner transfer failure preserves the manager and every linear owner.
+    /// Reuse a manager already held on the heap without moving the complete
+    /// physical owner onto the session's stack, including on rejection.
+    pub(crate) fn into_persistent_parts_boxed(
+        self: Box<Self>,
+    ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptiveBoxedPersistentRejection<Q, B, D>> {
+        self.into_settled_parts_boxed(AdaptiveCloseMode::RootQuiesce)
+    }
+    pub(crate) fn into_process_parts_boxed(
+        self: Box<Self>,
+    ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptiveBoxedPersistentRejection<Q, B, D>> {
+        self.into_settled_parts_boxed(AdaptiveCloseMode::ProcessShutdown)
+    }
+    fn into_settled_parts_boxed(
+        mut self: Box<Self>,
+        mode: AdaptiveCloseMode,
+    ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptiveBoxedPersistentRejection<Q, B, D>> {
+        let (receipt, cpu, continuation) = match self.prepare_settled_transfer(mode) {
+            Ok(parts) => parts,
+            Err(error) => {
+                return Err(AdaptiveBoxedPersistentRejection {
+                    error,
+                    manager: self,
+                });
+            }
+        };
+        // All fallible checks and CPU transfers are finished. Move the actual
+        // fields separately from the same allocation; do not move `*self`.
+        Ok(AdaptivePersistentParts {
+            native: self.native,
+            cpu,
+            external: self.external,
+            driver: self.driver,
+            continuation,
+            receipt,
+        })
+    }
+    // Existing by-value API remains compatible and uses the same checks.
     #[allow(clippy::result_large_err)]
     fn into_settled_parts(
         mut self,
         mode: AdaptiveCloseMode,
     ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>> {
+        let (receipt, cpu, continuation) = match self.prepare_settled_transfer(mode) {
+            Ok(parts) => parts,
+            Err(error) => {
+                return Err(AdaptivePersistentRejection {
+                    error,
+                    manager: self,
+                });
+            }
+        };
+        Ok(AdaptivePersistentParts {
+            native: self.native,
+            cpu,
+            external: self.external,
+            driver: self.driver,
+            continuation,
+            receipt,
+        })
+    }
+    /// Every failure happens while the original manager still owns all of its
+    /// resources. Successfully recovered CPU engines remain in their slots if
+    /// a later worker transfer fails.
+    fn prepare_settled_transfer(
+        &mut self,
+        mode: AdaptiveCloseMode,
+    ) -> Result<
+        (
+            AdaptiveShutdownReceipt,
+            Vec<PersistentCpuOwner>,
+            AdaptiveSequenceContinuation,
+        ),
+        AdaptiveManagerError,
+    > {
         if self.nnuec.is_some() || self.own.iter().any(|slot| slot.nnuec_retirement.is_some()) {
-            return Err(AdaptivePersistentRejection {
-                error: AdaptiveManagerError::Invalid(
-                    "NNUEC requires actual actor retirement transfer",
-                ),
-                manager: self,
-            });
+            return Err(AdaptiveManagerError::Invalid(
+                "NNUEC requires actual actor retirement transfer",
+            ));
         }
         let receipt = match self.shutdown_receipt() {
             Ok(receipt)
@@ -2723,40 +2811,24 @@ where
                 receipt
             }
             Ok(_) => {
-                return Err(AdaptivePersistentRejection {
-                    error: AdaptiveManagerError::Invalid(
-                        "owner transfer needs actual finished root/process fence",
-                    ),
-                    manager: self,
-                });
+                return Err(AdaptiveManagerError::Invalid(
+                    "owner transfer needs actual finished root/process fence",
+                ));
             }
-            Err(error) => {
-                return Err(AdaptivePersistentRejection {
-                    error,
-                    manager: self,
-                });
-            }
+            Err(error) => return Err(error),
         };
-        // Retain already-recovered values locally on any later error. This
-        // path only polls completed owner transfer, never waits for CPU work.
         for index in 0..self.own.len() {
             if self.own[index].recovered_engine.is_some() {
                 continue;
             }
             let Some(worker) = self.own[index].worker.as_mut() else {
-                return Err(AdaptivePersistentRejection {
-                    error: AdaptiveManagerError::Invalid("persistent CPU owner missing"),
-                    manager: self,
-                });
+                return Err(AdaptiveManagerError::Invalid(
+                    "persistent CPU owner missing",
+                ));
             };
             match worker.take_engine() {
                 Ok(engine) => self.own[index].recovered_engine = Some(engine),
-                Err(error) => {
-                    return Err(AdaptivePersistentRejection {
-                        error: error.into(),
-                        manager: self,
-                    });
-                }
+                Err(error) => return Err(error.into()),
             }
         }
         let cpu = self
@@ -2781,14 +2853,7 @@ where
             next_execution: self.next_execution,
             next_control: self.next_control,
         };
-        Ok(AdaptivePersistentParts {
-            native: self.native,
-            cpu,
-            external: self.external,
-            driver: self.driver,
-            continuation,
-            receipt,
-        })
+        Ok((receipt, cpu, continuation))
     }
     pub fn phase(&self) -> ManagerPhase {
         self.phase
@@ -3151,10 +3216,17 @@ where
     ) -> Result<PreparationId, AdaptiveManagerError> {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if let ResearcherResources::ProfiledExternal(source) = &self.researcher {
-            self.driver.validate_profiled_external_registration(
-                source.current_source(),
-                source.root_admission(),
-            )?;
+            if let Some(root) = source.root_admission_v1() {
+                self.driver
+                    .validate_profiled_external_registration(source.current_source(), root)?;
+            } else if let Some(root) = source.root_admission_v2() {
+                self.driver
+                    .validate_profiled_external_registration_v2(source.current_source(), root)?;
+            } else {
+                return Err(AdaptiveManagerError::Invalid(
+                    "profiled external original root absent",
+                ));
+            }
         }
         if input.stage != RefinementStage::ProposerRanking
             || !self.roles.is_empty()

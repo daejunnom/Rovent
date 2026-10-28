@@ -131,6 +131,11 @@ pub struct RoventCollectionTeacherSourceCustody {
     assets: Vec<(String, ArtifactRef, File)>,
 }
 impl RoventCollectionTeacherSourceCustody {
+    /// Original source owner identity; equal digests alone do not join a
+    /// teacher worker to the native source that admitted Collection.
+    pub fn matches_preload(&self, preload: &Arc<RoventCollectionPreloadSources>) -> bool {
+        Arc::ptr_eq(&self.original, preload)
+    }
     pub fn original_input_lock_digest(&self) -> Digest {
         self.original.input_lock_digest()
     }

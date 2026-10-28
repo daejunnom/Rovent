@@ -497,6 +497,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         now: MonotonicTick,
     ) -> Result<AdaptiveProfiledExternalPreparation, PalsError> {
         self.check_work(work)?;
+        // Check the same Store lineage as the eventual physical journal before
+        // a worker can accept the go. The post-submit check remains necessary
+        // for revocation and other changes during worker admission.
+        AdaptivePortQuestion::validate_frontier_source(work, &self.engine.semantic.stores)?;
         config.validate()?;
         let frontier = self
             .rovent_frontier()

@@ -1032,6 +1032,14 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         self.profile_validate(source, root)
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration_v2(
+        &self,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        root: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_validate_v2(source, root)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn profiled_external_work(
         &self,
     ) -> Option<rz_search::pals::rovent_frontier::FrontierExternalWork> {

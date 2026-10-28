@@ -106,6 +106,11 @@ impl ExternalNativeInputLock for RoventInputLockV2 {
 }
 
 impl<L: ExternalNativeInputLock> RoventPinnedExternalRSource<L> {
+    /// Borrow the original pinned owner; a digest does not grant source custody.
+    pub fn original_sources(&self) -> &Arc<RoventPinnedNativeSources<L>> {
+        &self.original
+    }
+
     /// Reuse the native owner's retained root capability and bounded artifact
     /// reader. Only this admission opens the selected snapshot paths; later
     /// consumption moves the original descriptors without reopening a path.
@@ -276,6 +281,11 @@ impl<L: ExternalNativeInputLock> RoventPinnedExternalRSource<L> {
 }
 
 impl<L: ExternalNativeInputLock> RoventExternalRSourceCustody<L> {
+    /// Borrow the exact immutable lock owner retained with the source FDs.
+    pub fn original_lock_owner(&self) -> &Arc<L> {
+        &self.original.lock
+    }
+
     pub fn input_lock_digest(&self) -> Digest {
         self.original.lock_digest()
     }

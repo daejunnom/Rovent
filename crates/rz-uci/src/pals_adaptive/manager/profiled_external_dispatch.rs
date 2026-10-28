@@ -133,6 +133,24 @@ where
             self.phase = ManagerPhase::Quarantined;
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }
+        if self
+            .profiled_binding
+            .as_ref()
+            .is_some_and(|binding| binding.reservation.is_none())
+        {
+            // The worker really returned this matching terminal, but a
+            // post-submit semantic projection failed before a frontier row
+            // could be issued. Preserve both the original binding and the
+            // owner-validated terminal; neither is a Rules/teacher result.
+            // Keep quarantine sticky while the physical owner drains, rather
+            // than endlessly retrying a nonexistent reservation or claiming
+            // that the already observed terminal itself is unknown.
+            self.profiled_orphan = Some(returned);
+            self.phase = ManagerPhase::Quarantined;
+            return Err(AdaptiveManagerError::Invalid(
+                "external terminal observed without frontier reservation",
+            ));
+        }
         let binding = self.profiled_binding.take().expect("same actual dispatch");
         let (_, packet, validation) = returned.into_parts();
         if let Err(error) = validation {

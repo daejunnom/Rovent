@@ -131,23 +131,35 @@ where
         // The source keeps the original private UCI Start admission across the
         // manager handoff. Archival cleanup cannot replace that root's clock
         // with a startup timeout or a newly registered execution window.
-        let (root, same_source) = match &owners.researcher_source {
-            SessionResearcherSource::ProfiledExternal(source) => (
-                source.retained_root_admission().cloned(),
-                source
-                    .retained_root_source()
-                    .is_some_and(|actual| actual.same_source(retirement.source())),
-            ),
-            SessionResearcherSource::Legacy => (None, false),
-        };
-        let Some(root) = root.filter(|root| {
-            same_source
-                && root.authority() == retirement.authority()
-                && self
-                    .rovent
-                    .as_ref()
-                    .is_some_and(|profile| root.startup_lock_digest() == profile.input_lock)
-        }) else {
+        let original_cleanup =
+            match &owners.researcher_source {
+                SessionResearcherSource::ProfiledExternal(source) => source
+                    .retained_root_admission()
+                    .filter(|root| {
+                        source
+                            .retained_root_source()
+                            .is_some_and(|actual| actual.same_source(retirement.source()))
+                            && root.authority() == retirement.authority()
+                            && self.rovent.as_ref().is_some_and(|profile| {
+                                root.startup_lock_digest() == profile.input_lock
+                            })
+                    })
+                    .map(|root| root.original_context().shutdown_deadline),
+                SessionResearcherSource::ProfiledExternalV2(source) => source
+                    .retained_root_admission_v2()
+                    .filter(|root| {
+                        source
+                            .retained_root_source()
+                            .is_some_and(|actual| actual.same_source(retirement.source()))
+                            && root.authority() == retirement.authority()
+                            && self.rovent.as_ref().is_some_and(|profile| {
+                                root.startup_lock_digest() == profile.input_lock
+                            })
+                    })
+                    .map(|root| root.original_context().shutdown_deadline),
+                SessionResearcherSource::Legacy => None,
+            };
+        let Some(original_cleanup) = original_cleanup else {
             *state = SessionState::Idle(owners);
             return Err(failure(
                 "RoventRetirementRoot",
@@ -156,7 +168,7 @@ where
         };
         let Some(sealed_cleanup) = retirement
             .original_cleanup_deadline()
-            .filter(|deadline| *deadline == root.original_context().shutdown_deadline)
+            .filter(|deadline| *deadline == original_cleanup)
         else {
             *state = SessionState::Idle(owners);
             return Err(failure(

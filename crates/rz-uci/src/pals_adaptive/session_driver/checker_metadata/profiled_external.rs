@@ -3,10 +3,70 @@
 
 use super::*;
 use crate::rovent_external_launch::RoventExternalOwner;
+use crate::rovent_root_admission::{RoventRootAdmission, source_seal::RoventRootAdmissionV2};
+use crate::search_driver::SearchSessionContext;
 use rz_runtime::contracts::ContractClock as _;
+use rz_runtime::contracts::ContractSystemClock;
 use rz_search::external_cpu::{
     ExternalEnginePurpose, ProfiledExternalResetProof, ProfiledExternalRootSource,
 };
+use std::sync::Arc;
+
+/// Borrow only the root actually admitted by this physical owner. A /2 launch
+/// must retain the same original lock allocation as the admitted /2 root.
+enum OriginalRoot<'a> {
+    V1(&'a RoventRootAdmission),
+    V2(&'a RoventRootAdmissionV2),
+}
+
+impl OriginalRoot<'_> {
+    fn authority(&self) -> SearchAuthority {
+        match self {
+            Self::V1(root) => root.authority(),
+            Self::V2(root) => root.authority(),
+        }
+    }
+    fn runtime_clock(&self) -> &ContractSystemClock {
+        match self {
+            Self::V1(root) => root.runtime_clock(),
+            Self::V2(root) => root.runtime_clock(),
+        }
+    }
+    fn original_context(&self) -> &SearchSessionContext {
+        match self {
+            Self::V1(root) => root.original_context(),
+            Self::V2(root) => root.original_context(),
+        }
+    }
+}
+
+fn original_root<'a>(
+    owner: &'a RoventExternalOwner,
+    legacy_missing: &'static str,
+) -> Result<OriginalRoot<'a>, CheckerError> {
+    if let Some(lock) = owner.launch().original_lock_owner_v2() {
+        let root = owner
+            .actual_root_admission_v2()
+            .ok_or(CheckerError::Unsupported(
+                "profiled metadata original /2 root is absent",
+            ))?;
+        if !root
+            .owner()
+            .v2()
+            .is_some_and(|root_lock| Arc::ptr_eq(lock, root_lock))
+        {
+            return Err(CheckerError::Invalid(
+                "profiled metadata original /2 lock differs",
+            ));
+        }
+        Ok(OriginalRoot::V2(root))
+    } else {
+        owner
+            .actual_root_admission()
+            .map(|root| OriginalRoot::V1(root))
+            .ok_or(CheckerError::Unsupported(legacy_missing))
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct ProfiledExternalMetadataBinding {
@@ -47,11 +107,7 @@ impl AdaptiveCheckerMetadata {
                 "profiled metadata current root is pending",
             ))?;
         source.validate_current()?;
-        let root = owner
-            .actual_root_admission()
-            .ok_or(CheckerError::Unsupported(
-                "profiled metadata original root is absent",
-            ))?;
+        let root = original_root(owner, "profiled metadata original root is absent")?;
         if source.authority() != root.authority()
             || source.authority().epoch != epoch
             || source.authority().implementation != implementation
@@ -113,11 +169,7 @@ impl AdaptiveCheckerMetadata {
                 "profiled reset current source is pending",
             ))?;
         source.validate_current()?;
-        let root = owner
-            .actual_root_admission()
-            .ok_or(CheckerError::Unsupported(
-                "profiled reset original root absent",
-            ))?;
+        let root = original_root(owner, "profiled reset original root absent")?;
         let observed = owner
             .worker()
             .current_reset_proof()

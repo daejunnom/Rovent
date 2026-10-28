@@ -18,7 +18,7 @@ pub mod product;
 pub(crate) mod storage_lifecycle;
 
 pub use pinned::{
-    RoventCollectionPreloadSources, RoventCollectionTeacherSourceCustody,
+    ExternalNativeInputLock, RoventCollectionPreloadSources, RoventCollectionTeacherSourceCustody,
     RoventCollectionTeacherSources, RoventExternalRAssetSelection, RoventExternalRSourceCustody,
     RoventExternalRSourceSelection, RoventPinnedExternalRSource, RoventTeacherAssetSelection,
     RoventTeacherSourceSelection,
@@ -491,7 +491,7 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
 }
 
 /// Retains the exact /2 sources and the same physical ticket-service owner.
-/// Collection provenance remains a separate, unsupported V2 capability.
+/// Collection provenance additionally requires original preloaded sources.
 pub struct PreparedRoventNativeV2<Q: NativeQuestionProjection = AdaptivePortQuestion> {
     service: RoventNativeService<Q>,
     snapshot: RoventNativeStartupSnapshot,
@@ -499,7 +499,38 @@ pub struct PreparedRoventNativeV2<Q: NativeQuestionProjection = AdaptivePortQues
     _verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
     control: RoventStartupControl,
 }
+/// Borrowed witness that can only be constructed beside the prepared owner.
+/// Its fields are private; unrelated native sources cannot be mixed into it.
+pub(crate) struct RoventCollectionReadyOwnerV2<'a, Q: NativeQuestionProjection> {
+    prepared: &'a PreparedRoventNativeV2<Q>,
+}
+impl<Q: NativeQuestionProjection> RoventCollectionReadyOwnerV2<'_, Q> {
+    pub(crate) fn snapshot(&self) -> &RoventNativeStartupSnapshot {
+        &self.prepared.snapshot
+    }
+    pub(crate) fn sources(&self) -> &Arc<RoventPinnedNativeSources<RoventInputLockV2>> {
+        &self.prepared.sources
+    }
+    pub(crate) fn service(&self) -> &RoventNativeService<Q> {
+        &self.prepared.service
+    }
+}
 impl<Q: NativeQuestionProjection> PreparedRoventNativeV2<Q> {
+    /// Issue Collection origin only from this Ready service and its exact /2
+    /// source owner. Frontier/root and teacher authority remain separate.
+    pub fn collection_identity(
+        &self,
+    ) -> Result<crate::pals_adaptive::RoventNativeCollectionOriginV2, BackendError> {
+        crate::pals_adaptive::RoventNativeCollectionOriginV2::from_loaded_ready(
+            RoventCollectionReadyOwnerV2 { prepared: self },
+        )
+        .map_err(|_| {
+            fail(
+                K::IdentityMismatch,
+                "loaded V2 source is not eligible for Rovent collection origin",
+            )
+        })
+    }
     pub fn snapshot(&self) -> &RoventNativeStartupSnapshot {
         &self.snapshot
     }

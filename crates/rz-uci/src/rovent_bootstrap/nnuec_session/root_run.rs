@@ -68,12 +68,12 @@ struct RootRunCustody {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     cohort_trial: Option<Arc<crate::pals_adaptive::UtilityTrialPhysicalRetirement>>,
     completed_utility: Option<Arc<crate::pals_adaptive::CompletedUtilityRouteAction>>,
-    admission: Arc<RoventRootAdmission>,
+    admission: NnuecRootAdmission,
     signal: Option<CompletionSignal>,
     next_request_sequence: u64,
     game: Option<u64>,
     collection_admitted: bool,
-    receipt: Option<Arc<RoventNnuecRootReceipt>>,
+    receipt: Option<NnuecRootReceipt>,
     result: Option<Box<PalsResult>>,
     work: Option<DriverWork>,
     retirement_deadline: Option<Instant>,
@@ -95,7 +95,7 @@ struct RootRunCustody {
 
 impl RootRunCustody {
     #[inline(never)]
-    fn new(idle: Box<Idle>, admission: Arc<RoventRootAdmission>) -> Box<Self> {
+    fn new(idle: Box<Idle>, admission: NnuecRootAdmission) -> Box<Self> {
         Box::new(Self {
             idle: Some(idle),
             native: None,
@@ -179,6 +179,61 @@ impl RootRunCustody {
     }
 }
 
+// The primary semantic failure survives both independent native cleanup and
+// optional storage cleanup. A missing/unavailable archive cannot skip the first.
+fn drain_independent_before_storage<T, S>(
+    retained: &mut T,
+    original: SearchSessionFailure,
+    independent: impl FnOnce(&mut T) -> Option<S>,
+    storage: impl FnOnce(&mut T, S),
+) -> Result<(), SearchSessionFailure> {
+    if let Some(signal) = independent(retained) {
+        storage(retained, signal);
+    }
+    Err(original)
+}
+
+#[cfg(test)]
+mod retained_drain_tests {
+    use super::*;
+    #[derive(Default)]
+    struct FakeRetained {
+        events: Vec<&'static str>,
+        actor_owned: bool,
+        native_owned: bool,
+        storage_error: bool,
+    }
+    #[test]
+    fn archive_absence_or_failure_never_skips_independent_drain_or_replaces_failure() {
+        for storage in ["absent", "locked", "present"] {
+            let mut retained = FakeRetained {
+                actor_owned: true,
+                native_owned: true,
+                ..Default::default()
+            };
+            let original = unknown("RootFailed", "original semantic failure");
+            let result = drain_independent_before_storage(
+                &mut retained,
+                original,
+                |r| {
+                    r.events.push("actor_shutdown");
+                    r.events.push("native_drain");
+                    Some(())
+                },
+                |r, ()| {
+                    r.events.push(storage);
+                    r.storage_error = storage == "locked";
+                },
+            )
+            .unwrap_err();
+            assert_eq!(result.code, "RootFailed");
+            assert_eq!(retained.events, ["actor_shutdown", "native_drain", storage]);
+            assert!(retained.actor_owned && retained.native_owned);
+            assert_eq!(retained.storage_error, storage == "locked");
+        }
+    }
+}
+
 impl RoventNnuecSessionDriver {
     /// Only pointer-sized phase custody crosses this orchestration frame.
     #[inline(never)]
@@ -187,7 +242,7 @@ impl RoventNnuecSessionDriver {
         idle: Box<Idle>,
         position: &Position,
         context: &SearchSessionContext,
-        admission: Arc<RoventRootAdmission>,
+        admission: NnuecRootAdmission,
         progress: &mut dyn FnMut(BoardMove),
     ) -> RootReturn {
         #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -245,42 +300,80 @@ impl RoventNnuecSessionDriver {
             |failed| unknown(failed.code, &failed.detail),
         );
         let until = until.min(run.admission.original_context().shutdown_deadline);
-        let mut storage = self.storage.try_lock().map_err(|_| original.clone())?;
-        let Some(storage) = storage.as_mut() else {
-            return Err(original);
-        };
-        let signal = if let Some(idle) = run.idle.as_mut() {
-            let signal = idle.native.service.signal();
-            if let Some(actor) = idle.actor.as_mut() {
-                actor.request_shutdown();
-                loop {
-                    match actor.try_join() {
-                        Ok(Some(())) => {
-                            idle.actor.take();
-                            break;
+        drain_independent_before_storage(
+            run,
+            original,
+            |run| {
+                // Only an intact Idle or an unbound pre-root transfer has a
+                // known native/actor pair. Later phases keep their owners.
+                let pair = if let Some(idle) = run.idle.as_mut() {
+                    Some((&mut idle.actor, &mut idle.native))
+                } else if run.root.is_none()
+                    && run.initial.is_none()
+                    && run.ready.is_none()
+                    && run.port.is_none()
+                    && run.worker.is_none()
+                    && run.manager.is_none()
+                    && run.preparing_custody.is_none()
+                    && run.retirement.is_none()
+                {
+                    run.native.as_mut().map(|native| (&mut run.actor, native))
+                } else {
+                    None
+                };
+                let signal = if let Some((actor_slot, native)) = pair {
+                    let signal = native.service.signal();
+                    if let Some(actor) = actor_slot.as_mut() {
+                        actor.request_shutdown();
+                        loop {
+                            match actor.try_join() {
+                                Ok(Some(())) => {
+                                    actor_slot.take();
+                                    break;
+                                }
+                                Ok(None) if Instant::now() < until => std::thread::yield_now(),
+                                Ok(None) => break,
+                                Err(error) => {
+                                    run.retained_actor_error.get_or_insert(error);
+                                    break;
+                                }
+                            }
                         }
-                        Ok(None) if Instant::now() < until => std::thread::yield_now(),
-                        Ok(None) => break,
-                        Err(error) => {
-                            run.retained_actor_error.get_or_insert(error);
-                            break;
+                    }
+                    if let Err(error) = native.finish(until) {
+                        run.retained_native_error.get_or_insert(error);
+                    }
+                    Some(signal)
+                } else {
+                    run.signal.clone()
+                };
+                signal
+            },
+            |run, signal| match self.storage.try_lock() {
+                Ok(mut slot) => {
+                    if let Some(storage) = slot.as_mut() {
+                        if let Err(error) = storage.abort_and_join(
+                            run.retained_failure.as_ref().map_or_else(
+                                SearchSessionFailure::physical_completion_unknown,
+                                |failed| unknown(failed.code, &failed.detail),
+                            ),
+                            until,
+                            &signal,
+                        ) {
+                            run.retained_storage_error.get_or_insert(error);
                         }
                     }
                 }
-            }
-            if let Err(error) = idle.native.finish(until) {
-                run.retained_native_error.get_or_insert(error);
-            }
-            signal
-        } else if let Some(signal) = &run.signal {
-            signal.clone()
-        } else {
-            return Err(original);
-        };
-        if let Err(error) = storage.abort_and_join(original.clone(), until, &signal) {
-            run.retained_storage_error.get_or_insert(error);
-        }
-        Err(original)
+                Err(_) => {
+                    run.retained_storage_error.get_or_insert_with(|| {
+                        unknown(
+                            "RoventNnuecStorageDrain",
+                            "original storage lock unavailable during retained cleanup",
+                        )
+                    });
+                }
+            },
+        )
     }
 
     #[inline(never)]
@@ -318,11 +411,18 @@ impl RoventNnuecSessionDriver {
             idle.game = Some(context.authority.game.0);
         }
         if let Some(storage) = storage.as_mut() {
+            let Some(admission) = run.admission.v1() else {
+                return Err(run.fail(
+                    "RoventNnuecStorageV2Unsupported",
+                    "V2 storage has no original admission consumer",
+                ));
+            };
+            let admission = Arc::clone(admission);
             let owner = idle.owner.take().expect("original semantic owner");
             let signal = idle.native.service.signal();
             match storage.prepare(
                 StorageSemanticOwner::Pcr(owner),
-                Arc::clone(&run.admission),
+                admission,
                 reset,
                 position,
                 &signal,
@@ -468,7 +568,7 @@ impl RoventNnuecSessionDriver {
                 run.next_request_sequence,
                 run.game,
                 context,
-                Arc::clone(&run.admission),
+                run.admission.clone(),
                 None,
             )));
             return Ok(false);
@@ -525,7 +625,7 @@ impl RoventNnuecSessionDriver {
                         run.native.take().expect("same native owner"),
                         cleanup,
                         context,
-                        Arc::clone(&run.admission),
+                        run.admission.clone(),
                         run.next_request_sequence,
                         run.game,
                         "RoventNnuecInitialStopped",
@@ -545,7 +645,7 @@ impl RoventNnuecSessionDriver {
                         run.native.take().expect("same native owner"),
                         failed.into_cleanup(),
                         context,
-                        Arc::clone(&run.admission),
+                        run.admission.clone(),
                         run.next_request_sequence,
                         run.game,
                         "RoventNnuecInitialPreparation",
@@ -581,6 +681,41 @@ impl RoventNnuecSessionDriver {
         run.worker = Some(worker);
         run.actor = Some(actor);
         run.metadata = Some(metadata);
+        let metadata = run.metadata.as_ref().expect("actual metadata");
+        if let Some(admission) = run.admission.v2() {
+            let lock = admission.owner().v2().expect("original V2 owner");
+            let rz_experiments::RoventRootTieDeclarationV2::Own {
+                expected_search_identity,
+                expected_worker_conditions_sha256,
+                ..
+            } = &lock.manifest.own_r_root_tie
+            else {
+                return Err(run.fail(
+                    "RoventNnuecV2WorkerIdentity",
+                    "actual own worker declaration is absent",
+                ));
+            };
+            let Some(actual) = metadata.owned_descriptor() else {
+                return Err(run.fail(
+                    "RoventNnuecV2WorkerIdentity",
+                    "actual own worker metadata is absent",
+                ));
+            };
+            let mut hash = Sha256::new();
+            hash.update(b"rz-cpu-search-conditions/1");
+            hash.update(actual.search_conditions.as_bytes());
+            let conditions = Digest(hash.finalize().into());
+            let expected =
+                rz_eval::asset::parse_sha256(expected_worker_conditions_sha256).map(Digest);
+            if actual.search_identity != expected_search_identity.as_str()
+                || expected.ok() != Some(conditions)
+            {
+                return Err(run.fail(
+                    "RoventNnuecV2WorkerIdentity",
+                    "actual own worker differs from original V2 lock",
+                ));
+            }
+        }
         let metadata = run.metadata.as_ref().expect("actual metadata");
         let port = run.port.as_ref().expect("same ready port");
         let registration = PalsCheckerRegistration {
@@ -725,7 +860,7 @@ impl RoventNnuecSessionDriver {
             run.next_request_sequence,
             run.game,
             context,
-            Arc::clone(&run.admission),
+            run.admission.clone(),
         )));
     }
 
@@ -773,6 +908,10 @@ impl RoventNnuecSessionDriver {
                 }
                 if context.accepts().unwrap_or(false) && !context.soft_expired(Instant::now()) {
                     if let Some(origin) = &self.collection_origin {
+                        let original_admission =
+                            admission.v1().ok_or(AdaptiveManagerError::Invalid(
+                                "V2 collection has no original admission consumer",
+                            ))?;
                         let frontier = manager
                             .driver()
                             .port()
@@ -786,7 +925,7 @@ impl RoventNnuecSessionDriver {
                             self.snapshot.input_lock,
                             root_budget,
                             self.selective_policy,
-                            Arc::clone(admission),
+                            Arc::clone(original_admission),
                         )?;
                         manager.admit_collection_root(cap)?;
                         if let Some(observer) = &self.collection_hooks.root_admission {
@@ -971,21 +1110,15 @@ impl RoventNnuecSessionDriver {
         };
         // Store the same Arc before the fallible latest/observer boundary.
         // A failed observer retains both this original receipt and its owners.
-        run.receipt = Some(Arc::new(RoventNnuecRootReceipt {
-            domain: ROVENT_NNUEC_ROOT_DOMAIN,
-            authority: context.authority,
-            input_lock: self.snapshot.input_lock,
-            root_admission: Arc::clone(&run.admission),
-            frontier: Some(frontier),
-            physical: Some(physical),
-            counters: run.manager.as_ref().expect("same manager").counters(),
-            stopped_before_research_execution: false,
-            deadline_before_frontier: false,
-            initial_retirement: None,
-            pre_materialization_retirement: None,
-        }));
+        run.receipt = Some(self.make_executed_receipt(
+            context,
+            &run.admission,
+            &frontier,
+            &physical,
+            run.manager.as_ref().expect("same manager").counters(),
+        ));
         let receipt = run.receipt.as_ref().expect("same original root receipt");
-        if let Err(error) = self.observe_root_receipt(receipt) {
+        if let Err(error) = self.observe_any_root_receipt(receipt) {
             return Err(run.retain_failure(
                 "RoventNnuecRootObservation",
                 error.detail.clone(),
@@ -1003,12 +1136,7 @@ impl RoventNnuecSessionDriver {
             .as_ref()
             .expect("same result")
             .best_move
-            .is_some_and(|movement| {
-                !receipt
-                    .root_admission
-                    .allowed_root_moves()
-                    .contains(&movement)
-            })
+            .is_some_and(|movement| !run.admission.allowed_root_moves().contains(&movement))
         {
             return Err(run.fail(
                 "RoventNnuecRootRestriction",
@@ -1191,12 +1319,14 @@ impl RoventNnuecSessionDriver {
             if let Some(trial) = &run.intervention_trial {
                 if !run.collection_admitted
                     || trial.authority() != context.authority
-                    || !trial.matches_root_admission(
-                        &run.receipt
-                            .as_ref()
-                            .expect("original receipt")
-                            .root_admission,
-                    )
+                    || run
+                        .receipt
+                        .as_ref()
+                        .expect("original receipt")
+                        .v1()
+                        .is_none_or(|receipt| {
+                            !trial.matches_root_admission(&receipt.root_admission)
+                        })
                 {
                     return Err(run.fail(
                         "RoventNnuecInterventionTrialScope",
@@ -1238,12 +1368,14 @@ impl RoventNnuecSessionDriver {
             if let Some(trial) = &run.cohort_trial {
                 if !run.collection_admitted
                     || trial.authority() != context.authority
-                    || !trial.matches_root_admission(
-                        &run.receipt
-                            .as_ref()
-                            .expect("original receipt")
-                            .root_admission,
-                    )
+                    || run
+                        .receipt
+                        .as_ref()
+                        .expect("original receipt")
+                        .v1()
+                        .is_none_or(|receipt| {
+                            !trial.matches_root_admission(&receipt.root_admission)
+                        })
                 {
                     return Err(run.fail(
                         "RoventNnuecUtilityTrialScope",
@@ -1275,13 +1407,7 @@ impl RoventNnuecSessionDriver {
         if let Some(completed) = &run.completed_utility {
             if !run.collection_admitted
                 || completed.id().authority() != context.authority
-                || completed.semantic().root_budget()
-                    != run
-                        .receipt
-                        .as_ref()
-                        .expect("original receipt")
-                        .root_admission
-                        .root_budget_digest()
+                || completed.semantic().root_budget() != run.admission.root_budget_digest()
             {
                 return Err(run.fail(
                     "RoventNnuecUtilityScope",
@@ -1314,8 +1440,7 @@ impl RoventNnuecSessionDriver {
         let receipt = run.receipt.take().expect("same original observed receipt");
         let result = run.result.take().expect("same original result");
         let mate_strategy = receipt
-            .frontier
-            .as_ref()
+            .frontier()
             .and_then(|frontier| frontier.mate_strategy.clone())
             .filter(|strategy| result.best_move == Some(strategy.best_move()));
         let retired = run.retired.take().expect("same fully acknowledged owner");
@@ -1333,13 +1458,13 @@ impl RoventNnuecSessionDriver {
             actor: Some(retired.actor),
             next_request_sequence,
             game: run.game,
-            previous_root: Some(Arc::clone(&receipt)),
+            previous_root: Some(receipt.clone()),
         });
         if let Some(original) = run.semantic_failures.take() {
             let mut failure = SearchSessionFailure::debug("RoventNnuecManagerFailure", &original);
             failure.detail.push_str(&format!(
                 "; actual_frontier_goal={:?}",
-                receipt.frontier.as_ref().map(|frontier| frontier.goal),
+                receipt.frontier().map(|frontier| frontier.goal),
             ));
             // Every original physical retirement above succeeded. Preserve
             // the same known Idle sources for session finish, rather than

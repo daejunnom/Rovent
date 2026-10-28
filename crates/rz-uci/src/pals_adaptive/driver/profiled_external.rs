@@ -421,6 +421,60 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         .map_err(profile_error)
     }
 
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(super) fn profile_validate_v2(
+        &self,
+        source: &ProfiledExternalRootSource,
+        root: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
+    ) -> Result<(), AdaptiveManagerError> {
+        use rz_runtime::contracts::ContractClock;
+        self.profile_source(source)?;
+        if !root
+            .original_context()
+            .accepts()
+            .map_err(|_| invalid("profiled V2 root revoked"))?
+            || root.authority() != self.authority
+            || source.clock().domain != root.runtime_clock().domain()
+            || source.clock().origin != root.runtime_clock().origin()
+            || self.hard_deadline != root.original_context().control.deadline
+        {
+            return Err(invalid(
+                "profiled V2 manager registration differs from original root clock",
+            ));
+        }
+        let budget = root
+            .descriptor()
+            .root_budget_digest()
+            .map_err(|_| invalid("profiled V2 original root budget invalid"))?;
+        let port = self
+            .port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let frontier = port
+            .rovent_frontier()
+            .ok_or(invalid("profiled frontier absent"))?;
+        let registered = frontier.registration();
+        if !Arc::ptr_eq(&registered.root_rules, &self.rules)
+            || !self
+                .rules
+                .rules()
+                .snapshot()
+                .same_state(root.root_snapshot())
+            || registered.original_deadline != root.hard_deadline()
+            || registered.root_budget != budget
+            || registered.goal != root.goal()
+            || registered.nodes != root.requested_nodes()
+            || registered.root_moves.allowed().as_ref() != root.allowed_root_moves().as_ref()
+            || registered.native_ledger.is_some()
+        {
+            return Err(invalid(
+                "profiled V2 original Rules, root domain or budget differs",
+            ));
+        }
+        port.validate_profiled_external_registration(source, registered.mode, budget)
+            .map_err(profile_error)
+    }
+
     pub(super) fn profile_release(
         &mut self,
         source: &ProfiledExternalRootSource,

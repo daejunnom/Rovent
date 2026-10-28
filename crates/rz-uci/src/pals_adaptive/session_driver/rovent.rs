@@ -22,6 +22,8 @@ pub const ROVENT_NATIVE_ROOT_DOMAIN: &str = "rz-rovent-native-root/1";
 pub const ROVENT_NATIVE_ROOT_V2_DOMAIN: &str = "rz-rovent-native-root/2";
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub const ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN: &str = "rz-rovent-profiled-external-root/1";
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+const ROVENT_PROFILED_EXTERNAL_ROOT_V2_DOMAIN: &str = "rz-rovent-profiled-external-root/2";
 
 /// Admitted alongside the actual native/CPU sources, never inferred from a
 /// SearchKind label. PC uses its distinct typed role-only owner instead.
@@ -191,9 +193,9 @@ pub struct RoventNativeRootReceipt {
     pub profiled_physical: Option<crate::pals_adaptive::ProfiledExternalShutdownReceipt>,
 }
 
-/// Actual /2 capability and root observations. `physical` is sampled before
-/// the manager's owner return and is not the final root or process fence;
-/// missing evidence stays unknown and never certifies process completion.
+/// Actual /2 capability and root observations. The physical observations are
+/// sampled before the manager's owner return and are not the final root or
+/// process fence; missing evidence never certifies process completion.
 #[cfg(feature = "pals-adaptive")]
 #[derive(Clone, Debug)]
 pub struct RoventNativeRootReceiptV2 {
@@ -208,6 +210,8 @@ pub struct RoventNativeRootReceiptV2 {
     pub native_accounting: Option<AdaptiveNativeAccountingSnapshot>,
     pub native_reservations: crate::pals_adaptive::RoventNativeAccountingObservation,
     pub physical: Option<AdaptiveShutdownReceipt>,
+    #[cfg(feature = "onnx-cpu")]
+    pub profiled_physical: Option<crate::pals_adaptive::ProfiledExternalShutdownReceipt>,
 }
 
 pub(super) enum RoventRootObservation {
@@ -451,18 +455,21 @@ where
                     "multiple original root capabilities",
                 ));
             }
-            #[cfg(feature = "onnx-cpu")]
-            if matches!(
-                self.researcher_class,
-                SessionResearcherClass::ProfiledExternal
-            ) {
-                return Err(failure(
-                    "RoventRootObservation",
-                    "V2 profiled external receipt is not connected",
-                ));
-            }
             let receipt = Arc::new(RoventNativeRootReceiptV2 {
-                domain: ROVENT_NATIVE_ROOT_V2_DOMAIN,
+                domain: match self.researcher_class {
+                    SessionResearcherClass::Legacy => ROVENT_NATIVE_ROOT_V2_DOMAIN,
+                    #[cfg(feature = "onnx-cpu")]
+                    SessionResearcherClass::ProfiledExternalV2 => {
+                        ROVENT_PROFILED_EXTERNAL_ROOT_V2_DOMAIN
+                    }
+                    #[cfg(feature = "onnx-cpu")]
+                    SessionResearcherClass::ProfiledExternal => {
+                        return Err(failure(
+                            "RoventRootObservation",
+                            "V1 external researcher cannot own a V2 root",
+                        ));
+                    }
+                },
                 authority: context.authority,
                 mode: profile.mode,
                 input_lock: profile.input_lock,
@@ -476,6 +483,8 @@ where
                     .map(|observation| observation.native_accounting()),
                 native_reservations: manager.rovent_native_accounting(),
                 physical: manager.shutdown_receipt().ok(),
+                #[cfg(feature = "onnx-cpu")]
+                profiled_physical: manager.profiled_shutdown_receipt().ok(),
             });
             *self.latest_rovent_root_v2.lock().map_err(|_| {
                 failure(
@@ -490,6 +499,13 @@ where
                 SessionResearcherClass::Legacy => ROVENT_NATIVE_ROOT_DOMAIN,
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 SessionResearcherClass::ProfiledExternal => ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                SessionResearcherClass::ProfiledExternalV2 => {
+                    return Err(failure(
+                        "RoventRootObservation",
+                        "V2 external researcher cannot own a V1 root",
+                    ));
+                }
             },
             authority: context.authority,
             mode: profile.mode,

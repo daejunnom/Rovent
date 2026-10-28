@@ -8,13 +8,17 @@
 use crate::rovent_bootstrap::RoventExternalRSourceCustody;
 use crate::rovent_external_launch::{RoventExternalOwner, VerifiedRoventExternalStartup};
 use crate::rovent_root_admission::RoventRootAdmission;
+use crate::rovent_root_admission::source_seal::RoventRootAdmissionV2;
+use crate::search_driver::SearchSessionContext;
+use rz_contracts::Digest;
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_eval::error::FailureKind;
-use rz_experiments::RoventExternalPurpose;
+use rz_experiments::{RoventExternalPurpose, RoventInputLock, RoventInputLockV2};
 use rz_runtime::CompletionSignal;
 use rz_runtime::adaptive::ControlMailbox;
 use rz_runtime::contracts::ContractClock;
+use rz_runtime::contracts::ContractSystemClock;
 use rz_search::cpu_checker::{CheckerError, CheckerShutdown};
 use rz_search::external_cpu::worker::ExternalWorkerStartup;
 use rz_search::external_cpu::{
@@ -25,6 +29,100 @@ use rz_search::external_cpu::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Version-specific admission keeps the original typed lock and root owners.
+/// This trait describes only supported manifest versions, not new authorities.
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::RoventInputLock {}
+    impl Sealed for super::RoventInputLockV2 {}
+}
+pub trait ExternalManagerLock: sealed::Sealed + Send + Sync + 'static {
+    type Root: ExternalManagerRoot;
+    type Custody;
+    fn purpose(custody: &Self::Custody) -> RoventExternalPurpose;
+    fn digest(custody: &Self::Custody) -> Digest;
+    fn policy(custody: &Self::Custody) -> Result<(ExternalGoConstraint, Duration), CheckerError>;
+    fn matches_owner(custody: &Self::Custody, root: &Arc<Self::Root>) -> bool;
+    fn admit(owner: &mut RoventExternalOwner, root: Arc<Self::Root>) -> Result<(), CheckerError>;
+    fn is_current(owner: &RoventExternalOwner, root: &Arc<Self::Root>) -> bool;
+}
+
+pub trait ExternalManagerRoot: Send + Sync + 'static {
+    fn startup_lock_digest(&self) -> Digest;
+    fn authority(&self) -> SearchAuthority;
+    fn original_context(&self) -> &SearchSessionContext;
+    fn runtime_clock(&self) -> &ContractSystemClock;
+}
+
+macro_rules! impl_manager_root {
+    ($root:ty) => {
+        impl ExternalManagerRoot for $root {
+            fn startup_lock_digest(&self) -> Digest {
+                self.startup_lock_digest()
+            }
+            fn authority(&self) -> SearchAuthority {
+                self.authority()
+            }
+            fn original_context(&self) -> &SearchSessionContext {
+                self.original_context()
+            }
+            fn runtime_clock(&self) -> &ContractSystemClock {
+                self.runtime_clock()
+            }
+        }
+    };
+}
+impl_manager_root!(RoventRootAdmission);
+impl_manager_root!(RoventRootAdmissionV2);
+
+macro_rules! impl_manager_lock {
+    ($lock:ty, $root:ty, $matches:expr, $admit:ident, $current:ident) => {
+        impl ExternalManagerLock for $lock {
+            type Root = $root;
+            type Custody = RoventExternalRSourceCustody<$lock>;
+            fn purpose(c: &Self::Custody) -> RoventExternalPurpose {
+                c.source_purpose()
+            }
+            fn digest(c: &Self::Custody) -> Digest {
+                c.input_lock_digest()
+            }
+            fn policy(c: &Self::Custody) -> Result<(ExternalGoConstraint, Duration), CheckerError> {
+                c.question_policy().map_err(|error| match error.kind {
+                    FailureKind::UnsupportedModel => CheckerError::Unsupported(error.detail),
+                    _ => invalid(error.detail),
+                })
+            }
+            fn matches_owner(c: &Self::Custody, r: &Arc<Self::Root>) -> bool {
+                ($matches)(c, r)
+            }
+            fn admit(o: &mut RoventExternalOwner, r: Arc<Self::Root>) -> Result<(), CheckerError> {
+                o.$admit(r)
+            }
+            fn is_current(o: &RoventExternalOwner, r: &Arc<Self::Root>) -> bool {
+                o.$current().is_some_and(|actual| Arc::ptr_eq(actual, r))
+            }
+        }
+    };
+}
+impl_manager_lock!(
+    RoventInputLock,
+    RoventRootAdmission,
+    |_c: &RoventExternalRSourceCustody<RoventInputLock>, _r: &Arc<RoventRootAdmission>| true,
+    admit_actual_root,
+    actual_root_admission
+);
+impl_manager_lock!(
+    RoventInputLockV2,
+    RoventRootAdmissionV2,
+    |c: &RoventExternalRSourceCustody<RoventInputLockV2>, r: &Arc<RoventRootAdmissionV2>| {
+        r.owner()
+            .v2()
+            .is_some_and(|owner| Arc::ptr_eq(c.original_lock_owner(), owner))
+    },
+    admit_actual_root_v2,
+    actual_root_admission_v2
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -96,43 +194,44 @@ impl ProfiledExternalManagerCompletion {
 
 /// A source rejection returns the same live owner and all descriptor custody.
 /// The caller must retain/clean it; an admission error is not a joined process.
-pub type ProfiledExternalSourceRejection = (
+pub type ProfiledExternalSourceRejection<L = RoventInputLock> = (
     RoventExternalOwner,
-    RoventExternalRSourceCustody,
+    <L as ExternalManagerLock>::Custody,
     CheckerError,
 );
 
 /// One manager is the only mutable owner. The existing worker's internal
 /// bounded mailbox is reused; no per-tick outer mutex or worker clone is added.
-pub struct ProfiledExternalManagerSource {
+pub struct ProfiledExternalManagerSource<L: ExternalManagerLock = RoventInputLock> {
     owner: RoventExternalOwner,
-    custody: RoventExternalRSourceCustody,
-    root: Arc<RoventRootAdmission>,
+    custody: L::Custody,
+    root: Arc<L::Root>,
     startup: VerifiedRoventExternalStartup,
     configuration: ExternalCpuConfig,
     question_constraint: ExternalGoConstraint,
     soft_quantum: Duration,
     source: ProfiledExternalRootSource,
     pending: Option<Pending>,
-    next_root: Option<Arc<RoventRootAdmission>>,
+    next_root: Option<Arc<L::Root>>,
     root_fence: Option<ProfiledExternalCurrentRootFence>,
     joined: Option<Result<CheckerShutdown, CheckerError>>,
     process_finish: Option<ProfiledExternalProcessFinishObservation>,
     phase: Phase,
 }
 
-impl ProfiledExternalManagerSource {
+impl<L: ExternalManagerLock> ProfiledExternalManagerSource<L> {
     /// No process is started and no path is reopened. Only the same original
     /// root capability can be retained when it was already admitted upstream.
     #[allow(clippy::result_large_err)]
     pub fn from_ready(
         mut owner: RoventExternalOwner,
-        custody: RoventExternalRSourceCustody,
-        root: Arc<RoventRootAdmission>,
-    ) -> Result<Self, ProfiledExternalSourceRejection> {
+        custody: L::Custody,
+        root: Arc<L::Root>,
+    ) -> Result<Self, ProfiledExternalSourceRejection<L>> {
         let checked = (|| {
-            if custody.source_purpose() != RoventExternalPurpose::ResearchChecker
-                || custody.input_lock_digest() != root.startup_lock_digest()
+            if L::purpose(&custody) != RoventExternalPurpose::ResearchChecker
+                || L::digest(&custody) != root.startup_lock_digest()
+                || !L::matches_owner(&custody, &root)
                 || owner.launch().profile().purpose != ExternalEnginePurpose::ResearchChecker
             {
                 return Err(invalid("profiled R original source purpose/lock differs"));
@@ -140,13 +239,7 @@ impl ProfiledExternalManagerSource {
             // This policy comes only from the same original /3 startup source.
             // Legacy sources have no implicit limit, and profile capabilities
             // never manufacture or narrow the registered requested constraint.
-            let (question_constraint, soft_quantum) =
-                custody
-                    .question_policy()
-                    .map_err(|error| match error.kind {
-                        FailureKind::UnsupportedModel => CheckerError::Unsupported(error.detail),
-                        _ => invalid(error.detail),
-                    })?;
+            let (question_constraint, soft_quantum) = L::policy(&custody)?;
             owner.launch().require_query(question_constraint, false)?;
             let startup = owner
                 .verified_startup()?
@@ -158,12 +251,12 @@ impl ProfiledExternalManagerSource {
                 return Err(invalid("profiled R actual startup/source pins differ"));
             }
             let configuration = owner.launch().configuration()?;
-            owner.admit_actual_root(Arc::clone(&root))?;
+            L::admit(&mut owner, Arc::clone(&root))?;
             let source = owner
                 .worker()
                 .current_root_source()?
                 .ok_or(invalid("profiled R current root source is pending"))?;
-            validate_source(&owner, &root, &startup, &configuration, &source)?;
+            validate_source::<L>(&owner, &root, &startup, &configuration, &source)?;
             Ok((
                 startup,
                 configuration,
@@ -197,7 +290,7 @@ impl ProfiledExternalManagerSource {
         &self.owner
     }
 
-    pub fn root_admission(&self) -> &Arc<RoventRootAdmission> {
+    pub fn root_admission(&self) -> &Arc<L::Root> {
         &self.root
     }
 
@@ -399,7 +492,7 @@ impl ProfiledExternalManagerSource {
     /// The retained original admission is installed after that fence completes.
     pub fn request_root_change(
         &mut self,
-        next: Arc<RoventRootAdmission>,
+        next: Arc<L::Root>,
         until: Instant,
     ) -> Result<(), CheckerError> {
         if self.phase != Phase::RootDrained || self.pending.is_some() || self.next_root.is_some() {
@@ -407,7 +500,8 @@ impl ProfiledExternalManagerSource {
                 "profiled R next root requires the original drained root",
             ));
         }
-        if next.startup_lock_digest() != self.custody.input_lock_digest()
+        if next.startup_lock_digest() != L::digest(&self.custody)
+            || !L::matches_owner(&self.custody, &next)
             || next.authority().epoch != self.root.authority().epoch
             || next.authority().implementation != self.root.authority().implementation
         {
@@ -439,13 +533,13 @@ impl ProfiledExternalManagerSource {
             {
                 return Err(invalid("profiled R next root fence differs"));
             }
-            self.owner.admit_actual_root(Arc::clone(next))?;
+            L::admit(&mut self.owner, Arc::clone(next))?;
             let source = self
                 .owner
                 .worker()
                 .current_root_source()?
                 .ok_or(invalid("profiled R next current source is pending"))?;
-            validate_source(
+            validate_source::<L>(
                 &self.owner,
                 next,
                 &self.startup,
@@ -581,7 +675,7 @@ impl ProfiledExternalManagerSource {
     /// Transfer the same opaque owner and FD custody only after a worker-issued
     /// current-root fence or confirmed physical join. Failure returns Self.
     #[allow(clippy::result_large_err)]
-    pub fn into_parts(self) -> Result<(RoventExternalOwner, RoventExternalRSourceCustody), Self> {
+    pub fn into_parts(self) -> Result<(RoventExternalOwner, L::Custody), Self> {
         let transferable = self.phase == Phase::ProcessClosed
             || self.phase == Phase::RootDrained && self.next_root.is_none();
         if self.pending.is_some() || !transferable {
@@ -595,9 +689,9 @@ impl ProfiledExternalManagerSource {
     }
 }
 
-fn validate_source(
+fn validate_source<L: ExternalManagerLock>(
     owner: &RoventExternalOwner,
-    root: &Arc<RoventRootAdmission>,
+    root: &Arc<L::Root>,
     startup: &VerifiedRoventExternalStartup,
     configuration: &ExternalCpuConfig,
     source: &ProfiledExternalRootSource,
@@ -617,9 +711,7 @@ fn validate_source(
             ExternalEnginePurpose::ResearchChecker,
             source.worker_owner(),
         )
-        || !owner
-            .actual_root_admission()
-            .is_some_and(|actual| Arc::ptr_eq(actual, root))
+        || !L::is_current(owner, root)
     {
         return Err(invalid(
             "profiled R current source/clock/profile/admission differs",

@@ -18,8 +18,12 @@ where
             external.worker.request_shutdown(until);
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if let SessionResearcherSource::ProfiledExternal(source) = &mut owners.researcher_source {
-            source.begin_process_finish(until);
+        match &mut owners.researcher_source {
+            SessionResearcherSource::ProfiledExternal(source) => source.begin_process_finish(until),
+            SessionResearcherSource::ProfiledExternalV2(source) => {
+                source.begin_process_finish(until)
+            }
+            SessionResearcherSource::Legacy => {}
         }
         loop {
             let version = owners.native.signal().version();
@@ -56,6 +60,13 @@ where
                     match &mut owners.researcher_source {
                         SessionResearcherSource::Legacy => true,
                         SessionResearcherSource::ProfiledExternal(source) => {
+                            let complete = source
+                                .try_process_finish()
+                                .map_err(SearchSessionFailure::unknown_if_unclosed)?;
+                            owners.external_finished = source.shutdown_receipt();
+                            complete
+                        }
+                        SessionResearcherSource::ProfiledExternalV2(source) => {
                             let complete = source
                                 .try_process_finish()
                                 .map_err(SearchSessionFailure::unknown_if_unclosed)?;

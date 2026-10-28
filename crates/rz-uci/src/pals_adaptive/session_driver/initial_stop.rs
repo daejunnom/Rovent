@@ -57,6 +57,16 @@ impl RoventPcrInitialReceiptV2 {
             _ => None,
         }
     }
+    /// Previous physical external-root evidence, not evidence for this stop.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn previous_clean_profiled_root(
+        &self,
+    ) -> Option<&super::super::ProfiledExternalShutdownReceipt> {
+        match &self.idle_custody {
+            RoventPcrIdleCustody::RetiredProfiledRoot(receipt) => Some(receipt),
+            _ => None,
+        }
+    }
     pub fn used_original_startup_ready(&self) -> bool {
         matches!(self.idle_custody, RoventPcrIdleCustody::StartupReady)
     }
@@ -187,6 +197,43 @@ where
             .as_ref()
             .is_some_and(|policy| policy.owner.same_original_owner(stopped.owner()));
         self.validate_initial_idle(owners, same_owner)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(policy) = &self.rovent_root_policy_v2 {
+            let lock = policy
+                .owner
+                .v2()
+                .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+            if matches!(
+                lock.manifest.engine.researcher.as_ref(),
+                Some(rz_experiments::RoventResearcher::External { .. })
+            ) {
+                let SessionResearcherSource::ProfiledExternalV2(source) = &owners.researcher_source
+                else {
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                };
+                let same_idle_custody = match &owners.rovent_idle_custody {
+                    RoventPcrIdleCustody::StartupReady => {
+                        source.ready_for_root_policy_registration()
+                    }
+                    RoventPcrIdleCustody::RetiredProfiledRoot(receipt) => {
+                        receipt.permits_root_reuse()
+                            && source
+                                .retained_root_admission_v2()
+                                .is_some_and(|root| root.authority() == receipt.authority())
+                            && source.retained_root_source().is_some_and(|worker_source| {
+                                worker_source.same_source(receipt.source())
+                            })
+                    }
+                    RoventPcrIdleCustody::RetiredRoot(_) => false,
+                };
+                if !source.same_original_lock(lock)
+                    || !source.permits_initial_idle()
+                    || !same_idle_custody
+                {
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+            }
+        }
         let receipt = Arc::new(RoventPcrInitialReceiptV2 {
             authority: context.authority,
             source: Arc::new(stopped),

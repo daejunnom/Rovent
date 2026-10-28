@@ -113,7 +113,24 @@ impl RoventFrontier {
             .validate_current()
             .map_err(|_| FrontierError::MissingAcceptance)?;
         self.check_external_source(source)?;
-        self.check_external_journal_capacity()
+        self.check_external_journal_capacity()?;
+        // Allocation and overflow must be known before the foreign worker owns
+        // a request. Retain the allocation for the single-writer journal.
+        self.external
+            .rows
+            .try_reserve(1)
+            .map_err(|_| FrontierError::Capacity("external reported-work journal"))?;
+        self.external
+            .work
+            .dispatched_questions
+            .checked_add(1)
+            .ok_or(FrontierError::Invalid("external dispatch counter overflow"))?;
+        self.external
+            .work
+            .outstanding_questions
+            .checked_add(1)
+            .ok_or(FrontierError::Invalid("external pending counter overflow"))?;
+        Ok(())
     }
 
     /// Preserve a dispatch already admitted by the real private worker, even

@@ -1170,7 +1170,6 @@ fn run_v2_native(
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
         || arguments.initial_stop_source_diagnostics
-        || lock.manifest.engine.nnuec.is_some()
         || !matches!(
             lock.manifest.purpose,
             rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment
@@ -1260,19 +1259,16 @@ fn run_v2_native(
         .configuration()
         .require_supported_native_capabilities()
         .map_err(|failure| error("Capability", failure))?;
-    if sources.configuration().fields().nnuec_selection() != NativeNnuecSelection::Absent {
-        return Err(error(
-            "InputLockUnsupportedV2",
-            "the /2 native route does not support NNUEC",
-        ));
-    }
-    match (topology, sources.configuration().fields().execution) {
+    let nnuec_selection = sources.configuration().fields().nnuec_selection();
+    match (
+        topology,
+        sources.configuration().fields().execution,
+        nnuec_selection,
+    ) {
         (
             super::RoventStartupTopology::RolesOnly,
-            ExecutionConfiguration::RolesOnly {
-                shared_nnuec_readout: None,
-                ..
-            },
+            ExecutionConfiguration::RolesOnly { .. },
+            NativeNnuecSelection::Absent | NativeNnuecSelection::SharedPc,
         ) => {}
         (
             super::RoventStartupTopology::OwnResearcher,
@@ -1280,11 +1276,12 @@ fn run_v2_native(
                 value: ResearchValueConfiguration::BaselineBoard,
                 ..
             },
+            NativeNnuecSelection::Absent,
         ) => {}
         _ => {
             return Err(error(
                 "InputLockUnsupportedV2",
-                "V2 execution configuration and baseline topology do not match",
+                "V2 execution configuration or NNUEC topology is unsupported",
             ));
         }
     }
@@ -1331,6 +1328,14 @@ fn run_v2_native(
         command_capacity: configuration.fields().native.command_capacity,
     };
     let diagnostic = NativeStartupDiagnostic::default();
+    let loaded_nnuec = match nnuec_selection {
+        NativeNnuecSelection::Absent => None,
+        NativeNnuecSelection::SharedPc => Some(
+            LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
+                .map_err(|failure| error("NnuecSource", failure))?,
+        ),
+        NativeNnuecSelection::OwnResearcher => unreachable!("own NNUEC rejected above"),
+    };
     let owners = Arc::new(OwnerRegistry::default());
     let identity = EngineIdentity {
         name: format!("Rovent {:?}", lock.manifest.engine.mode),
@@ -1339,7 +1344,7 @@ fn run_v2_native(
     // Each arm transfers the one original prepared worker into its matching
     // product. The common error path retains the same boundary and FDs.
     macro_rules! launch_v2_product {
-        ($question:ty, $constructor:path, $reject:path) => {{
+        ($question:ty, $constructor:path, $reject:path $(, $extra:expr)*) => {{
             let prepared = super::prepare_native_v2::<$question>(
                 Arc::clone(&sources),
                 resources,
@@ -1349,6 +1354,7 @@ fn run_v2_native(
             .map_err(|rejection| reject_factory(rejection, cleanup_until, &diagnostic))?;
             let driver = $constructor(
                 prepared,
+                $($extra,)*
                 Arc::clone(&boundary),
                 clock.clone(),
                 Arc::clone(&owners),
@@ -1361,20 +1367,24 @@ fn run_v2_native(
         }};
     }
     let assembled = (|| -> Result<_, RoventLaunchError> {
-        match topology {
-            super::RoventStartupTopology::RolesOnly => launch_v2_product!(
+        match (topology, loaded_nnuec) {
+            (super::RoventStartupTopology::RolesOnly, None) => launch_v2_product!(
                 PcPortQuestion,
                 super::product::RoventNativeProductDriverV2::pc,
                 reject_product_v2
             ),
-            super::RoventStartupTopology::OwnResearcher => launch_v2_product!(
+            (super::RoventStartupTopology::RolesOnly, Some(loaded)) => launch_v2_product!(
+                PcPortQuestion,
+                super::product::RoventNativeProductDriverV2::pc_with_shared_nnuec,
+                reject_product_v2,
+                loaded
+            ),
+            (super::RoventStartupTopology::OwnResearcher, None) => launch_v2_product!(
                 AdaptivePortQuestion,
                 super::product::RoventOwnPcrProductDriverV2::own_board_pcr,
                 reject_own_pcr_product_v2
             ),
-            super::RoventStartupTopology::ExternalResearcher => {
-                unreachable!("external topology rejected before startup")
-            }
+            _ => unreachable!("unsupported topology or NNUEC selection rejected before startup"),
         }
     })();
     let (driver, completion) = match assembled {

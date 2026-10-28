@@ -31,8 +31,8 @@ use std::{
 mod collection;
 mod external_r;
 pub use external_r::{
-    RoventExternalRAssetSelection, RoventExternalRSourceCustody, RoventExternalRSourceSelection,
-    RoventPinnedExternalRSource,
+    ExternalNativeInputLock, RoventExternalRAssetSelection, RoventExternalRSourceCustody,
+    RoventExternalRSourceSelection, RoventPinnedExternalRSource,
 };
 mod nnuec;
 pub use collection::{
@@ -268,13 +268,22 @@ impl NativeInputLock for RoventInputLockV2 {
         &self,
         collection: Option<&RoventCollectionPreloadSources>,
     ) -> Result<RoventStartupTopology, BackendError> {
-        if collection.is_some() {
-            return Err(fail(
-                K::UnsupportedModel,
-                "V2 Collection preload is not connected",
-            ));
-        }
-        let topology = super::admitted_topology_v2(self)?;
+        let topology = match collection {
+            None => super::admitted_topology_v2(self)?,
+            Some(original) => {
+                self.validate_original()
+                    .map_err(|_| fail(K::IdentityMismatch, "Rovent lock validation failed"))?;
+                let explicit_purpose = self.manifest.purpose
+                    == rz_experiments::RoventPurpose::Collection
+                    && original.input_lock_digest().0 == parse_sha256(&self.canonical_sha256)?
+                    && original.teacher_count() == self.manifest.engine.teachers.len();
+                super::admitted_native_topology_fields(
+                    &self.manifest.engine,
+                    &self.manifest.coordinator,
+                    explicit_purpose,
+                )?
+            }
+        };
         if !matches!(
             topology,
             RoventStartupTopology::RolesOnly | RoventStartupTopology::OwnResearcher
@@ -379,6 +388,66 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
         self.original_v2_control
             .as_ref()
             .is_some_and(|original| same_startup_control(original, control))
+    }
+
+    /// Revalidate the joined original Collection sources. This grants no root,
+    /// teacher process, target or dispatch authority.
+    pub fn verify_collection_v2_origin(
+        &self,
+    ) -> Result<&Arc<RoventCollectionPreloadSources>, BackendError> {
+        let original = self.collection.as_ref().ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                "V2 Collection preload source is absent",
+            )
+        })?;
+        let control = self
+            .original_v2_control
+            .as_ref()
+            .ok_or_else(|| fail(K::IdentityMismatch, "original V2 startup control is absent"))?;
+        if !original.matches_v2_origin(&self.lock, control)
+            || !original.matches_original_root_path_v2(&self.private_root_path)
+            || !original.matches_original_root_v2(&self._root)?
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                "V2 Collection source origin differs",
+            ));
+        }
+        Ok(original)
+    }
+
+    /// Join the original /2 Collection sources before native model admission.
+    /// Both owners retain the exact lock, original cancellation and deadlines,
+    /// directory capability and profile path; no legacy lock is synthesized.
+    pub fn open_v2_with_collection(
+        lock: Arc<RoventInputLockV2>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        collection: Arc<RoventCollectionPreloadSources>,
+    ) -> Result<Self, BackendError> {
+        control.check()?;
+        if !collection.matches_v2_origin(&lock, control)
+            || !collection.matches_original_root_path_v2(&private_root_path)
+            || !collection.matches_original_root_v2(&root)?
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                "V2 Collection source origin differs",
+            ));
+        }
+        let owner = Self::open_selected(
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            Some(collection),
+        )?;
+        owner.verify_collection_v2_origin()?;
+        Ok(owner)
     }
 
     /// Pin native inputs against the original V2 lock. Collection and the

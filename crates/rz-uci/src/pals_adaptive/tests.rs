@@ -1878,6 +1878,24 @@ fn pending_snapshot_never_hides_a_registry_charge_without_a_bound_ticket() {
 }
 
 #[test]
+fn boxed_owner_transfer_retains_same_manager_on_rejection_and_closes_after_join() {
+    let (manager, _, _, until) = fixture(FixtureScope::OwnCpuResume, true, 13);
+    let manager = Box::new(manager);
+    let original = std::ptr::from_ref(manager.as_ref());
+    let mut rejected = match manager.into_persistent_parts_boxed() {
+        Ok(_) => panic!("an active root cannot transfer its owner"),
+        Err(rejected) => rejected,
+    };
+    assert_eq!(std::ptr::from_ref(rejected.manager.as_ref()), original);
+    assert!(shutdown(&mut rejected.manager, until).permits_archive_close());
+    let parts = match rejected.manager.into_process_parts_boxed() {
+        Ok(parts) => parts,
+        Err(rejected) => panic!("joined owner transfer: {}", rejected.error),
+    };
+    assert!(parts.receipt().permits_archive_close());
+}
+
+#[test]
 fn two_actual_root_fences_reuse_one_native_factory_and_preserve_cpu_engine_work() {
     // This case observes a completed attempt across root reuse. Yield and its
     // final cancellation attempt are exercised separately below.

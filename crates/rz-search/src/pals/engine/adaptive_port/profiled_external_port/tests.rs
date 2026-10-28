@@ -782,6 +782,118 @@ fn retained_question_capacity_keeps_every_slot_until_root_retirement() {
 }
 
 #[test]
+fn foreign_frontier_lineage_is_rejected_before_external_preparation() {
+    let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
+    let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);
+    let mut work = fixture.work(1);
+    // Keep the actual board, move and view while changing the context after
+    // its producer seal was made. The ordinary work check alone accepts it.
+    let context = &mut Arc::make_mut(&mut work.input.question).context;
+    context.public_revision = context.public_revision.wrapping_add(1);
+    assert!(fixture.port.check_work(&work).is_ok());
+    assert!(AdaptivePortQuestion::validate_frontier_source(
+        &work, &fixture.port.engine.semantic.stores,
+    ).is_err());
+    let before = fixture
+        .port
+        .rovent_frontier()
+        .unwrap()
+        .external_work()
+        .unwrap();
+    let entries_before = fixture.port.profiled_external.entries.len();
+    let result = fixture.port.prepare_profiled_external(
+        &work,
+        &fixture.config,
+        &fixture.source,
+        ReciprocalQuestionId {
+            authority: fixture.port.authority,
+            sequence: 1,
+        },
+        rz_contracts::ExecutionId::new(fixture.port.authority.epoch, 1),
+        ExternalGoConstraint::Nodes { reported_nodes: 16 },
+        Duration::from_millis(100),
+        CompletionSignal::default(),
+        fixture.clock.domain(),
+        fixture.clock.now().unwrap(),
+    );
+    assert!(result.is_err());
+    assert_eq!(fixture.port.profiled_external.entries.len(), entries_before);
+    assert_eq!(
+        fixture
+            .port
+            .rovent_frontier()
+            .unwrap()
+            .external_work()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn post_submit_lineage_failure_still_allows_real_worker_terminal_and_fence() {
+    let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
+    let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);
+    let mut work = fixture.work(1);
+    let constraint = ExternalGoConstraint::Nodes { reported_nodes: 16 };
+    let prepared = fixture
+        .port
+        .prepare_profiled_external(
+            &work,
+            &fixture.config,
+            &fixture.source,
+            ReciprocalQuestionId {
+                authority: fixture.port.authority,
+                sequence: 1,
+            },
+            rz_contracts::ExecutionId::new(fixture.port.authority.epoch, 1),
+            constraint,
+            Duration::from_millis(100),
+            CompletionSignal::default(),
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    let AdaptiveProfiledExternalPreparation::Ready(job) = prepared else {
+        panic!("fixture's research query must be supported")
+    };
+    let dispatch = fixture.worker.as_mut().unwrap().submit(job).unwrap();
+    // Fault injection after physical admission: it must not be accepted as
+    // the original sealed question, even though the worker now owns the go.
+    let context = &mut Arc::make_mut(&mut work.input.question).context;
+    context.public_revision = context.public_revision.wrapping_add(1);
+    assert!(
+        fixture
+            .port
+            .profiled_external_admitted(
+                &work,
+                &fixture.source,
+                &dispatch,
+                fixture.clock.domain(),
+                fixture.clock.now().unwrap(),
+            )
+            .is_err()
+    );
+    let worker = fixture.worker.as_mut().unwrap();
+    let terminal = poll(worker, || worker.take_completion());
+    assert!(terminal.matches_submission(&dispatch));
+    assert!(terminal.controls().terminal);
+    assert_eq!(terminal.go_issue(), ExternalGoIssue::Issued);
+    let fence = fixture.quiesce();
+    assert!(fence.permits_reuse());
+    assert!(fence.source().same_source(&fixture.source));
+    assert_eq!(fence.process_identity(), fixture.source.process_identity());
+    assert_eq!(fence.authority(), fixture.source.authority());
+    let observed = fixture
+        .port
+        .rovent_frontier()
+        .unwrap()
+        .external_work()
+        .unwrap();
+    assert_eq!(observed.dispatched_questions, 0);
+    assert_eq!(observed.returned_terminal_packets, 0);
+}
+
+#[test]
 fn authored_worker_nodes_only_keeps_raw_constraint_and_publication_once() {
     let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
     let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);

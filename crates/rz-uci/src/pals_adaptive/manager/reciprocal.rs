@@ -619,17 +619,27 @@ where
             || self.reciprocal_routing.is_some()
             || !mode.has_native_r()
             || first_question_sequence == 0
-            || source.root_admission().root_budget_digest() != root_budget
+            || source
+                .root_budget_digest()
+                .map_err(AdaptiveManagerError::ProfiledExternal)?
+                != root_budget
             || self.driver.rovent_root_budget()? != Some(root_budget)
         {
             return Err(AdaptiveManagerError::Invalid(
                 "profiled external original routing registration",
             ));
         }
-        self.driver.validate_profiled_external_registration(
-            source.current_source(),
-            source.root_admission(),
-        )?;
+        if let Some(root) = source.root_admission_v1() {
+            self.driver
+                .validate_profiled_external_registration(source.current_source(), root)?;
+        } else if let Some(root) = source.root_admission_v2() {
+            self.driver
+                .validate_profiled_external_registration_v2(source.current_source(), root)?;
+        } else {
+            return Err(AdaptiveManagerError::Invalid(
+                "profiled external original root absent",
+            ));
+        }
         self.machine
             .enable_reciprocal_questions(mode, root_budget)?;
         self.next_reciprocal_question = first_question_sequence;

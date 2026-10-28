@@ -34,9 +34,11 @@ use std::time::Instant;
 
 mod actual_root;
 mod frontier_source;
-pub use frontier_source::RoventAdmittedExternalRootSource;
+pub use frontier_source::{RoventAdmittedExternalRootSource, RoventAdmittedExternalRootSourceV2};
 mod collection_teacher;
 pub use collection_teacher::RoventCollectionTeacherOwner;
+#[cfg(feature = "onnx-cpu")]
+pub use collection_teacher::RoventCollectionTeacherOwnerV2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

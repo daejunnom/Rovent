@@ -5,15 +5,19 @@
 //! the legacy external-worker entry points cannot construct this source kind.
 
 use super::*;
-use crate::pals_adaptive::ProfiledExternalManagerSource;
-use crate::rovent_bootstrap::{RoventExternalRSourceCustody, RoventPinnedExternalRSource};
+use crate::pals_adaptive::{
+    ExternalManagerLock, ExternalManagerRoot, ProfiledExternalManagerSource,
+};
+use crate::rovent_bootstrap::{
+    ExternalNativeInputLock, RoventExternalRSourceCustody, RoventPinnedExternalRSource,
+};
 use crate::rovent_external_launch::{
-    PreparedRoventExternalLaunch, RoventAdmittedExternalRootSource, RoventExternalOwner,
-    RoventExternalSpawnRejection,
+    PreparedRoventExternalLaunch, RoventAdmittedExternalRootSource,
+    RoventAdmittedExternalRootSourceV2, RoventExternalOwner, RoventExternalSpawnRejection,
 };
 use crate::rovent_root_admission::RoventRootAdmission;
 use rz_contracts::pals_adaptive::CpuWorkerId;
-use rz_experiments::RoventExternalPurpose;
+use rz_experiments::{RoventExternalPurpose, RoventInputLock, RoventInputLockV2};
 use rz_runtime::contracts::ContractClock as _;
 use rz_search::cpu_checker::CheckerError;
 use rz_search::external_cpu::ProfiledExternalRootSource;
@@ -34,6 +38,24 @@ where
     pub external: RoventExternalSessionSource,
 }
 
+pub struct RoventExternalSessionSourcesV2<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+{
+    pub common: AdaptiveSessionSources<B>,
+    pub external: RoventExternalSessionSource<RoventInputLockV2>,
+}
+
+pub struct RoventExternalSessionAdmissionRejectionV2<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+{
+    pub failure: SearchSessionFailure,
+    pub sources: AdaptiveSessionSources<B>,
+    pub external: RoventExternalSessionSource<RoventInputLockV2>,
+    pub retirement_sink: RegisteredProfiledRetirementSink,
+}
+
 pub struct RoventExternalSessionAdmissionRejection<B>
 where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
@@ -50,27 +72,27 @@ struct DormantExternalSource {
     working_directory: File,
 }
 
-pub struct RoventExternalSourcePreparationRejection {
+pub struct RoventExternalSourcePreparationRejection<L: SessionExternalLock = RoventInputLock> {
     pub error: CheckerError,
-    _retained: RejectedExternalSource,
+    _retained: RejectedExternalSource<L>,
 }
 
-enum RejectedExternalSource {
+enum RejectedExternalSource<L: SessionExternalLock> {
     Pinned {
-        _source: RoventPinnedExternalRSource,
+        _source: RoventPinnedExternalRSource<L>,
     },
     Consumed {
         _launch: PreparedRoventExternalLaunch,
         _executable: File,
         _working_directory: File,
-        _custody: RoventExternalRSourceCustody,
+        _custody: RoventExternalRSourceCustody<L>,
     },
 }
 
 // Each session source has one process-state slot. Original launch/FD/worker
 // custody moves between these variants rather than entering an unbounded queue.
 #[allow(clippy::large_enum_variant)]
-enum ExternalProcessState {
+enum ExternalProcessState<L: SessionExternalLock> {
     Dormant(DormantExternalSource),
     Running(RoventExternalOwner),
     /// The retaining startup entry guarantees that no physical worker was
@@ -82,14 +104,14 @@ enum ExternalProcessState {
     Failed,
     /// Returned by the common manager. The helper still owns its original
     /// process/custody until its actual fence permits extracting them.
-    Returned(Box<ProfiledExternalManagerSource>),
+    Returned(Box<ProfiledExternalManagerSource<L>>),
 }
 
 /// Unique retained source owner. The public type has no public constructor or
 /// fields; only the pinned, purpose-checked input above can create it.
-pub struct RoventExternalSessionSource {
-    state: ExternalProcessState,
-    custody: Option<RoventExternalRSourceCustody>,
+pub struct RoventExternalSessionSource<L: SessionExternalLock = RoventInputLock> {
+    state: ExternalProcessState<L>,
+    custody: Option<RoventExternalRSourceCustody<L>>,
     declaration: AdaptiveCheckerMetadata,
     input_lock: Digest,
     canonical_profile: String,
@@ -98,13 +120,20 @@ pub struct RoventExternalSessionSource {
     shutdown: Option<CheckerShutdown>,
 }
 
-impl RoventExternalSessionSource {
+pub trait SessionExternalLock:
+    Sized + ExternalNativeInputLock + ExternalManagerLock<Custody = RoventExternalRSourceCustody<Self>>
+{
+}
+impl SessionExternalLock for RoventInputLock {}
+impl SessionExternalLock for RoventInputLockV2 {}
+
+impl<L: SessionExternalLock> RoventExternalSessionSource<L> {
     // A rejected preparation returns its original source/FD custody without
     // allocating a replacement error owner on the failure path.
     #[allow(clippy::result_large_err)]
     pub(crate) fn from_pinned(
-        external: RoventPinnedExternalRSource,
-    ) -> Result<Self, RoventExternalSourcePreparationRejection> {
+        external: RoventPinnedExternalRSource<L>,
+    ) -> Result<Self, RoventExternalSourcePreparationRejection<L>> {
         if external.source_purpose() != RoventExternalPurpose::ResearchChecker {
             return Err(RoventExternalSourcePreparationRejection {
                 error: CheckerError::Invalid(
@@ -203,10 +232,14 @@ impl RoventExternalSessionSource {
 
     pub(super) fn prepare_actual_root(
         &mut self,
-        root: Arc<RoventRootAdmission>,
+        root: Arc<L::Root>,
         clock: &ProcessClock,
     ) -> Result<(), SearchSessionFailure> {
-        if root.startup_lock_digest() != self.input_lock
+        if self
+            .custody
+            .as_ref()
+            .is_some_and(|custody| !L::matches_owner(custody, &root))
+            || root.startup_lock_digest() != self.input_lock
             || root.runtime_clock().domain() != clock.domain()
             || root.runtime_clock().origin() != clock.runtime_clock().origin()
             || !root.original_context().accepts().unwrap_or(false)
@@ -291,8 +324,8 @@ impl RoventExternalSessionSource {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        if let Some(previous) = owner.actual_root_admission() {
-            if previous.digest() != root.digest() {
+        if owner.actual_root_admission().is_some() || owner.actual_root_admission_v2().is_some() {
+            if !L::is_current(owner, &root) {
                 owner
                     .worker()
                     .request_root_change(root.authority(), root.original_context().control.deadline)
@@ -318,8 +351,7 @@ impl RoventExternalSessionSource {
                 }
             }
         }
-        owner
-            .admit_actual_root(root)
+        L::admit(owner, root)
             .map_err(|error| SearchSessionFailure::debug("RoventExternalRoot", &error))
     }
 
@@ -350,8 +382,8 @@ impl RoventExternalSessionSource {
     #[allow(clippy::result_large_err)]
     pub(super) fn into_manager(
         mut self,
-        root: Arc<RoventRootAdmission>,
-    ) -> Result<ProfiledExternalManagerSource, (Self, SearchSessionFailure)> {
+        root: Arc<L::Root>,
+    ) -> Result<ProfiledExternalManagerSource<L>, (Self, SearchSessionFailure)> {
         if let Err(error) = self.extract_returned_owner() {
             return Err((self, error));
         }
@@ -364,7 +396,7 @@ impl RoventExternalSessionSource {
             self.state = ExternalProcessState::Running(owner);
             return Err((self, SearchSessionFailure::physical_completion_unknown()));
         };
-        match ProfiledExternalManagerSource::from_ready(owner, custody, root) {
+        match ProfiledExternalManagerSource::<L>::from_ready(owner, custody, root) {
             Ok(source) => Ok(source),
             Err((owner, custody, error)) => {
                 self.state = ExternalProcessState::Running(owner);
@@ -378,7 +410,7 @@ impl RoventExternalSessionSource {
     }
 
     pub(super) fn from_manager(
-        source: ProfiledExternalManagerSource,
+        source: ProfiledExternalManagerSource<L>,
         declaration: AdaptiveCheckerMetadata,
     ) -> Self {
         let shutdown = source
@@ -410,14 +442,6 @@ impl RoventExternalSessionSource {
     pub(super) fn retained_root_source(&self) -> Option<&ProfiledExternalRootSource> {
         match &self.state {
             ExternalProcessState::Returned(source) => Some(source.current_source()),
-            _ => None,
-        }
-    }
-
-    pub(super) fn retained_root_admission(&self) -> Option<&Arc<RoventRootAdmission>> {
-        match &self.state {
-            ExternalProcessState::Returned(source) => Some(source.root_admission()),
-            ExternalProcessState::Running(owner) => owner.actual_root_admission(),
             _ => None,
         }
     }
@@ -459,11 +483,134 @@ impl RoventExternalSessionSource {
     }
 }
 
+impl RoventExternalSessionSource<RoventInputLock> {
+    pub(super) fn retained_root_admission(&self) -> Option<&Arc<RoventRootAdmission>> {
+        match &self.state {
+            ExternalProcessState::Returned(source) => Some(source.root_admission()),
+            ExternalProcessState::Running(owner) => owner.actual_root_admission(),
+            _ => None,
+        }
+    }
+}
+
+impl RoventExternalSessionSource<RoventInputLockV2> {
+    pub(super) fn same_original_lock(&self, original: &Arc<RoventInputLockV2>) -> bool {
+        match &self.state {
+            ExternalProcessState::Returned(source) => source
+                .root_admission()
+                .owner()
+                .v2()
+                .is_some_and(|owner| Arc::ptr_eq(owner, original)),
+            _ => self
+                .custody
+                .as_ref()
+                .is_some_and(|custody| Arc::ptr_eq(custody.original_lock_owner(), original)),
+        }
+    }
+
+    pub(super) fn ready_for_root_policy_registration(&self) -> bool {
+        matches!(self.state, ExternalProcessState::Dormant(_))
+            && self.custody.is_some()
+            && self.shutdown.is_none()
+    }
+
+    pub(super) fn permits_initial_idle(&self) -> bool {
+        match &self.state {
+            ExternalProcessState::Dormant(_) => self.ready_for_root_policy_registration(),
+            ExternalProcessState::Returned(source) => {
+                source.root_drained() && !source.is_quarantined()
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn retained_root_admission_v2(
+        &self,
+    ) -> Option<&Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>> {
+        match &self.state {
+            ExternalProcessState::Returned(source) => Some(source.root_admission()),
+            ExternalProcessState::Running(owner) => owner.actual_root_admission_v2(),
+            _ => None,
+        }
+    }
+}
+
 impl<B> AdaptiveSessionDriver<B>
 where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// /2 is admitted only with its retained pinned researcher and /2 root
+    /// policy. Collection needs its own original-owner join and stays closed.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    pub(crate) fn new_rovent_external_v2_with_resource_limits(
+        options: AdaptiveSessionOptions,
+        limits: AdaptiveExecutionLimits,
+        sources: RoventExternalSessionSourcesV2<B>,
+        clock: ProcessClock,
+        issuer: AdaptiveRulesOwnerIssuer,
+        registration: PalsCheckerRegistration,
+        profile: RoventPcrSessionProfile,
+        retirement_sink: RegisteredProfiledRetirementSink,
+        origin: Option<crate::pals_adaptive::RoventNativeCollectionOrigin>,
+        hooks: AdaptiveSessionCollectionHooks<B>,
+    ) -> Result<Self, RoventExternalSessionAdmissionRejectionV2<B>> {
+        let RoventExternalSessionSourcesV2 { common, external } = sources;
+        let checked = external
+            .validate_declaration(&profile, &common)
+            .and_then(|()| {
+                if retirement_sink.admission_closed() {
+                    return Err(failure(
+                        "RoventExternalRetirementSink",
+                        "original durable evidence sink admission is closed",
+                    ));
+                }
+                if origin.is_some() || hooks.root_admission.is_some() {
+                    return Err(failure(
+                        "RoventExternalCollectionHooks",
+                        "/2 external Collection owner is not admitted",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(failure) = checked {
+            return Err(RoventExternalSessionAdmissionRejectionV2 {
+                failure,
+                sources: common,
+                external,
+                retirement_sink,
+            });
+        }
+        match Self::admit_with_researcher_source(
+            options,
+            limits,
+            common,
+            clock,
+            issuer,
+            registration,
+            None,
+            None,
+            hooks,
+            true,
+            SessionResearcherSource::ProfiledExternalV2(Box::new(external)),
+        ) {
+            Ok(mut driver) => {
+                driver.rovent = Some(profile);
+                driver.profiled_retirement_sink = Mutex::new(Some(retirement_sink));
+                Ok(driver)
+            }
+            Err((rejected, SessionResearcherSource::ProfiledExternalV2(external))) => {
+                Err(RoventExternalSessionAdmissionRejectionV2 {
+                    failure: rejected.failure,
+                    sources: rejected.sources,
+                    external: *external,
+                    retirement_sink,
+                })
+            }
+            Err(_) => unreachable!("typed /2 external source preserved"),
+        }
+    }
+
     /// Read-only recovery over the same Store owner. This does not acknowledge
     /// persistence or release the retained Work/view pins. A later durable
     /// consumer must supply its own producer-owned commit receipt.
@@ -573,12 +720,108 @@ where
                     retirement_sink,
                 })
             }
-            Err((_, SessionResearcherSource::Legacy)) => unreachable!("typed source preserved"),
+            Err((
+                _,
+                SessionResearcherSource::Legacy | SessionResearcherSource::ProfiledExternalV2(_),
+            )) => unreachable!("typed source preserved"),
         }
     }
 }
 
 impl RoventPcrSessionProfile {
+    /// Join the original /2 root to the actual worker before attaching the
+    /// existing Store-backed frontier. No Collection authority is synthesized.
+    pub(super) fn attach_profiled_external_v2<B>(
+        &self,
+        manager: &mut SessionManager<B>,
+        context: &SearchSessionContext,
+        clock: &ProcessClock,
+        admission: &RoventPcrRootAdmission,
+        joined: &RoventAdmittedExternalRootSourceV2,
+    ) -> Result<(), AdaptiveManagerError>
+    where
+        B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+        B::Output: ProposerRankingOutput,
+    {
+        context.goal.validate(self.maximum_goal_plies)?;
+        let original = admission
+            .original_v2
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "external R requires original /2 root admission",
+            ))?;
+        joined
+            .validate_current()
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?;
+        let source = joined.worker_source();
+        let budget = original
+            .descriptor()
+            .root_budget_digest()
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?;
+        if !context.accepts()?
+            || !Arc::ptr_eq(original, joined.root_admission())
+            || source.authority() != context.authority
+            || source.authority() != original.authority()
+            || budget != admission.budget
+            || source.clock().domain != clock.domain()
+            || source.clock().origin != clock.runtime_clock().origin()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "external R /2 actual root/clock/source differs",
+            ));
+        }
+        let port = manager
+            .driver()
+            .port()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let root_rules = port.root_rules();
+        let actual_namespace = port
+            .model_namespace()
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?;
+        if actual_namespace != self.model_namespace.as_ref() {
+            return Err(AdaptiveManagerError::Invalid(
+                "external R port/native namespace differs",
+            ));
+        }
+        let root_moves = Arc::new(
+            RootMoveDomain::new(&root_rules, context.root_moves.as_deref())
+                .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?,
+        );
+        let registration = FrontierRegistration {
+            authority: context.authority,
+            mode: self.mode,
+            original_deadline: clock.deadline(context.control.deadline)?,
+            root_budget: admission.budget,
+            goal: context.goal,
+            nodes: context.requested_nodes,
+            selective_policy: self.selective_policy,
+            root_rules,
+            root_moves: Arc::clone(&root_moves),
+            root_state: port.root_state_id(),
+            model_namespace: Arc::clone(&self.model_namespace),
+            native_ledger: None,
+        };
+        manager.driver_mut().attach_rovent_external_frontier(
+            registration,
+            self.frontier_limits.clone(),
+            AdaptiveFrontierStartup {
+                mode: self.mode,
+                root_budget: admission.budget,
+                root_moves: &root_moves,
+                native_ledger: None,
+            },
+            source,
+            clock.domain(),
+            clock.now()?,
+        )?;
+        manager
+            .driver_mut()
+            .register_profiled_external_cleanup_deadline(source, context.shutdown_deadline)?;
+        manager.configure_rovent_external_routing(self.mode, admission.budget, 1)?;
+        manager.configure_rovent_peer_followups(self.peers)?;
+        Ok(())
+    }
+
     pub(super) fn attach_profiled_external<B>(
         &self,
         manager: &mut SessionManager<B>,

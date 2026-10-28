@@ -379,6 +379,7 @@ pub struct RoventPcSessionV2Rejection {
     pub failure: SearchSessionFailure,
     pub prepared: PreparedRoventNativeV2<PcPortQuestion>,
     pub process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+    pub loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>>,
 }
 /// No preparation thread is started before this constructor has succeeded.
 /// Rejection therefore returns both original startup owners without a join.
@@ -393,8 +394,20 @@ struct ConstructionRejection {
     loaded: Option<LoadedRoventNnuecSource>,
 }
 /// Exactly one optional RuntimeHelper; no R engine or native node owner.
+enum SharedNnuecLoaded {
+    V1(LoadedRoventNnuecSource),
+    V2(LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>),
+}
+impl SharedNnuecLoaded {
+    fn model(&self) -> &Arc<rz_search::cpu_value::nnuec::v2::Model> {
+        match self {
+            Self::V1(source) => source.model(),
+            Self::V2(source) => source.model(),
+        }
+    }
+}
 struct SharedNnuecOwner {
-    loaded: LoadedRoventNnuecSource,
+    loaded: SharedNnuecLoaded,
     actor: Mutex<SharedNnuecActor>,
 }
 /// Readback only. An actual thread ID is neither an affinity claim nor a
@@ -516,110 +529,191 @@ impl RoventPcSessionDriver {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventPcSessionV2Rejection> {
-        let build =
-            (|| -> Result<_, SearchSessionFailure> {
-                let sources = prepared.sources();
-                if !Arc::ptr_eq(sources.lock_owner(), process.input_lock())
-                    || !process.matches_startup_control(prepared.startup_control())
-                    || sources.private_root_path() != process.private_cwd()
-                    || !sources
-                        .same_original_root(process.original_root())
-                        .map_err(|e| SearchSessionFailure::debug("RoventPcV2Root", &e))?
-                {
-                    return Err(failure(
-                        "RoventPcV2Custody",
-                        "original lock, root, or startup control differs",
-                    ));
-                }
-                let configuration = sources.configuration().clone();
-                configuration
-                    .require_supported_native_capabilities()
-                    .map_err(|e| SearchSessionFailure::debug("RoventPcCapability", &e))?;
-                if !matches!(
-                    configuration.fields().execution,
+        Self::construct_v2(
+            prepared,
+            None,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+    }
+
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn new_v2_with_shared_nnuec(
+        prepared: PreparedRoventNativeV2<PcPortQuestion>,
+        loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventPcSessionV2Rejection> {
+        Self::construct_v2(
+            prepared,
+            Some(loaded),
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+    }
+
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    fn construct_v2(
+        prepared: PreparedRoventNativeV2<PcPortQuestion>,
+        loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventPcSessionV2Rejection> {
+        let build = (|| -> Result<_, SearchSessionFailure> {
+            let sources = prepared.sources();
+            if !Arc::ptr_eq(sources.lock_owner(), process.input_lock())
+                || !process.matches_startup_control(prepared.startup_control())
+                || sources.private_root_path() != process.private_cwd()
+                || !sources
+                    .same_original_root(process.original_root())
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcV2Root", &e))?
+            {
+                return Err(failure(
+                    "RoventPcV2Custody",
+                    "original lock, root, or startup control differs",
+                ));
+            }
+            let configuration = sources.configuration().clone();
+            configuration
+                .require_supported_native_capabilities()
+                .map_err(|e| SearchSessionFailure::debug("RoventPcCapability", &e))?;
+            match (configuration.fields().execution, &loaded) {
+                (
                     ExecutionConfiguration::RolesOnly {
                         shared_nnuec_readout: None,
                         ..
+                    },
+                    None,
+                ) if sources.lock().manifest.engine.nnuec.is_none() => {}
+                (
+                    ExecutionConfiguration::RolesOnly {
+                        shared_nnuec_readout: Some(readout),
+                        ..
+                    },
+                    Some(loaded),
+                ) => {
+                    if !declares_shared_nnuec_helper(&sources.lock().manifest.resources.pools) {
+                        return Err(failure(
+                            "RoventPcNnuecResources",
+                            "shared readout requires one declared RuntimeHelper thread",
+                        ));
                     }
-                ) || sources.lock().manifest.engine.nnuec.is_some()
-                    || sources.collection_preload_sources().is_some()
-                    || prepared.snapshot().mode.has_native_r()
-                    || prepared.snapshot().process_epoch != clock.epoch().0
-                    || identity.name.is_empty()
-                    || identity.author.is_empty()
-                {
+                    let actual = loaded.model().registration().map_err(|error| {
+                        SearchSessionFailure::debug("RoventPcNnuecRegistration", &error)
+                    })?;
+                    if !loaded.matches_sources(sources)
+                        || loaded.input_lock_digest() != prepared.snapshot().input_lock
+                        || loaded.registration() != &actual
+                        || readout.context_namespace_policy != actual.context_namespace_policy()
+                        || readout.local_namespace_policy != actual.local_namespace_policy()
+                    {
+                        return Err(failure(
+                            "RoventPcNnuecStartup",
+                            "original NNUEC source/registration/namespace mismatch",
+                        ));
+                    }
+                }
+                _ => {
                     return Err(failure(
                         "RoventPcV2Startup",
-                        "unsupported V2 session profile",
+                        "shared readout and original loaded NNUEC owner must be selected together",
                     ));
                 }
-                let native_clock = prepared.service.ready_clock().ok_or_else(|| {
-                    failure("RoventPcV2Startup", "actual native Ready clock is absent")
-                })?;
-                let original_clock = clock.runtime_clock();
-                if prepared.service.is_quarantined()
-                    || prepared.service.native_acceptance_verifier().is_none()
-                    || native_clock.domain() != original_clock.domain()
-                    || native_clock.origin() != original_clock.origin()
-                    || prepared.snapshot().input_lock != sources.lock_digest()
-                {
-                    return Err(SearchSessionFailure::physical_completion_unknown());
-                }
-                let original_owner = rz_experiments::RoventOriginalInputLock::from_v2(Arc::clone(
-                    sources.lock_owner(),
-                ))
-                .map_err(|e| SearchSessionFailure::debug("RoventPcV2Lock", &e.error))?;
-                let namespace = prepared
-                    .snapshot()
-                    .model_namespace()
-                    .map_err(|e| SearchSessionFailure::debug("RoventPcNamespace", &e))?;
-                let model = AdaptivePortModel::new_with_namespace(
-                    prepared.snapshot().role_model_identity(),
-                    Some(
-                        prepared
-                            .snapshot()
-                            .model_value_identity()
-                            .map_err(|e| SearchSessionFailure::debug("RoventPcNamespace", &e))?,
-                    ),
-                    namespace,
-                )
-                .map_err(|e| SearchSessionFailure::debug("RoventPcModelMirror", &e))?;
-                let owner =
-                    PcSemanticOwner::new_selected_rovent(
-                        configuration.fields().semantic.actual().map_err(|e| {
-                            SearchSessionFailure::debug("RoventPcConfiguration", &e)
-                        })?,
-                        model,
-                        configuration.fields().review.actual().map_err(|e| {
-                            SearchSessionFailure::debug("RoventPcConfiguration", &e)
-                        })?,
-                        configuration.fields().index.actual().map_err(|e| {
-                            SearchSessionFailure::debug("RoventPcConfiguration", &e)
-                        })?,
-                    )
-                    .map_err(|e| SearchSessionFailure::debug("RoventPcSemanticOwner", &e))?;
-                let implementation =
-                    Self::implementation_digest_from_metadata(&configuration, root_policy)
-                        .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?;
-                let selective_policy = Digest(
-                    configuration
-                        .search_configuration_digest()
-                        .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
-                );
-                let frontier_limits = configuration
+            }
+            if sources.collection_preload_sources().is_some()
+                || prepared.snapshot().mode.has_native_r()
+                || prepared.snapshot().process_epoch != clock.epoch().0
+                || identity.name.is_empty()
+                || identity.author.is_empty()
+            {
+                return Err(failure(
+                    "RoventPcV2Startup",
+                    "unsupported V2 session profile",
+                ));
+            }
+            let native_clock = prepared.service.ready_clock().ok_or_else(|| {
+                failure("RoventPcV2Startup", "actual native Ready clock is absent")
+            })?;
+            let original_clock = clock.runtime_clock();
+            if prepared.service.is_quarantined()
+                || prepared.service.native_acceptance_verifier().is_none()
+                || native_clock.domain() != original_clock.domain()
+                || native_clock.origin() != original_clock.origin()
+                || prepared.snapshot().input_lock != sources.lock_digest()
+            {
+                return Err(SearchSessionFailure::physical_completion_unknown());
+            }
+            let original_owner =
+                rz_experiments::RoventOriginalInputLock::from_v2(Arc::clone(sources.lock_owner()))
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcV2Lock", &e.error))?;
+            let namespace = prepared
+                .snapshot()
+                .model_namespace()
+                .map_err(|e| SearchSessionFailure::debug("RoventPcNamespace", &e))?;
+            let model = AdaptivePortModel::new_with_namespace(
+                prepared.snapshot().role_model_identity(),
+                Some(
+                    prepared
+                        .snapshot()
+                        .model_value_identity()
+                        .map_err(|e| SearchSessionFailure::debug("RoventPcNamespace", &e))?,
+                ),
+                namespace,
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventPcModelMirror", &e))?;
+            let owner = PcSemanticOwner::new_selected_rovent(
+                configuration
                     .fields()
-                    .frontier
+                    .semantic
                     .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
+                model,
+                configuration
+                    .fields()
+                    .review
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
+                configuration
+                    .fields()
+                    .index
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventPcSemanticOwner", &e))?;
+            let implementation =
+                Self::implementation_digest_from_metadata(&configuration, root_policy)
                     .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?;
-                Ok((
-                    configuration,
-                    original_owner,
-                    owner,
-                    implementation,
-                    selective_policy,
-                    frontier_limits,
-                ))
-            })();
+            let selective_policy = Digest(
+                configuration
+                    .search_configuration_digest()
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
+            );
+            let frontier_limits = configuration
+                .fields()
+                .frontier
+                .actual()
+                .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?;
+            Ok((
+                configuration,
+                original_owner,
+                owner,
+                implementation,
+                selective_policy,
+                frontier_limits,
+            ))
+        })();
         let (
             configuration,
             original_owner,
@@ -634,6 +728,7 @@ impl RoventPcSessionDriver {
                     failure,
                     prepared,
                     process,
+                    loaded,
                 });
             }
         };
@@ -668,7 +763,10 @@ impl RoventPcSessionDriver {
             latest_v2: Mutex::new(None),
             latest_initial_v2: Mutex::new(None),
             retained_repair: Mutex::new(None),
-            shared_nnuec: None,
+            shared_nnuec: loaded.map(|loaded| SharedNnuecOwner {
+                loaded: SharedNnuecLoaded::V2(loaded),
+                actor: Mutex::new(SharedNnuecActor::default()),
+            }),
             storage: Mutex::new(None),
         })
     }
@@ -968,7 +1066,7 @@ impl RoventPcSessionDriver {
             latest_initial_v2: Mutex::new(None),
             retained_repair: Mutex::new(None),
             shared_nnuec: loaded.map(|loaded| SharedNnuecOwner {
-                loaded,
+                loaded: SharedNnuecLoaded::V1(loaded),
                 actor: Mutex::new(SharedNnuecActor::default()),
             }),
             storage: Mutex::new(None),
