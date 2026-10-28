@@ -4,14 +4,16 @@
 //! no root, dispatch, completion, target or Rules authority. The actual external
 //! owner must retain the returned custody through physical worker cleanup.
 
-use super::{PinnedBlob, RoventPinnedNativeSources, open_blob, read_blob};
+use super::{NativeInputLock, PinnedBlob, RoventPinnedNativeSources, open_blob, read_blob};
 use crate::pals_checker_profile::rovent::RoventExternalProfile;
 use crate::rovent_bootstrap::configuration::ExecutionConfiguration;
 use crate::rovent_bootstrap::{RoventStartupControl, fail};
 use crate::rovent_external_launch::{PreparedRoventExternalLaunch, RoventExternalSlot};
 use rz_contracts::Digest;
 use rz_eval::error::{BackendError, FailureKind as K};
-use rz_experiments::{ArtifactRef, RoventExternalPurpose, RoventResearcher};
+use rz_experiments::{
+    ArtifactRef, RoventExternalPurpose, RoventInputLock, RoventInputLockV2, RoventResearcher,
+};
 use rz_search::cpu_checker::CheckerError;
 use rz_search::external_cpu::{
     EXTERNAL_MIN_QUANTUM, EXTERNAL_STOP_DRAIN_RESERVE, ExternalEnginePurpose, ExternalGoConstraint,
@@ -42,8 +44,8 @@ pub struct RoventExternalRSourceSelection {
 
 /// Only `open` creates this bundle from the actual External researcher slot.
 /// P/C, teacher and arena declarations cannot be relabeled as ExternalR.
-pub struct RoventPinnedExternalRSource {
-    original: Arc<RoventPinnedNativeSources>,
+pub struct RoventPinnedExternalRSource<L = RoventInputLock> {
+    original: Arc<RoventPinnedNativeSources<L>>,
     purpose: RoventExternalPurpose,
     prepared: PreparedRoventExternalLaunch,
     source_profile: RoventExternalProfile,
@@ -56,27 +58,71 @@ pub struct RoventPinnedExternalRSource {
 
 /// Opaque original source custody for the physical external worker's owner.
 /// Keeping it alive is not evidence that the worker loaded any declared asset.
-pub struct RoventExternalRSourceCustody {
-    original: Arc<RoventPinnedNativeSources>,
+pub struct RoventExternalRSourceCustody<L = RoventInputLock> {
+    original: Arc<RoventPinnedNativeSources<L>>,
     purpose: RoventExternalPurpose,
     source_profile: RoventExternalProfile,
     _profile: PinnedBlob,
     _assets: Vec<(String, PinnedBlob)>,
 }
 
-impl RoventPinnedExternalRSource {
+/// Implementations are restricted by `NativeInputLock` to the exact /1 or /2
+/// lock; no alternate declaration can be substituted for the original owner.
+#[doc(hidden)]
+pub trait ExternalNativeInputLock: NativeInputLock {
+    fn prepare_external_r(
+        self: &Arc<Self>,
+        profile_bytes: &[u8],
+    ) -> Result<PreparedRoventExternalLaunch, CheckerError>;
+    fn original_wall_time_max_ms(&self) -> u64;
+}
+
+impl ExternalNativeInputLock for RoventInputLock {
+    fn prepare_external_r(
+        self: &Arc<Self>,
+        profile_bytes: &[u8],
+    ) -> Result<PreparedRoventExternalLaunch, CheckerError> {
+        PreparedRoventExternalLaunch::from_lock(self, RoventExternalSlot::Researcher, profile_bytes)
+    }
+    fn original_wall_time_max_ms(&self) -> u64 {
+        self.manifest.wall_time_max_ms
+    }
+}
+
+impl ExternalNativeInputLock for RoventInputLockV2 {
+    fn prepare_external_r(
+        self: &Arc<Self>,
+        profile_bytes: &[u8],
+    ) -> Result<PreparedRoventExternalLaunch, CheckerError> {
+        PreparedRoventExternalLaunch::from_lock_v2(
+            self,
+            RoventExternalSlot::Researcher,
+            profile_bytes,
+        )
+    }
+    fn original_wall_time_max_ms(&self) -> u64 {
+        self.manifest.wall_time_max_ms
+    }
+}
+
+impl<L: ExternalNativeInputLock> RoventPinnedExternalRSource<L> {
     /// Reuse the native owner's retained root capability and bounded artifact
     /// reader. Only this admission opens the selected snapshot paths; later
     /// consumption moves the original descriptors without reopening a path.
     pub fn open(
-        original: &Arc<RoventPinnedNativeSources>,
+        original: &Arc<RoventPinnedNativeSources<L>>,
         selection: &RoventExternalRSourceSelection,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
         control.check()?;
+        if !original.admits_original_startup_control(control) {
+            return Err(invalid(
+                "ExternalR startup control differs from native source owner",
+            ));
+        }
         original.validate_lock()?;
         control.check()?;
-        let pin = match &original.lock.manifest.engine.researcher {
+        let pin = match &original.lock.engine().researcher {
             Some(RoventResearcher::External { profile }) => profile.as_ref(),
             _ => return Err(invalid("original lock has no ExternalR source slot")),
         };
@@ -99,12 +145,10 @@ impl RoventPinnedExternalRSource {
         let profile = open_blob(root, pin.profile.clone(), PROFILE_MAX as u64)?;
         let original_profile_bytes = read_blob(&profile, PROFILE_MAX)?;
         control.check()?;
-        let prepared = PreparedRoventExternalLaunch::from_lock(
-            &original.lock,
-            RoventExternalSlot::Researcher,
-            &original_profile_bytes,
-        )
-        .map_err(|_| invalid("original ExternalR profile/capability declaration differs"))?;
+        let prepared = original
+            .lock
+            .prepare_external_r(&original_profile_bytes)
+            .map_err(|_| invalid("original ExternalR profile/capability declaration differs"))?;
         let declaration = prepared.profile();
         question_policy(original, declaration)?;
         if Path::new(&declaration.program) != original.private_root_path.join(&pin.binary.path)
@@ -126,11 +170,7 @@ impl RoventPinnedExternalRSource {
             if selected.purpose != expected.purpose
                 || selected.artifact.sha256 != expected.sha256
                 || !rz_experiments::pals_private_snapshot_path_v5(&selected.artifact.path)
-                || !original
-                    .lock
-                    .manifest
-                    .provenance
-                    .contains(&selected.artifact)
+                || !original.lock.provenance().contains(&selected.artifact)
                 || !paths.insert(selected.artifact.path.as_str())
             {
                 return Err(invalid(
@@ -217,7 +257,7 @@ impl RoventPinnedExternalRSource {
         Vec<u8>,
         File,
         File,
-        RoventExternalRSourceCustody,
+        RoventExternalRSourceCustody<L>,
     ) {
         (
             self.prepared,
@@ -235,7 +275,7 @@ impl RoventPinnedExternalRSource {
     }
 }
 
-impl RoventExternalRSourceCustody {
+impl<L: ExternalNativeInputLock> RoventExternalRSourceCustody<L> {
     pub fn input_lock_digest(&self) -> Digest {
         self.original.lock_digest()
     }
@@ -255,8 +295,8 @@ impl RoventExternalRSourceCustody {
     }
 }
 
-fn question_policy(
-    original: &RoventPinnedNativeSources,
+fn question_policy<L: ExternalNativeInputLock>(
+    original: &RoventPinnedNativeSources<L>,
     profile: &RoventExternalProfile,
 ) -> Result<(ExternalGoConstraint, Duration), BackendError> {
     if profile.purpose != ExternalEnginePurpose::ResearchChecker {
@@ -278,7 +318,7 @@ fn question_policy(
     profile
         .require_query(
             constraint,
-            original.lock.manifest.engine.search.searchmoves.is_some(),
+            original.lock.engine().search.searchmoves.is_some(),
         )
         .map_err(|error| match error {
             CheckerError::Unsupported(detail) => fail(K::UnsupportedModel, detail),
@@ -287,7 +327,7 @@ fn question_policy(
         })?;
     let stop_grace = Duration::from_millis(profile.stop_grace_ms);
     let task_wall = Duration::from_millis(profile.max_task_wall_time_ms);
-    let original_wall = Duration::from_millis(original.lock.manifest.wall_time_max_ms);
+    let original_wall = Duration::from_millis(original.lock.original_wall_time_max_ms());
     if quantum < EXTERNAL_MIN_QUANTUM
         || quantum > Duration::from_secs(180)
         || stop_grace < EXTERNAL_STOP_DRAIN_RESERVE

@@ -163,6 +163,7 @@ fn engine_storage_rejects_legacy_budget_without_issuing_a_replacement_original_g
     let legacy = RoventPcrRootAdmission {
         budget: Digest([19; 32]),
         original: None,
+        original_v2: None,
     };
     for admission in [None, Some(&legacy)] {
         let rejected = storage::original_storage_admission(admission).unwrap_err();

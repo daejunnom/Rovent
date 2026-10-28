@@ -12,8 +12,8 @@ use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_contracts::rovent::ExecutionMode;
 use rz_experiments::{
     ArtifactRef, ExternalSourceV2, ExternalUciEndpointV2, NativeEngineRole,
-    ROVENT_EXTERNAL_PROFILE_DOMAIN, RoventExternalProfilePin, RoventExternalPurpose,
-    RoventInputLock, RoventResearcher,
+    ROVENT_EXTERNAL_PROFILE_DOMAIN, RoventEngineDeclaration, RoventExternalProfilePin,
+    RoventExternalPurpose, RoventInputLock, RoventInputLockV2, RoventResearcher,
 };
 use rz_search::cpu_checker::{
     CheckerError, CheckerShutdown, ExternalProcessIdentity, ExternalUciIdentity,
@@ -28,6 +28,7 @@ use rz_search::external_cpu::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs::File;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -51,6 +52,7 @@ pub struct PreparedRoventExternalLaunch {
     canonical_sha256: String,
     capability_sha256: String,
     input_lock_sha256: Option<String>,
+    original_lock_v2: Option<Arc<RoventInputLockV2>>,
     mode: Option<ExecutionMode>,
     root_budget: Option<Digest>,
 }
@@ -119,8 +121,44 @@ impl PreparedRoventExternalLaunch {
     ) -> Result<Self, CheckerError> {
         lock.validate()
             .map_err(|_| invalid("invalid Rovent input lock"))?;
+        Self::from_validated_fields(
+            &lock.manifest.engine,
+            &lock.canonical_sha256,
+            &lock.manifest.coordinator.original_root_budget_sha256,
+            slot,
+            profile_bytes,
+        )
+    }
+
+    /// Select the slot from the actual /2 lock without creating a /1 lock.
+    /// This still grants no process, root or teacher-result authority.
+    pub fn from_lock_v2(
+        lock: &Arc<RoventInputLockV2>,
+        slot: RoventExternalSlot,
+        profile_bytes: &[u8],
+    ) -> Result<Self, CheckerError> {
+        lock.validate()
+            .map_err(|_| invalid("invalid Rovent input lock"))?;
+        let mut launch = Self::from_validated_fields(
+            &lock.manifest.engine,
+            &lock.canonical_sha256,
+            &lock.manifest.coordinator.original_root_budget_sha256,
+            slot,
+            profile_bytes,
+        )?;
+        launch.original_lock_v2 = Some(Arc::clone(lock));
+        Ok(launch)
+    }
+
+    fn from_validated_fields(
+        engine: &RoventEngineDeclaration,
+        lock_sha256: &str,
+        root_budget_sha256: &str,
+        slot: RoventExternalSlot,
+        profile_bytes: &[u8],
+    ) -> Result<Self, CheckerError> {
         let pin = match slot {
-            RoventExternalSlot::Researcher => match &lock.manifest.engine.researcher {
+            RoventExternalSlot::Researcher => match &engine.researcher {
                 Some(RoventResearcher::External { profile }) => profile.as_ref(),
                 _ => {
                     return Err(CheckerError::Unsupported(
@@ -128,14 +166,9 @@ impl PreparedRoventExternalLaunch {
                     ));
                 }
             },
-            RoventExternalSlot::Teacher { index } => lock
-                .manifest
-                .engine
-                .teachers
-                .get(index)
-                .ok_or(CheckerError::Unsupported(
-                    "manifest has no requested external teacher",
-                ))?,
+            RoventExternalSlot::Teacher { index } => engine.teachers.get(index).ok_or(
+                CheckerError::Unsupported("manifest has no requested external teacher"),
+            )?,
         };
         let expected = match slot {
             RoventExternalSlot::Researcher => RoventExternalPurpose::ResearchChecker,
@@ -145,11 +178,9 @@ impl PreparedRoventExternalLaunch {
             return Err(invalid("manifest external slot/purpose mismatch"));
         }
         let mut launch = Self::from_pin(pin, profile_bytes)?;
-        launch.input_lock_sha256 = Some(lock.canonical_sha256.clone());
-        launch.mode = Some(lock.manifest.engine.mode);
-        launch.root_budget = Some(digest(
-            &lock.manifest.coordinator.original_root_budget_sha256,
-        )?);
+        launch.input_lock_sha256 = Some(lock_sha256.to_owned());
+        launch.mode = Some(engine.mode);
+        launch.root_budget = Some(digest(root_budget_sha256)?);
         Ok(launch)
     }
 
@@ -179,6 +210,7 @@ impl PreparedRoventExternalLaunch {
             profile,
             binary: pin.binary.clone(),
             input_lock_sha256: None,
+            original_lock_v2: None,
             mode: None,
             root_budget: None,
         })
@@ -186,6 +218,11 @@ impl PreparedRoventExternalLaunch {
 
     pub fn profile(&self) -> &RoventExternalProfile {
         self.profile.profile()
+    }
+    /// Borrow the original /2 allocation for an actual owner join. This does
+    /// not establish a worker, root admission or physical-completion witness.
+    pub fn original_lock_owner_v2(&self) -> Option<&Arc<RoventInputLockV2>> {
+        self.original_lock_v2.as_ref()
     }
     pub fn canonical_sha256(&self) -> &str {
         &self.canonical_sha256
@@ -452,6 +489,7 @@ impl RoventExternalOwner {
         &mut self,
         job: ProfiledExternalJob,
     ) -> Result<ProfiledExternalDispatch, CheckerError> {
+        require_v1_legacy_external_access(self.launch.original_lock_v2.is_some())?;
         if self.active_root.is_some() {
             return Err(CheckerError::Unsupported(
                 "use actual-root external submission after live-root admission",
@@ -476,6 +514,7 @@ impl RoventExternalOwner {
         completion: &ProfiledExternalCompletion,
         dispatch: &ProfiledExternalDispatch,
     ) -> Result<(), CheckerError> {
+        require_v1_legacy_external_access(self.launch.original_lock_v2.is_some())?;
         if self.active_root.is_some() {
             return Err(CheckerError::Unsupported(
                 "use actual-root completion validation after live-root admission",
@@ -548,6 +587,15 @@ impl RoventExternalOwner {
     pub fn root_change_result(&self) -> Option<Result<ProfiledExternalRootFence, CheckerError>> {
         self.worker.root_change_result()
     }
+}
+
+fn require_v1_legacy_external_access(v2_lock: bool) -> Result<(), CheckerError> {
+    if v2_lock {
+        return Err(CheckerError::Unsupported(
+            "V2 external dispatch and completion require actual-root admission",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_pin(
@@ -797,6 +845,15 @@ mod tests {
                 .require_query(ExternalGoConstraint::Nodes { reported_nodes: 32 }, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_external_access_rejects_v2_without_live_root() {
+        assert!(require_v1_legacy_external_access(false).is_ok());
+        assert!(matches!(
+            require_v1_legacy_external_access(true),
+            Err(CheckerError::Unsupported(_))
+        ));
     }
 
     #[test]

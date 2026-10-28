@@ -18,6 +18,8 @@ use rz_search::pals::rovent_frontier::{
 use std::num::NonZeroU16;
 
 pub const ROVENT_NATIVE_ROOT_DOMAIN: &str = "rz-rovent-native-root/1";
+#[cfg(feature = "pals-adaptive")]
+pub const ROVENT_NATIVE_ROOT_V2_DOMAIN: &str = "rz-rovent-native-root/2";
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub const ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN: &str = "rz-rovent-profiled-external-root/1";
 
@@ -188,46 +190,100 @@ pub struct RoventNativeRootReceipt {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub profiled_physical: Option<crate::pals_adaptive::ProfiledExternalShutdownReceipt>,
 }
+
+/// Actual /2 capability and root observations. `physical` is sampled before
+/// the manager's owner return and is not the final root or process fence;
+/// missing evidence stays unknown and never certifies process completion.
+#[cfg(feature = "pals-adaptive")]
+#[derive(Clone, Debug)]
+pub struct RoventNativeRootReceiptV2 {
+    pub domain: &'static str,
+    pub authority: SearchAuthority,
+    pub mode: ExecutionMode,
+    pub input_lock: Digest,
+    pub root_budget: Digest,
+    pub root_admission: Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
+    pub frontier: Option<FrontierSnapshot>,
+    pub counters: AdaptiveManagerCounters,
+    pub native_accounting: Option<AdaptiveNativeAccountingSnapshot>,
+    pub native_reservations: crate::pals_adaptive::RoventNativeAccountingObservation,
+    pub physical: Option<AdaptiveShutdownReceipt>,
+}
+
+pub(super) enum RoventRootObservation {
+    V1(Arc<RoventNativeRootReceipt>),
+    #[cfg(feature = "pals-adaptive")]
+    V2(Arc<RoventNativeRootReceiptV2>),
+}
+impl RoventRootObservation {
+    pub(super) fn frontier(&self) -> Option<&FrontierSnapshot> {
+        match self {
+            Self::V1(receipt) => receipt.frontier.as_ref(),
+            #[cfg(feature = "pals-adaptive")]
+            Self::V2(receipt) => receipt.frontier.as_ref(),
+        }
+    }
+    pub(super) fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
+        match self {
+            Self::V1(receipt) => receipt.work(),
+            #[cfg(feature = "pals-adaptive")]
+            Self::V2(receipt) => receipt.work(),
+        }
+    }
+}
 impl RoventNativeRootReceipt {
     pub fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
-        let frontier = self.frontier.as_ref().ok_or_else(|| {
-            failure(
-                "RoventFrontierMissing",
-                "actual root never admitted its goal controller",
-            )
-        })?;
-        let visits = if frontier.work.native_usage_known {
-            Some(frontier.work.total_node_visits().ok_or_else(|| {
-                failure(
-                    "RoventWorkOverflow",
-                    "actual node observations overflow the registered domain",
-                )
-            })?)
-        } else {
-            None
-        };
-        Ok(DriverWork::RoventNative {
-            root_entries: frontier.work.root_entries,
-            total_node_visits: visits,
-            checked_transitions: frontier.work.checked_transitions,
-            native_nodes: frontier
-                .work
-                .native_usage_known
-                .then_some(frontier.work.native_nodes),
-            native_qsearch_nodes: frontier
-                .work
-                .native_usage_known
-                .then_some(frontier.work.native_qsearch_nodes),
-            submitted_role_tickets: self.counters.submitted_role_tickets,
-            consumed_role_outputs: self.counters.consumed_role_outputs,
-            completed_nn_inputs: (self.counters.nn_input_count_unknown == 0)
-                .then_some(self.counters.completed_nn_inputs),
-            consumed_nn_inputs: (self.counters.consumed_nn_input_count_unknown == 0)
-                .then_some(self.counters.consumed_nn_inputs),
-            completed_depth: frontier.horizon.completed_depth.map(|depth| depth.0),
-            maximum_examined_ply: frontier.horizon.maximum_examined_ply.0,
-        })
+        root_work(self.frontier.as_ref(), &self.counters)
     }
+}
+#[cfg(feature = "pals-adaptive")]
+impl RoventNativeRootReceiptV2 {
+    pub fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
+        root_work(self.frontier.as_ref(), &self.counters)
+    }
+}
+
+fn root_work(
+    frontier: Option<&FrontierSnapshot>,
+    counters: &AdaptiveManagerCounters,
+) -> Result<DriverWork, SearchSessionFailure> {
+    let frontier = frontier.ok_or_else(|| {
+        failure(
+            "RoventFrontierMissing",
+            "actual root never admitted its goal controller",
+        )
+    })?;
+    let visits = if frontier.work.native_usage_known {
+        Some(frontier.work.total_node_visits().ok_or_else(|| {
+            failure(
+                "RoventWorkOverflow",
+                "actual node observations overflow the registered domain",
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok(DriverWork::RoventNative {
+        root_entries: frontier.work.root_entries,
+        total_node_visits: visits,
+        checked_transitions: frontier.work.checked_transitions,
+        native_nodes: frontier
+            .work
+            .native_usage_known
+            .then_some(frontier.work.native_nodes),
+        native_qsearch_nodes: frontier
+            .work
+            .native_usage_known
+            .then_some(frontier.work.native_qsearch_nodes),
+        submitted_role_tickets: counters.submitted_role_tickets,
+        consumed_role_outputs: counters.consumed_role_outputs,
+        completed_nn_inputs: (counters.nn_input_count_unknown == 0)
+            .then_some(counters.completed_nn_inputs),
+        consumed_nn_inputs: (counters.consumed_nn_input_count_unknown == 0)
+            .then_some(counters.consumed_nn_inputs),
+        completed_depth: frontier.horizon.completed_depth.map(|depth| depth.0),
+        maximum_examined_ply: frontier.horizon.maximum_examined_ply.0,
+    })
 }
 
 impl<B> AdaptiveSessionDriver<B>
@@ -363,12 +419,21 @@ where
             .map(|receipt| receipt.clone())
             .map_err(|_| poisoned("Rovent root observation mutex poisoned"))
     }
+    #[cfg(feature = "pals-adaptive")]
+    pub fn latest_rovent_root_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventNativeRootReceiptV2>>, ContractError> {
+        self.latest_rovent_root_v2
+            .lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| poisoned("Rovent V2 root observation mutex poisoned"))
+    }
     pub(super) fn observe_rovent_root(
         &self,
         manager: &SessionManager<B>,
         context: &SearchSessionContext,
         admission: Option<&RoventPcrRootAdmission>,
-    ) -> Result<Option<Arc<RoventNativeRootReceipt>>, SearchSessionFailure> {
+    ) -> Result<Option<RoventRootObservation>, SearchSessionFailure> {
         let Some(profile) = &self.rovent else {
             return Ok(None);
         };
@@ -378,6 +443,48 @@ where
             .driver()
             .rovent_frontier_receipt()
             .map_err(|error| SearchSessionFailure::debug("RoventFrontierObservation", &error))?;
+        #[cfg(feature = "pals-adaptive")]
+        if let Some(original) = &admission.original_v2 {
+            if admission.original.is_some() {
+                return Err(failure(
+                    "RoventRootObservation",
+                    "multiple original root capabilities",
+                ));
+            }
+            #[cfg(feature = "onnx-cpu")]
+            if matches!(
+                self.researcher_class,
+                SessionResearcherClass::ProfiledExternal
+            ) {
+                return Err(failure(
+                    "RoventRootObservation",
+                    "V2 profiled external receipt is not connected",
+                ));
+            }
+            let receipt = Arc::new(RoventNativeRootReceiptV2 {
+                domain: ROVENT_NATIVE_ROOT_V2_DOMAIN,
+                authority: context.authority,
+                mode: profile.mode,
+                input_lock: profile.input_lock,
+                root_budget: admission.budget,
+                root_admission: Arc::clone(original),
+                frontier: actual.map(|receipt| receipt.snapshot),
+                counters: manager.counters(),
+                native_accounting: manager
+                    .root_observation_snapshot()
+                    .ok()
+                    .map(|observation| observation.native_accounting()),
+                native_reservations: manager.rovent_native_accounting(),
+                physical: manager.shutdown_receipt().ok(),
+            });
+            *self.latest_rovent_root_v2.lock().map_err(|_| {
+                failure(
+                    "RoventRootObservation",
+                    "Rovent V2 observation mutex poisoned",
+                )
+            })? = Some(Arc::clone(&receipt));
+            return Ok(Some(RoventRootObservation::V2(receipt)));
+        }
         let receipt = Arc::new(RoventNativeRootReceipt {
             domain: match self.researcher_class {
                 SessionResearcherClass::Legacy => ROVENT_NATIVE_ROOT_DOMAIN,
@@ -406,7 +513,7 @@ where
             .lock()
             .map_err(|_| failure("RoventRootObservation", "Rovent observation mutex poisoned"))? =
             Some(Arc::clone(&receipt));
-        Ok(Some(receipt))
+        Ok(Some(RoventRootObservation::V1(receipt)))
     }
     /// A normal control boundary closes admission without claiming a completed
     /// horizon. Only the original typed public-record bound joins control

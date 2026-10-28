@@ -6,10 +6,11 @@
 //! model reset, selected view, CPU thread or ledger is made here.
 
 use super::*;
-use crate::rovent_root_admission::source_seal::StoppedInitial;
+use crate::rovent_root_admission::source_seal::{StoppedInitial, StoppedInitialV2};
 use rz_runtime::contracts::ContractClock as _;
 
 pub const ROVENT_PCR_INITIAL_DOMAIN: &str = "rz-rovent-pcr-native-initial-stop/1";
+pub const ROVENT_PCR_INITIAL_DOMAIN_V2: &str = "rz-rovent-pcr-native-initial-stop/2";
 
 // One idle-custody slot per session retains its actual previous root receipt.
 // A larger variant does not add a queue or grant a new physical fence.
@@ -30,6 +31,35 @@ pub struct RoventPcrInitialReceipt {
     authority: SearchAuthority,
     source: Arc<StoppedInitial>,
     idle_custody: RoventPcrIdleCustody,
+}
+
+/// Producer-only /2 initial stop. Its source owns the original V2 lock and
+/// the idle custody retains the actual preceding physical receipt, if any.
+#[derive(Clone, Debug)]
+pub struct RoventPcrInitialReceiptV2 {
+    authority: SearchAuthority,
+    source: Arc<StoppedInitialV2>,
+    idle_custody: RoventPcrIdleCustody,
+}
+impl RoventPcrInitialReceiptV2 {
+    pub fn domain(&self) -> &'static str {
+        ROVENT_PCR_INITIAL_DOMAIN_V2
+    }
+    pub fn authority(&self) -> SearchAuthority {
+        self.authority
+    }
+    pub fn source(&self) -> &Arc<StoppedInitialV2> {
+        &self.source
+    }
+    pub fn previous_clean_root(&self) -> Option<&AdaptiveShutdownReceipt> {
+        match &self.idle_custody {
+            RoventPcrIdleCustody::RetiredRoot(receipt) => Some(receipt),
+            _ => None,
+        }
+    }
+    pub fn used_original_startup_ready(&self) -> bool {
+        matches!(self.idle_custody, RoventPcrIdleCustody::StartupReady)
+    }
 }
 impl RoventPcrInitialReceipt {
     pub fn domain(&self) -> &'static str {
@@ -62,23 +92,27 @@ impl RoventPcrInitialReceipt {
         }
     }
     fn report(&self) -> SearchSessionReport {
-        SearchSessionReport {
-            best_move: self.source.fallback(),
-            work: DriverWork::RoventNative {
-                root_entries: 0,
-                total_node_visits: Some(0),
-                checked_transitions: 0,
-                native_nodes: Some(0),
-                native_qsearch_nodes: Some(0),
-                submitted_role_tickets: 0,
-                consumed_role_outputs: 0,
-                completed_nn_inputs: Some(0),
-                consumed_nn_inputs: Some(0),
-                completed_depth: None,
-                maximum_examined_ply: 0,
-            },
-            mate_strategy: None,
-        }
+        stopped_report(self.source.fallback())
+    }
+}
+
+fn stopped_report(fallback: Option<BoardMove>) -> SearchSessionReport {
+    SearchSessionReport {
+        best_move: fallback,
+        work: DriverWork::RoventNative {
+            root_entries: 0,
+            total_node_visits: Some(0),
+            checked_transitions: 0,
+            native_nodes: Some(0),
+            native_qsearch_nodes: Some(0),
+            submitted_role_tickets: 0,
+            consumed_role_outputs: 0,
+            completed_nn_inputs: Some(0),
+            consumed_nn_inputs: Some(0),
+            completed_depth: None,
+            maximum_examined_ply: 0,
+        },
+        mate_strategy: None,
     }
 }
 
@@ -87,6 +121,15 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    pub fn latest_rovent_initial_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventPcrInitialReceiptV2>>, ContractError> {
+        self.latest_rovent_initial_v2
+            .lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| poisoned("Rovent V2 initial receipt owner poisoned"))
+    }
+
     pub fn latest_rovent_initial(
         &self,
     ) -> Result<Option<Arc<RoventPcrInitialReceipt>>, ContractError> {
@@ -104,37 +147,7 @@ where
         context: &SearchSessionContext,
         stopped: StoppedInitial,
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
-        let original = &self.clock.runtime_clock();
-        let ready = owners
-            .native
-            .ready_clock()
-            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
-        if self.closed.load(Ordering::Acquire)
-            || self.rovent_root_policy.is_none()
-            || owners.engine.is_none()
-            || owners.native_finished.is_some()
-            || owners.native_joined
-            || owners.native.is_quarantined()
-            || owners.native.occupancy() != 0
-            || ready.domain() != original.domain()
-            || ready.origin() != original.origin()
-            || matches!(
-                &owners.rovent_idle_custody,
-                RoventPcrIdleCustody::RetiredRoot(receipt) if !receipt.permits_root_reuse()
-            )
-            || {
-                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                {
-                    matches!(&owners.rovent_idle_custody, RoventPcrIdleCustody::RetiredProfiledRoot(receipt) if !receipt.permits_root_reuse())
-                }
-                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
-                {
-                    false
-                }
-            }
-        {
-            return Err(SearchSessionFailure::physical_completion_unknown());
-        }
+        self.validate_initial_idle(owners, self.rovent_root_policy.is_some())?;
         // No reset-request sequence or game/root metadata is consumed here.
         // Private custody plus the actual matching Ready clock/idle owner are
         // required; occupancy zero by itself never certifies physical reuse.
@@ -159,5 +172,82 @@ where
             .lock()
             .map_err(|_| SearchSessionFailure::physical_completion_unknown())? = Some(receipt);
         Ok(report)
+    }
+
+    /// /2 uses the exact original owner and the same idle physical custody;
+    /// the stopped source must not be reconstructed from metadata or a /1 lock.
+    pub(super) fn finish_rovent_initial_v2(
+        &self,
+        owners: &IdleOwners<B>,
+        context: &SearchSessionContext,
+        stopped: StoppedInitialV2,
+    ) -> Result<SearchSessionReport, SearchSessionFailure> {
+        let same_owner = self
+            .rovent_root_policy_v2
+            .as_ref()
+            .is_some_and(|policy| policy.owner.same_original_owner(stopped.owner()));
+        self.validate_initial_idle(owners, same_owner)?;
+        let receipt = Arc::new(RoventPcrInitialReceiptV2 {
+            authority: context.authority,
+            source: Arc::new(stopped),
+            idle_custody: owners.rovent_idle_custody.clone(),
+        });
+        let report = stopped_report(receipt.source.fallback());
+        let legal = receipt.source.allowed_root_moves().to_vec();
+        *self
+            .pending_output
+            .lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())? =
+            Some(PendingOutput {
+                authority: context.authority,
+                report: report.best_move,
+                legal,
+            });
+        *self
+            .latest_rovent_initial_v2
+            .lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())? = Some(receipt);
+        Ok(report)
+    }
+
+    /// Caller holds the actual idle mutex throughout both validation and receipt
+    /// publication. `registered` is checked before any state is consumed.
+    pub(super) fn validate_initial_idle(
+        &self,
+        owners: &IdleOwners<B>,
+        registered: bool,
+    ) -> Result<(), SearchSessionFailure> {
+        let original = &self.clock.runtime_clock();
+        let ready = owners
+            .native
+            .ready_clock()
+            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+        if self.closed.load(Ordering::Acquire)
+            || !registered
+            || owners.engine.is_none()
+            || owners.native_finished.is_some()
+            || owners.native_joined
+            || owners.native.is_quarantined()
+            || owners.native.occupancy() != 0
+            || ready.domain() != original.domain()
+            || ready.origin() != original.origin()
+            || matches!(
+                &owners.rovent_idle_custody,
+                RoventPcrIdleCustody::RetiredRoot(receipt) if !receipt.permits_root_reuse()
+            )
+            || {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                {
+                    matches!(&owners.rovent_idle_custody, RoventPcrIdleCustody::RetiredProfiledRoot(receipt) if !receipt.permits_root_reuse())
+                }
+                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                {
+                    false
+                }
+            }
+        {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        Ok(())
     }
 }

@@ -91,6 +91,11 @@ impl PreparedRoventExternalLaunch {
         cancel: &AtomicBool,
         process_permit: Option<CollectionProcessPermit>,
     ) -> Result<RoventCollectionTeacherOwner, CheckerError> {
+        // This path accepts only a /1 root. A /2 launch must never be joined
+        // to a different owner's /1 root using digest equality alone.
+        if self.original_lock_owner_v2().is_some() {
+            return Err(invalid("collection teacher /2 requires a /2 root owner"));
+        }
         if cancel.load(Ordering::Acquire) || Instant::now() >= startup_deadline {
             return Err(invalid("collection teacher startup canceled/expired"));
         }

@@ -25,13 +25,18 @@ pub use completion_observation::{
 #[cfg(feature = "pals-adaptive")]
 use initial_stop::RoventPcrIdleCustody;
 #[cfg(feature = "pals-adaptive")]
-pub use initial_stop::{ROVENT_PCR_INITIAL_DOMAIN, RoventPcrInitialReceipt};
-#[cfg(feature = "pals-adaptive")]
-use root_admission::RoventPcrRootPolicy;
+pub use initial_stop::{
+    ROVENT_PCR_INITIAL_DOMAIN, ROVENT_PCR_INITIAL_DOMAIN_V2, RoventPcrInitialReceipt,
+    RoventPcrInitialReceiptV2,
+};
 use root_admission::{RoventPcrRootAdmission, RoventPcrRootSource};
+#[cfg(feature = "pals-adaptive")]
+use root_admission::{RoventPcrRootPolicy, RoventPcrRootPolicyV2};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use rovent::ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN;
 pub use rovent::{ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile};
+#[cfg(feature = "pals-adaptive")]
+pub use rovent::{ROVENT_NATIVE_ROOT_V2_DOMAIN, RoventNativeRootReceiptV2};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use rovent_external::{
     RoventExternalSessionAdmissionRejection, RoventExternalSessionSource,
@@ -582,10 +587,16 @@ where
     rovent: Option<RoventPcrSessionProfile>,
     #[cfg(feature = "pals-adaptive")]
     rovent_root_policy: Option<RoventPcrRootPolicy>,
+    #[cfg(feature = "pals-adaptive")]
+    rovent_root_policy_v2: Option<RoventPcrRootPolicyV2>,
     rovent_collection_origin: Option<super::RoventNativeCollectionOrigin>,
     latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
     #[cfg(feature = "pals-adaptive")]
+    latest_rovent_root_v2: Mutex<Option<Arc<RoventNativeRootReceiptV2>>>,
+    #[cfg(feature = "pals-adaptive")]
     latest_rovent_initial: Mutex<Option<Arc<RoventPcrInitialReceipt>>>,
+    #[cfg(feature = "pals-adaptive")]
+    latest_rovent_initial_v2: Mutex<Option<Arc<RoventPcrInitialReceiptV2>>>,
     archive_receipts: Mutex<VecDeque<ArchiveWorkReceipt>>,
     pending_output: Mutex<Option<PendingOutput>>,
     accepted_outputs: Mutex<VecDeque<AdaptiveUciOutputObservation>>,
@@ -1267,10 +1278,16 @@ where
             rovent: None,
             #[cfg(feature = "pals-adaptive")]
             rovent_root_policy: None,
+            #[cfg(feature = "pals-adaptive")]
+            rovent_root_policy_v2: None,
             rovent_collection_origin: None,
             latest_rovent_root: Mutex::new(None),
             #[cfg(feature = "pals-adaptive")]
+            latest_rovent_root_v2: Mutex::new(None),
+            #[cfg(feature = "pals-adaptive")]
             latest_rovent_initial: Mutex::new(None),
+            #[cfg(feature = "pals-adaptive")]
+            latest_rovent_initial_v2: Mutex::new(None),
             archive_receipts: Mutex::new(VecDeque::with_capacity(64)),
             pending_output: Mutex::new(None),
             accepted_outputs: Mutex::new(VecDeque::with_capacity(64)),
@@ -1907,36 +1924,75 @@ where
         // Resolve the final source gate only while borrowing the actual idle
         // owner. Initially stopped product roots leave reset/game/Store/credit
         // unchanged and return no live capability or root-dependent work.
-        let root_admission = match root_source {
-            None => None,
-            Some(RoventPcrRootSource::Legacy(budget)) => Some(RoventPcrRootAdmission {
-                budget,
+        let root_admission =
+            match root_source {
+                None => None,
+                Some(RoventPcrRootSource::Legacy(budget)) => Some(RoventPcrRootAdmission {
+                    budget,
+                    #[cfg(feature = "pals-adaptive")]
+                    original: None,
+                    #[cfg(feature = "pals-adaptive")]
+                    original_v2: None,
+                }),
                 #[cfg(feature = "pals-adaptive")]
-                original: None,
-            }),
-            #[cfg(feature = "pals-adaptive")]
-            Some(RoventPcrRootSource::Original(source)) => {
-                use crate::rovent_root_admission::source_seal::InitialAdmissionOutcome;
-                match source
-                    .into_initial()
-                    .map_err(|error| SearchSessionFailure::debug("RoventRootAdmission", &error))?
-                {
-                    InitialAdmissionOutcome::Admitted(original) => {
-                        let original = Arc::new(original);
-                        Some(RoventPcrRootAdmission {
-                            budget: original.root_budget_digest(),
-                            original: Some(original),
-                        })
-                    }
-                    InitialAdmissionOutcome::StoppedInitial(stopped) => {
-                        let SessionState::Idle(owners) = &*state else {
-                            return Err(SearchSessionFailure::physical_completion_unknown());
-                        };
-                        return self.finish_rovent_initial(owners, context, stopped);
+                Some(RoventPcrRootSource::Original(source)) => {
+                    use crate::rovent_root_admission::source_seal::InitialAdmissionOutcome;
+                    match source.into_initial().map_err(|error| {
+                        SearchSessionFailure::debug("RoventRootAdmission", &error)
+                    })? {
+                        InitialAdmissionOutcome::Admitted(original) => {
+                            let original = Arc::new(original);
+                            Some(RoventPcrRootAdmission {
+                                budget: original.root_budget_digest(),
+                                original: Some(original),
+                                original_v2: None,
+                            })
+                        }
+                        InitialAdmissionOutcome::StoppedInitial(stopped) => {
+                            let SessionState::Idle(owners) = &*state else {
+                                return Err(SearchSessionFailure::physical_completion_unknown());
+                            };
+                            return self.finish_rovent_initial(owners, context, stopped);
+                        }
                     }
                 }
-            }
-        };
+                #[cfg(feature = "pals-adaptive")]
+                Some(RoventPcrRootSource::OriginalV2(source)) => {
+                    use crate::rovent_root_admission::source_seal::InitialAdmissionOutcomeV2;
+                    let SessionState::Idle(owners) = &*state else {
+                        return Err(SearchSessionFailure::physical_completion_unknown());
+                    };
+                    let original_owner = self
+                        .rovent_root_policy_v2
+                        .as_ref()
+                        .is_some_and(|policy| policy.owner.same_original_owner(source.owner()));
+                    self.validate_initial_idle(owners, original_owner)?;
+                    match source.into_initial().map_err(|error| {
+                        SearchSessionFailure::debug("RoventRootAdmissionV2", &error)
+                    })? {
+                        InitialAdmissionOutcomeV2::Admitted(original) => {
+                            let budget =
+                                original
+                                    .descriptor()
+                                    .root_budget_digest()
+                                    .map_err(|error| {
+                                        SearchSessionFailure::debug("RoventRootBudgetV2", &error)
+                                    })?;
+                            Some(RoventPcrRootAdmission {
+                                budget,
+                                original: None,
+                                original_v2: Some(Arc::new(original)),
+                            })
+                        }
+                        InitialAdmissionOutcomeV2::StoppedInitial(stopped) => {
+                            let SessionState::Idle(owners) = &*state else {
+                                return Err(SearchSessionFailure::physical_completion_unknown());
+                            };
+                            return self.finish_rovent_initial_v2(owners, context, stopped);
+                        }
+                    }
+                }
+            };
         let mut initial_game = InitialGameFailureGuard {
             closed: &self.closed,
             armed: false,
@@ -2619,7 +2675,7 @@ where
         initial_game.armed = false;
         let mate_strategy = rovent_receipt
             .as_ref()
-            .and_then(|receipt| receipt.frontier.as_ref())
+            .and_then(|receipt| receipt.frontier())
             .and_then(|frontier| frontier.mate_strategy.clone())
             .filter(|strategy| result.best_move == Some(strategy.best_move()));
         Ok(SearchSessionReport {
@@ -2969,7 +3025,7 @@ where
     fn supports_ponder_clock(&self) -> bool {
         #[cfg(feature = "pals-adaptive")]
         {
-            self.rovent_root_policy.is_some()
+            self.rovent_root_policy.is_some() || self.rovent_root_policy_v2.is_some()
         }
         #[cfg(not(feature = "pals-adaptive"))]
         {
@@ -3005,6 +3061,27 @@ where
                 position,
                 go,
                 &registered.lock,
+                registered.policy,
+                profile.maximum_goal_plies,
+            )
+            .map_err(|error| {
+                ContractError::new(ErrorCode::InvalidInput, Stage::Admission, error.detail)
+            })?;
+        }
+        #[cfg(feature = "pals-adaptive")]
+        if let Some(registered) = &self.rovent_root_policy_v2 {
+            let profile = self
+                .rovent
+                .as_ref()
+                .ok_or_else(|| poisoned("Rovent startup profile absent"))?;
+            let lock = registered
+                .owner
+                .v2()
+                .ok_or_else(|| poisoned("Rovent /2 startup lock absent"))?;
+            crate::rovent_root_admission::preadmission::validate_go_v2(
+                position,
+                go,
+                lock,
                 registered.policy,
                 profile.maximum_goal_plies,
             )

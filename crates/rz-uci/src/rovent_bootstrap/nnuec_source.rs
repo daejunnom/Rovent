@@ -5,11 +5,12 @@
 //! numerical acceptance. Raw artifact hashes and semantic parameter hashes are
 //! deliberately different identities and are checked independently.
 
+use super::pinned::NativeInputLock;
 use super::{RoventPinnedNativeSources, RoventStartupControl, fail, hex};
 use rz_contracts::Digest;
 use rz_eval::asset::parse_sha256;
 use rz_eval::error::{BackendError, CauseCode, FailureKind as K};
-use rz_experiments::{ArtifactRef, RoventNnuecPin, decode_json};
+use rz_experiments::{ArtifactRef, RoventInputLock, RoventNnuecPin, decode_json};
 use rz_search::cpu_value::nnuec::v2::Model;
 use rz_search::cpu_value::nnuec::v2::registration::NnuecV2Registration;
 use rz_search::cpu_value::{CpuTrainingState, CpuValueIdentity};
@@ -26,21 +27,32 @@ const MAX_PROVENANCE_ARTIFACTS: usize = 32;
 /// model, compiled registration and exact startup lock. Keeping the source Arc
 /// also keeps its original directory and file descriptors alive.
 /// Clone은 같은 source/model Arc를 공유하며 재로딩이나 새 권한을 발급하지 않는다.
-#[derive(Clone)]
-pub struct LoadedRoventNnuecSource {
-    sources: Arc<RoventPinnedNativeSources>,
+pub struct LoadedRoventNnuecSource<L = RoventInputLock> {
+    sources: Arc<RoventPinnedNativeSources<L>>,
     model: Arc<Model>,
     registration: NnuecV2Registration,
     weights_artifact: ArtifactRef,
     provenance_artifact: ArtifactRef,
 }
 
-impl LoadedRoventNnuecSource {
-    pub fn matches_sources(&self, sources: &Arc<RoventPinnedNativeSources>) -> bool {
+impl<L> Clone for LoadedRoventNnuecSource<L> {
+    fn clone(&self) -> Self {
+        Self {
+            sources: Arc::clone(&self.sources),
+            model: Arc::clone(&self.model),
+            registration: self.registration.clone(),
+            weights_artifact: self.weights_artifact.clone(),
+            provenance_artifact: self.provenance_artifact.clone(),
+        }
+    }
+}
+
+impl<L: NativeInputLock> LoadedRoventNnuecSource<L> {
+    pub fn matches_sources(&self, sources: &Arc<RoventPinnedNativeSources<L>>) -> bool {
         Arc::ptr_eq(&self.sources, sources)
     }
     pub fn load(
-        sources: Arc<RoventPinnedNativeSources>,
+        sources: Arc<RoventPinnedNativeSources<L>>,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
         let verified = verify_source_metadata(&sources, control)?;
@@ -121,27 +133,28 @@ struct VerifiedNnuecMetadata {
     provenance_artifact: ArtifactRef,
 }
 
-fn verify_source_metadata(
-    sources: &RoventPinnedNativeSources,
+fn verify_source_metadata<L: NativeInputLock>(
+    sources: &RoventPinnedNativeSources<L>,
     control: &RoventStartupControl,
 ) -> Result<VerifiedNnuecMetadata, BackendError> {
     control.check()?;
-    sources.lock().validate().map_err(|error| {
+    if !sources.admits_original_startup_control(control) {
+        return Err(mismatch(
+            "original NNUEC startup control differs from native sources",
+        ));
+    }
+    sources.lock().validate_original().map_err(|error| {
         invalid("original NNUEC input lock").with_external_cause(CauseCode::ProfileParse, &error)
     })?;
-    sources.configuration().admit_against(sources.lock())?;
-    let pin = sources
+    sources
         .lock()
-        .manifest
-        .engine
-        .nnuec
-        .as_ref()
-        .ok_or_else(|| {
-            fail(
-                K::UnsupportedModel,
-                "original startup does not declare NNUEC",
-            )
-        })?;
+        .admit_configuration(sources.configuration())?;
+    let pin = sources.lock().engine().nnuec.as_ref().ok_or_else(|| {
+        fail(
+            K::UnsupportedModel,
+            "original startup does not declare NNUEC",
+        )
+    })?;
     if !(1..=NNUEC_WEIGHTS_MAX_BYTES as u64).contains(&pin.weights.bytes)
         || !(1..=NNUEC_PROVENANCE_MAX_BYTES as u64).contains(&pin.provenance.bytes)
     {
@@ -187,7 +200,7 @@ fn verify_source_metadata(
     })?;
     verify_declarations(
         pin,
-        &sources.lock().manifest.provenance,
+        sources.lock().provenance(),
         sources.configuration().nnuec_conditions_digest()?,
         &body,
         &model,

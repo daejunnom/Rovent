@@ -164,6 +164,7 @@ mod native_lock_sealed {
 
 #[doc(hidden)]
 pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
+    fn validate_original(&self) -> Result<(), rz_experiments::ManifestError>;
     fn engine(&self) -> &rz_experiments::RoventEngineDeclaration;
     fn provenance(&self) -> &[ArtifactRef];
     fn canonical_sha256(&self) -> &str;
@@ -186,6 +187,9 @@ pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
 
 impl native_lock_sealed::Sealed for RoventInputLock {}
 impl NativeInputLock for RoventInputLock {
+    fn validate_original(&self) -> Result<(), rz_experiments::ManifestError> {
+        self.validate()
+    }
     fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
         &self.manifest.engine
     }
@@ -236,6 +240,9 @@ impl NativeInputLock for RoventInputLock {
 
 impl native_lock_sealed::Sealed for RoventInputLockV2 {}
 impl NativeInputLock for RoventInputLockV2 {
+    fn validate_original(&self) -> Result<(), rz_experiments::ManifestError> {
+        self.validate()
+    }
     fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
         &self.manifest.engine
     }
@@ -411,6 +418,13 @@ fn same_directory_identity(_left: &Dir, _right: &Dir) -> Result<bool, BackendErr
 }
 
 impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
+    /// V2 source admission and NNUEC startup share the same cancellation
+    /// allocation and unrenewed deadlines. Legacy /1 keeps its prior behavior.
+    pub(crate) fn admits_original_startup_control(&self, control: &RoventStartupControl) -> bool {
+        self.original_v2_control
+            .as_ref()
+            .is_none_or(|original| same_startup_control(original, control))
+    }
     fn open_selected(
         lock: Arc<L>,
         root: Dir,
