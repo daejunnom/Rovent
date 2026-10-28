@@ -419,7 +419,13 @@ class RetirementFailureReportingTests(unittest.TestCase):
                  retirement.retire_prepared_normal_deferred_selected_numeric_code),
                 (retirement.PreparedNormalDeferredSelectedNumericCode,
                  retirement.audit_prepared_normal_deferred_selected_native_code,
-                 retirement.retire_prepared_normal_deferred_selected_native_code)):
+                 retirement.retire_prepared_normal_deferred_selected_native_code),
+                (retirement.PreparedNormalDeferredSelectedNativeCode,
+                 retirement.audit_prepared_normal_deferred_selected_utility_code,
+                 retirement.retire_prepared_normal_deferred_selected_utility_code),
+                (retirement.PreparedNormalDeferredSelectedUtilityCode,
+                 retirement.audit_prepared_normal_deferred_selected_numeric_code,
+                 retirement.retire_prepared_normal_deferred_selected_numeric_code)):
             foreign = object.__new__(foreign_type)
             with self.subTest(foreign=foreign_type.__name__):
                 with self.assertRaises(StorageError):
@@ -448,6 +454,9 @@ class RetirementFailureReportingTests(unittest.TestCase):
                  retirement.review.NATIVE_CODE_PROFILE),
                 (retirement.PreparedNormalDeferredSelectedNativeCode,
                  retirement.retire_prepared_normal_deferred_selected_native_code,
+                 retirement.review.NUMERIC_CODE_PROFILE),
+                (retirement.PreparedNormalDeferredSelectedUtilityCode,
+                 retirement.retire_prepared_normal_deferred_selected_utility_code,
                  retirement.review.NUMERIC_CODE_PROFILE)):
             for boundary, raw in (("decode", b"{"),
                                   ("profile", json.dumps({"profile": other_profile}).encode("utf-8"))):

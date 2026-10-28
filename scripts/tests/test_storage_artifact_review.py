@@ -121,6 +121,44 @@ class NumericCodePlanDeclarationTests(unittest.TestCase):
                     with self.assertRaises(StorageError):
                         prepare(mixed)
 
+    def test_utility_plan_is_exact_target_and_cannot_be_mixed(self):
+        value = self.plan("utility-kind")
+        value.update(schema=review.UTILITY_CODE_PLAN_SCHEMA, profile=review.UTILITY_CODE_PROFILE)
+        value["code"][0].update(relative=review.UTILITY_CODE_RELATIVE,
+                                tar_member=review.UTILITY_CODE_TAR_MEMBER)
+        proposal = review.prepare_normal_deferred_selected_utility_code_plan(value)
+        self.assertEqual(proposal["plan"], value)
+        self.assertFalse(proposal["retirement_authority_issued"])
+        self.assertFalse(proposal["deletion_performed"])
+        spec = review._normal_deferred_selected_code_spec(review.UTILITY_CODE_PROFILE)
+        self.assertEqual(spec["target"], "rz-rovent-utility-trainer")
+        self.assertEqual(spec["requested_features"], ("pals-collection-onnx", "native-cuda"))
+        utility_reference = self.raw_pin("/fixture-utility-kind/inputs/keeper-utility-kind/" +
+                                         review.UTILITY_CODE_RELATIVE, b"other protected utility")
+        with_utility_reference = copy.deepcopy(value)
+        with_utility_reference["protected_reference_pins"].append(utility_reference)
+        self.assertEqual(review.prepare_normal_deferred_selected_utility_code_plan(
+            with_utility_reference)["plan"], with_utility_reference)
+        wrong_reference = copy.deepcopy(with_utility_reference)
+        wrong_reference["protected_reference_pins"][-1]["path"] += "-unregistered"
+        with self.assertRaises(StorageError):
+            review.prepare_normal_deferred_selected_utility_code_plan(wrong_reference)
+        wrong_reference["protected_reference_pins"][-1]["path"] = (
+            value["output"] + "/" + review.UTILITY_CODE_RELATIVE)
+        with self.assertRaises(StorageError):
+            review.prepare_normal_deferred_selected_utility_code_plan(wrong_reference)
+        for field in ("schema", "profile", "relative", "tar_member"):
+            mixed = copy.deepcopy(value)
+            native = self.plan("utility-other", native=True)
+            if field in ("relative", "tar_member"):
+                mixed["code"][0][field] = native["code"][0][field]
+            else:
+                mixed[field] = native[field]
+            with self.subTest(field=field), self.assertRaises(StorageError):
+                review.prepare_normal_deferred_selected_utility_code_plan(mixed)
+        with self.assertRaises(StorageError):
+            review.prepare_normal_deferred_selected_numeric_code_plan(value)
+
     def test_empty_raw_evidence_requires_empty_hash_and_other_payloads_stay_positive(self):
         value = self.plan("empty-evidence")
         raw_path = value["raw_evidence"][0]["pin"]["path"]
@@ -306,12 +344,15 @@ lease.finish(status="fixture_original_children_closed",tree_gone=True)
 
         raw = self.code.read_bytes()
         source_commit = hashlib.sha1(b"bounded keeper source fixture").hexdigest()
-        profiles = (review.NUMERIC_CODE_PROFILE, review.NATIVE_CODE_PROFILE)
+        profiles = ((review.NUMERIC_CODE_PROFILE, review.NATIVE_CODE_PROFILE),
+                    (review.NATIVE_CODE_PROFILE, review.NUMERIC_CODE_PROFILE),
+                    (review.UTILITY_CODE_PROFILE, review.NATIVE_CODE_PROFILE))
         declared_features = {
             review.NUMERIC_CODE_PROFILE: ("onnx", "contracts"),
             review.NATIVE_CODE_PROFILE: ("pals-collection-onnx", "native-cuda", "native-validation-diagnostics"),
+            review.UTILITY_CODE_PROFILE: ("pals-collection-onnx", "native-cuda"),
         }
-        for profile, other_profile in (profiles, profiles[::-1]):
+        for profile, other_profile in profiles:
             spec = review._normal_deferred_selected_code_spec(profile)
             other = review._normal_deferred_selected_code_spec(other_profile)
             self.assertEqual(spec["requested_features"], declared_features[profile])

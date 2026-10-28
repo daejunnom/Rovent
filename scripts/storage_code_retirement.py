@@ -952,10 +952,15 @@ class PreparedNormalDeferredSelectedNativeCode(_PreparedNormalDeferredSelectedCo
     __slots__ = ()
 
 
+class PreparedNormalDeferredSelectedUtilityCode(_PreparedNormalDeferredSelectedCode):
+    __slots__ = ()
+
+
 def _selected_code_proof_type(profile):
     review._normal_deferred_selected_code_spec(profile)
-    return (PreparedNormalDeferredSelectedNumericCode if profile == review.NUMERIC_CODE_PROFILE
-            else PreparedNormalDeferredSelectedNativeCode)
+    return {review.NUMERIC_CODE_PROFILE: PreparedNormalDeferredSelectedNumericCode,
+            review.NATIVE_CODE_PROFILE: PreparedNormalDeferredSelectedNativeCode,
+            review.UTILITY_CODE_PROFILE: PreparedNormalDeferredSelectedUtilityCode}[profile]
 
 
 def _prepare_normal_deferred_selected_code(plan_pin, *, profile, hard_until, seconds=300):
@@ -1020,6 +1025,11 @@ def prepare_normal_deferred_selected_native_code(plan_pin, *, hard_until, second
         hard_until=hard_until, seconds=seconds)
 
 
+def prepare_normal_deferred_selected_utility_code(plan_pin, *, hard_until, seconds=300):
+    return _prepare_normal_deferred_selected_code(plan_pin, profile=review.UTILITY_CODE_PROFILE,
+        hard_until=hard_until, seconds=seconds)
+
+
 def _numeric_target_row(plan, row):
     _need(type(row) is dict and row.get("schema") == "rovezero.managed-output.v1"
           and row.get("key") == plan["key"] and row.get("output") == plan["output"]
@@ -1059,6 +1069,10 @@ def audit_prepared_normal_deferred_selected_numeric_code(prepared):
 
 def audit_prepared_normal_deferred_selected_native_code(prepared):
     return _audit_prepared_normal_deferred_selected_code(prepared, review.NATIVE_CODE_PROFILE)
+
+
+def audit_prepared_normal_deferred_selected_utility_code(prepared):
+    return _audit_prepared_normal_deferred_selected_code(prepared, review.UTILITY_CODE_PROFILE)
 
 
 def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowed_live_view,
@@ -1198,5 +1212,12 @@ def retire_prepared_normal_deferred_selected_numeric_code(prepared, *, borrowed_
 def retire_prepared_normal_deferred_selected_native_code(prepared, *, borrowed_live_view,
         source_pack, actual_originals, same_guard):
     return _retire_prepared_normal_deferred_selected_code(prepared, profile=review.NATIVE_CODE_PROFILE,
+        borrowed_live_view=borrowed_live_view, source_pack=source_pack,
+        actual_originals=actual_originals, same_guard=same_guard)
+
+
+def retire_prepared_normal_deferred_selected_utility_code(prepared, *, borrowed_live_view,
+        source_pack, actual_originals, same_guard):
+    return _retire_prepared_normal_deferred_selected_code(prepared, profile=review.UTILITY_CODE_PROFILE,
         borrowed_live_view=borrowed_live_view, source_pack=source_pack,
         actual_originals=actual_originals, same_guard=same_guard)

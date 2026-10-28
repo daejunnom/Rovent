@@ -39,6 +39,10 @@ NATIVE_CODE_PROFILE = "normal-deferred-selected-native-code"
 NATIVE_CODE_PLAN_SCHEMA = "rovezero.normal-deferred-selected-native-code-plan.v1"
 NATIVE_CODE_RELATIVE = "selected-native/rz-rovent-native"
 NATIVE_CODE_TAR_MEMBER = "bin/rz-rovent-native"
+UTILITY_CODE_PROFILE = "normal-deferred-selected-utility-code"
+UTILITY_CODE_PLAN_SCHEMA = "rovezero.normal-deferred-selected-utility-code-plan.v1"
+UTILITY_CODE_RELATIVE = "rz-rovent-utility-trainer"
+UTILITY_CODE_TAR_MEMBER = "bin/rz-rovent-utility-trainer"
 
 
 def need(value, message):
@@ -303,11 +307,15 @@ def _normal_deferred_selected_code_spec(profile):
     if profile == NUMERIC_CODE_PROFILE:
         schema, relative, member, target, features = (NUMERIC_CODE_PLAN_SCHEMA, NUMERIC_CODE_RELATIVE,
             NUMERIC_CODE_TAR_MEMBER, "virtual_review_numeric_capture", ("onnx", "contracts"))
-    else:
-        need(profile == NATIVE_CODE_PROFILE, "explicit normal deferred selected code profile required")
+    elif profile == NATIVE_CODE_PROFILE:
         schema, relative, member, target, features = (NATIVE_CODE_PLAN_SCHEMA, NATIVE_CODE_RELATIVE,
             NATIVE_CODE_TAR_MEMBER, "rz-rovent-native",
             ("pals-collection-onnx", "native-cuda", "native-validation-diagnostics"))
+    else:
+        need(profile == UTILITY_CODE_PROFILE, "explicit normal deferred selected code profile required")
+        schema, relative, member, target, features = (UTILITY_CODE_PLAN_SCHEMA, UTILITY_CODE_RELATIVE,
+            UTILITY_CODE_TAR_MEMBER, "rz-rovent-utility-trainer",
+            ("pals-collection-onnx", "native-cuda"))
     need(target in CODE_NAMES, "registered CI selected code target required")
     return {"profile": profile, "schema": schema, "relative": relative, "tar_member": member,
             "target": target, "requested_features": features}
@@ -394,9 +402,13 @@ def _prepare_normal_deferred_selected_code_plan(value, profile):
             reference = PurePosixPath(pin["path"])
             need(reference.is_relative_to(output.parent), "protected references are registered code inputs only")
             relative = reference.relative_to(output.parent)
-            need(len(relative.parts) == 3 and relative.parts[1] in
+            nested_code = (len(relative.parts) == 3 and relative.parts[1] in
                  ("selected-native", "selected-numeric", "selected-numerical-gate", "selected4", "private-elf")
-                 and relative.name in CODE_NAMES, "model/runtime payloads are not selected code retirement inputs")
+                 and relative.name in CODE_NAMES)
+            utility_root_code = (profile == UTILITY_CODE_PROFILE and len(relative.parts) == 2
+                                 and relative.name == UTILITY_CODE_RELATIVE)
+            need(nested_code or utility_root_code,
+                 "model/runtime payloads are not selected code retirement inputs")
             need(pin["path"] not in reference_paths and pin["path"] != candidate,
                  "candidate is a current protected reference or reference path is duplicated")
             reference_paths.add(pin["path"])
@@ -424,6 +436,10 @@ def prepare_normal_deferred_selected_native_code_plan(value):
     return _prepare_normal_deferred_selected_code_plan(value, NATIVE_CODE_PROFILE)
 
 
+def prepare_normal_deferred_selected_utility_code_plan(value):
+    return _prepare_normal_deferred_selected_code_plan(value, UTILITY_CODE_PROFILE)
+
+
 def _read_normal_deferred_selected_code_plan(inputs, plan_pin, profile):
     """Read a complete data plan; live FD/View/owner checks remain mandatory."""
     plan = decode(inputs.open(plan_pin, INVENTORY_CAP).read(INVENTORY_CAP + 1))
@@ -442,6 +458,10 @@ def read_normal_deferred_selected_numeric_code_plan(inputs, plan_pin):
 
 def read_normal_deferred_selected_native_code_plan(inputs, plan_pin):
     return _read_normal_deferred_selected_code_plan(inputs, plan_pin, NATIVE_CODE_PROFILE)
+
+
+def read_normal_deferred_selected_utility_code_plan(inputs, plan_pin):
+    return _read_normal_deferred_selected_code_plan(inputs, plan_pin, UTILITY_CODE_PROFILE)
 
 
 def audit_code_cache(plan_pin, *, seconds=300):
