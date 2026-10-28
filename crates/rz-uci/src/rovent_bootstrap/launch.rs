@@ -32,7 +32,7 @@ use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use rz_contracts::ProcessEpoch;
 use rz_eval::pals_onnx::virtual_review::VirtualReviewProfileDirectory;
-use rz_experiments::{ArtifactRef, RoventDevice, RoventInputLock};
+use rz_experiments::{ArtifactRef, RoventDevice, RoventInputLock, RoventInputLockV2};
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
 use serde::Deserialize;
 use std::{
@@ -602,6 +602,24 @@ pub fn run_with_resource_admission<'a>(
 type ResourceAdmission<'a> =
     Box<dyn FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a>;
 
+/// Identify a validated /2 lock without projecting it into the legacy /1
+/// process, storage, and root owners. The actual /2 admission path is not yet
+/// connected. This boundary does not load a model or issue any authority.
+fn parse_launch_lock(bytes: &[u8]) -> Result<Arc<RoventInputLock>, RoventLaunchError> {
+    let input =
+        std::str::from_utf8(bytes).map_err(|_| error("InputLock", "UTF-8 input required"))?;
+    match RoventInputLock::from_json(input) {
+        Ok(lock) => Ok(Arc::new(lock)),
+        Err(original_failure) => match RoventInputLockV2::from_json(input) {
+            Ok(_original_v2) => Err(error(
+                "InputLockUnsupportedV2",
+                "the original /2 lock cannot yet enter UCI process and root admission",
+            )),
+            Err(_) => Err(error("InputLock", original_failure)),
+        },
+    }
+}
+
 type ProductRunner<'a> = Box<
     dyn FnOnce(
             RoventNativeProductDriver,
@@ -658,13 +676,7 @@ fn run_inner<'a>(
         .map_err(|failure| error("InputLock", failure))?
         .into_std();
     let lock_bytes = read_bounded(&lock_file, MAX_LOCK_BYTES)?;
-    let lock = Arc::new(
-        RoventInputLock::from_json(
-            std::str::from_utf8(&lock_bytes)
-                .map_err(|_| error("InputLock", "UTF-8 input required"))?,
-        )
-        .map_err(|failure| error("InputLock", failure))?,
-    );
+    let lock = parse_launch_lock(&lock_bytes)?;
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
         return Err(error(
             "StartupWindow",

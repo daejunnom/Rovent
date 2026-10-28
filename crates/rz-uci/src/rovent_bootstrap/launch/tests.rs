@@ -1,5 +1,56 @@
 use super::*;
 
+#[test]
+fn launch_retains_v1_and_rejects_valid_v2_without_projecting_it() {
+    use rz_contracts::rovent::ExecutionMode;
+    use rz_experiments::{
+        ROVENT_EXECUTION_V2_DOMAIN, RoventExecutionManifest, RoventExecutionManifestV2,
+        RoventOwnRNotApplicableV2, RoventRootTieDeclarationV2,
+    };
+
+    let wire = crate::rovent_bootstrap::tests::wire(ExecutionMode::CpuPc);
+    let base = RoventExecutionManifest::from_json(&wire.to_string()).unwrap();
+    let v1 = base.clone().lock().unwrap();
+    let v1_bytes = serde_json::to_vec(&v1).unwrap();
+    let original = parse_launch_lock(&v1_bytes).unwrap();
+    assert_eq!(*original, v1);
+
+    let v2 = RoventExecutionManifestV2 {
+        domain: ROVENT_EXECUTION_V2_DOMAIN.into(),
+        contract_revision: base.contract_revision,
+        run_id: base.run_id,
+        purpose: base.purpose,
+        startup_document: base.engine.binary.clone(),
+        startup_search_configuration_sha256: base.engine.search.search_configuration_sha256.clone(),
+        startup_configuration_sha256: base.coordinator.policy_sha256.clone(),
+        engine: base.engine,
+        resources: base.resources,
+        coordinator: base.coordinator,
+        wall_time_max_ms: base.wall_time_max_ms,
+        cleanup_max_ms: base.cleanup_max_ms,
+        output_bytes_max: base.output_bytes_max,
+        agent_renewable: base.agent_renewable,
+        provenance: base.provenance,
+        own_r_root_tie: RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::PcOnly,
+        },
+    }
+    .lock()
+    .unwrap();
+    let failure = parse_launch_lock(&serde_json::to_vec(&v2).unwrap()).unwrap_err();
+    assert_eq!(failure.stage, "InputLockUnsupportedV2");
+
+    let mut invalid = v2;
+    invalid.canonical_sha256 = "0".repeat(64);
+    let invalid_bytes = serde_json::to_vec(&invalid).unwrap();
+    let legacy_failure =
+        RoventInputLock::from_json(std::str::from_utf8(&invalid_bytes).unwrap()).unwrap_err();
+    let failure = parse_launch_lock(&invalid_bytes).unwrap_err();
+    assert_eq!(failure.stage, "InputLock");
+    assert_eq!(failure.detail, error("InputLock", legacy_failure).detail);
+    assert_eq!(parse_launch_lock(b"\xff").unwrap_err().stage, "InputLock");
+}
+
 fn arguments() -> Vec<String> {
     [
         "--input-lock=inputs/rovent-input-lock.json",
