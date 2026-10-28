@@ -915,7 +915,13 @@ fn drive(
             task.start_iteration(false).map_err(Abort::Error)?;
         }
         let mut frame = task.frames.pop().expect("iteration has a frame");
-        let action = frame.advance(engine, &mut task.work, control, &mut task.returned);
+        let action = frame.advance(
+            engine,
+            &mut task.work,
+            control,
+            &mut task.returned,
+            &task.legal,
+        );
         task.value_retained_bytes = control.value.retained_bytes();
         match action {
             Ok(Action::Continue) => {
@@ -966,6 +972,7 @@ enum Stage {
 enum ChildPhase {
     Scout,
     Full,
+    RootTieConfirm,
     Quiescence,
 }
 
@@ -1066,6 +1073,7 @@ impl Frame {
         position: &mut Position,
         control: &mut Control<'_>,
         returned: &mut Option<NodeValue>,
+        root_legal: &[BoardMove],
     ) -> Result<Action, Abort> {
         match &mut self.stage {
             Stage::Enter => self.enter(engine, position, control),
@@ -1161,6 +1169,26 @@ impl Frame {
                         -self.alpha,
                     )));
                 }
+                // The scout value at alpha can be an upper bound, not an
+                // exact tie. Only re-search an earlier Rules root candidate;
+                // keep the same move/undo and paused owner through that work.
+                if engine.root_tie_policy == CpuRootTiePolicy::RulesOrderConfirmed
+                    && self.kind == Kind::Root
+                    && active.phase == ChildPhase::Scout
+                    && score == self.best.score
+                    && self.alpha == self.best.score
+                    && self.alpha > -INFINITY
+                    && root_move_precedes(root_legal, active.mv, self.best.pv.first().copied())
+                {
+                    active.phase = ChildPhase::RootTieConfirm;
+                    return Ok(Action::Push(Frame::child(
+                        engine,
+                        self.depth - 1,
+                        self.ply + 1,
+                        -self.beta,
+                        1 - self.alpha,
+                    )));
+                }
                 let mv = active.mv;
                 position.unmake(active.undo.take().expect("active move owns Rules undo"))?;
                 engine.evaluator.restore(
@@ -1171,7 +1199,11 @@ impl Frame {
                         .expect("active move owns value undo"),
                     position,
                 )?;
-                if score > self.best.score {
+                if score > self.best.score
+                    || (active.phase == ChildPhase::RootTieConfirm
+                        && score == self.best.score
+                        && root_move_precedes(root_legal, mv, self.best.pv.first().copied()))
+                {
                     self.best.score = score;
                     self.best.pv.clear();
                     self.best.pv.push(mv);
@@ -1530,6 +1562,132 @@ mod tests {
     use super::*;
     use crate::cpu_value::{CpuFloatCheckpoint, CpuFloatValue};
     use std::sync::atomic::AtomicU64;
+
+    fn pause_at_root_tie(
+        cpu: &mut CpuEngine,
+        position: &Position,
+        moves: &[BoardMove],
+        cancel: &AtomicBool,
+    ) -> (CpuReport, u64) {
+        let mut report = cpu
+            .analyze_root_moves(position, moves, limits(1), cancel)
+            .unwrap();
+        let mut charged = report.nodes;
+        for _ in 0..10_000 {
+            if cpu.paused.as_ref().is_some_and(|task| task.frames.iter().any(|frame| {
+                matches!(&frame.stage, Stage::Await(active) if active.phase == ChildPhase::RootTieConfirm)
+            })) {
+                return (report, charged);
+            }
+            assert!(report.completed_depth < 2, "confirmation was not reached");
+            let token = report.resume.take().expect("original paused owner");
+            report = cpu.resume(position, &token, limits(1), cancel).unwrap();
+            charged += report.nodes;
+        }
+        panic!("bounded work did not reach root tie confirmation");
+    }
+
+    #[test]
+    fn root_tie_confirmation_can_pause_and_resume_the_same_owned_work() {
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let moves = [
+            BoardMove::from_uci("b1c3").unwrap(),
+            BoardMove::from_uci("g1f3").unwrap(),
+        ];
+        let cancel = AtomicBool::new(false);
+        for earlier_is_worse in [false, true] {
+            let mut whole = super::super::tests::root_tie_engine(
+                CpuResumePolicy::PausedStack,
+                earlier_is_worse,
+                0,
+            );
+            let expected = whole
+                .analyze_root_moves(&position, &moves, limits(30_000), &cancel)
+                .unwrap();
+            let mut sliced = super::super::tests::root_tie_engine(
+                CpuResumePolicy::PausedStack,
+                earlier_is_worse,
+                0,
+            );
+            let (mut report, mut charged) =
+                pause_at_root_tie(&mut sliced, &position, &moves, &cancel);
+            for _ in 0..10_000 {
+                if report.completed_depth == 2 {
+                    break;
+                }
+                let token = report.resume.take().expect("original paused owner");
+                report = sliced
+                    .resume(&position, &token, limits(1), &cancel)
+                    .unwrap();
+                charged += report.nodes;
+            }
+            assert_eq!(
+                (
+                    report.completed_depth,
+                    report.score,
+                    report.best_move,
+                    &report.pv
+                ),
+                (
+                    expected.completed_depth,
+                    expected.score,
+                    expected.best_move,
+                    &expected.pv
+                )
+            );
+            assert_eq!(
+                charged, expected.nodes,
+                "resuming must not recharge consumed nodes"
+            );
+            assert!(position.matches_snapshot(&before));
+        }
+    }
+
+    #[test]
+    fn root_tie_confirmation_cancel_and_value_error_discard_only_the_owned_task() {
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let moves = [
+            BoardMove::from_uci("b1c3").unwrap(),
+            BoardMove::from_uci("g1f3").unwrap(),
+        ];
+        for cancel_instead in [false, true] {
+            let cancel = AtomicBool::new(false);
+            let (mut cpu, fail_score) = super::super::tests::root_tie_engine_with_failure();
+            let (mut report, _) = pause_at_root_tie(&mut cpu, &position, &moves, &cancel);
+            let token = report.resume.take().expect("original paused owner");
+            if cancel_instead {
+                cancel.store(true, Ordering::Release);
+                let stopped = cpu
+                    .resume(&position, &token, limits(30_000), &cancel)
+                    .unwrap();
+                assert_eq!(stopped.completion, CpuCompletion::Canceled);
+                assert!(stopped.resume.is_none());
+                cancel.store(false, Ordering::Release);
+            } else {
+                fail_score.store(true, Ordering::Release);
+                assert!(matches!(
+                    cpu.resume(&position, &token, limits(30_000), &cancel),
+                    Err(CpuError::Value(CpuValueError::NonFiniteForward))
+                ));
+                fail_score.store(false, Ordering::Release);
+            }
+            assert!(!cpu.token_is_current(&token));
+            assert!(cpu.paused.is_none());
+            assert!(position.matches_snapshot(&before));
+            // A new task must reconstruct the Rules/value owner; a dropped
+            // in-flight confirmation must not leak its partial state.
+            let fresh = cpu
+                .analyze_root_moves(&position, &moves, limits(30_000), &cancel)
+                .unwrap();
+            assert_eq!(
+                (fresh.completed_depth, fresh.score, fresh.best_move),
+                (2, 0, Some(moves[0]))
+            );
+            assert!(position.matches_snapshot(&before));
+        }
+    }
 
     fn config(tt_entries: usize) -> CpuConfig {
         CpuConfig {

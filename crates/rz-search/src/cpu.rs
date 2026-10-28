@@ -37,6 +37,14 @@ pub const CPU_PAUSED_STACK_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see-paus
 pub const CPU_PAUSED_SIDE_SCOPE_SEARCH_VERSION: &str = "rz-cpu-pvs-paused-side-scope/1";
 pub const CPU_PAUSED_SIDE_SCOPE_SEE_SEARCH_VERSION: &str =
     "rz-cpu-pvs-legal-see-paused-side-scope/1";
+pub const CPU_ROOT_TIE_SEARCH_VERSION: &str = "rz-cpu-pvs-root-tie-confirmed/1";
+pub const CPU_ROOT_TIE_SEE_SEARCH_VERSION: &str = "rz-cpu-pvs-legal-see-root-tie-confirmed/1";
+pub const CPU_ROOT_TIE_PAUSED_SEARCH_VERSION: &str = "rz-cpu-pvs-paused-root-tie-confirmed/1";
+pub const CPU_ROOT_TIE_PAUSED_SEE_SEARCH_VERSION: &str =
+    "rz-cpu-pvs-legal-see-paused-root-tie-confirmed/1";
+pub const CPU_ROOT_TIE_SIDE_SEARCH_VERSION: &str = "rz-cpu-pvs-side-root-tie-confirmed/1";
+pub const CPU_ROOT_TIE_SIDE_SEE_SEARCH_VERSION: &str =
+    "rz-cpu-pvs-legal-see-side-root-tie-confirmed/1";
 pub const CPU_PAUSED_STACK_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const CPU_PAUSED_STACK_OWNER_ACCOUNTING_DOMAIN: &str =
     "rz-pals-paused-stack-owner-accounting-v4/1";
@@ -102,6 +110,24 @@ pub enum CpuResumePolicy {
     #[default]
     CompletedIteration,
     PausedStack,
+}
+
+/// An immutable search-semantic choice, separate from move ordering. Legacy
+/// constructors preserve their original first-searched root tie behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum CpuRootTiePolicy {
+    #[default]
+    LegacyFirstSearched,
+    RulesOrderConfirmed,
+}
+
+impl CpuRootTiePolicy {
+    pub fn identity(self) -> &'static str {
+        match self {
+            Self::LegacyFirstSearched => "cpu-root-tie-first-searched-v1",
+            Self::RulesOrderConfirmed => "cpu-root-tie-rules-confirmed-v1",
+        }
+    }
 }
 
 impl CpuResumePolicy {
@@ -750,6 +776,7 @@ struct TtEntry {
 pub struct CpuEngine {
     config: CpuConfig,
     ordering: CpuOrderingPolicy,
+    root_tie_policy: CpuRootTiePolicy,
     tt: Vec<Option<TtEntry>>,
     /// Saturating side/from/to quiet history; fixed 32 KiB.
     history: Box<[[[i32; 64]; 64]; 2]>,
@@ -1146,6 +1173,23 @@ impl CpuEngine {
         ordering: CpuOrderingPolicy,
         resume_policy: CpuResumePolicy,
     ) -> Result<Self, CpuError> {
+        Self::with_evaluator_ordering_resume_and_tie_policy(
+            config,
+            evaluator,
+            ordering,
+            resume_policy,
+            CpuRootTiePolicy::LegacyFirstSearched,
+        )
+    }
+
+    /// Select the root tie semantics once, before any TT, task or token exists.
+    pub fn with_evaluator_ordering_resume_and_tie_policy(
+        config: CpuConfig,
+        evaluator: Arc<dyn CpuValueEvaluator>,
+        ordering: CpuOrderingPolicy,
+        resume_policy: CpuResumePolicy,
+        root_tie_policy: CpuRootTiePolicy,
+    ) -> Result<Self, CpuError> {
         config.tt_allocation_bytes()?;
         evaluator.identity().validate().map_err(CpuError::Value)?;
         if config.max_depth == 0 || config.max_depth > MAX_DEPTH {
@@ -1161,6 +1205,7 @@ impl CpuEngine {
         Ok(Self {
             config,
             ordering,
+            root_tie_policy,
             tt,
             history: Box::new([[[0; 64]; 64]; 2]),
             value_identity: Arc::new(evaluator.identity().clone()),
@@ -1189,13 +1234,36 @@ impl CpuEngine {
         evaluator: Arc<dyn CpuValueEvaluator>,
         ordering: CpuOrderingPolicy,
     ) -> Result<Self, CpuError> {
+        Self::with_paused_side_scope_and_tie_policy(
+            config,
+            evaluator,
+            ordering,
+            CpuRootTiePolicy::LegacyFirstSearched,
+        )
+    }
+
+    /// The isolated side owner and retained primary share the same immutable
+    /// root tie semantics, while their TT/history owners remain separate.
+    pub fn with_paused_side_scope_and_tie_policy(
+        config: CpuConfig,
+        evaluator: Arc<dyn CpuValueEvaluator>,
+        ordering: CpuOrderingPolicy,
+        root_tie_policy: CpuRootTiePolicy,
+    ) -> Result<Self, CpuError> {
         let fixed_reserved_bytes = Self::side_scope_allocation_bytes(&config)?;
-        let side = Self::with_evaluator_and_ordering(config.clone(), evaluator.clone(), ordering)?;
-        let mut primary = Self::with_evaluator_ordering_and_resume_policy(
+        let side = Self::with_evaluator_ordering_resume_and_tie_policy(
+            config.clone(),
+            evaluator.clone(),
+            ordering,
+            CpuResumePolicy::CompletedIteration,
+            root_tie_policy,
+        )?;
+        let mut primary = Self::with_evaluator_ordering_resume_and_tie_policy(
             config,
             evaluator,
             ordering,
             CpuResumePolicy::PausedStack,
+            root_tie_policy,
         )?;
         primary.paused_side_scope = Some(Box::new(side));
         primary.side_scope_observation = Some(CpuSideScopeSnapshot {
@@ -1239,7 +1307,33 @@ impl CpuEngine {
         self.ordering
     }
 
+    pub fn root_tie_policy(&self) -> CpuRootTiePolicy {
+        self.root_tie_policy
+    }
+
     pub fn search_identity(&self) -> &'static str {
+        if self.root_tie_policy == CpuRootTiePolicy::RulesOrderConfirmed {
+            if self.paused_side_scope.is_some() {
+                return match self.ordering {
+                    CpuOrderingPolicy::LegacyMvvLvaV1 => CPU_ROOT_TIE_SIDE_SEARCH_VERSION,
+                    CpuOrderingPolicy::LegalSeeV1 => CPU_ROOT_TIE_SIDE_SEE_SEARCH_VERSION,
+                };
+            }
+            return match (self.ordering, self.resume_policy) {
+                (CpuOrderingPolicy::LegacyMvvLvaV1, CpuResumePolicy::CompletedIteration) => {
+                    CPU_ROOT_TIE_SEARCH_VERSION
+                }
+                (CpuOrderingPolicy::LegalSeeV1, CpuResumePolicy::CompletedIteration) => {
+                    CPU_ROOT_TIE_SEE_SEARCH_VERSION
+                }
+                (CpuOrderingPolicy::LegacyMvvLvaV1, CpuResumePolicy::PausedStack) => {
+                    CPU_ROOT_TIE_PAUSED_SEARCH_VERSION
+                }
+                (CpuOrderingPolicy::LegalSeeV1, CpuResumePolicy::PausedStack) => {
+                    CPU_ROOT_TIE_PAUSED_SEE_SEARCH_VERSION
+                }
+            };
+        }
         if self.paused_side_scope.is_some() {
             return match self.ordering {
                 CpuOrderingPolicy::LegacyMvvLvaV1 => CPU_PAUSED_SIDE_SCOPE_SEARCH_VERSION,
@@ -1402,8 +1496,15 @@ impl CpuEngine {
     }
 
     pub fn search_conditions(&self) -> String {
+        let base = match self.root_tie_policy {
+            CpuRootTiePolicy::LegacyFirstSearched => CPU_SEARCH_CONDITIONS.to_owned(),
+            CpuRootTiePolicy::RulesOrderConfirmed => CPU_SEARCH_CONDITIONS.replace(
+                "ties:Rules-order",
+                "root-ties:Rules-order-confirmed;internal-pv-ties:search-order;root-tie-confirmation:scout-bound-research",
+            ),
+        };
         let legacy = format!(
-            "{CPU_SEARCH_CONDITIONS};profile={};max_depth={};q_plies={};tt_entries={}",
+            "{base};profile={};max_depth={};q_plies={};tt_entries={}",
             self.config.profile.identity(),
             self.config.max_depth,
             self.config.quiescence_ply,
@@ -2106,13 +2207,35 @@ impl CpuEngine {
                     return Err(error.into());
                 }
             };
-            let child = self.pvs_child(position, depth - 1, 1, alpha, beta, index == 0, control);
+            let child = self
+                .pvs_child(position, depth - 1, 1, alpha, beta, index == 0, control)
+                .and_then(|child| {
+                    // A zero-window fail-low equal to alpha is only an upper
+                    // bound. Prove an earlier Rules move actually ties before
+                    // replacing the current root choice.
+                    if self.root_tie_policy == CpuRootTiePolicy::RulesOrderConfirmed
+                        && index != 0
+                        && -child.score == best.score
+                        && alpha == best.score
+                        && alpha > -INFINITY
+                        && root_move_precedes(legal, mv, best.pv.first().copied())
+                    {
+                        self.negamax(position, depth - 1, 1, -beta, 1 - alpha, control)
+                    } else {
+                        Ok(child)
+                    }
+                });
             position.unmake(undo)?;
             self.evaluator
                 .restore(&mut control.value, value_undo, position)?;
             let child = child?;
             let score = -child.score;
-            if score > best.score {
+            if score > best.score
+                || (self.root_tie_policy == CpuRootTiePolicy::RulesOrderConfirmed
+                    && score == best.score
+                    && alpha == best.score
+                    && root_move_precedes(legal, mv, best.pv.first().copied()))
+            {
                 best.score = score;
                 best.pv.clear();
                 best.pv.push(mv);
@@ -2476,6 +2599,22 @@ impl CpuEngine {
     }
 }
 
+// Both moves were admitted from this Rules-ordered root domain. A missing
+// incumbent is not a tie; an unknown candidate must never gain priority.
+fn root_move_precedes(
+    legal: &[BoardMove],
+    candidate: BoardMove,
+    current: Option<BoardMove>,
+) -> bool {
+    match (
+        legal.iter().position(|movement| *movement == candidate),
+        current.and_then(|best| legal.iter().position(|movement| *movement == best)),
+    ) {
+        (Some(candidate), Some(current)) => candidate < current,
+        _ => false,
+    }
+}
+
 impl Control<'_> {
     fn actual_work(&self) -> CpuWork {
         CpuWork {
@@ -2639,6 +2778,322 @@ pub fn evaluate_bootstrap(position: &Position) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The second Rules move wins at depth one, then both tie (or the first
+    // is strictly worse) at depth two. It makes the real previous-best PVS
+    // path exercise an earlier move whose scout score can be only a bound.
+    struct RootTieValue {
+        base: BootstrapCpuValue,
+        earlier_is_worse: bool,
+        identity: CpuValueIdentity,
+        fail_score: Arc<AtomicBool>,
+    }
+    impl RootTieValue {
+        fn new(earlier_is_worse: bool) -> Self {
+            Self {
+                base: BootstrapCpuValue::default(),
+                earlier_is_worse,
+                identity: CpuValueIdentity {
+                    semantics: if earlier_is_worse {
+                        "test-root-tie-bound-v1"
+                    } else {
+                        "test-root-tie-equal-v1"
+                    }
+                    .to_owned(),
+                    weights_sha256: None,
+                    training: crate::cpu_value::CpuTrainingState::Bootstrap,
+                },
+                fail_score: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+    impl CpuValueEvaluator for RootTieValue {
+        fn identity(&self) -> &CpuValueIdentity {
+            &self.identity
+        }
+        fn provenance(&self) -> &'static str {
+            "root-tie-test"
+        }
+        fn initialize(&self, p: &Position) -> Result<CpuAccumulator, CpuValueError> {
+            self.base.initialize(p)
+        }
+        fn cache_context(
+            &self,
+            a: &CpuAccumulator,
+            p: &Position,
+        ) -> Result<CpuValueCacheContext, CpuValueError> {
+            self.base.cache_context(a, p)
+        }
+        fn score(&self, _: &CpuAccumulator, p: &Position) -> Result<i32, CpuValueError> {
+            if self.fail_score.load(Ordering::Acquire) {
+                return Err(CpuValueError::NonFiniteForward);
+            }
+            let f3 = p.piece_at("f3".parse().unwrap());
+            let c3 = p.piece_at("c3".parse().unwrap());
+            let white_knight = |piece: Option<rz_position::Piece>| {
+                piece.is_some_and(|p| p.color == Color::White && p.kind == PieceKind::Knight)
+            };
+            if p.side_to_move() == Color::Black && white_knight(f3) {
+                Ok(-100)
+            } else if self.earlier_is_worse
+                && p.side_to_move() == Color::White
+                && white_knight(c3)
+                && p.piece_at("b5".parse().unwrap()).is_some_and(|piece| {
+                    piece.color == Color::Black && piece.kind == PieceKind::Pawn
+                })
+            {
+                Ok(-10)
+            } else {
+                Ok(0)
+            }
+        }
+        fn apply_delta(
+            &self,
+            a: &mut CpuAccumulator,
+            d: &rz_position::RuleMoveDelta,
+        ) -> Result<crate::cpu_value::CpuAccumulatorUndo, CpuValueError> {
+            self.base.apply_delta(a, d)
+        }
+        fn restore(
+            &self,
+            a: &mut CpuAccumulator,
+            u: crate::cpu_value::CpuAccumulatorUndo,
+            p: &Position,
+        ) -> Result<(), CpuValueError> {
+            self.base.restore(a, u, p)
+        }
+    }
+
+    pub(super) fn root_tie_engine(
+        policy: CpuResumePolicy,
+        earlier_is_worse: bool,
+        tt_entries: usize,
+    ) -> CpuEngine {
+        root_tie_engine_with_ordering(
+            policy,
+            earlier_is_worse,
+            tt_entries,
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+    }
+
+    pub(super) fn root_tie_engine_with_failure() -> (CpuEngine, Arc<AtomicBool>) {
+        let value = RootTieValue::new(false);
+        let fail_score = Arc::clone(&value.fail_score);
+        let cpu = CpuEngine::with_evaluator_ordering_resume_and_tie_policy(
+            CpuConfig {
+                tt_entries: 0,
+                max_depth: 2,
+                quiescence_ply: 0,
+                ..CpuConfig::default()
+            },
+            Arc::new(value),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+            CpuResumePolicy::PausedStack,
+            CpuRootTiePolicy::RulesOrderConfirmed,
+        )
+        .unwrap();
+        (cpu, fail_score)
+    }
+
+    fn root_tie_engine_with_ordering(
+        policy: CpuResumePolicy,
+        earlier_is_worse: bool,
+        tt_entries: usize,
+        ordering: CpuOrderingPolicy,
+    ) -> CpuEngine {
+        CpuEngine::with_evaluator_ordering_resume_and_tie_policy(
+            CpuConfig {
+                tt_entries,
+                max_depth: 2,
+                quiescence_ply: 0,
+                ..CpuConfig::default()
+            },
+            Arc::new(RootTieValue::new(earlier_is_worse)),
+            ordering,
+            policy,
+            CpuRootTiePolicy::RulesOrderConfirmed,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn root_rules_tie_is_proved_before_overriding_previous_best() {
+        let root = Position::startpos();
+        let original = root.snapshot();
+        let moves = [
+            BoardMove::from_uci("b1c3").unwrap(),
+            BoardMove::from_uci("g1f3").unwrap(),
+        ];
+        let rules = root.ordered_legal_moves();
+        assert!(
+            rules.moves().iter().position(|m| *m == moves[0])
+                < rules.moves().iter().position(|m| *m == moves[1])
+        );
+        for (policy, ordering, tt) in [
+            (
+                CpuResumePolicy::CompletedIteration,
+                CpuOrderingPolicy::LegacyMvvLvaV1,
+                0,
+            ),
+            (
+                CpuResumePolicy::PausedStack,
+                CpuOrderingPolicy::LegalSeeV1,
+                64,
+            ),
+        ] {
+            for earlier_is_worse in [false, true] {
+                let cancel = AtomicBool::new(false);
+                let mut first =
+                    root_tie_engine_with_ordering(policy, earlier_is_worse, tt, ordering);
+                assert_eq!(
+                    first
+                        .analyze_root_moves(&root, &moves, limits(1), &cancel)
+                        .unwrap()
+                        .best_move,
+                    Some(moves[1])
+                );
+                let mut whole =
+                    root_tie_engine_with_ordering(policy, earlier_is_worse, tt, ordering);
+                let report = whole
+                    .analyze_root_moves(&root, &moves, limits(2), &cancel)
+                    .unwrap();
+                assert_eq!((report.completed_depth, report.score), (2, 0));
+                assert_eq!(
+                    report.best_move,
+                    Some(if earlier_is_worse { moves[1] } else { moves[0] })
+                );
+                assert!(root.matches_snapshot(&original));
+            }
+        }
+    }
+
+    #[test]
+    fn root_tie_scout_bound_is_not_an_exact_equal_score() {
+        let cancel = AtomicBool::new(false);
+        let mut p = Position::startpos();
+        p.make_move(BoardMove::from_uci("b1c3").unwrap()).unwrap();
+        let original = p.snapshot();
+        let mut cpu = root_tie_engine(CpuResumePolicy::CompletedIteration, true, 0);
+        let mut scout_control = ordering_control(&cpu, &p, &cancel, limits(2));
+        let scout = cpu
+            .negamax(&mut p, 1, 1, -1, 0, &mut scout_control)
+            .unwrap();
+        assert_eq!(-scout.score, 0, "scout can return the false tie bound");
+        assert!(original.same_state(&p.snapshot()));
+        let mut exact_control = ordering_control(&cpu, &p, &cancel, limits(2));
+        let exact = cpu
+            .negamax(&mut p, 1, 1, -INFINITY, INFINITY, &mut exact_control)
+            .unwrap();
+        assert_eq!(-exact.score, -10, "full search finds the later b7b5 reply");
+        assert!(original.same_state(&p.snapshot()));
+    }
+
+    #[test]
+    fn explicit_root_tie_policy_preserves_legacy_and_separates_tokens() {
+        let position = Position::startpos();
+        let moves = [
+            BoardMove::from_uci("b1c3").unwrap(),
+            BoardMove::from_uci("g1f3").unwrap(),
+        ];
+        let cancel = AtomicBool::new(false);
+        let config = CpuConfig {
+            tt_entries: 0,
+            max_depth: 2,
+            quiescence_ply: 0,
+            ..CpuConfig::default()
+        };
+        let mut legacy_owner = CpuEngine::with_evaluator_ordering_and_resume_policy(
+            config.clone(),
+            Arc::new(RootTieValue::new(false)),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+            CpuResumePolicy::PausedStack,
+        )
+        .unwrap();
+        let first = legacy_owner
+            .analyze_root_moves(
+                &position,
+                &moves,
+                CpuLimits {
+                    max_nodes: 1,
+                    ..limits(2)
+                },
+                &cancel,
+            )
+            .unwrap();
+        let live_token = first.resume.unwrap();
+        assert!(live_token.is_paused_stack() && legacy_owner.token_is_current(&live_token));
+        let mut other_policy = root_tie_engine(CpuResumePolicy::PausedStack, false, 0);
+        assert_eq!(
+            legacy_owner.root_tie_policy(),
+            CpuRootTiePolicy::LegacyFirstSearched
+        );
+        assert_ne!(
+            legacy_owner.search_identity(),
+            other_policy.search_identity()
+        );
+        assert_ne!(
+            legacy_owner.search_conditions(),
+            other_policy.search_conditions()
+        );
+        assert!(matches!(
+            other_policy.resume(&position, &live_token, limits(2), &cancel),
+            Err(CpuError::ResumeMismatch(_))
+        ));
+        assert!(legacy_owner.token_is_current(&live_token));
+        let legacy_done = legacy_owner
+            .resume(&position, &live_token, limits(2), &cancel)
+            .unwrap();
+        assert_eq!(
+            (legacy_done.completed_depth, legacy_done.best_move),
+            (2, Some(moves[1]))
+        );
+
+        let mut side = CpuEngine::with_paused_side_scope_and_tie_policy(
+            config,
+            Arc::new(RootTieValue::new(false)),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+            CpuRootTiePolicy::RulesOrderConfirmed,
+        )
+        .unwrap();
+        assert_eq!(side.search_identity(), CPU_ROOT_TIE_SIDE_SEARCH_VERSION);
+        assert_eq!(
+            side.paused_side_scope.as_ref().unwrap().root_tie_policy(),
+            CpuRootTiePolicy::RulesOrderConfirmed
+        );
+        assert_eq!(
+            side.paused_side_scope.as_ref().unwrap().search_identity(),
+            CPU_ROOT_TIE_SEARCH_VERSION
+        );
+        let first = side
+            .analyze_root_moves(
+                &position,
+                &moves,
+                CpuLimits {
+                    max_nodes: 1,
+                    ..limits(2)
+                },
+                &cancel,
+            )
+            .unwrap();
+        let retained = first.resume.unwrap();
+        assert!(retained.is_paused_stack() && side.token_is_current(&retained));
+        let side_report = side
+            .analyze_root_moves(&position, &moves, limits(2), &cancel)
+            .unwrap();
+        assert_eq!(
+            (side_report.search_version, side_report.best_move),
+            (CPU_ROOT_TIE_SIDE_SEARCH_VERSION, Some(moves[0]))
+        );
+        assert!(side_report.resume.is_none() && side.token_is_current(&retained));
+        let primary = side
+            .resume(&position, &retained, limits(2), &cancel)
+            .unwrap();
+        assert_eq!(
+            (primary.completed_depth, primary.best_move),
+            (2, Some(moves[0]))
+        );
+    }
     #[test]
     fn only_original_soft_value_revocation_can_be_a_controlled_stop() {
         use crate::cpu_value::CpuValueAuthorityRevocation;
