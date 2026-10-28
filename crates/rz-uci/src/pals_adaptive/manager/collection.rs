@@ -116,3 +116,48 @@ pub trait AdaptiveCollectionObserver<Q, O>: Send {
     fn settled(&mut self, tickets: &[RoleTicketEnvelope]) -> Result<(), AdaptiveCollectionError>;
 }
 pub type AdaptiveCollectionObserverBox<Q, O> = Box<dyn AdaptiveCollectionObserver<Q, O>>;
+
+/// The origin of a recorded search-consumption observation.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoleOnlySearchConsumptionV2 {
+    DriverReturnedSuccess,
+    DriverReadbackAfterError,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+/// Observer for an original V2 root. Accepted is native-owner acceptance,
+/// not a claim that the search has consumed the result. A teacher process and
+/// other physical resources must be owned by the separate session lifecycle,
+/// not by this observation-only object.
+pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
+    fn admitted(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveCollectionError>;
+    fn dispatch(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        input: &FrameInput<ReviewView, Q>,
+    ) -> Result<(), AdaptiveCollectionError>;
+    fn native_event(&mut self, event: &TicketNativeEvent<O>)
+    -> Result<(), AdaptiveCollectionError>;
+    fn accepted(
+        &mut self,
+        accepted: &AcceptedRoleStep,
+        input: &FrameInput<ReviewView, Q>,
+        output: &O,
+    ) -> Result<(), AdaptiveCollectionError>;
+    /// Called after the manager records actual search consumption. This is a
+    /// separate observation from native acceptance and carries its readback path.
+    fn consumed(
+        &mut self,
+        accepted: &AcceptedRoleStep,
+        observation: RoleOnlySearchConsumptionV2,
+    ) -> Result<(), AdaptiveCollectionError>;
+    fn abandoned(&mut self, ticket: &RoleTicketEnvelope) -> Result<(), AdaptiveCollectionError>;
+    fn settled(&mut self, tickets: &[RoleTicketEnvelope]) -> Result<(), AdaptiveCollectionError>;
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub type AdaptiveCollectionObserverBoxV2<Q, O> = Box<dyn AdaptiveCollectionObserverV2<Q, O>>;

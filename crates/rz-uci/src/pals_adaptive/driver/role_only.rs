@@ -258,6 +258,40 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
         }
         Ok(())
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_collection_admission_v2(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .rovent_frontier()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "P/C V2 collection has no actual attached frontier",
+            ))?;
+        let registered = frontier.registration();
+        let root = admission.root_admission();
+        if root.authority() != registered.authority
+            || root.hard_deadline() != registered.original_deadline
+            || admission.root_budget() != registered.root_budget
+            || admission
+                .native_origin()
+                .sources()
+                .lock()
+                .manifest
+                .engine
+                .mode
+                != registered.mode
+            || !Arc::ptr_eq(admission.rules(), &self.original_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &registered.root_moves)
+            || admission.selective_policy() != registered.selective_policy
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V2 collection is outside its actual frontier owner",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "onnx-cpu")]

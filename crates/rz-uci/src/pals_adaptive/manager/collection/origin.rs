@@ -241,6 +241,30 @@ impl RoventCollectionRootAdmissionV2 {
         self.selective_policy
     }
 
+    /// Match the manager's verifier to the original Ready worker. Matching a
+    /// worker is not proof of current liveness, output acceptance, or completion.
+    pub(crate) fn validate_native_owner(
+        &self,
+        verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
+    ) -> Result<(), AdaptiveCollectionError> {
+        if !self
+            .root_admission
+            .original_context()
+            .accepts()
+            .map_err(|error| reject(error.to_string()))?
+            || !self
+                .original
+                .original
+                ._original_verifier
+                .same_owner(verifier)
+        {
+            return Err(reject(
+                "native verifier is not the original /2 worker verifier",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate_ticket(
         &self,
         ticket: &RoleTicketEnvelope,
@@ -257,6 +281,37 @@ impl RoventCollectionRootAdmissionV2 {
         {
             return Err(reject(
                 "native ticket is outside the original admitted /2 Collection root",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate against the namespace of the same original Ready worker and
+    /// the still-live /2 root, without reconstructing a /1 capability.
+    pub fn validate_output(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<(), AdaptiveCollectionError> {
+        self.validate_ticket(ticket)?;
+        let namespace = &self.original.original.namespace;
+        namespace
+            .verify(ticket, output, Some(namespace.value_identity()))
+            .map_err(|error| reject(error.to_string()))
+    }
+
+    /// A ranking belongs to this root only if it uses the original Rules
+    /// owner. This is a check, not a publication or teacher authority.
+    pub(super) fn validate_ranking(
+        &self,
+        ranking: &ProposerRankingPublished,
+    ) -> Result<(), AdaptiveCollectionError> {
+        self.validate_ticket(&ranking.source().ticket)?;
+        if ranking.source().ticket.role != Role::Proposer
+            || !std::ptr::eq(ranking.rules(), self.rules.as_ref())
+        {
+            return Err(reject(
+                "initial P publication is not from the original admitted /2 Rules owner",
             ));
         }
         Ok(())

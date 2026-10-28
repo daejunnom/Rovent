@@ -559,6 +559,40 @@ pub fn prepare_native_v2<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNativeV2<Q>, RoventNativeStartupRejection<Q>> {
+    prepare_native_v2_inner(sources, resources, clock, control, None)
+}
+
+/// Prepare the original /2 Collection native worker with its actual input
+/// observer. This only establishes the Ready owner: it does not create root,
+/// teacher, publication, or physical-completion authority.
+pub fn prepare_native_v2_collection<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV2>>,
+    resources: RoventNativeResources,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+) -> Result<PreparedRoventNativeV2<Q>, RoventNativeStartupRejection<Q>> {
+    if sources.lock().manifest.purpose != rz_experiments::RoventPurpose::Collection
+        || sources.collection_preload_sources().is_none()
+    {
+        return Err(RoventNativeStartupRejection {
+            error: fail(
+                K::IdentityMismatch,
+                "V2 Collection needs its original preload",
+            ),
+            native: None,
+        });
+    }
+    prepare_native_v2_inner(sources, resources, clock, control, Some(observer))
+}
+
+fn prepare_native_v2_inner<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV2>>,
+    resources: RoventNativeResources,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+) -> Result<PreparedRoventNativeV2<Q>, RoventNativeStartupRejection<Q>> {
     if !sources.matches_startup_control(&control) {
         return Err(RoventNativeStartupRejection {
             error: fail(
@@ -574,7 +608,7 @@ pub fn prepare_native_v2<Q: NativeQuestionProjection>(
         resources,
         clock.clone(),
         &control,
-        None,
+        observer,
         &diagnostic,
     )?;
     let ready_clock_matches = native
@@ -1173,6 +1207,8 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap/launch/collection.rs"),
         include_str!("rovent_bootstrap/launch/evidence.rs"),
         include_str!("rovent_bootstrap/launch/storage.rs"),
+        include_str!("rovent_bootstrap/launch/v2_external.rs"),
+        include_str!("rovent_bootstrap/launch/v2_rejections.rs"),
         include_str!("rovent_bootstrap/nnuec_source.rs"),
         include_str!("rovent_bootstrap/nnuec_preparing.rs"),
         include_str!("rovent_bootstrap/nnuec_session.rs"),

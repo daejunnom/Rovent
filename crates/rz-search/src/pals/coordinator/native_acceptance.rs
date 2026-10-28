@@ -39,6 +39,13 @@ pub struct NativeAcceptanceIssuer {
 pub struct NativeAcceptanceVerifier {
     identity: Arc<()>,
 }
+impl NativeAcceptanceVerifier {
+    /// Compare the original native issuer identity, without issuing a permit
+    /// or asserting liveness, output acceptance, or physical completion.
+    pub fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
 impl NativeAcceptanceIssuer {
     pub fn new_pair() -> (Self, NativeAcceptanceVerifier) {
         let identity = Arc::new(());
@@ -56,6 +63,20 @@ impl NativeAcceptanceIssuer {
             permit,
             identity: Arc::clone(&self.identity),
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_identity_tests {
+    use super::NativeAcceptanceIssuer;
+
+    #[test]
+    fn verifier_owner_identity_tracks_clones_not_distinct_issuers() {
+        let (_first_issuer, first) = NativeAcceptanceIssuer::new_pair();
+        let (_second_issuer, second) = NativeAcceptanceIssuer::new_pair();
+        assert!(first.same_owner(&first.clone()));
+        assert!(!first.same_owner(&second));
+        assert!(!second.same_owner(&first));
     }
 }
 

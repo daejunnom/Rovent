@@ -6,6 +6,14 @@ use rz_search::pals::coordinator::AcceptedRoleStep;
 use rz_search::pals::engine::NoResearcher;
 use std::collections::VecDeque;
 
+#[derive(Clone, Copy, Debug, Default)]
+enum ConsumeFault {
+    #[default]
+    None,
+    ErrorAfterCommit,
+    DeadlineBeforeCommit,
+}
+
 struct RoleOnlyFixture {
     no_r: NoResearcher,
     registration: RoleOnlyManagerRegistration,
@@ -14,6 +22,8 @@ struct RoleOnlyFixture {
     submitted: BTreeMap<RequestId, (RoleTicketEnvelope, FrameInput<ReviewView, u64>)>,
     consumed: Vec<(RoleTicketEnvelope, u64)>,
     discarded: usize,
+    strict_discard: bool,
+    consume_fault: ConsumeFault,
     revoked: bool,
 }
 impl RoleOnlySearchDriver<u64> for RoleOnlyFixture {
@@ -73,9 +83,17 @@ impl RoleOnlySearchDriver<u64> for RoleOnlyFixture {
     ) -> Result<(), AdaptiveManagerError> {
         self.validate_role(input, accepted.ticket(), output)?;
         assert!(accepted.validates_output(output));
+        if matches!(self.consume_fault, ConsumeFault::DeadlineBeforeCommit) {
+            return Err(AdaptiveManagerError::Deadline);
+        }
         self.submitted.remove(&accepted.ticket().id).unwrap();
         self.consumed
             .push((*accepted.ticket(), input.view.sequence()));
+        if matches!(self.consume_fault, ConsumeFault::ErrorAfterCommit) {
+            return Err(AdaptiveManagerError::Invalid(
+                "fixture error after actual consume",
+            ));
+        }
         Ok(())
     }
     fn role_discarded(
@@ -84,10 +102,23 @@ impl RoleOnlySearchDriver<u64> for RoleOnlyFixture {
         ticket: Option<&RoleTicketEnvelope>,
     ) -> Result<(), AdaptiveManagerError> {
         if let Some(ticket) = ticket {
-            self.submitted.remove(&ticket.id);
+            let original = self.submitted.remove(&ticket.id);
+            if self.strict_discard {
+                assert!(
+                    original.is_some(),
+                    "consumed ticket cannot be discarded again"
+                );
+            }
         }
         self.discarded += 1;
         Ok(())
+    }
+    fn role_consumption_recorded(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        _: &FrameInput<ReviewView, u64>,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(self.consumed.iter().any(|(recorded, _)| recorded == ticket))
     }
     fn is_complete(&self) -> bool {
         self.ready.is_empty() && self.submitted.is_empty()
@@ -231,6 +262,8 @@ fn role_only_fixture_on_clock(
         submitted: BTreeMap::new(),
         consumed: Vec::new(),
         discarded: 0,
+        strict_discard: false,
+        consume_fault: ConsumeFault::None,
         revoked: false,
     };
     let facts = Arc::new(NativeFacts::default());
@@ -472,6 +505,202 @@ fn role_only_stop_drains_pending_native_inputs_without_consuming_late_heads() {
     assert!(manager.driver().revoked);
     assert_eq!(receipt.counters.cpu_slice_receipts, 0);
     assert_eq!(receipt.pending_tickets, 0);
+}
+
+/// This fixture installs only an observer, without fabricating a Collection
+/// admission. Actual tickets, ACKs, acceptance proofs and fences still come
+/// from the existing native service and registry fixture.
+struct RoleOnlyObserverFixture {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    reject_accepted: bool,
+}
+impl AdaptiveCollectionObserver<u64, RoleOutput> for RoleOnlyObserverFixture {
+    fn admitted(
+        &mut self,
+        _: &RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveCollectionError> {
+        panic!("fixture does not issue Collection admission")
+    }
+    fn dispatch(
+        &mut self,
+        _: &RoleTicketEnvelope,
+        _: &FrameInput<ReviewView, u64>,
+    ) -> Result<(), AdaptiveCollectionError> {
+        Ok(())
+    }
+    fn native_event(
+        &mut self,
+        _: &TicketNativeEvent<RoleOutput>,
+    ) -> Result<(), AdaptiveCollectionError> {
+        Ok(())
+    }
+    fn accepted(
+        &mut self,
+        accepted: &AcceptedRoleStep,
+        _: &FrameInput<ReviewView, u64>,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveCollectionError> {
+        assert!(accepted.validates_output(output));
+        self.events.lock().unwrap().push("accepted");
+        if self.reject_accepted {
+            return Err(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Accepted,
+                "fixture",
+                "injected observer failure",
+            ));
+        }
+        Ok(())
+    }
+    fn root_ranking(
+        &mut self,
+        _: &RoventRootRankingAcceptance,
+        _: &FrameInput<ReviewView, u64>,
+        _: &RoleOutput,
+    ) -> Result<(), AdaptiveCollectionError> {
+        Ok(())
+    }
+    fn abandoned(&mut self, _: &RoleTicketEnvelope) -> Result<(), AdaptiveCollectionError> {
+        self.events.lock().unwrap().push("abandoned");
+        Ok(())
+    }
+    fn settled(&mut self, _: &[RoleTicketEnvelope]) -> Result<(), AdaptiveCollectionError> {
+        self.events.lock().unwrap().push("settled");
+        Ok(())
+    }
+}
+
+fn finish_role_only_test_native(
+    manager: RoleOnlyExecutionManager<u64, NativeFixture, RoleOnlyFixture>,
+    facts: &NativeFacts,
+) -> RoleOnlyFixture {
+    let mut sources = manager
+        .into_sources()
+        .unwrap_or_else(|(_, error)| panic!("fixture closure: {error}"));
+    let cleanup_until = Instant::now() + WINDOW;
+    sources.native.begin_shutdown(cleanup_until);
+    let mut physical_shutdown_confirmed = None;
+    loop {
+        while let Some(event) = sources.native.poll() {
+            if let TicketNativeEvent::Finished {
+                physical_shutdown_confirmed: confirmed,
+            } = event
+            {
+                assert!(physical_shutdown_confirmed.replace(confirmed).is_none());
+            }
+        }
+        if sources.native.try_join().unwrap() {
+            while let Some(event) = sources.native.poll() {
+                if let TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed: confirmed,
+                } = event
+                {
+                    assert!(physical_shutdown_confirmed.replace(confirmed).is_none());
+                }
+            }
+            break;
+        }
+        assert!(Instant::now() < cleanup_until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(facts.finish_called.load(Ordering::Acquire));
+    assert_eq!(physical_shutdown_confirmed, Some(true));
+    sources.driver
+}
+
+#[test]
+fn role_only_observer_accept_failure_keeps_real_acceptance_without_search_consumption() {
+    let (mut manager, facts, until) = role_only_fixture(false);
+    manager.driver_mut().ready.truncate(1);
+    manager.driver_mut().strict_discard = true;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    manager
+        .install_collection_observer_fixture(Box::new(RoleOnlyObserverFixture {
+            events: Arc::clone(&events),
+            reject_accepted: true,
+        }))
+        .unwrap();
+    let receipt = manager
+        .run_root_until(until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure());
+    assert!(
+        manager
+            .failures()
+            .any(|e| matches!(e, AdaptiveManagerError::Collection(_)))
+    );
+    assert_eq!(facts.accepted.lock().unwrap().len(), 1);
+    assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["accepted", "abandoned", "settled"]
+    );
+    let driver = finish_role_only_test_native(manager, &facts);
+    assert!(driver.consumed.is_empty());
+    assert_eq!(driver.discarded, 1);
+}
+
+#[test]
+fn role_only_consume_error_with_positive_readback_is_not_discarded_twice() {
+    let (mut manager, facts, until) = role_only_fixture(false);
+    manager.driver_mut().ready.truncate(1);
+    manager.driver_mut().strict_discard = true;
+    manager.driver_mut().consume_fault = ConsumeFault::ErrorAfterCommit;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    manager
+        .install_collection_observer_fixture(Box::new(RoleOnlyObserverFixture {
+            events: Arc::clone(&events),
+            reject_accepted: false,
+        }))
+        .unwrap();
+    let receipt = manager
+        .run_root_until(until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure());
+    assert!(manager.failures().any(|e| matches!(
+        e,
+        AdaptiveManagerError::Invalid("fixture error after actual consume")
+    )));
+    assert_eq!(facts.accepted.lock().unwrap().len(), 1);
+    assert_eq!(receipt.counters.consumed_role_outputs, 1);
+    assert_eq!(*events.lock().unwrap(), ["accepted", "settled"]);
+    let driver = finish_role_only_test_native(manager, &facts);
+    assert_eq!(driver.consumed.len(), 1);
+    assert_eq!(driver.discarded, 0);
+}
+
+#[test]
+fn role_only_driver_deadline_after_admission_abandons_without_consumption() {
+    // Deterministic deadline rejection injection after manager admission;
+    // this is not evidence of a measured wall-clock race.
+    let (mut manager, facts, until) = role_only_fixture(false);
+    manager.driver_mut().ready.truncate(1);
+    manager.driver_mut().strict_discard = true;
+    manager.driver_mut().consume_fault = ConsumeFault::DeadlineBeforeCommit;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    manager
+        .install_collection_observer_fixture(Box::new(RoleOnlyObserverFixture {
+            events: Arc::clone(&events),
+            reject_accepted: false,
+        }))
+        .unwrap();
+    let receipt = manager
+        .run_root_until(until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure());
+    assert!(
+        manager
+            .failures()
+            .any(|e| matches!(e, AdaptiveManagerError::Deadline))
+    );
+    assert_eq!(facts.accepted.lock().unwrap().len(), 1);
+    assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["accepted", "abandoned", "settled"]
+    );
+    let driver = finish_role_only_test_native(manager, &facts);
+    assert!(driver.consumed.is_empty());
+    assert_eq!(driver.discarded, 1);
 }
 
 #[test]

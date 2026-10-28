@@ -2,6 +2,10 @@
 //! adaptive CPU controller, R frame machine, evaluator or stack in this owner.
 //! Encoding and inference stay on the existing single native service worker.
 use super::collection::{AdaptiveCollectionObserver, RoventCollectionRootAdmission};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use super::collection::{
+    AdaptiveCollectionObserverBoxV2, RoleOnlySearchConsumptionV2, RoventCollectionRootAdmissionV2,
+};
 use super::*;
 use rz_search::cpu_value::nnuec::v2::Model as SharedNnuecModel;
 use rz_search::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
@@ -138,6 +142,22 @@ pub trait RoleOnlySearchDriver<Q> {
             "driver has no actual native collection root admission",
         ))
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_collection_admission_v2(
+        &self,
+        _: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual V2 native collection root admission",
+        ))
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoleOnlyCollectionV2Rejection<Q, O> {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub observer: AdaptiveCollectionObserverBoxV2<Q, O>,
 }
 
 /// Pure role configuration. R counts, R credit and R control are absent by type.
@@ -300,6 +320,10 @@ where
     retained_permits: Vec<NativeAcceptancePermit>,
     collection: Option<Box<dyn AdaptiveCollectionObserver<Q, B::Output>>>,
     collection_admission: Option<RoventCollectionRootAdmission>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2: Option<AdaptiveCollectionObserverBoxV2<Q, B::Output>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_admission_v2: Option<RoventCollectionRootAdmissionV2>,
     collection_settled: bool,
 }
 
@@ -402,6 +426,10 @@ where
             retained_permits: Vec::with_capacity(16),
             collection: None,
             collection_admission: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_admission_v2: None,
             collection_settled: false,
         })
     }
@@ -760,6 +788,7 @@ where
     ) -> Result<(), AdaptiveManagerError> {
         if self.collection.is_some()
             || self.collection_admission.is_some()
+            || self.has_collection_v2()
             || self.phase != ManagerPhase::Running
             || self.registry.cumulative_observation().admitted != 0
             || !self.bindings.is_empty()
@@ -784,6 +813,133 @@ where
         self.collection_admission = Some(admission);
         self.collection = Some(observer);
         Ok(())
+    }
+
+    /// Event-flow fixture only; it never creates a root admission or exists
+    /// in a product build. Native tickets and acceptance stay real.
+    #[cfg(test)]
+    pub(crate) fn install_collection_observer_fixture(
+        &mut self,
+        observer: Box<dyn AdaptiveCollectionObserver<Q, B::Output>>,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.collection.is_some()
+            || self.collection_admission.is_some()
+            || self.has_collection_v2()
+            || self.phase != ManagerPhase::Running
+            || !self.bindings.is_empty()
+            || self.pending_input.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C collection test fixture state",
+            ));
+        }
+        self.collection = Some(observer);
+        Ok(())
+    }
+
+    fn has_collection_v2(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            self.collection_v2.is_some() || self.collection_admission_v2.is_some()
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            false
+        }
+    }
+
+    /// Internal V2 admission preserves its original objects on every failure.
+    /// Installing an observer is not authority to start a teacher or a product.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn install_collection_observer_v2(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV2,
+        mut observer: AdaptiveCollectionObserverBoxV2<Q, B::Output>,
+    ) -> Result<(), RoleOnlyCollectionV2Rejection<Q, B::Output>> {
+        let result =
+            (|| {
+                if self.collection.is_some()
+                    || self.collection_admission.is_some()
+                    || self.has_collection_v2()
+                    || self.phase != ManagerPhase::Running
+                    || self.registry.cumulative_observation().admitted != 0
+                    || !self.bindings.is_empty()
+                    || self.pending_input.is_some()
+                {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "P/C V2 collection observer admission",
+                    ));
+                }
+                let root = admission.root_admission();
+                if root.authority() != self.registration.authority
+                    || root.hard_deadline() != self.deadline
+                    || admission.root_budget() != self.registration.root_budget
+                    || admission
+                        .native_origin()
+                        .sources()
+                        .lock()
+                        .manifest
+                        .engine
+                        .mode
+                        != self.registration.mode
+                {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "P/C V2 collection root registration",
+                    ));
+                }
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("P/C V2 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v2(&admission)?;
+                observer.admitted(&admission)?;
+                Ok(())
+            })();
+        if let Err(error) = result {
+            return Err(RoleOnlyCollectionV2Rejection {
+                error,
+                admission,
+                observer,
+            });
+        }
+        self.collection_admission_v2 = Some(admission);
+        self.collection_v2 = Some(observer);
+        Ok(())
+    }
+
+    /// Return the original observer and admission only after the native root
+    /// fence and collection settlement. This says nothing about a teacher.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn take_collection_observer_v2(
+        &mut self,
+    ) -> Result<
+        Option<(
+            RoventCollectionRootAdmissionV2,
+            AdaptiveCollectionObserverBoxV2<Q, B::Output>,
+        )>,
+        AdaptiveManagerError,
+    > {
+        if self.collection_v2.is_none() && self.collection_admission_v2.is_none() {
+            return Ok(None);
+        }
+        if self.collection_v2.is_none() || self.collection_admission_v2.is_none() {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V2 collection owner mismatch",
+            ));
+        }
+        let receipt = self.shutdown_receipt()?;
+        if self.phase != ManagerPhase::Finished
+            || !self.collection_settled
+            || !receipt.permits_semantic_closure()
+        {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        Ok(Some((
+            self.collection_admission_v2
+                .take()
+                .expect("checked admission"),
+            self.collection_v2.take().expect("checked observer"),
+        )))
     }
 
     fn now(&self) -> Result<MonotonicTick, AdaptiveManagerError> {
@@ -986,6 +1142,16 @@ where
                         .dispatch(&ticket, &binding.input)
                         .map_err(AdaptiveManagerError::Collection)?;
                 }
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if let Some(observer) = &mut self.collection_v2 {
+                    self.collection_admission_v2
+                        .as_ref()
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "P/C V2 collection admission absent",
+                        ))?
+                        .validate_ticket(&ticket)?;
+                    observer.dispatch(&ticket, &binding.input)?;
+                }
                 self.bindings[index].collection_dispatched = true;
             }
             let binding = &self.bindings[index];
@@ -1096,9 +1262,14 @@ where
                 continue;
             }
             let will_consume = self.phase == ManagerPhase::Running
+                && self.failures.is_empty()
                 && self.now().is_ok()
+                && !self.bindings[index].consumption_recorded
                 && self.bindings[index].accepted.is_some();
-            if !will_consume && !self.bindings[index].collection_abandoned {
+            if !will_consume
+                && !self.bindings[index].consumption_recorded
+                && !self.bindings[index].collection_abandoned
+            {
                 if let (Some(observer), Some(ticket)) =
                     (&mut self.collection, self.bindings[index].ticket.as_ref())
                 {
@@ -1106,10 +1277,17 @@ where
                         .abandoned(ticket)
                         .map_err(AdaptiveManagerError::Collection)?;
                 }
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if let (Some(observer), Some(ticket)) = (
+                    &mut self.collection_v2,
+                    self.bindings[index].ticket.as_ref(),
+                ) {
+                    observer.abandoned(ticket)?;
+                }
                 self.bindings[index].collection_abandoned = true;
             }
             let binding = &self.bindings[index];
-            if self.phase == ManagerPhase::Running && self.now().is_ok() {
+            if will_consume {
                 if let Some(accepted) = &binding.accepted {
                     let output = binding
                         .delivered
@@ -1137,6 +1315,22 @@ where
                     };
                     if consumed {
                         self.mark_consumed(index)?;
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if let Some(observer) = &mut self.collection_v2 {
+                            let accepted = self.bindings[index].accepted.as_ref().ok_or(
+                                AdaptiveManagerError::Invalid("P/C V2 consumed proof absent"),
+                            )?;
+                            let observation = if returned.is_ok() {
+                                RoleOnlySearchConsumptionV2::DriverReturnedSuccess
+                            } else {
+                                RoleOnlySearchConsumptionV2::DriverReadbackAfterError
+                            };
+                            if let Err(error) = observer.consumed(accepted, observation) {
+                                // Consumption already happened. Keep both that
+                                // fact and the observer error without replay.
+                                self.record_failure(AdaptiveManagerError::Collection(error));
+                            }
+                        }
                     }
                     returned?;
                 } else {
@@ -1144,10 +1338,10 @@ where
                         .role_discarded(&binding.input, binding.ticket.as_ref())?;
                     self.counters.unused_role_results += 1;
                 }
-            } else {
+            } else if !binding.consumption_recorded {
                 self.driver
                     .role_discarded(&binding.input, binding.ticket.as_ref())?;
-                self.counters.unused_role_results += u64::from(!binding.consumption_recorded);
+                self.counters.unused_role_results += 1;
             }
             self.bindings.remove(index);
             changed = true;
@@ -1527,6 +1721,10 @@ where
                         ) {
                             Ok(accepted) => {
                                 self.bindings[index].accepted = Some(accepted);
+                                // The native retirement already occurred. Keep
+                                // that fact even when an observer rejects the
+                                // accepted record; it is not search consumption.
+                                self.bindings[index].retired = true;
                                 if let Some(observer) = &mut self.collection {
                                     let binding = &self.bindings[index];
                                     observer
@@ -1545,6 +1743,30 @@ where
                                                 .as_ref(),
                                         )
                                         .map_err(AdaptiveManagerError::Collection)?;
+                                }
+                                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                                if let Some(observer) = &mut self.collection_v2 {
+                                    let binding = &self.bindings[index];
+                                    let accepted =
+                                        binding.accepted.as_ref().expect("actual accepted proof");
+                                    let output = binding.delivered.as_ref().ok_or(
+                                        AdaptiveManagerError::Invalid(
+                                            "accepted V2 capture output custody",
+                                        ),
+                                    )?;
+                                    let role_output = output.proposer_ranking_output();
+                                    self.collection_admission_v2
+                                        .as_ref()
+                                        .ok_or(AdaptiveManagerError::Invalid(
+                                            "P/C V2 collection admission absent",
+                                        ))?
+                                        .validate_output(accepted.ticket(), role_output)?;
+                                    if !accepted.validates_output(role_output) {
+                                        return Err(AdaptiveManagerError::Invalid(
+                                            "P/C V2 accepted output differs",
+                                        ));
+                                    }
+                                    observer.accepted(accepted, &binding.input, output.as_ref())?;
                                 }
                             }
                             Err(rejected) => {
@@ -1697,10 +1919,19 @@ where
                 .collection
                 .as_mut()
                 .and_then(|observer| observer.native_event(&event).err());
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let collection_failure_v2 = self
+                .collection_v2
+                .as_mut()
+                .and_then(|observer| observer.native_event(&event).err());
             if let Err(error) = self.event(event) {
                 self.record_failure(error);
             }
             if let Some(error) = collection_failure {
+                self.record_failure(AdaptiveManagerError::Collection(error));
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if let Some(error) = collection_failure_v2 {
                 self.record_failure(AdaptiveManagerError::Collection(error));
             }
         }
@@ -1781,14 +2012,25 @@ where
                             .settled(&remaining)
                             .map_err(AdaptiveManagerError::Collection)?;
                     }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if let Some(observer) = &mut self.collection_v2 {
+                        let remaining: Vec<_> = self
+                            .bindings
+                            .iter()
+                            .filter_map(|binding| binding.ticket)
+                            .collect();
+                        observer.settled(&remaining)?;
+                    }
                     self.collection_settled = true;
                 }
                 self.registry.retire_revoked_after_worker_join()?;
                 // Only the actual owner fence permits releasing unconsumed
                 // revoked inputs or linear permits, never logical cancel.
                 for binding in &self.bindings {
-                    self.driver
-                        .role_discarded(&binding.input, binding.ticket.as_ref())?;
+                    if !binding.consumption_recorded {
+                        self.driver
+                            .role_discarded(&binding.input, binding.ticket.as_ref())?;
+                    }
                 }
                 self.counters.unused_role_results += self
                     .bindings
@@ -1894,6 +2136,12 @@ where
         };
         if self.phase != ManagerPhase::Finished || !receipt.permits_semantic_closure() {
             return Err((self, AdaptiveManagerError::PhysicalUnknown));
+        }
+        if self.has_collection_v2() {
+            return Err((
+                self,
+                AdaptiveManagerError::Invalid("P/C V2 collection observer must be returned"),
+            ));
         }
         Ok(RoleOnlyManagerSources {
             native: self.native,
