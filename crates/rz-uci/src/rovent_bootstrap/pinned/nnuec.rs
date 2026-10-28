@@ -15,10 +15,10 @@ pub(super) struct PinnedNnuecArtifacts {
 impl PinnedNnuecArtifacts {
     pub(super) fn open(
         root: &Dir,
-        lock: &RoventInputLock,
+        pin: Option<&rz_experiments::RoventNnuecPin>,
         control: &RoventStartupControl,
     ) -> Result<Option<Self>, BackendError> {
-        let Some(pin) = &lock.manifest.engine.nnuec else {
+        let Some(pin) = pin else {
             return Ok(None);
         };
         control.check()?;

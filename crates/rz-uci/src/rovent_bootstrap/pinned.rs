@@ -358,7 +358,8 @@ impl RoventPinnedNativeSources {
                 "explicit runtime bundle manifest/provider mismatch",
             ));
         }
-        let nnuec = PinnedNnuecArtifacts::open(&root, &lock, control)?;
+        let nnuec =
+            PinnedNnuecArtifacts::open(&root, lock.manifest.engine.nnuec.as_ref(), control)?;
         let owner = Self {
             lock,
             topology,

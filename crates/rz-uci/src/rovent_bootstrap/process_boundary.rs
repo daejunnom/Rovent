@@ -13,7 +13,7 @@ use crate::process_receipts::ExecutableIdentitySourceV1;
 use crate::process_receipts::ExecutableIdentityV1;
 use cap_std::fs::Dir;
 use rz_contracts::Digest;
-use rz_experiments::{ArtifactRef, RoventInputLock, RoventResearcher};
+use rz_experiments::{ArtifactRef, RoventEngineDeclaration, RoventInputLock, RoventResearcher};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
@@ -490,21 +490,55 @@ pub fn verify_actual_process_boundary<'a>(
             "original input lock",
         )
     })?;
+    let observation = verify_actual_process_observation(
+        &lock.manifest.engine,
+        &lock.canonical_sha256,
+        binary,
+        original_binary,
+        private_cwd,
+        original_root,
+        control,
+    )?;
+    Ok(VerifiedRoventProcessBoundary {
+        lock,
+        original_binary,
+        original_root,
+        observation,
+    })
+}
+
+/// Actual process observation shared by typed lock callers after they have
+/// validated their original lock. This private helper does not itself issue a
+/// public boundary or replace the original lock/descriptor/control owners.
+fn verify_actual_process_observation(
+    engine: &RoventEngineDeclaration,
+    canonical_sha256: &str,
+    binary: &ArtifactRef,
+    original_binary: &File,
+    private_cwd: &Path,
+    original_root: &Dir,
+    control: &RoventStartupControl,
+) -> Result<Arc<ProcessBoundaryObservation>, ProcessBoundaryError> {
     require(
-        binary == &lock.manifest.engine.binary,
+        binary == &engine.binary,
         ProcessBoundaryFailure::BinaryDeclaration,
         "retained binary declaration differs from the original lock",
     )?;
-    verify_commit_registration(&lock.manifest.engine.source_commit)?;
+    verify_commit_registration(&engine.source_commit)?;
     verify_component_declaration(
-        &lock.manifest.engine.source_components,
-        lock.manifest.engine.researcher.as_ref(),
-        lock.manifest.engine.nnuec.is_some(),
+        &engine.source_components,
+        engine.researcher.as_ref(),
+        engine.nnuec.is_some(),
     )?;
     check_control(control)?;
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (original_binary, private_cwd, original_root);
+        let _ = (
+            canonical_sha256,
+            original_binary,
+            private_cwd,
+            original_root,
+        );
         Err(fail(
             ProcessBoundaryFailure::UnsupportedMappedExecutable,
             "this platform does not provide the Linux mapped-executable proof",
@@ -532,8 +566,8 @@ pub fn verify_actual_process_boundary<'a>(
             "original process working directory changed",
         )?;
         let source_aggregate = rz_experiments::rovent_source_aggregate_sha256(
-            &lock.manifest.engine.source_commit,
-            &lock.manifest.engine.source_components,
+            &engine.source_commit,
+            &engine.source_components,
         )
         .map_err(|_| fail(ProcessBoundaryFailure::SourceComponent, "source aggregate"))?;
         let parse = |value: &str| {
@@ -546,19 +580,14 @@ pub fn verify_actual_process_boundary<'a>(
                     )
                 })
         };
-        let input_lock = parse(&lock.canonical_sha256)?;
+        let input_lock = parse(canonical_sha256)?;
         let source_aggregate = parse(&source_aggregate)?;
         check_control(control)?;
-        Ok(VerifiedRoventProcessBoundary {
-            lock,
-            original_binary,
-            original_root,
-            observation: Arc::new(ProcessBoundaryObservation {
-                executable,
-                input_lock,
-                source_aggregate,
-            }),
-        })
+        Ok(Arc::new(ProcessBoundaryObservation {
+            executable,
+            input_lock,
+            source_aggregate,
+        }))
     }
 }
 
