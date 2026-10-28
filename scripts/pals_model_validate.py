@@ -102,6 +102,12 @@ class StageSourceInputFailure(ValueError):
     """A known unavailable or changed source input belongs to its own stage."""
 
 
+def _record_source_failure(record, error):
+    record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+    if isinstance(error, StageSourceInputFailure) and isinstance(error.__cause__, OSError):
+        record.update(original_error_type=type(error.__cause__).__name__, errno=error.__cause__.errno)
+
+
 def _stage_source_snapshot(source, paths):
     try:
         selected = tuple(sorted(paths()))
@@ -121,7 +127,7 @@ def _stage_source_snapshot(source, paths):
                 raise StageSourceInputFailure("stage source changed while being read")
             observed[relative] = (before, hashlib.sha256(raw).hexdigest())
         return observed
-    except (FileNotFoundError, NotADirectoryError) as error:
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as error:
         raise StageSourceInputFailure("stage source is unavailable") from error
 
 
@@ -132,7 +138,7 @@ def run_with_stage_sources(operation, *, receipt, name, source, paths):
     try:
         before = _stage_source_snapshot(source, paths)
     except BaseException as error:
-        record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+        _record_source_failure(record, error)
         raise
     record.update(status="registered", files={path: value[1] for path, value in before.items()})
     primary = None
@@ -149,7 +155,7 @@ def run_with_stage_sources(operation, *, receipt, name, source, paths):
             if _stage_source_snapshot(source, paths) != before:
                 raise StageSourceInputFailure("stage source cohort changed during execution")
         except StageSourceInputFailure as error:
-            record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+            _record_source_failure(record, error)
             if primary is None:
                 raise
             # Never replace an original timeout/cancel/unknown failure with a local input error.
@@ -177,9 +183,10 @@ def run_with_rules_profile(operation, *, receipt, path):
             raise StageSourceInputFailure("Rules descriptor changed while being registered")
         digest = hashlib.sha256(raw).hexdigest()
         receipt["rules_profile"] = {"sha256": digest, "bytes": len(raw)}
-    except (FileNotFoundError, NotADirectoryError) as error:
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as error:
         failure = StageSourceInputFailure("registered Rules descriptor unavailable")
-        record.update(status="failed", error_type=type(failure).__name__, error=str(failure))
+        record.update(status="failed", error_type=type(failure).__name__, error=str(failure),
+                      original_error_type=type(error).__name__, errno=error.errno)
         raise failure from error
     except BaseException as error:
         record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
@@ -191,13 +198,13 @@ def run_with_rules_profile(operation, *, receipt, path):
                     or hashlib.sha256(path.read_bytes()).hexdigest() != digest
                     or input_identity(path) != identity):
                 raise StageSourceInputFailure("registered Rules descriptor changed")
-        except (FileNotFoundError, NotADirectoryError) as error:
+        except (FileNotFoundError, NotADirectoryError, PermissionError) as error:
             raise StageSourceInputFailure("registered Rules descriptor unavailable") from error
 
     try:
         check()
     except BaseException as error:
-        record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+        _record_source_failure(record, error)
         raise
     record["status"] = "registered"
     primary = None
@@ -213,7 +220,7 @@ def run_with_rules_profile(operation, *, receipt, path):
         try:
             check()
         except StageSourceInputFailure as error:
-            record.update(status="failed", error_type=type(error).__name__, error=str(error)[:2048])
+            _record_source_failure(record, error)
             if primary is None:
                 raise
             BaseException.add_note(primary, "Rules descriptor verification also failed: " + str(error))
@@ -281,6 +288,11 @@ class ValidationStages:
         except (subprocess.CalledProcessError, CommandNotStarted, ValueError) as error:
             result.update(status="failed", failure_scope="stage",
                           error_type=type(error).__name__, error=str(error)[:2048])
+            if isinstance(error, StageSourceInputFailure) and isinstance(error.__cause__, OSError):
+                # Preserve the actual stage-local access failure without
+                # reclassifying a shared-scope I/O failure as harmless.
+                result.update(original_error_type=type(error.__cause__).__name__,
+                              errno=error.__cause__.errno)
             if isinstance(error, CommandNotStarted):
                 result.update(command_exec_started=False, original_error_type=error.original_error_type,
                               errno=error.errno)

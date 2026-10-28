@@ -50,6 +50,77 @@ class ValidationStageTests(unittest.TestCase):
         self.assertIsNone(self.stages.shared_failure)
         self.assertEqual(self.stages.results["packing_rust"]["failure_scope"], "stage")
 
+    def test_permission_denied_on_branch_source_keeps_other_stages_independent(self):
+        with tempfile.TemporaryDirectory(prefix="pals-stage-permission-") as temporary:
+            source = Path(temporary)
+            branch = source / "packing.rs"
+            branch.write_bytes(b"branch-only input")
+            real_identity = wrapper.input_identity
+
+            def observe(path):
+                if path == branch:
+                    raise PermissionError(13, "branch source denied")
+                return real_identity(path)
+
+            with mock.patch.object(wrapper, "input_identity", side_effect=observe):
+                self.assertFalse(self.stages.perform("packing", lambda: wrapper.run_with_stage_sources(
+                    lambda: self.fail("denied source must not run"), receipt=self.receipt,
+                    name="packing", source=source, paths=lambda: [branch])))
+            self.assertEqual(self.stages.results["packing"]["error_type"], "StageSourceInputFailure")
+            self.assertEqual(self.stages.results["packing"]["failure_scope"], "stage")
+            self.assertEqual(self.stages.results["packing"]["original_error_type"], "PermissionError")
+            self.assertEqual(self.stages.results["packing"]["errno"], 13)
+            self.assertEqual(self.receipt["stage_source_files"]["packing"]["status"], "failed")
+            self.assertEqual(self.receipt["stage_source_files"]["packing"]["original_error_type"], "PermissionError")
+            self.assertTrue(self.stages.perform("neural", self.operation("neural")))
+            self.assertIsNone(self.stages.shared_failure)
+            with self.assertRaises(ValidationStagesFailed):
+                self.stages.require_complete()
+
+    def test_permission_denied_on_shared_input_still_blocks_other_stages(self):
+        def denied():
+            raise PermissionError("shared input denied")
+        stages = ValidationStages({"stages": {}}, denied)
+        self.assertFalse(stages.perform("first", lambda: None))
+        self.assertFalse(stages.perform("second", lambda: self.fail("shared failure must block")))
+        self.assertEqual(stages.results["first"]["failure_scope"], "registered_inputs_or_shared_storage")
+        self.assertEqual(stages.results["first"]["error_type"], "PermissionError")
+        self.assertEqual(stages.results["second"]["blocked_by"], ["first"])
+
+    def test_postcheck_permission_denial_preserves_primary_failure(self):
+        with tempfile.TemporaryDirectory(prefix="pals-stage-postcheck-") as temporary:
+            source = Path(temporary)
+            item = source / "input"
+            item.write_bytes(b"input")
+            real_identity = wrapper.input_identity
+            for kind in ("stage", "rules"):
+                with self.subTest(kind=kind):
+                    receipt, denied = {}, False
+
+                    def observe(path):
+                        if denied and path == item:
+                            raise PermissionError(13, "postcheck denied")
+                        return real_identity(path)
+
+                    def fail_operation(*_args):
+                        nonlocal denied
+                        denied = True
+                        raise subprocess.CalledProcessError(7, ["fake command"])
+
+                    with mock.patch.object(wrapper, "input_identity", side_effect=observe), \
+                            self.assertRaises(subprocess.CalledProcessError) as primary:
+                        if kind == "stage":
+                            wrapper.run_with_stage_sources(fail_operation, receipt=receipt,
+                                name="packing", source=source, paths=lambda: [item])
+                        else:
+                            wrapper.run_with_rules_profile(fail_operation, receipt=receipt, path=item)
+                    record = (receipt["stage_source_files"]["packing"] if kind == "stage"
+                              else receipt["rules_profile_verification"])
+                    self.assertEqual(primary.exception.returncode, 7)
+                    self.assertEqual(record["operation_error"]["returncode"], 7)
+                    self.assertEqual((record["original_error_type"], record["errno"]),
+                                     ("PermissionError", 13))
+
     def source_stage_case(self, branch, *, missing=False, shared_change=False, error=None):
         receipt, observed = {"stages": {}}, []
         with tempfile.TemporaryDirectory(prefix="pals-stage-sources-") as temporary:
@@ -506,7 +577,40 @@ class OwnerBoundaryTests(unittest.TestCase):
         self.assertEqual(stages["initialize_seconds"]["status"], "passed")
         self.assertEqual(stages["export_seconds"]["failure_scope"], "stage")
         self.assertEqual(stages["export_seconds"]["error_type"], "StageSourceInputFailure")
+        self.assertEqual(stages["export_seconds"]["original_error_type"], "FileNotFoundError")
         self.assertFalse(stages["numeric_seconds"]["executed"])
+        self.assertEqual(stages["runtime_preservation_seconds"]["status"], "passed")
+        self.assertEqual(sum(call[0] == "finish" for call in self.lease.calls), 1)
+
+    def test_permission_denied_rules_profile_blocks_export_only(self):
+        profile = self.root / "rules-profile.json"
+        profile.write_bytes(b"original rules descriptor")
+        self.args.rules_profile_json = profile
+        runtime = self.root / "runtime-fixture.so"
+        runtime.write_bytes(b"small source-only runtime fixture")
+
+        def observe_identity(path):
+            if path == profile:
+                raise PermissionError(13, "rules descriptor denied")
+            return (1, 2, 3, 1, 7, 8, 9)
+
+        with self.patched_boundaries(), \
+                mock.patch.object(wrapper, "input_identity", side_effect=observe_identity), \
+                mock.patch.object(wrapper, "run", return_value=0.0), \
+                mock.patch.object(wrapper.subprocess, "check_output", return_value=str(runtime)), \
+                mock.patch.object(wrapper, "publish_runtime", return_value=(runtime, "5" * 64)), \
+                self.assertRaises(ValidationStagesFailed):
+            wrapper.main()
+
+        receipt = json.loads((self.output / "validation.json").read_text(encoding="utf-8"))
+        stages = receipt["stage_results"]
+        self.assertEqual(stages["export_seconds"]["failure_scope"], "stage")
+        self.assertEqual(stages["export_seconds"]["error_type"], "StageSourceInputFailure")
+        self.assertEqual(stages["export_seconds"]["original_error_type"], "PermissionError")
+        self.assertEqual(stages["export_seconds"]["errno"], 13)
+        self.assertEqual(receipt["rules_profile_verification"]["original_error_type"], "PermissionError")
+        self.assertFalse(stages["numeric_seconds"]["executed"])
+        self.assertFalse(stages["rust_fixtures_seconds"]["executed"])
         self.assertEqual(stages["runtime_preservation_seconds"]["status"], "passed")
         self.assertEqual(sum(call[0] == "finish" for call in self.lease.calls), 1)
 
