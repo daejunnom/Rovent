@@ -275,6 +275,124 @@ mod linux {
         }
     }
 
+    // Declaration-only /2 fixture: no observation or live proof is fabricated.
+    fn unexecuted_inputs_v2(
+        fixture: &Fixture,
+        control: RoventStartupControl,
+    ) -> RoventProcessBoundaryInputsV2 {
+        use rz_experiments::{
+            ROVENT_EXECUTION_V2_DOMAIN, RoventExecutionManifestV2, RoventOwnRNotApplicableV2,
+            RoventRootTieDeclarationV2,
+        };
+        let v1 = unexecuted_inputs(fixture, control);
+        let base = &v1.lock.manifest;
+        let manifest = RoventExecutionManifestV2 {
+            domain: ROVENT_EXECUTION_V2_DOMAIN.into(),
+            contract_revision: base.contract_revision.clone(),
+            run_id: base.run_id.clone(),
+            purpose: base.purpose,
+            engine: base.engine.clone(),
+            resources: base.resources.clone(),
+            coordinator: base.coordinator.clone(),
+            wall_time_max_ms: base.wall_time_max_ms,
+            cleanup_max_ms: base.cleanup_max_ms,
+            output_bytes_max: base.output_bytes_max,
+            agent_renewable: base.agent_renewable,
+            provenance: base.provenance.clone(),
+            startup_document: base.engine.binary.clone(),
+            startup_configuration_sha256: base.coordinator.policy_sha256.clone(),
+            startup_search_configuration_sha256: base
+                .engine
+                .search
+                .search_configuration_sha256
+                .clone(),
+            own_r_root_tie: RoventRootTieDeclarationV2::NotApplicable {
+                reason: RoventOwnRNotApplicableV2::PcOnly,
+            },
+        };
+        RoventProcessBoundaryInputsV2 {
+            lock: Arc::new(manifest.lock().unwrap()),
+            original_binary: v1.original_binary,
+            original_root: v1.original_root,
+            private_cwd: v1.private_cwd,
+            control: v1.control,
+        }
+    }
+
+    #[test]
+    fn owned_v2_rejection_returns_original_lock_descriptors_and_controls() {
+        let fixture = Fixture::new();
+        for canceled in [false, true] {
+            let mut original_control = control();
+            if canceled {
+                original_control.cancellation.store(true, Ordering::Release);
+            } else {
+                original_control.until = Instant::now() - Duration::from_millis(1);
+            }
+            let mut inputs = unexecuted_inputs_v2(&fixture, original_control.clone());
+            inputs.original_binary.seek(SeekFrom::Start(7)).unwrap();
+            let lock = Arc::clone(&inputs.lock);
+            let binary_fd = inputs.original_binary.as_raw_fd();
+            let root_fd = inputs.original_root.as_raw_fd();
+            let failure = verify_actual_owned_process_boundary_v2(inputs).unwrap_err();
+            assert_eq!(
+                failure.error.kind,
+                if canceled {
+                    ProcessBoundaryFailure::Cancelled
+                } else {
+                    ProcessBoundaryFailure::Expired
+                }
+            );
+            let mut returned = failure.inputs;
+            assert!(Arc::ptr_eq(&returned.lock, &lock));
+            assert_eq!(returned.original_binary.as_raw_fd(), binary_fd);
+            assert_eq!(returned.original_root.as_raw_fd(), root_fd);
+            assert_eq!(returned.original_binary.stream_position().unwrap(), 7);
+            assert_eq!(returned.private_cwd, fixture.root);
+            assert_eq!(returned.control.until, original_control.until);
+            assert_eq!(
+                returned.control.cleanup_until,
+                original_control.cleanup_until
+            );
+            assert!(Arc::ptr_eq(
+                &returned.control.cancellation,
+                &original_control.cancellation
+            ));
+        }
+    }
+
+    #[test]
+    fn owned_v2_partial_source_failure_keeps_original_inputs() {
+        let fixture = Fixture::new();
+        let inputs = unexecuted_inputs_v2(&fixture, control());
+        let lock = Arc::clone(&inputs.lock);
+        let binary_fd = inputs.original_binary.as_raw_fd();
+        let root_fd = inputs.original_root.as_raw_fd();
+        let failure = verify_actual_owned_process_boundary_v2(inputs).unwrap_err();
+        assert_eq!(
+            failure.error.kind,
+            ProcessBoundaryFailure::SourceCommitRegistration
+        );
+        assert!(Arc::ptr_eq(&failure.inputs.lock, &lock));
+        assert_eq!(failure.inputs.original_binary.as_raw_fd(), binary_fd);
+        assert_eq!(failure.inputs.original_root.as_raw_fd(), root_fd);
+    }
+
+    #[test]
+    fn owned_v2_invalid_digest_returns_original_inputs_before_process_observation() {
+        let fixture = Fixture::new();
+        let mut inputs = unexecuted_inputs_v2(&fixture, control());
+        Arc::make_mut(&mut inputs.lock).canonical_sha256 = "0".repeat(64);
+        let lock = Arc::clone(&inputs.lock);
+        let binary_fd = inputs.original_binary.as_raw_fd();
+        let root_fd = inputs.original_root.as_raw_fd();
+        let failure = verify_actual_owned_process_boundary_v2(inputs).unwrap_err();
+        assert_eq!(failure.error.kind, ProcessBoundaryFailure::InvalidInputLock);
+        assert!(Arc::ptr_eq(&failure.inputs.lock, &lock));
+        assert_eq!(failure.inputs.original_binary.as_raw_fd(), binary_fd);
+        assert_eq!(failure.inputs.original_root.as_raw_fd(), root_fd);
+    }
+
     #[test]
     fn owned_public_rejection_returns_original_lock_descriptors_cursor_and_controls() {
         let fixture = Fixture::new();

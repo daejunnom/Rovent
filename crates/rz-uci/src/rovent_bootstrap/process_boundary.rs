@@ -13,7 +13,9 @@ use crate::process_receipts::ExecutableIdentitySourceV1;
 use crate::process_receipts::ExecutableIdentityV1;
 use cap_std::fs::Dir;
 use rz_contracts::Digest;
-use rz_experiments::{ArtifactRef, RoventEngineDeclaration, RoventInputLock, RoventResearcher};
+use rz_experiments::{
+    ArtifactRef, RoventEngineDeclaration, RoventInputLock, RoventInputLockV2, RoventResearcher,
+};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
@@ -470,6 +472,178 @@ pub fn verify_actual_owned_process_boundary(
         })),
         Err(error) => Err(RoventOwnedProcessBoundaryFailure { error, inputs }),
     }
+}
+
+/// /2-owned inputs. The original lock, descriptors, and control are retained
+/// together; constructing this value does not issue process authority.
+pub struct RoventProcessBoundaryInputsV2 {
+    pub lock: Arc<RoventInputLockV2>,
+    pub original_binary: File,
+    pub original_root: Dir,
+    pub private_cwd: PathBuf,
+    pub control: RoventStartupControl,
+}
+
+/// A borrowed view of one actual /2 process observation and its original
+/// inputs. It cannot be reconstructed from a digest or a /1 observation.
+pub struct VerifiedRoventProcessBoundaryV2<'a> {
+    lock: &'a RoventInputLockV2,
+    original_binary: &'a File,
+    original_root: &'a Dir,
+    observation: Arc<ProcessBoundaryObservation>,
+}
+
+impl VerifiedRoventProcessBoundaryV2<'_> {
+    pub fn input_lock_digest(&self) -> Digest {
+        self.observation.input_lock
+    }
+    pub fn executable_identity(&self) -> &ExecutableIdentityV1 {
+        &self.observation.executable
+    }
+    pub fn source_aggregate_digest(&self) -> Digest {
+        self.observation.source_aggregate
+    }
+    pub fn registered_source_commit(&self) -> &str {
+        &self.lock.manifest.engine.source_commit
+    }
+    pub fn source_scope(&self) -> &'static str {
+        PROCESS_SOURCE_SCOPE
+    }
+    pub fn original_binary(&self) -> &File {
+        self.original_binary
+    }
+    pub fn original_root(&self) -> &Dir {
+        self.original_root
+    }
+}
+
+/// Owns the original /2 lock and actual process observation. This says nothing
+/// about a model, worker, neural completion, or process teardown.
+pub struct VerifiedOwnedRoventProcessBoundaryV2 {
+    inputs: RoventProcessBoundaryInputsV2,
+    observation: Arc<ProcessBoundaryObservation>,
+}
+
+impl fmt::Debug for VerifiedOwnedRoventProcessBoundaryV2 {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("VerifiedOwnedRoventProcessBoundaryV2")
+            .field("input_lock", &self.observation.input_lock)
+            .field("executable", &self.observation.executable)
+            .field("scope", &PROCESS_SOURCE_SCOPE)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedOwnedRoventProcessBoundaryV2 {
+    pub fn input_lock(&self) -> &Arc<RoventInputLockV2> {
+        &self.inputs.lock
+    }
+    pub fn original_binary(&self) -> &File {
+        &self.inputs.original_binary
+    }
+    pub fn original_root(&self) -> &Dir {
+        &self.inputs.original_root
+    }
+    pub fn private_cwd(&self) -> &Path {
+        &self.inputs.private_cwd
+    }
+    pub fn startup_view(
+        &self,
+    ) -> Result<VerifiedRoventProcessBoundaryV2<'_>, ProcessBoundaryError> {
+        check_control(&self.inputs.control)?;
+        Ok(VerifiedRoventProcessBoundaryV2 {
+            lock: &self.inputs.lock,
+            original_binary: &self.inputs.original_binary,
+            original_root: &self.inputs.original_root,
+            observation: Arc::clone(&self.observation),
+        })
+    }
+    /// Re-observe only with the same held inputs, cancellation, and deadline.
+    pub fn revalidate_startup(&self) -> Result<(), ProcessBoundaryError> {
+        let actual = verify_actual_process_boundary_v2(
+            &self.inputs.lock,
+            &self.inputs.lock.manifest.engine.binary,
+            &self.inputs.original_binary,
+            &self.inputs.private_cwd,
+            &self.inputs.original_root,
+            &self.inputs.control,
+        )?;
+        require(
+            same_observed_values(&self.observation, &actual.observation),
+            ProcessBoundaryFailure::MappedExecutable,
+            "owned /2 process observation changed during original startup",
+        )
+    }
+}
+
+/// A rejected /2 observation returns the same owner and every held input.
+pub struct RoventOwnedProcessBoundaryFailureV2 {
+    pub error: ProcessBoundaryError,
+    pub inputs: RoventProcessBoundaryInputsV2,
+}
+impl fmt::Debug for RoventOwnedProcessBoundaryFailureV2 {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("RoventOwnedProcessBoundaryFailureV2")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub fn verify_actual_owned_process_boundary_v2(
+    inputs: RoventProcessBoundaryInputsV2,
+) -> Result<Arc<VerifiedOwnedRoventProcessBoundaryV2>, RoventOwnedProcessBoundaryFailureV2> {
+    let observed = verify_actual_process_boundary_v2(
+        &inputs.lock,
+        &inputs.lock.manifest.engine.binary,
+        &inputs.original_binary,
+        &inputs.private_cwd,
+        &inputs.original_root,
+        &inputs.control,
+    )
+    .map(|actual| actual.observation);
+    match observed {
+        Ok(observation) => Ok(Arc::new(VerifiedOwnedRoventProcessBoundaryV2 {
+            inputs,
+            observation,
+        })),
+        Err(error) => Err(RoventOwnedProcessBoundaryFailureV2 { error, inputs }),
+    }
+}
+
+/// Observe the current process against the actual /2 lock and held inputs.
+/// This is a typed sibling of /1, not a projection into a /1 lock.
+pub fn verify_actual_process_boundary_v2<'a>(
+    lock: &'a RoventInputLockV2,
+    binary: &ArtifactRef,
+    original_binary: &'a File,
+    private_cwd: &Path,
+    original_root: &'a Dir,
+    control: &RoventStartupControl,
+) -> Result<VerifiedRoventProcessBoundaryV2<'a>, ProcessBoundaryError> {
+    check_control(control)?;
+    require_mapped_executable_profile()?;
+    lock.validate().map_err(|_| {
+        fail(
+            ProcessBoundaryFailure::InvalidInputLock,
+            "original /2 input lock",
+        )
+    })?;
+    let observation = verify_actual_process_observation(
+        &lock.manifest.engine,
+        &lock.canonical_sha256,
+        binary,
+        original_binary,
+        private_cwd,
+        original_root,
+        control,
+    )?;
+    Ok(VerifiedRoventProcessBoundaryV2 {
+        lock,
+        original_binary,
+        original_root,
+        observation,
+    })
 }
 
 /// Source/startup evidence only. The exact original startup deadline and cancel

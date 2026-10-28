@@ -166,3 +166,38 @@ fn native_snapshot_uses_original_model_namespace_without_claiming_first_inferenc
     assert!(snapshot.model_namespace().is_ok());
     assert!(!snapshot.neural_service_executed && !snapshot.validator_loaded);
 }
+
+#[test]
+fn v2_native_sources_use_the_original_startup_pin_without_requiring_duplicate_provenance() {
+    use super::pinned::NativeInputLock;
+    use rz_eval::pals_onnx::virtual_review::VirtualReviewOwnedSources;
+    use rz_experiments::{
+        ArtifactRef, ROVENT_EXECUTION_V2_DOMAIN, RoventExecutionManifestV2, RoventInputLockV2,
+    };
+
+    // This is a real /2 lock, not a fabricated /1 projection. Its typed
+    // startup document is deliberately absent from the common provenance.
+    let mut declaration = wire(ExecutionMode::CpuPc);
+    declaration["domain"] = json!(ROVENT_EXECUTION_V2_DOMAIN);
+    declaration["startup_document"] = artifact("v2-startup");
+    declaration["startup_configuration_sha256"] = json!("7".repeat(64));
+    declaration["startup_search_configuration_sha256"] = json!("1".repeat(64));
+    declaration["own_r_root_tie"] = json!({"kind":"not_applicable", "reason":"pc_only"});
+    let lock = RoventExecutionManifestV2::from_json(&declaration.to_string())
+        .unwrap()
+        .lock()
+        .unwrap();
+    let startup: ArtifactRef = serde_json::from_value(artifact("v2-startup")).unwrap();
+    assert!(!lock.manifest.provenance.contains(&startup));
+    assert_eq!(
+        lock.topology(None).unwrap(),
+        RoventStartupTopology::RolesOnly
+    );
+    assert!(lock.admit_startup_artifact(&startup).is_ok());
+    let mut wrong = startup.clone();
+    wrong.sha256 = "f".repeat(64);
+    assert!(lock.admit_startup_artifact(&wrong).is_err());
+
+    fn original_sources<T: VirtualReviewOwnedSources>() {}
+    original_sources::<RoventPinnedNativeSources<RoventInputLockV2>>();
+}

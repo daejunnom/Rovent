@@ -12,6 +12,7 @@ pub mod nnuec_session;
 pub mod nnuec_source;
 pub mod pc_session;
 mod pinned;
+use pinned::NativeInputLock;
 pub mod process_boundary;
 pub mod product;
 pub(crate) mod storage_lifecycle;
@@ -45,7 +46,8 @@ use rz_eval::pals_onnx::virtual_review::{
 use rz_eval::pals_onnx::{PalsCudaControlPolicy, PalsOnnxConfig, PalsSessionResidency};
 use rz_eval::runtime_pin::RuntimeLibraryPin;
 use rz_experiments::{
-    RoventBackend, RoventDevice, RoventInputLock, RoventPurpose, RoventResearcher,
+    RoventBackend, RoventCoordinatorDeclaration, RoventDevice, RoventEngineDeclaration,
+    RoventInputLock, RoventInputLockV2, RoventPcConfiguration, RoventPurpose, RoventResearcher,
 };
 use rz_runtime::contracts::{ContractClock, ContractSystemClock};
 use rz_search::pals::coordinator::RoleFailure;
@@ -452,6 +454,133 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
     diagnostic: NativeStartupDiagnostic,
 ) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
+    let (native, snapshot) = spawn_native_owner(
+        Arc::clone(&sources),
+        resources,
+        clock,
+        &control,
+        observer,
+        &diagnostic,
+    )?;
+    let product_lifetime = match crate::pals_adaptive::RoventNativeProductLifetime::from_ready(
+        &snapshot, &sources, &native,
+    ) {
+        Ok(lifetime) => lifetime,
+        Err(error) => {
+            return Err(rejected_native(
+                fail(
+                    K::IdentityMismatch,
+                    "original Ready native lifetime was rejected",
+                )
+                .with_diagnostic("RoventNativeLifetime", &error.to_string()),
+                Some(native),
+                control.cleanup_until,
+            ));
+        }
+    };
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::NativeReady,
+        NativeStartupDiagnosticPhase::Exit,
+    );
+    Ok(PreparedRoventNative {
+        service: *native,
+        snapshot,
+        sources,
+        product_lifetime,
+    })
+}
+
+/// Retains the exact /2 sources and the same physical ticket-service owner.
+/// Collection provenance remains a separate, unsupported V2 capability.
+pub struct PreparedRoventNativeV2<Q: NativeQuestionProjection = AdaptivePortQuestion> {
+    service: RoventNativeService<Q>,
+    snapshot: RoventNativeStartupSnapshot,
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV2>>,
+    _verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+}
+impl<Q: NativeQuestionProjection> PreparedRoventNativeV2<Q> {
+    pub fn snapshot(&self) -> &RoventNativeStartupSnapshot {
+        &self.snapshot
+    }
+    pub fn sources(&self) -> &Arc<RoventPinnedNativeSources<RoventInputLockV2>> {
+        &self.sources
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        RoventNativeService<Q>,
+        RoventNativeStartupSnapshot,
+        Arc<RoventPinnedNativeSources<RoventInputLockV2>>,
+    ) {
+        (self.service, self.snapshot, self.sources)
+    }
+}
+
+/// Load only the selected V2 V-free P/C source. Real Ready and worker-issued
+/// acceptance verifier are required; this does not grant a root or receipt.
+pub fn prepare_native_v2<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV2>>,
+    resources: RoventNativeResources,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+) -> Result<PreparedRoventNativeV2<Q>, RoventNativeStartupRejection<Q>> {
+    let diagnostic = NativeStartupDiagnostic::default();
+    let (native, snapshot) = spawn_native_owner(
+        Arc::clone(&sources),
+        resources,
+        clock.clone(),
+        &control,
+        None,
+        &diagnostic,
+    )?;
+    let ready_clock_matches = native
+        .ready_clock()
+        .is_some_and(|ready| ready.domain() == clock.domain() && ready.origin() == clock.origin());
+    let verifier = match native.native_acceptance_verifier() {
+        Some(verifier)
+            if snapshot.input_lock == sources.lock_digest()
+                && snapshot.process_epoch == clock.domain().0.0
+                && ready_clock_matches
+                && snapshot.model_namespace().is_ok()
+                && snapshot.physical_workers_created == 1
+                && !snapshot.neural_service_executed =>
+        {
+            verifier
+        }
+        _ => {
+            return Err(rejected_native(
+                fail(
+                    K::IdentityMismatch,
+                    "original V2 Ready service/source differs",
+                ),
+                Some(native),
+                control.cleanup_until,
+            ));
+        }
+    };
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::NativeReady,
+        NativeStartupDiagnosticPhase::Exit,
+    );
+    Ok(PreparedRoventNativeV2 {
+        service: *native,
+        snapshot,
+        sources,
+        _verifier: verifier,
+    })
+}
+
+fn spawn_native_owner<Q: NativeQuestionProjection, L: NativeInputLock>(
+    sources: Arc<RoventPinnedNativeSources<L>>,
+    resources: RoventNativeResources,
+    clock: ContractSystemClock,
+    control: &RoventStartupControl,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    diagnostic: &NativeStartupDiagnostic,
+) -> Result<
+    (Box<RoventNativeService<Q>>, RoventNativeStartupSnapshot),
+    RoventNativeStartupRejection<Q>,
+> {
     let before = || -> Result<(), BackendError> {
         control.check()?;
         sources.validate_lock()?;
@@ -467,7 +596,7 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
             || control
                 .cleanup_until
                 .saturating_duration_since(control.until)
-                > Duration::from_millis(sources.lock().manifest.cleanup_max_ms)
+                > Duration::from_millis(sources.lock().cleanup_max_ms())
         {
             return Err(fail(
                 K::InvalidInput,
@@ -482,7 +611,7 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
             native: None,
         });
     }
-    let pending_capacity = sources.lock().manifest.coordinator.role_tickets_max as usize;
+    let pending_capacity = sources.lock().role_tickets_max() as usize;
     let limits = resources.tickets;
     let commands = resources.command_capacity;
     let factory_sources = Arc::clone(&sources);
@@ -579,38 +708,12 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
     if let Err(error) = control.check() {
         return Err(rejected_native(error, native, control.cleanup_until));
     }
-    let product_lifetime = match crate::pals_adaptive::RoventNativeProductLifetime::from_ready(
-        &snapshot,
-        &sources,
+    Ok((
         native
-            .as_deref()
-            .expect("successful startup retains native owner"),
-    ) {
-        Ok(lifetime) => lifetime,
-        Err(error) => {
-            return Err(rejected_native(
-                fail(
-                    K::IdentityMismatch,
-                    "original Ready native lifetime was rejected",
-                )
-                .with_diagnostic("RoventNativeLifetime", &error.to_string()),
-                native,
-                control.cleanup_until,
-            ));
-        }
-    };
-    diagnostic.emit(
-        NativeStartupDiagnosticStage::NativeReady,
-        NativeStartupDiagnosticPhase::Exit,
-    );
-    Ok(PreparedRoventNative {
-        service: *native
             .take()
             .expect("successful startup retains native owner"),
         snapshot,
-        sources,
-        product_lifetime,
-    })
+    ))
 }
 
 fn rejected_native<Q: NativeQuestionProjection>(
@@ -624,8 +727,8 @@ fn rejected_native<Q: NativeQuestionProjection>(
     RoventNativeStartupRejection { error, native }
 }
 
-fn load_native(
-    sources: Arc<RoventPinnedNativeSources>,
+fn load_native<L: NativeInputLock>(
+    sources: Arc<RoventPinnedNativeSources<L>>,
     resources: RoventNativeResources,
     clock: ContractSystemClock,
     control: &RoventStartupControl,
@@ -688,7 +791,7 @@ fn load_native(
         domain: ROVENT_NATIVE_STARTUP_DOMAIN,
         input_lock: sources.lock_digest(),
         process_epoch: clock.domain().0.0,
-        mode: sources.lock().manifest.engine.mode,
+        mode: sources.lock().engine().mode,
         topology: sources.topology(),
         weights: Digest(backend.model_epoch()),
         export_manifest: Digest(backend.manifest_digest()),
@@ -716,13 +819,34 @@ fn load_native(
     Ok((backend, snapshot))
 }
 
-fn validate_native_resources(
-    sources: &RoventPinnedNativeSources,
+fn validate_native_resources<L: NativeInputLock>(
+    sources: &RoventPinnedNativeSources<L>,
     resources: &RoventNativeResources,
 ) -> Result<(), BackendError> {
     let lock = sources.lock();
-    let pc = &lock.manifest.engine.pc;
-    let startup = sources.configuration();
+    validate_native_resource_fields(
+        &lock.engine().pc,
+        lock.cleanup_max_ms(),
+        lock.role_tickets_max(),
+        sources.configuration(),
+        sources.cuda_inventory_digest(),
+        resources,
+        || sources.validate_runtime(&resources.runtime),
+    )
+}
+
+/// Shared resource validation for the original typed lock's borrowed fields.
+/// Runtime custody still belongs to the actual source owner supplied by the
+/// caller; this function does not construct or attest that owner.
+fn validate_native_resource_fields(
+    pc: &RoventPcConfiguration,
+    cleanup_max_ms: u64,
+    role_tickets_max: u32,
+    startup: &configuration::StartupConfigurationDocument,
+    cuda_inventory: Option<[u8; 32]>,
+    resources: &RoventNativeResources,
+    validate_runtime: impl FnOnce() -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
     let expected = startup
         .fields()
         .native
@@ -769,14 +893,14 @@ fn validate_native_resources(
         ));
     }
     if resources.drain_limit.is_zero()
-        || resources.drain_limit > Duration::from_millis(lock.manifest.cleanup_max_ms)
+        || resources.drain_limit > Duration::from_millis(cleanup_max_ms)
         || resources.configuration.intra_threads != 1
         || pc.ort_intra_threads != Some(1)
         || pc.ort_inter_threads != Some(1)
         || pc.ort_spinning != Some(false)
         || resources.configuration.device_public_memory
         || !(1..=8).contains(&resources.command_capacity)
-        || lock.manifest.coordinator.role_tickets_max > 16
+        || role_tickets_max > 16
     {
         return Err(fail(
             K::UnsupportedModel,
@@ -787,7 +911,7 @@ fn validate_native_resources(
         (RoventDevice::Cpu, RoventBackend::OrtCpu, Provider::Cpu)
             if resources.loading_profile.is_none()
                 && resources.cuda_profile.is_none()
-                && sources.cuda_inventory_digest().is_none()
+                && cuda_inventory.is_none()
                 && resources.runtime.bundle_digest().is_none() => {}
         (
             RoventDevice::Cuda { ordinal, .. },
@@ -796,7 +920,7 @@ fn validate_native_resources(
         ) if i32::try_from(*ordinal).ok() == Some(device_id)
             && resources.loading_profile.is_some()
             && resources.cuda_profile.is_some()
-            && sources.cuda_inventory_digest().is_some()
+            && cuda_inventory.is_some()
             && resources.runtime.bundle_digest().is_some() => {}
         _ => {
             return Err(fail(
@@ -805,8 +929,8 @@ fn validate_native_resources(
             ));
         }
     }
-    sources.validate_runtime(&resources.runtime)?;
-    let actual = configuration_digest(resources, sources.cuda_inventory_digest())?;
+    validate_runtime()?;
+    let actual = configuration_digest(resources, cuda_inventory)?;
     if parse_sha256(&pc.backend_configuration_sha256)? != actual {
         return Err(fail(
             K::IdentityMismatch,
@@ -915,6 +1039,29 @@ fn admitted_native_topology(
                 && original.teacher_count() == engine.teachers.len()
         }
     };
+    admitted_native_topology_fields(engine, &lock.manifest.coordinator, explicit_purpose)
+}
+
+/// Admit a /2 declaration using its original typed lock. Collection is not
+/// admitted here: it requires a separately retained original teacher owner.
+pub(crate) fn admitted_topology_v2(
+    lock: &RoventInputLockV2,
+) -> Result<RoventStartupTopology, BackendError> {
+    lock.validate()
+        .map_err(|_| fail(K::IdentityMismatch, "Rovent lock validation failed"))?;
+    let engine = &lock.manifest.engine;
+    let explicit_purpose = matches!(
+        lock.manifest.purpose,
+        RoventPurpose::Validation | RoventPurpose::Deployment
+    ) && engine.teachers.is_empty();
+    admitted_native_topology_fields(engine, &lock.manifest.coordinator, explicit_purpose)
+}
+
+fn admitted_native_topology_fields(
+    engine: &RoventEngineDeclaration,
+    coordinator: &RoventCoordinatorDeclaration,
+    explicit_purpose: bool,
+) -> Result<RoventStartupTopology, BackendError> {
     if !explicit_purpose
         || engine.pc.validator.is_some()
         || !matches!(
@@ -924,7 +1071,7 @@ fn admitted_native_topology(
         || engine.pc.ort_intra_threads != Some(1)
         || engine.pc.ort_inter_threads != Some(1)
         || engine.pc.ort_spinning != Some(false)
-        || lock.manifest.coordinator.role_tickets_max > 16
+        || coordinator.role_tickets_max > 16
     {
         return Err(fail(
             K::UnsupportedModel,

@@ -11,7 +11,7 @@ use super::{
 };
 use crate::parser::GoLimits;
 use rz_contracts::{Digest, rovent::SearchGoal};
-use rz_experiments::RoventInputLock;
+use rz_experiments::{RoventInputLock, RoventInputLockV2, RoventSearchDeclaration};
 use rz_position::{BoardMove, Position, PositionSnapshot};
 use std::{num::NonZeroU16, sync::Arc};
 
@@ -80,7 +80,49 @@ pub fn validate_go(
             "original startup input lock before go",
         )
     })?;
-    let registered = &lock.manifest.engine.search;
+    validate_go_for_search(
+        position,
+        go,
+        &lock.manifest.engine.search,
+        &lock.canonical_sha256,
+        policy,
+        max_goal_plies,
+    )
+}
+
+/// Applies the same pure Rules and workload checks to the original /2 lock.
+/// This does not convert the lock or create a root, worker, clock or authority.
+pub fn validate_go_v2(
+    position: &Position,
+    go: &GoLimits,
+    lock: &RoventInputLockV2,
+    policy: RoventRootAdmissionPolicy,
+    max_goal_plies: NonZeroU16,
+) -> Result<RoventGoPrevalidation, RoventRootAdmissionError> {
+    lock.validate().map_err(|_| {
+        fail(
+            RoventRootAdmissionFailure::InvalidLock,
+            "original startup input lock before go",
+        )
+    })?;
+    validate_go_for_search(
+        position,
+        go,
+        &lock.manifest.engine.search,
+        &lock.canonical_sha256,
+        policy,
+        max_goal_plies,
+    )
+}
+
+fn validate_go_for_search(
+    position: &Position,
+    go: &GoLimits,
+    registered: &RoventSearchDeclaration,
+    canonical_sha256: &str,
+    policy: RoventRootAdmissionPolicy,
+    max_goal_plies: NonZeroU16,
+) -> Result<RoventGoPrevalidation, RoventRootAdmissionError> {
     let goal = SearchGoal {
         depth_plies: go.depth_plies,
         mate_moves: go.mate_moves,
@@ -130,7 +172,7 @@ pub fn validate_go(
     }
     Ok(RoventGoPrevalidation {
         policy,
-        startup_lock: parse_digest(&lock.canonical_sha256)?,
+        startup_lock: parse_digest(canonical_sha256)?,
         snapshot,
         state_and_history,
         rules_profile,

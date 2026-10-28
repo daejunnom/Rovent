@@ -66,13 +66,13 @@ impl PinnedNnuecArtifacts {
     }
 }
 
-impl RoventPinnedNativeSources {
+impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
     /// Bounded publication/load read from the original retained descriptors.
     /// A named replacement cannot supply a different model or provenance.
     pub(crate) fn nnuec_artifact_bytes(
         &self,
     ) -> Result<Option<NnuecWeightsAndProvenanceBytes>, BackendError> {
-        match (&self.nnuec, &self.lock.manifest.engine.nnuec) {
+        match (&self.nnuec, &self.lock.engine().nnuec) {
             (None, None) => Ok(None),
             (Some(held), Some(pin)) => held.read(pin).map(Some),
             _ => Err(fail(

@@ -143,6 +143,85 @@ fn v2_prepared_source_uses_actual_start_and_preserves_original_owner_without_liv
     );
 }
 
+#[test]
+fn v2_final_gate_retains_exact_owner_and_rejects_replaced_or_canceled_sources() {
+    let position = Position::startpos();
+    let clock = ProcessClock::new(ProcessEpoch(7509));
+    let context = context(&clock, false);
+    let owner = input_lock_v2(&position);
+    let prepare_v2 = || {
+        PreparedSourceV2::prepare(
+            &owner,
+            RoventRootAdmissionPolicy::DynamicGo,
+            &position,
+            &context,
+            &clock,
+        )
+        .unwrap()
+    };
+
+    let admitted = prepare_v2().try_into_live().unwrap();
+    assert!(admitted.owner().same_original_owner(&owner));
+    assert_eq!(admitted.original_context().authority, context.authority);
+    assert!(admitted.root_snapshot().same_state(&position.snapshot()));
+    admitted
+        .allocation_clock()
+        .verify_against(admitted.descriptor(), owner.v2().unwrap())
+        .unwrap();
+
+    let canceled = prepare_v2();
+    context.control.cancel();
+    let (canceled, error) = canceled.try_into_live().unwrap_err();
+    assert_eq!(error.kind, RoventRootAdmissionFailure::RevokedAuthority);
+    context.control.cancellation.store(false, Ordering::Release);
+    match canceled.into_initial().unwrap() {
+        InitialAdmissionOutcomeV2::StoppedInitial(stopped) => {
+            assert_eq!(stopped.stop_reason(), InitialStopReason::Canceled);
+            assert!(stopped.owner().same_original_owner(&owner));
+            assert_eq!(
+                stopped.fallback(),
+                stopped.allowed_root_moves().first().copied()
+            );
+        }
+        InitialAdmissionOutcomeV2::Admitted(_) => panic!("canceled /2 source became live"),
+    }
+
+    let replaced = prepare_v2();
+    let mut other = context.authority;
+    other.implementation = Digest([8; 32]);
+    *context.current.lock().unwrap() = SessionScope::Search(other);
+    context.cancellation.cancel();
+    match replaced.into_initial().unwrap() {
+        InitialAdmissionOutcomeV2::StoppedInitial(stopped) => {
+            assert_eq!(stopped.stop_reason(), InitialStopReason::RootReplaced);
+        }
+        InitialAdmissionOutcomeV2::Admitted(_) => panic!("replaced /2 source became live"),
+    }
+}
+
+#[test]
+fn v2_expired_source_is_stopped_before_live_admission() {
+    let position = Position::startpos();
+    let clock = ProcessClock::new(ProcessEpoch(7510));
+    let context = context(&clock, true);
+    let owner = input_lock_v2(&position);
+    let source = PreparedSourceV2::prepare(
+        &owner,
+        RoventRootAdmissionPolicy::DynamicGo,
+        &position,
+        &context,
+        &clock,
+    )
+    .unwrap();
+    match source.into_initial().unwrap() {
+        InitialAdmissionOutcomeV2::StoppedInitial(stopped) => {
+            assert_eq!(stopped.stop_reason(), InitialStopReason::Deadline);
+            assert!(stopped.owner().same_original_owner(&owner));
+        }
+        InitialAdmissionOutcomeV2::Admitted(_) => panic!("expired /2 source became live"),
+    }
+}
+
 fn context(clock: &ProcessClock, expired: bool) -> SearchSessionContext {
     let authority = SearchAuthority {
         epoch: clock.epoch(),

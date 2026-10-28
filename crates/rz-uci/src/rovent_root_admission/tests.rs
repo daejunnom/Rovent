@@ -848,6 +848,87 @@ fn pure_preadmission_checks_workload_without_creating_or_reviving_root_authority
 }
 
 #[test]
+fn v2_preadmission_uses_original_lock_and_the_same_rules_and_go_checks() {
+    let position = Position::startpos();
+    let original = lock(wire(&position));
+    let mut value = serde_json::to_value(&original.manifest).unwrap();
+    let fields = value.as_object_mut().unwrap();
+    fields.insert(
+        "domain".into(),
+        json!(rz_experiments::ROVENT_EXECUTION_V2_DOMAIN),
+    );
+    fields.insert("startup_document".into(), artifact("startup-v4"));
+    fields.insert("startup_configuration_sha256".into(), json!("4".repeat(64)));
+    fields.insert(
+        "startup_search_configuration_sha256".into(),
+        json!(original.manifest.engine.search.search_configuration_sha256.clone()),
+    );
+    fields.insert(
+        "own_r_root_tie".into(),
+        json!({"kind":"not_applicable", "reason":"pc_only"}),
+    );
+    let v2 = rz_experiments::RoventExecutionManifestV2::from_json(&value.to_string())
+        .unwrap()
+        .lock()
+        .unwrap();
+    let clock = ProcessClock::new(ProcessEpoch(7115));
+    let context = context(&clock);
+    let mut go = context.original_go.as_deref().unwrap().clone();
+    let max = NonZeroU16::new(64).unwrap();
+    let policy = RoventRootAdmissionPolicy::ExactRegistered;
+    let v1_result = preadmission::validate_go(&position, &go, &original, policy, max).unwrap();
+    let v2_result = preadmission::validate_go_v2(&position, &go, &v2, policy, max).unwrap();
+    assert_eq!(
+        v2_result.startup_lock_digest(),
+        parse_digest(&v2.canonical_sha256).unwrap()
+    );
+    assert_ne!(
+        v2_result.startup_lock_digest(),
+        v1_result.startup_lock_digest()
+    );
+    assert_eq!(
+        v2_result.state_and_history_digest(),
+        v1_result.state_and_history_digest()
+    );
+    assert_eq!(
+        v2_result.rules_profile_digest(),
+        v1_result.rules_profile_digest()
+    );
+    assert_eq!(v2_result.goal(), v1_result.goal());
+    assert_eq!(
+        v2_result.allowed_root_moves(),
+        v1_result.allowed_root_moves()
+    );
+    go.nodes = Some(0);
+    assert_eq!(
+        preadmission::validate_go_v2(&position, &go, &v2, policy, max)
+            .unwrap_err()
+            .kind,
+        RoventRootAdmissionFailure::RegisteredWorkload
+    );
+    assert_eq!(
+        preadmission::validate_go_v2(
+            &position,
+            &go,
+            &v2,
+            RoventRootAdmissionPolicy::DynamicGo,
+            max
+        )
+        .unwrap()
+        .requested_nodes(),
+        Some(0)
+    );
+    let mut invalid = v2;
+    invalid.canonical_sha256 = "0".repeat(64);
+    assert_eq!(
+        preadmission::validate_go_v2(&position, &go, &invalid, policy, max)
+            .unwrap_err()
+            .kind,
+        RoventRootAdmissionFailure::InvalidLock
+    );
+}
+
+#[test]
 fn persisted_metadata_verification_cannot_revive_a_revoked_live_root() {
     let position = Position::startpos();
     let lock = lock(wire(&position));

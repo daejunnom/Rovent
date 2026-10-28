@@ -156,11 +156,133 @@ impl RoventPinnedStartupV2 {
     }
 }
 
+// The owner retains the original typed lock. Implementations are sealed so a
+// caller cannot substitute a declaration-only object for actual admission.
+mod native_lock_sealed {
+    pub trait Sealed {}
+}
+
+#[doc(hidden)]
+pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration;
+    fn provenance(&self) -> &[ArtifactRef];
+    fn canonical_sha256(&self) -> &str;
+    fn cleanup_max_ms(&self) -> u64;
+    fn role_tickets_max(&self) -> u32;
+    fn topology(
+        &self,
+        collection: Option<&RoventCollectionPreloadSources>,
+    ) -> Result<RoventStartupTopology, BackendError>;
+    fn admit_configuration(
+        &self,
+        config: &StartupConfigurationDocument,
+    ) -> Result<(), BackendError>;
+    fn admit_startup_artifact(&self, artifact: &ArtifactRef) -> Result<(), BackendError>;
+}
+
+impl native_lock_sealed::Sealed for RoventInputLock {}
+impl NativeInputLock for RoventInputLock {
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
+        &self.manifest.engine
+    }
+    fn provenance(&self) -> &[ArtifactRef] {
+        &self.manifest.provenance
+    }
+    fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+    fn cleanup_max_ms(&self) -> u64 {
+        self.manifest.cleanup_max_ms
+    }
+    fn role_tickets_max(&self) -> u32 {
+        self.manifest.coordinator.role_tickets_max
+    }
+    fn topology(
+        &self,
+        collection: Option<&RoventCollectionPreloadSources>,
+    ) -> Result<RoventStartupTopology, BackendError> {
+        match collection {
+            Some(original) => super::admitted_collection_topology(self, original),
+            None => admitted_topology(self),
+        }
+    }
+    fn admit_configuration(
+        &self,
+        config: &StartupConfigurationDocument,
+    ) -> Result<(), BackendError> {
+        config.admit_against(self)
+    }
+    fn admit_startup_artifact(&self, artifact: &ArtifactRef) -> Result<(), BackendError> {
+        if self.provenance().contains(artifact) {
+            Ok(())
+        } else {
+            Err(fail(
+                K::IdentityMismatch,
+                "selected native asset is absent or duplicated in the Rovent lock",
+            ))
+        }
+    }
+}
+
+impl native_lock_sealed::Sealed for RoventInputLockV2 {}
+impl NativeInputLock for RoventInputLockV2 {
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
+        &self.manifest.engine
+    }
+    fn provenance(&self) -> &[ArtifactRef] {
+        &self.manifest.provenance
+    }
+    fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+    fn cleanup_max_ms(&self) -> u64 {
+        self.manifest.cleanup_max_ms
+    }
+    fn role_tickets_max(&self) -> u32 {
+        self.manifest.coordinator.role_tickets_max
+    }
+    fn topology(
+        &self,
+        collection: Option<&RoventCollectionPreloadSources>,
+    ) -> Result<RoventStartupTopology, BackendError> {
+        if collection.is_some() {
+            return Err(fail(
+                K::UnsupportedModel,
+                "V2 Collection preload is not connected",
+            ));
+        }
+        let topology = super::admitted_topology_v2(self)?;
+        if topology != RoventStartupTopology::RolesOnly {
+            return Err(fail(
+                K::UnsupportedModel,
+                "V2 researcher source is not connected",
+            ));
+        }
+        Ok(topology)
+    }
+    fn admit_configuration(
+        &self,
+        config: &StartupConfigurationDocument,
+    ) -> Result<(), BackendError> {
+        config.admit_against_v2(self)
+    }
+    fn admit_startup_artifact(&self, artifact: &ArtifactRef) -> Result<(), BackendError> {
+        if *artifact == self.manifest.startup_document {
+            Ok(())
+        } else {
+            Err(fail(
+                K::IdentityMismatch,
+                "selected startup differs from the V2 lock",
+            ))
+        }
+    }
+}
+
 /// Descriptors remain bound to the exact new lock. Path replacement cannot
 /// redirect a later read. Participating owners must still prevent mutation of
 /// these private files; metadata checks are not a hostile same-UID sandbox.
-pub struct RoventPinnedNativeSources {
-    lock: Arc<RoventInputLock>,
+pub struct RoventPinnedNativeSources<L = RoventInputLock> {
+    lock: Arc<L>,
     topology: RoventStartupTopology,
     _root: Dir,
     private_root_path: PathBuf,
@@ -213,8 +335,25 @@ impl RoventPinnedNativeSources {
             Some(collection),
         )
     }
+}
+
+impl RoventPinnedNativeSources<RoventInputLockV2> {
+    /// Pin native inputs against the original V2 lock. V2 Collection and R
+    /// owners remain unsupported until their original typed paths are connected.
+    pub fn open_v2(
+        lock: Arc<RoventInputLockV2>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+    ) -> Result<Self, BackendError> {
+        Self::open_selected(lock, root, private_root_path, selection, control, None)
+    }
+}
+
+impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
     fn open_selected(
-        lock: Arc<RoventInputLock>,
+        lock: Arc<L>,
         root: Dir,
         private_root_path: PathBuf,
         selection: RoventNativeAssetSelection,
@@ -222,10 +361,7 @@ impl RoventPinnedNativeSources {
         collection: Option<Arc<RoventCollectionPreloadSources>>,
     ) -> Result<Self, BackendError> {
         control.check()?;
-        let topology = match &collection {
-            Some(original) => super::admitted_collection_topology(&lock, original)?,
-            None => admitted_topology(&lock)?,
-        };
+        let topology = lock.topology(collection.as_deref())?;
         if !private_root_path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -244,15 +380,11 @@ impl RoventPinnedNativeSources {
                 "compiled native source inventory unavailable",
             )
         })?;
-        let model = &lock.manifest.engine.pc.proposer;
-        if lock
-            .manifest
-            .engine
-            .source_components
-            .get("rovent_bootstrap")
+        let model = &lock.engine().pc.proposer;
+        if lock.engine().source_components.get("rovent_bootstrap")
             != Some(&hex(compiled_bootstrap_source_digest()))
             || compiled.get("model_native") != Some(&model.implementation_sha256)
-            || lock.manifest.engine.source_components.get("model_native")
+            || lock.engine().source_components.get("model_native")
                 != Some(&model.implementation_sha256)
         {
             return Err(fail(
@@ -261,14 +393,15 @@ impl RoventPinnedNativeSources {
             ));
         }
         let mut selected_paths = BTreeSet::new();
-        for artifact in std::iter::once(&selection.startup_configuration)
-            .chain(std::iter::once(&selection.export_manifest))
+        lock.admit_startup_artifact(&selection.startup_configuration)?;
+        selected_paths.insert(selection.startup_configuration.path.clone());
+        for artifact in std::iter::once(&selection.export_manifest)
             .chain(std::iter::once(&selection.rules_descriptor))
             .chain(selection.graphs.iter().map(|graph| &graph.artifact))
             .chain(selection.cuda_control_inventory.iter())
             .chain(selection.runtime_bundle_manifest.iter())
         {
-            if !lock.manifest.provenance.contains(artifact)
+            if !lock.provenance().contains(artifact)
                 || !selected_paths.insert(artifact.path.clone())
             {
                 return Err(fail(
@@ -286,7 +419,7 @@ impl RoventPinnedNativeSources {
             &configuration_blob,
             ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
         )?)?;
-        configuration.admit_against(&lock)?;
+        lock.admit_configuration(&configuration)?;
         control.check()?;
         let export = open_blob(&root, selection.export_manifest, 256 << 10)?;
         control.check()?;
@@ -332,7 +465,7 @@ impl RoventPinnedNativeSources {
             })
             .transpose()?;
         let mut runtime = Vec::new();
-        for artifact in &lock.manifest.engine.pc.runtime_artifacts {
+        for artifact in &lock.engine().pc.runtime_artifacts {
             if !rz_experiments::pals_private_snapshot_path_v5(&artifact.path) {
                 return Err(fail(
                     K::InvalidInput,
@@ -348,18 +481,15 @@ impl RoventPinnedNativeSources {
             runtime.push(open_blob(&root, artifact.clone(), 1 << 30)?);
             control.check()?;
         }
-        if matches!(
-            lock.manifest.engine.pc.device,
-            rz_experiments::RoventDevice::Cpu
-        ) != runtime_bundle_manifest.is_none()
+        if matches!(lock.engine().pc.device, rz_experiments::RoventDevice::Cpu)
+            != runtime_bundle_manifest.is_none()
         {
             return Err(fail(
                 K::IdentityMismatch,
                 "explicit runtime bundle manifest/provider mismatch",
             ));
         }
-        let nnuec =
-            PinnedNnuecArtifacts::open(&root, lock.manifest.engine.nnuec.as_ref(), control)?;
+        let nnuec = PinnedNnuecArtifacts::open(&root, lock.engine().nnuec.as_ref(), control)?;
         let owner = Self {
             lock,
             topology,
@@ -382,11 +512,11 @@ impl RoventPinnedNativeSources {
         control.check()?;
         Ok(owner)
     }
-    pub fn lock(&self) -> &RoventInputLock {
+    pub fn lock(&self) -> &L {
         &self.lock
     }
     /// Borrow the original allocation; equal bytes in a new Arc are not custody.
-    pub(crate) fn lock_owner(&self) -> &Arc<RoventInputLock> {
+    pub(crate) fn lock_owner(&self) -> &Arc<L> {
         &self.lock
     }
     pub fn collection_preload_sources(&self) -> Option<&Arc<RoventCollectionPreloadSources>> {
@@ -420,7 +550,7 @@ impl RoventPinnedNativeSources {
     /// or verified flag that could bypass the root/named-file guards.
     pub fn pin_runtime(&self) -> Result<RuntimeLibraryPin, BackendError> {
         self.validate_lock()?;
-        let backend = match self.lock.manifest.engine.pc.backend {
+        let backend = match self.lock.engine().pc.backend {
             rz_experiments::RoventBackend::OrtCpu => RuntimeBackend::OrtCpu,
             rz_experiments::RoventBackend::OrtCuda => RuntimeBackend::OrtCuda,
             _ => {
@@ -444,8 +574,7 @@ impl RoventPinnedNativeSources {
         };
         let mut expected: Vec<_> = self
             .lock
-            .manifest
-            .engine
+            .engine()
             .pc
             .runtime_artifacts
             .iter()
@@ -462,8 +591,7 @@ impl RoventPinnedNativeSources {
         if let Some(manifest) = &self.runtime_bundle_manifest {
             let original = self
                 .lock
-                .manifest
-                .provenance
+                .provenance()
                 .iter()
                 .find(|artifact| **artifact == manifest.declaration)
                 .ok_or_else(|| {
@@ -495,7 +623,7 @@ impl RoventPinnedNativeSources {
     }
     pub fn lock_digest(&self) -> Digest {
         // Construction has already validated this exact immutable lock string.
-        Digest(parse_sha256(&self.lock.canonical_sha256).expect("admitted lock digest"))
+        Digest(parse_sha256(self.lock.canonical_sha256()).expect("admitted lock digest"))
     }
     pub fn export_digest_text(&self) -> String {
         self.export.declaration.sha256.clone()
@@ -522,10 +650,7 @@ impl RoventPinnedNativeSources {
             .transpose()
     }
     pub fn validate_lock(&self) -> Result<(), BackendError> {
-        let topology = match &self.collection {
-            Some(original) => super::admitted_collection_topology(&self.lock, original)?,
-            None => admitted_topology(&self.lock)?,
-        };
+        let topology = self.lock.topology(self.collection.as_deref())?;
         if topology != self.topology {
             return Err(fail(
                 K::IdentityMismatch,
@@ -536,7 +661,9 @@ impl RoventPinnedNativeSources {
             &self.configuration_blob,
             ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
         )?)?;
-        configuration.admit_against(&self.lock)?;
+        self.lock
+            .admit_startup_artifact(&self.configuration_blob.declaration)?;
+        self.lock.admit_configuration(&configuration)?;
         if configuration != self.configuration {
             return Err(fail(
                 K::IdentityMismatch,
@@ -551,7 +678,7 @@ impl RoventPinnedNativeSources {
         )?;
         let rules_raw = read_blob(&self.rules, 64 << 10)?;
         let rules = validate_pals_virtual_rules_descriptor_bytes(&rules_raw)?;
-        let model = &self.lock.manifest.engine.pc.proposer;
+        let model = &self.lock.engine().pc.proposer;
         if summary.checkpoint_sha256 != self.weights_digest()
             || summary.validator_present
             || summary.model_semantics != model.semantics
@@ -590,7 +717,7 @@ impl RoventPinnedNativeSources {
         Ok(())
     }
     pub(crate) fn validate_runtime(&self, pin: &RuntimeLibraryPin) -> Result<(), BackendError> {
-        let artifacts = &self.lock.manifest.engine.pc.runtime_artifacts;
+        let artifacts = &self.lock.engine().pc.runtime_artifacts;
         match pin.bundle_files() {
             None => {
                 if artifacts.len() != 1
@@ -640,7 +767,7 @@ impl RoventPinnedNativeSources {
         Ok(())
     }
 }
-impl VirtualReviewOwnedSources for RoventPinnedNativeSources {
+impl<L: NativeInputLock> VirtualReviewOwnedSources for RoventPinnedNativeSources<L> {
     fn read_manifest(&self, maximum: usize) -> Result<Vec<u8>, BackendError> {
         read_blob(&self.export, maximum)
     }

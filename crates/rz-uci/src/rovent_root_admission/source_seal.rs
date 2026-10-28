@@ -89,14 +89,58 @@ pub struct StoppedInitial {
 }
 
 /// A /2 source prepared from the actual Rules/Start/clock inputs. It retains
-/// the exact original lock owner and context but does not provide a live
-/// admission conversion; the existing final gate must be shared first.
+/// the exact original lock owner and context for one final-gate decision.
 #[derive(Debug)]
 pub struct PreparedSourceV2 {
     owner: rz_experiments::RoventOriginalInputLock,
     core: PreparedRootCore,
     descriptor: rz_experiments::RoventRootDescriptorV2,
     allocation_clock: rz_experiments::RoventRootAllocationClockV2,
+    rejected: Option<InitialStopReason>,
+}
+
+/// A /2 live admission, issued only while the original current-owner mutex is
+/// held. The original /2 lock and revocation context remain owned; this is
+/// never projected into a /1 admission.
+#[derive(Debug)]
+pub struct RoventRootAdmissionV2 {
+    owner: rz_experiments::RoventOriginalInputLock,
+    policy: RoventRootAdmissionPolicy,
+    startup_lock: Digest,
+    state_and_history: Digest,
+    rules_profile: Digest,
+    snapshot: PositionSnapshot,
+    context: SearchSessionContext,
+    runtime_clock: ContractSystemClock,
+    root_moves: Option<Arc<[BoardMove]>>,
+    allowed_moves: Arc<[BoardMove]>,
+    hard: Deadline,
+    soft: Deadline,
+    admission: Deadline,
+    cleanup: Deadline,
+    descriptor: rz_experiments::RoventRootDescriptorV2,
+    allocation_clock: rz_experiments::RoventRootAllocationClockV2,
+}
+
+/// An originally stopped /2 source retains metadata but no live context.
+#[derive(Debug)]
+pub struct StoppedInitialV2 {
+    owner: rz_experiments::RoventOriginalInputLock,
+    startup_lock: Digest,
+    state_and_history: Digest,
+    rules_profile: Digest,
+    descriptor: rz_experiments::RoventRootDescriptorV2,
+    allocation_clock: rz_experiments::RoventRootAllocationClockV2,
+    allowed_moves: Arc<[BoardMove]>,
+    fallback: Option<BoardMove>,
+    stop_reason: InitialStopReason,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum InitialAdmissionOutcomeV2 {
+    Admitted(RoventRootAdmissionV2),
+    StoppedInitial(StoppedInitialV2),
 }
 
 impl PreparedSourceV2 {
@@ -136,6 +180,7 @@ impl PreparedSourceV2 {
             core,
             descriptor,
             allocation_clock,
+            rejected: None,
         })
     }
 
@@ -151,6 +196,168 @@ impl PreparedSourceV2 {
     }
     pub fn startup_lock_digest(&self) -> Digest {
         self.core.startup_lock
+    }
+
+    /// A rejected source retains its original owner and cannot later mint live
+    /// authority after cancellation, root replacement, or expiry is reversed.
+    #[allow(clippy::result_large_err)]
+    pub fn try_into_live(self) -> Result<RoventRootAdmissionV2, (Self, RoventRootAdmissionError)> {
+        if let Some(reason) = self.rejected {
+            return Err((self, stopped_error(reason)));
+        }
+        let context = self.core.context.clone();
+        let runtime_clock = self.core.runtime_clock.clone();
+        let hard = self.core.hard;
+        let mut source = Some(self);
+        match with_live_gate(&context, &runtime_clock, hard, || {
+            let source = source.take().expect("one original /2 source");
+            RoventRootAdmissionV2 {
+                owner: source.owner,
+                policy: source.core.policy,
+                startup_lock: source.core.startup_lock,
+                state_and_history: source.core.state_and_history,
+                rules_profile: source.core.rules_profile,
+                snapshot: source.core.snapshot,
+                context: source.core.context,
+                runtime_clock: source.core.runtime_clock,
+                root_moves: source.core.root_moves,
+                allowed_moves: source.core.allowed_moves,
+                hard: source.core.hard,
+                soft: source.core.soft,
+                admission: source.core.admission,
+                cleanup: source.core.cleanup,
+                descriptor: source.descriptor,
+                allocation_clock: source.allocation_clock,
+            }
+        }) {
+            Ok(admitted) => Ok(admitted),
+            Err((reason, error)) => {
+                let mut source = source.expect("unissued original /2 source");
+                source.rejected = reason;
+                Err((source, error))
+            }
+        }
+    }
+
+    pub fn into_initial(self) -> Result<InitialAdmissionOutcomeV2, RoventRootAdmissionError> {
+        match self.try_into_live() {
+            Ok(admitted) => Ok(InitialAdmissionOutcomeV2::Admitted(admitted)),
+            Err((source, error)) => match source.rejected {
+                Some(stop_reason) => Ok(InitialAdmissionOutcomeV2::StoppedInitial(
+                    StoppedInitialV2 {
+                        owner: source.owner,
+                        startup_lock: source.core.startup_lock,
+                        state_and_history: source.core.state_and_history,
+                        rules_profile: source.core.rules_profile,
+                        descriptor: source.descriptor,
+                        allocation_clock: source.allocation_clock,
+                        allowed_moves: source.core.allowed_moves,
+                        fallback: source.core.fallback,
+                        stop_reason,
+                    },
+                )),
+                None => Err(error),
+            },
+        }
+    }
+}
+
+impl RoventRootAdmissionV2 {
+    pub fn owner(&self) -> &rz_experiments::RoventOriginalInputLock {
+        &self.owner
+    }
+    pub fn descriptor(&self) -> &rz_experiments::RoventRootDescriptorV2 {
+        &self.descriptor
+    }
+    pub fn allocation_clock(&self) -> &rz_experiments::RoventRootAllocationClockV2 {
+        &self.allocation_clock
+    }
+    pub fn startup_lock_digest(&self) -> Digest {
+        self.startup_lock
+    }
+    pub fn policy(&self) -> RoventRootAdmissionPolicy {
+        self.policy
+    }
+    pub fn state_and_history_digest(&self) -> Digest {
+        self.state_and_history
+    }
+    pub fn rules_profile_digest(&self) -> Digest {
+        self.rules_profile
+    }
+    pub fn authority(&self) -> rz_contracts::pals::SearchAuthority {
+        self.context.authority
+    }
+    pub fn original_go(&self) -> &crate::parser::GoLimits {
+        self.context
+            .original_go
+            .as_deref()
+            .expect("admitted original go")
+    }
+    pub fn requested_nodes(&self) -> Option<u64> {
+        self.context.requested_nodes
+    }
+    pub fn goal(&self) -> rz_contracts::rovent::SearchGoal {
+        self.context.goal
+    }
+    pub fn declared_ceilings(&self) -> &RoventRootDeclaredCeilings {
+        &self.descriptor.input.declared_ceilings
+    }
+    pub fn original_context(&self) -> &SearchSessionContext {
+        &self.context
+    }
+    pub fn root_snapshot(&self) -> &PositionSnapshot {
+        &self.snapshot
+    }
+    pub fn allowed_root_moves(&self) -> &Arc<[BoardMove]> {
+        &self.allowed_moves
+    }
+    pub fn root_moves(&self) -> Option<&Arc<[BoardMove]>> {
+        self.root_moves.as_ref()
+    }
+    pub fn runtime_clock(&self) -> &ContractSystemClock {
+        &self.runtime_clock
+    }
+    pub fn hard_deadline(&self) -> Deadline {
+        self.hard
+    }
+    pub fn soft_deadline(&self) -> Deadline {
+        self.soft
+    }
+    pub fn admission_deadline(&self) -> Deadline {
+        self.admission
+    }
+    pub fn cleanup_deadline(&self) -> Deadline {
+        self.cleanup
+    }
+}
+
+impl StoppedInitialV2 {
+    pub fn owner(&self) -> &rz_experiments::RoventOriginalInputLock {
+        &self.owner
+    }
+    pub fn startup_lock_digest(&self) -> Digest {
+        self.startup_lock
+    }
+    pub fn state_and_history_digest(&self) -> Digest {
+        self.state_and_history
+    }
+    pub fn rules_profile_digest(&self) -> Digest {
+        self.rules_profile
+    }
+    pub fn descriptor(&self) -> &rz_experiments::RoventRootDescriptorV2 {
+        &self.descriptor
+    }
+    pub fn allocation_clock(&self) -> &rz_experiments::RoventRootAllocationClockV2 {
+        &self.allocation_clock
+    }
+    pub fn allowed_root_moves(&self) -> &Arc<[BoardMove]> {
+        &self.allowed_moves
+    }
+    pub fn fallback(&self) -> Option<BoardMove> {
+        self.fallback
+    }
+    pub fn stop_reason(&self) -> InitialStopReason {
+        self.stop_reason
     }
 }
 
@@ -236,80 +443,49 @@ impl SourceSeal {
     // Return the original seal and error without a fresh failure allocation;
     // the seal's rejected state still prevents a later live-admission retry.
     #[allow(clippy::result_large_err)]
-    pub fn try_into_live(
-        mut self,
-    ) -> Result<RoventRootAdmission, (Self, RoventRootAdmissionError)> {
+    pub fn try_into_live(self) -> Result<RoventRootAdmission, (Self, RoventRootAdmissionError)> {
         // A rejected source cannot be retried into a live capability, even if a
         // caller later changes shared state to resemble the original root.
         if let Some(reason) = self.rejected {
             return Err((self, stopped_error(reason)));
         }
-        let accepted = match self.context.accepts() {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                let mut failure = fail(
-                    RoventRootAdmissionFailure::RevokedAuthority,
-                    "original UCI authority unavailable",
-                );
-                failure.metadata_error = Some(error.to_string());
-                return Err((self, failure));
+        let context = self.context.clone();
+        let runtime_clock = self.runtime_clock.clone();
+        let hard = self.hard;
+        let mut source = Some(self);
+        match with_live_gate(&context, &runtime_clock, hard, || {
+            let source = source.take().expect("one original /1 source");
+            RoventRootAdmission {
+                policy: source.policy,
+                startup_lock: source.startup_lock,
+                state_and_history: source.state_and_history,
+                rules_profile: source.rules_profile,
+                snapshot: source.snapshot,
+                context: source.context,
+                runtime_clock: source.runtime_clock,
+                root_moves: source.root_moves,
+                allowed_moves: source.allowed_moves,
+                hard: source.hard,
+                soft: source.soft,
+                admission: source.admission,
+                cleanup: source.cleanup,
+                descriptor: source.descriptor,
+                root_budget: source.root_budget,
+                deadline_seal: source.deadline_seal,
+                digest: source.digest,
+                canonical: source.canonical,
+                allocation_clock: source.allocation_clock,
+                allocation_clock_digest: source.allocation_clock_digest,
+                allocation_clock_canonical: source.allocation_clock_canonical,
             }
-        };
-        // This clone keeps the guard independent of the fields consumed below.
-        // The actual owner mutex remains locked through capability creation.
-        let current_owner = Arc::clone(&self.context.current);
-        let current = match current_owner.lock() {
-            Ok(current) => current,
-            Err(_) => {
-                return Err((
-                    self,
-                    fail(
-                        RoventRootAdmissionFailure::RevokedAuthority,
-                        "original UCI authority mutex poisoned",
-                    ),
-                ));
+        }) {
+            Ok(admitted) => Ok(admitted),
+            Err((reason, error)) => {
+                let mut source = source.expect("unissued original /1 source");
+                source.rejected = reason;
+                Err((source, error))
             }
-        };
-        let reason = match source_stop_reason(&self, *current) {
-            Ok(reason) => reason,
-            Err(error) => return Err((self, error)),
-        };
-        if let Some(reason) = reason {
-            self.rejected = Some(reason);
-            return Err((self, stopped_error(reason)));
         }
-        if !accepted {
-            return Err((
-                self,
-                fail(
-                    RoventRootAdmissionFailure::RevokedAuthority,
-                    "original UCI authority rejected without a stable control stop",
-                ),
-            ));
-        }
-        Ok(RoventRootAdmission {
-            policy: self.policy,
-            startup_lock: self.startup_lock,
-            state_and_history: self.state_and_history,
-            rules_profile: self.rules_profile,
-            snapshot: self.snapshot,
-            context: self.context,
-            runtime_clock: self.runtime_clock,
-            root_moves: self.root_moves,
-            allowed_moves: self.allowed_moves,
-            hard: self.hard,
-            soft: self.soft,
-            admission: self.admission,
-            cleanup: self.cleanup,
-            descriptor: self.descriptor,
-            root_budget: self.root_budget,
-            deadline_seal: self.deadline_seal,
-            digest: self.digest,
-            canonical: self.canonical,
-            allocation_clock: self.allocation_clock,
-            allocation_clock_digest: self.allocation_clock_digest,
-            allocation_clock_canonical: self.allocation_clock_canonical,
-        })
     }
 
     /// Resolve one original source; only a captured control stop is normal.
@@ -702,25 +878,67 @@ fn prepare_root_core(
     })
 }
 
+/// Both wire versions pass this same final gate. The original current-owner
+/// mutex is held until `issue` has constructed the typed live admission.
+fn with_live_gate<T>(
+    context: &SearchSessionContext,
+    runtime_clock: &ContractSystemClock,
+    hard: Deadline,
+    issue: impl FnOnce() -> T,
+) -> Result<T, (Option<InitialStopReason>, RoventRootAdmissionError)> {
+    let accepted = context.accepts().map_err(|error| {
+        let mut failure = fail(
+            RoventRootAdmissionFailure::RevokedAuthority,
+            "original UCI authority unavailable",
+        );
+        failure.metadata_error = Some(error.to_string());
+        (None, failure)
+    })?;
+    let current_owner = Arc::clone(&context.current);
+    let current = current_owner.lock().map_err(|_| {
+        (
+            None,
+            fail(
+                RoventRootAdmissionFailure::RevokedAuthority,
+                "original UCI authority mutex poisoned",
+            ),
+        )
+    })?;
+    if let Some(reason) =
+        source_stop_reason(context, runtime_clock, hard, *current).map_err(|error| (None, error))?
+    {
+        return Err((Some(reason), stopped_error(reason)));
+    }
+    if !accepted {
+        return Err((
+            None,
+            fail(
+                RoventRootAdmissionFailure::RevokedAuthority,
+                "original UCI authority rejected without a stable control stop",
+            ),
+        ));
+    }
+    Ok(issue())
+}
+
 /// Called while holding this source's actual current-owner mutex. Scope takes
 /// precedence over both original cancellation owners and then hard expiry.
 fn source_stop_reason(
-    source: &SourceSeal,
+    context: &SearchSessionContext,
+    runtime_clock: &ContractSystemClock,
+    hard: Deadline,
     current: SessionScope,
 ) -> Result<Option<InitialStopReason>, RoventRootAdmissionError> {
-    if current != SessionScope::Search(source.context.authority) {
+    if current != SessionScope::Search(context.authority) {
         return Ok(Some(InitialStopReason::RootReplaced));
     }
-    if source.context.cancellation.is_canceled()
-        || source.context.control.cancellation.load(Ordering::Acquire)
-    {
+    if context.cancellation.is_canceled() || context.control.cancellation.load(Ordering::Acquire) {
         return Ok(Some(InitialStopReason::Canceled));
     }
-    let now = source
-        .runtime_clock
+    let now = runtime_clock
         .try_now()
         .map_err(|_| fail(RoventRootAdmissionFailure::Clock, "original process now"))?;
-    match source.hard.accepts(source.runtime_clock.domain(), now) {
+    match hard.accepts(runtime_clock.domain(), now) {
         Ok(()) => Ok(None),
         Err(error) if error.code == ErrorCode::Expired => Ok(Some(InitialStopReason::Deadline)),
         Err(_) => Err(fail(
