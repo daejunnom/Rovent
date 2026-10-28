@@ -896,6 +896,28 @@ fn fixture_with_registered_role_limit(
     FrameInput<ReviewView, u64>,
     Instant,
 ) {
+    fixture_with_registered_role_limit_window(
+        scope,
+        finish_ok,
+        credit,
+        limits,
+        role_call_limit,
+        WINDOW,
+    )
+}
+fn fixture_with_registered_role_limit_window(
+    scope: FixtureScope,
+    finish_ok: bool,
+    credit: u64,
+    limits: Option<AdaptiveExecutionLimits>,
+    role_call_limit: Option<u64>,
+    fixture_window: Duration,
+) -> (
+    Manager,
+    Arc<NativeFacts>,
+    FrameInput<ReviewView, u64>,
+    Instant,
+) {
     let position = Position::from_fen("3rk3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
     let mut expected_cpu = BTreeMap::new();
     if matches!(scope, FixtureScope::OwnCpuResume) {
@@ -924,7 +946,7 @@ fn fixture_with_registered_role_limit(
         }
     }
     let clock = ContractSystemClock::new(ProcessEpoch(117));
-    let until = clock.origin() + WINDOW;
+    let until = clock.origin() + fixture_window;
     let authority = SearchAuthority {
         epoch: ProcessEpoch(117),
         game: GameGeneration(1),
@@ -3368,6 +3390,94 @@ fn diagnostic_actual_native_queue_admissions_keep_other_pending_question_identit
     assert!(receipt.permits_archive_close());
     assert_eq!(receipt.pending_tickets, 0);
     assert_eq!(receipt.native_cpu_reserved, 0);
+}
+
+#[test]
+fn begin_shutdown_preserves_existing_paused_owner_cancel_sequence() {
+    let (mut manager, facts, root, until) = fixture_with_registered_role_limit_window(
+        FixtureScope::OwnCpuResume,
+        true,
+        1,
+        None,
+        None,
+        Duration::from_secs(30),
+    );
+    facts.child_gate.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.own[0].binding.is_some()
+    });
+    let event = loop {
+        if let Some(event) = manager.own[0].worker.as_ref().unwrap().try_event().unwrap() {
+            break event;
+        }
+        assert!(
+            Instant::now() < until,
+            "original CPU receipt did not arrive"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    let CpuWorkerEvent::Slice(first) = event else {
+        panic!("original CPU invocation must return its slice");
+    };
+    assert!(first.continuation_retained && !first.terminal);
+    manager.own_event(0, CpuWorkerEvent::Slice(first)).unwrap();
+    let controls = Arc::clone(&manager.own[0].binding.as_ref().unwrap().controls);
+    let original_cancel = manager.issue_control().unwrap();
+    controls.request_cancel(original_cancel).unwrap();
+    manager.begin_shutdown(until).unwrap();
+    assert_eq!(controls.snapshot().cancel_sequence, original_cancel);
+    let receipt = shutdown(&mut manager, until);
+    let terminal = controls.snapshot();
+    assert!(terminal.terminal);
+    assert_eq!(terminal.cancel_sequence, original_cancel);
+    assert_eq!(terminal.cancel_ack, original_cancel);
+    assert_eq!(receipt.native_cpu_reserved, 0);
+    assert_eq!(receipt.own_cpu_joined, receipt.expected_own_cpu_owners);
+    assert!(receipt.permits_archive_close());
+    assert!(manager.failures().next().is_none());
+}
+
+#[test]
+fn close_does_not_replace_cancel_observed_by_owning_worker() {
+    let controls = Arc::new(rz_runtime::adaptive::ControlMailbox::new(
+        "job",
+        rz_runtime::CompletionSignal::default(),
+    ));
+    assert!(close_cancel_needed(&controls));
+    controls.request_cancel(1).unwrap();
+    let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let owner = Arc::clone(&controls);
+    let handle = thread::spawn(move || {
+        let sequence = owner.snapshot().cancel_sequence;
+        observed_tx.send(sequence).ok()?;
+        resume_rx.recv_timeout(Duration::from_secs(30)).ok()?;
+        owner.acknowledge_cancel(sequence).ok()?;
+        Some(owner.seal_terminal())
+    });
+    assert_eq!(
+        observed_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+        1
+    );
+    // Same decision used by begin_close, while the owner still holds seq 1.
+    let duplicate = close_cancel_needed(&controls).then(|| controls.request_cancel(2));
+    let retained_sequence = controls.snapshot().cancel_sequence;
+    resume_tx.send(()).unwrap();
+    let owner_result = handle.join();
+    assert!(duplicate.is_none());
+    assert_eq!(retained_sequence, 1);
+    let terminal = owner_result
+        .unwrap()
+        .expect("original cancel must be acknowledged");
+    assert!(terminal.terminal);
+    assert_eq!((terminal.cancel_sequence, terminal.cancel_ack), (1, 1));
+    assert!(!close_cancel_needed(&controls));
+    let fresh = rz_runtime::adaptive::ControlMailbox::new(
+        "new-job",
+        rz_runtime::CompletionSignal::default(),
+    );
+    assert!(close_cancel_needed(&fresh));
 }
 
 #[test]

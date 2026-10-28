@@ -8233,15 +8233,25 @@ where
         }
         // First revoke question authority, then cancel each same-owner task.
         for index in 0..self.own.len() {
-            let sequence = self.issue_control()?;
-            if let Some(binding) = &self.own[index].binding {
-                let _ = binding.controls.request_cancel(sequence);
+            if self.own[index]
+                .binding
+                .as_ref()
+                .is_some_and(|binding| close_cancel_needed(&binding.controls))
+            {
+                let sequence = self.issue_control()?;
+                if let Some(binding) = &self.own[index].binding {
+                    let _ = binding.controls.request_cancel(sequence);
+                }
             }
             if let Some(worker) = &self.own[index].worker {
                 worker.request_shutdown();
             }
         }
-        if self.foreign.is_some() {
+        if self
+            .foreign
+            .as_ref()
+            .is_some_and(|binding| close_cancel_needed(&binding.job.control))
+        {
             let sequence = self.issue_control()?;
             if let Some(binding) = &self.foreign {
                 let _ = binding.job.control.request_cancel(sequence);
@@ -8656,6 +8666,14 @@ where
             }
         }
     }
+}
+
+// The manager is the sole control writer for its Job. Once cancellation is
+// published, retain that exact sequence for the owner acknowledgement and
+// terminal receipt; shutdown must not replace an in-flight cancellation.
+fn close_cancel_needed<S>(controls: &rz_runtime::adaptive::ControlMailbox<S>) -> bool {
+    let snapshot = controls.snapshot();
+    !snapshot.terminal && !snapshot.is_cancelled()
 }
 
 /// A natural terminal/cancel racing with S-policy advice remains an owner
