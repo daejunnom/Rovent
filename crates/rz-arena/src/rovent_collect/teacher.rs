@@ -8,6 +8,7 @@ use rz_uci::pals_checker_profile::rovent::RoventExternalProfile;
 use rz_uci::rovent_external_launch::{PreparedRoventExternalLaunch, RoventExternalOwner};
 mod collection;
 pub use collection::RoventCollectionTeacherBinding;
+mod v2_actor_preflight;
 mod session;
 pub use session::*;
 mod pump;

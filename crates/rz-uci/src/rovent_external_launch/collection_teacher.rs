@@ -679,6 +679,236 @@ impl RoventCollectionTeacherOwnerV2 {
     }
 }
 
+/// One observed retirement of the original teacher process. Even Confirmed
+/// does not mean its queued completions were recovered or its parent process
+/// scope closed. It is not root revocation, a native fence, or label authority.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Debug)]
+pub(crate) enum RoventTeacherPhysicalRetirementV2 {
+    NotRequested,
+    Pending,
+    Confirmed(CheckerShutdown),
+    Unknown(Option<CheckerShutdown>),
+}
+
+/// Whether the original diagnostics were returned to the caller. Unavailable
+/// does not distinguish unpublished bytes from bytes taken by an earlier owner.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoventTeacherDiagnosticsDispositionV2 {
+    NotObserved,
+    Recovered,
+    UnavailableOrAlreadyTaken,
+}
+
+/// Errors, actual process evidence and undrained work remain separate. A
+/// confirmed process retirement does not imply that its output was consumed.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Debug)]
+pub(crate) struct RoventTeacherRetirementObservationV2 {
+    pub root_observation_error: Option<rz_contracts::ContractError>,
+    pub worker_join: Option<Result<CheckerShutdown, CheckerError>>,
+    pub physical: RoventTeacherPhysicalRetirementV2,
+    pub commands: usize,
+    pub reliable_queued: usize,
+    pub reliable_reserved: usize,
+    pub diagnostics: RoventTeacherDiagnosticsDispositionV2,
+    /// This wrapper does not know whether prior dispatches all produced and
+    /// delivered terminals, even when the lower mailbox is currently empty.
+    pub terminal_accounting: RoventTeacherTerminalAccountingV2,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoventTeacherTerminalAccountingV2 {
+    Unknown,
+}
+
+/// Owns the original /2 teacher across admission closure, shutdown and join.
+/// The surrounding session still owns root revoke and the process scope. It
+/// must call `observe_root` as part of its control loop; this type starts no
+/// watcher and does not independently authorize Collection execution.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub(crate) struct RoventCollectionTeacherLifecycleV2 {
+    owner: Option<RoventCollectionTeacherOwnerV2>,
+    shutdown_requested: bool,
+    root_observation_error: Option<rz_contracts::ContractError>,
+    diagnostics: RoventTeacherDiagnosticsDispositionV2,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventCollectionTeacherLifecycleV2 {
+    pub(crate) fn new(owner: RoventCollectionTeacherOwnerV2) -> Self {
+        Self {
+            owner: Some(owner),
+            shutdown_requested: false,
+            root_observation_error: None,
+            diagnostics: RoventTeacherDiagnosticsDispositionV2::NotObserved,
+        }
+    }
+
+    /// Observe the original root, and close teacher admission on revocation,
+    /// expiry, or an unavailable observation. `false` does not distinguish
+    /// those cases and is not itself the root's revocation operation.
+    pub(crate) fn observe_root(&mut self) -> Result<bool, rz_contracts::ContractError> {
+        if self.shutdown_requested {
+            return Ok(false);
+        }
+        let context = self.owner.as_ref().expect("retained teacher owner").admission().root_admission().original_context();
+        let until = context.shutdown_deadline;
+        match context.accepts() {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.request_shutdown(until);
+                Ok(false)
+            }
+            Err(error) => {
+                self.root_observation_error = Some(error);
+                self.request_shutdown(until);
+                Err(error)
+            }
+        }
+    }
+
+    /// The lower worker closes its mailbox and bounds the deadline by the
+    /// original cleanup ceiling. A request is not evidence of physical exit.
+    pub(crate) fn request_shutdown(&mut self, until: Instant) {
+        self.shutdown_requested = true;
+        self.owner.as_ref().expect("retained teacher owner").worker.request_shutdown(until);
+    }
+
+    pub(crate) fn submit(&mut self, job: TeacherJob) -> Result<TeacherDispatch, CheckerError> {
+        if !self
+            .observe_root()
+            .map_err(|_| invalid("teacher /2 root observation unavailable"))?
+        {
+            return Err(invalid("teacher /2 admission closed"));
+        }
+        let result = self.owner.as_mut().expect("retained teacher owner").submit(job);
+        if result.is_err() {
+            // A root can close between the two admission observations. Preserve
+            // the original submit error while arranging shutdown on that race.
+            let _ = self.observe_root();
+        }
+        result
+    }
+
+    /// The original completion remains available even after root revocation;
+    /// the caller must preserve it and must not treat it as a valid label.
+    pub(crate) fn take_completion(&self) -> Option<TeacherCompletion> {
+        self.owner.as_ref().expect("retained teacher owner").worker.take_completion()
+    }
+
+    /// Preserve the original live-root and private-dispatch validation for a
+    /// completion. Retirement evidence alone never makes a label eligible.
+    pub(crate) fn validate_completion(
+        &mut self,
+        completion: &TeacherCompletion,
+        dispatch: &TeacherDispatch,
+    ) -> Result<(), CheckerError> {
+        if !self.observe_root().map_err(|_| invalid("teacher /2 root observation unavailable"))? {
+            return Err(invalid("teacher /2 admission closed"));
+        }
+        let result = self.owner.as_ref().expect("retained teacher owner").validate_completion(completion, dispatch);
+        if result.is_err() {
+            let _ = self.observe_root();
+        }
+        result
+    }
+
+    /// Recover the lower worker's original diagnostic bytes only after join.
+    pub(crate) fn take_diagnostics_after_join(&mut self) -> Option<TeacherDiagnostics> {
+        if self.diagnostics != RoventTeacherDiagnosticsDispositionV2::NotObserved {
+            return None;
+        }
+        let worker = &mut self.owner.as_mut().expect("retained teacher owner").worker;
+        if worker.shutdown_snapshot().is_none() {
+            return None;
+        }
+        let diagnostics = worker.take_diagnostics_after_join();
+        self.diagnostics = if diagnostics.is_some() {
+            RoventTeacherDiagnosticsDispositionV2::Recovered
+        } else {
+            RoventTeacherDiagnosticsDispositionV2::UnavailableOrAlreadyTaken
+        };
+        diagnostics
+    }
+
+    /// Poll without discarding reliable completions or consuming the owner.
+    /// An error can coexist with separately confirmed process-exit evidence.
+    pub(crate) fn poll(&mut self) -> RoventTeacherRetirementObservationV2 {
+        if !self.shutdown_requested {
+            let _ = self.observe_root();
+        }
+        let owner = self.owner.as_mut().expect("retained teacher owner");
+        let joined = owner.worker.try_join().or_else(|| owner.worker.shutdown_snapshot());
+        let process = owner.worker.process_after_join();
+        let occupancy = owner.worker.occupancy();
+        let physical = if !self.shutdown_requested && joined.is_none() {
+            RoventTeacherPhysicalRetirementV2::NotRequested
+        } else if joined.is_none() {
+            RoventTeacherPhysicalRetirementV2::Pending
+        } else if let Some(evidence) = process.filter(|p| {
+            p.process_identity.is_some()
+                && p.exit_observed
+                && p.stdout_drained
+                && p.stderr_drained
+                && p.cleanup_complete
+                && !p.quarantined
+                && !p.ownership_lost
+        }) {
+            RoventTeacherPhysicalRetirementV2::Confirmed(evidence)
+        } else {
+            RoventTeacherPhysicalRetirementV2::Unknown(process)
+        };
+        RoventTeacherRetirementObservationV2 {
+            root_observation_error: self.root_observation_error,
+            worker_join: joined,
+            physical,
+            commands: occupancy.commands,
+            reliable_queued: occupancy.reliable_queued,
+            reliable_reserved: occupancy.reliable_reserved,
+            diagnostics: self.diagnostics,
+            terminal_accounting: RoventTeacherTerminalAccountingV2::Unknown,
+        }
+    }
+
+    /// Return the same owner only after its physical process is known closed,
+    /// the observable queues are empty and diagnostic availability was observed.
+    /// This returns the process owner only; it does not establish that every
+    /// dispatched terminal was delivered, or authorize a Collection label.
+    /// Failure returns the wrapper itself so the caller can keep polling.
+    pub(crate) fn try_finish(
+        mut self,
+    ) -> Result<(RoventCollectionTeacherOwnerV2, RoventTeacherRetirementObservationV2), Self> {
+        let observation = self.poll();
+        if !matches!(&observation.physical, RoventTeacherPhysicalRetirementV2::Confirmed(_))
+            || observation.worker_join.is_none()
+            || observation.commands != 0
+            || observation.reliable_queued != 0
+            || observation.reliable_reserved != 0
+            || observation.diagnostics == RoventTeacherDiagnosticsDispositionV2::NotObserved
+        {
+            return Err(self);
+        }
+        Ok((self.owner.take().expect("retained teacher owner"), observation))
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl Drop for RoventCollectionTeacherLifecycleV2 {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            // The surrounding session failed to recover the owner explicitly.
+            // Close admission and quarantine the whole owner, including its
+            // worker/mailbox, rather than lose late completion or diagnostics.
+            let until = owner.admission().root_admission().original_context().shutdown_deadline;
+            owner.worker.request_shutdown(until);
+            std::mem::forget(owner);
+        }
+    }
+}
+
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl Drop for RoventCollectionTeacherOwnerV2 {
     fn drop(&mut self) {
