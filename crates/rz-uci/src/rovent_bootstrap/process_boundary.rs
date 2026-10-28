@@ -535,6 +535,12 @@ impl fmt::Debug for VerifiedOwnedRoventProcessBoundaryV2 {
 }
 
 impl VerifiedOwnedRoventProcessBoundaryV2 {
+    /// Exact original cancellation allocation and the unrenewed deadlines.
+    pub(crate) fn matches_startup_control(&self, other: &RoventStartupControl) -> bool {
+        Arc::ptr_eq(&self.inputs.control.cancellation, &other.cancellation)
+            && self.inputs.control.until == other.until
+            && self.inputs.control.cleanup_until == other.cleanup_until
+    }
     pub fn input_lock(&self) -> &Arc<RoventInputLockV2> {
         &self.inputs.lock
     }

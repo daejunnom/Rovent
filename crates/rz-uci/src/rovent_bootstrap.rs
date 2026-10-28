@@ -497,6 +497,7 @@ pub struct PreparedRoventNativeV2<Q: NativeQuestionProjection = AdaptivePortQues
     snapshot: RoventNativeStartupSnapshot,
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV2>>,
     _verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+    control: RoventStartupControl,
 }
 impl<Q: NativeQuestionProjection> PreparedRoventNativeV2<Q> {
     pub fn snapshot(&self) -> &RoventNativeStartupSnapshot {
@@ -504,6 +505,9 @@ impl<Q: NativeQuestionProjection> PreparedRoventNativeV2<Q> {
     }
     pub fn sources(&self) -> &Arc<RoventPinnedNativeSources<RoventInputLockV2>> {
         &self.sources
+    }
+    pub(crate) fn startup_control(&self) -> &RoventStartupControl {
+        &self.control
     }
     pub fn into_parts(
         self,
@@ -524,6 +528,15 @@ pub fn prepare_native_v2<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNativeV2<Q>, RoventNativeStartupRejection<Q>> {
+    if !sources.matches_startup_control(&control) {
+        return Err(RoventNativeStartupRejection {
+            error: fail(
+                K::IdentityMismatch,
+                "V2 source and native startup control differ",
+            ),
+            native: None,
+        });
+    }
     let diagnostic = NativeStartupDiagnostic::default();
     let (native, snapshot) = spawn_native_owner(
         Arc::clone(&sources),
@@ -567,6 +580,7 @@ pub fn prepare_native_v2<Q: NativeQuestionProjection>(
         snapshot,
         sources,
         _verifier: verifier,
+        control,
     })
 }
 

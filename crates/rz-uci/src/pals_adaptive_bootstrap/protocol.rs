@@ -8,7 +8,12 @@ use crate::search_driver::{
 use crate::{EngineIdentity, forward_lines};
 use rz_contracts::Digest;
 use rz_position::{BoardMove, Position};
-use std::{io, sync::Arc, thread};
+use std::{
+    io,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 pub fn serve_driver(
     driver: Arc<dyn SearchSessionDriver>,
@@ -16,7 +21,7 @@ pub fn serve_driver(
     owners: Arc<OwnerRegistry>,
     settings: EngineSettings,
 ) -> Result<(), engine::EngineError> {
-    let process = EngineProcess::with_search_driver(driver, owners, clock);
+    let process = EngineProcess::with_search_driver(Arc::clone(&driver), owners, clock);
     let (sender, events) = engine::event_channel();
     let input = sender.clone();
     // Only stdin may block here. Search, stop and physical drain have independent
@@ -30,13 +35,7 @@ pub fn serve_driver(
                 settings.parser.max_line_bytes,
             );
         })
-        .map_err(|_| {
-            engine::EngineError::Contract(rz_contracts::ContractError::new(
-                rz_contracts::ErrorCode::BackendFailure,
-                rz_contracts::Stage::Admission,
-                "adaptive stdin owner thread creation failed",
-            ))
-        })?;
+        .map_err(|_| stdin_spawn_failure(&driver, settings.shutdown_limit))?;
     engine::serve(
         events,
         sender,
@@ -48,6 +47,43 @@ pub fn serve_driver(
         process,
         settings,
     )
+}
+
+/// No engine event loop or search can have started on this path. Try to close
+/// the original driver within its registered shutdown limit; retain the spawn
+/// failure as the primary error and never promote unknown completion to success.
+fn stdin_spawn_failure(
+    driver: &Arc<dyn SearchSessionDriver>,
+    shutdown_limit: Duration,
+) -> engine::EngineError {
+    use crate::search_driver::DriverPhysicalCompletion;
+    let primary = engine::EngineError::Contract(rz_contracts::ContractError::new(
+        rz_contracts::ErrorCode::BackendFailure,
+        rz_contracts::Stage::Admission,
+        "adaptive stdin owner thread creation failed",
+    ));
+    let cleanup = match Instant::now().checked_add(shutdown_limit) {
+        None => Some(engine::EngineError::DrainTimeout),
+        Some(until) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.finish_session(until)
+        })) {
+            Ok(Ok(Some(DriverPhysicalCompletion::Unknown))) => {
+                Some(engine::EngineError::SearchDriverClose(
+                    SearchSessionFailure::physical_completion_unknown(),
+                ))
+            }
+            Ok(Err(error)) => Some(engine::EngineError::SearchDriverClose(error)),
+            Err(_) => Some(engine::EngineError::WorkerPanic),
+            Ok(Ok(_)) => None,
+        },
+    };
+    match cleanup {
+        Some(cleanup) => engine::EngineError::Cleanup {
+            primary: Box::new(primary),
+            cleanup: vec![cleanup],
+        },
+        None => primary,
+    }
 }
 
 pub struct RulesOnlyPreflightDriver {
@@ -109,6 +145,75 @@ mod tests {
 
     const WORKER_MARKER: &str = "rules-only-worker-stderr-before-report";
     const CHILD_TEST: &str = "pals_adaptive_bootstrap::protocol::tests::worker_stderr_stdio_child";
+
+    #[test]
+    fn failed_stdin_spawn_closes_the_original_driver_and_preserves_unknown() {
+        use crate::search_driver::DriverPhysicalCompletion;
+        use std::sync::Mutex;
+
+        struct ClosingDriver {
+            result: DriverPhysicalCompletion,
+            calls: AtomicUsize,
+            deadline: Mutex<Option<Instant>>,
+        }
+        impl SearchSessionDriver for ClosingDriver {
+            fn kind(&self) -> SearchKind {
+                SearchKind::Pals
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "early-close fixture".into(),
+                    author: "RoveZero".into(),
+                }
+            }
+            fn implementation(&self) -> Digest {
+                Digest([7; 32])
+            }
+            fn run(
+                &self,
+                _: &Position,
+                _: &SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<SearchSessionReport, SearchSessionFailure> {
+                unreachable!("stdin failure happens before UCI search")
+            }
+            fn finish_session(
+                &self,
+                until: Instant,
+            ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                *self.deadline.lock().unwrap() = Some(until);
+                Ok(Some(self.result))
+            }
+        }
+        for expected in [
+            DriverPhysicalCompletion::Confirmed,
+            DriverPhysicalCompletion::Unknown,
+        ] {
+            let original = Arc::new(ClosingDriver {
+                result: expected,
+                calls: AtomicUsize::new(0),
+                deadline: Mutex::new(None),
+            });
+            let driver: Arc<dyn SearchSessionDriver> = original.clone();
+            let before = Instant::now();
+            let error = stdin_spawn_failure(&driver, Duration::from_secs(2));
+            let after = Instant::now();
+            let deadline = original.deadline.lock().unwrap().unwrap();
+            assert!(deadline >= before + Duration::from_secs(2));
+            assert!(deadline <= after + Duration::from_secs(2));
+            assert_eq!(original.calls.load(Ordering::Acquire), 1);
+            match expected {
+                DriverPhysicalCompletion::Confirmed => {
+                    assert!(matches!(error, engine::EngineError::Contract(_)))
+                }
+                DriverPhysicalCompletion::Unknown => assert!(matches!(error,
+                    engine::EngineError::Cleanup { primary, cleanup }
+                        if matches!(primary.as_ref(), engine::EngineError::Contract(_))
+                            && matches!(cleanup.as_slice(), [engine::EngineError::SearchDriverClose(_)]))),
+            }
+        }
+    }
 
     // This is a Rules-only fixture, not a native/lifecycle receipt producer.
     // The real worker writes to the same process-wide stderr that the ordinary

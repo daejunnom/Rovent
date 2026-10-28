@@ -4,11 +4,12 @@
 use super::configuration::{ExecutionConfiguration, StartupConfigurationDocument};
 use super::launch::storage::RoventStorageOwnedRuntimeRegistration;
 use super::nnuec_source::LoadedRoventNnuecSource;
+use super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2;
 use super::product::SharedRoventStorageRegistration;
 use super::storage_lifecycle::{SessionStorageLifecycle, StorageSemanticOwner};
 use super::{
-    PreparedRoventNative, RoventNativeBackend, RoventNativeService, RoventNativeStartupSnapshot,
-    RoventPinnedNativeSources,
+    PreparedRoventNative, PreparedRoventNativeV2, RoventNativeBackend, RoventNativeService,
+    RoventNativeStartupSnapshot, RoventPinnedNativeSources,
 };
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
@@ -19,7 +20,8 @@ use crate::pals_adaptive::{
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
-    InitialAdmissionOutcome, SourceSeal, StoppedInitial,
+    InitialAdmissionOutcome, InitialAdmissionOutcomeV2, PreparedSourceV2, RoventRootAdmissionV2,
+    SourceSeal, StoppedInitial, StoppedInitialV2,
 };
 use crate::rovent_root_admission::{RoventRootAdmission, RoventRootAdmissionPolicy};
 use crate::search_driver::{
@@ -52,6 +54,43 @@ use std::{
 
 type Backend = RoventNativeBackend<PcPortQuestion>;
 type Model = AdaptivePortModel;
+enum PcSources {
+    V1(Arc<RoventPinnedNativeSources>),
+    V2(Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV2>>),
+}
+enum PcPreparedRoot {
+    V1(SourceSeal),
+    V2(PreparedSourceV2),
+}
+enum PcRootAdmission {
+    V1(Arc<RoventRootAdmission>),
+    V2(Arc<RoventRootAdmissionV2>),
+}
+impl PcRootAdmission {
+    fn budget_digest(&self) -> Result<Digest, SearchSessionFailure> {
+        match self {
+            Self::V1(value) => Ok(value.root_budget_digest()),
+            Self::V2(value) => value
+                .descriptor()
+                .root_budget_digest()
+                .map_err(|e| SearchSessionFailure::debug("RoventPcV2Budget", &e)),
+        }
+    }
+}
+impl PcSources {
+    fn v1(&self) -> Option<&Arc<RoventPinnedNativeSources>> {
+        match self {
+            Self::V1(source) => Some(source),
+            Self::V2(_) => None,
+        }
+    }
+    fn forget_original(&self) {
+        match self {
+            Self::V1(source) => std::mem::forget(Arc::clone(source)),
+            Self::V2(source) => std::mem::forget(Arc::clone(source)),
+        }
+    }
+}
 pub type RoventPcSessionManager =
     RoleOnlyExecutionManager<PcPortQuestion, Backend, PcPortDriver<Model>>;
 type Manager = RoventPcSessionManager;
@@ -84,6 +123,30 @@ pub struct RoventPcRootReceipt {
     pub physical: RoleOnlyShutdownReceipt,
     pub repair: Option<rz_search::pals::engine::pc_port::PcRepairReport>,
 }
+
+/// Actual /2 root outcome, retaining its original typed admission and fence.
+pub struct RoventPcRootReceiptV2 {
+    pub domain: &'static str,
+    pub authority: SearchAuthority,
+    pub input_lock: Digest,
+    pub root_admission: Arc<RoventRootAdmissionV2>,
+    pub frontier: FrontierSnapshot,
+    pub physical: RoleOnlyShutdownReceipt,
+    pub repair: Option<rz_search::pals::engine::pc_port::PcRepairReport>,
+}
+impl std::fmt::Debug for RoventPcRootReceiptV2 {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("RoventPcRootReceiptV2")
+            .field("domain", &self.domain)
+            .field("authority", &self.authority)
+            .field("input_lock", &self.input_lock)
+            .field("root_admission", &self.root_admission)
+            .field("frontier", &self.frontier)
+            .field("physical", &self.physical)
+            .field("repair_present", &self.repair.is_some())
+            .finish()
+    }
+}
 impl std::fmt::Debug for RoventPcRootReceipt {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         out.debug_struct("RoventPcRootReceipt")
@@ -97,42 +160,43 @@ impl std::fmt::Debug for RoventPcRootReceipt {
             .finish()
     }
 }
-impl RoventPcRootReceipt {
-    fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
-        if !self.frontier.work.native_usage_known
-            || self.frontier.work.native_nodes != 0
-            || self.frontier.work.native_qsearch_nodes != 0
-            || self.frontier.work.reserved_native_nodes != 0
-            || self.frontier.work.outstanding_native_executions != 0
-        {
-            return Err(failure(
-                "RoventPcResearcherPresent",
-                "R-free work contains native R accounting",
-            ));
-        }
-        let total = self.frontier.work.total_node_visits().ok_or_else(|| {
-            failure(
-                "RoventPcWorkOverflow",
-                "original node observations overflow",
-            )
-        })?;
-        let counts = &self.physical.counters;
-        Ok(DriverWork::RoventNative {
-            root_entries: self.frontier.work.root_entries,
-            total_node_visits: Some(total),
-            checked_transitions: self.frontier.work.checked_transitions,
-            native_nodes: Some(0),
-            native_qsearch_nodes: Some(0),
-            submitted_role_tickets: counts.submitted_role_tickets,
-            consumed_role_outputs: counts.consumed_role_outputs,
-            completed_nn_inputs: (counts.nn_input_count_unknown == 0)
-                .then_some(counts.completed_nn_inputs),
-            consumed_nn_inputs: (counts.consumed_nn_input_count_unknown == 0)
-                .then_some(counts.consumed_nn_inputs),
-            completed_depth: self.frontier.horizon.completed_depth.map(|depth| depth.0),
-            maximum_examined_ply: self.frontier.horizon.maximum_examined_ply.0,
-        })
+fn pc_root_work(
+    frontier: &FrontierSnapshot,
+    physical: &RoleOnlyShutdownReceipt,
+) -> Result<DriverWork, SearchSessionFailure> {
+    if !frontier.work.native_usage_known
+        || frontier.work.native_nodes != 0
+        || frontier.work.native_qsearch_nodes != 0
+        || frontier.work.reserved_native_nodes != 0
+        || frontier.work.outstanding_native_executions != 0
+    {
+        return Err(failure(
+            "RoventPcResearcherPresent",
+            "R-free work contains native R accounting",
+        ));
     }
+    let total = frontier.work.total_node_visits().ok_or_else(|| {
+        failure(
+            "RoventPcWorkOverflow",
+            "original node observations overflow",
+        )
+    })?;
+    let counts = &physical.counters;
+    Ok(DriverWork::RoventNative {
+        root_entries: frontier.work.root_entries,
+        total_node_visits: Some(total),
+        checked_transitions: frontier.work.checked_transitions,
+        native_nodes: Some(0),
+        native_qsearch_nodes: Some(0),
+        submitted_role_tickets: counts.submitted_role_tickets,
+        consumed_role_outputs: counts.consumed_role_outputs,
+        completed_nn_inputs: (counts.nn_input_count_unknown == 0)
+            .then_some(counts.completed_nn_inputs),
+        consumed_nn_inputs: (counts.consumed_nn_input_count_unknown == 0)
+            .then_some(counts.consumed_nn_inputs),
+        completed_depth: frontier.horizon.completed_depth.map(|depth| depth.0),
+        maximum_examined_ply: frontier.horizon.maximum_examined_ply.0,
+    })
 }
 
 /// An original Start stopped before a root, view or native ticket was created.
@@ -144,6 +208,19 @@ pub struct RoventPcInitialReceipt {
     input_lock: Digest,
     source: Arc<StoppedInitial>,
     idle_custody: IdleCustody,
+}
+
+#[derive(Clone, Debug)]
+pub struct RoventPcInitialReceiptV2 {
+    pub authority: SearchAuthority,
+    pub input_lock: Digest,
+    pub source: Arc<StoppedInitialV2>,
+    previous: Option<Arc<RoventPcRootReceiptV2>>,
+}
+impl RoventPcInitialReceiptV2 {
+    pub fn previous_clean_root(&self) -> Option<&Arc<RoventPcRootReceiptV2>> {
+        self.previous.as_ref()
+    }
 }
 impl RoventPcInitialReceipt {
     pub fn domain(&self) -> &'static str {
@@ -162,29 +239,33 @@ impl RoventPcInitialReceipt {
         match &self.idle_custody {
             IdleCustody::StartupReady => None,
             IdleCustody::RetiredRoot(receipt) => Some(receipt),
+            IdleCustody::RetiredRootV2(_) => None,
         }
     }
     pub fn used_original_startup_ready(&self) -> bool {
         matches!(self.idle_custody, IdleCustody::StartupReady)
     }
     fn report(&self) -> SearchSessionReport {
-        SearchSessionReport {
-            best_move: self.source.fallback(),
-            work: DriverWork::RoventNative {
-                root_entries: 0,
-                total_node_visits: Some(0),
-                checked_transitions: 0,
-                native_nodes: Some(0),
-                native_qsearch_nodes: Some(0),
-                submitted_role_tickets: 0,
-                consumed_role_outputs: 0,
-                completed_nn_inputs: Some(0),
-                consumed_nn_inputs: Some(0),
-                completed_depth: None,
-                maximum_examined_ply: 0,
-            },
-            mate_strategy: None,
-        }
+        initial_stop_report(self.source.fallback())
+    }
+}
+fn initial_stop_report(fallback: Option<BoardMove>) -> SearchSessionReport {
+    SearchSessionReport {
+        best_move: fallback,
+        work: DriverWork::RoventNative {
+            root_entries: 0,
+            total_node_visits: Some(0),
+            checked_transitions: 0,
+            native_nodes: Some(0),
+            native_qsearch_nodes: Some(0),
+            submitted_role_tickets: 0,
+            consumed_role_outputs: 0,
+            completed_nn_inputs: Some(0),
+            consumed_nn_inputs: Some(0),
+            completed_depth: None,
+            maximum_examined_ply: 0,
+        },
+        mate_strategy: None,
     }
 }
 
@@ -192,6 +273,7 @@ impl RoventPcInitialReceipt {
 enum IdleCustody {
     StartupReady,
     RetiredRoot(Arc<RoventPcRootReceipt>),
+    RetiredRootV2(Arc<RoventPcRootReceiptV2>),
 }
 struct Idle {
     native: NativeOwner,
@@ -293,6 +375,11 @@ pub struct RoventPcSessionRejection {
     pub failure: SearchSessionFailure,
     pub prepared: PreparedRoventNative<PcPortQuestion>,
 }
+pub struct RoventPcSessionV2Rejection {
+    pub failure: SearchSessionFailure,
+    pub prepared: PreparedRoventNativeV2<PcPortQuestion>,
+    pub process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+}
 /// No preparation thread is started before this constructor has succeeded.
 /// Rejection therefore returns both original startup owners without a join.
 pub struct RoventPcSharedNnuecSessionRejection {
@@ -361,7 +448,9 @@ impl SharedNnuecActor {
     }
 }
 pub struct RoventPcSessionDriver {
-    sources: Arc<RoventPinnedNativeSources>,
+    sources: PcSources,
+    original_v2_owner: Option<rz_experiments::RoventOriginalInputLock>,
+    process_v2: Option<Arc<VerifiedOwnedRoventProcessBoundaryV2>>,
     snapshot: RoventNativeStartupSnapshot,
     configuration: StartupConfigurationDocument,
     clock: ProcessClock,
@@ -378,6 +467,8 @@ pub struct RoventPcSessionDriver {
     state: Mutex<State>,
     latest: Mutex<Option<Arc<RoventPcRootReceipt>>>,
     latest_initial: Mutex<Option<Arc<RoventPcInitialReceipt>>>,
+    latest_v2: Mutex<Option<Arc<RoventPcRootReceiptV2>>>,
+    latest_initial_v2: Mutex<Option<Arc<RoventPcInitialReceiptV2>>>,
     /// A report already taken from the port survives any later failed transfer.
     /// The exclusive root owner permits at most one such in-progress report.
     retained_repair: Mutex<Option<rz_search::pals::engine::pc_port::PcRepairReport>>,
@@ -412,6 +503,174 @@ impl RoventPcSessionDriver {
             RoventRootAdmissionPolicy::DynamicGo => 1,
         }]);
         Ok(Digest(hash.finalize().into()))
+    }
+
+    /// Consume the original V2 Ready/source/process owners as one unit.
+    /// This path supports only roles-only, archive-off execution.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn new_v2(
+        prepared: PreparedRoventNativeV2<PcPortQuestion>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventPcSessionV2Rejection> {
+        let build =
+            (|| -> Result<_, SearchSessionFailure> {
+                let sources = prepared.sources();
+                if !Arc::ptr_eq(sources.lock_owner(), process.input_lock())
+                    || !process.matches_startup_control(prepared.startup_control())
+                    || sources.private_root_path() != process.private_cwd()
+                    || !sources
+                        .same_original_root(process.original_root())
+                        .map_err(|e| SearchSessionFailure::debug("RoventPcV2Root", &e))?
+                {
+                    return Err(failure(
+                        "RoventPcV2Custody",
+                        "original lock, root, or startup control differs",
+                    ));
+                }
+                let configuration = sources.configuration().clone();
+                configuration
+                    .require_supported_native_capabilities()
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcCapability", &e))?;
+                if !matches!(
+                    configuration.fields().execution,
+                    ExecutionConfiguration::RolesOnly {
+                        shared_nnuec_readout: None,
+                        ..
+                    }
+                ) || sources.lock().manifest.engine.nnuec.is_some()
+                    || sources.collection_preload_sources().is_some()
+                    || prepared.snapshot().mode.has_native_r()
+                    || prepared.snapshot().process_epoch != clock.epoch().0
+                    || identity.name.is_empty()
+                    || identity.author.is_empty()
+                {
+                    return Err(failure(
+                        "RoventPcV2Startup",
+                        "unsupported V2 session profile",
+                    ));
+                }
+                let native_clock = prepared.service.ready_clock().ok_or_else(|| {
+                    failure("RoventPcV2Startup", "actual native Ready clock is absent")
+                })?;
+                let original_clock = clock.runtime_clock();
+                if prepared.service.is_quarantined()
+                    || prepared.service.native_acceptance_verifier().is_none()
+                    || native_clock.domain() != original_clock.domain()
+                    || native_clock.origin() != original_clock.origin()
+                    || prepared.snapshot().input_lock != sources.lock_digest()
+                {
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+                let original_owner = rz_experiments::RoventOriginalInputLock::from_v2(Arc::clone(
+                    sources.lock_owner(),
+                ))
+                .map_err(|e| SearchSessionFailure::debug("RoventPcV2Lock", &e.error))?;
+                let namespace = prepared
+                    .snapshot()
+                    .model_namespace()
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcNamespace", &e))?;
+                let model = AdaptivePortModel::new_with_namespace(
+                    prepared.snapshot().role_model_identity(),
+                    Some(
+                        prepared
+                            .snapshot()
+                            .model_value_identity()
+                            .map_err(|e| SearchSessionFailure::debug("RoventPcNamespace", &e))?,
+                    ),
+                    namespace,
+                )
+                .map_err(|e| SearchSessionFailure::debug("RoventPcModelMirror", &e))?;
+                let owner =
+                    PcSemanticOwner::new_selected_rovent(
+                        configuration.fields().semantic.actual().map_err(|e| {
+                            SearchSessionFailure::debug("RoventPcConfiguration", &e)
+                        })?,
+                        model,
+                        configuration.fields().review.actual().map_err(|e| {
+                            SearchSessionFailure::debug("RoventPcConfiguration", &e)
+                        })?,
+                        configuration.fields().index.actual().map_err(|e| {
+                            SearchSessionFailure::debug("RoventPcConfiguration", &e)
+                        })?,
+                    )
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcSemanticOwner", &e))?;
+                let implementation =
+                    Self::implementation_digest_from_metadata(&configuration, root_policy)
+                        .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?;
+                let selective_policy = Digest(
+                    configuration
+                        .search_configuration_digest()
+                        .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
+                );
+                let frontier_limits = configuration
+                    .fields()
+                    .frontier
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?;
+                Ok((
+                    configuration,
+                    original_owner,
+                    owner,
+                    implementation,
+                    selective_policy,
+                    frontier_limits,
+                ))
+            })();
+        let (
+            configuration,
+            original_owner,
+            owner,
+            implementation,
+            selective_policy,
+            frontier_limits,
+        ) = match build {
+            Ok(value) => value,
+            Err(failure) => {
+                return Err(RoventPcSessionV2Rejection {
+                    failure,
+                    prepared,
+                    process,
+                });
+            }
+        };
+        let (native, snapshot, sources) = prepared.into_parts();
+        let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
+        Ok(Self {
+            sources: PcSources::V2(sources),
+            original_v2_owner: Some(original_owner),
+            process_v2: Some(process),
+            snapshot,
+            configuration,
+            clock,
+            issuer,
+            identity,
+            implementation,
+            root_policy,
+            collection_origin: None,
+            collection_hooks: RoventPcCollectionHooks::default(),
+            selective_policy,
+            frontier_limits,
+            closed: AtomicBool::new(false),
+            reset_requested: AtomicBool::new(false),
+            state: Mutex::new(State::Idle(Box::new(Idle {
+                native: NativeOwner::new(native),
+                owner: Some(Box::new(owner)),
+                next_request_sequence: 1,
+                game: None,
+                custody: IdleCustody::StartupReady,
+            }))),
+            latest: Mutex::new(None),
+            latest_initial: Mutex::new(None),
+            latest_v2: Mutex::new(None),
+            latest_initial_v2: Mutex::new(None),
+            retained_repair: Mutex::new(None),
+            shared_nnuec: None,
+            storage: Mutex::new(None),
+        })
     }
 
     #[allow(clippy::result_large_err)]
@@ -680,7 +939,9 @@ impl RoventPcSessionDriver {
         let (native, snapshot, sources) = prepared.into_parts();
         let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
         Ok(Self {
-            sources,
+            sources: PcSources::V1(sources),
+            original_v2_owner: None,
+            process_v2: None,
             snapshot,
             configuration,
             clock,
@@ -703,6 +964,8 @@ impl RoventPcSessionDriver {
             }))),
             latest: Mutex::new(None),
             latest_initial: Mutex::new(None),
+            latest_v2: Mutex::new(None),
+            latest_initial_v2: Mutex::new(None),
             retained_repair: Mutex::new(None),
             shared_nnuec: loaded.map(|loaded| SharedNnuecOwner {
                 loaded,
@@ -719,6 +982,12 @@ impl RoventPcSessionDriver {
         Arc<SharedRoventStorageRegistration>,
         (RoventStorageOwnedRuntimeRegistration, SearchSessionFailure),
     > {
+        let Some(sources) = self.sources.v1() else {
+            return Err((
+                original,
+                failure("RoventPcV2Storage", "V2 storage is not connected"),
+            ));
+        };
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(_) => {
@@ -754,11 +1023,9 @@ impl RoventPcSessionDriver {
                 ),
             ));
         }
-        if let Err(error) = original.validate_session_attachment(
-            self.sources.lock(),
-            &self.clock,
-            self.implementation,
-        ) {
+        if let Err(error) =
+            original.validate_session_attachment(sources.lock(), &self.clock, self.implementation)
+        {
             return Err((
                 original,
                 SearchSessionFailure::debug("RoventPcStorageNamespace", &error),
@@ -766,7 +1033,7 @@ impl RoventPcSessionDriver {
         }
         if let Err(error) = original
             .profile()
-            .validate_for_manifest(&self.sources.lock().manifest)
+            .validate_for_manifest(&sources.lock().manifest)
         {
             return Err((
                 original,
@@ -837,6 +1104,20 @@ impl RoventPcSessionDriver {
             .map(|value| value.clone())
             .map_err(|_| poisoned())
     }
+    pub fn latest_root_v2(&self) -> Result<Option<Arc<RoventPcRootReceiptV2>>, ContractError> {
+        self.latest_v2
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| poisoned())
+    }
+    pub fn latest_initial_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventPcInitialReceiptV2>>, ContractError> {
+        self.latest_initial_v2
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| poisoned())
+    }
     /// A failed transfer cannot silently discard the already recovered report.
     /// Only a closed root owner exposes this move; live work keeps its custody.
     pub fn take_failed_repair_report(
@@ -889,14 +1170,30 @@ impl RoventPcSessionDriver {
                 "invalid original root restriction",
             ));
         }
-        let source = SourceSeal::prepare(
-            self.sources.lock(),
-            self.root_policy,
-            position,
-            context,
-            &self.clock,
-        )
-        .map_err(|error| SearchSessionFailure::debug("RoventPcOriginalRoot", &error))?;
+        let source = match &self.sources {
+            PcSources::V1(sources) => PcPreparedRoot::V1(
+                SourceSeal::prepare(
+                    sources.lock(),
+                    self.root_policy,
+                    position,
+                    context,
+                    &self.clock,
+                )
+                .map_err(|error| SearchSessionFailure::debug("RoventPcOriginalRoot", &error))?,
+            ),
+            PcSources::V2(_) => PcPreparedRoot::V2(
+                PreparedSourceV2::prepare(
+                    self.original_v2_owner
+                        .as_ref()
+                        .expect("V2 source retains original owner"),
+                    self.root_policy,
+                    position,
+                    context,
+                    &self.clock,
+                )
+                .map_err(|error| SearchSessionFailure::debug("RoventPcOriginalRoot", &error))?,
+            ),
+        };
         let mut state = loop {
             match self.state.try_lock() {
                 Ok(state) => break state,
@@ -952,32 +1249,69 @@ impl RoventPcSessionDriver {
                 ));
             }
         };
-        let root_admission = match source
-            .into_initial()
-            .map_err(|error| SearchSessionFailure::debug("RoventPcOriginalRoot", &error))?
-        {
-            InitialAdmissionOutcome::Admitted(admitted) => Arc::new(admitted),
-            InitialAdmissionOutcome::StoppedInitial(stopped) => {
-                let receipt = Arc::new(RoventPcInitialReceipt {
-                    authority: context.authority,
-                    input_lock: self.snapshot.input_lock,
-                    source: Arc::new(stopped),
-                    idle_custody: idle.custody.clone(),
-                });
-                let report = receipt.report();
-                match self.latest_initial.lock() {
-                    Ok(mut latest) => *latest = Some(receipt),
-                    Err(_) => {
-                        self.closed.store(true, Ordering::Release);
-                        return Err(physical_unknown_at(
-                            "RoventPcStoppedInitial",
-                            "initial receipt owner is poisoned",
-                        ));
-                    }
+        let root_admission = match source {
+            PcPreparedRoot::V1(source) => match source
+                .into_initial()
+                .map_err(|error| SearchSessionFailure::debug("RoventPcOriginalRoot", &error))?
+            {
+                InitialAdmissionOutcome::Admitted(admitted) => {
+                    PcRootAdmission::V1(Arc::new(admitted))
                 }
-                return Ok(report);
-            }
+                InitialAdmissionOutcome::StoppedInitial(stopped) => {
+                    let receipt = Arc::new(RoventPcInitialReceipt {
+                        authority: context.authority,
+                        input_lock: self.snapshot.input_lock,
+                        source: Arc::new(stopped),
+                        idle_custody: idle.custody.clone(),
+                    });
+                    let report = receipt.report();
+                    match self.latest_initial.lock() {
+                        Ok(mut latest) => *latest = Some(receipt),
+                        Err(_) => {
+                            self.closed.store(true, Ordering::Release);
+                            return Err(physical_unknown_at(
+                                "RoventPcStoppedInitial",
+                                "initial receipt owner is poisoned",
+                            ));
+                        }
+                    }
+                    return Ok(report);
+                }
+            },
+            PcPreparedRoot::V2(source) => match source
+                .into_initial()
+                .map_err(|error| SearchSessionFailure::debug("RoventPcOriginalRoot", &error))?
+            {
+                InitialAdmissionOutcomeV2::Admitted(admitted) => {
+                    PcRootAdmission::V2(Arc::new(admitted))
+                }
+                InitialAdmissionOutcomeV2::StoppedInitial(stopped) => {
+                    let previous = match &idle.custody {
+                        IdleCustody::RetiredRootV2(value) => Some(Arc::clone(value)),
+                        _ => None,
+                    };
+                    let fallback = stopped.fallback();
+                    let receipt = Arc::new(RoventPcInitialReceiptV2 {
+                        authority: context.authority,
+                        input_lock: self.snapshot.input_lock,
+                        source: Arc::new(stopped),
+                        previous,
+                    });
+                    match self.latest_initial_v2.lock() {
+                        Ok(mut latest) => *latest = Some(receipt),
+                        Err(_) => {
+                            self.closed.store(true, Ordering::Release);
+                            return Err(physical_unknown_at(
+                                "RoventPcStoppedInitialV2",
+                                "initial receipt owner is poisoned",
+                            ));
+                        }
+                    }
+                    return Ok(initial_stop_report(fallback));
+                }
+            },
         };
+        let root_budget_digest = root_admission.budget_digest()?;
         let retained = std::mem::replace(&mut *state, State::Moving);
         let mut idle = match retained {
             State::Idle(idle) => idle,
@@ -1028,11 +1362,18 @@ impl RoventPcSessionDriver {
             idle.game = Some(context.authority.game.0);
         }
         if let Some(storage) = storage.as_mut() {
+            let original_admission = match &root_admission {
+                PcRootAdmission::V1(value) => Arc::clone(value),
+                PcRootAdmission::V2(_) => {
+                    *state = State::Idle(idle);
+                    return Err(failure("RoventPcV2Storage", "V2 storage is not connected"));
+                }
+            };
             let owner = idle.owner.take().expect("original semantic owner");
             let signal = idle.native.service.signal();
             match storage.prepare(
                 StorageSemanticOwner::Pc(owner),
-                Arc::clone(&root_admission),
+                original_admission,
                 reset,
                 position,
                 &signal,
@@ -1173,7 +1514,7 @@ impl RoventPcSessionDriver {
             authority: context.authority,
             mode: self.snapshot.mode,
             original_deadline,
-            root_budget: root_admission.root_budget_digest(),
+            root_budget: root_budget_digest,
             goal: context.goal,
             nodes: context.requested_nodes,
             selective_policy: self.selective_policy,
@@ -1205,6 +1546,20 @@ impl RoventPcSessionDriver {
         }
         let collection_admission = match &self.collection_origin {
             Some(origin) => {
+                let original_admission = match &root_admission {
+                    PcRootAdmission::V1(value) => Arc::clone(value),
+                    PcRootAdmission::V2(_) => {
+                        *state = State::RejectedPort {
+                            native,
+                            port: PcPortDriver::new(port),
+                        };
+                        self.closed.store(true, Ordering::Release);
+                        return Err(failure(
+                            "RoventPcV2Collection",
+                            "V2 Collection is not connected",
+                        ));
+                    }
+                };
                 let admission = port
                     .rovent_frontier()
                     .ok_or_else(|| failure("RoventPcCollectionRoot", "actual Frontier is absent"))
@@ -1215,7 +1570,7 @@ impl RoventPcSessionDriver {
                             self.snapshot.input_lock,
                             root_budget,
                             self.selective_policy,
-                            Arc::clone(&root_admission),
+                            original_admission,
                         )
                         .map_err(|error| {
                             SearchSessionFailure::debug("RoventPcCollectionRoot", &error)
@@ -1553,36 +1908,70 @@ impl RoventPcSessionDriver {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        let receipt = Arc::new(RoventPcRootReceipt {
-            domain: ROVENT_PC_ROOT_DOMAIN,
-            authority: context.authority,
-            input_lock: self.snapshot.input_lock,
-            root_admission,
-            frontier,
-            physical: physical.clone(),
-            repair,
-        });
-        // This is an observation of the actual fence/frontier/report. It is
-        // retained before fallible observation publication and semantic owner
-        // recovery; it is not a run-success flag.
-        match self.latest.lock() {
-            Ok(mut latest) => *latest = Some(Arc::clone(&receipt)),
-            Err(_) => {
-                // The root cannot resume after this loss of its receipt slot.
-                // Preserve the original report even on this poisoned boundary.
-                std::mem::forget(receipt);
-                *state = State::RejectedPort {
-                    native,
-                    port: PcPortDriver::new(port),
-                };
-                self.closed.store(true, Ordering::Release);
-                return Err(physical_unknown_at(
-                    "RoventPcPublishReceipt",
-                    "root receipt owner is poisoned",
-                ));
+        let custody = match root_admission {
+            PcRootAdmission::V1(root_admission) => {
+                let receipt = Arc::new(RoventPcRootReceipt {
+                    domain: ROVENT_PC_ROOT_DOMAIN,
+                    authority: context.authority,
+                    input_lock: self.snapshot.input_lock,
+                    root_admission,
+                    frontier,
+                    physical: physical.clone(),
+                    repair,
+                });
+                match self.latest.lock() {
+                    Ok(mut latest) => *latest = Some(Arc::clone(&receipt)),
+                    Err(_) => {
+                        std::mem::forget(receipt);
+                        *state = State::RejectedPort {
+                            native,
+                            port: PcPortDriver::new(port),
+                        };
+                        self.closed.store(true, Ordering::Release);
+                        return Err(physical_unknown_at(
+                            "RoventPcPublishReceipt",
+                            "root receipt owner is poisoned",
+                        ));
+                    }
+                }
+                IdleCustody::RetiredRoot(receipt)
             }
-        }
-        let work = match receipt.work() {
+            PcRootAdmission::V2(root_admission) => {
+                let receipt = Arc::new(RoventPcRootReceiptV2 {
+                    domain: "rz-rovent-pc-native-root/2",
+                    authority: context.authority,
+                    input_lock: self.snapshot.input_lock,
+                    root_admission,
+                    frontier,
+                    physical: physical.clone(),
+                    repair,
+                });
+                match self.latest_v2.lock() {
+                    Ok(mut latest) => *latest = Some(Arc::clone(&receipt)),
+                    Err(_) => {
+                        std::mem::forget(receipt);
+                        *state = State::RejectedPort {
+                            native,
+                            port: PcPortDriver::new(port),
+                        };
+                        self.closed.store(true, Ordering::Release);
+                        return Err(physical_unknown_at(
+                            "RoventPcPublishReceiptV2",
+                            "root receipt owner is poisoned",
+                        ));
+                    }
+                }
+                IdleCustody::RetiredRootV2(receipt)
+            }
+        };
+        // Publish the physical receipt before any fallible work extraction or
+        // strategy clone, as in the original V1 lifecycle.
+        let (frontier, physical) = match &custody {
+            IdleCustody::RetiredRoot(receipt) => (&receipt.frontier, &receipt.physical),
+            IdleCustody::RetiredRootV2(receipt) => (&receipt.frontier, &receipt.physical),
+            IdleCustody::StartupReady => unreachable!("root receipt was just published"),
+        };
+        let work = match pc_root_work(frontier, physical) {
             Ok(work) => work,
             Err(error) => {
                 *state = State::RejectedPort {
@@ -1593,10 +1982,7 @@ impl RoventPcSessionDriver {
                 return Err(error);
             }
         };
-        // The actual return, not a later global latest observation, owns the
-        // same immutable checked strategy through UCI physical publication.
-        let mate_strategy = receipt
-            .frontier
+        let mate_strategy = frontier
             .mate_strategy
             .clone()
             .filter(|strategy| result.best_move == Some(strategy.best_move()));
@@ -1606,7 +1992,7 @@ impl RoventPcSessionDriver {
             owner: Some(Box::new(owner)),
             next_request_sequence: next,
             game: Some(context.authority.game.0),
-            custody: IdleCustody::RetiredRoot(Arc::clone(&receipt)),
+            custody,
         }));
         if result.best_move.is_some_and(|movement| {
             !legal.contains(&movement)
@@ -1907,13 +2293,22 @@ impl SearchSessionDriver for RoventPcSessionDriver {
             ));
         }
         let max = self.search_goal_capability().ok_or_else(poisoned)?;
-        crate::rovent_root_admission::preadmission::validate_go(
-            position,
-            go,
-            self.sources.lock(),
-            self.root_policy,
-            max,
-        )
+        match &self.sources {
+            PcSources::V1(sources) => crate::rovent_root_admission::preadmission::validate_go(
+                position,
+                go,
+                sources.lock(),
+                self.root_policy,
+                max,
+            ),
+            PcSources::V2(sources) => crate::rovent_root_admission::preadmission::validate_go_v2(
+                position,
+                go,
+                sources.lock(),
+                self.root_policy,
+                max,
+            ),
+        }
         .map_err(|error| {
             ContractError::new(
                 rz_contracts::ErrorCode::InvalidInput,
@@ -1973,7 +2368,10 @@ impl Drop for RoventPcSessionDriver {
             std::mem::forget(retained);
             // Preserve the original descriptors with the quarantined physical
             // owner instead of releasing startup provenance on an unknown drop.
-            std::mem::forget(Arc::clone(&self.sources));
+            self.sources.forget_original();
+            if let Some(process) = self.process_v2.take() {
+                std::mem::forget(process);
+            }
             if let Some(owner) = self.shared_nnuec.take() {
                 // Do not run PreparationActor's joining Drop on an unknown
                 // manager/root. Its original cache/terminal/model owners stay

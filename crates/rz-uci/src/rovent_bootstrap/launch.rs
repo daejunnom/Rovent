@@ -5,8 +5,9 @@ use super::configuration::{ExecutionConfiguration, NativeNnuecSelection};
 use super::external_session::RoventExternalProductStartupOwners;
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::{
-    RoventProcessBoundaryInputs, VerifiedOwnedRoventProcessBoundary, VerifiedRoventProcessBoundary,
-    verify_actual_owned_process_boundary, verify_actual_process_boundary,
+    RoventProcessBoundaryInputs, RoventProcessBoundaryInputsV2, VerifiedOwnedRoventProcessBoundary,
+    VerifiedRoventProcessBoundary, verify_actual_owned_process_boundary,
+    verify_actual_owned_process_boundary_v2, verify_actual_process_boundary,
 };
 use super::product::{
     RoventNativeProductDriver, RoventProductStartupOwners, RoventProductStartupRejection,
@@ -602,19 +603,19 @@ pub fn run_with_resource_admission<'a>(
 type ResourceAdmission<'a> =
     Box<dyn FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a>;
 
-/// Identify a validated /2 lock without projecting it into the legacy /1
-/// process, storage, and root owners. The actual /2 admission path is not yet
-/// connected. This boundary does not load a model or issue any authority.
-fn parse_launch_lock(bytes: &[u8]) -> Result<Arc<RoventInputLock>, RoventLaunchError> {
+/// The parser retains the actual version and never projects a /2 lock to /1.
+#[derive(Debug)]
+enum LaunchInputLock {
+    V1(Arc<RoventInputLock>),
+    V2(Arc<RoventInputLockV2>),
+}
+fn parse_launch_lock(bytes: &[u8]) -> Result<LaunchInputLock, RoventLaunchError> {
     let input =
         std::str::from_utf8(bytes).map_err(|_| error("InputLock", "UTF-8 input required"))?;
     match RoventInputLock::from_json(input) {
-        Ok(lock) => Ok(Arc::new(lock)),
+        Ok(lock) => Ok(LaunchInputLock::V1(Arc::new(lock))),
         Err(original_failure) => match RoventInputLockV2::from_json(input) {
-            Ok(_original_v2) => Err(error(
-                "InputLockUnsupportedV2",
-                "the original /2 lock cannot yet enter UCI process and root admission",
-            )),
+            Ok(lock) => Ok(LaunchInputLock::V2(Arc::new(lock))),
             Err(_) => Err(error("InputLock", original_failure)),
         },
     }
@@ -676,7 +677,23 @@ fn run_inner<'a>(
         .map_err(|failure| error("InputLock", failure))?
         .into_std();
     let lock_bytes = read_bounded(&lock_file, MAX_LOCK_BYTES)?;
-    let lock = parse_launch_lock(&lock_bytes)?;
+    let lock = match parse_launch_lock(&lock_bytes)? {
+        LaunchInputLock::V1(lock) => lock,
+        LaunchInputLock::V2(lock) => {
+            if teacher_selections.is_some()
+                || collection_observer.is_some()
+                || collection_assemble.is_some()
+                || resource_admission.is_some()
+                || product_runner.is_some()
+            {
+                return Err(error(
+                    "InputLockUnsupportedV2",
+                    "V1-only launch callbacks cannot consume /2",
+                ));
+            }
+            return run_v2_pc(arguments, lock, root, cwd, lock_file);
+        }
+    };
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
         return Err(error(
             "StartupWindow",
@@ -1134,6 +1151,212 @@ fn prepare_launch_native<Q: NativeQuestionProjection>(
     })
 }
 
+/// The first /2 product route is PC-only with archive and collection disabled.
+/// Its original process, selected file and lock remain alive through UCI drain.
+fn run_v2_pc(
+    arguments: Arguments,
+    lock: Arc<RoventInputLockV2>,
+    root: Dir,
+    cwd: PathBuf,
+    lock_file: File,
+) -> Result<(), RoventLaunchError> {
+    if arguments.storage.is_some()
+        || arguments.external_r_sources.is_some()
+        || arguments.retirement_sink.is_some()
+        || arguments.evidence_root.is_some()
+        || arguments.startup_diagnostics
+        || arguments.lifecycle_diagnostics
+        || arguments.initial_stop_source_diagnostics
+        || lock.manifest.engine.mode.has_native_r()
+        || lock.manifest.engine.nnuec.is_some()
+        || !matches!(
+            lock.manifest.purpose,
+            rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment
+        )
+    {
+        return Err(error(
+            "InputLockUnsupportedV2",
+            "the /2 PC route does not support this mode, asset, storage, or diagnostic",
+        ));
+    }
+    if arguments.startup_ms > lock.manifest.wall_time_max_ms {
+        return Err(error(
+            "StartupWindow",
+            "startup exceeds the original declared window",
+        ));
+    }
+    let begin = Instant::now();
+    let until = begin
+        .checked_add(Duration::from_millis(arguments.startup_ms))
+        .ok_or_else(|| error("StartupWindow", "startup deadline overflow"))?;
+    let cleanup_until = until
+        .checked_add(Duration::from_millis(lock.manifest.cleanup_max_ms))
+        .ok_or_else(|| error("StartupWindow", "cleanup deadline overflow"))?;
+    let control = RoventStartupControl {
+        until,
+        cleanup_until,
+        cancellation: Arc::new(AtomicBool::new(false)),
+    };
+    let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
+    let binary = lock
+        .manifest
+        .engine
+        .binary
+        .open_verified_at(&root, 128 << 20)
+        .map_err(|failure| error("Binary", failure))?;
+    let boundary = verify_actual_owned_process_boundary_v2(RoventProcessBoundaryInputsV2 {
+        lock: Arc::clone(&lock),
+        original_binary: binary,
+        original_root: root,
+        private_cwd: cwd.clone(),
+        control: control.clone(),
+    })
+    .map_err(|rejected| error("ProcessBoundary", rejected.error))?;
+    let root = boundary.original_root();
+    let view = boundary
+        .startup_view()
+        .map_err(|failure| error("ProcessBoundary", failure))?;
+    let selected: Vec<_> = lock
+        .manifest
+        .provenance
+        .iter()
+        .filter(|artifact| artifact.path == arguments.native_assets)
+        .collect();
+    if selected.len() != 1 {
+        return Err(error(
+            "Assets",
+            "selection is not a unique original provenance artifact",
+        ));
+    }
+    let selection_file = selected[0]
+        .open_verified_at(root, MAX_SELECTION_BYTES)
+        .map_err(|failure| error("Assets", failure))?;
+    let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
+    let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
+    let sources = Arc::new(
+        RoventPinnedNativeSources::<RoventInputLockV2>::open_v2(
+            Arc::clone(&lock),
+            source_root,
+            cwd,
+            selection,
+            &control,
+        )
+        .map_err(|failure| error("Assets", failure))?,
+    );
+    sources
+        .configuration()
+        .require_supported_native_capabilities()
+        .map_err(|failure| error("Capability", failure))?;
+    if sources.configuration().fields().nnuec_selection() != NativeNnuecSelection::Absent {
+        return Err(error(
+            "InputLockUnsupportedV2",
+            "the /2 PC route does not support NNUEC",
+        ));
+    }
+    let cuda_profile = if matches!(lock.manifest.engine.pc.device, RoventDevice::Cuda { .. }) {
+        let name = format!(
+            "rovent-cuda-profile-{}-{}",
+            std::process::id(),
+            arguments.process_epoch
+        );
+        root.create_dir(&name)
+            .map_err(|failure| error("ProfileDirectory", failure))?;
+        let directory = root
+            .open_dir_nofollow(&name)
+            .map_err(|failure| error("ProfileDirectory", failure))?;
+        Some(
+            VirtualReviewProfileDirectory::from_owned_directory(directory.into_std_file())
+                .map_err(|failure| error("ProfileDirectory", failure))?,
+        )
+    } else {
+        None
+    };
+    let configuration = sources.configuration();
+    let resources = RoventNativeResources {
+        runtime: sources
+            .pin_runtime()
+            .map_err(|failure| error("Runtime", failure))?,
+        configuration: configuration
+            .fields()
+            .native
+            .onnx(&lock.manifest.engine.pc.device, cuda_profile.is_some())
+            .map_err(|failure| error("Configuration", failure))?,
+        loading_profile: configuration
+            .fields()
+            .native
+            .loading_profile
+            .map(|profile| profile.actual()),
+        cuda_profile,
+        drain_limit: Duration::from_millis(configuration.fields().native.drain_ms),
+        tickets: configuration
+            .fields()
+            .native
+            .tickets(configuration.fields().review.token_budget)
+            .map_err(|failure| error("Configuration", failure))?,
+        command_capacity: configuration.fields().native.command_capacity,
+    };
+    let diagnostic = NativeStartupDiagnostic::default();
+    let prepared = match super::prepare_native_v2::<PcPortQuestion>(
+        Arc::clone(&sources),
+        resources,
+        clock.runtime_clock(),
+        control.clone(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(rejection) => {
+            let failure = reject_factory(rejection, cleanup_until, &diagnostic);
+            drop(view);
+            if failure.stage == "PhysicalCompletionUnknown" {
+                std::mem::forget((boundary, sources, selection_file, lock_file));
+            }
+            return Err(failure);
+        }
+    };
+    let owners = Arc::new(OwnerRegistry::default());
+    let identity = EngineIdentity {
+        name: format!("Rovent {:?}", lock.manifest.engine.mode),
+        author: "Rovent contributors".into(),
+    };
+    let driver = match super::product::RoventNativeProductDriverV2::pc(
+        prepared,
+        Arc::clone(&boundary),
+        clock.clone(),
+        Arc::clone(&owners),
+        identity,
+        arguments.root_policy,
+    ) {
+        Ok(driver) => driver,
+        Err(rejection) => {
+            let failure = reject_product_v2(rejection, cleanup_until, &diagnostic);
+            drop(view);
+            if failure.stage == "PhysicalCompletionUnknown" {
+                std::mem::forget((boundary, sources, selection_file, lock_file));
+            }
+            return Err(failure);
+        }
+    };
+    let completion = driver.physical_close_observation();
+    let mut settings = EngineSettings {
+        shutdown_limit: Duration::from_millis(lock.manifest.cleanup_max_ms),
+        ..EngineSettings::default()
+    };
+    settings.search.untimed_limit = Duration::from_millis(lock.manifest.wall_time_max_ms);
+    let result = serve_driver(Arc::new(driver), clock, owners, settings)
+        .map_err(|failure| error("UciSession", failure));
+    drop(view);
+    if !completion.is_confirmed() {
+        std::mem::forget((boundary, sources, selection_file, lock_file));
+        return Err(error(
+            "PhysicalCompletionUnknown",
+            match result {
+                Ok(()) => "UCI returned before actual physical finish".into(),
+                Err(failure) => format!("UCI failed before actual physical finish: {failure}"),
+            },
+        ));
+    }
+    result
+}
+
 // Assembly rejection returns the original prepared/startup owners and pins;
 // retaining them must not require a fresh allocation on the failure path.
 #[allow(clippy::result_large_err)]
@@ -1290,6 +1513,32 @@ fn reject_product(
             drain_native(&mut prepared.service, until)
         }
     };
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        if confirmed {
+            NativeStartupDiagnosticPhase::Exit
+        } else {
+            NativeStartupDiagnosticPhase::Error
+        },
+    );
+    if !confirmed {
+        let _quarantine = Box::leak(Box::new(failure));
+        return error("PhysicalCompletionUnknown", detail);
+    }
+    detail
+}
+
+fn reject_product_v2(
+    mut failure: super::product::RoventProductV2StartupRejection,
+    until: Instant,
+    diagnostic: &NativeStartupDiagnostic,
+) -> RoventLaunchError {
+    let detail = error("ProductAssembly", &failure.failure);
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        NativeStartupDiagnosticPhase::Entry,
+    );
+    let confirmed = drain_native(&mut failure.prepared.service, until);
     diagnostic.emit(
         NativeStartupDiagnosticStage::ProductDrain,
         if confirmed {

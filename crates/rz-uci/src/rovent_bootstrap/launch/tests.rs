@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn launch_retains_v1_and_rejects_valid_v2_without_projecting_it() {
+fn launch_retains_the_original_lock_version_without_projecting_it() {
     use rz_contracts::rovent::ExecutionMode;
     use rz_experiments::{
         ROVENT_EXECUTION_V2_DOMAIN, RoventExecutionManifest, RoventExecutionManifestV2,
@@ -12,7 +12,9 @@ fn launch_retains_v1_and_rejects_valid_v2_without_projecting_it() {
     let base = RoventExecutionManifest::from_json(&wire.to_string()).unwrap();
     let v1 = base.clone().lock().unwrap();
     let v1_bytes = serde_json::to_vec(&v1).unwrap();
-    let original = parse_launch_lock(&v1_bytes).unwrap();
+    let LaunchInputLock::V1(original) = parse_launch_lock(&v1_bytes).unwrap() else {
+        panic!("original V1 lock must remain V1")
+    };
     assert_eq!(*original, v1);
 
     let v2 = RoventExecutionManifestV2 {
@@ -37,8 +39,12 @@ fn launch_retains_v1_and_rejects_valid_v2_without_projecting_it() {
     }
     .lock()
     .unwrap();
-    let failure = parse_launch_lock(&serde_json::to_vec(&v2).unwrap()).unwrap_err();
-    assert_eq!(failure.stage, "InputLockUnsupportedV2");
+    let LaunchInputLock::V2(original) =
+        parse_launch_lock(&serde_json::to_vec(&v2).unwrap()).unwrap()
+    else {
+        panic!("original V2 lock must remain V2")
+    };
+    assert_eq!(*original, v2);
 
     let mut invalid = v2;
     invalid.canonical_sha256 = "0".repeat(64);

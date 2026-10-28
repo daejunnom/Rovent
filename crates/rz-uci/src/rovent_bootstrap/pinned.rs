@@ -169,6 +169,10 @@ pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
     fn canonical_sha256(&self) -> &str;
     fn cleanup_max_ms(&self) -> u64;
     fn role_tickets_max(&self) -> u32;
+    fn retain_startup_control(
+        &self,
+        control: &RoventStartupControl,
+    ) -> Option<RoventStartupControl>;
     fn topology(
         &self,
         collection: Option<&RoventCollectionPreloadSources>,
@@ -196,6 +200,12 @@ impl NativeInputLock for RoventInputLock {
     }
     fn role_tickets_max(&self) -> u32 {
         self.manifest.coordinator.role_tickets_max
+    }
+    fn retain_startup_control(
+        &self,
+        _control: &RoventStartupControl,
+    ) -> Option<RoventStartupControl> {
+        None
     }
     fn topology(
         &self,
@@ -241,6 +251,12 @@ impl NativeInputLock for RoventInputLockV2 {
     fn role_tickets_max(&self) -> u32 {
         self.manifest.coordinator.role_tickets_max
     }
+    fn retain_startup_control(
+        &self,
+        control: &RoventStartupControl,
+    ) -> Option<RoventStartupControl> {
+        Some(control.clone())
+    }
     fn topology(
         &self,
         collection: Option<&RoventCollectionPreloadSources>,
@@ -283,6 +299,7 @@ impl NativeInputLock for RoventInputLockV2 {
 /// these private files; metadata checks are not a hostile same-UID sandbox.
 pub struct RoventPinnedNativeSources<L = RoventInputLock> {
     lock: Arc<L>,
+    original_v2_control: Option<RoventStartupControl>,
     topology: RoventStartupTopology,
     _root: Dir,
     private_root_path: PathBuf,
@@ -338,6 +355,22 @@ impl RoventPinnedNativeSources {
 }
 
 impl RoventPinnedNativeSources<RoventInputLockV2> {
+    /// Compare the directory capabilities by Linux filesystem identity. This
+    /// checks that both FDs refer to the same directory, not that they are the
+    /// same FD or that same-UID mutation is prevented.
+    pub(crate) fn same_original_root(&self, other: &Dir) -> Result<bool, BackendError> {
+        same_directory_identity(&self._root, other)
+    }
+
+    /// The same cancellation authority and both original deadlines must pass
+    /// from source admission into preparation; equal timestamps alone are not
+    /// proof that cancellation has the same owner.
+    pub(crate) fn matches_startup_control(&self, control: &RoventStartupControl) -> bool {
+        self.original_v2_control
+            .as_ref()
+            .is_some_and(|original| same_startup_control(original, control))
+    }
+
     /// Pin native inputs against the original V2 lock. V2 Collection and R
     /// owners remain unsupported until their original typed paths are connected.
     pub fn open_v2(
@@ -351,6 +384,32 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
     }
 }
 
+fn same_startup_control(left: &RoventStartupControl, right: &RoventStartupControl) -> bool {
+    left.until == right.until
+        && left.cleanup_until == right.cleanup_until
+        && Arc::ptr_eq(&left.cancellation, &right.cancellation)
+}
+
+#[cfg(target_os = "linux")]
+fn same_directory_identity(left: &Dir, right: &Dir) -> Result<bool, BackendError> {
+    use cap_fs_ext::MetadataExt as _;
+    let a = left
+        .dir_metadata()
+        .map_err(|_| fail(K::Io, "cannot observe retained native root"))?;
+    let b = right
+        .dir_metadata()
+        .map_err(|_| fail(K::Io, "cannot observe original process root"))?;
+    Ok(a.is_dir() && b.is_dir() && a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn same_directory_identity(_left: &Dir, _right: &Dir) -> Result<bool, BackendError> {
+    Err(fail(
+        K::UnsupportedModel,
+        "native root identity requires Linux directory descriptors",
+    ))
+}
+
 impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
     fn open_selected(
         lock: Arc<L>,
@@ -362,6 +421,7 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
     ) -> Result<Self, BackendError> {
         control.check()?;
         let topology = lock.topology(collection.as_deref())?;
+        let original_v2_control = lock.retain_startup_control(control);
         if !private_root_path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -492,6 +552,7 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
         let nnuec = PinnedNnuecArtifacts::open(&root, lock.engine().nnuec.as_ref(), control)?;
         let owner = Self {
             lock,
+            original_v2_control,
             topology,
             _root: root,
             private_root_path,
@@ -907,4 +968,68 @@ fn positional_read(_: &File, _: &mut [u8], _: u64) -> std::io::Result<usize> {
         std::io::ErrorKind::Unsupported,
         "positional asset read unavailable",
     ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod directory_identity_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn compares_held_directory_identity_not_path_text() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("rovent-root-id-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let other_path = root.join("other");
+        std::fs::create_dir(&other_path).unwrap();
+        let held = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let reopened = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let other = Dir::open_ambient_dir(&other_path, cap_std::ambient_authority()).unwrap();
+        assert!(same_directory_identity(&held, &reopened).unwrap());
+        assert!(!same_directory_identity(&held, &other).unwrap());
+        drop((held, reopened, other));
+        std::fs::remove_dir(other_path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod startup_control_identity_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn exact_control_needs_both_deadlines_and_the_same_cancel_authority() {
+        let now = Instant::now();
+        let original = RoventStartupControl {
+            until: now + Duration::from_secs(10),
+            cleanup_until: now + Duration::from_secs(20),
+            cancellation: Arc::new(AtomicBool::new(false)),
+        };
+        let clone = original.clone();
+        assert!(same_startup_control(&original, &clone));
+        let other_cancel = RoventStartupControl {
+            cancellation: Arc::new(AtomicBool::new(false)),
+            ..clone.clone()
+        };
+        assert!(!same_startup_control(&original, &other_cancel));
+        let other_work_deadline = RoventStartupControl {
+            until: original.until + Duration::from_millis(1),
+            ..clone.clone()
+        };
+        assert!(!same_startup_control(&original, &other_work_deadline));
+        let other_cleanup_deadline = RoventStartupControl {
+            cleanup_until: original.cleanup_until + Duration::from_millis(1),
+            ..clone.clone()
+        };
+        assert!(!same_startup_control(&original, &other_cleanup_deadline));
+        original.cancellation.store(true, Ordering::Release);
+        assert!(clone.check().is_err());
+        assert!(same_startup_control(&original, &clone));
+    }
 }
