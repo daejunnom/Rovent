@@ -861,7 +861,14 @@ fn v2_preadmission_uses_original_lock_and_the_same_rules_and_go_checks() {
     fields.insert("startup_configuration_sha256".into(), json!("4".repeat(64)));
     fields.insert(
         "startup_search_configuration_sha256".into(),
-        json!(original.manifest.engine.search.search_configuration_sha256.clone()),
+        json!(
+            original
+                .manifest
+                .engine
+                .search
+                .search_configuration_sha256
+                .clone()
+        ),
     );
     fields.insert(
         "own_r_root_tie".into(),

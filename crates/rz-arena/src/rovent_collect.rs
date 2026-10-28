@@ -1056,8 +1056,8 @@ pub use observer::*;
 mod rules_replay;
 pub use rules_replay::*;
 mod external_scope;
-mod historical_scope;
 mod historical_declarations_v2;
+mod historical_scope;
 pub use external_scope::{
     RoventHistoricalExternalSource, verify_historical_external_source_input_lock,
 };

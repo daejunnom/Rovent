@@ -754,7 +754,13 @@ impl RoventCollectionTeacherLifecycleV2 {
         if self.shutdown_requested {
             return Ok(false);
         }
-        let context = self.owner.as_ref().expect("retained teacher owner").admission().root_admission().original_context();
+        let context = self
+            .owner
+            .as_ref()
+            .expect("retained teacher owner")
+            .admission()
+            .root_admission()
+            .original_context();
         let until = context.shutdown_deadline;
         match context.accepts() {
             Ok(true) => Ok(true),
@@ -774,7 +780,11 @@ impl RoventCollectionTeacherLifecycleV2 {
     /// original cleanup ceiling. A request is not evidence of physical exit.
     pub(crate) fn request_shutdown(&mut self, until: Instant) {
         self.shutdown_requested = true;
-        self.owner.as_ref().expect("retained teacher owner").worker.request_shutdown(until);
+        self.owner
+            .as_ref()
+            .expect("retained teacher owner")
+            .worker
+            .request_shutdown(until);
     }
 
     pub(crate) fn submit(&mut self, job: TeacherJob) -> Result<TeacherDispatch, CheckerError> {
@@ -784,7 +794,11 @@ impl RoventCollectionTeacherLifecycleV2 {
         {
             return Err(invalid("teacher /2 admission closed"));
         }
-        let result = self.owner.as_mut().expect("retained teacher owner").submit(job);
+        let result = self
+            .owner
+            .as_mut()
+            .expect("retained teacher owner")
+            .submit(job);
         if result.is_err() {
             // A root can close between the two admission observations. Preserve
             // the original submit error while arranging shutdown on that race.
@@ -796,7 +810,11 @@ impl RoventCollectionTeacherLifecycleV2 {
     /// The original completion remains available even after root revocation;
     /// the caller must preserve it and must not treat it as a valid label.
     pub(crate) fn take_completion(&self) -> Option<TeacherCompletion> {
-        self.owner.as_ref().expect("retained teacher owner").worker.take_completion()
+        self.owner
+            .as_ref()
+            .expect("retained teacher owner")
+            .worker
+            .take_completion()
     }
 
     /// Preserve the original live-root and private-dispatch validation for a
@@ -806,10 +824,17 @@ impl RoventCollectionTeacherLifecycleV2 {
         completion: &TeacherCompletion,
         dispatch: &TeacherDispatch,
     ) -> Result<(), CheckerError> {
-        if !self.observe_root().map_err(|_| invalid("teacher /2 root observation unavailable"))? {
+        if !self
+            .observe_root()
+            .map_err(|_| invalid("teacher /2 root observation unavailable"))?
+        {
             return Err(invalid("teacher /2 admission closed"));
         }
-        let result = self.owner.as_ref().expect("retained teacher owner").validate_completion(completion, dispatch);
+        let result = self
+            .owner
+            .as_ref()
+            .expect("retained teacher owner")
+            .validate_completion(completion, dispatch);
         if result.is_err() {
             let _ = self.observe_root();
         }
@@ -841,7 +866,10 @@ impl RoventCollectionTeacherLifecycleV2 {
             let _ = self.observe_root();
         }
         let owner = self.owner.as_mut().expect("retained teacher owner");
-        let joined = owner.worker.try_join().or_else(|| owner.worker.shutdown_snapshot());
+        let joined = owner
+            .worker
+            .try_join()
+            .or_else(|| owner.worker.shutdown_snapshot());
         let process = owner.worker.process_after_join();
         let occupancy = owner.worker.occupancy();
         let physical = if !self.shutdown_requested && joined.is_none() {
@@ -880,10 +908,18 @@ impl RoventCollectionTeacherLifecycleV2 {
     /// Failure returns the wrapper itself so the caller can keep polling.
     pub(crate) fn try_finish(
         mut self,
-    ) -> Result<(RoventCollectionTeacherOwnerV2, RoventTeacherRetirementObservationV2), Self> {
+    ) -> Result<
+        (
+            RoventCollectionTeacherOwnerV2,
+            RoventTeacherRetirementObservationV2,
+        ),
+        Self,
+    > {
         let observation = self.poll();
-        if !matches!(&observation.physical, RoventTeacherPhysicalRetirementV2::Confirmed(_))
-            || observation.worker_join.is_none()
+        if !matches!(
+            &observation.physical,
+            RoventTeacherPhysicalRetirementV2::Confirmed(_)
+        ) || observation.worker_join.is_none()
             || observation.commands != 0
             || observation.reliable_queued != 0
             || observation.reliable_reserved != 0
@@ -891,7 +927,10 @@ impl RoventCollectionTeacherLifecycleV2 {
         {
             return Err(self);
         }
-        Ok((self.owner.take().expect("retained teacher owner"), observation))
+        Ok((
+            self.owner.take().expect("retained teacher owner"),
+            observation,
+        ))
     }
 }
 
@@ -902,7 +941,11 @@ impl Drop for RoventCollectionTeacherLifecycleV2 {
             // The surrounding session failed to recover the owner explicitly.
             // Close admission and quarantine the whole owner, including its
             // worker/mailbox, rather than lose late completion or diagnostics.
-            let until = owner.admission().root_admission().original_context().shutdown_deadline;
+            let until = owner
+                .admission()
+                .root_admission()
+                .original_context()
+                .shutdown_deadline;
             owner.worker.request_shutdown(until);
             std::mem::forget(owner);
         }
