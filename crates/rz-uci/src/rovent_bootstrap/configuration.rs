@@ -15,7 +15,11 @@ use rz_contracts::rovent::{ExecutionMode, SearchRecipient};
 use rz_eval::error::{BackendError, FailureKind as K};
 use rz_eval::onnx::{NativeLoadingProfile, Provider};
 use rz_eval::pals_onnx::{PalsCuDnnConvSearch, PalsOnnxConfig};
-use rz_experiments::{ArtifactRef, RoventDevice, RoventInputLock, RoventResearcher};
+use rz_experiments::{
+    ArtifactRef, RoventCoordinatorDeclaration, RoventDevice, RoventEngineDeclaration,
+    RoventInputLock, RoventInputLockV2, RoventResearcher, RoventRootTieDeclarationV2,
+    RoventRootTiePolicyV2,
+};
 use rz_runtime::adaptive::{AdaptiveController, ControllerConfig, CoordinatorPolicy, LogicalCpu};
 use rz_search::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile};
 use rz_search::external_cpu::{ExternalGoConstraint, ExternalSlicePolicy};
@@ -107,6 +111,72 @@ impl StartupConfigurationDocument {
                 "startup configuration /4 requires policy-aware lock",
             )),
         }
+    }
+    /// Validate a /4 startup declaration against a policy-aware /2 lock.
+    /// This does not construct an R owner or attest a product execution.
+    pub fn admit_against_v2(&self, lock: &RoventInputLockV2) -> Result<(), BackendError> {
+        lock.validate()
+            .map_err(|_| invalid("Rovent input lock /2"))?;
+        let Self::V4(config) = self else {
+            return Err(invalid("Rovent input lock /2 requires startup /4"));
+        };
+        config.validate()?;
+        let manifest = &lock.manifest;
+        if manifest.startup_configuration_sha256 != hex(config.configuration_digest()?)
+            || manifest.startup_search_configuration_sha256
+                != hex(config.search_configuration_digest()?)
+        {
+            return Err(invalid("locked startup /4 digest differs"));
+        }
+        config.fields().admit_shared(
+            &manifest.engine,
+            &manifest.coordinator,
+            manifest.cleanup_max_ms,
+            || config.configuration_digest(),
+            || config.search_configuration_digest(),
+            || config.nnuec_search_conditions_digest(),
+        )?;
+        match (&manifest.own_r_root_tie, config.own_r_root_tie_policy()?) {
+            (RoventRootTieDeclarationV2::NotApplicable { .. }, None) => {}
+            (RoventRootTieDeclarationV2::Own { policy, .. }, Some(actual))
+                if matches!(
+                    (policy, actual),
+                    (
+                        RoventRootTiePolicyV2::LegacyFirstSearched,
+                        rz_search::cpu::CpuRootTiePolicy::LegacyFirstSearched
+                    ) | (
+                        RoventRootTiePolicyV2::RulesOrderConfirmed,
+                        rz_search::cpu::CpuRootTiePolicy::RulesOrderConfirmed
+                    )
+                ) => {}
+            _ => return Err(invalid("locked own R policy differs from startup /4")),
+        }
+        if let ExecutionConfiguration::ExternalResearcher { slice, .. } = &config.execution {
+            let whole = slice
+                .quantum_ms
+                .checked_add(slice.stop_drain_reserve_ms)
+                .ok_or_else(|| invalid("external quantum plus stop reserve overflows"))?;
+            if whole > manifest.wall_time_max_ms {
+                return Err(invalid(
+                    "original external quantum plus stop reserve exceeds locked wall",
+                ));
+            }
+            if let Some(ExternalGoConstraint::MoveTime { milliseconds }) =
+                config.external_question_limit()?
+            {
+                let total = milliseconds
+                    .checked_add(slice.stop_drain_reserve_ms)
+                    .ok_or_else(|| {
+                        invalid("explicit external movetime plus stop reserve overflows")
+                    })?;
+                if total > manifest.wall_time_max_ms {
+                    return Err(invalid(
+                        "explicit external movetime plus stop reserve exceeds locked wall",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, BackendError> {
         match self {
@@ -930,14 +1000,30 @@ impl ConfigurationFields<'_> {
         nnuec_conditions_digest: impl Fn() -> Result<Option<[u8; 32]>, BackendError>,
     ) -> Result<(), BackendError> {
         lock.validate().map_err(|_| invalid("Rovent input lock"))?;
-        let engine = &lock.manifest.engine;
-        let declaration = &lock.manifest.coordinator;
+        self.admit_shared(
+            &lock.manifest.engine,
+            &lock.manifest.coordinator,
+            lock.manifest.cleanup_max_ms,
+            configuration_digest,
+            search_configuration_digest,
+            nnuec_conditions_digest,
+        )
+    }
+    fn admit_shared(
+        &self,
+        engine: &RoventEngineDeclaration,
+        declaration: &RoventCoordinatorDeclaration,
+        cleanup_max_ms: u64,
+        configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
+        search_configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
+        nnuec_conditions_digest: impl Fn() -> Result<Option<[u8; 32]>, BackendError>,
+    ) -> Result<(), BackendError> {
         if declaration.policy_sha256 != hex(configuration_digest()?)
             || engine.search.search_configuration_sha256 != hex(search_configuration_digest()?)
             || engine.search.registered_max_chess_plies.get() != self.frontier.maximum_goal_plies
             || declaration.role_tickets_max as usize != self.execution.role_tickets_max()
             || self.frontier.maximum_frames > declaration.questions_max as usize
-            || self.native.drain_ms > lock.manifest.cleanup_max_ms
+            || self.native.drain_ms > cleanup_max_ms
         {
             return Err(invalid("locked startup configuration differs"));
         }
@@ -1080,6 +1166,276 @@ fn invalid(detail: &'static str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v4_wire() -> Value {
+        let mut wire = serde_json::to_value(pc()).unwrap();
+        wire["domain"] = Value::String(v4::ROVENT_STARTUP_CONFIGURATION_V4_DOMAIN.into());
+        wire["post_repair"] = serde_json::json!("disabled");
+        wire["external"] = serde_json::json!({"kind":"absent"});
+        wire["own_r_root_tie"] = serde_json::json!({"kind":"not_applicable"});
+        wire
+    }
+
+    fn policy_manifest(
+        startup: &StartupConfigurationDocument,
+        raw: &[u8],
+        base_wire: Value,
+        tie: RoventRootTieDeclarationV2,
+    ) -> rz_experiments::RoventExecutionManifestV2 {
+        use rz_experiments::{
+            ROVENT_EXECUTION_V2_DOMAIN, RoventExecutionManifest, RoventExecutionManifestV2,
+        };
+        let mut base = RoventExecutionManifest::from_json(&base_wire.to_string()).unwrap();
+        base.engine.search.registered_max_chess_plies =
+            std::num::NonZeroU16::new(startup.fields().frontier.maximum_goal_plies).unwrap();
+        base.engine.search.search_configuration_sha256 =
+            hex(startup.search_configuration_digest().unwrap());
+        if let Some(RoventResearcher::Own {
+            search_configuration_sha256,
+            ..
+        }) = &mut base.engine.researcher
+        {
+            *search_configuration_sha256 = hex(startup.search_configuration_digest().unwrap());
+        }
+        base.coordinator.policy_sha256 = hex(startup.configuration_digest().unwrap());
+        RoventExecutionManifestV2 {
+            domain: ROVENT_EXECUTION_V2_DOMAIN.into(),
+            contract_revision: base.contract_revision,
+            run_id: base.run_id,
+            purpose: base.purpose,
+            engine: base.engine,
+            resources: base.resources,
+            coordinator: base.coordinator,
+            wall_time_max_ms: base.wall_time_max_ms,
+            cleanup_max_ms: base.cleanup_max_ms,
+            output_bytes_max: base.output_bytes_max,
+            agent_renewable: base.agent_renewable,
+            provenance: base.provenance,
+            startup_document: ArtifactRef {
+                path: "startup.json".into(),
+                sha256: hex(Sha256::digest(raw).into()),
+                bytes: raw.len() as u64,
+                source: "https://example.org/fixture".into(),
+                license: "MIT".into(),
+            },
+            startup_configuration_sha256: hex(startup.configuration_digest().unwrap()),
+            startup_search_configuration_sha256: hex(startup
+                .search_configuration_digest()
+                .unwrap()),
+            own_r_root_tie: tie,
+        }
+    }
+
+    #[test]
+    fn policy_lock_pins_real_startup_without_manufacturing_an_r_owner() {
+        use crate::rovent_bootstrap::RoventStartupControl;
+        use crate::rovent_bootstrap::pinned::RoventPinnedStartupV2;
+        use rz_experiments::RoventOwnRNotApplicableV2;
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let wire = v4_wire();
+        let raw = serde_json::to_vec_pretty(&wire).unwrap();
+        let startup = StartupConfigurationDocument::from_json(&raw).unwrap();
+        let manifest = policy_manifest(
+            &startup,
+            &raw,
+            crate::rovent_bootstrap::tests::wire(ExecutionMode::CpuPc),
+            RoventRootTieDeclarationV2::NotApplicable {
+                reason: RoventOwnRNotApplicableV2::PcOnly,
+            },
+        );
+        let artifact = manifest.startup_document.clone();
+        let lock = Arc::new(manifest.lock().unwrap());
+        assert!(startup.admit_against_v2(&lock).is_ok());
+        let legacy = StartupConfigurationDocument::V1(pc());
+        assert!(legacy.admit_against_v2(&lock).is_err());
+        let mut bad = lock.manifest.clone();
+        bad.startup_configuration_sha256 = "a".repeat(64);
+        assert!(startup.admit_against_v2(&bad.lock().unwrap()).is_err());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("rovent-startup-v2-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("startup.json"), &raw).unwrap();
+        let root = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority()).unwrap();
+        let now = Instant::now();
+        let control = RoventStartupControl {
+            until: now + Duration::from_secs(30),
+            cleanup_until: now + Duration::from_secs(60),
+            cancellation: Arc::new(AtomicBool::new(false)),
+        };
+        let mut wrong_artifact = artifact.clone();
+        wrong_artifact.sha256 = "a".repeat(64);
+        assert!(
+            RoventPinnedStartupV2::open(
+                Arc::clone(&lock),
+                root.try_clone().unwrap(),
+                wrong_artifact,
+                &control,
+            )
+            .is_err()
+        );
+        let mut corrupt_lock = (*lock).clone();
+        corrupt_lock.canonical_sha256 = "a".repeat(64);
+        assert!(
+            RoventPinnedStartupV2::open(
+                Arc::new(corrupt_lock),
+                root.try_clone().unwrap(),
+                artifact.clone(),
+                &control,
+            )
+            .is_err()
+        );
+        let pinned = RoventPinnedStartupV2::open(lock, root, artifact, &control).unwrap();
+        assert!(pinned.revalidate().is_ok());
+        std::fs::write(path.join("startup.json"), vec![b' '; raw.len()]).unwrap();
+        assert!(pinned.revalidate().is_err());
+        drop(pinned);
+        std::fs::remove_file(path.join("startup.json")).unwrap();
+        std::fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn policy_lock_joins_both_own_policies_and_nnuec_plan_not_worker_conditions() {
+        use rz_experiments::RoventRootTiePolicyV2;
+        use serde_json::json;
+        for (name, policy, opposite) in [
+            (
+                "legacy_first_searched",
+                RoventRootTiePolicyV2::LegacyFirstSearched,
+                RoventRootTiePolicyV2::RulesOrderConfirmed,
+            ),
+            (
+                "rules_order_confirmed",
+                RoventRootTiePolicyV2::RulesOrderConfirmed,
+                RoventRootTiePolicyV2::LegacyFirstSearched,
+            ),
+        ] {
+            let mut wire = v4_wire();
+            wire["execution"] = json!({
+                "assembly":"own_researcher", "event_order":"fixed",
+                "queues":{"waiting_jobs_max":8,"worker_commands_max":8,"role_tickets_max":16,"paused_bytes_per_worker_max":1048576},
+                "max_rounds":16,"max_native_nodes":4096,"cpu_depth":2,"cpu_nodes_per_task":1024,
+                "cpu_plan":{"profile":"independent","tt_entries":4096,"max_depth":8,"quiescence_ply":4,"ordering":"legal_see_v1","paused_bytes_limit":1048576,"preserve_paused_side_scope":true,"affinity":null},
+                "value":{"value":"nnuec_v2","context_namespace_policy":"fixture-context","local_namespace_policy":"fixture-local"},
+                "controller":{"fixed_node_credit":64,"fixed_soft_lease_us":1000,"initial_workers":1,"max_workers":1,"consecutive_observations":3,"worker_cooldown_ms":2000},
+                "reciprocal":{"recipient":"critic","max_questions_per_job":1,"node_interval":1,"first_question_sequence":1},
+                "peers":{"pc_peer":true,"researcher":true,"max_sources_per_root":1}
+            });
+            wire["own_r_root_tie"] = json!({"kind":"own","policy":name});
+            let raw = serde_json::to_vec(&wire).unwrap();
+            let startup = StartupConfigurationDocument::from_json(&raw).unwrap();
+            let mut base = crate::rovent_bootstrap::tests::wire(ExecutionMode::CpuPcr);
+            base["coordinator"]["waiting_jobs_max"] = json!(8);
+            let expected_worker = "d".repeat(64);
+            let mut manifest = policy_manifest(
+                &startup,
+                &raw,
+                base,
+                RoventRootTieDeclarationV2::Own {
+                    policy,
+                    expected_search_identity: "fixture-search/1".into(),
+                    expected_worker_conditions_sha256: expected_worker.clone(),
+                },
+            );
+            let plan = hex(startup.nnuec_conditions_digest().unwrap().unwrap());
+            assert_ne!(plan, expected_worker);
+            let pin_artifact = manifest.startup_document.clone();
+            manifest.engine.nnuec = Some(rz_experiments::RoventNnuecPin {
+                schema: "fixture-schema/1".into(),
+                semantics: "fixture-semantics/1".into(),
+                encoding: "fixture-encoding/1".into(),
+                implementation_sha256: "b".repeat(64),
+                configuration_sha256: "c".repeat(64),
+                weights: pin_artifact.clone(),
+                provenance: pin_artifact,
+                diagnostic: false,
+                context_namespace_policy_sha256: hex(framed_digest(
+                    "rz-rovent-nnuec-context-policy/1",
+                    &canonical(&"fixture-context").unwrap(),
+                )
+                .unwrap()),
+                local_namespace_policy_sha256: hex(framed_digest(
+                    "rz-rovent-nnuec-local-policy/1",
+                    &canonical(&"fixture-local").unwrap(),
+                )
+                .unwrap()),
+                search_conditions_sha256: plan,
+            });
+            assert!(
+                startup
+                    .admit_against_v2(&manifest.clone().lock().unwrap())
+                    .is_ok()
+            );
+            let mut bad_policy = manifest.clone();
+            if let RoventRootTieDeclarationV2::Own { policy, .. } = &mut bad_policy.own_r_root_tie {
+                *policy = opposite;
+            }
+            assert!(
+                startup
+                    .admit_against_v2(&bad_policy.lock().unwrap())
+                    .is_err()
+            );
+            let mut bad_plan = manifest;
+            bad_plan
+                .engine
+                .nnuec
+                .as_mut()
+                .unwrap()
+                .search_conditions_sha256 = expected_worker;
+            assert!(startup.admit_against_v2(&bad_plan.lock().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_lock_external_r_checks_original_profile_without_own_worker() {
+        use rz_experiments::RoventOwnRNotApplicableV2;
+        use serde_json::json;
+        let mut wire = v4_wire();
+        let profile = json!({"path":"fixtures/external-profile.json","sha256":"a".repeat(64),
+            "bytes":32,"source":"https://example.invalid/profile","license":"fixture"});
+        wire["execution"] = json!({"assembly":"external_researcher", "event_order":"fixed",
+            "queues":{"waiting_jobs_max":16,"worker_commands_max":8,"role_tickets_max":16,"paused_bytes_per_worker_max":1048576},
+            "max_rounds":64,"max_reported_nodes":64,"cpu_depth":8,"cpu_nodes_per_task":128,
+            "profile":profile,"slice":{"quantum_ms":1000,"stop_drain_reserve_ms":500,"requested_reported_nodes":256,"multipv":1},
+            "peers":{"pc_peer":true,"researcher":true,"max_sources_per_root":16}});
+        wire["external"] =
+            json!({"kind":"researcher","question_limit":{"kind":"nodes","reported_nodes":32}});
+        let raw = serde_json::to_vec(&wire).unwrap();
+        let startup = StartupConfigurationDocument::from_json(&raw).unwrap();
+        let mut base = crate::rovent_bootstrap::tests::wire(ExecutionMode::CpuPcr);
+        let mut binary = base["engine"]["binary"].clone();
+        binary["path"] = json!("fixture/external-engine");
+        base["engine"]["researcher"] = json!({"provider":"external", "profile":{
+            "domain":"rz-rovent-external-engine-profile/1","profile":profile,
+            "canonical_sha256":"8".repeat(64),"capability_sha256":"9".repeat(64),
+            "purpose":"research_checker","binary":binary,"source_commit":"b".repeat(40),
+            "requested_threads":1,"requested_hash_mib":256}});
+        base["resources"]["pools"][1]["actors"] = json!(["external_r"]);
+        let manifest = policy_manifest(
+            &startup,
+            &raw,
+            base,
+            RoventRootTieDeclarationV2::NotApplicable {
+                reason: RoventOwnRNotApplicableV2::ExternalResearcher,
+            },
+        );
+        assert!(
+            startup
+                .admit_against_v2(&manifest.clone().lock().unwrap())
+                .is_ok()
+        );
+        let mut bad = manifest;
+        if let Some(RoventResearcher::External { profile }) = &mut bad.engine.researcher {
+            profile.profile.sha256 = "f".repeat(64);
+        }
+        assert!(startup.admit_against_v2(&bad.lock().unwrap()).is_err());
+    }
 
     fn pc() -> RoventStartupConfiguration {
         RoventStartupConfiguration {

@@ -568,7 +568,11 @@ impl RoventNnuecSessionDriver {
                     "actual paused-owner budget differs from queues",
                 ));
             }
-            let plan = DeferredNnuecCpuPlan::new(
+            let root_tie_policy = document
+                .own_r_root_tie_policy()
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecTiePolicy", &e))?
+                .ok_or_else(|| failure("RoventNnuecTiePolicy", "own-R policy is required"))?;
+            let plan = DeferredNnuecCpuPlan::new_with_root_tie_policy(
                 cpu_plan
                     .actual()
                     .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?,
@@ -577,6 +581,7 @@ impl RoventNnuecSessionDriver {
                 cpu_plan.preserve_paused_side_scope,
                 limits.worker_commands_max,
                 cpu_plan.affinity(),
+                root_tie_policy,
             )
             .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?;
             let source = DeferredNnuecRSource::new(Arc::clone(loaded.model()), plan);

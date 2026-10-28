@@ -22,7 +22,10 @@ pub use pinned::{
     RoventExternalRSourceSelection, RoventPinnedExternalRSource, RoventTeacherAssetSelection,
     RoventTeacherSourceSelection,
 };
-pub use pinned::{RoventNativeAssetSelection, RoventNativeGraphAsset, RoventPinnedNativeSources};
+pub use pinned::{
+    RoventNativeAssetSelection, RoventNativeGraphAsset, RoventPinnedNativeSources,
+    RoventPinnedStartupV2,
+};
 
 use crate::pals_adaptive::{NativeQuestionProjection, ProjectedNativeBackend};
 use crate::pals_native::ticketed::{

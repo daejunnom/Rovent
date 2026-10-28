@@ -20,7 +20,7 @@ use rz_eval::pals_onnx::virtual_review::{
     validate_virtual_review_export_manifest_kind,
 };
 use rz_eval::runtime_pin::{RuntimeBundleFileRole, RuntimeLibraryPin};
-use rz_experiments::{ArtifactRef, RoventInputLock};
+use rz_experiments::{ArtifactRef, RoventInputLock, RoventInputLockV2};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeSet,
@@ -75,6 +75,85 @@ struct PinnedGraph {
     role: String,
     registered_file: String,
     blob: PinnedBlob,
+}
+
+/// The /2 lock and exact /4 startup file remain owned together. This is a
+/// startup admission only: it does not pin model/runtime assets, construct a
+/// worker, issue an R job, or attest execution. No /1 lock is synthesized.
+pub struct RoventPinnedStartupV2 {
+    lock: Arc<RoventInputLockV2>,
+    _root: Dir,
+    blob: PinnedBlob,
+    configuration: StartupConfigurationDocument,
+}
+
+impl RoventPinnedStartupV2 {
+    pub fn open(
+        lock: Arc<RoventInputLockV2>,
+        root: Dir,
+        selected: ArtifactRef,
+        control: &RoventStartupControl,
+    ) -> Result<Self, BackendError> {
+        control.check()?;
+        lock.validate()
+            .map_err(|_| fail(K::IdentityMismatch, "invalid Rovent input lock /2"))?;
+        if selected != lock.manifest.startup_document {
+            return Err(fail(
+                K::IdentityMismatch,
+                "selected startup differs from /2 lock",
+            ));
+        }
+        let blob = open_blob(
+            &root,
+            selected,
+            ROVENT_STARTUP_CONFIGURATION_MAX_BYTES as u64,
+        )?;
+        let configuration = StartupConfigurationDocument::from_json(&read_blob(
+            &blob,
+            ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
+        )?)?;
+        configuration.admit_against_v2(&lock)?;
+        control.check()?;
+        Ok(Self {
+            lock,
+            _root: root,
+            blob,
+            configuration,
+        })
+    }
+
+    pub fn lock(&self) -> &RoventInputLockV2 {
+        &self.lock
+    }
+
+    pub fn configuration(&self) -> &StartupConfigurationDocument {
+        &self.configuration
+    }
+
+    pub fn configuration_artifact(&self) -> &ArtifactRef {
+        &self.blob.declaration
+    }
+
+    /// Re-read the retained descriptor, re-check bytes and the typed lock.
+    /// As with the /1 owner, same-UID mutation prevention remains the caller's
+    /// responsibility; pathname or metadata checks alone do not freeze bytes.
+    pub fn revalidate(&self) -> Result<(), BackendError> {
+        if self.blob.declaration != self.lock.manifest.startup_document {
+            return Err(fail(
+                K::IdentityMismatch,
+                "retained startup differs from /2 lock",
+            ));
+        }
+        let current = StartupConfigurationDocument::from_json(&read_blob(
+            &self.blob,
+            ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
+        )?)?;
+        current.admit_against_v2(&self.lock)?;
+        if current != self.configuration {
+            return Err(fail(K::IdentityMismatch, "retained startup /4 changed"));
+        }
+        Ok(())
+    }
 }
 
 /// Descriptors remain bound to the exact new lock. Path replacement cannot

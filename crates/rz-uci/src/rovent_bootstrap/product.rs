@@ -512,6 +512,10 @@ impl RoventNativeProductDriver {
             let control = controller
                 .actual(*event_order)
                 .map_err(|error| SearchSessionFailure::debug("RoventPcrController", &error))?;
+            let root_tie_policy = configuration
+                .own_r_root_tie_policy()
+                .map_err(|error| SearchSessionFailure::debug("RoventPcrTiePolicy", &error))?
+                .ok_or_else(|| failure("RoventPcrTiePolicy", "own-R policy is required"))?;
             let mut cpu = Vec::new();
             cpu.try_reserve_exact(usize::from(control.max_workers))
                 .map_err(|error| SearchSessionFailure::debug("RoventPcrCpuCapacity", &error))?;
@@ -521,13 +525,19 @@ impl RoventNativeProductDriver {
                     .actual()
                     .map_err(|error| SearchSessionFailure::debug("RoventPcrCpuPlan", &error))?;
                 let mut engine = if cpu_plan.preserve_paused_side_scope {
-                    CpuEngine::with_paused_side_scope(actual, evaluator, cpu_plan.ordering())
+                    CpuEngine::with_paused_side_scope_and_tie_policy(
+                        actual,
+                        evaluator,
+                        cpu_plan.ordering(),
+                        root_tie_policy,
+                    )
                 } else {
-                    CpuEngine::with_evaluator_ordering_and_resume_policy(
+                    CpuEngine::with_evaluator_ordering_resume_and_tie_policy(
                         actual,
                         evaluator,
                         cpu_plan.ordering(),
                         CpuResumePolicy::PausedStack,
+                        root_tie_policy,
                     )
                 }
                 .map_err(|error| SearchSessionFailure::debug("RoventPcrCpu", &error))?;
