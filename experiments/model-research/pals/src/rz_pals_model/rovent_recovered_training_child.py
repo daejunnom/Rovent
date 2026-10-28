@@ -387,6 +387,44 @@ def _history_scope(startup):
         "scope": "recorded_historical_integrity_only_new_parent_owns_this_window"}
 
 
+def _execute_ipc_check(startup, owner, native_intake, spec, authority, torch, *, clock, cancelled,
+                       r_auxiliary_intake=None):
+    """Check this child and its live parent without dispatching training work."""
+    from .rovent_recovered_training_window import train_rovent_window
+
+    auxiliary = {} if r_auxiliary_intake is None else {"r_auxiliary_intake": r_auxiliary_intake}
+    before_completed, before_dispatched = dict(owner.completed), dict(owner.dispatched)
+    if owner.pending_microbatches != 0 or owner.quarantined:
+        raise ValueError("IPC check requires an idle nonquarantined tensor owner")
+    if cancelled() or clock() >= startup["execution_until_ns"]:
+        raise TimeoutError("IPC check cancelled or expired before admission")
+    validation = train_rovent_window(owner, native_intake, spec,
+        startup["registration"]["checkpoint_directory"], execute=False, **auxiliary)
+    if validation.get("actual_training_executed") is not False or validation.get("optimizer_updates") != 0:
+        raise ValueError("IPC check requires validation-only training admission")
+    if cancelled() or clock() >= startup["execution_until_ns"]:
+        raise TimeoutError("IPC check cancelled or expired before parent handshake")
+    owner.physical_completion = "unknown"
+    try:
+        lease = authority.begin_window(owner, native_intake, spec, validation["admission"])
+        for device in owner.cuda_devices:
+            torch.cuda.synchronize(device)
+        owner.physical_completion = "confirmed"
+        if (owner.completed != before_completed or owner.dispatched != before_dispatched
+                or owner.pending_microbatches != 0):
+            raise ValueError("IPC check unexpectedly changed update state")
+        if cancelled() or clock() >= startup["execution_until_ns"]:
+            raise TimeoutError("IPC check cancelled or expired before terminal acknowledgement")
+        authority.end_window(lease, status="ipc_check_complete", owner=owner)
+    except BaseException:
+        owner.quarantined = True
+        raise
+    return {"schema": "rz-rovent-recovered-trainer-ipc-check/1", "optimizer_updates": 0,
+        "actual_training_executed": False, "scope": "current_child_dataset_and_ipc_only",
+        "validation": validation, "model_owner_created": True,
+        "optimizer_objects_may_be_created": True, "cuda_synchronization_performed": bool(owner.cuda_devices)}
+
+
 def recovered_rovent_child_main(argv=None, *, stdin=None, clock=time.monotonic_ns):
     args = _parser().parse_args(argv)
     if not args.execute:
@@ -460,6 +498,9 @@ def recovered_rovent_child_main(argv=None, *, stdin=None, clock=time.monotonic_n
         if registration["action"] == "export":
             result, export_pin, export_expense = _execute_export(startup, owner, staged, native_intake, spec,
                 request, authority, reads, torch, clock=clock, cancelled=lambda: cancelled, **auxiliary)
+        elif registration["action"] == "ipc_check":
+            result = _execute_ipc_check(startup, owner, native_intake, spec, authority, torch,
+                clock=clock, cancelled=lambda: cancelled, **auxiliary)
         else:
             from .rovent_recovered_training_window import train_rovent_window
             result = train_rovent_window(owner, native_intake, spec, registration["checkpoint_directory"],

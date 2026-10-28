@@ -569,6 +569,18 @@ fn actual_typed_rust_metadata_is_accepted_by_independent_python_decoder() {
 }
 
 #[test]
+fn ipc_check_registration_round_trips_through_python_without_training_authority() {
+    let mut value = fixture();
+    let mut registration: RoventRecoveredTrainingRegistration =
+        serde_json::from_value(value["registration"].clone()).unwrap();
+    registration.action = RoventRecoveredTrainingAction::IpcCheck;
+    registration.validate().unwrap();
+    value["registration"] = serde_json::to_value(registration).unwrap();
+    assert_eq!(value["registration"]["action"], "ipc_check");
+    assert_python_accepts_fixture(value);
+}
+
+#[test]
 fn typed_zero_training_epoch_preserves_positive_collection_epochs() {
     // Zero is an original training/output epoch, not an absent value or a
     // replacement for the positive epoch of the sealed collection input.

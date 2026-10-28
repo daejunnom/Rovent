@@ -1015,6 +1015,22 @@ fn publish_current_boundary(
     }
 }
 
+fn operation_allowed(action: &RoventRecoveredTrainingAction, operation: &str) -> bool {
+    match action {
+        RoventRecoveredTrainingAction::Train => true,
+        RoventRecoveredTrainingAction::Export => matches!(
+            operation,
+            "begin_window" | "end_window" | "validate_checkpoint_state" | "validate_learned_export"
+        ),
+        // Historical checkpoint validation permits resume/fork initialization;
+        // it grants no sample, update, checkpoint or export authority.
+        RoventRecoveredTrainingAction::IpcCheck => matches!(
+            operation,
+            "begin_window" | "end_window" | "validate_checkpoint_state"
+        ),
+    }
+}
+
 fn dispatch(
     ctx: &Broker,
     ledger: &mut TrainerLedger,
@@ -1023,15 +1039,8 @@ fn dispatch(
 ) -> Result<Value, ArenaError> {
     let train = ctx.registration.action == RoventRecoveredTrainingAction::Train;
     check(
-        train
-            || matches!(
-                operation,
-                "begin_window"
-                    | "end_window"
-                    | "validate_checkpoint_state"
-                    | "validate_learned_export"
-            ),
-        "export owner cannot consume samples/update/write a training checkpoint",
+        operation_allowed(&ctx.registration.action, operation),
+        "registered action does not authorize this trainer RPC",
     )?;
     match operation {
         "begin_window" => {
@@ -1328,11 +1337,19 @@ fn dispatch(
                                         | "window_update_budget_complete"
                                 )
                             )
-                    } else {
+                    } else if ctx.registration.action == RoventRecoveredTrainingAction::Export {
                         p["status"] == "export_complete"
                             && ledger.export_admitted
                             && ledger.updates.is_empty()
                             && ctx.checkpoint.is_some()
+                    } else {
+                        p["status"] == "ipc_check_complete"
+                            && ledger.completed == ledger.initial
+                            && ledger.updates.is_empty()
+                            && ledger.checkpoints.is_empty()
+                            && ledger.samples_admitted == 0
+                            && ledger.groups_started == 0
+                            && !ledger.export_admitted
                     },
                 "current window end must confirm actual fence/boundary, not historical closure",
             )?;
@@ -2082,7 +2099,14 @@ pub fn run_rovent_training_recovered(
                 && (reg.action != RoventRecoveredTrainingAction::Export
                     || journal.checkpoint_checked
                         && journal.export_admitted
-                        && journal.updates.is_empty()),
+                        && journal.updates.is_empty())
+                && (reg.action != RoventRecoveredTrainingAction::IpcCheck
+                    || journal.completed == journal.initial
+                        && journal.updates.is_empty()
+                        && journal.checkpoints.is_empty()
+                        && journal.samples_admitted == 0
+                        && journal.groups_started == 0
+                        && !journal.export_admitted),
             "current process/physical/ledger closure incomplete",
         )?;
         let mut terminal_summary: Value = decode(&original.process().stdout)?;
@@ -2101,6 +2125,16 @@ pub fn run_rovent_training_recovered(
             .ok_or_else(|| invalid("terminal FD owner absent"))?;
         owner.journals.push(terminal_file);
         let terminal: Value = decode(&terminal_raw)?;
+        if reg.action == RoventRecoveredTrainingAction::IpcCheck {
+            check(
+                terminal["result"]["schema"] == "rz-rovent-recovered-trainer-ipc-check/1"
+                    && terminal["result"]["optimizer_updates"] == 0
+                    && terminal["result"]["actual_training_executed"] == false
+                    && terminal["result"]["scope"] == "current_child_dataset_and_ipc_only",
+                "current child IPC-check result is missing or claims training work",
+            )?;
+            terminal_summary["ipc_check"] = terminal["result"].clone();
+        }
         for value in [&terminal_summary, &terminal] {
             check(
                 value["schema"] == ROVENT_RECOVERED_RESULT
@@ -2586,6 +2620,37 @@ fn verify_learned_export_proof(proof: &Value, original: &Value) -> Result<(), Ar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_check_admits_only_its_handshake_and_checkpoint_validation() {
+        let action = RoventRecoveredTrainingAction::IpcCheck;
+        for operation in ["begin_window", "end_window", "validate_checkpoint_state"] {
+            assert!(operation_allowed(&action, operation));
+        }
+        for operation in [
+            "consume_sample",
+            "consume_auxiliary",
+            "completed_update",
+            "checkpoint_published",
+            "validate_learned_export",
+            "unknown",
+        ] {
+            assert!(!operation_allowed(&action, operation));
+        }
+        assert!(operation_allowed(
+            &RoventRecoveredTrainingAction::Train,
+            "completed_update"
+        ));
+        assert!(operation_allowed(
+            &RoventRecoveredTrainingAction::Export,
+            "validate_learned_export"
+        ));
+        assert!(!operation_allowed(
+            &RoventRecoveredTrainingAction::Export,
+            "completed_update"
+        ));
+    }
+
     fn unknown_cost_export_fixture() -> (Value, Value) {
         let cost = json!({"forward_calls":0,"backward_calls":0,"samples":0,"wall_time_ns":0,
             "partial_accumulation_ns":0,"replay_ns":0,"masked_groups":0,"output_bytes":0});

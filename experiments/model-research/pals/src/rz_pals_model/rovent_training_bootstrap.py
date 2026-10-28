@@ -561,8 +561,8 @@ def validate_recovered_registration(value):
         for count in value[name].values():
             _uint(count, 65536)
     action = value["action"]
-    if type(action) is not str or action not in ("train", "export"):
-        raise ValueError("explicit recovered train or export action required")
+    if type(action) is not str or action not in ("train", "export", "ipc_check"):
+        raise ValueError("explicit recovered train, export or ipc_check action required")
     source = value["initialization_source"]
     if type(source) is not dict:
         raise ValueError("tagged recovered initialization_source required")
@@ -571,7 +571,7 @@ def validate_recovered_registration(value):
         _fields(source, ("kind", "pc_checkpoint", "nnuec_checkpoint"), "recovered initialize source")
         _pin(source["pc_checkpoint"], MAX_RUNTIME_MODULE_BYTES)
         _pin(source["nnuec_checkpoint"], MAX_RUNTIME_MODULE_BYTES)
-        if action != "train" or any(value["expected_initial_completed"].values()):
+        if action not in ("train", "ipc_check") or any(value["expected_initial_completed"].values()):
             raise ValueError("recovered initialize cannot export or claim existing stage updates")
     elif kind == "resume":
         _fields(source, ("kind", "checkpoint"), "recovered resume source")
@@ -580,13 +580,13 @@ def validate_recovered_registration(value):
         _fields(source, ("kind", "checkpoint", "parent_stage_id"), "recovered fork source")
         _historical_checkpoint_request(source["checkpoint"])
         _identifier(source["parent_stage_id"])
-        if action != "train" or any(value["expected_initial_completed"].values()):
+        if action not in ("train", "ipc_check") or any(value["expected_initial_completed"].values()):
             raise ValueError("recovered fork requires fresh current-stage counts and train action")
     else:
         raise ValueError("unregistered recovered initialization source")
-    if action == "train":
+    if action in ("train", "ipc_check"):
         if value["export_request"] is not None:
-            raise ValueError("recovered train cannot carry an export request")
+            raise ValueError("recovered train or ipc_check cannot carry an export request")
     else:
         _pin(value["export_request"])
         if kind != "resume":

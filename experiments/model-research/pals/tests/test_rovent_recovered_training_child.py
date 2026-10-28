@@ -78,6 +78,45 @@ class RecoveredChildContractTests(unittest.TestCase):
     def tearDown(self):
         sys.meta_path.remove(self.guard)
 
+    def test_ipc_check_uses_validation_only_then_live_begin_fence_and_end(self):
+        from rz_pals_model import rovent_recovered_training_window as window
+        calls = []
+        owner = SimpleNamespace(completed={"proposer": 0}, dispatched={"proposer": 0},
+            pending_microbatches=0, quarantined=False, physical_completion="unknown", cuda_devices=["cuda:0"])
+        lease = object()
+        authority = SimpleNamespace(
+            begin_window=lambda *_args: calls.append("begin") or lease,
+            end_window=lambda got, **kwargs: calls.append(("end", got, kwargs["status"], owner.physical_completion)))
+        torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda device: calls.append(("fence", device))))
+        startup = {"execution_until_ns": 10, "registration": {"checkpoint_directory": "/fixture/checkpoint"}}
+        validation = {"actual_training_executed": False, "optimizer_updates": 0, "admission": {"corpus_sha256": "x"}}
+        with patch.object(window, "train_rovent_window", return_value=validation) as validate:
+            result = child._execute_ipc_check(startup, owner, object(), {}, authority, torch,
+                clock=lambda: 1, cancelled=lambda: False)
+        self.assertIs(validate.call_args.kwargs["execute"], False)
+        self.assertEqual(calls, ["begin", ("fence", "cuda:0"), ("end", lease, "ipc_check_complete", "confirmed")])
+        self.assertEqual(result["optimizer_updates"], 0)
+        self.assertFalse(result["actual_training_executed"])
+        self.assertEqual(result["scope"], "current_child_dataset_and_ipc_only")
+
+    def test_ipc_check_fence_failure_quarantines_without_end_ack(self):
+        from rz_pals_model import rovent_recovered_training_window as window
+        owner = SimpleNamespace(completed={}, dispatched={}, pending_microbatches=0, quarantined=False,
+            physical_completion="unknown", cuda_devices=["cuda:0"])
+        authority = SimpleNamespace(begin_window=lambda *_args: object(),
+            end_window=lambda *_args, **_kwargs: self.fail("failed fence must not report successful end"))
+        def fail_fence(_device):
+            raise RuntimeError("fixture fence failure")
+        torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=fail_fence))
+        startup = {"execution_until_ns": 10, "registration": {"checkpoint_directory": "/fixture/checkpoint"}}
+        validation = {"actual_training_executed": False, "optimizer_updates": 0, "admission": {}}
+        with patch.object(window, "train_rovent_window", return_value=validation):
+            with self.assertRaisesRegex(RuntimeError, "fixture fence failure"):
+                child._execute_ipc_check(startup, owner, object(), {}, authority, torch,
+                    clock=lambda: 1, cancelled=lambda: False)
+        self.assertTrue(owner.quarantined)
+        self.assertEqual(owner.physical_completion, "unknown")
+
     def test_startup_read_requires_exact_eof_and_bounded_integer(self):
         self.assertEqual(child._read_startup(io.BytesIO(b"{}"), 2), b"{}")
         for payload, count in ((b"{}x", 2), (b"{", 2), (b"", 0), (b"{}", True)):

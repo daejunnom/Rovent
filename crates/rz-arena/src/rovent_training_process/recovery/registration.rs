@@ -269,6 +269,8 @@ pub struct RoventHistoricalCheckpointRegistration {
 pub enum RoventRecoveredTrainingAction {
     Train,
     Export,
+    /// A current child and its IPC are checked without admitting any update.
+    IpcCheck,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -401,7 +403,7 @@ impl RoventRecoveredTrainingRegistration {
                 pin_shape(pc_checkpoint, 2 << 30)?;
                 pin_shape(nnuec_checkpoint, 2 << 30)?;
                 check(
-                    self.action == RoventRecoveredTrainingAction::Train
+                    self.action != RoventRecoveredTrainingAction::Export
                         && self.expected_initial_completed.values().all(|v| *v == 0),
                     "initialize cannot export or claim trained initial updates",
                 )?;
@@ -414,17 +416,19 @@ impl RoventRecoveredTrainingRegistration {
                 checkpoint.validate()?;
                 check(
                     generation_identifier(parent_stage_id)
-                        && self.action == RoventRecoveredTrainingAction::Train
+                        && self.action != RoventRecoveredTrainingAction::Export
                         && self.expected_initial_completed.values().all(|v| *v == 0),
                     "fork needs explicit parent and fresh current-stage count",
                 )?;
             }
         }
         match self.action {
-            RoventRecoveredTrainingAction::Train => check(
-                self.export_request.is_none(),
-                "train action cannot smuggle export request",
-            )?,
+            RoventRecoveredTrainingAction::Train | RoventRecoveredTrainingAction::IpcCheck => {
+                check(
+                    self.export_request.is_none(),
+                    "train/IPC check cannot carry an export request",
+                )?
+            }
             RoventRecoveredTrainingAction::Export => {
                 pin_shape(
                     self.export_request
