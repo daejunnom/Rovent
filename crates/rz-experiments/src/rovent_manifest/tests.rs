@@ -318,6 +318,75 @@ fn policy_manifest_v2(
 }
 
 #[test]
+fn original_versioned_lock_owner_retains_exact_arc_and_borrowed_fields() {
+    use crate::RoventOriginalInputLock;
+    use std::sync::Arc;
+
+    let original_v1 = Arc::new(manifest().lock().unwrap());
+    let original_v2 = Arc::new(
+        policy_manifest_v2(
+            manifest(),
+            RoventRootTieDeclarationV2::NotApplicable {
+                reason: RoventOwnRNotApplicableV2::PcOnly,
+            },
+        )
+        .lock()
+        .unwrap(),
+    );
+    let v1_bytes = serde_json::to_vec(original_v1.as_ref()).unwrap();
+    let v2_bytes = serde_json::to_vec(original_v2.as_ref()).unwrap();
+    let v1 = RoventOriginalInputLock::from_v1(Arc::clone(&original_v1)).unwrap();
+    let v2 = RoventOriginalInputLock::from_v2(Arc::clone(&original_v2)).unwrap();
+
+    assert!(Arc::ptr_eq(v1.v1().unwrap(), &original_v1));
+    assert!(Arc::ptr_eq(v2.v2().unwrap(), &original_v2));
+    assert!(v1.v2().is_none() && v2.v1().is_none());
+    assert!(v1.same_original_owner(&v1.clone()));
+    assert!(v2.same_original_owner(&v2.clone()));
+    let separate = RoventOriginalInputLock::from_v2(Arc::new((*original_v2).clone())).unwrap();
+    assert!(!v2.same_original_owner(&separate));
+    assert!(!v1.same_original_owner(&v2));
+    assert_eq!(v1.common().canonical_sha256, original_v1.canonical_sha256);
+    assert_eq!(v2.common().canonical_sha256, original_v2.canonical_sha256);
+    assert!(std::ptr::eq(
+        v2.common().engine,
+        &original_v2.manifest.engine
+    ));
+    assert!(std::ptr::eq(
+        v1.common().resources,
+        &original_v1.manifest.resources
+    ));
+    assert!(v1.validate().is_ok() && v2.validate().is_ok());
+    assert_eq!(serde_json::to_vec(original_v1.as_ref()).unwrap(), v1_bytes);
+    assert_eq!(serde_json::to_vec(original_v2.as_ref()).unwrap(), v2_bytes);
+}
+
+#[test]
+fn original_versioned_lock_owner_returns_invalid_original_to_caller() {
+    use crate::RoventOriginalInputLock;
+    use std::sync::Arc;
+
+    let mut invalid_v1 = manifest().lock().unwrap();
+    invalid_v1.canonical_sha256 = sha_value('9');
+    let original_v1 = Arc::new(invalid_v1);
+    let failure = RoventOriginalInputLock::from_v1(Arc::clone(&original_v1)).unwrap_err();
+    assert!(Arc::ptr_eq(&failure.original, &original_v1));
+
+    let mut invalid_v2 = policy_manifest_v2(
+        manifest(),
+        RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::PcOnly,
+        },
+    )
+    .lock()
+    .unwrap();
+    invalid_v2.canonical_sha256 = sha_value('9');
+    let original_v2 = Arc::new(invalid_v2);
+    let failure = RoventOriginalInputLock::from_v2(Arc::clone(&original_v2)).unwrap_err();
+    assert!(Arc::ptr_eq(&failure.original, &original_v2));
+}
+
+#[test]
 fn policy_v2_domains_lock_and_pc_observations_do_not_downgrade() {
     let old = manifest();
     let old_bytes = old.canonical_bytes().unwrap();

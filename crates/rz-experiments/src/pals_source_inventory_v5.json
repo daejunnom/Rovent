@@ -527,6 +527,7 @@
       "crates/rz-experiments/src/pals_startup_v5/content_admission/owned_files.rs",
       "crates/rz-experiments/src/rovent_manifest.rs",
       "crates/rz-experiments/src/rovent_manifest/v2.rs",
+      "crates/rz-experiments/src/rovent_input_lock_owner.rs",
       "crates/rz-experiments/src/rovent_storage.rs",
       "crates/rz-experiments/src/rovent_root_descriptor.rs",
       "crates/rz-uci/examples/rovent_startup_metadata.rs"
