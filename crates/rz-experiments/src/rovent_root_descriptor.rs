@@ -5,7 +5,10 @@
 //! observe applied resources, or attest neural execution. The actual UCI owner
 //! must retain and validate its original Rules, go, clock and revocation state.
 
-use crate::{ManifestError, ROVENT_POSITION_VISIT_UNIT, RoventInputLock, RoventResourcePlan};
+use crate::{
+    ManifestError, ROVENT_POSITION_VISIT_UNIT, RoventCoordinatorDeclaration, RoventInputLock,
+    RoventInputLockV2, RoventResourcePlan, RoventSearchDeclaration,
+};
 use rz_contracts::{Digest, rovent::SearchGoal};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,6 +18,9 @@ use std::{collections::BTreeSet, io::Write, num::NonZeroU16};
 pub const ROVENT_ROOT_ADMISSION_DOMAIN: &str = "rz-rovent-root-admission/1";
 pub const ROVENT_ROOT_BUDGET_DOMAIN: &str = "rz-rovent-root-budget/1";
 pub const ROVENT_ROOT_DEADLINE_DOMAIN: &str = "rz-rovent-root-deadline/1";
+pub const ROVENT_ROOT_ADMISSION_V2_DOMAIN: &str = "rz-rovent-root-admission/2";
+pub const ROVENT_ROOT_BUDGET_V2_DOMAIN: &str = "rz-rovent-root-budget/2";
+pub const ROVENT_ROOT_DEADLINE_V2_DOMAIN: &str = "rz-rovent-root-deadline/2";
 const MAX_DESCRIPTOR_BYTES: usize = 64 << 10;
 const MAX_RAW_MOVES_BYTES: usize = 32 << 10;
 const MAX_ROOT_MOVES: usize = 218;
@@ -181,48 +187,17 @@ impl RoventRootDescriptor {
     pub fn verify_against(&self, lock: &RoventInputLock) -> Result<(), ManifestError> {
         lock.validate()?;
         self.validate()?;
-        let input = &self.input;
         let manifest = &lock.manifest;
-        let search = &manifest.engine.search;
-        let coordinator = &manifest.coordinator;
-        let ceilings = &input.declared_ceilings;
-        require(
-            input.startup_lock_sha256 == lock.canonical_sha256
-                && input.node_unit == search.node_unit
-                && input.search_configuration_sha256 == search.search_configuration_sha256
-                && input.coordinator_policy_sha256 == coordinator.policy_sha256
-                && input.rules_profile_sha256 == search.rules_profile_sha256,
-            "root descriptor differs from startup source/configuration/Rules declarations",
-        )?;
-        require(
-            ceilings.resource_plan == manifest.resources
-                && ceilings.registered_max_chess_plies == search.registered_max_chess_plies
-                && ceilings.cpu_credit_limit == coordinator.cpu_credit_limit
-                && ceilings.questions_max == coordinator.questions_max
-                && ceilings.ancestor_depth_max == coordinator.ancestor_depth_max
-                && ceilings.waiting_jobs_max == coordinator.waiting_jobs_max
-                && ceilings.role_tickets_max == coordinator.role_tickets_max
-                && ceilings.wall_time_max_ms == manifest.wall_time_max_ms
-                && ceilings.cleanup_max_ms == manifest.cleanup_max_ms
-                && ceilings.output_bytes_max == manifest.output_bytes_max,
-            "root descriptor changes an original declared ceiling or resource plan",
-        )?;
-        if input.policy == RoventRootAdmissionPolicy::ExactRegistered {
-            require(
-                input.state_and_history_sha256 == search.root_state_and_history_sha256
-                    && input.original_go.requested_nodes == search.requested_nodes
-                    && input.original_go.depth_plies == search.depth_plies
-                    && input.original_go.mate_moves == search.mate_moves
-                    && same_optional_move_set(
-                        input.original_go.searchmoves.as_deref(),
-                        search.searchmoves.as_deref(),
-                    ),
-                "root descriptor differs from the exact registered workload",
-            )?;
-        }
-        // DynamicGo intentionally inherits only startup source/assets/runtime,
-        // resources and profiles via the exact lock, never its workload label.
-        Ok(())
+        verify_declarations(
+            &self.input,
+            &lock.canonical_sha256,
+            &manifest.engine.search,
+            &manifest.coordinator,
+            &manifest.resources,
+            manifest.wall_time_max_ms,
+            manifest.cleanup_max_ms,
+            manifest.output_bytes_max,
+        )
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
@@ -248,7 +223,175 @@ impl RoventRootDescriptor {
     }
 }
 
+/// A distinct /2 wire domain for declarations joined to a typed /2 lock.
+/// It is metadata only and cannot grant a live root or observation authority.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventRootDescriptorV2 {
+    pub domain: String,
+    pub startup_lock_domain: String,
+    pub input: RoventRootDescriptorInput,
+    pub root_budget_sha256: String,
+    pub deadline_seal_sha256: String,
+}
+
+impl RoventRootDescriptorV2 {
+    pub fn seal(
+        input: RoventRootDescriptorInput,
+        lock: &RoventInputLockV2,
+    ) -> Result<Self, ManifestError> {
+        let (root_budget_sha256, deadline_seal_sha256) = seals_for(
+            &input,
+            ROVENT_ROOT_BUDGET_V2_DOMAIN,
+            ROVENT_ROOT_DEADLINE_V2_DOMAIN,
+        )?;
+        let value = Self {
+            domain: ROVENT_ROOT_ADMISSION_V2_DOMAIN.into(),
+            startup_lock_domain: crate::ROVENT_LOCK_V2_DOMAIN.into(),
+            input,
+            root_budget_sha256,
+            deadline_seal_sha256,
+        };
+        value.verify_against(lock)?;
+        canonical(&value)?;
+        Ok(value)
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        require(
+            input.len() <= MAX_DESCRIPTOR_BYTES,
+            "root descriptor input exceeds 64 KiB",
+        )?;
+        let value: Self = crate::decode_json(input)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        require(
+            self.domain == ROVENT_ROOT_ADMISSION_V2_DOMAIN
+                && self.startup_lock_domain == crate::ROVENT_LOCK_V2_DOMAIN
+                && sha(&self.root_budget_sha256)
+                && sha(&self.deadline_seal_sha256),
+            "root /2 descriptor domain or seal syntax differs",
+        )?;
+        let (budget, deadline) = seals_for(
+            &self.input,
+            ROVENT_ROOT_BUDGET_V2_DOMAIN,
+            ROVENT_ROOT_DEADLINE_V2_DOMAIN,
+        )?;
+        require(
+            budget == self.root_budget_sha256 && deadline == self.deadline_seal_sha256,
+            "root /2 descriptor seals differ from their canonical inputs",
+        )?;
+        canonical(self)?;
+        Ok(())
+    }
+
+    /// Compares declarations only. The caller must separately preserve and
+    /// validate the real owner, Rules state, clock and revocation gate.
+    pub fn verify_against(&self, lock: &RoventInputLockV2) -> Result<(), ManifestError> {
+        lock.validate()?;
+        self.validate()?;
+        let manifest = &lock.manifest;
+        verify_declarations(
+            &self.input,
+            &lock.canonical_sha256,
+            &manifest.engine.search,
+            &manifest.coordinator,
+            &manifest.resources,
+            manifest.wall_time_max_ms,
+            manifest.cleanup_max_ms,
+            manifest.output_bytes_max,
+        )
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
+        canonical(self)
+    }
+
+    pub fn digest(&self) -> Result<Digest, ManifestError> {
+        Ok(domain_hash(
+            ROVENT_ROOT_ADMISSION_V2_DOMAIN,
+            &self.canonical_bytes()?,
+        ))
+    }
+
+    pub fn root_budget_digest(&self) -> Result<Digest, ManifestError> {
+        self.validate()?;
+        parse_digest(&self.root_budget_sha256)
+    }
+
+    pub fn deadline_seal_digest(&self) -> Result<Digest, ManifestError> {
+        self.validate()?;
+        parse_digest(&self.deadline_seal_sha256)
+    }
+}
+
+fn verify_declarations(
+    input: &RoventRootDescriptorInput,
+    canonical_sha256: &str,
+    search: &RoventSearchDeclaration,
+    coordinator: &RoventCoordinatorDeclaration,
+    resources: &RoventResourcePlan,
+    wall_time_max_ms: u64,
+    cleanup_max_ms: u64,
+    output_bytes_max: u64,
+) -> Result<(), ManifestError> {
+    let ceilings = &input.declared_ceilings;
+    require(
+        input.startup_lock_sha256 == canonical_sha256
+            && input.node_unit == search.node_unit
+            && input.search_configuration_sha256 == search.search_configuration_sha256
+            && input.coordinator_policy_sha256 == coordinator.policy_sha256
+            && input.rules_profile_sha256 == search.rules_profile_sha256,
+        "root descriptor differs from startup source/configuration/Rules declarations",
+    )?;
+    require(
+        ceilings.resource_plan == *resources
+            && ceilings.registered_max_chess_plies == search.registered_max_chess_plies
+            && ceilings.cpu_credit_limit == coordinator.cpu_credit_limit
+            && ceilings.questions_max == coordinator.questions_max
+            && ceilings.ancestor_depth_max == coordinator.ancestor_depth_max
+            && ceilings.waiting_jobs_max == coordinator.waiting_jobs_max
+            && ceilings.role_tickets_max == coordinator.role_tickets_max
+            && ceilings.wall_time_max_ms == wall_time_max_ms
+            && ceilings.cleanup_max_ms == cleanup_max_ms
+            && ceilings.output_bytes_max == output_bytes_max,
+        "root descriptor changes an original declared ceiling or resource plan",
+    )?;
+    if input.policy == RoventRootAdmissionPolicy::ExactRegistered {
+        require(
+            input.state_and_history_sha256 == search.root_state_and_history_sha256
+                && input.original_go.requested_nodes == search.requested_nodes
+                && input.original_go.depth_plies == search.depth_plies
+                && input.original_go.mate_moves == search.mate_moves
+                && same_optional_move_set(
+                    input.original_go.searchmoves.as_deref(),
+                    search.searchmoves.as_deref(),
+                ),
+            "root descriptor differs from the exact registered workload",
+        )?;
+    }
+    // DynamicGo intentionally inherits only startup source/assets/runtime,
+    // resources and profiles via the exact lock, never its workload label.
+    Ok(())
+}
+
 fn seals(input: &RoventRootDescriptorInput) -> Result<(String, String), ManifestError> {
+    seals_for(
+        input,
+        ROVENT_ROOT_BUDGET_DOMAIN,
+        ROVENT_ROOT_DEADLINE_DOMAIN,
+    )
+}
+
+fn seals_for(
+    input: &RoventRootDescriptorInput,
+    budget_domain: &str,
+    deadline_domain: &str,
+) -> Result<(String, String), ManifestError> {
     validate_input(input)?;
     // Serialize once within the byte bound before constructing a Value. Clock
     // is the only excluded input: raw go and every declared ceiling stay bound.
@@ -258,9 +401,9 @@ fn seals(input: &RoventRootDescriptorInput) -> Result<(String, String), Manifest
         .as_object_mut()
         .ok_or_else(|| integrity("root input is not an object"))?
         .remove("clock");
-    let budget = hex(domain_hash(ROVENT_ROOT_BUDGET_DOMAIN, &canonical(&stable)?));
+    let budget = hex(domain_hash(budget_domain, &canonical(&stable)?));
     let deadline = json!({
-        "domain": ROVENT_ROOT_DEADLINE_DOMAIN,
+        "domain": deadline_domain,
         "startup_lock_sha256": input.startup_lock_sha256,
         "policy": input.policy,
         "authority": input.authority,
@@ -268,10 +411,7 @@ fn seals(input: &RoventRootDescriptorInput) -> Result<(String, String), Manifest
         "clock": input.clock,
         "cleanup_max_ms": input.declared_ceilings.cleanup_max_ms,
     });
-    let deadline = hex(domain_hash(
-        ROVENT_ROOT_DEADLINE_DOMAIN,
-        &canonical(&deadline)?,
-    ));
+    let deadline = hex(domain_hash(deadline_domain, &canonical(&deadline)?));
     Ok((budget, deadline))
 }
 

@@ -48,6 +48,66 @@ fn lock() -> RoventInputLock {
         .unwrap()
 }
 
+fn lock_v2(base: &RoventInputLock) -> RoventInputLockV2 {
+    let mut wire = serde_json::to_value(&base.manifest).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.insert("domain".into(), json!(crate::ROVENT_EXECUTION_V2_DOMAIN));
+    object.insert("startup_document".into(), artifact("startup"));
+    object.insert("startup_configuration_sha256".into(), json!(sha_value('4')));
+    object.insert(
+        "startup_search_configuration_sha256".into(),
+        json!(base.manifest.engine.search.search_configuration_sha256),
+    );
+    object.insert(
+        "own_r_root_tie".into(),
+        json!({"kind":"not_applicable", "reason":"pc_only"}),
+    );
+    crate::RoventExecutionManifestV2::from_json(&wire.to_string())
+        .unwrap()
+        .lock()
+        .unwrap()
+}
+
+#[test]
+fn v2_descriptor_has_distinct_wire_and_joins_only_exact_v2_lock() {
+    let old = lock();
+    let old_descriptor = RoventRootDescriptor::seal(input(&old)).unwrap();
+    let old_bytes = old_descriptor.canonical_bytes().unwrap();
+    let old_digest = old_descriptor.digest().unwrap();
+    let new_lock = lock_v2(&old);
+    let mut new_input = input(&old);
+    new_input.startup_lock_sha256 = new_lock.canonical_sha256.clone();
+    let new_descriptor = RoventRootDescriptorV2::seal(new_input, &new_lock).unwrap();
+    let wire = new_descriptor.canonical_bytes().unwrap();
+    let text = std::str::from_utf8(&wire).unwrap();
+    assert!(RoventRootDescriptor::from_json(text).is_err());
+    assert!(RoventRootDescriptorV2::from_json(std::str::from_utf8(&old_bytes).unwrap()).is_err());
+    assert_eq!(
+        RoventRootDescriptorV2::from_json(text).unwrap(),
+        new_descriptor
+    );
+    assert!(new_descriptor.verify_against(&new_lock).is_ok());
+    let mut other = new_lock.clone();
+    other.manifest.run_id.push_str("-other");
+    other = other.manifest.lock().unwrap();
+    assert!(new_descriptor.verify_against(&other).is_err());
+    let mut bad = new_descriptor.clone();
+    bad.startup_lock_domain = crate::ROVENT_LOCK_DOMAIN.into();
+    assert!(bad.validate().is_err());
+    let mut bad_input = new_descriptor.input.clone();
+    bad_input.search_configuration_sha256 = sha_value('9');
+    assert!(RoventRootDescriptorV2::seal(bad_input, &new_lock).is_err());
+    let mut bad_input = new_descriptor.input.clone();
+    bad_input.declared_ceilings.output_bytes_max += 1;
+    assert!(RoventRootDescriptorV2::seal(bad_input, &new_lock).is_err());
+    let mut bad_input = new_descriptor.input.clone();
+    bad_input.clock.hard.clock_epoch += 1;
+    assert!(RoventRootDescriptorV2::seal(bad_input, &new_lock).is_err());
+    assert_eq!(old_descriptor.canonical_bytes().unwrap(), old_bytes);
+    assert_eq!(old_descriptor.digest().unwrap(), old_digest);
+    old_descriptor.verify_against(&old).unwrap();
+}
+
 fn input(lock: &RoventInputLock) -> RoventRootDescriptorInput {
     let manifest = &lock.manifest;
     let coordinator = &manifest.coordinator;

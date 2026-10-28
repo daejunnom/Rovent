@@ -6,7 +6,8 @@
 //! the output allocation boundary into an observed bestmove completion time.
 
 use crate::{
-    ManifestError, RoventInputLock, RoventRootAuthority, RoventRootDeadline, RoventRootDescriptor,
+    ManifestError, RoventInputLock, RoventInputLockV2, RoventRootAuthority, RoventRootDeadline,
+    RoventRootDescriptor, RoventRootDescriptorInput, RoventRootDescriptorV2,
 };
 use rz_contracts::Digest;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 pub const ROVENT_ROOT_ALLOCATION_CLOCK_DOMAIN: &str = "rz-rovent-root-allocation-clock/1";
+pub const ROVENT_ROOT_ALLOCATION_CLOCK_V2_DOMAIN: &str = "rz-rovent-root-allocation-clock/2";
 pub const MAX_ROOT_ALLOCATION_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -37,6 +39,88 @@ pub struct RoventRootAllocationInput {
 pub struct RoventRootAllocationClock {
     pub domain: String,
     pub input: RoventRootAllocationInput,
+}
+
+/// Separate /2 wire, joined only to the exact typed /2 declarations.
+/// No live clock, process observation, or root authority is produced.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventRootAllocationClockV2 {
+    pub domain: String,
+    pub startup_lock_domain: String,
+    pub input: RoventRootAllocationInput,
+}
+
+impl RoventRootAllocationClockV2 {
+    pub fn seal(
+        input: RoventRootAllocationInput,
+        descriptor: &RoventRootDescriptorV2,
+        lock: &RoventInputLockV2,
+    ) -> Result<Self, ManifestError> {
+        let value = Self {
+            domain: ROVENT_ROOT_ALLOCATION_CLOCK_V2_DOMAIN.into(),
+            startup_lock_domain: crate::ROVENT_LOCK_V2_DOMAIN.into(),
+            input,
+        };
+        value.verify_against(descriptor, lock)?;
+        Ok(value)
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        require(
+            input.len() <= MAX_ROOT_ALLOCATION_BYTES,
+            "allocation-clock JSON exceeds 4 KiB",
+        )?;
+        let value: Self = crate::decode_json(input)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        require(
+            self.startup_lock_domain == crate::ROVENT_LOCK_V2_DOMAIN,
+            "allocation-clock /2 lock domain differs",
+        )?;
+        validate_body(
+            &self.input,
+            &self.domain,
+            ROVENT_ROOT_ALLOCATION_CLOCK_V2_DOMAIN,
+        )?;
+        require(
+            canonical(self)?.len() <= MAX_ROOT_ALLOCATION_BYTES,
+            "allocation-clock canonical JSON exceeds 4 KiB",
+        )
+    }
+
+    pub fn verify_against(
+        &self,
+        descriptor: &RoventRootDescriptorV2,
+        lock: &RoventInputLockV2,
+    ) -> Result<(), ManifestError> {
+        descriptor.verify_against(lock)?;
+        self.validate()?;
+        verify_join(
+            &self.input,
+            &descriptor.input,
+            descriptor.digest()?,
+            &lock.canonical_sha256,
+            lock.manifest.wall_time_max_ms,
+            lock.manifest.cleanup_max_ms,
+        )
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
+        canonical(self)
+    }
+
+    pub fn digest(&self) -> Result<Digest, ManifestError> {
+        let mut hash = Sha256::new();
+        hash.update(ROVENT_ROOT_ALLOCATION_CLOCK_V2_DOMAIN.as_bytes());
+        hash.update([0]);
+        hash.update(self.canonical_bytes()?);
+        Ok(Digest(hash.finalize().into()))
+    }
 }
 
 impl RoventRootAllocationClock {
@@ -69,38 +153,11 @@ impl RoventRootAllocationClock {
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
-        let input = &self.input;
-        require(
-            self.domain == ROVENT_ROOT_ALLOCATION_CLOCK_DOMAIN
-                && sha(&input.root_descriptor_sha256)
-                && sha(&input.startup_lock_sha256)
-                && sha(&input.authority.implementation_sha256)
-                && input.authority.epoch != 0,
-            "allocation-clock domain, source or authority declaration differs",
+        validate_body(
+            &self.input,
+            &self.domain,
+            ROVENT_ROOT_ALLOCATION_CLOCK_DOMAIN,
         )?;
-        require(
-            input.start.clock_epoch == input.authority.epoch
-                && input.output.clock_epoch == input.authority.epoch
-                && input.start.at_ns <= input.output.at_ns,
-            "allocation start/output domains or order differ",
-        )?;
-        require(
-            (1..=86_400_000).contains(&input.wall_time_max_ms)
-                && (1..=30_000).contains(&input.cleanup_max_ms),
-            "allocation-clock declared wall/cleanup ceilings are outside bounds",
-        )?;
-        let wall_ns = checked_ns(input.wall_time_max_ms, "wall ceiling overflows nanoseconds")?;
-        checked_ns(
-            input.cleanup_max_ms,
-            "cleanup ceiling overflows nanoseconds",
-        )?;
-        require(
-            input.output.at_ns.checked_sub(input.start.at_ns) == Some(input.allocation_ns)
-                && input.allocation_ns <= wall_ns,
-            "allocation differs from original output minus start or exceeds wall ceiling",
-        )?;
-        // Every string and scalar is already bounded, so Value construction
-        // cannot grow an unbounded caller-supplied collection or opaque body.
         require(
             canonical(self)?.len() <= MAX_ROOT_ALLOCATION_BYTES,
             "allocation-clock canonical JSON exceeds 4 KiB",
@@ -116,52 +173,13 @@ impl RoventRootAllocationClock {
     ) -> Result<(), ManifestError> {
         descriptor.verify_against(lock)?;
         self.validate()?;
-        let input = &self.input;
-        let original = &descriptor.input;
-        require(
-            input.root_descriptor_sha256 == hex(descriptor.digest()?)
-                && input.startup_lock_sha256 == lock.canonical_sha256
-                && input.startup_lock_sha256 == original.startup_lock_sha256
-                && input.authority == original.authority,
-            "allocation-clock does not join its original descriptor, startup and authority",
-        )?;
-        require(
-            input.wall_time_max_ms == lock.manifest.wall_time_max_ms
-                && input.wall_time_max_ms == original.declared_ceilings.wall_time_max_ms
-                && input.cleanup_max_ms == lock.manifest.cleanup_max_ms
-                && input.cleanup_max_ms == original.declared_ceilings.cleanup_max_ms,
-            "allocation-clock changes an original wall/cleanup ceiling",
-        )?;
-        let clock = &original.clock;
-        require(
-            [
-                input.start,
-                clock.soft,
-                clock.admission,
-                clock.hard,
-                input.output,
-                clock.cleanup,
-            ]
-            .into_iter()
-            .all(|tick| tick.clock_epoch == input.authority.epoch)
-                && input.start.at_ns <= clock.soft.at_ns
-                && clock.soft.at_ns <= clock.admission.at_ns
-                && clock.admission.at_ns <= clock.hard.at_ns
-                && clock.hard.at_ns <= input.output.at_ns
-                && input.output.at_ns <= clock.cleanup.at_ns,
-            "allocation-clock original start/soft/admission/hard/output/cleanup order differs",
-        )?;
-        let cleanup_ns = checked_ns(
-            input.cleanup_max_ms,
-            "cleanup ceiling overflows nanoseconds",
-        )?;
-        require(
-            clock
-                .cleanup
-                .at_ns
-                .checked_sub(clock.hard.at_ns)
-                .is_some_and(|duration| duration <= cleanup_ns),
-            "allocation-clock cleanup exceeds its original declared ceiling",
+        verify_join(
+            &self.input,
+            &descriptor.input,
+            descriptor.digest()?,
+            &lock.canonical_sha256,
+            lock.manifest.wall_time_max_ms,
+            lock.manifest.cleanup_max_ms,
         )
     }
 
@@ -177,6 +195,98 @@ impl RoventRootAllocationClock {
         hash.update(self.canonical_bytes()?);
         Ok(Digest(hash.finalize().into()))
     }
+}
+
+fn validate_body(
+    input: &RoventRootAllocationInput,
+    domain: &str,
+    expected_domain: &str,
+) -> Result<(), ManifestError> {
+    require(
+        domain == expected_domain
+            && sha(&input.root_descriptor_sha256)
+            && sha(&input.startup_lock_sha256)
+            && sha(&input.authority.implementation_sha256)
+            && input.authority.epoch != 0,
+        "allocation-clock domain, source or authority declaration differs",
+    )?;
+    require(
+        input.start.clock_epoch == input.authority.epoch
+            && input.output.clock_epoch == input.authority.epoch
+            && input.start.at_ns <= input.output.at_ns,
+        "allocation start/output domains or order differ",
+    )?;
+    require(
+        (1..=86_400_000).contains(&input.wall_time_max_ms)
+            && (1..=30_000).contains(&input.cleanup_max_ms),
+        "allocation-clock declared wall/cleanup ceilings are outside bounds",
+    )?;
+    let wall_ns = checked_ns(input.wall_time_max_ms, "wall ceiling overflows nanoseconds")?;
+    checked_ns(
+        input.cleanup_max_ms,
+        "cleanup ceiling overflows nanoseconds",
+    )?;
+    require(
+        input.output.at_ns.checked_sub(input.start.at_ns) == Some(input.allocation_ns)
+            && input.allocation_ns <= wall_ns,
+        "allocation differs from original output minus start or exceeds wall ceiling",
+    )?;
+    Ok(())
+}
+
+fn verify_join(
+    input: &RoventRootAllocationInput,
+    original: &RoventRootDescriptorInput,
+    descriptor_digest: Digest,
+    lock_digest: &str,
+    wall_time_max_ms: u64,
+    cleanup_max_ms: u64,
+) -> Result<(), ManifestError> {
+    require(
+        input.root_descriptor_sha256 == hex(descriptor_digest)
+            && input.startup_lock_sha256 == lock_digest
+            && input.startup_lock_sha256 == original.startup_lock_sha256
+            && input.authority == original.authority,
+        "allocation-clock does not join its original descriptor, startup and authority",
+    )?;
+    require(
+        input.wall_time_max_ms == wall_time_max_ms
+            && input.wall_time_max_ms == original.declared_ceilings.wall_time_max_ms
+            && input.cleanup_max_ms == cleanup_max_ms
+            && input.cleanup_max_ms == original.declared_ceilings.cleanup_max_ms,
+        "allocation-clock changes an original wall/cleanup ceiling",
+    )?;
+    let clock = &original.clock;
+    require(
+        [
+            input.start,
+            clock.soft,
+            clock.admission,
+            clock.hard,
+            input.output,
+            clock.cleanup,
+        ]
+        .into_iter()
+        .all(|tick| tick.clock_epoch == input.authority.epoch)
+            && input.start.at_ns <= clock.soft.at_ns
+            && clock.soft.at_ns <= clock.admission.at_ns
+            && clock.admission.at_ns <= clock.hard.at_ns
+            && clock.hard.at_ns <= input.output.at_ns
+            && input.output.at_ns <= clock.cleanup.at_ns,
+        "allocation-clock original start/soft/admission/hard/output/cleanup order differs",
+    )?;
+    let cleanup_ns = checked_ns(
+        input.cleanup_max_ms,
+        "cleanup ceiling overflows nanoseconds",
+    )?;
+    require(
+        clock
+            .cleanup
+            .at_ns
+            .checked_sub(clock.hard.at_ns)
+            .is_some_and(|duration| duration <= cleanup_ns),
+        "allocation-clock cleanup exceeds its original declared ceiling",
+    )
 }
 
 fn checked_ns(milliseconds: u64, message: &str) -> Result<u64, ManifestError> {

@@ -142,6 +142,65 @@ fn tick(at_ns: u64) -> RoventRootDeadline {
     }
 }
 
+#[test]
+fn v2_allocation_rejects_old_wire_and_joins_exact_v2_descriptor_and_lock() {
+    let (old_lock, old_descriptor, mut input) = fixture();
+    let old = RoventRootAllocationClock::seal(input.clone(), &old_descriptor, &old_lock).unwrap();
+    let old_bytes = old.canonical_bytes().unwrap();
+    let mut wire = serde_json::to_value(&old_lock.manifest).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.insert("domain".into(), json!(crate::ROVENT_EXECUTION_V2_DOMAIN));
+    object.insert("startup_document".into(), artifact("startup"));
+    object.insert("startup_configuration_sha256".into(), json!(sha_value('4')));
+    object.insert(
+        "startup_search_configuration_sha256".into(),
+        json!(old_lock.manifest.engine.search.search_configuration_sha256),
+    );
+    object.insert(
+        "own_r_root_tie".into(),
+        json!({"kind":"not_applicable", "reason":"pc_only"}),
+    );
+    let lock = crate::RoventExecutionManifestV2::from_json(&wire.to_string())
+        .unwrap()
+        .lock()
+        .unwrap();
+    let mut descriptor_input = old_descriptor.input.clone();
+    descriptor_input.startup_lock_sha256 = lock.canonical_sha256.clone();
+    let descriptor = RoventRootDescriptorV2::seal(descriptor_input, &lock).unwrap();
+    input.startup_lock_sha256 = lock.canonical_sha256.clone();
+    input.root_descriptor_sha256 = digest_hex(descriptor.digest().unwrap());
+    let allocation = RoventRootAllocationClockV2::seal(input, &descriptor, &lock).unwrap();
+    let encoded = allocation.canonical_bytes().unwrap();
+    let text = std::str::from_utf8(&encoded).unwrap();
+    assert!(RoventRootAllocationClock::from_json(text).is_err());
+    assert!(
+        RoventRootAllocationClockV2::from_json(std::str::from_utf8(&old_bytes).unwrap()).is_err()
+    );
+    assert_eq!(
+        RoventRootAllocationClockV2::from_json(text).unwrap(),
+        allocation
+    );
+    allocation.verify_against(&descriptor, &lock).unwrap();
+    let mut bad = allocation.clone();
+    bad.input.root_descriptor_sha256 = sha_value('9');
+    assert!(bad.verify_against(&descriptor, &lock).is_err());
+    let mut bad = allocation.clone();
+    bad.input.authority.root += 1;
+    assert!(bad.verify_against(&descriptor, &lock).is_err());
+    let mut bad = allocation.clone();
+    bad.input.cleanup_max_ms += 1;
+    assert!(bad.verify_against(&descriptor, &lock).is_err());
+    let mut bad = allocation.clone();
+    bad.input.start.clock_epoch += 1;
+    assert!(bad.verify_against(&descriptor, &lock).is_err());
+    let mut other = lock.clone();
+    other.manifest.run_id.push_str("-other");
+    other = other.manifest.lock().unwrap();
+    assert!(allocation.verify_against(&descriptor, &other).is_err());
+    assert_eq!(old.canonical_bytes().unwrap(), old_bytes);
+    old.verify_against(&old_descriptor, &old_lock).unwrap();
+}
+
 fn wrapper(input: RoventRootAllocationInput) -> RoventRootAllocationClock {
     RoventRootAllocationClock {
         domain: ROVENT_ROOT_ALLOCATION_CLOCK_DOMAIN.into(),

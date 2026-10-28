@@ -59,6 +59,90 @@ fn input_lock(position: &Position) -> RoventInputLock {
         .unwrap()
 }
 
+fn input_lock_v2(position: &Position) -> rz_experiments::RoventOriginalInputLock {
+    let base = input_lock(position);
+    let mut wire = serde_json::to_value(&base.manifest).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.insert(
+        "domain".into(),
+        json!(rz_experiments::ROVENT_EXECUTION_V2_DOMAIN),
+    );
+    object.insert("startup_document".into(), artifact("startup-v4"));
+    object.insert("startup_configuration_sha256".into(), json!("4".repeat(64)));
+    object.insert(
+        "startup_search_configuration_sha256".into(),
+        json!(base.manifest.engine.search.search_configuration_sha256),
+    );
+    object.insert(
+        "own_r_root_tie".into(),
+        json!({"kind":"not_applicable", "reason":"pc_only"}),
+    );
+    let lock = rz_experiments::RoventExecutionManifestV2::from_json(&wire.to_string())
+        .unwrap()
+        .lock()
+        .unwrap();
+    rz_experiments::RoventOriginalInputLock::from_v2(Arc::new(lock)).unwrap()
+}
+
+#[test]
+fn v2_prepared_source_uses_actual_start_and_preserves_original_owner_without_live_authority() {
+    let position = Position::startpos();
+    let clock = ProcessClock::new(ProcessEpoch(7500));
+    let context = context(&clock, false);
+    let owner = input_lock_v2(&position);
+    let prepared = PreparedSourceV2::prepare(
+        &owner,
+        RoventRootAdmissionPolicy::DynamicGo,
+        &position,
+        &context,
+        &clock,
+    )
+    .unwrap();
+    assert!(prepared.owner().same_original_owner(&owner));
+    assert_eq!(
+        prepared.descriptor().input.startup_lock_sha256,
+        owner.v2().unwrap().canonical_sha256
+    );
+    assert_eq!(
+        prepared.descriptor().input.allowed_root_moves,
+        position
+            .ordered_legal_moves()
+            .moves()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    prepared
+        .allocation_clock()
+        .verify_against(prepared.descriptor(), owner.v2().unwrap())
+        .unwrap();
+    let mut invalid = context.clone();
+    Arc::make_mut(invalid.original_go.as_mut().unwrap()).nodes = Some(8);
+    let error = PreparedSourceV2::prepare(
+        &owner,
+        RoventRootAdmissionPolicy::DynamicGo,
+        &position,
+        &invalid,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, RoventRootAdmissionFailure::OriginalGoMismatch);
+    let v1 =
+        rz_experiments::RoventOriginalInputLock::from_v1(Arc::new(input_lock(&position))).unwrap();
+    assert_eq!(
+        PreparedSourceV2::prepare(
+            &v1,
+            RoventRootAdmissionPolicy::DynamicGo,
+            &position,
+            &context,
+            &clock
+        )
+        .unwrap_err()
+        .kind,
+        RoventRootAdmissionFailure::InvalidLock
+    );
+}
+
 fn context(clock: &ProcessClock, expired: bool) -> SearchSessionContext {
     let authority = SearchAuthority {
         epoch: clock.epoch(),
