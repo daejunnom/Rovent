@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
 
+mod v2;
+pub use v2::*;
+
 pub const ROVENT_EXECUTION_DOMAIN: &str = "rz-rovent-execution/1";
 pub const ROVENT_LOCK_DOMAIN: &str = "rz-rovent-input-lock/1";
 pub const ROVENT_RECEIPT_DOMAIN: &str = "rz-rovent-execution-receipt/1";

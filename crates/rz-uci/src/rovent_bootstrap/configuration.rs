@@ -3,6 +3,7 @@
 
 pub mod v2;
 pub mod v3;
+pub mod v4;
 
 use super::{fail, hex};
 use crate::pals_adaptive::{
@@ -50,6 +51,7 @@ pub enum StartupConfigurationDocument {
     V1(RoventStartupConfiguration),
     V2(v2::RoventStartupConfigurationV2),
     V3(v3::RoventStartupConfigurationV3),
+    V4(v4::RoventStartupConfigurationV4),
 }
 impl StartupConfigurationDocument {
     pub fn from_json(bytes: &[u8]) -> Result<Self, BackendError> {
@@ -72,6 +74,9 @@ impl StartupConfigurationDocument {
             v3::ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN => {
                 v3::RoventStartupConfigurationV3::from_json(bytes).map(Self::V3)
             }
+            v4::ROVENT_STARTUP_CONFIGURATION_V4_DOMAIN => {
+                v4::RoventStartupConfigurationV4::from_json(bytes).map(Self::V4)
+            }
             _ => Err(invalid("startup configuration version domain")),
         }
     }
@@ -80,6 +85,7 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.fields(),
             Self::V2(config) => config.fields(),
             Self::V3(config) => config.fields(),
+            Self::V4(config) => config.fields(),
         }
     }
     pub fn validate(&self) -> Result<(), BackendError> {
@@ -87,6 +93,7 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.validate(),
             Self::V2(config) => config.validate(),
             Self::V3(config) => config.validate(),
+            Self::V4(config) => config.validate(),
         }
     }
     pub fn admit_against(&self, lock: &RoventInputLock) -> Result<(), BackendError> {
@@ -94,6 +101,11 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.admit_against(lock),
             Self::V2(config) => config.admit_against(lock),
             Self::V3(config) => config.admit_against(lock),
+            // /4 requires a distinct policy-aware lock and receipt. A /1 lock
+            // cannot attest the new policy even if common fields match.
+            Self::V4(_) => Err(invalid(
+                "startup configuration /4 requires policy-aware lock",
+            )),
         }
     }
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, BackendError> {
@@ -101,6 +113,7 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.canonical_bytes(),
             Self::V2(config) => config.canonical_bytes(),
             Self::V3(config) => config.canonical_bytes(),
+            Self::V4(config) => config.canonical_bytes(),
         }
     }
     pub fn configuration_digest(&self) -> Result<[u8; 32], BackendError> {
@@ -108,6 +121,7 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.configuration_digest(),
             Self::V2(config) => config.configuration_digest(),
             Self::V3(config) => config.configuration_digest(),
+            Self::V4(config) => config.configuration_digest(),
         }
     }
     pub fn search_configuration_digest(&self) -> Result<[u8; 32], BackendError> {
@@ -115,6 +129,7 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.search_configuration_digest(),
             Self::V2(config) => config.search_configuration_digest(),
             Self::V3(config) => config.search_configuration_digest(),
+            Self::V4(config) => config.search_configuration_digest(),
         }
     }
     pub fn nnuec_conditions_digest(&self) -> Result<Option<[u8; 32]>, BackendError> {
@@ -122,6 +137,7 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.nnuec_search_conditions_digest(),
             Self::V2(config) => config.nnuec_search_conditions_digest(),
             Self::V3(config) => config.nnuec_search_conditions_digest(),
+            Self::V4(config) => config.nnuec_search_conditions_digest(),
         }
     }
     pub fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
@@ -129,6 +145,23 @@ impl StartupConfigurationDocument {
             Self::V1(config) => config.require_supported_native_capabilities(),
             Self::V2(config) => config.require_supported_native_capabilities(),
             Self::V3(config) => config.require_supported_native_capabilities(),
+            Self::V4(config) => config.require_supported_native_capabilities(),
+        }
+    }
+    /// The historical versions declare the historical own-R policy. /4
+    /// explicitly selects it; this is a declaration, not an owner readback.
+    pub fn own_r_root_tie_policy(
+        &self,
+    ) -> Result<Option<rz_search::cpu::CpuRootTiePolicy>, BackendError> {
+        self.validate()?;
+        match self {
+            Self::V4(config) => config.own_r_root_tie_policy(),
+            Self::V1(_) | Self::V2(_) | Self::V3(_) => Ok(match self.fields().execution {
+                ExecutionConfiguration::OwnResearcher { .. } => {
+                    Some(rz_search::cpu::CpuRootTiePolicy::LegacyFirstSearched)
+                }
+                _ => None,
+            }),
         }
     }
     /// Legacy PC and PCR keep their separately established policy choices.
@@ -143,6 +176,7 @@ impl StartupConfigurationDocument {
             },
             Self::V2(config) => config.post_repair_policy(),
             Self::V3(config) => config.post_repair_policy(),
+            Self::V4(config) => config.post_repair_policy(),
         }
     }
     /// Legacy external declarations carry no explicit query selection. They
@@ -150,6 +184,7 @@ impl StartupConfigurationDocument {
     pub fn external_question_limit(&self) -> Result<Option<ExternalGoConstraint>, BackendError> {
         match self {
             Self::V3(config) => config.external_question_limit(),
+            Self::V4(config) => config.external_question_limit(),
             Self::V1(_) | Self::V2(_) => {
                 self.validate()?;
                 if matches!(

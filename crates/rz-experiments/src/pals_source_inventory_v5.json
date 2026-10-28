@@ -462,6 +462,7 @@
       "crates/rz-uci/src/rovent_bootstrap/configuration.rs",
       "crates/rz-uci/src/rovent_bootstrap/configuration/v2.rs",
       "crates/rz-uci/src/rovent_bootstrap/configuration/v3.rs",
+      "crates/rz-uci/src/rovent_bootstrap/configuration/v4.rs",
       "crates/rz-uci/src/rovent_bootstrap/external_session.rs",
       "crates/rz-uci/src/rovent_bootstrap/launch.rs",
       "crates/rz-uci/src/rovent_bootstrap/launch/cohort_prepare.rs",
@@ -525,6 +526,7 @@
       "crates/rz-experiments/src/pals_startup_v5/content_admission/numerical_scope.rs",
       "crates/rz-experiments/src/pals_startup_v5/content_admission/owned_files.rs",
       "crates/rz-experiments/src/rovent_manifest.rs",
+      "crates/rz-experiments/src/rovent_manifest/v2.rs",
       "crates/rz-experiments/src/rovent_storage.rs",
       "crates/rz-experiments/src/rovent_root_descriptor.rs",
       "crates/rz-uci/examples/rovent_startup_metadata.rs"
@@ -579,6 +581,7 @@
       "crates/rz-uci/src/pals_native/virtual_selected_input.rs",
       "crates/rz-uci/src/rovent_bootstrap.rs",
       "crates/rz-uci/src/rovent_bootstrap/configuration/v3.rs",
+      "crates/rz-uci/src/rovent_bootstrap/configuration/v4.rs",
       "crates/rz-uci/src/rovent_bootstrap/external_session.rs",
       "crates/rz-uci/src/rovent_bootstrap/launch.rs",
       "crates/rz-uci/src/rovent_bootstrap/launch/cohort_prepare.rs",

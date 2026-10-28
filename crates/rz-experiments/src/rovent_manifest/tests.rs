@@ -292,6 +292,283 @@ fn strict_new_domain_and_lock_do_not_convert_legacy_or_tampered_input() {
     assert!(lock.validate().is_err());
 }
 
+fn policy_manifest_v2(
+    base: RoventExecutionManifest,
+    tie: RoventRootTieDeclarationV2,
+) -> RoventExecutionManifestV2 {
+    let search_digest = base.engine.search.search_configuration_sha256.clone();
+    RoventExecutionManifestV2 {
+        domain: ROVENT_EXECUTION_V2_DOMAIN.into(),
+        contract_revision: base.contract_revision,
+        run_id: base.run_id,
+        purpose: base.purpose,
+        engine: base.engine,
+        resources: base.resources,
+        coordinator: base.coordinator,
+        wall_time_max_ms: base.wall_time_max_ms,
+        cleanup_max_ms: base.cleanup_max_ms,
+        output_bytes_max: base.output_bytes_max,
+        agent_renewable: base.agent_renewable,
+        provenance: base.provenance,
+        startup_document: artifact("startup-v4.json"),
+        startup_configuration_sha256: sha_value('4'),
+        startup_search_configuration_sha256: search_digest,
+        own_r_root_tie: tie,
+    }
+}
+
+#[test]
+fn policy_v2_domains_lock_and_pc_observations_do_not_downgrade() {
+    let old = manifest();
+    let old_bytes = old.canonical_bytes().unwrap();
+    let m = policy_manifest_v2(
+        old.clone(),
+        RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::PcOnly,
+        },
+    );
+    let wire = serde_json::to_string(&m).unwrap();
+    assert!(RoventExecutionManifest::from_json(&wire).is_err());
+    assert_eq!(RoventExecutionManifestV2::from_json(&wire).unwrap(), m);
+    assert_eq!(old.canonical_bytes().unwrap(), old_bytes);
+    let mut lock = m.lock().unwrap();
+    let lock_wire = serde_json::to_string(&lock).unwrap();
+    assert!(RoventInputLock::from_json(&lock_wire).is_err());
+    assert_eq!(RoventInputLockV2::from_json(&lock_wire).unwrap(), lock);
+    let mut r = RoventExecutionReceiptV2 {
+        domain: ROVENT_RECEIPT_V2_DOMAIN.into(),
+        run_id: lock.manifest.run_id.clone(),
+        input_lock_sha256: lock.canonical_sha256.clone(),
+        own_r_activity: RoventOwnRActivityV2::Unknown,
+        root_tie_observation: RoventRootTieObservationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::PcOnly,
+            evidence: artifact("pc-no-r.json"),
+        },
+        execution_evidence: artifact("execution.json"),
+    };
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::Unknown
+    );
+    r.own_r_activity = RoventOwnRActivityV2::NotApplicable {
+        evidence: artifact("pc-activity.json"),
+    };
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::ConsistentUnattested
+    );
+    let old_lock = old.lock().unwrap();
+    assert!(
+        RoventExecutionReceipt::from_json(&serde_json::to_string(&r).unwrap(), &old_lock).is_err()
+    );
+    lock.manifest.startup_configuration_sha256 = sha_value('9');
+    assert!(lock.validate().is_err());
+}
+
+#[test]
+fn policy_v2_distinguishes_own_not_issued_ready_unknown_and_mismatch() {
+    let mut base = manifest();
+    base.engine.mode = ExecutionMode::CpuPcr;
+    base.engine.researcher = Some(RoventResearcher::Own {
+        implementation_sha256: sha_value('6'),
+        search_configuration_sha256: sha_value('7'),
+    });
+    base.resources.pools[0].actors.insert(RoventActor::OwnR);
+    base.engine.nnuec = Some(RoventNnuecPin {
+        schema: "nnuec-fixture/1".into(),
+        semantics: "fixture/1".into(),
+        encoding: "fixture/1".into(),
+        implementation_sha256: sha_value('1'),
+        configuration_sha256: sha_value('2'),
+        weights: artifact("nnuec.bin"),
+        provenance: artifact("nnuec-provenance.json"),
+        diagnostic: false,
+        context_namespace_policy_sha256: sha_value('3'),
+        local_namespace_policy_sha256: sha_value('4'),
+        search_conditions_sha256: sha_value('5'),
+    });
+    let m = policy_manifest_v2(
+        base,
+        RoventRootTieDeclarationV2::Own {
+            policy: RoventRootTiePolicyV2::RulesOrderConfirmed,
+            expected_search_identity: "fixture-cpu/2".into(),
+            expected_worker_conditions_sha256: sha_value('6'),
+        },
+    );
+    // NNUEC plan conditions and actual CPU worker conditions are distinct domains.
+    assert_ne!(
+        m.engine.nnuec.as_ref().unwrap().search_conditions_sha256,
+        sha_value('6')
+    );
+    let lock = m.lock().unwrap();
+    let mut r = RoventExecutionReceiptV2 {
+        domain: ROVENT_RECEIPT_V2_DOMAIN.into(),
+        run_id: lock.manifest.run_id.clone(),
+        input_lock_sha256: lock.canonical_sha256.clone(),
+        own_r_activity: RoventOwnRActivityV2::NotIssued {
+            evidence: artifact("not-issued.json"),
+        },
+        root_tie_observation: RoventRootTieObservationV2::NotIssued {
+            reason: RoventOwnRNotIssuedReasonV2::NnuecPreMaterializationStop,
+            evidence: artifact("pre-materialization-stop.json"),
+        },
+        execution_evidence: artifact("execution.json"),
+    };
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::ConsistentUnattested
+    );
+    // A pre-materialization stop requires an explicit, structurally valid
+    // witness; an empty placeholder cannot be used as evidence.
+    if let RoventRootTieObservationV2::NotIssued { evidence, .. } = &mut r.root_tie_observation {
+        evidence.bytes = 0;
+    }
+    assert!(r.policy_consistency(&lock).is_err());
+    if let RoventRootTieObservationV2::NotIssued { evidence, .. } = &mut r.root_tie_observation {
+        *evidence = artifact("pre-materialization-stop.json");
+    }
+    let mut board_only_manifest = lock.manifest.clone();
+    board_only_manifest.engine.nnuec = None;
+    let board_only_lock = board_only_manifest.lock().unwrap();
+    let mut board_only_receipt = r.clone();
+    board_only_receipt.input_lock_sha256 = board_only_lock.canonical_sha256.clone();
+    assert_eq!(
+        board_only_receipt
+            .policy_consistency(&board_only_lock)
+            .unwrap(),
+        RoventPolicyRecordConsistencyV2::Mismatch
+    );
+    r.own_r_activity = RoventOwnRActivityV2::Unknown;
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::Unknown
+    );
+    r.own_r_activity = RoventOwnRActivityV2::Issued {
+        jobs: std::num::NonZeroU64::new(1).unwrap(),
+        owner_id: "owner-1".into(),
+        root_authority_sha256: sha_value('8'),
+        job_set_sha256: sha_value('9'),
+        evidence: artifact("job.json"),
+    };
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::Mismatch
+    );
+    r.root_tie_observation = RoventRootTieObservationV2::Observed {
+        policy: RoventRootTiePolicyV2::RulesOrderConfirmed,
+        search_identity: "fixture-cpu/2".into(),
+        worker_conditions_sha256: sha_value('6'),
+        nnuec_plan: RoventNnuecPlanObservationV2::Observed {
+            conditions_sha256: sha_value('5'),
+            evidence: artifact("nnuec-plan.json"),
+        },
+        root_state_and_history_sha256: lock
+            .manifest
+            .engine
+            .search
+            .root_state_and_history_sha256
+            .clone(),
+        root_authority_sha256: sha_value('8'),
+        owner_id: "owner-1".into(),
+        ready_evidence: artifact("ready.json"),
+        retirement_evidence: None,
+    };
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::ConsistentUnattested
+    );
+    // Ready is an owner observation, so a subsequent R job need not have
+    // been issued. The not-issued witness is still required independently.
+    let issued_activity = r.own_r_activity.clone();
+    r.own_r_activity = RoventOwnRActivityV2::NotIssued {
+        evidence: artifact("ready-but-no-job.json"),
+    };
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::ConsistentUnattested
+    );
+    r.own_r_activity = issued_activity;
+    let (parsed, verdict) =
+        RoventExecutionReceiptV2::parse_and_assess(&serde_json::to_string(&r).unwrap(), &lock)
+            .unwrap();
+    assert_eq!(parsed, r);
+    assert_eq!(
+        verdict,
+        RoventPolicyRecordConsistencyV2::ConsistentUnattested
+    );
+    if let RoventRootTieObservationV2::Observed { nnuec_plan, .. } = &mut r.root_tie_observation {
+        *nnuec_plan = RoventNnuecPlanObservationV2::Unknown;
+    }
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::Unknown
+    );
+    if let RoventRootTieObservationV2::Observed { nnuec_plan, .. } = &mut r.root_tie_observation {
+        *nnuec_plan = RoventNnuecPlanObservationV2::Observed {
+            conditions_sha256: sha_value('7'),
+            evidence: artifact("wrong-plan.json"),
+        };
+    }
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::Mismatch
+    );
+    if let RoventRootTieObservationV2::Observed {
+        nnuec_plan,
+        root_authority_sha256,
+        ..
+    } = &mut r.root_tie_observation
+    {
+        *nnuec_plan = RoventNnuecPlanObservationV2::Observed {
+            conditions_sha256: sha_value('5'),
+            evidence: artifact("nnuec-plan.json"),
+        };
+        *root_authority_sha256 = sha_value('9');
+    }
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::Mismatch
+    );
+    if let RoventRootTieObservationV2::Observed { policy, .. } = &mut r.root_tie_observation {
+        *policy = RoventRootTiePolicyV2::LegacyFirstSearched;
+    }
+    if let RoventRootTieObservationV2::Observed {
+        root_authority_sha256,
+        ..
+    } = &mut r.root_tie_observation
+    {
+        *root_authority_sha256 = sha_value('8');
+    }
+    r.own_r_activity = RoventOwnRActivityV2::Unknown;
+    assert_eq!(
+        r.policy_consistency(&lock).unwrap(),
+        RoventPolicyRecordConsistencyV2::Mismatch
+    );
+}
+
+#[test]
+fn policy_v2_external_researcher_is_not_pc_or_own() {
+    let mut base = manifest();
+    base.engine.mode = ExecutionMode::CpuPcr;
+    base.engine.researcher = Some(RoventResearcher::External {
+        profile: Box::new(external(RoventExternalPurpose::ResearchChecker)),
+    });
+    base.resources.pools[0]
+        .actors
+        .insert(RoventActor::ExternalR);
+    let mut m = policy_manifest_v2(
+        base,
+        RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::ExternalResearcher,
+        },
+    );
+    assert!(m.validate().is_ok());
+    m.own_r_root_tie = RoventRootTieDeclarationV2::NotApplicable {
+        reason: RoventOwnRNotApplicableV2::PcOnly,
+    };
+    assert!(m.validate().is_err());
+}
+
 #[test]
 fn all_four_modes_require_the_actual_device_and_researcher_assembly() {
     for mode in [

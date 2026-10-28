@@ -39,6 +39,7 @@ mod metadata {
         ExecutionConfiguration, LoadingProfile, ROVENT_STARTUP_CONFIGURATION_DOMAIN,
         ResearchValueConfiguration, StartupConfigurationDocument,
         v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN, v3::ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
+        v4::ROVENT_STARTUP_CONFIGURATION_V4_DOMAIN,
     };
     use rz_uci::rovent_bootstrap::configuration_digest_from_metadata;
     use rz_uci::rovent_bootstrap::external_session::external_researcher_implementation_digest_from_metadata;
@@ -836,6 +837,7 @@ mod metadata {
                 StartupConfigurationDocument::V1(_) => ROVENT_STARTUP_CONFIGURATION_DOMAIN,
                 StartupConfigurationDocument::V2(_) => ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN,
                 StartupConfigurationDocument::V3(_) => ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
+                StartupConfigurationDocument::V4(_) => ROVENT_STARTUP_CONFIGURATION_V4_DOMAIN,
             },
             source_configuration: byte_pin(bytes),
             canonical_configuration: byte_pin(&canonical),

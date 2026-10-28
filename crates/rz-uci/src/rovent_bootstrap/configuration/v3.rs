@@ -122,42 +122,7 @@ impl RoventStartupConfigurationV3 {
         self.joined_external_question_limit().map(|_| ())
     }
     fn joined_external_question_limit(&self) -> Result<Option<ExternalGoConstraint>, BackendError> {
-        match (&self.execution, self.external) {
-            (
-                ExecutionConfiguration::RolesOnly { .. }
-                | ExecutionConfiguration::OwnResearcher { .. },
-                ExternalConfigurationV3::Absent {},
-            ) => Ok(None),
-            (
-                ExecutionConfiguration::ExternalResearcher {
-                    max_reported_nodes,
-                    cpu_depth,
-                    cpu_nodes_per_task,
-                    slice,
-                    ..
-                },
-                ExternalConfigurationV3::Researcher { question_limit },
-            ) => {
-                let actual = question_limit.actual()?;
-                if actual
-                    .requested_depth()
-                    .is_some_and(|depth| depth > *cpu_depth)
-                    || actual.requested_nodes().is_some_and(|nodes| {
-                        nodes > *cpu_nodes_per_task
-                            || nodes > slice.requested_reported_nodes
-                            || nodes > *max_reported_nodes
-                    })
-                {
-                    return Err(invalid(
-                        "explicit external question exceeds original execution ceilings",
-                    ));
-                }
-                Ok(Some(actual))
-            }
-            _ => Err(invalid(
-                "explicit external policy differs from actual execution assembly",
-            )),
-        }
+        joined_external_question_limit(&self.execution, self.external)
     }
     pub fn external_question_limit(&self) -> Result<Option<ExternalGoConstraint>, BackendError> {
         self.validate()?;
@@ -243,6 +208,49 @@ impl RoventStartupConfigurationV3 {
             return Err(invalid("actual post-repair policy differs from startup /3"));
         }
         Ok(())
+    }
+}
+
+// The /3 and /4 declarations share exactly the same question/ceiling
+// validation. This does not transform either version's persisted document.
+pub(super) fn joined_external_question_limit(
+    execution: &ExecutionConfiguration,
+    external: ExternalConfigurationV3,
+) -> Result<Option<ExternalGoConstraint>, BackendError> {
+    match (execution, external) {
+        (
+            ExecutionConfiguration::RolesOnly { .. } | ExecutionConfiguration::OwnResearcher { .. },
+            ExternalConfigurationV3::Absent {},
+        ) => Ok(None),
+        (
+            ExecutionConfiguration::ExternalResearcher {
+                max_reported_nodes,
+                cpu_depth,
+                cpu_nodes_per_task,
+                slice,
+                ..
+            },
+            ExternalConfigurationV3::Researcher { question_limit },
+        ) => {
+            let actual = question_limit.actual()?;
+            if actual
+                .requested_depth()
+                .is_some_and(|depth| depth > *cpu_depth)
+                || actual.requested_nodes().is_some_and(|nodes| {
+                    nodes > *cpu_nodes_per_task
+                        || nodes > slice.requested_reported_nodes
+                        || nodes > *max_reported_nodes
+                })
+            {
+                return Err(invalid(
+                    "explicit external question exceeds original execution ceilings",
+                ));
+            }
+            Ok(Some(actual))
+        }
+        _ => Err(invalid(
+            "explicit external policy differs from actual execution assembly",
+        )),
     }
 }
 
