@@ -1,7 +1,9 @@
 //! Separate Rovent UCI entry. No legacy V5 DTO, command-line attestation or
 //! fabricated weights path participates in this source-bound native assembly.
 
-use super::configuration::{ExecutionConfiguration, NativeNnuecSelection};
+use super::configuration::{
+    ExecutionConfiguration, NativeNnuecSelection, ResearchValueConfiguration,
+};
 use super::external_session::RoventExternalProductStartupOwners;
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::{
@@ -691,7 +693,7 @@ fn run_inner<'a>(
                     "V1-only launch callbacks cannot consume /2",
                 ));
             }
-            return run_v2_pc(arguments, lock, root, cwd, lock_file);
+            return run_v2_native(arguments, lock, root, cwd, lock_file);
         }
     };
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
@@ -1151,9 +1153,10 @@ fn prepare_launch_native<Q: NativeQuestionProjection>(
     })
 }
 
-/// The first /2 product route is PC-only with archive and collection disabled.
-/// Its original process, selected file and lock remain alive through UCI drain.
-fn run_v2_pc(
+/// /2 PC and own-board researcher routes retain their original process,
+/// selected files and lock through actual UCI drain. Collection, external R,
+/// NNUEC and storage remain separate unsupported startup profiles.
+fn run_v2_native(
     arguments: Arguments,
     lock: Arc<RoventInputLockV2>,
     root: Dir,
@@ -1167,7 +1170,6 @@ fn run_v2_pc(
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
         || arguments.initial_stop_source_diagnostics
-        || lock.manifest.engine.mode.has_native_r()
         || lock.manifest.engine.nnuec.is_some()
         || !matches!(
             lock.manifest.purpose,
@@ -1176,7 +1178,18 @@ fn run_v2_pc(
     {
         return Err(error(
             "InputLockUnsupportedV2",
-            "the /2 PC route does not support this mode, asset, storage, or diagnostic",
+            "the /2 native route does not support this asset, storage, or diagnostic",
+        ));
+    }
+    let topology = super::admitted_topology_v2(&lock)
+        .map_err(|failure| error("InputLockUnsupportedV2", failure))?;
+    if !matches!(
+        topology,
+        super::RoventStartupTopology::RolesOnly | super::RoventStartupTopology::OwnResearcher
+    ) {
+        return Err(error(
+            "InputLockUnsupportedV2",
+            "V2 external researcher is not connected",
         ));
     }
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
@@ -1250,8 +1263,30 @@ fn run_v2_pc(
     if sources.configuration().fields().nnuec_selection() != NativeNnuecSelection::Absent {
         return Err(error(
             "InputLockUnsupportedV2",
-            "the /2 PC route does not support NNUEC",
+            "the /2 native route does not support NNUEC",
         ));
+    }
+    match (topology, sources.configuration().fields().execution) {
+        (
+            super::RoventStartupTopology::RolesOnly,
+            ExecutionConfiguration::RolesOnly {
+                shared_nnuec_readout: None,
+                ..
+            },
+        ) => {}
+        (
+            super::RoventStartupTopology::OwnResearcher,
+            ExecutionConfiguration::OwnResearcher {
+                value: ResearchValueConfiguration::BaselineBoard,
+                ..
+            },
+        ) => {}
+        _ => {
+            return Err(error(
+                "InputLockUnsupportedV2",
+                "V2 execution configuration and baseline topology do not match",
+            ));
+        }
     }
     let cuda_profile = if matches!(lock.manifest.engine.pc.device, RoventDevice::Cuda { .. }) {
         let name = format!(
@@ -1296,38 +1331,55 @@ fn run_v2_pc(
         command_capacity: configuration.fields().native.command_capacity,
     };
     let diagnostic = NativeStartupDiagnostic::default();
-    let prepared = match super::prepare_native_v2::<PcPortQuestion>(
-        Arc::clone(&sources),
-        resources,
-        clock.runtime_clock(),
-        control.clone(),
-    ) {
-        Ok(prepared) => prepared,
-        Err(rejection) => {
-            let failure = reject_factory(rejection, cleanup_until, &diagnostic);
-            drop(view);
-            if failure.stage == "PhysicalCompletionUnknown" {
-                std::mem::forget((boundary, sources, selection_file, lock_file));
-            }
-            return Err(failure);
-        }
-    };
     let owners = Arc::new(OwnerRegistry::default());
     let identity = EngineIdentity {
         name: format!("Rovent {:?}", lock.manifest.engine.mode),
         author: "Rovent contributors".into(),
     };
-    let driver = match super::product::RoventNativeProductDriverV2::pc(
-        prepared,
-        Arc::clone(&boundary),
-        clock.clone(),
-        Arc::clone(&owners),
-        identity,
-        arguments.root_policy,
-    ) {
-        Ok(driver) => driver,
-        Err(rejection) => {
-            let failure = reject_product_v2(rejection, cleanup_until, &diagnostic);
+    // Each arm transfers the one original prepared worker into its matching
+    // product. The common error path retains the same boundary and FDs.
+    macro_rules! launch_v2_product {
+        ($question:ty, $constructor:path, $reject:path) => {{
+            let prepared = super::prepare_native_v2::<$question>(
+                Arc::clone(&sources),
+                resources,
+                clock.runtime_clock(),
+                control.clone(),
+            )
+            .map_err(|rejection| reject_factory(rejection, cleanup_until, &diagnostic))?;
+            let driver = $constructor(
+                prepared,
+                Arc::clone(&boundary),
+                clock.clone(),
+                Arc::clone(&owners),
+                identity,
+                arguments.root_policy,
+            )
+            .map_err(|rejection| $reject(rejection, cleanup_until, &diagnostic))?;
+            let completion = driver.physical_close_observation();
+            Ok((Arc::new(driver) as Arc<dyn SearchSessionDriver>, completion))
+        }};
+    }
+    let assembled = (|| -> Result<_, RoventLaunchError> {
+        match topology {
+            super::RoventStartupTopology::RolesOnly => launch_v2_product!(
+                PcPortQuestion,
+                super::product::RoventNativeProductDriverV2::pc,
+                reject_product_v2
+            ),
+            super::RoventStartupTopology::OwnResearcher => launch_v2_product!(
+                AdaptivePortQuestion,
+                super::product::RoventOwnPcrProductDriverV2::own_board_pcr,
+                reject_own_pcr_product_v2
+            ),
+            super::RoventStartupTopology::ExternalResearcher => {
+                unreachable!("external topology rejected before startup")
+            }
+        }
+    })();
+    let (driver, completion) = match assembled {
+        Ok(assembled) => assembled,
+        Err(failure) => {
             drop(view);
             if failure.stage == "PhysicalCompletionUnknown" {
                 std::mem::forget((boundary, sources, selection_file, lock_file));
@@ -1335,13 +1387,12 @@ fn run_v2_pc(
             return Err(failure);
         }
     };
-    let completion = driver.physical_close_observation();
     let mut settings = EngineSettings {
         shutdown_limit: Duration::from_millis(lock.manifest.cleanup_max_ms),
         ..EngineSettings::default()
     };
     settings.search.untimed_limit = Duration::from_millis(lock.manifest.wall_time_max_ms);
-    let result = serve_driver(Arc::new(driver), clock, owners, settings)
+    let result = serve_driver(driver, clock, owners, settings)
         .map_err(|failure| error("UciSession", failure));
     drop(view);
     if !completion.is_confirmed() {
@@ -1539,6 +1590,44 @@ fn reject_product_v2(
         NativeStartupDiagnosticPhase::Entry,
     );
     let confirmed = drain_native(&mut failure.prepared.service, until);
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        if confirmed {
+            NativeStartupDiagnosticPhase::Exit
+        } else {
+            NativeStartupDiagnosticPhase::Error
+        },
+    );
+    if !confirmed {
+        let _quarantine = Box::leak(Box::new(failure));
+        return error("PhysicalCompletionUnknown", detail);
+    }
+    detail
+}
+fn reject_own_pcr_product_v2(
+    mut failure: super::product::RoventOwnPcrV2StartupRejection,
+    until: Instant,
+    diagnostic: &NativeStartupDiagnostic,
+) -> RoventLaunchError {
+    use super::product::RoventOwnPcrV2RejectedOwners;
+    let detail = error("ProductAssembly", &failure.failure);
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        NativeStartupDiagnosticPhase::Entry,
+    );
+    let confirmed = match &mut failure.owners {
+        RoventOwnPcrV2RejectedOwners::Prepared(prepared) => {
+            drain_native(&mut prepared.service, until)
+        }
+        RoventOwnPcrV2RejectedOwners::Session(rejected) => {
+            drain_native(&mut rejected.sources.native, until)
+        }
+        RoventOwnPcrV2RejectedOwners::Driver(driver) => {
+            driver.finish_session(until).is_ok_and(|completion| {
+                completion == Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)
+            })
+        }
+    };
     diagnostic.emit(
         NativeStartupDiagnosticStage::ProductDrain,
         if confirmed {

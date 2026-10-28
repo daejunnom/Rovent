@@ -275,10 +275,13 @@ impl NativeInputLock for RoventInputLockV2 {
             ));
         }
         let topology = super::admitted_topology_v2(self)?;
-        if topology != RoventStartupTopology::RolesOnly {
+        if !matches!(
+            topology,
+            RoventStartupTopology::RolesOnly | RoventStartupTopology::OwnResearcher
+        ) {
             return Err(fail(
                 K::UnsupportedModel,
-                "V2 researcher source is not connected",
+                "V2 external researcher source is not connected",
             ));
         }
         Ok(topology)
@@ -378,8 +381,8 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
             .is_some_and(|original| same_startup_control(original, control))
     }
 
-    /// Pin native inputs against the original V2 lock. V2 Collection and R
-    /// owners remain unsupported until their original typed paths are connected.
+    /// Pin native inputs against the original V2 lock. Collection and the
+    /// external researcher still require separately admitted typed owners.
     pub fn open_v2(
         lock: Arc<RoventInputLockV2>,
         root: Dir,
