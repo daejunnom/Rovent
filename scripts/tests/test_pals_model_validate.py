@@ -87,6 +87,45 @@ class ValidationStageTests(unittest.TestCase):
         self.assertEqual(stages.results["first"]["error_type"], "PermissionError")
         self.assertEqual(stages.results["second"]["blocked_by"], ["first"])
 
+    def test_packing_output_access_failure_does_not_block_independent_model(self):
+        with tempfile.TemporaryDirectory(prefix="pals-packing-access-") as temporary:
+            directory = Path(temporary)
+            manifest, graph = directory / "device-packing.json", directory / "device_public_pack.onnx"
+            manifest.write_bytes(b"{}")
+            graph.write_bytes(b"graph")
+            inputs = {manifest.name: manifest, graph.name: graph}
+            real_open = Path.open
+
+            def denied(path, *args, **kwargs):
+                if path == graph:
+                    raise PermissionError(13, "packing graph denied", str(graph))
+                return real_open(path, *args, **kwargs)
+
+            self.assertTrue(self.stages.perform("reference_install_seconds", lambda: None, requires=()))
+            self.assertTrue(self.stages.perform("device_packing_export_seconds", lambda: None))
+            with mock.patch.object(Path, "open", autospec=True, side_effect=denied):
+                self.assertFalse(self.stages.perform("device_packing_files_seconds",
+                    lambda: wrapper.inspect_device_packing(inputs)))
+            failed = self.stages.results["device_packing_files_seconds"]
+            self.assertEqual((failed["failure_scope"], failed["error_type"],
+                              failed["original_error_type"], failed["errno"]),
+                             ("stage", "StageInputFailure", "PermissionError", 13))
+            self.assertFalse(self.stages.perform("device_packing_rust_body_seconds", lambda: self.fail("blocked")))
+            self.assertTrue(self.stages.perform("initialize_seconds", self.operation("neural"), requires=()))
+            self.assertIsNone(self.stages.shared_failure)
+            with self.assertRaises(ValidationStagesFailed):
+                self.stages.require_complete()
+
+    def test_unknown_packing_io_failure_remains_shared(self):
+        with tempfile.TemporaryDirectory(prefix="pals-packing-io-") as temporary:
+            item = Path(temporary) / "device-packing.json"
+            item.write_bytes(b"{}")
+            with mock.patch.object(Path, "open", side_effect=OSError(12, "allocation failed")):
+                self.assertFalse(self.stages.perform("packing_files",
+                    lambda: wrapper.inspect_device_packing({item.name: item})))
+            self.assertEqual(self.stages.results["packing_files"]["failure_scope"], "shared_managed_execution")
+            self.assertFalse(self.stages.perform("independent_neural", lambda: self.fail("blocked")))
+
     def test_postcheck_permission_denial_preserves_primary_failure(self):
         with tempfile.TemporaryDirectory(prefix="pals-stage-postcheck-") as temporary:
             source = Path(temporary)

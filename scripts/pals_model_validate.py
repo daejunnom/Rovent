@@ -98,7 +98,11 @@ def input_identity(path):
             value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
-class StageSourceInputFailure(ValueError):
+class StageInputFailure(ValueError):
+    """A known unavailable input belongs only to its consuming stage."""
+
+
+class StageSourceInputFailure(StageInputFailure):
     """A known unavailable or changed source input belongs to its own stage."""
 
 
@@ -288,7 +292,7 @@ class ValidationStages:
         except (subprocess.CalledProcessError, CommandNotStarted, ValueError) as error:
             result.update(status="failed", failure_scope="stage",
                           error_type=type(error).__name__, error=str(error)[:2048])
-            if isinstance(error, StageSourceInputFailure) and isinstance(error.__cause__, OSError):
+            if isinstance(error, StageInputFailure) and isinstance(error.__cause__, OSError):
                 # Preserve the actual stage-local access failure without
                 # reclassifying a shared-scope I/O failure as harmless.
                 result.update(original_error_type=type(error.__cause__).__name__,
@@ -319,6 +323,23 @@ class ValidationStages:
         incomplete = [name for name in self.results if not self.passed(name)]
         if incomplete:
             raise ValidationStagesFailed("required validation stages incomplete: " + ", ".join(incomplete))
+
+
+def inspect_device_packing(packing_files):
+    """Identify packing outputs without promoting their access failure to NN scope."""
+    pins = {}
+    for name, asset_path in packing_files.items():
+        cap = 512 * 1024 if name.endswith(".json") else 2 * 1024 * 1024
+        try:
+            size = asset_path.stat().st_size
+            if asset_path.is_symlink() or not asset_path.is_file() or not 1 <= size <= cap:
+                raise ValueError("generated packing artifact violates static file bounds")
+            with asset_path.open("rb") as handle:
+                sha = hashlib.file_digest(handle, "sha256").hexdigest()
+        except (FileNotFoundError, NotADirectoryError, PermissionError) as error:
+            raise StageInputFailure("generated packing artifact is unavailable") from error
+        pins[name] = {"bytes": size, "sha256": sha}
+    return pins
 
 
 def main():
@@ -461,17 +482,7 @@ def main():
                 str(packing)], cwd=source, environment=environment))
 
             def inspect_packing():
-                for name, asset_path in packing_files.items():
-                    cap = 512 * 1024 if name.endswith(".json") else 2 * 1024 * 1024
-                    try:
-                        size = asset_path.stat().st_size
-                    except FileNotFoundError as error:
-                        raise ValueError("generated packing artifact is missing") from error
-                    if asset_path.is_symlink() or not asset_path.is_file() or not 1 <= size <= cap:
-                        raise ValueError("generated packing artifact violates static file bounds")
-                    with asset_path.open("rb") as handle:
-                        sha = hashlib.file_digest(handle, "sha256").hexdigest()
-                    packing_pins[name] = {"bytes": size, "sha256": sha}
+                packing_pins.update(inspect_device_packing(packing_files))
 
             controller.perform("device_packing_files_seconds", inspect_packing)
             controller.perform("device_packing_rust_body_seconds", lambda: run_with_stage_sources(
