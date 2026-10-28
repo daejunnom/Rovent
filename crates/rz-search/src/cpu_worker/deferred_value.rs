@@ -10,6 +10,7 @@ use super::{
 };
 use crate::cpu::{
     CPU_PAUSED_STACK_MAX_BYTES, CpuConfig, CpuEngine, CpuError, CpuOrderingPolicy, CpuResumePolicy,
+    CpuRootTiePolicy,
 };
 use crate::cpu_value::nnuec::NnuecError;
 use crate::cpu_value::nnuec::v2::Model;
@@ -30,6 +31,7 @@ use std::sync::{Arc, Mutex};
 pub struct DeferredNnuecCpuPlan {
     config: CpuConfig,
     ordering: CpuOrderingPolicy,
+    root_tie_policy: CpuRootTiePolicy,
     paused_bytes_limit: usize,
     side_scope: bool,
     command_capacity: usize,
@@ -43,6 +45,27 @@ impl DeferredNnuecCpuPlan {
         side_scope: bool,
         command_capacity: usize,
         affinity: Option<Vec<LogicalCpu>>,
+    ) -> Result<Self, CpuWorkerError> {
+        Self::new_with_root_tie_policy(
+            config,
+            ordering,
+            paused_bytes_limit,
+            side_scope,
+            command_capacity,
+            affinity,
+            CpuRootTiePolicy::LegacyFirstSearched,
+        )
+    }
+
+    /// Select the immutable root semantics before any native owner exists.
+    pub fn new_with_root_tie_policy(
+        config: CpuConfig,
+        ordering: CpuOrderingPolicy,
+        paused_bytes_limit: usize,
+        side_scope: bool,
+        command_capacity: usize,
+        affinity: Option<Vec<LogicalCpu>>,
+        root_tie_policy: CpuRootTiePolicy,
     ) -> Result<Self, CpuWorkerError> {
         // These are the actual native constructor's supported bounds. The
         // allocation remains deferred until the actor has an accepted Bound.
@@ -65,6 +88,7 @@ impl DeferredNnuecCpuPlan {
         Ok(Self {
             config,
             ordering,
+            root_tie_policy,
             paused_bytes_limit,
             side_scope,
             command_capacity,
@@ -76,6 +100,9 @@ impl DeferredNnuecCpuPlan {
     }
     pub fn ordering_policy(&self) -> CpuOrderingPolicy {
         self.ordering
+    }
+    pub fn root_tie_policy(&self) -> CpuRootTiePolicy {
+        self.root_tie_policy
     }
     pub fn paused_bytes_limit(&self) -> usize {
         self.paused_bytes_limit
@@ -171,6 +198,7 @@ impl DeferredNnuecRSource {
             &self.declaration.model,
             &materialized.bound,
             materialized.binding,
+            self.declaration.plan.root_tie_policy,
             "deferred NNUEC source/binding revoked",
         ) {
             return Err((materialized, reason));
@@ -268,13 +296,19 @@ impl MaterializationRequest {
         let plan = &self.declaration.plan;
         let value: Arc<dyn CpuValueEvaluator> = self.value.clone();
         let result = if plan.side_scope {
-            CpuEngine::with_paused_side_scope(plan.config.clone(), value, plan.ordering)
+            CpuEngine::with_paused_side_scope_and_tie_policy(
+                plan.config.clone(),
+                value,
+                plan.ordering,
+                plan.root_tie_policy,
+            )
         } else {
-            CpuEngine::with_evaluator_ordering_and_resume_policy(
+            CpuEngine::with_evaluator_ordering_resume_and_tie_policy(
                 plan.config.clone(),
                 value,
                 plan.ordering,
                 CpuResumePolicy::PausedStack,
+                plan.root_tie_policy,
             )
         };
         let mut engine = match result {
@@ -289,6 +323,7 @@ impl MaterializationRequest {
             &self.declaration.model,
             &self.bound,
             self.binding,
+            plan.root_tie_policy,
             "deferred NNUEC materialization readback",
         ) {
             return Err((self, reason));
@@ -312,10 +347,11 @@ fn validate_materialized_readback(
     model: &Arc<Model>,
     bound: &Arc<BoundNnuecReviewContext>,
     binding: Digest,
+    root_tie_policy: CpuRootTiePolicy,
     invalid: &'static str,
 ) -> Result<(), CpuWorkerError> {
     let observed = engine.job_binding_digest();
-    if engine.value_identity() != model.identity() {
+    if engine.value_identity() != model.identity() || engine.root_tie_policy() != root_tie_policy {
         return Err(CpuWorkerError::Invalid(invalid));
     }
     match observed {

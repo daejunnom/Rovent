@@ -382,6 +382,124 @@ fn materialization_preserves_required_plan_and_has_no_searched_work() {
 }
 
 #[test]
+fn deferred_materialization_preserves_explicit_root_tie_policy_and_rejects_mismatch() {
+    assert_eq!(
+        plan(false).root_tie_policy(),
+        CpuRootTiePolicy::LegacyFirstSearched
+    );
+    for side_scope in [false, true] {
+        let fixture = fixture();
+        let explicit = DeferredNnuecCpuPlan::new_with_root_tie_policy(
+            config(),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+            128 * 1024,
+            side_scope,
+            3,
+            None,
+            CpuRootTiePolicy::RulesOrderConfirmed,
+        )
+        .unwrap();
+        let source = DeferredNnuecRSource::new(Arc::clone(&fixture.model), explicit);
+        let original = request(&source, &fixture);
+        let materialized = materialize(original);
+        assert_eq!(
+            materialized.engine.root_tie_policy(),
+            CpuRootTiePolicy::RulesOrderConfirmed
+        );
+        assert!(
+            materialized
+                .engine
+                .search_identity()
+                .contains("root-tie-confirmed")
+        );
+        assert_eq!(
+            materialized.engine.preserves_paused_on_fresh_tasks(),
+            side_scope
+        );
+        assert_eq!(
+            validate_materialized_readback(
+                &materialized.engine,
+                &fixture.model,
+                &materialized.bound,
+                materialized.binding,
+                CpuRootTiePolicy::LegacyFirstSearched,
+                "policy mismatch",
+            ),
+            Err(CpuWorkerError::Invalid("policy mismatch")),
+        );
+        assert_eq!(materialized.engine.last_attempt_work(), None);
+        let expected_conditions =
+            crate::cpu_worker::cpu_search_conditions_digest(&materialized.engine);
+        let starting = start(&source, materialized);
+        assert_eq!(wait_ready(&starting).search_conditions, expected_conditions);
+        let (worker, registration) = starting
+            .accept_ready()
+            .unwrap_or_else(|(_, error)| panic!("ready refused: {error:?}"));
+        assert_eq!(
+            registration.profile().search_conditions,
+            expected_conditions
+        );
+        assert!(worker.shutdown().unwrap().thread_joined);
+    }
+}
+
+#[test]
+fn deferred_policy_mismatch_returns_the_same_materialized_owner_before_spawn() {
+    let fixture = fixture();
+    let plan = DeferredNnuecCpuPlan::new_with_root_tie_policy(
+        config(),
+        CpuOrderingPolicy::LegacyMvvLvaV1,
+        128 * 1024,
+        false,
+        3,
+        None,
+        CpuRootTiePolicy::RulesOrderConfirmed,
+    )
+    .unwrap();
+    let source = DeferredNnuecRSource::new(Arc::clone(&fixture.model), plan);
+    let original = request(&source, &fixture);
+    let evaluator: Arc<dyn CpuValueEvaluator> = original.value.clone();
+    let mut materialized = materialize(original);
+    // Simulate a mismatched engine before the original source is allowed to
+    // start a worker, while retaining the original model and Bound binding.
+    materialized.engine = CpuEngine::with_evaluator_ordering_and_resume_policy(
+        config(),
+        evaluator,
+        CpuOrderingPolicy::LegacyMvvLvaV1,
+        CpuResumePolicy::PausedStack,
+    )
+    .unwrap();
+    let owner = materialized
+        .engine
+        .paused_stack_snapshot()
+        .unwrap()
+        .owner_id;
+    let binding = materialized.binding_digest();
+    let returned =
+        match source.try_spawn_worker(materialized, CpuWorkerId(0), CompletionSignal::default()) {
+            Ok(_) => panic!("mismatched policy must not start a worker"),
+            Err((returned, reason)) => {
+                assert_eq!(
+                    reason,
+                    CpuWorkerError::Invalid("deferred NNUEC source/binding revoked")
+                );
+                returned
+            }
+        };
+    assert_eq!(
+        returned.engine.paused_stack_snapshot().unwrap().owner_id,
+        owner
+    );
+    assert_eq!(
+        returned.engine.root_tie_policy(),
+        CpuRootTiePolicy::LegacyFirstSearched
+    );
+    assert_eq!(returned.binding_digest(), binding);
+    assert_eq!(returned.engine.job_binding_digest().unwrap(), Some(binding));
+    assert_eq!(returned.engine.last_attempt_work(), None);
+}
+
+#[test]
 fn an_equal_model_and_plan_cannot_substitute_for_the_original_source_owner() {
     let fixture = fixture();
     let original = source(&fixture, false);

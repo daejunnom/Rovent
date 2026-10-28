@@ -7,7 +7,9 @@ use super::super::{
 };
 use super::*;
 use crate::contract_time::InstantClock;
-use crate::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile, CpuResumePolicy, CpuWork};
+use crate::cpu::{
+    CpuConfig, CpuOrderingPolicy, CpuProfile, CpuResumePolicy, CpuRootTiePolicy, CpuWork,
+};
 use crate::cpu_value::nnuec::v2::review::{PreparationActor, Request as ReviewRequest};
 use crate::cpu_value::nnuec::v2::{Checkpoint, RelationParameters, SCHEMA, SEMANTICS};
 use crate::cpu_value::nnuec::{
@@ -183,6 +185,10 @@ fn payload(fixture: &Fixture) -> PreparedValueInstallation {
 }
 
 fn engine(side_scope: bool) -> CpuEngine {
+    engine_with_tie(side_scope, CpuRootTiePolicy::LegacyFirstSearched)
+}
+
+fn engine_with_tie(side_scope: bool, tie: CpuRootTiePolicy) -> CpuEngine {
     let config = CpuConfig {
         profile: CpuProfile::PlanAssisted,
         tt_entries: 16,
@@ -190,20 +196,149 @@ fn engine(side_scope: bool) -> CpuEngine {
         quiescence_ply: 0,
     };
     if side_scope {
-        CpuEngine::with_paused_side_scope(
+        CpuEngine::with_paused_side_scope_and_tie_policy(
             config,
             Arc::new(BootstrapCpuValue::default()),
             CpuOrderingPolicy::LegacyMvvLvaV1,
+            tie,
         )
         .unwrap()
     } else {
-        CpuEngine::with_evaluator_ordering_and_resume_policy(
+        CpuEngine::with_evaluator_ordering_resume_and_tie_policy(
             config,
             Arc::new(BootstrapCpuValue::default()),
             CpuOrderingPolicy::LegacyMvvLvaV1,
             CpuResumePolicy::PausedStack,
+            tie,
         )
         .unwrap()
+    }
+}
+
+#[test]
+fn actual_prepared_replacement_keeps_selected_root_tie_policy_and_owner_profile() {
+    for side_scope in [false, true] {
+        let fixture = fixture("e2e4");
+        let cpu = engine_with_tie(side_scope, CpuRootTiePolicy::RulesOrderConfirmed);
+        let identity = cpu.search_identity();
+        let conditions = cpu.search_conditions();
+        let mut worker = CpuWorker::spawn(CpuWorkerId(0), cpu).unwrap();
+        let before = worker.profile();
+        let value = payload(&fixture);
+        let binding = value.binding_digest();
+        worker.try_install_prepared_value(value).unwrap();
+        let receipt = wait_install(&mut worker);
+        let readback = receipt.result().unwrap();
+        assert_eq!(
+            readback.profile().search_conditions,
+            before.search_conditions
+        );
+        assert_eq!(readback.profile().evaluation_namespace, binding);
+        assert_eq!(readback.side_scope_preserved(), side_scope);
+        worker.request_shutdown();
+        assert!(wait_join(&mut worker).engine_recoverable);
+        let cpu = worker.take_engine().unwrap();
+        assert_eq!(cpu.root_tie_policy(), CpuRootTiePolicy::RulesOrderConfirmed);
+        assert_eq!(cpu.search_identity(), identity);
+        assert_eq!(cpu.search_conditions(), conditions);
+        assert_eq!(cpu.job_binding_digest().unwrap(), Some(binding));
+    }
+}
+
+#[test]
+fn rejected_prepared_replacement_keeps_selected_tie_owner_and_binding() {
+    for side_scope in [false, true] {
+        let fixture = fixture("e2e4");
+        let (mut endpoint, mut owner) = channel();
+        let mut cpu = engine_with_tie(side_scope, CpuRootTiePolicy::RulesOrderConfirmed);
+        let previous = profile(&cpu);
+        let old_identity = cpu.search_identity();
+        let old_stack_owner = cpu.paused_stack_snapshot().unwrap().owner_id;
+        let mut binding = None;
+        endpoint.try_submit(payload(&fixture), previous).unwrap();
+        fixture.cancel.store(true, Ordering::Release);
+        owner
+            .service(
+                &mut cpu,
+                &mut binding,
+                true,
+                true,
+                empty_occupancy(),
+                false,
+                &CompletionSignal::default(),
+            )
+            .unwrap();
+        let receipt = endpoint.try_ack().unwrap().unwrap();
+        assert_eq!(
+            receipt.result().err(),
+            Some(&CpuWorkerError::Invalid("prepared value authority revoked"))
+        );
+        assert_eq!(profile(&cpu), previous);
+        assert_eq!(cpu.root_tie_policy(), CpuRootTiePolicy::RulesOrderConfirmed);
+        assert_eq!(cpu.search_identity(), old_identity);
+        assert_eq!(
+            cpu.paused_stack_snapshot().unwrap().owner_id,
+            old_stack_owner
+        );
+        assert_eq!(binding, None);
+    }
+}
+
+#[test]
+fn mismatched_search_conditions_do_not_replace_existing_bound_owner() {
+    for side_scope in [false, true] {
+        let first = fixture("e2e4");
+        let second = fixture("d2d4");
+        let (mut endpoint, mut owner) = channel();
+        let mut cpu = engine_with_tie(side_scope, CpuRootTiePolicy::RulesOrderConfirmed);
+        let mut binding = None;
+        endpoint.try_submit(payload(&first), profile(&cpu)).unwrap();
+        owner
+            .service(
+                &mut cpu,
+                &mut binding,
+                true,
+                true,
+                empty_occupancy(),
+                false,
+                &CompletionSignal::default(),
+            )
+            .unwrap();
+        let first_receipt = endpoint.try_ack().unwrap().unwrap();
+        let actual = first_receipt.result().unwrap().profile();
+        let old_owner = cpu.paused_stack_snapshot().unwrap().owner_id;
+        let old_search = cpu.search_identity();
+        let old_value = cpu.value_identity().clone();
+        let old_binding = binding;
+        assert_eq!(cpu.job_binding_digest().unwrap(), old_binding);
+        let mut mismatched = actual;
+        mismatched.search_conditions.0[0] ^= 1;
+        endpoint.try_submit(payload(&second), mismatched).unwrap();
+        owner
+            .service(
+                &mut cpu,
+                &mut binding,
+                true,
+                true,
+                empty_occupancy(),
+                false,
+                &CompletionSignal::default(),
+            )
+            .unwrap();
+        let rejected = endpoint.try_ack().unwrap().unwrap();
+        assert_eq!(
+            rejected.result().err(),
+            Some(&CpuWorkerError::Invalid(
+                "prepared value previous profile mismatch"
+            ))
+        );
+        assert_eq!(cpu.root_tie_policy(), CpuRootTiePolicy::RulesOrderConfirmed);
+        assert_eq!(cpu.search_identity(), old_search);
+        assert_eq!(cpu.value_identity(), &old_value);
+        assert_eq!(cpu.paused_stack_snapshot().unwrap().owner_id, old_owner);
+        assert_eq!(cpu_search_conditions_digest(&cpu), actual.search_conditions);
+        assert_eq!(binding, old_binding);
+        assert_eq!(cpu.job_binding_digest().unwrap(), old_binding);
     }
 }
 

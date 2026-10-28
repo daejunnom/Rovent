@@ -479,19 +479,22 @@ impl Owner {
             return Err(CpuWorkerError::Invalid("prepared value authority revoked"));
         }
         let side_scope = engine.preserves_paused_on_fresh_tasks();
+        let root_tie_policy = engine.root_tie_policy();
         let evaluator = Arc::clone(&request.payload.evaluator);
         let mut replacement = if side_scope {
-            CpuEngine::with_paused_side_scope(
+            CpuEngine::with_paused_side_scope_and_tie_policy(
                 engine.config().clone(),
                 evaluator,
                 engine.ordering_policy(),
+                root_tie_policy,
             )?
         } else {
-            CpuEngine::with_evaluator_ordering_and_resume_policy(
+            CpuEngine::with_evaluator_ordering_resume_and_tie_policy(
                 engine.config().clone(),
                 evaluator,
                 engine.ordering_policy(),
                 engine.resume_policy(),
+                root_tie_policy,
             )?
         };
         replacement.set_paused_stack_max_bytes(engine.paused_stack_max_bytes())?;
@@ -500,6 +503,8 @@ impl Owner {
             || replacement.config().max_depth != previous.max_depth
             || cpu_search_conditions_digest(&replacement) != previous.search_conditions
             || replacement.ordering_policy() != engine.ordering_policy()
+            || replacement.root_tie_policy() != root_tie_policy
+            || replacement.search_identity() != engine.search_identity()
             || replacement.resume_policy() != engine.resume_policy()
             || replacement.preserves_paused_on_fresh_tasks() != side_scope
             || replacement.paused_stack_max_bytes() != engine.paused_stack_max_bytes()
