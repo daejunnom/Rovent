@@ -691,7 +691,11 @@ where
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     rovent_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_handoff_transferred_v2: Mutex<Option<std::sync::Weak<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     rovent_collection_delivery_v2: Mutex<Option<RoventBoardCollectionDeliveryV2>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_teacher_aggregate_ack_v2: Mutex<Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>>,
     latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
     #[cfg(feature = "pals-adaptive")]
     latest_rovent_root_v2: Mutex<Option<Arc<RoventNativeRootReceiptV2>>>,
@@ -1489,7 +1493,11 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             rovent_collection_handoff_v2: Mutex::new(None),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_handoff_transferred_v2: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             rovent_collection_delivery_v2: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_teacher_aggregate_ack_v2: Mutex::new(None),
             latest_rovent_root: Mutex::new(None),
             #[cfg(feature = "pals-adaptive")]
             latest_rovent_root_v2: Mutex::new(None),
@@ -2917,6 +2925,7 @@ where
             };
             let handoff = Arc::new(Mutex::new(RoventBoardCollectionHandoffV2 {
                 admission, observer, settlement, native_fence,
+                teacher_physical_ack: None, teacher_aggregate_ack: None,
             }));
             *self.rovent_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()) =
                 Some(Arc::clone(&handoff));
@@ -3333,6 +3342,30 @@ where
                         .unwrap_or_else(|poison| poison.into_inner()).push(payload);
                 }
             }
+            // Only the complete scope aggregate can establish child and
+            // worker retirement. A raw physical ACK stays in the original
+            // handoff, so its owner can use it to form that aggregate.
+            let mut retained_ack = self.rovent_collection_teacher_aggregate_ack_v2.try_lock()
+                .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+            let transferred = self.rovent_collection_handoff_transferred_v2.try_lock()
+                .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+            let handoff = transferred.as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+            if retained_ack.is_none() {
+                let mut original = handoff.try_lock()
+                    .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+                let ack = original.teacher_aggregate_ack.take()
+                    .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+                if !ack.matches_admission(&original.admission) {
+                    original.teacher_aggregate_ack = Some(ack);
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+                *retained_ack = Some(ack);
+            }
+            // Aggregate retirement is still not semantic success or final
+            // publication. Retain manager and original handoff until the
+            // separate collection and publication results are connected.
             return Err(SearchSessionFailure::physical_completion_unknown());
         }
         let mut state = self
@@ -3782,6 +3815,10 @@ where
                 self.rovent_collection_failure_v2.get_mut()
                     .unwrap_or_else(|poison| poison.into_inner()).take(),
                 self.rovent_collection_handoff_v2.get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner()).take(),
+                self.rovent_collection_handoff_transferred_v2.get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner()).take(),
+                self.rovent_collection_teacher_aggregate_ack_v2.get_mut()
                     .unwrap_or_else(|poison| poison.into_inner()).take(),
                 std::mem::take(self.rovent_collection_panic_v2.get_mut()
                     .unwrap_or_else(|poison| poison.into_inner())),

@@ -6,7 +6,7 @@
 //! Rules 결과, native node credit 또는 exact resume 권한을 발급하지 않는다.
 //! 기존 profiled R worker의 mode/recipient guard는 이 경로에서 변경하지 않는다.
 
-use super::process_scope::CollectionProcessPermit;
+use super::process_scope::{CollectionProcessPermit, CollectionWorkerJoinedWitness, CollectionWorkerLease};
 use super::profiled_worker::{ProfiledExternalOutcome, ProfiledExternalTiming};
 use super::worker::{
     ExternalWorkerClock, ExternalWorkerStartup, external_evaluation_namespace,
@@ -250,6 +250,13 @@ pub struct CollectionTeacherWorker {
     process_after_shutdown: Arc<Mutex<Option<CheckerShutdown>>>,
     thread: Option<JoinHandle<Result<CheckerShutdown, CheckerError>>>,
     joined: Option<Result<CheckerShutdown, CheckerError>>,
+    // One actual same-issuer worker reservation, distinct from OS-child state.
+    scope_worker_lease: Option<CollectionWorkerLease>,
+    scope_join_witness: Option<CollectionWorkerJoinedWitness>,
+    scope_join_failure: Option<CheckerError>,
+    // A panic payload can itself own an in-flight resource. Joining the
+    // thread does not justify silently dropping that original payload.
+    join_panic_payload: Option<Box<dyn std::any::Any + Send>>,
     high_water: u64,
 }
 
@@ -367,13 +374,9 @@ impl CollectionTeacherWorker {
                 "teacher original registration/clock/deadline",
             ));
         }
-        let launch_pin = match process_permit {
-            Some(permit) => {
-                permit.validate(registration)?;
-                launch_pin.with_collection_permit(permit)
-            }
-            None => launch_pin,
-        };
+        if let Some(permit) = process_permit.as_ref() {
+            permit.validate(registration)?;
+        }
         let mailbox = Mailbox::new(1, 2, CompletionSignal::default())
             .map_err(|_| error("teacher_worker", "mailbox_capacity"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -397,12 +400,24 @@ impl CollectionTeacherWorker {
             diagnostics.clone(),
         );
         let worker_process = process_after_shutdown.clone();
-        let thread = std::thread::Builder::new()
-            .name(format!(
-                "rz-collection-teacher-{}",
-                registration.collection_owner
-            ))
-            .spawn(move || {
+        let builder = std::thread::Builder::new().name(format!(
+            "rz-collection-teacher-{}",
+            registration.collection_owner
+        ));
+        // Reserve the unique same-issuer worker before the thread can exist.
+        // A concurrent scope close either prevents this reservation or leaves
+        // it pending until the exact spawn attempt reaches a terminal outcome.
+        let mut worker_reservation = process_permit.as_ref()
+            .map(CollectionProcessPermit::reserve_worker).transpose()?;
+        let launch_pin = match process_permit {
+            Some(permit) => launch_pin.with_collection_permit(permit),
+            None => launch_pin,
+        };
+        if worker_reservation.as_ref().is_some_and(|reservation| !reservation.spawn_allowed()) {
+            worker_reservation.take().expect("checked reservation").cancel_before_spawn();
+            return Err(error("teacher_worker", "collection_scope_closed_before_thread"));
+        }
+        let spawned = builder.spawn(move || {
                 run_worker(
                     worker_config,
                     profile,
@@ -419,8 +434,19 @@ impl CollectionTeacherWorker {
                     worker_process,
                     create_checker,
                 )
-            })
-            .map_err(|_| error("teacher_worker", "thread_spawn"))?;
+            });
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(_) => {
+                if let Some(reservation) = worker_reservation.take() {
+                    reservation.spawn_failed();
+                }
+                return Err(error("teacher_worker", "thread_spawn"));
+            }
+        };
+        // Even a quarantined/inconsistent reservation returns its actual
+        // lease; the JoinHandle and lease therefore keep the same owner.
+        let scope_worker_lease = worker_reservation.take().map(|reservation| reservation.spawn_succeeded());
         Ok(Self {
             registration,
             config,
@@ -435,6 +461,10 @@ impl CollectionTeacherWorker {
             process_after_shutdown,
             thread: Some(thread),
             joined: None,
+            scope_worker_lease,
+            scope_join_witness: None,
+            scope_join_failure: None,
+            join_panic_payload: None,
             high_water: 0,
         })
     }
@@ -554,12 +584,19 @@ impl CollectionTeacherWorker {
     }
     pub fn try_join(&mut self) -> Option<Result<CheckerShutdown, CheckerError>> {
         if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
-            let result = self
-                .thread
-                .take()
-                .expect("checked teacher worker")
-                .join()
-                .unwrap_or_else(|_| Err(error("teacher_worker", "thread_panicked")));
+            let result = match self.thread.take().expect("checked teacher worker").join() {
+                Ok(result) => result,
+                Err(payload) => {
+                    self.join_panic_payload = Some(payload);
+                    Err(error("teacher_worker", "thread_panicked"))
+                }
+            };
+            if let Some(lease) = self.scope_worker_lease.take() {
+                match lease.joined() {
+                    Ok(witness) => self.scope_join_witness = Some(witness),
+                    Err(error) => self.scope_join_failure = Some(error),
+                }
+            }
             self.joined = Some(result.clone());
             Some(result)
         } else {
@@ -568,6 +605,24 @@ impl CollectionTeacherWorker {
     }
     pub fn shutdown_snapshot(&self) -> Option<Result<CheckerShutdown, CheckerError>> {
         self.joined.clone()
+    }
+    /// Whether the original join panic payload remains with this worker.
+    /// This does not imply successful terminal delivery or process closure.
+    pub fn join_panic_payload_retained(&self) -> bool {
+        self.join_panic_payload.is_some()
+    }
+    /// Borrow the original worker join witness without transferring custody.
+    /// This establishes thread join only, not process or terminal success.
+    pub fn scope_join_witness(&self) -> Option<&CollectionWorkerJoinedWitness> {
+        self.scope_join_witness.as_ref()
+    }
+    /// Transfer the original same-issuer join witness, once. The witness
+    /// establishes thread join only, not process or terminal success.
+    pub fn take_scope_join_witness(&mut self) -> Option<CollectionWorkerJoinedWitness> {
+        self.scope_join_witness.take()
+    }
+    pub fn scope_join_failure(&self) -> Option<&CheckerError> {
+        self.scope_join_failure.as_ref()
     }
     /// An Err retirement can still leave actual quarantine/pipe/process evidence.
     /// Joining alone is not evidence that the process group and pipes closed.
@@ -596,6 +651,11 @@ fn create_profiled_teacher(
 impl Drop for CollectionTeacherWorker {
     fn drop(&mut self) {
         self.request_shutdown(Instant::now() + self.config.shutdown_grace);
+        if let Some(payload) = self.join_panic_payload.take() {
+            // Until an explicit owner-aware recovery boundary exists, dropping
+            // an unknown payload must not release resources it might own.
+            std::mem::forget(payload);
+        }
     }
 }
 
@@ -1667,10 +1727,23 @@ mod tests {
             startup,
             cleanup,
             pin.clone(),
-            Some(first_permit),
+            Some(first_permit.clone()),
             create_fixture_checker,
         )
         .unwrap();
+        // A cloned permit cannot create a second worker for the same seat,
+        // whether the first thread is still starting or already owns a child.
+        assert!(CollectionTeacherWorker::spawn_checked(
+            config.clone(),
+            profile,
+            first_registration,
+            clock,
+            startup,
+            cleanup,
+            pin.clone(),
+            Some(first_permit.clone()),
+            create_fixture_checker,
+        ).is_err());
         let mut second = CollectionTeacherWorker::spawn_checked(
             config.clone(),
             profile,
@@ -1724,6 +1797,10 @@ mod tests {
         let second_closed = close_fixture(&mut second, cleanup);
         assert_eq!(first_closed.process_identity, Some(first_process));
         assert_eq!(second_closed.process_identity, Some(second_process));
+        let first_join = first.take_scope_join_witness().expect("actual original worker join");
+        assert!(first_join.same_member(&first_permit));
+        assert!(first.take_scope_join_witness().is_none());
+        drop(first_permit);
 
         // Both actual process leases have retired; a retained closed worker
         // receipt alone must not keep the whole group exclusively claimed.

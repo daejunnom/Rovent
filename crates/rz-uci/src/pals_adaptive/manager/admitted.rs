@@ -71,6 +71,16 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_observer_v2: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_disabled: false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_disabled_first_ticket: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_busy_ticket: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_first_failure: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_disable_failed: false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_admission_v2: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_v2_settlement: None,

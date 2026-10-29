@@ -61,6 +61,8 @@ impl RoventPcCollectionRunV2 {
             Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved) => "retirement_and_handoff_observed",
             Some(RoventPcCollectionWorkerExitV2::Deadline) => "deadline",
             Some(RoventPcCollectionWorkerExitV2::AdmissionCanceled) => "admission_canceled",
+            Some(RoventPcCollectionWorkerExitV2::PhysicalAckDelivered) => "physical_scope_ack_delivered",
+            Some(RoventPcCollectionWorkerExitV2::AggregateHandoffObserved) => "physical_aggregate_handoff_observed",
             Some(RoventPcCollectionWorkerExitV2::Panicked(_)) => "caught_panic",
             None if self.worker_thread_panicked => "outer_panic",
             None => "pending",
@@ -85,8 +87,14 @@ impl RoventPcCollectionRunV2 {
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
+                "collection_incomplete_due_to_backpressure":status.collection_disabled_first_ticket.is_some() || !status.prior_disabled_first_tickets.is_empty(),
+                "first_omitted_ticket":status.collection_disabled_first_ticket.as_ref().map(ticket_json),
+                "disable_reason":status.collection_disabled_reason.map(|reason|format!("{reason:?}")),
+                "prior_disabled_first_tickets":status.prior_disabled_first_tickets.iter().map(ticket_json).collect::<Vec<_>>(),
+                "prior_disabled_reasons":status.prior_disabled_reasons.iter().map(|reason|format!("{reason:?}")).collect::<Vec<_>>(),
                 "incomplete_capture":status.incomplete_capture_count,
                 "failed_captures":status.retained_failed_captures,
+                "failed_staged_inputs":status.retained_failed_staged,
                 "failure":status.failure.map(|error|format!("{error:?}")),
                 "callback_lock_failure":status.callback_lock_failure})),
             "physical_completion_claimed":false,"corpus_published":false,"training_executed":false})
@@ -131,7 +139,8 @@ impl RoventPcCollectionRunV2 {
         )?;
         let status = self.owner.try_status()?.ok_or_else(|| invalid("Collection /2 owner busy"))?;
         check(status.admitted && status.settled && status.pending_count == 0
-            && status.incomplete_capture_count == 0 && status.failure.is_none()
+            && status.incomplete_capture_count == 0 && status.retained_failed_captures == 0
+            && status.retained_failed_staged == 0 && status.failure.is_none()
             && !status.callback_lock_failure,
             "Collection /2 native observer is not settled")?;
         Ok(self.owner.clone())
@@ -142,8 +151,10 @@ impl Drop for RoventPcCollectionRunV2 {
     fn drop(&mut self) {
         let owner_resolved = self.owner.try_status().ok().flatten().is_some_and(|status|
             status.admitted && status.settled && status.pending_count == 0
+                && status.collection_disabled_first_ticket.is_none()
+                && status.prior_disabled_first_tickets.is_empty()
                 && status.pending_retired_count == 0 && status.incomplete_capture_count == 0
-                && status.retained_failed_captures == 0 && status.failure.is_none()
+                && status.retained_failed_captures == 0 && status.retained_failed_staged == 0 && status.failure.is_none()
                 && !status.callback_lock_failure);
         let physically_resolved = owner_resolved && self.native_failure.is_none() && !self.native_failure_taken
             && self.resource_error.is_none()
@@ -174,21 +185,47 @@ pub fn run_rovent_pc_collection_lock_v2(
     worker_deadline: Instant,
     cleanup_deadline: Instant,
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
+    run_rovent_pc_collection_lock_v2_inner(arguments, plan, input_directory, worker_deadline, cleanup_deadline, |_| Ok(()))
+}
+
+/// Test harness hook: receive the actual owner created by this launch. This
+/// does not bypass pinned inputs, startup, Ready, or UCI/native admission.
+#[cfg(feature = "test-fixtures")]
+pub fn run_rovent_pc_collection_lock_v2_with_test_owner(
+    arguments: Vec<String>,
+    plan: RoventCollectionLockV2LaunchPlan,
+    input_directory: &Dir,
+    worker_deadline: Instant,
+    cleanup_deadline: Instant,
+    on_owner: impl FnOnce(&RoventCollectionOwnerLockV2) -> Result<(), ArenaError>,
+) -> Result<RoventPcCollectionRunV2, ArenaError> {
+    run_rovent_pc_collection_lock_v2_inner(arguments, plan, input_directory, worker_deadline, cleanup_deadline, on_owner)
+}
+
+fn run_rovent_pc_collection_lock_v2_inner(
+    arguments: Vec<String>,
+    plan: RoventCollectionLockV2LaunchPlan,
+    input_directory: &Dir,
+    worker_deadline: Instant,
+    cleanup_deadline: Instant,
+    on_owner: impl FnOnce(&RoventCollectionOwnerLockV2) -> Result<(), ArenaError>,
+) -> Result<RoventPcCollectionRunV2, ArenaError> {
     check(plan.maximum_roots == 1, "P/C Collection /2 bridge currently accepts one root")?;
     check(Instant::now() < worker_deadline && worker_deadline <= cleanup_deadline,
         "P/C Collection /2 finite worker/cleanup deadline")?;
     let bytes = read_pin(input_directory, &plan.manifest, 16 << 20)?;
-    let manifest = RoventCorpusManifestLockV2::from_json(
+    let manifest = Arc::new(RoventCorpusManifestLockV2::from_json(
         std::str::from_utf8(&bytes).map_err(|_| invalid("Collection /2 manifest UTF8"))?,
-    )?;
+    )?);
     plan.validate_registration(&manifest)?;
-    let (owner, observer) = RoventCollectionOwnerLockV2::new(manifest.clone(), plan.metadata.clone())?;
+    let (owner, observer) = RoventCollectionOwnerLockV2::new_shared(Arc::clone(&manifest), plan.metadata.clone())?;
+    on_owner(&owner)?;
     let roster = plan.teacher_slots.iter().map(|entry| RoventTeacherRosterEntryV2 {
         actor_id: entry.actor_id.clone(), source_index: entry.source_index,
         collection_owner: entry.collection_owner,
     }).collect();
     let (bridge, worker) = RoventPcCollectionBridgeV2::new(
-        owner.clone(), Arc::new(manifest.registration.clone()), roster,
+        owner.clone(), Arc::clone(&manifest), roster,
     )?;
     let worker = Arc::new(Mutex::new(worker));
     let resource = Arc::new(Mutex::new(resources::CollectionResourceCustody::prepare(

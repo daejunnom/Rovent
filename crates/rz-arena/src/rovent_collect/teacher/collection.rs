@@ -19,7 +19,7 @@ fn digest(value: &str) -> Result<Digest, ArenaError> {
     }
     Ok(Digest(bytes))
 }
-fn scope_json(scope: TeacherInputScope) -> Value {
+pub(super) fn scope_json(scope: TeacherInputScope) -> Value {
     json!({"authority":{"process_epoch":scope.authority.epoch.0,"game_generation":scope.authority.game.0,
         "root_generation":scope.authority.root.0,"implementation_sha256":hex(scope.authority.implementation)},
         "input_sha256":hex(scope.input_sha256),"view_sha256":hex(scope.view_sha256),"source_sha256":hex(scope.source_sha256),

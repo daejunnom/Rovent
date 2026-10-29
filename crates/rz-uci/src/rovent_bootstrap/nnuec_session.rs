@@ -108,9 +108,50 @@ pub struct RoventNnuecCollectionHandoffV2 {
     observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
     settlement: Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
     native_fence: AdaptiveShutdownReceipt,
+    collection_failures: Box<[crate::pals_adaptive::AdaptiveCollectionError]>,
+    teacher_physical_ack: Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
+    teacher_aggregate_ack: Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
 }
 
 impl RoventNnuecCollectionHandoffV2 {
+    /// Collection diagnostics do not imply a failure of the native search.
+    pub fn collection_failures(&self) -> &[crate::pals_adaptive::AdaptiveCollectionError] {
+        &self.collection_failures
+    }
+    /// This attests physical and worker cleanup only. It is not teacher or
+    /// corpus success; duplicate/foreign evidence returns its original owner.
+    pub fn submit_teacher_aggregate_ack(
+        &mut self,
+        ack: crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2,
+    ) -> Result<(), crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2> {
+        if self.teacher_aggregate_ack.is_some() || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_aggregate_ack = Some(ack);
+        Ok(())
+    }
+
+    pub fn teacher_aggregate_ack(&self) -> Option<&crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2> {
+        self.teacher_aggregate_ack.as_ref()
+    }
+
+    /// Keep the original acknowledgement; duplicate or different-root
+    /// evidence is rejected intact. This does not certify worker join.
+    pub fn submit_teacher_physical_ack(
+        &mut self,
+        ack: crate::pals_adaptive::RoventTeacherScopePhysicalAckV2,
+    ) -> Result<(), crate::pals_adaptive::RoventTeacherScopePhysicalAckV2> {
+        if self.teacher_physical_ack.is_some() || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_physical_ack = Some(ack);
+        Ok(())
+    }
+
+    pub fn teacher_physical_ack(&self) -> Option<&crate::pals_adaptive::RoventTeacherScopePhysicalAckV2> {
+        self.teacher_physical_ack.as_ref()
+    }
+
     pub fn parts_mut(&mut self) -> (
         &RoventCollectionRootAdmissionV2,
         &mut AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
@@ -125,8 +166,11 @@ impl RoventNnuecCollectionHandoffV2 {
         AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
         Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
         AdaptiveShutdownReceipt,
+        Box<[crate::pals_adaptive::AdaptiveCollectionError]>,
+        Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
+        Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
     ) {
-        (self.admission, self.observer, self.settlement, self.native_fence)
+        (self.admission, self.observer, self.settlement, self.native_fence, self.collection_failures, self.teacher_physical_ack, self.teacher_aggregate_ack)
     }
 }
 
@@ -147,6 +191,7 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     fn revoke(&self);
     /// A bounded nonblocking handoff; delivery is not teacher retirement.
     fn handoff_sender(&self) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>;
+
 }
 
 /// Failure custody returned by the /2 hook. This must contain the original
@@ -739,6 +784,9 @@ pub struct RoventNnuecSessionDriver {
     collection_hooks: RoventNnuecCollectionHooks,
     collection_origin_v2: Option<RoventNativeCollectionOriginV2>,
     collection_hooks_v2: Option<Arc<dyn RoventNnuecCollectionHooksV2>>,
+    /// The channel can lose its receiver after a successful send. Preserve
+    /// the same original handoff until outer custody is actually proven.
+    v2_handoff_custody: Mutex<Option<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>>,
     v2_revoke_panic: Mutex<Option<Box<dyn Any + Send>>>,
     selective_policy: Digest,
     frontier_limits: FrontierLimits,
@@ -1045,6 +1093,7 @@ impl RoventNnuecSessionDriver {
             collection_hooks: collection_hooks.unwrap_or_default(),
             collection_origin_v2: None,
             collection_hooks_v2: None,
+            v2_handoff_custody: Mutex::new(None),
             v2_revoke_panic: Mutex::new(None),
             selective_policy,
             frontier_limits,
@@ -1364,6 +1413,7 @@ impl RoventNnuecSessionDriver {
             collection_hooks: RoventNnuecCollectionHooks::default(),
             collection_origin_v2,
             collection_hooks_v2,
+            v2_handoff_custody: Mutex::new(None),
             v2_revoke_panic: Mutex::new(None),
             selective_policy,
             frontier_limits,
@@ -2358,6 +2408,12 @@ impl SearchSessionDriver for RoventNnuecSessionDriver {
 }
 impl Drop for RoventNnuecSessionDriver {
     fn drop(&mut self) {
+        // Outer delivery alone does not prove that the receiver retained the
+        // original observer/data. Unclaimed evidence is quarantined on drop.
+        if let Some(handoff) = self.v2_handoff_custody.get_mut()
+            .unwrap_or_else(|poison| poison.into_inner()).take() {
+            std::mem::forget(handoff);
+        }
         let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
         if !matches!(state, State::Closed) {
             std::mem::forget(std::mem::replace(state, State::Moving));

@@ -115,9 +115,44 @@ pub struct RoventPcCollectionHandoffV2 {
     observer: AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
     settlement: Result<(), AdaptiveCollectionError>,
     native_fence: RoleOnlyShutdownReceipt,
+    teacher_physical_ack: Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
+    teacher_aggregate_ack: Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
 }
 
 impl RoventPcCollectionHandoffV2 {
+    /// Accept exactly one physical teacher-scope acknowledgement from this
+    /// same root. A mismatch or duplicate returns the original capability.
+    /// This does not attest semantic success or dataset publication.
+    pub fn submit_teacher_physical_ack(
+        &mut self,
+        ack: crate::pals_adaptive::RoventTeacherScopePhysicalAckV2,
+    ) -> Result<(), crate::pals_adaptive::RoventTeacherScopePhysicalAckV2> {
+        if self.teacher_physical_ack.is_some() || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_physical_ack = Some(ack);
+        Ok(())
+    }
+
+    /// Retain one aggregate proof for this exact root. It does not on its own
+    /// attest semantic success, publication, or authority to resume a root.
+    pub fn submit_teacher_aggregate_ack(
+        &mut self,
+        ack: crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2,
+    ) -> Result<(), crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2> {
+        if self.teacher_aggregate_ack.is_some() || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_aggregate_ack = Some(ack);
+        Ok(())
+    }
+
+    pub fn teacher_aggregate_ack(
+        &self,
+    ) -> Option<&crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2> {
+        self.teacher_aggregate_ack.as_ref()
+    }
+
     /// Inspect or operate on the original observer while the session retains
     /// another Arc to this handoff. Borrowing cannot move out its owners.
     pub fn parts_mut(
@@ -140,8 +175,35 @@ impl RoventPcCollectionHandoffV2 {
         AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
         Result<(), AdaptiveCollectionError>,
         RoleOnlyShutdownReceipt,
+        Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
+        Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
     ) {
-        (self.admission, self.observer, self.settlement, self.native_fence)
+        (self.admission, self.observer, self.settlement, self.native_fence, self.teacher_physical_ack, self.teacher_aggregate_ack)
+    }
+}
+
+/// The original joined per-root collection worker and the same handoff.
+/// Custody does not assert dataset publication or semantic teacher success.
+pub struct RoventPcCollectionRootCustodyV2 {
+    handoff: Arc<Mutex<RoventPcCollectionHandoffV2>>,
+    original_worker: Box<dyn Any + Send>,
+}
+
+impl RoventPcCollectionRootCustodyV2 {
+    /// The adapter constructs this only after joining the original worker.
+    pub fn from_joined_worker(
+        handoff: Arc<Mutex<RoventPcCollectionHandoffV2>>,
+        original_worker: Box<dyn Any + Send>,
+    ) -> Self {
+        Self { handoff, original_worker }
+    }
+
+    pub fn matches_handoff(&self, handoff: &Arc<Mutex<RoventPcCollectionHandoffV2>>) -> bool {
+        Arc::ptr_eq(&self.handoff, handoff)
+    }
+
+    pub fn into_parts(self) -> (Arc<Mutex<RoventPcCollectionHandoffV2>>, Box<dyn Any + Send>) {
+        (self.handoff, self.original_worker)
     }
 }
 
@@ -166,6 +228,13 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
     /// sends directly with `try_send` and retains another Arc whether delivery
     /// fails, the receiver is dropped, or teacher completion is unresolved.
     fn handoff_sender(&self) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>;
+    /// Nonblocking; `None` preserves the still-running original worker.
+    fn try_take_root_custody(
+        &self,
+        _handoff: &Arc<Mutex<RoventPcCollectionHandoffV2>>,
+    ) -> Result<Option<RoventPcCollectionRootCustodyV2>, AdaptiveManagerError> {
+        Ok(None)
+    }
 }
 
 /// The rejected admission and every acquired observer/teacher owner remain
@@ -640,6 +709,7 @@ pub struct RoventPcSessionDriver {
     collection_hooks_v2: Option<Arc<dyn RoventPcCollectionHooksV2>>,
     collection_v2_outstanding: AtomicBool,
     retained_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionHandoffV2>>>>,
+    retained_collection_custody_v2: Mutex<Option<RoventPcCollectionRootCustodyV2>>,
     retained_collection_failure_v2: Mutex<Option<RoventPcCollectionAdmissionFailureV2>>,
     retained_collection_panic_v2: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
     selective_policy: Digest,
@@ -969,6 +1039,7 @@ impl RoventPcSessionDriver {
             collection_hooks_v2,
             collection_v2_outstanding: AtomicBool::new(false),
             retained_collection_handoff_v2: Mutex::new(None),
+            retained_collection_custody_v2: Mutex::new(None),
             retained_collection_failure_v2: Mutex::new(None),
             retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
@@ -1277,6 +1348,7 @@ impl RoventPcSessionDriver {
             collection_hooks_v2: None,
             collection_v2_outstanding: AtomicBool::new(false),
             retained_collection_handoff_v2: Mutex::new(None),
+            retained_collection_custody_v2: Mutex::new(None),
             retained_collection_failure_v2: Mutex::new(None),
             retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
@@ -2248,19 +2320,56 @@ impl RoventPcSessionDriver {
                 observer,
                 settlement,
                 native_fence: physical.clone(),
+                teacher_physical_ack: None,
+                teacher_aggregate_ack: None,
             }));
             *self.retained_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
-            if sender.try_send(handoff).is_err() {
+            if sender.try_send(Arc::clone(&handoff)).is_err() {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
                 return Err(physical_unknown_at("RoventPcV2HandoffUndelivered", "original handoff and manager retained"));
             }
-            // Delivery transfers the observer, but is not teacher retirement.
-            // Keep the original manager and hook until same-owner retirement
-            // is observed by a separate worker.
+            // Reclaim only the same joined root worker, without blocking the
+            // collection worker on this manager. A scope ACK by itself does
+            // not prove worker join, terminal recovery, or publication.
+            let signal = manager.activity_signal();
+            let hook = self.collection_hooks_v2.as_ref().expect("started hook");
+            let mut custody_state = String::from("worker join not yet observed");
+            loop {
+                let observed = signal.version();
+                let result = catch_unwind(AssertUnwindSafe(|| hook.try_take_root_custody(&handoff)));
+                match result {
+                    Ok(Ok(Some(custody))) => {
+                        let matches = custody.matches_handoff(&handoff);
+                        *self.retained_collection_custody_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(custody);
+                        custody_state = if matches {
+                            "same root worker joined; publication custody retained but not yet transferred"
+                        } else {
+                            "foreign joined worker custody retained; original root unresolved"
+                        }.into();
+                        break;
+                    }
+                    Ok(Ok(None)) if Instant::now() < context.shutdown_deadline => {
+                        signal.wait_changed(observed, context.shutdown_deadline
+                            .saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                    }
+                    Ok(Ok(None)) => break,
+                    Ok(Err(error)) => {
+                        custody_state = format!("original worker custody request failed; owner retained by hook: {error:?}");
+                        break;
+                    }
+                    Err(payload) => {
+                        self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                        custody_state = "worker custody callback panicked; original owners retained".into();
+                        break;
+                    }
+                }
+            }
+            // Publication/row custody has no transfer path yet. Keep the
+            // worker, observer and manager instead of fabricating completion.
             *state = State::Manager(manager);
             self.closed.store(true, Ordering::Release);
-            return Err(physical_unknown_at("RoventPcV2TeacherRetirementUnsupported", "observer handoff sent; same-owner teacher retirement not yet confirmed"));
+            return Err(physical_unknown_at("RoventPcV2CollectionCustodyPending", custody_state));
         }
         if let Some(observer) = &self.collection_hooks.root_closure {
             if let Err(error) = observer(&mut manager) {
@@ -2681,9 +2790,6 @@ impl RoventPcSessionDriver {
                         }
                     };
                     if self.collection_v2_outstanding.load(Ordering::Acquire) {
-                        // Native root shutdown does not establish teacher
-                        // retirement or an observer handoff. Preserve all
-                        // owners until a same-owner proof is connected.
                         *state = State::Manager(manager);
                         return Err(SearchSessionFailure::physical_completion_unknown());
                     }
@@ -2858,6 +2964,9 @@ impl Drop for RoventPcSessionDriver {
             }
             if let Some(handoff) = self.retained_collection_handoff_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
                 std::mem::forget(handoff);
+            }
+            if let Some(custody) = self.retained_collection_custody_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+                std::mem::forget(custody);
             }
             if let Some(failure) = self.retained_collection_failure_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
                 std::mem::forget(failure);

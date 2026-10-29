@@ -4,7 +4,8 @@
 use super::collection::{AdaptiveCollectionObserver, RoventCollectionRootAdmission};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use super::collection::{
-    AdaptiveCollectionObserverBoxV2, RoleOnlySearchConsumptionV2,
+    AdaptiveCollectionBoundaryV2, AdaptiveCollectionDispatchV2, AdaptiveCollectionObserverBoxV2,
+    RoleOnlySearchConsumptionV2, RoventDispatchWitnessFailureV2, RoventTicketValidationKindV2,
     RoventCollectionAcceptedWitnessV2, RoventCollectionConsumedWitnessV2,
     RoventCollectionRootAdmissionV2,
 };
@@ -351,6 +352,12 @@ where
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2: Option<AdaptiveCollectionObserverBoxV2<Q, B::Output>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_disabled_first_ticket: Option<RoleTicketEnvelope>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_first_failure: Option<AdaptiveCollectionError>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_busy_ticket: Option<RoleTicketEnvelope>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_admission_v2: Option<RoventCollectionRootAdmissionV2>,
     collection_settled: bool,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -459,6 +466,12 @@ where
             collection_admission: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_v2: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_disabled_first_ticket: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_first_failure: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_busy_ticket: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_admission_v2: None,
             collection_settled: false,
@@ -1257,7 +1270,23 @@ where
             self.bindings[index].dispatch_pending = true;
         }
         let mut changed = false;
-        for index in 0..self.bindings.len() {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let priority = self.collection_v2_busy_ticket.and_then(|ticket|
+            self.bindings.iter().position(|binding| binding.ticket == Some(ticket) && binding.dispatch_pending));
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.collection_v2_busy_ticket.is_some() && priority.is_none() {
+            // A staged capture cannot be silently replaced by another ticket.
+            // Close through the normal owner fence and settlement path.
+            return Err(AdaptiveManagerError::Invalid("P/C V2 busy ticket owner unavailable"));
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let priority: Option<usize> = None;
+        for ordinal in 0..self.bindings.len() {
+            let index = match priority {
+                Some(first) if ordinal == 0 => first,
+                Some(first) if ordinal <= first => ordinal - 1,
+                _ => ordinal,
+            };
             if !self.bindings[index].dispatch_pending {
                 continue;
             }
@@ -1277,12 +1306,79 @@ where
                         .ok_or(AdaptiveManagerError::Invalid(
                             "P/C V2 collection admission or verifier absent",
                         ))?;
-                    let witness = super::collection::RoventCollectionDispatchWitnessV2::new(
+                    let witness = match super::collection::RoventCollectionDispatchWitnessV2::try_new(
                         admission, verifier, &ticket,
-                    )?;
-                    observer.dispatch(witness, &binding.input)?;
+                    ) {
+                        Ok(witness) => witness,
+                        Err(RoventDispatchWitnessFailureV2::Ticket(error)) if error.kind == RoventTicketValidationKindV2::Busy => {
+                            self.collection_v2_busy_ticket = Some(ticket);
+                            break;
+                        }
+                        Err(RoventDispatchWitnessFailureV2::Ticket(error)) => return Err(error.error.into()),
+                        Err(RoventDispatchWitnessFailureV2::NativeIdentity(error)) => return Err(error.into()),
+                    };
+                    if let Some(first) = self.collection_v2_disabled_first_ticket {
+                        if ticket.id.epoch != first.id.epoch || ticket.authority != first.authority {
+                            return Err(AdaptiveManagerError::Invalid("P/C V2 disabled boundary mismatch"));
+                        }
+                        if ticket.id.sequence < first.id.sequence {
+                            match observer.allow_disabled_prior_ticket(witness)? {
+                                AdaptiveCollectionBoundaryV2::Ready => {}
+                                // Retain this exact pending ticket for the next
+                                // tick; do not dispatch native before its marker.
+                                AdaptiveCollectionBoundaryV2::Busy => {
+                                    self.collection_v2_busy_ticket = Some(ticket);
+                                    break;
+                                }
+                            }
+                        }
+                    } else if let Some(original) = self.collection_v2_first_failure.as_ref() {
+                        match observer.disable_after_failure(witness, original)? {
+                            AdaptiveCollectionBoundaryV2::Ready => self.collection_v2_disabled_first_ticket = Some(ticket),
+                            AdaptiveCollectionBoundaryV2::Busy => {
+                                self.collection_v2_busy_ticket = Some(ticket);
+                                break;
+                            }
+                        }
+                    } else {
+                        match observer.dispatch(witness, &binding.input) {
+                            Ok(AdaptiveCollectionDispatchV2::Captured) => {}
+                            Ok(AdaptiveCollectionDispatchV2::Busy) => {
+                                self.collection_v2_busy_ticket = Some(ticket);
+                                break;
+                            }
+                            Ok(AdaptiveCollectionDispatchV2::DisabledBackpressure) => {
+                                self.collection_v2_disabled_first_ticket = Some(ticket);
+                            }
+                            Err(original) => {
+                                self.collection_v2_first_failure = Some(original.clone());
+                                let witness = match super::collection::RoventCollectionDispatchWitnessV2::try_new(
+                                    admission, verifier, &ticket,
+                                ) {
+                                    Ok(witness) => witness,
+                                    Err(RoventDispatchWitnessFailureV2::Ticket(error)) if error.kind == RoventTicketValidationKindV2::Busy => {
+                                        self.collection_v2_busy_ticket = Some(ticket);
+                                        break;
+                                    }
+                                    Err(RoventDispatchWitnessFailureV2::Ticket(error)) => return Err(error.error.into()),
+                                    Err(RoventDispatchWitnessFailureV2::NativeIdentity(error)) => return Err(error.into()),
+                                };
+                                match observer.disable_after_failure(witness, &original)? {
+                                    AdaptiveCollectionBoundaryV2::Ready => self.collection_v2_disabled_first_ticket = Some(ticket),
+                                    AdaptiveCollectionBoundaryV2::Busy => {
+                                        self.collection_v2_busy_ticket = Some(ticket);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 self.bindings[index].collection_dispatched = true;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if self.collection_v2_busy_ticket == Some(ticket) {
+                    self.collection_v2_busy_ticket = None;
+                }
             }
             let binding = &self.bindings[index];
             match self
@@ -1418,7 +1514,9 @@ where
                     &mut self.collection_v2,
                     self.bindings[index].ticket.as_ref(),
                 ) {
-                    observer.abandoned(ticket)?;
+                    if let Err(error) = observer.abandoned(ticket) {
+                        self.collection_v2_first_failure.get_or_insert(error);
+                    }
                 }
                 self.bindings[index].collection_abandoned = true;
             }
@@ -1479,7 +1577,7 @@ where
                             ) {
                                 // Consumption already happened. Keep both that
                                 // fact and the observer error without replay.
-                                self.record_failure(AdaptiveManagerError::Collection(error));
+                                self.collection_v2_first_failure.get_or_insert(error);
                             }
                         }
                     }
@@ -1962,7 +2060,9 @@ where
                                     let witness = RoventCollectionAcceptedWitnessV2::new(
                                         admission, &verifier, accepted, role_output,
                                     )?;
-                                    observer.accepted(witness, &binding.input, output.as_ref())?;
+                                    if let Err(error) = observer.accepted(witness, &binding.input, output.as_ref()) {
+                                        self.collection_v2_first_failure.get_or_insert(error);
+                                    }
                                 }
                             }
                             Err(rejected) => {
@@ -2118,7 +2218,7 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             let collection_failure_v2 = self.collection_v2.as_mut().and_then(|observer| {
                 let verifier = self.native.native_acceptance_verifier();
-                self.collection_admission_v2.as_ref().zip(verifier.as_ref())
+                let witness = self.collection_admission_v2.as_ref().zip(verifier.as_ref())
                     .ok_or_else(|| AdaptiveCollectionError::new(
                         AdaptiveCollectionStage::NativeEvent,
                         "NativeOwnerUnavailable",
@@ -2129,7 +2229,11 @@ where
                             admission, verifier, &event,
                         )
                     })
-                    .and_then(|witness| observer.native_event(witness)).err()
+                    ;
+                match witness {
+                    Ok(witness) => observer.native_event(witness).err().map(|error| (error, true)),
+                    Err(error) => Some((error, false)),
+                }
             });
             if let Err(error) = self.event(event) {
                 self.record_failure(error);
@@ -2138,8 +2242,12 @@ where
                 self.record_failure(AdaptiveManagerError::Collection(error));
             }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            if let Some(error) = collection_failure_v2 {
-                self.record_failure(AdaptiveManagerError::Collection(error));
+            if let Some((error, callback)) = collection_failure_v2 {
+                if callback {
+                    self.collection_v2_first_failure.get_or_insert(error);
+                } else {
+                    self.record_failure(AdaptiveManagerError::Collection(error));
+                }
             }
         }
         for action in [
@@ -2220,10 +2328,13 @@ where
                     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                     if let Some(observer) = &mut self.collection_v2 {
                         let result = observer.settled(&remaining);
-                        self.collection_v2_settlement = Some(result.clone());
                         if let Err(error) = result {
-                            self.record_failure(AdaptiveManagerError::Collection(error));
+                            self.collection_v2_first_failure.get_or_insert(error);
                         }
+                        self.collection_v2_settlement = Some(match self.collection_v2_first_failure.as_ref() {
+                            Some(error) => Err(error.clone()),
+                            None => Ok(()),
+                        });
                     }
                     self.collection_settled = true;
                 }

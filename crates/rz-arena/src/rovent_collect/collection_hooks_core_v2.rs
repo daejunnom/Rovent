@@ -4,14 +4,17 @@
 #![allow(dead_code)]
 use super::teacher::v2_session::{
     RoventCollectionTeacherSessionV2, RoventTeacherRosterEntryV2, TeacherSessionRetirementSealV2,
-    TeacherSessionStartErrorV2,
+    TeacherSessionStartErrorV2, TeacherSessionPrepareOwnerV2,
 };
 use super::{ArenaError, RoventCollectionOwnerLockV2, check};
-use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
-use rz_uci::pals_adaptive::{AdaptiveManagerError, RoventCollectionRootAdmissionV2};
+use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
+use rz_uci::pals_adaptive::{AdaptiveManagerError, RoventCollectionRootAdmissionV2, RoventTeacherScopePhysicalAckV2, RoventTeacherScopeWorkerAckV2};
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
     RoventTeacherRetirementObservationV2, RoventTeacherRetirementTokenV2,
+    RoventTeacherWorkerTerminalTokenV2,
+    RoventTeacherScopeAggregateAckV2, RoventTeacherScopeAggregateFailureV2,
+    RoventTeacherRetiredActorV2,
     TeacherRecoveryCustodianV2,
 };
 use std::collections::BTreeMap;
@@ -62,14 +65,16 @@ pub(crate) struct CollectionBridgeCoreV2<H> {
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
     pub(crate) fn new(
         owner: RoventCollectionOwnerLockV2,
-        manifest: Arc<RoventCorpusManifestV2>,
+        manifest: Arc<RoventCorpusManifestLockV2>,
         roster: Vec<RoventTeacherRosterEntryV2>,
         handoff_matches: HandoffMatches<H>,
+        handoff_submit: HandoffSubmit<H>,
     ) -> Result<(Arc<Self>, CollectionWorkerCoreV2<H>), ArenaError> {
-        manifest.validate()?;
+        // Full /2 validation uses the original live input lock once admitted.
+        manifest.registration.validate()?;
         check(
-            owner.matches_registration(&manifest)?,
-            "V2 teacher and original corpus registration differ",
+            owner.matches_manifest(&manifest)?,
+            "V2 teacher and original corpus manifest owners differ",
         )?;
         check(
             !roster.is_empty() && roster.len() <= 16,
@@ -95,6 +100,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             admission_receiver,
             handoff_receiver,
             handoff_matches,
+            handoff_submit,
             revoked,
             failed,
             admission_phase,
@@ -103,10 +109,22 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             roster,
             slot: None,
             handoff: None,
+            physical_ack: None,
+            worker_ack: None,
+            aggregate_ack: None,
+            aggregate_failure: None,
+            aggregate_release_failed: false,
+            physical_ack_delivered: false,
+            physical_ack_error: None,
+            scope_busy_observations: 0,
+            scope_close_failure_recorded: false,
             session: None,
+            prepare_owner: None,
+            unclaimed_scope_outcome: None,
             retirement: None,
             custodian: TeacherRecoveryCustodianV2::new(),
             tokens: BTreeMap::new(),
+            worker_tokens: BTreeMap::new(),
             teacher_observations: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
             next_actor: 0,
@@ -120,6 +138,9 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
 }
 
 pub(crate) type HandoffMatches<H> = fn(&mut H, &RoventCollectionRootAdmissionV2, &TeacherSessionRetirementSealV2) -> bool;
+/// On rejection the same opaque roster aggregate returns to its owner.
+pub(crate) type HandoffSubmit<H> = fn(&mut H, RoventTeacherScopeAggregateAckV2)
+    -> Result<(), RoventTeacherScopeAggregateAckV2>;
 
 pub(crate) struct CoreAdmissionFailure {
     pub(crate) error: AdaptiveManagerError,
@@ -264,7 +285,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
 pub(crate) enum WorkerFailure {
     Preparation(ArenaError),
     ActorStart(TeacherSessionStartErrorV2),
-    Shutdown(ArenaError),
+    Shutdown(rz_uci::pals_adaptive::AdaptiveCollectionError),
     TeacherWorkerJoin {
         actor_id: String,
         error: rz_search::cpu_checker::CheckerError,
@@ -278,6 +299,7 @@ pub(crate) enum WorkerFailure {
     RootClosedBeforeStartup,
     WorkerPanicked,
     RetirementSealRejected,
+    AggregateRejected(&'static str),
 }
 
 impl WorkerFailure {
@@ -297,6 +319,7 @@ impl WorkerFailure {
             Self::RootClosedBeforeStartup => "root_closed_before_startup",
             Self::WorkerPanicked => "worker_panicked",
             Self::RetirementSealRejected => "retirement_seal_rejected",
+            Self::AggregateRejected(_) => "aggregate_rejected",
         }
     }
 }
@@ -316,18 +339,33 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     admission_receiver: mpsc::Receiver<Arc<AdmissionSlot>>,
     handoff_receiver: mpsc::Receiver<Arc<Mutex<H>>>,
     handoff_matches: HandoffMatches<H>,
+    handoff_submit: HandoffSubmit<H>,
     revoked: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     admission_phase: Arc<AtomicU8>,
     startup: Arc<OnceLock<RoventStartupControl>>,
-    manifest: Arc<RoventCorpusManifestV2>,
+    manifest: Arc<RoventCorpusManifestLockV2>,
     roster: Vec<RoventTeacherRosterEntryV2>,
     slot: Option<Arc<AdmissionSlot>>,
     handoff: Option<Arc<Mutex<H>>>,
+    physical_ack: Option<RoventTeacherScopePhysicalAckV2>,
+    worker_ack: Option<RoventTeacherScopeWorkerAckV2>,
+    aggregate_ack: Option<RoventTeacherScopeAggregateAckV2>,
+    aggregate_failure: Option<Box<RoventTeacherScopeAggregateFailureV2>>,
+    aggregate_release_failed: bool,
+    physical_ack_delivered: bool,
+    physical_ack_error: Option<String>,
+    scope_busy_observations: u64,
+    scope_close_failure_recorded: bool,
     session: Option<RoventCollectionTeacherSessionV2>,
+    prepare_owner: Option<Box<TeacherSessionPrepareOwnerV2>>,
+    unclaimed_scope_outcome: Option<rz_search::external_cpu::process_scope::CollectionScopePhysicalOutcome>,
     retirement: Option<TeacherSessionRetirementSealV2>,
     custodian: TeacherRecoveryCustodianV2,
     tokens: BTreeMap<String, RoventTeacherRetirementTokenV2>,
+    // Original joined workers which do not yet have physical retirement.
+    // Never drop or replace them on a no-child or unknown observation.
+    worker_tokens: BTreeMap<String, RoventTeacherWorkerTerminalTokenV2>,
     teacher_observations: BTreeMap<String, RoventTeacherRetirementObservationV2>,
     diagnostics: BTreeMap<String, rz_search::external_cpu::collection_teacher::TeacherDiagnostics>,
     next_actor: usize,
@@ -343,11 +381,39 @@ pub(crate) enum CollectionWorkerExitV2 {
     NoAdmission,
     AdmissionCanceled,
     RetirementAndHandoffObserved,
+    /// Only the process scope proof was transferred to the same root. Actor
+    /// worker join, Collection success and publication remain separate.
+    PhysicalAckDelivered,
+    /// The original aggregate was handed off. Semantic success, publication,
+    /// native completion and this bridge thread's join remain separate.
+    AggregateHandoffObserved,
     Deadline,
     Panicked(Vec<Box<dyn std::any::Any + Send>>),
 }
 
+/// A read-only observation of the original handoff is not a transfer or a
+/// completion receipt. In particular, temporary lock contention is not a
+/// collection failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandoffObservationErrorV2 {
+    Absent,
+    Busy,
+    Poisoned,
+}
+
 impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
+    pub(crate) fn try_handoff_observation<T>(
+        &self,
+        observe: impl FnOnce(&H) -> T,
+    ) -> Result<T, HandoffObservationErrorV2> {
+        let handoff = self.handoff.as_ref().ok_or(HandoffObservationErrorV2::Absent)?;
+        let handoff = handoff.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => HandoffObservationErrorV2::Busy,
+            std::sync::TryLockError::Poisoned(_) => HandoffObservationErrorV2::Poisoned,
+        })?;
+        Ok(observe(&handoff))
+    }
+
     fn record_failure(&mut self, failure: WorkerFailure) {
         if self.failure.is_none() {
             self.failure = Some(failure);
@@ -366,7 +432,14 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         let failure = self.session.as_mut().and_then(|session| session.request_shutdown(until).err());
         self.shutdown_requested = true;
         if let Some(error) = failure {
-            self.record_failure(WorkerFailure::Shutdown(error));
+            if error.code == "TeacherScopeBusy" {
+                // Contention is retried by the physical observation path;
+                // preserve its count without declaring a semantic failure.
+                self.scope_busy_observations = self.scope_busy_observations.saturating_add(1);
+            } else {
+                self.scope_close_failure_recorded = true;
+                self.record_failure(WorkerFailure::Shutdown(error));
+            }
         }
     }
 
@@ -387,7 +460,11 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         let slot = Arc::clone(self.slot.as_ref().expect("admission retained"));
         match slot.state.load(Ordering::Acquire) {
             RESERVING => return,
-            REJECTED => return,
+            REJECTED => {
+                self.poll_handoff();
+                self.try_transfer_physical_ack();
+                return;
+            }
             INSTALLED => {}
             _ => {
                 self.record_failure(WorkerFailure::HandoffMismatch);
@@ -434,7 +511,10 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 &self.roster,
             ) {
                 Ok(session) => self.session = Some(session),
-                Err(error) => self.record_failure(WorkerFailure::Preparation(error)),
+                Err(rejected) => {
+                    self.prepare_owner = rejected.owner;
+                    self.record_failure(WorkerFailure::Preparation(rejected.error));
+                }
             }
         }
         if let Some(session) = &mut self.session {
@@ -476,7 +556,10 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                             self.diagnostics.insert(item.actor_id.clone(), original);
                         }
                     }
-                    match session.try_retire_actor(&item.actor_id) {
+                    if self.worker_tokens.contains_key(&item.actor_id) {
+                        continue;
+                    }
+                    match session.try_finish_worker_actor(&item.actor_id) {
                         Ok(Some(token)) => {
                             let observation = token.observation();
                             // Preserve all independent fields, including a
@@ -495,7 +578,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                                     actor_id: item.actor_id.clone(),
                                 });
                             }
-                            self.tokens.insert(item.actor_id.clone(), token);
+                            // Keep original terminal and lifecycle intact for
+                            // the same-scope worker/physical aggregate.
+                            self.worker_tokens.insert(item.actor_id.clone(), token);
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -531,6 +616,11 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 }
             }
         }
+        self.poll_handoff();
+        self.try_transfer_physical_ack();
+    }
+
+    fn poll_handoff(&mut self) {
         if self.handoff.is_none() {
             match self.handoff_receiver.try_recv() {
                 Ok(handoff) => self.handoff = Some(handoff),
@@ -538,6 +628,191 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.record_failure(WorkerFailure::HandoffDisconnected)
                 }
+            }
+        }
+    }
+
+    /// Get the physical-only proof outside the handoff lock. In particular,
+    /// a Collection semantic error or observer settlement error must not
+    /// turn a confirmed teacher-process outcome into physical unknown.
+    fn try_transfer_physical_ack(&mut self) {
+        if self.physical_ack_delivered || self.handoff.is_none() { return; }
+        if self.aggregate_failure.is_some() || self.aggregate_release_failed { return; }
+        if self.aggregate_ack.is_some() {
+            self.transfer_aggregate_ack();
+            return;
+        }
+        let Some(slot) = self.slot.as_ref().cloned() else { return; };
+        let rejected = slot.state.load(Ordering::Acquire) == REJECTED;
+        if !rejected && !self.revoked.load(Ordering::Acquire) && self.failure.is_none() { return; }
+
+        if self.physical_ack.is_none() {
+            // A previous nonblocking close may have met contention; retry
+            // without interpreting it as a physical failure. Started actors
+            // were already signalled by request_teacher_shutdown.
+            let close_error = self.session.as_mut().and_then(|session| session.close_admission().err());
+            if let Some(error) = close_error {
+                if error.code == "TeacherScopeBusy" {
+                    self.scope_busy_observations = self.scope_busy_observations.saturating_add(1);
+                } else if !self.scope_close_failure_recorded {
+                    self.scope_close_failure_recorded = true;
+                    self.record_failure(WorkerFailure::Shutdown(error.clone()));
+                }
+                self.physical_ack_error = Some(error.to_string());
+                return;
+            }
+            let result = if let Some(session) = &self.session {
+                session.try_physical_retirement()
+            } else if let Some(seal) = &self.retirement {
+                seal.try_physical_retirement()
+            } else if let Some(owner) = self.prepare_owner.as_deref() {
+                match owner {
+                    TeacherSessionPrepareOwnerV2::Claimed(capability) => {
+                        capability.close().and_then(|()| capability.try_physical_retirement())
+                    }
+                    TeacherSessionPrepareOwnerV2::Unclaimed(scope) => {
+                        // This issuer was rejected before claim and cannot be
+                        // submitted to a worker. Keep its actual closed roster
+                        // outcome independently of the root's no-scope seal.
+                        if self.unclaimed_scope_outcome.is_none() {
+                            scope.close_admission();
+                            match scope.try_physical_retirement() {
+                                Ok(Some(outcome)) => self.unclaimed_scope_outcome = Some(outcome),
+                                Ok(None) => return,
+                                Err(error) => {
+                                    self.physical_ack_error = Some(error.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                        slot.admission.seal_unclaimed_teacher_scope().map(Some)
+                    }
+                }
+            } else {
+                slot.admission.seal_unclaimed_teacher_scope().map(Some)
+            };
+            match result {
+                Ok(Some(ack)) => { self.physical_ack = Some(ack); self.physical_ack_error = None; }
+                Ok(None) => return,
+                Err(error) => { self.physical_ack_error = Some(error.to_string()); return; }
+            }
+        }
+        // Keep the original physical ACK in this worker until the independent
+        // worker roster has been observed and same-member no-child custody is
+        // resolved. NoScope is itself a one-shot proof that no compliant
+        // scoped worker could have started.
+        let Some(physical) = self.physical_ack.as_ref() else { return; };
+        if !physical.is_sealed_no_scope() && self.worker_ack.is_none() {
+            let result = if let Some(session) = &self.session {
+                session.try_worker_retirement()
+            } else if let Some(seal) = &self.retirement {
+                seal.try_worker_retirement()
+            } else if let Some(TeacherSessionPrepareOwnerV2::Claimed(capability)) = self.prepare_owner.as_deref() {
+                capability.try_worker_retirement()
+            } else {
+                self.physical_ack_error = Some("scoped physical proof has no original worker scope owner".into());
+                return;
+            };
+            match result {
+                Ok(Some(ack)) if ack.matches_admission(&slot.admission) => self.worker_ack = Some(ack),
+                Ok(Some(ack)) => {
+                    // Preserve a mismatched original capability for diagnosis;
+                    // never convert it into authority for another root.
+                    self.worker_ack = Some(ack);
+                    self.physical_ack_error = Some("worker roster admission mismatch".into());
+                    return;
+                }
+                Ok(None) => return,
+                Err(error) => { self.physical_ack_error = Some(error.to_string()); return; }
+            }
+        }
+        if !physical.is_sealed_no_scope() {
+            let Some(workers) = self.worker_ack.as_ref() else { return; };
+            if !workers.matches_admission(&slot.admission) { return; }
+            let joined = workers.outcome().members().iter().filter(|(_, state)|
+                *state == rz_search::external_cpu::process_scope::CollectionMemberWorkerState::Joined
+            ).count();
+            // A joined thread may still have an undelivered terminal; defer
+            // the consuming builder until every original token is available.
+            if joined != self.worker_tokens.len() { return; }
+        }
+        let identities: Vec<_> = self.worker_tokens.iter()
+            .map(|(id, token)| (token.registration(), id.clone())).collect();
+        let physical = self.physical_ack.take().expect("original proof retained");
+        let workers = self.worker_ack.take();
+        let tokens = std::mem::take(&mut self.worker_tokens).into_values().collect();
+        match RoventTeacherScopeAggregateAckV2::try_build(physical, workers, tokens) {
+            Ok(ack) => {
+                self.observe_retired_actors(&identities, ack.retired());
+                if let Some(session) = &mut self.session {
+                    if let Err(error) = session.release_retired_permits(&ack) {
+                        self.aggregate_ack = Some(ack);
+                        self.aggregate_release_failed = true;
+                        self.record_failure(WorkerFailure::Retirement(error));
+                        return;
+                    }
+                }
+                if let Some(seal) = &mut self.retirement {
+                    if let Err(error) = seal.release_retired_permits(&ack) {
+                        self.aggregate_ack = Some(ack);
+                        self.aggregate_release_failed = true;
+                        self.record_failure(WorkerFailure::Retirement(error));
+                        return;
+                    }
+                }
+                self.aggregate_ack = Some(ack);
+            }
+            Err(failure) => {
+                let reason = failure.reason;
+                self.observe_retired_actors(&identities, &failure.retired);
+                self.aggregate_failure = Some(Box::new(failure));
+                self.record_failure(WorkerFailure::AggregateRejected(reason));
+                return;
+            }
+        }
+        self.transfer_aggregate_ack();
+    }
+
+    fn observe_retired_actors(
+        &mut self,
+        identities: &[(rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration, String)],
+        retired: &[RoventTeacherRetiredActorV2],
+    ) {
+        for actor in retired {
+            let (owner, observation) = match actor {
+                RoventTeacherRetiredActorV2::Physical(token) => (token.owner(), token.observation()),
+                RoventTeacherRetiredActorV2::NoChild(token) => (token.owner(), token.observation()),
+            };
+            let registration = owner.worker().registration();
+            if let Some((_, actor_id)) = identities.iter().find(|(r, _)| *r == registration) {
+                let poison_new = observation.registry_poisoned
+                    && !self.teacher_observations.get(actor_id).is_some_and(|old| old.registry_poisoned);
+                self.teacher_observations.insert(actor_id.clone(), observation.clone());
+                if poison_new {
+                    self.record_failure(WorkerFailure::TeacherRegistryPoisoned { actor_id: actor_id.clone() });
+                }
+            } else {
+                // Preserve the aggregate and flag the missing original actor
+                // mapping rather than discarding the owner's observation.
+                self.record_failure(WorkerFailure::HandoffMismatch);
+            }
+        }
+    }
+
+    fn transfer_aggregate_ack(&mut self) {
+        let Some(handoff) = &self.handoff else { return; };
+        let Ok(mut original) = handoff.try_lock() else { return; };
+        let Some(ack) = self.aggregate_ack.take() else { return; };
+        match (self.handoff_submit)(&mut *original, ack) {
+            Ok(()) => {
+                self.physical_ack_delivered = true;
+                if self.unclaimed_scope_outcome.is_some()
+                    && matches!(self.prepare_owner.as_deref(), Some(TeacherSessionPrepareOwnerV2::Unclaimed(_)))
+                { self.prepare_owner = None; }
+            }
+            Err(ack) => {
+                self.aggregate_ack = Some(ack);
+                self.physical_ack_error = Some("same-root handoff rejected aggregate proof".into());
             }
         }
     }
@@ -571,6 +846,16 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
 
     pub(crate) fn has_failure(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    /// The proof only describes the original external-process scope. It is
+    /// independent of native settlement and of Collection semantic success.
+    pub(crate) fn physical_ack_observation(&self) -> (bool, bool, Option<&str>) {
+        (
+            self.physical_ack_delivered,
+            self.physical_ack.is_some() || self.aggregate_ack.is_some() || self.aggregate_failure.is_some(),
+            self.physical_ack_error.as_deref(),
+        )
     }
 
     pub(crate) fn failure(&self) -> Option<&WorkerFailure> {
@@ -639,8 +924,18 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                     );
                 }
                 self.poll();
-                if self.retirement_matches_handoff() {
+                if self.retirement_matches_handoff() && self.physical_ack_delivered {
                     break CollectionWorkerExitV2::RetirementAndHandoffObserved;
+                }
+                if self.physical_ack_delivered && (self.session.is_some() || self.retirement.is_some()) {
+                    break CollectionWorkerExitV2::AggregateHandoffObserved;
+                }
+                // A no-session or rejected-claim path can prove that the
+                // process scope has no unresolved child. Keep its errors and
+                // original owners in this worker; do not claim actor join or
+                // Collection success from this physical-only transfer.
+                if self.physical_ack_delivered && self.session.is_none() && self.retirement.is_none() {
+                    break CollectionWorkerExitV2::PhysicalAckDelivered;
                 }
                 if stop.load(Ordering::Acquire)
                     && self.slot.is_none()

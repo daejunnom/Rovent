@@ -8,6 +8,13 @@ use rz_search::external_cpu::collection_teacher::{
     CollectionTeacherWorker, TeacherCompletion, TeacherDiagnostics, TeacherDispatch, TeacherJob,
 };
 use rz_search::external_cpu::process_scope::CollectionProcessPermit;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use rz_search::external_cpu::process_scope::CollectionProcessMemberWitness;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use rz_search::external_cpu::process_scope::{
+    CollectionMemberPhysicalState, CollectionMemberWorkerState, CollectionScopePhysicalOutcome,
+    CollectionScopeWorkerOutcome,
+};
 use std::sync::Arc;
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -28,7 +35,11 @@ pub use actor_binding_v2::{
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod policy_seal_v2;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-pub use policy_seal_v2::{RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealFailureV2};
+mod scope_aggregate_v2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use scope_aggregate_v2::{RoventTeacherScopeAggregateAckV2, RoventTeacherScopeAggregateFailureV2, RoventTeacherRetiredActorV2};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use policy_seal_v2::{RoventTeacherPolicyCustodyV2, RoventTeacherPolicySealErrorV2, RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealFailureV2, RoventTeacherPolicySealFailureKindV2};
 
 pub struct RoventCollectionTeacherOwner {
     launch: PreparedRoventExternalLaunch,
@@ -342,6 +353,8 @@ pub struct RoventCollectionTeacherOwnerV2 {
     frozen_actor: Digest,
     source_index: usize,
     bound_source: Option<BoundTeacherOriginalSourceV2>,
+    member_witness: CollectionProcessMemberWitness,
+    verified_no_child: bool,
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -552,6 +565,8 @@ impl RoventCollectionTeacherOwnerV2 {
                     frozen_actor,
                     source_index,
                     bound_source: None,
+                    member_witness: permit.member_witness(),
+                    verified_no_child: false,
                 };
                 Ok(owner)
             }
@@ -766,6 +781,7 @@ struct SpawnedTeacherGuardV2 {
     actor: Option<BoundCollectionTeacherActorV2>,
     worker: Option<CollectionTeacherWorker>,
     reservation: Option<TeacherRecoveryReservationV2>,
+    member_witness: Option<CollectionProcessMemberWitness>,
     cleanup_deadline: Instant,
 }
 
@@ -773,6 +789,7 @@ struct SpawnedTeacherGuardV2 {
 fn owner_from_spawned_actor_v2(
     actor: BoundCollectionTeacherActorV2,
     worker: CollectionTeacherWorker,
+    member_witness: CollectionProcessMemberWitness,
 ) -> RoventCollectionTeacherOwnerV2 {
     // Both conversions below only move the original fields. They must remain
     // allocation-free and non-fallible while the worker has no other owner.
@@ -786,6 +803,8 @@ fn owner_from_spawned_actor_v2(
         custody: Some(custody),
         frozen_actor: parts.actor_digest,
         source_index: index,
+        member_witness,
+        verified_no_child: false,
         bound_source: Some(BoundTeacherOriginalSourceV2 {
             _manifest: parts.manifest,
             _actor_id: parts.actor_id,
@@ -806,7 +825,8 @@ impl SpawnedTeacherGuardV2 {
             .reservation
             .take()
             .expect("spawn guard retains recovery reservation");
-        let owner = owner_from_spawned_actor_v2(actor, worker);
+        let member_witness = self.member_witness.take().expect("spawn guard retains member witness");
+        let owner = owner_from_spawned_actor_v2(actor, worker, member_witness);
         RoventCollectionTeacherLifecycleV2::new(owner, reservation, self.cleanup_deadline)
     }
 }
@@ -814,10 +834,10 @@ impl SpawnedTeacherGuardV2 {
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl Drop for SpawnedTeacherGuardV2 {
     fn drop(&mut self) {
-        if self.actor.is_none() && self.worker.is_none() && self.reservation.is_none() {
+        if self.actor.is_none() && self.worker.is_none() && self.reservation.is_none() && self.member_witness.is_none() {
             return;
         }
-        if self.actor.is_none() || self.worker.is_none() || self.reservation.is_none() {
+        if self.actor.is_none() || self.worker.is_none() || self.reservation.is_none() || self.member_witness.is_none() {
             // An impossible partial handoff must not silently destroy a
             // remaining worker or release a possibly occupied reservation.
             quarantine_v2::mark_custody_violation();
@@ -832,12 +852,13 @@ impl Drop for SpawnedTeacherGuardV2 {
             }
             return;
         }
-        if let (Some(actor), Some(worker), Some(reservation)) = (
+        if let (Some(actor), Some(worker), Some(reservation), Some(member_witness)) = (
             self.actor.take(),
             self.worker.take(),
             self.reservation.take(),
+            self.member_witness.take(),
         ) {
-            let owner = owner_from_spawned_actor_v2(actor, worker);
+            let owner = owner_from_spawned_actor_v2(actor, worker, member_witness);
             // Lifecycle Drop requests shutdown and parks the same owner in
             // the already registered recovery slot; it never claims exit.
             drop(RoventCollectionTeacherLifecycleV2::new(
@@ -1010,6 +1031,7 @@ pub fn spawn_bound_collection_teacher_v2(
         actor: Some(actor),
         worker: Some(worker),
         reservation: Some(reservation),
+        member_witness: Some(permit.member_witness()),
         cleanup_deadline,
     }
     .into_lifecycle();
@@ -1110,6 +1132,105 @@ pub enum RoventTeacherTerminalAccountingV2 {
 pub struct RoventTeacherRetirementTokenV2 {
     owner: RoventCollectionTeacherOwnerV2,
     observation: RoventTeacherRetirementObservationV2,
+}
+
+/// Evidence that the original worker has joined and delivered all terminal
+/// messages. This does not establish whether an OS child existed or exited.
+/// Custody and the recovery reservation remain attached until an independent
+/// physical process-scope proof is matched or ordinary retirement succeeds.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventTeacherWorkerTerminalTokenV2 {
+    lifecycle: RoventCollectionTeacherLifecycleV2,
+    observation: RoventTeacherRetirementObservationV2,
+}
+
+/// Original owner retired after a joined worker was proved to have created no
+/// OS child. This is neither a process-exit proof nor a teacher success.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventTeacherNoChildRetirementTokenV2 {
+    owner: RoventCollectionTeacherOwnerV2,
+    observation: RoventTeacherRetirementObservationV2,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventTeacherNoChildRetirementTokenV2 {
+    pub fn owner(&self) -> &RoventCollectionTeacherOwnerV2 { &self.owner }
+    pub fn observation(&self) -> &RoventTeacherRetirementObservationV2 { &self.observation }
+    pub fn matches_admission(&self, admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2) -> bool {
+        self.owner.admission().same_original_admission(admission)
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventTeacherWorkerTerminalTokenV2 {
+    /// Identifies the member originally handed to the worker at spawn. This
+    /// identity is not itself a worker join or physical process proof.
+    pub fn member_witness(&self) -> &CollectionProcessMemberWitness {
+        &self.lifecycle.owner().member_witness
+    }
+
+    pub fn registration(&self) -> TeacherWorkerRegistration {
+        self.lifecycle.owner().worker.registration()
+    }
+
+    fn has_original_join_witness(&self) -> bool {
+        self.lifecycle.owner().worker.scope_join_witness()
+            .is_some_and(|joined| self.member_witness().same_joined_member(joined))
+    }
+
+    pub fn matches_admission(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> bool {
+        self.lifecycle.owner().admission().same_original_admission(admission)
+    }
+
+    pub fn owner(&self) -> &RoventCollectionTeacherOwnerV2 {
+        self.lifecycle.owner()
+    }
+
+    pub fn observation(&self) -> &RoventTeacherRetirementObservationV2 {
+        &self.observation
+    }
+
+    /// Physical retirement uses the existing independent checks. On failure
+    /// the original token, owner and reservation remain with the caller.
+    pub fn try_into_physical_retirement(self) -> Result<RoventTeacherRetirementTokenV2, Self> {
+        let Self { lifecycle, observation } = self;
+        match lifecycle.try_retire() {
+            Ok(token) => Ok(token),
+            Err(lifecycle) => Err(Self { lifecycle, observation }),
+        }
+    }
+
+    /// Release original custody only after same-issuer immutable roster
+    /// outcomes prove this joined member never created an OS child. Worker
+    /// errors and registry poisoning remain present in the observation.
+    pub fn try_into_no_child_retirement(
+        mut self,
+        physical: &CollectionScopePhysicalOutcome,
+        workers: &CollectionScopeWorkerOutcome,
+    ) -> Result<RoventTeacherNoChildRetirementTokenV2, Self> {
+        let witness = self.member_witness();
+        if !self.has_original_join_witness() || !matches!(witness.physical_state_in(physical),
+            Some(CollectionMemberPhysicalState::IssuedNoChild | CollectionMemberPhysicalState::AcquiredNoChild))
+            || witness.state_in(workers) != Some(CollectionMemberWorkerState::Joined)
+        {
+            return Err(self);
+        }
+        let poisoned = match self.lifecycle.reservation.as_mut()
+            .and_then(|reservation| reservation.release().ok()) {
+            Some(poisoned) => poisoned,
+            None => return Err(self),
+        };
+        self.observation.registry_poisoned |= poisoned;
+        let mut owner = self.lifecycle.owner.take().expect("retained teacher owner");
+        owner.verified_no_child = true;
+        Ok(RoventTeacherNoChildRetirementTokenV2 {
+            owner,
+            observation: self.observation,
+        })
+    }
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -1464,6 +1585,27 @@ impl RoventCollectionTeacherLifecycleV2 {
         ))
     }
 
+    /// Preserve a joined worker's terminal evidence independently of physical
+    /// process closure. In particular a join error is evidence, not success.
+    pub fn try_finish_worker(mut self) -> Result<RoventTeacherWorkerTerminalTokenV2, Self> {
+        let observation = self.poll();
+        if observation.worker_join.is_none()
+            || !self.owner().worker.scope_join_witness()
+                .is_some_and(|joined| self.owner().member_witness.same_joined_member(joined))
+            || observation.commands != 0
+            || observation.reliable_queued != 0
+            || observation.reliable_reserved != 0
+            || observation.diagnostics == RoventTeacherDiagnosticsDispositionV2::NotObserved
+            || !matches!(
+                observation.terminal_accounting,
+                RoventTeacherTerminalAccountingV2::Delivered { .. }
+            )
+        {
+            return Err(self);
+        }
+        Ok(RoventTeacherWorkerTerminalTokenV2 { lifecycle: self, observation })
+    }
+
     /// Issue an opaque token only through the same physical retirement path.
     /// A failure returns the original lifecycle and retains recovery custody.
     pub fn try_retire(self) -> Result<RoventTeacherRetirementTokenV2, Self> {
@@ -1521,7 +1663,7 @@ impl Drop for RoventCollectionTeacherOwnerV2 {
                 && !p.quarantined
                 && !p.ownership_lost
         });
-        if !closed {
+        if !closed && !self.verified_no_child {
             if let Some(source) = self.bound_source.take() {
                 std::mem::forget(source);
             }

@@ -11,10 +11,12 @@ use rz_experiments::rovent_submitted_input::{
 pub struct RoventInputCaptureReservationV2 {
     original: RoventInputCaptureReservation,
     native_domain: &'static str,
+    producer_owner: Option<std::sync::Arc<()>>,
 }
 pub struct RoventCapturedInputV2 {
     original: RoventCapturedInput,
     input: rz_experiments::rovent_submitted_input::RoventSubmittedInputV1,
+    producer_owner: Option<std::sync::Arc<()>>,
 }
 impl RoventInputCaptureReservationV2 {
     pub fn sequence(&self) -> u64 {
@@ -61,6 +63,7 @@ impl RoventInputCaptureReservationV2 {
         let common = captured.common_validation_projection();
         Ok(RoventCapturedInputV2 {
             input: captured,
+            producer_owner: self.producer_owner,
             original: RoventCapturedInput {
                 manifest_sha256: self.original.manifest_sha256,
                 pending: Pending {
@@ -93,16 +96,51 @@ pub struct RoventCorpusProducerV2 {
 /// an accepted manager-issued witness must still be joined to the original
 /// physical completion before an opaque row can be emitted.
 pub struct RoventCorpusProducerLockV2 {
-    manifest: rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
+    manifest:
+        std::sync::Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
     admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    producer_owner: std::sync::Arc<()>,
     original: RoventCorpusProducerV2,
     native_retirements: BTreeMap<RequestId, RoleTicketEnvelope>,
-    native_observation_failures: BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
+    native_observation_failures:
+        BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
 }
 
 impl RoventCorpusProducerLockV2 {
+    /// Expose only the same producer to the teacher target calculator. This
+    /// does not authorize a worker call while the caller holds its lock.
+    #[cfg(feature = "pals-collection-onnx")]
+    pub(super) fn teacher_target_producer_mut(&mut self) -> &mut RoventCorpusProducer {
+        &mut self.original.original
+    }
+
+    #[cfg(feature = "pals-collection-onnx")]
+    pub(super) fn validate_teacher_row(
+        &self,
+        row: &RoventRetiredLockV2Record,
+    ) -> Result<(), ArenaError> {
+        check(
+            std::sync::Arc::ptr_eq(&row.producer_owner, &self.producer_owner)
+                && row.matches_manifest_owner(&self.manifest)
+                && row.admission.same_original_admission(&self.admission)
+                && row.manifest_sha256 == self.original.original.manifest_sha256,
+            "lock-v2 teacher row differs from original producer ownership",
+        )
+    }
+
     pub fn new(
         manifest: rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
+        admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<Self, ArenaError> {
+        Self::new_shared(std::sync::Arc::new(manifest), admission)
+    }
+
+    /// Retain the original full corpus manifest owner across native capture,
+    /// retirement and teacher binding. This is not a live-root capability.
+    pub fn new_shared(
+        manifest: std::sync::Arc<
+            rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
+        >,
         admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
     ) -> Result<Self, ArenaError> {
         let lock = admission.native_origin().original_input_lock();
@@ -120,13 +158,16 @@ impl RoventCorpusProducerLockV2 {
         Ok(Self {
             manifest,
             admission,
+            producer_owner: std::sync::Arc::new(()),
             original,
             native_retirements: BTreeMap::new(),
             native_observation_failures: BTreeMap::new(),
         })
     }
 
-    pub fn manifest(&self) -> &rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2 {
+    pub fn manifest(
+        &self,
+    ) -> &rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2 {
         &self.manifest
     }
 
@@ -147,22 +188,28 @@ impl RoventCorpusProducerLockV2 {
         &self,
         admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
     ) -> Result<(), ArenaError> {
-        check(self.admission.same_original_admission(admission),
-            "lock-v2 collection admission differs from original owner")
+        check(
+            self.admission.same_original_admission(admission),
+            "lock-v2 collection admission differs from original owner",
+        )
     }
 
     /// Reserve only for a ticket whose manager dispatch witness was checked by
     /// the collection observer. The native callback owns the actual capture.
-    pub(super) fn reserve_input(
+    pub(super) fn try_reserve_input(
         &mut self,
         ticket: &RoleTicketEnvelope,
         context: GenerationCaptureContextV3,
         lineage: RoventLineage,
-    ) -> Result<RoventInputCaptureReservationV2, ArenaError> {
-        self.admission
-            .validate_ticket(ticket)
-            .map_err(|error| invalid(error.to_string()))?;
-        self.original.reserve_input(context, lineage)
+    ) -> Result<Option<RoventInputCaptureReservationV2>, ArenaError> {
+        if let Err(error) = self.admission.try_validate_ticket(ticket) {
+            return if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV2::Busy {
+                Ok(None)
+            } else { Err(invalid(error.error.to_string())) };
+        }
+        let mut reservation = self.original.reserve_input(context, lineage)?;
+        reservation.producer_owner = Some(std::sync::Arc::clone(&self.producer_owner));
+        Ok(Some(reservation))
     }
 
     pub(super) fn admit_captured_lock_input(
@@ -175,16 +222,31 @@ impl RoventCorpusProducerLockV2 {
         let validation = (|| {
             self.validate_admission(input.admission())?;
             let captured = input.captured();
-            let key = (captured.original.pending.ticket.id.epoch.0,
-                captured.original.pending.ticket.id.sequence);
+            check(
+                captured.producer_owner.as_ref().is_some_and(|owner| {
+                    std::sync::Arc::ptr_eq(owner, &self.producer_owner)
+                }),
+                "lock-v2 captured input belongs to another original producer",
+            )?;
+            let key = (
+                captured.original.pending.ticket.id.epoch.0,
+                captured.original.pending.ticket.id.sequence,
+            );
             let original = &self.original.original;
-            check(!self.original.inputs.contains_key(&key) && self.original.inputs.len() < 16,
-                "lock-v2 original input duplicate/cap")?;
-            check(captured.original.manifest_sha256 == original.manifest_sha256
-                && original.reserved.contains(&captured.original.pending.submitted)
-                && original.pending.len() < 16 && !original.pending.contains_key(&key)
-                && !original.retired.contains(&key),
-                "lock-v2 revoked/different-owner/duplicate captured input")?;
+            check(
+                !self.original.inputs.contains_key(&key) && self.original.inputs.len() < 16,
+                "lock-v2 original input duplicate/cap",
+            )?;
+            check(
+                captured.original.manifest_sha256 == original.manifest_sha256
+                    && original
+                        .reserved
+                        .contains(&captured.original.pending.submitted)
+                    && original.pending.len() < 16
+                    && !original.pending.contains_key(&key)
+                    && !original.retired.contains(&key),
+                "lock-v2 revoked/different-owner/duplicate captured input",
+            )?;
             Ok::<(), ArenaError>(())
         })();
         if let Err(error) = validation {
@@ -193,10 +255,18 @@ impl RoventCorpusProducerLockV2 {
         // Validation happens before moving the input; commit has no fallible
         // operations and preserves the original owner and reservation.
         let (captured, _) = input.into_original();
-        let key = (captured.original.pending.ticket.id.epoch.0,
-            captured.original.pending.ticket.id.sequence);
-        self.original.original.reserved.remove(&captured.original.pending.submitted);
-        self.original.original.pending.insert(key, captured.original.pending);
+        let key = (
+            captured.original.pending.ticket.id.epoch.0,
+            captured.original.pending.ticket.id.sequence,
+        );
+        self.original
+            .original
+            .reserved
+            .remove(&captured.original.pending.submitted);
+        self.original
+            .original
+            .pending
+            .insert(key, captured.original.pending);
         self.original.inputs.insert(key, captured.input);
         Ok(())
     }
@@ -217,28 +287,49 @@ impl RoventCorpusProducerLockV2 {
         )?;
         let event = witness.event();
         let (ticket, failures) = match event {
-            TicketNativeEvent::Completed { completion, observation_failures, .. } =>
-                (Some(completion.ticket), Some(observation_failures)),
-            TicketNativeEvent::Retired { ticket, observation_failures, .. } =>
-                (Some(*ticket), Some(observation_failures)),
+            TicketNativeEvent::Completed {
+                completion,
+                observation_failures,
+                ..
+            } => (Some(completion.ticket), Some(observation_failures)),
+            TicketNativeEvent::Retired {
+                ticket,
+                observation_failures,
+                ..
+            } => (Some(*ticket), Some(observation_failures)),
             _ => (None, None),
         };
         if let (Some(ticket), Some(failures)) = (ticket, failures) {
             if !failures.is_empty() {
-                check(self.native_observation_failures.len() < MAX_CORPUS_ROWS
-                    || self.native_observation_failures.contains_key(&ticket.id),
-                    "lock-v2 native failure evidence cap")?;
-                let records = self.native_observation_failures.entry(ticket.id).or_default();
+                check(
+                    self.native_observation_failures.len() < MAX_CORPUS_ROWS
+                        || self.native_observation_failures.contains_key(&ticket.id),
+                    "lock-v2 native failure evidence cap",
+                )?;
+                let records = self
+                    .native_observation_failures
+                    .entry(ticket.id)
+                    .or_default();
                 records.extend(failures.iter().cloned());
-                return Err(invalid(format!("lock-v2 original native observation failed: {records:?}")));
+                return Err(invalid(format!(
+                    "lock-v2 original native observation failed: {records:?}"
+                )));
             }
         }
         self.original.observe_native_event(event)?;
-        if let TicketNativeEvent::Retired { ticket, accepted: true, result: Ok(()), .. } = event {
-            check(!self.native_observation_failures.contains_key(&ticket.id)
-                && self.native_retirements.len() < MAX_CORPUS_ROWS
-                && !self.native_retirements.contains_key(&ticket.id),
-                "lock-v2 duplicate or failed native retirement")?;
+        if let TicketNativeEvent::Retired {
+            ticket,
+            accepted: true,
+            result: Ok(()),
+            ..
+        } = event
+        {
+            check(
+                !self.native_observation_failures.contains_key(&ticket.id)
+                    && self.native_retirements.len() < MAX_CORPUS_ROWS
+                    && !self.native_retirements.contains_key(&ticket.id),
+                "lock-v2 duplicate or failed native retirement",
+            )?;
             self.native_retirements.insert(ticket.id, *ticket);
         }
         Ok(())
@@ -260,7 +351,11 @@ impl RoventCorpusProducerLockV2 {
             "lock-v2 consumption belongs to another original admission",
         )?;
         let accepted = witness.accepted();
-        self.retire_original(*accepted.ticket(), accepted.output_digest(), "accepted_role_step")
+        self.retire_original(
+            *accepted.ticket(),
+            accepted.output_digest(),
+            "accepted_role_step",
+        )
     }
 
     /// The manager's original root-ranking publication is a separate proof;
@@ -275,14 +370,20 @@ impl RoventCorpusProducerLockV2 {
             "lock-v2 ranking belongs to another original admission",
         )?;
         let source = accepted.ranking().source();
-        accepted.admission().validate_output(&source.ticket, output)
+        accepted
+            .admission()
+            .validate_output(&source.ticket, output)
             .map_err(|error| invalid(error.to_string()))?;
         check(
             native_acceptance_output_digest(output).map_err(|error| invalid(error.to_string()))?
                 == source.output_digest,
             "lock-v2 original ranking/output digest mismatch",
         )?;
-        self.retire_original(source.ticket, source.output_digest, "root_ranking_published")
+        self.retire_original(
+            source.ticket,
+            source.output_digest,
+            "root_ranking_published",
+        )
     }
 
     fn retire_original(
@@ -291,16 +392,25 @@ impl RoventCorpusProducerLockV2 {
         output_digest: Digest,
         acceptance_kind: &str,
     ) -> Result<RoventRetiredLockV2Record, ArenaError> {
-        check(self.native_retirements.get(&ticket.id) == Some(&ticket)
-            && !self.native_observation_failures.contains_key(&ticket.id),
-            "lock-v2 original native retirement is missing or reported an observation failure")?;
+        check(
+            self.native_retirements.get(&ticket.id) == Some(&ticket)
+                && !self.native_observation_failures.contains_key(&ticket.id),
+            "lock-v2 original native retirement is missing or reported an observation failure",
+        )?;
         let key = (ticket.id.epoch.0, ticket.id.sequence);
         let producer = &mut self.original.original;
-        let pending = producer.pending.get(&key)
+        let pending = producer
+            .pending
+            .get(&key)
             .ok_or_else(|| invalid("lock-v2 retirement has no original input"))?;
-        let completed = pending.completed.as_ref()
+        let completed = pending
+            .completed
+            .as_ref()
             .ok_or_else(|| invalid("lock-v2 retirement before physical completion"))?;
-        let input = self.original.inputs.get(&key)
+        let input = self
+            .original
+            .inputs
+            .get(&key)
             .ok_or_else(|| invalid("lock-v2 retained input is missing"))?;
         check(
             pending.ticket == ticket
@@ -310,9 +420,14 @@ impl RoventCorpusProducerLockV2 {
                 && producer.retired.len() < MAX_CORPUS_ROWS,
             "lock-v2 accepted result differs from original physical completion",
         )?;
-        let split = *producer.manifest.opening_splits.get(&input.opening_id)
+        let split = *producer
+            .manifest
+            .opening_splits
+            .get(&input.opening_id)
             .ok_or_else(|| invalid("lock-v2 opening split is not registered"))?;
-        let sequence = producer.sequence.checked_add(1)
+        let sequence = producer
+            .sequence
+            .checked_add(1)
             .ok_or_else(|| invalid("Rovent collector sequence exhausted"))?;
         let raw = json!({"schema":producer.native_domain,"kind":"retired","sequence":sequence,
             "process_epoch":ticket.id.epoch.0,"game_generation":ticket.authority.game.0,"root_generation":ticket.authority.root.0,
@@ -335,6 +450,8 @@ impl RoventCorpusProducerLockV2 {
         producer.retired.insert(key);
         Ok(RoventRetiredLockV2Record {
             manifest_sha256: producer.manifest_sha256.clone(),
+            manifest_owner: std::sync::Arc::clone(&self.manifest),
+            producer_owner: std::sync::Arc::clone(&self.producer_owner),
             ticket,
             admission: self.admission.clone(),
             record: rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2(
@@ -362,12 +479,11 @@ impl RoventCorpusProducerLockV2 {
     }
 
     /// Keep the original row with the caller on validation failure.
-    pub fn seal_retired(
-        &self,
-        row: &mut RoventRetiredLockV2Record,
-    ) -> Result<(), ArenaError> {
+    pub fn seal_retired(&self, row: &mut RoventRetiredLockV2Record) -> Result<(), ArenaError> {
         check(
-            row.manifest_sha256 == self.original.original.manifest_sha256
+            std::sync::Arc::ptr_eq(&row.producer_owner, &self.producer_owner)
+                && std::sync::Arc::ptr_eq(&row.manifest_owner, &self.manifest)
+                && row.manifest_sha256 == self.original.original.manifest_sha256
                 && row.admission.same_original_admission(&self.admission)
                 && row.record.0.native.raw_retirement["root_admission_sha256"]
                     == self.admission.raw_sha256()
@@ -376,7 +492,10 @@ impl RoventCorpusProducerLockV2 {
             "lock-v2 retired record lost original owner",
         )?;
         let mut candidate = row.record.clone();
-        candidate.seal(&self.manifest, self.admission.native_origin().original_input_lock())?;
+        candidate.seal(
+            &self.manifest,
+            self.admission.native_origin().original_input_lock(),
+        )?;
         row.record = candidate;
         Ok(())
     }
@@ -405,7 +524,9 @@ impl RoventCorpusProducerLockV2 {
         outcome: &RoventRulesOutcome,
     ) -> Result<(), ArenaError> {
         check(
-            row.manifest_sha256 == self.original.original.manifest_sha256
+            std::sync::Arc::ptr_eq(&row.producer_owner, &self.producer_owner)
+                && std::sync::Arc::ptr_eq(&row.manifest_owner, &self.manifest)
+                && row.manifest_sha256 == self.original.original.manifest_sha256
                 && row.admission.same_original_admission(&self.admission),
             "lock-v2 WDL row belongs to another producer",
         )?;
@@ -417,7 +538,11 @@ impl RoventCorpusProducerLockV2 {
                 && outcome.authority.anchors.contains(&input.rules_anchor),
             "lock-v2 WDL is not an actual trajectory member",
         )?;
-        let sequence = self.original.original.sequence.checked_add(1)
+        let sequence = self
+            .original
+            .original
+            .sequence
+            .checked_add(1)
             .ok_or_else(|| invalid("Rovent collector sequence exhausted"))?;
         let raw = json!({"schema":HEAD_DOMAIN,"kind":"rules_wdl","input_sha256":record.input_sha256,
             "anchor":input.rules_anchor,"trajectory":outcome.authority,"rules_receipt":outcome.receipt,"rules_replay":outcome.replay});
@@ -537,12 +662,17 @@ impl RoventCorpusProducerV2 {
         Ok(RoventInputCaptureReservationV2 {
             original: self.original.reserve_input(context, lineage)?,
             native_domain: self.original.native_domain,
+            producer_owner: None,
         })
     }
     pub fn admit_captured_input(
         &mut self,
         captured: RoventCapturedInputV2,
     ) -> Result<(), ArenaError> {
+        check(
+            captured.producer_owner.is_none(),
+            "lock-v2 captured input requires its original lock-v2 producer",
+        )?;
         let ticket = captured.original.pending.ticket;
         let key = (ticket.id.epoch.0, ticket.id.sequence);
         check(

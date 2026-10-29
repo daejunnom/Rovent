@@ -18,6 +18,18 @@ enum RegisteredInputCapture {
         reservation: RoventInputCaptureReservationV2,
         admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
     },
+    /// An already-issued ticket dispatched after the root was disabled, but
+    /// whose sequence predates the disabled boundary. Exact identity remains
+    /// in the bounded per-ticket registration until native dispatch consumes it.
+    LockV2DisabledPrior {
+        ticket: RoleTicketEnvelope,
+        admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    },
+}
+pub(super) enum LockV2RegistrationAttempt {
+    Ready,
+    Busy(RoventInputCaptureReservationV2),
+    Failed(ArenaError, RoventInputCaptureReservationV2),
 }
 /// Created only after the original service context and root admission match.
 /// This is still input capture, not proof of execution or acceptance.
@@ -33,6 +45,7 @@ impl RoventCapturedLockInputV2 {
     }
 }
 type Registrations = Arc<Mutex<BTreeMap<RequestId, RegisteredInputCapture>>>;
+type DisabledRoot = Arc<Mutex<Option<(rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2, RoleTicketEnvelope)>>>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoventNativeCaptureFailure {
     pub stage: VirtualReviewCaptureFailureStage,
@@ -50,11 +63,14 @@ struct CaptureFailureState {
     input: Option<RoventFailedCapturedInput>,
 }
 type CaptureFailure = Arc<Mutex<CaptureFailureState>>;
+#[derive(Clone)]
 pub struct RoventNativeCaptureRegistration {
     registered: Registrations,
+    disabled_root: DisabledRoot,
 }
 pub struct RoventNativeInputObserver {
     registered: Registrations,
+    disabled_root: DisabledRoot,
     failure: CaptureFailure,
     failed_input: Option<RoventFailedCapturedInput>,
     sender: mpsc::SyncSender<RoventCapturedInput>,
@@ -74,6 +90,7 @@ pub fn rovent_native_capture_channel() -> (
     RoventCapturedInputReceiver,
 ) {
     let registered = Arc::new(Mutex::new(BTreeMap::new()));
+    let disabled_root = Arc::new(Mutex::new(None));
     let failure = Arc::new(Mutex::new(CaptureFailureState::default()));
     let (sender, receiver) = mpsc::sync_channel(16);
     let (submitted_sender, submitted_receiver) = mpsc::sync_channel(16);
@@ -81,9 +98,11 @@ pub fn rovent_native_capture_channel() -> (
     (
         RoventNativeCaptureRegistration {
             registered: Arc::clone(&registered),
+            disabled_root: Arc::clone(&disabled_root),
         },
         RoventNativeInputObserver {
             registered,
+            disabled_root,
             failure: Arc::clone(&failure),
             failed_input: None,
             sender,
@@ -100,6 +119,64 @@ pub fn rovent_native_capture_channel() -> (
     )
 }
 impl RoventNativeCaptureRegistration {
+    /// Test-only contention injection. The closure is controlled by the test;
+    /// no ticket, admission, capture or physical completion is manufactured.
+    #[cfg(feature = "test-fixtures")]
+    pub(super) fn test_with_registration_held<T>(&self, action: impl FnOnce() -> T) -> Result<T, ArenaError> {
+        let _held = self.registered.lock()
+            .map_err(|_| invalid("Rovent capture registration poisoned"))?;
+        Ok(action())
+    }
+    pub(super) fn try_has_registration(&self, id: RequestId) -> Result<Option<bool>, ArenaError> {
+        match self.registered.try_lock() {
+            Ok(registered) => Ok(Some(registered.contains_key(&id))),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(invalid("Rovent capture registration poisoned")),
+        }
+    }
+    pub(super) fn try_register_disabled_prior(
+        &self, ticket: &RoleTicketEnvelope,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<bool, ArenaError> {
+        if let Err(error) = admission.try_validate_ticket(ticket) {
+            return if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV2::Busy {
+                Ok(false)
+            } else { Err(invalid(error.error.to_string())) };
+        }
+        let mut registered = match self.registered.try_lock() {
+            Ok(registered) => registered,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Rovent capture registration poisoned")),
+        };
+        check(registered.len() < 16 && !registered.contains_key(&ticket.id),
+            "disabled prior input registration duplicate/cap")?;
+        registered.insert(ticket.id, RegisteredInputCapture::LockV2DisabledPrior {
+            ticket: *ticket, admission: admission.clone(),
+        });
+        Ok(true)
+    }
+    pub(super) fn try_disable_lock_v2_root(&self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+        first_ticket: &RoleTicketEnvelope,
+    ) -> Result<bool, ArenaError> {
+        if let Err(error) = admission.try_validate_ticket(first_ticket) {
+            return if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV2::Busy {
+                Ok(false)
+            } else { Err(invalid(error.error.to_string())) };
+        }
+        let mut disabled = match self.disabled_root.try_lock() {
+            Ok(disabled) => disabled,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 disabled root poisoned")),
+        };
+        check(disabled.is_none(), "lock-v2 capture root already disabled")?;
+        *disabled = Some((admission.clone(), *first_ticket));
+        Ok(true)
+    }
+    pub(super) fn clear_disabled_lock_v2_root(&self) -> Result<(), ArenaError> {
+        *self.disabled_root.lock().map_err(|_| invalid("lock-v2 disabled root poisoned"))? = None;
+        Ok(())
+    }
     /// 원 dispatch observer가 ticket 발급 후 execute 전에 호출한다.
     pub fn register(
         &self,
@@ -133,21 +210,31 @@ impl RoventNativeCaptureRegistration {
         registered.insert(ticket.id, RegisteredInputCapture::SubmittedV1(reservation));
         Ok(())
     }
-    pub(super) fn register_lock_v2(
+    pub(super) fn try_register_lock_v2(
         &self,
         ticket: &RoleTicketEnvelope,
         reservation: RoventInputCaptureReservationV2,
         admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
-    ) -> Result<(), ArenaError> {
-        admission.validate_ticket(ticket).map_err(|error| invalid(error.to_string()))?;
-        let mut registered = self.registered.lock()
-            .map_err(|_| invalid("Rovent capture registration poisoned"))?;
-        check(registered.len() < 16 && !registered.contains_key(&ticket.id),
-            "capture input registration duplicate/cap")?;
+    ) -> LockV2RegistrationAttempt {
+        if let Err(error) = admission.try_validate_ticket(ticket) {
+            return if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV2::Busy {
+                LockV2RegistrationAttempt::Busy(reservation)
+            } else { LockV2RegistrationAttempt::Failed(invalid(error.error.to_string()), reservation) };
+        }
+        let mut registered = match self.registered.try_lock() {
+            Ok(registered) => registered,
+            Err(std::sync::TryLockError::WouldBlock) => return LockV2RegistrationAttempt::Busy(reservation),
+            Err(std::sync::TryLockError::Poisoned(_)) => return LockV2RegistrationAttempt::Failed(
+                invalid("Rovent capture registration poisoned"), reservation),
+        };
+        if let Err(error) = check(registered.len() < 16 && !registered.contains_key(&ticket.id),
+            "capture input registration duplicate/cap") {
+            return LockV2RegistrationAttempt::Failed(error, reservation);
+        }
         registered.insert(ticket.id, RegisteredInputCapture::LockV2 {
             ticket: *ticket, reservation, admission: admission.clone(),
         });
-        Ok(())
+        LockV2RegistrationAttempt::Ready
     }
     /// 아직 native owner가 읽지 않은 예약만 반환한다. 반환 sequence는
     /// producer.discard_reserved_input에 전달하고 물리 취소는 원 owner가 한다.
@@ -162,7 +249,7 @@ impl RoventNativeCaptureRegistration {
         check(
             !matches!(
                 registered.get(&id),
-                Some(RegisteredInputCapture::SubmittedV1(_) | RegisteredInputCapture::LockV2 { .. })
+                Some(RegisteredInputCapture::SubmittedV1(_) | RegisteredInputCapture::LockV2 { .. } | RegisteredInputCapture::LockV2DisabledPrior { .. })
             ),
             "legacy cancel refuses submitted-input reservation",
         )?;
@@ -177,10 +264,11 @@ impl RoventNativeCaptureRegistration {
             .lock()
             .map_err(|_| invalid("Rovent capture registration poisoned"))?
             .remove(&id)
-            .map(|value| match value {
-                RegisteredInputCapture::Legacy(value) => value.sequence(),
-                RegisteredInputCapture::SubmittedV1(value) => value.sequence(),
-                RegisteredInputCapture::LockV2 { reservation, .. } => reservation.sequence(),
+            .and_then(|value| match value {
+                RegisteredInputCapture::Legacy(value) => Some(value.sequence()),
+                RegisteredInputCapture::SubmittedV1(value) => Some(value.sequence()),
+                RegisteredInputCapture::LockV2 { reservation, .. } => Some(reservation.sequence()),
+                RegisteredInputCapture::LockV2DisabledPrior { .. } => None,
             }))
     }
 }
@@ -313,8 +401,20 @@ impl RoventNativeInputObserver {
         let reservation = {
             let mut registered = self.registered.lock()
                 .map_err(|_| RoleFailure::Backend("Rovent capture registration poisoned".into()))?;
-            let candidate = registered.get(&ticket.id)
-                .ok_or_else(|| RoleFailure::Backend("Rovent native input lacks original manager reservation".into()))?;
+            let Some(candidate) = registered.get(&ticket.id) else {
+                let disabled = self.disabled_root.lock().map_err(|_| RoleFailure::Backend("lock-v2 disabled root poisoned".into()))?;
+                let (admission, first_ticket) = disabled.as_ref().ok_or_else(|| RoleFailure::Backend("Rovent native input lacks original manager reservation".into()))?;
+                if ticket.id.epoch != first_ticket.id.epoch || ticket.id.sequence < first_ticket.id.sequence {
+                    return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
+                        "missing reservation predates disabled capture boundary".into())));
+                }
+                // This path discards optional collection input only. A late
+                // native callback may outlive logical root authority; it must
+                // still match the original immutable root and physical owner.
+                admission.validate_native_discard_owner(context)
+                    .map_err(|error| RoleFailure::Backend(error.to_string()))?;
+                return Ok(());
+            };
             if let RegisteredInputCapture::LockV2 { ticket: registered_ticket, admission, .. } = candidate {
                 if registered_ticket != ticket {
                     return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
@@ -324,9 +424,19 @@ impl RoventNativeInputObserver {
                 admission.validate_native_dispatch_owner(context)
                     .map_err(|error| RoleFailure::Backend(error.to_string()))?;
             }
+            if let RegisteredInputCapture::LockV2DisabledPrior { ticket: registered_ticket, admission } = candidate {
+                if registered_ticket != ticket {
+                    return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
+                        "disabled prior ticket differs from original registration".into(),
+                    )));
+                }
+                admission.validate_native_discard_owner(context)
+                    .map_err(|error| RoleFailure::Backend(error.to_string()))?;
+            }
             registered.remove(&ticket.id).expect("checked registration")
         };
         match reservation {
+            RegisteredInputCapture::LockV2DisabledPrior { .. } => Ok(()),
             RegisteredInputCapture::Legacy(reservation) => {
                 let captured = reservation.capture(*ticket, &preparation.view, &prepared.input, &prepared.identity)
                     .map_err(|e| RoleFailure::Backend(e.to_string()))?;

@@ -3,7 +3,7 @@
 use super::collection_hooks_core_v2::{CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure};
 use super::teacher::v2_session::{RoventTeacherRosterEntryV2, TeacherSessionRetirementSealV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2};
-use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
+use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::pals_adaptive::{AdaptiveManagerError, RoventCollectionRootAdmissionV2};
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_bootstrap::nnuec_session::{
@@ -31,13 +31,20 @@ fn handoff_matches(
         && fence.permits_semantic_closure()
 }
 
+fn handoff_submit(
+    handoff: &mut RoventNnuecCollectionHandoffV2,
+    ack: rz_uci::rovent_external_launch::RoventTeacherScopeAggregateAckV2,
+) -> Result<(), rz_uci::rovent_external_launch::RoventTeacherScopeAggregateAckV2> {
+    handoff.submit_teacher_aggregate_ack(ack)
+}
+
 impl RoventNnuecCollectionBridgeV2 {
     pub(crate) fn new(
         owner: RoventCollectionOwnerLockV2,
-        manifest: Arc<RoventCorpusManifestV2>,
+        manifest: Arc<RoventCorpusManifestLockV2>,
         roster: Vec<RoventTeacherRosterEntryV2>,
     ) -> Result<(Arc<Self>, RoventNnuecCollectionWorkerV2), ArenaError> {
-        let (core, worker) = CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches)?;
+        let (core, worker) = CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
         Ok((Arc::new(Self { core }), worker))
     }
 }

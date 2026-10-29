@@ -161,8 +161,27 @@ pub struct RoventCollectionDispatchWitnessV2<'a> {
     ticket: &'a RoleTicketEnvelope,
 }
 
+/// The original ticket failure is retained intact so a temporary lock
+/// contention cannot be mistaken for a revoked or malformed authority.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub enum RoventDispatchWitnessFailureV2 {
+    NativeIdentity(AdaptiveCollectionError),
+    Ticket(RoventTicketValidationErrorV2),
+}
+
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl<'a> RoventCollectionDispatchWitnessV2<'a> {
+    pub(super) fn try_new(
+        admission: &'a RoventCollectionRootAdmissionV2,
+        verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
+        ticket: &'a RoleTicketEnvelope,
+    ) -> Result<Self, RoventDispatchWitnessFailureV2> {
+        admission.validate_native_identity(verifier)
+            .map_err(RoventDispatchWitnessFailureV2::NativeIdentity)?;
+        admission.try_validate_ticket(ticket)
+            .map_err(RoventDispatchWitnessFailureV2::Ticket)?;
+        Ok(Self { admission, ticket })
+    }
     pub(super) fn new(
         admission: &'a RoventCollectionRootAdmissionV2,
         verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
@@ -259,6 +278,30 @@ impl<'a> RoventCollectionConsumedWitnessV2<'a> {
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+/// Capture or disable optional collection for the original root. Neither
+/// disposition changes native search or physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveCollectionDispatchV2 {
+    Captured,
+    /// The original capture owner is briefly busy. The manager retains the
+    /// same ticket and retries inside its original deadline without executing.
+    Busy,
+    /// This root's optional collection is disabled from the original ticket
+    /// onward. The observer must first retain that ticket, reason and root
+    /// boundary and register the same disabled scope with native capture.
+    DisabledBackpressure,
+}
+
+/// A busy original owner is retried only while the same root and ticket are
+/// live; it is not an installed capture bypass or a physical completion.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveCollectionBoundaryV2 {
+    Ready,
+    Busy,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 /// Observer for an original V2 root. Accepted is native-owner acceptance,
 /// not a claim that the search has consumed the result. A teacher process and
 /// other physical resources must be owned by the separate session lifecycle,
@@ -272,7 +315,35 @@ pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
         &mut self,
         ticket: RoventCollectionDispatchWitnessV2<'_>,
         input: &FrameInput<ReviewView, Q>,
-    ) -> Result<(), AdaptiveCollectionError>;
+    ) -> Result<AdaptiveCollectionDispatchV2, AdaptiveCollectionError>;
+    /// Preserve the first collection-only failure and install the original
+    /// root's native capture bypass before dispatching the supplied ticket.
+    /// Existing per-ticket captures retain priority and must still be drained.
+    /// A missing or unsafe boundary must return an error, not claim success.
+    fn disable_after_failure(
+        &mut self,
+        _ticket: RoventCollectionDispatchWitnessV2<'_>,
+        _original: &AdaptiveCollectionError,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        Err(AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Dispatch,
+            "DisableAfterFailureUnsupported",
+            "original collection owner cannot establish a safe disabled boundary",
+        ))
+    }
+    /// A previously prepared ticket may be dispatched after a later ticket
+    /// disabled this root. Preserve its exact original native identity before
+    /// allowing that earlier-sequence ticket to execute without a capture.
+    fn allow_disabled_prior_ticket(
+        &mut self,
+        _ticket: RoventCollectionDispatchWitnessV2<'_>,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        Err(AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Dispatch,
+            "DisabledPriorTicketUnsupported",
+            "original collection owner cannot register the earlier ticket",
+        ))
+    }
     fn native_event(&mut self, event: RoventCollectionNativeEventWitnessV2<'_, O>)
     -> Result<(), AdaptiveCollectionError>;
     fn accepted(

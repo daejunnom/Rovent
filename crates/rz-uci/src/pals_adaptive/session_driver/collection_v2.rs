@@ -5,7 +5,9 @@ use super::*;
 use crate::pals_adaptive::{
     AdaptiveCollectionError, AdaptiveCollectionObserverBoxV2, AdaptiveCollectionV2ObserverStatus,
     RoventCollectionRootAdmissionV2, RoventNativeCollectionOriginV2,
+    RoventTeacherScopePhysicalAckV2,
 };
+use crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2;
 use std::any::Any;
 
 /// The collection owner must not perform blocking teacher or filesystem work
@@ -37,6 +39,8 @@ pub struct RoventBoardCollectionHandoffV2<O> {
     pub(super) observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
     pub(super) settlement: Result<(), AdaptiveCollectionError>,
     pub(super) native_fence: AdaptiveShutdownReceipt,
+    pub(super) teacher_physical_ack: Option<RoventTeacherScopePhysicalAckV2>,
+    pub(super) teacher_aggregate_ack: Option<RoventTeacherScopeAggregateAckV2>,
 }
 
 /// Delivery never certifies teacher or physical completion.
@@ -48,6 +52,47 @@ pub enum RoventBoardCollectionDeliveryV2 {
 }
 
 impl<O> RoventBoardCollectionHandoffV2<O> {
+    /// Accept only a unique, original teacher scope acknowledgment for this
+    /// exact admission. It conveys physical retirement, not semantic success.
+    pub fn submit_teacher_physical_ack(
+        &mut self,
+        ack: RoventTeacherScopePhysicalAckV2,
+    ) -> Result<(), RoventTeacherScopePhysicalAckV2> {
+        if self.teacher_physical_ack.is_some() || self.teacher_aggregate_ack.is_some()
+            || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_physical_ack = Some(ack);
+        Ok(())
+    }
+
+    /// Reclaim the same non-clone acknowledgment; removing it does not itself
+    /// certify that the session or its native owner has stopped.
+    pub fn take_teacher_physical_ack(&mut self) -> Option<RoventTeacherScopePhysicalAckV2> {
+        self.teacher_physical_ack.take()
+    }
+
+    /// Aggregate retirement remains separate from collection semantic success
+    /// and cannot replace the original observer or publication custody.
+    pub fn submit_teacher_aggregate_ack(
+        &mut self,
+        ack: RoventTeacherScopeAggregateAckV2,
+    ) -> Result<(), RoventTeacherScopeAggregateAckV2> {
+        if self.teacher_physical_ack.is_some() || self.teacher_aggregate_ack.is_some()
+            || !ack.matches_admission(&self.admission) {
+            return Err(ack);
+        }
+        self.teacher_aggregate_ack = Some(ack);
+        Ok(())
+    }
+
+    pub fn teacher_aggregate_ack(&self) -> Option<&RoventTeacherScopeAggregateAckV2> {
+        self.teacher_aggregate_ack.as_ref()
+    }
+
+    pub fn take_teacher_aggregate_ack(&mut self) -> Option<RoventTeacherScopeAggregateAckV2> {
+        self.teacher_aggregate_ack.take()
+    }
     pub fn parts_mut(&mut self) -> (
         &RoventCollectionRootAdmissionV2,
         &mut AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
@@ -62,8 +107,11 @@ impl<O> RoventBoardCollectionHandoffV2<O> {
         AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
         Result<(), AdaptiveCollectionError>,
         AdaptiveShutdownReceipt,
+        Option<RoventTeacherScopePhysicalAckV2>,
+        Option<RoventTeacherScopeAggregateAckV2>,
     ) {
-        (self.admission, self.observer, self.settlement, self.native_fence)
+        (self.admission, self.observer, self.settlement, self.native_fence,
+         self.teacher_physical_ack, self.teacher_aggregate_ack)
     }
 }
 
@@ -136,6 +184,31 @@ where
         self.rovent_collection_delivery_v2.lock()
             .map(|status| *status)
             .map_err(|_| failure("RoventBoardCollectionDeliveryV2", "delivery state poisoned"))
+    }
+
+    /// Transfer this session's original handoff to a caller that will retain
+    /// its observer and unpublished corpus data. This is also the recovery
+    /// path when the worker channel was full or disconnected. It cannot
+    /// fabricate a teacher acknowledgment or establish corpus acceptance.
+    /// Repeated calls never create a second copy of this custody transfer.
+    pub fn take_board_collection_handoff_v2(
+        &self,
+    ) -> Result<Option<Arc<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>>, SearchSessionFailure> {
+        let mut transferred = self.rovent_collection_handoff_transferred_v2.try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let mut retained = self.rovent_collection_handoff_v2.try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        if transferred.is_some() {
+            if retained.is_some() {
+                return Err(SearchSessionFailure::physical_completion_unknown());
+            }
+            return Ok(None);
+        }
+        let Some(original) = retained.take() else {
+            return Ok(None);
+        };
+        *transferred = Some(Arc::downgrade(&original));
+        Ok(Some(original))
     }
     /// Installs only the actual loaded /2 owner on the still-idle session.
     /// A copied digest or a separately loaded model cannot stand in for it.
