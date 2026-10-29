@@ -345,6 +345,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/native_accounting.rs"),
             source!("crates/rz-uci/src/pals_adaptive/projection.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/session_driver/collection_v2.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/storage.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/checker_metadata.rs"),
             source!(
@@ -411,6 +412,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-runtime/src/adaptive/topology.rs"),
             source!("crates/rz-uci/src/pals_adaptive/continuation_diagnostic.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/session_driver/collection_v2.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/storage.rs"),
             source!(
                 "crates/rz-uci/src/pals_adaptive/session_driver/checker_metadata/profiled_external.rs"
@@ -492,6 +494,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/native_accounting.rs"),
             source!("crates/rz-uci/src/pals_adaptive/projection.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/session_driver/collection_v2.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/storage.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/checker_metadata.rs"),
             source!(

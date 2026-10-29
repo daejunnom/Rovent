@@ -89,6 +89,10 @@ pub fn adaptive_execution_manager_source_digest() -> [u8; 32] {
             include_bytes!("pals_adaptive/session_driver.rs").as_slice(),
         ),
         (
+            "pals_adaptive/session_driver/collection_v2.rs",
+            include_bytes!("pals_adaptive/session_driver/collection_v2.rs").as_slice(),
+        ),
+        (
             "pals_adaptive/native_accounting.rs",
             include_bytes!("pals_adaptive/native_accounting.rs").as_slice(),
         ),

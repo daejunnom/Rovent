@@ -5,6 +5,10 @@
 
 mod checker_metadata;
 pub use checker_metadata::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod collection_v2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use collection_v2::*;
 mod completion_observation;
 mod idle_physical_close;
 #[cfg(feature = "pals-adaptive")]
@@ -674,6 +678,14 @@ where
     #[cfg(feature = "pals-adaptive")]
     rovent_root_policy_v2: Option<RoventPcrRootPolicyV2>,
     rovent_collection_origin: Option<super::RoventNativeCollectionOrigin>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_origin_v2: Option<super::RoventNativeCollectionOriginV2>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_hooks_v2: Option<Arc<dyn RoventBoardCollectionHooksV2<B>>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_failure_v2: Mutex<Option<RoventBoardCollectionAdmissionFailureV2>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_panic_v2: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
     latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
     #[cfg(feature = "pals-adaptive")]
     latest_rovent_root_v2: Mutex<Option<Arc<RoventNativeRootReceiptV2>>>,
@@ -1458,6 +1470,14 @@ where
             #[cfg(feature = "pals-adaptive")]
             rovent_root_policy_v2: None,
             rovent_collection_origin: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_origin_v2: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_hooks_v2: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_failure_v2: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_panic_v2: Mutex::new(Vec::new()),
             latest_rovent_root: Mutex::new(None),
             #[cfg(feature = "pals-adaptive")]
             latest_rovent_root_v2: Mutex::new(None),
@@ -2639,6 +2659,10 @@ where
             }
         };
         *observation = AttemptObservation::PalsStarted;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let mut board_collection_v2_started = false;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let mut board_collection_v2_revoked = false;
         let admitted = catch_unwind(AssertUnwindSafe(|| {
             if let Some(profile) = &self.rovent {
                 match self.researcher_class {
@@ -2668,6 +2692,19 @@ where
                         ))?,
                     external_source,
                 )?;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if self.rovent_collection_origin_v2.is_some() {
+                    // Mark before invoking an external hook: it may acquire a
+                    // teacher owner even if admission fails or unwinds.
+                    board_collection_v2_started = true;
+                    self.admit_board_collection_v2(
+                        &mut manager,
+                        root_admission.as_ref().ok_or(AdaptiveManagerError::Invalid(
+                            "V2 board root admission absent",
+                        ))?,
+                        profile,
+                    )?;
+                }
             }
             #[cfg(feature = "pals-adaptive-diagnostics")]
             if let Some(diagnostic) = self.continuation_diagnostic.get() {
@@ -2722,6 +2759,19 @@ where
                         {
                             manager.begin_root_quiesce(context.shutdown_deadline)?;
                         }
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if board_collection_v2_started {
+                            if manager.phase() != ManagerPhase::Running {
+                                if !board_collection_v2_revoked {
+                                    if let Some(hooks) = &self.rovent_collection_hooks_v2 {
+                                        hooks.revoke();
+                                    }
+                                    board_collection_v2_revoked = true;
+                                }
+                            } else if let Some(hooks) = &self.rovent_collection_hooks_v2 {
+                                hooks.pump()?;
+                            }
+                        }
                         if let Some(pump) = &self.collection_hooks.cooperative {
                             pump()?;
                         }
@@ -2755,11 +2805,34 @@ where
         }));
         let admitted = match admitted {
             Ok(result) => result,
-            Err(_) => {
+            Err(payload) => {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if board_collection_v2_started {
+                    self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
+                    if let Some(hooks) = &self.rovent_collection_hooks_v2 {
+                        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                            // Both panic payloads can own resources. Retain a
+                            // second one independently if revocation panics.
+                            self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
+                        }
+                    }
+                }
+                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                drop(payload);
                 *state = SessionState::Manager(manager);
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         };
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if board_collection_v2_started && !board_collection_v2_revoked {
+            if let Some(hooks) = &self.rovent_collection_hooks_v2 {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                    self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
+                    *state = SessionState::Manager(manager);
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+            }
+        }
         if let Err(error) = admitted {
             let _cleanup = catch_unwind(AssertUnwindSafe(|| {
                 let _ = manager.begin_root_quiesce(context.shutdown_deadline);
@@ -2793,6 +2866,14 @@ where
             let _ = self.observe_rovent_root(&manager, context, root_admission.as_ref());
             *state = SessionState::Manager(manager);
             return Err(failure);
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if board_collection_v2_started {
+            // The native root fence does not attest the separate teacher's
+            // retirement. Keep the original manager and observer until the
+            // matching cross-owner handoff supplies that proof.
+            *state = SessionState::Manager(manager);
+            return Err(SearchSessionFailure::physical_completion_unknown());
         }
         #[cfg(feature = "pals-adaptive-diagnostics")]
         if let Some(diagnostic) = self.continuation_diagnostic.get() {
@@ -3622,6 +3703,18 @@ where
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if !physically_closed {
+            // The manager quarantine alone does not own the external hook,
+            // rejected admission or callback panic payload. Keep those same
+            // owners alongside it when teacher completion is unknown.
+            let collection_owners = (
+                self.rovent_collection_origin_v2.take(),
+                self.rovent_collection_hooks_v2.take(),
+                self.rovent_collection_failure_v2.get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner()).take(),
+                std::mem::take(self.rovent_collection_panic_v2.get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner())),
+            );
+            std::mem::forget(collection_owners);
             let storage = self
                 .storage
                 .get_mut()
