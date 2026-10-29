@@ -29,7 +29,7 @@ from storage_code_retirement import _Inputs, _file_identity, _need, _note, _path
 SCHEMA = "rovezero.legacy-build-observation.v1"
 MAX_ENTRIES = 4096
 MAX_RECORD_BYTES = 4 << 20
-MAX_BYTES = 18 << 30
+WARNING_BYTES = 18 << 30
 _NAME = re.compile(r"(?:original-binaries-build-[0-9]+|binaries-build-[0-9]+|binaries)\Z")
 
 
@@ -121,10 +121,15 @@ def _publish(directory_fd, name, raw, tick):
 
 def observe(inputs_root: Path, directory: Path, output: Path, *,
             max_bytes: int, max_entries: int = MAX_ENTRIES, seconds: int = 60):
-    """Write a bounded, create-only snapshot; it grants no cleanup authority."""
+    """Write a create-only snapshot; byte thresholds warn, not grant authority.
+
+    This inventory only observes file metadata, not file contents. Time and
+    entry count bound its actual work; the selected files' total size does not.
+    ``max_bytes`` is retained as a caller-selected warning threshold.
+    """
     _need(sys.platform == "linux", "legacy observation requires Linux")
-    _need(type(max_bytes) is int and 0 < max_bytes <= MAX_BYTES,
-          "explicit bounded byte limit required")
+    _need(type(max_bytes) is int and max_bytes > 0,
+          "positive byte warning threshold required")
     _need(type(max_entries) is int and 0 < max_entries <= MAX_ENTRIES,
           "explicit bounded entry limit required")
     for path in (inputs_root, directory, output):
@@ -180,7 +185,6 @@ def observe(inputs_root: Path, directory: Path, output: Path, *,
                           "ordinary single-link files required")
                     kind = "file"
                     total += info.st_size
-                    _need(total <= max_bytes, "observation byte bound exceeded")
                 rows.append({"relative_path": str(path.relative_to(directory)), "kind": kind,
                              "device": info.st_dev, "inode": info.st_ino,
                              "mode": info.st_mode, "uid": info.st_uid, "gid": info.st_gid,
@@ -229,6 +233,14 @@ def observe(inputs_root: Path, directory: Path, output: Path, *,
         first = inputs.close(first)
     if first is not None:
         raise first
+    threshold = min(max_bytes, WARNING_BYTES)
+    if total > threshold:
+        try:
+            print(f"rovezero_storage_warning: legacy observation accounts for {total} bytes "
+                  f"(warning threshold {threshold} bytes); no cleanup authority was granted",
+                  file=sys.stderr)
+        except (OSError, ValueError):
+            pass
     return result
 
 
@@ -294,7 +306,8 @@ def main():
     parser.add_argument("--inputs-root", type=Path, required=True)
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--max-bytes", type=int, required=True)
+    parser.add_argument("--max-bytes", type=int, required=True,
+                        help="caller-selected warning threshold; no byte-based rejection")
     parser.add_argument("--max-entries", type=int, default=MAX_ENTRIES)
     parser.add_argument("--seconds", type=int, default=60)
     args = parser.parse_args()

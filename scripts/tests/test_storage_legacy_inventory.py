@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -136,7 +136,7 @@ class LegacyInventoryTests(unittest.TestCase):
 
     def test_bounds_and_scope_reject_without_publishing(self):
         with self.assertRaises(StorageError):
-            self.register(max_bytes=1)
+            self.register(max_bytes=0)
         self.assertFalse(self.output.exists())
         with self.assertRaises(StorageError):
             observe(self.inputs, self.directory, self.directory / "output.json", max_bytes=1000)
@@ -144,6 +144,25 @@ class LegacyInventoryTests(unittest.TestCase):
         with self.assertRaises(StorageError):
             observe(self.inputs, self.inputs, self.output, max_bytes=1000)
         self.assertFalse(self.output.exists())
+
+    def test_byte_warning_does_not_block_observation_or_grant_authority(self):
+        # File bytes are not read by this metadata inventory. Simulate a large
+        # size threshold with a small fixture instead of allocating a large file.
+        captured = io.StringIO()
+        with mock.patch("storage_legacy_inventory.WARNING_BYTES", 5), redirect_stderr(captured):
+            record = self.register(max_bytes=1 << 40)
+        self.assertIn("rovezero_storage_warning", captured.getvalue())
+        self.assertEqual(record["total_file_bytes"], self.binary.stat().st_size)
+        self.assertFalse(record["deletion_authorized"])
+        self.assertTrue(self.binary.exists())
+        self.assertEqual(json.loads(self.output.read_text()), record)
+
+    def test_caller_byte_threshold_warns_without_rejecting(self):
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            record = self.register(max_bytes=1)
+        self.assertIn("rovezero_storage_warning", captured.getvalue())
+        self.assertFalse(record["ownership_adopted"])
 
 
 if __name__ == "__main__":
