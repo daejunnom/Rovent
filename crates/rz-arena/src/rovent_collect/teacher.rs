@@ -40,6 +40,7 @@ fn question_json(q: rz_contracts::rovent::QuestionEnvelope) -> Value {
 }
 /// A declaration joined to the existing retained launch. It is deliberately
 /// not a running teacher, go receipt, completion or a training authority.
+#[derive(Clone)]
 pub struct RoventRegisteredTeacher {
     actor_id: String,
     pin: RoventTeacherPin,
