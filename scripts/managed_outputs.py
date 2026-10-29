@@ -477,7 +477,7 @@ class OutputLease:
                 if tree_size(self.output) > self.reserve:
                     raise OutputBudgetError("preservation evidence exceeds original output reservation")
                 warn_output_threshold(self._output_usage(self._quarantine_view.rows() if self.unattributed_preservation is not None else _catalog_rows(self.catalog)),
-                                      self.total_limit, scope="output_actual")
+                                      self.total_limit, scope="output_accounted")
             return self
         except BaseException as error:
             try:
@@ -642,7 +642,8 @@ class OutputLease:
                      if self._quarantine_view is not None else self._last_own_usage)
         if own_usage > self.reserve:
             raise OutputBudgetError("managed output byte budget exceeded; evidence retained")
-        warn_output_threshold(actual, self.total_limit, scope="output_actual")
+        warn_output_threshold(actual, self.total_limit, scope="output_accounted",
+                              observed_bytes=own_usage)
         self._check_created_directory()
         self._check_quarantine_view()
 
@@ -820,7 +821,7 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
         try:
             total = view.usage(_catalog_rows(catalog))
             view.check()
-            warn_output_threshold(total, scope="output_actual")
+            warn_output_threshold(total, scope="output_accounted")
             return total
         finally:
             view.close(sys.exc_info()[1])
@@ -833,7 +834,7 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
         try:
             total = view.usage(_catalog_rows(catalog))
             view.check()
-            warn_output_threshold(total, scope="output_actual")
+            warn_output_threshold(total, scope="output_accounted")
             return total
         finally:
             view.close(sys.exc_info()[1])
@@ -844,6 +845,7 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
             raise StorageError("previously observed supervised output catalog disappeared")
         return 0
     total = 0
+    observed_bytes = 0
     owned_seen = set()
     entries = list(catalog.iterdir())
     if len(entries) > MAX_RUNS + 1:
@@ -913,12 +915,13 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
                 raise StorageError("managed output exceeds reservation")
             _warn_unrelated_output("reservation exceeded; retained for owner review")
         total += amount
+        observed_bytes += amount
     if supervisor_scope is not None and foreign_cache is not None:
         previously_owned = foreign_cache.setdefault("__owned_rows__", set())
         if previously_owned - owned_seen:
             raise StorageError("previously observed supervised output disappeared or changed owner")
         previously_owned.update(owned_seen)
-    warn_output_threshold(total, scope="output_reserved_estimate" if supervisor_scope is not None else "output_actual")
+    warn_output_threshold(total, scope="output_accounted", observed_bytes=observed_bytes)
     return total
 
 

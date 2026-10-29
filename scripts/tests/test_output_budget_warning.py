@@ -38,6 +38,22 @@ class OutputBudgetWarningTests(unittest.TestCase):
         with patch.object(sys, "stderr", BrokenStream()):
             self.assertTrue(managed_storage.warn_output_threshold(19, 18, scope="broken"))
 
+    def test_reservations_are_not_reported_as_actual_usage(self):
+        sink = io.StringIO()
+        with patch.object(sys, "stderr", sink):
+            self.assertTrue(managed_storage.warn_output_threshold(
+                51_609_195_897, 18 * managed_storage.GiB,
+                scope="output_accounted", observed_bytes=1234))
+            self.assertTrue(managed_storage.warn_output_threshold(
+                19, 18, scope="unattributed"))
+        message = sink.getvalue()
+        self.assertIn("accounted_bytes=51609195897", message)
+        self.assertIn("may include reservations; not actual disk usage", message)
+        self.assertIn("observed_logical_bytes=1234", message)
+        self.assertIn("observed_logical_bytes=unknown", message)
+        self.assertIn("remaining_actual_bytes=unknown", message)
+        self.assertNotIn("output_actual", message)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ DEFAULT_OUTPUT_WARNING_BYTES = 18 * GiB
 _warned_output_scopes: set[str] = set()
 
 
-def warn_output_threshold(total, threshold=DEFAULT_OUTPUT_WARNING_BYTES, *, scope="output"):
+def warn_output_threshold(total, threshold=DEFAULT_OUTPUT_WARNING_BYTES, *, scope="output", observed_bytes=None):
     """Warn once per over-threshold interval; never grant cleanup authority.
 
     Diagnostic delivery failures cannot stop the producer or change custody.
@@ -36,9 +36,13 @@ def warn_output_threshold(total, threshold=DEFAULT_OUTPUT_WARNING_BYTES, *, scop
             _warned_output_scopes.add(label)
         try:
             import sys
+            observed = (str(observed_bytes) if type(observed_bytes) is int and observed_bytes >= 0
+                        else "unknown")
             sys.stderr.write(
-                f"rovezero_storage_warning: {label} accounts for {total} bytes "
-                f"(warning threshold {threshold} bytes); safe cleanup is due\n"
+                f"rovezero_storage_warning: scope={label} accounted_bytes={total} "
+                f"(may include reservations; not actual disk usage); "
+                f"observed_logical_bytes={observed}; remaining_actual_bytes=unknown; "
+                f"warning_threshold_bytes={threshold}; safe cleanup is due\n"
             )
         except Exception:
             pass
