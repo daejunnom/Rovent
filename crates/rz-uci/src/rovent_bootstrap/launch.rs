@@ -56,6 +56,9 @@ const MAX_SELECTION_BYTES: u64 = 64 << 10;
 
 mod cohort_prepare;
 mod collection;
+mod collection_v2_observer;
+#[cfg(test)]
+mod collection_v2_tests;
 mod evidence;
 pub mod storage;
 mod v2_external;
@@ -66,7 +69,7 @@ pub use cohort_prepare::{
 };
 use collection::{CollectionLaunch, CollectionLaunchV2};
 pub use collection::{
-    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
+    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, RoventPcCollectionLaunchFailureV2, run_collection,
     run_collection_with_driver, run_collection_with_resource_admission,
     run_pc_collection_v2_with_resource_admission,
 };
@@ -1239,6 +1242,10 @@ fn run_v2_native<'a>(
         cleanup_until,
         cancellation: Arc::new(AtomicBool::new(false)),
     };
+    if let Some(request) = &collection {
+        request.hooks.register_startup_control(&control)
+            .map_err(|failure| error("PhysicalCompletionUnknown", failure))?;
+    }
     let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
     let binary = lock
         .manifest
@@ -1258,9 +1265,9 @@ fn run_v2_native<'a>(
     let view = boundary
         .startup_view()
         .map_err(|failure| error("ProcessBoundary", failure))?;
-    let (teacher_selections, observer, hooks, resource) = match collection {
-        Some(request) => (Some(request.teacher_selections), Some(request.observer), Some(request.hooks), Some(request.admit_resource)),
-        None => (None, None, None, None),
+    let (teacher_selections, observer, hooks, resource, startup_attempt, native_settled) = match collection {
+        Some(request) => (Some(request.teacher_selections), Some(request.observer), Some(request.hooks), Some(request.admit_resource), Some(request.startup_attempt), Some(request.native_settled)),
+        None => (None, None, None, None, None, None),
     };
     if let Some(resource) = resource {
         control.check().map_err(|failure| error("ResourceAdmission", failure))?;
@@ -1447,9 +1454,20 @@ fn run_v2_native<'a>(
     }
     let assembled = (|| -> Result<_, RoventLaunchError> {
         if let (Some(observer), Some(hooks)) = (observer, hooks) {
+            if let Some(attempt) = &startup_attempt {
+                attempt.store(true, std::sync::atomic::Ordering::Release);
+            }
             let prepared = super::prepare_native_v2_collection::<PcPortQuestion>(
                 Arc::clone(&sources), resources, clock.runtime_clock(), control.clone(), observer,
-            ).map_err(|rejection| reject_factory(rejection, cleanup_until, &diagnostic))?;
+            ).map_err(|rejection| {
+                let failure = reject_factory(rejection, cleanup_until, &diagnostic);
+                if failure.stage != "PhysicalCompletionUnknown" {
+                    if let Some(settled) = &native_settled {
+                        settled.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                failure
+            })?;
             let driver = super::product::RoventNativeProductDriverV2::pc_with_collection_hooks_v2(
                 prepared, loaded_nnuec, Arc::clone(&boundary), clock.clone(),
                 Arc::clone(&owners), identity, arguments.root_policy, hooks,
@@ -1546,6 +1564,9 @@ fn run_v2_native<'a>(
                 Err(failure) => format!("UCI failed before actual physical finish: {failure}"),
             },
         ));
+    }
+    if let Some(settled) = &native_settled {
+        settled.store(true, std::sync::atomic::Ordering::Release);
     }
     result
 }

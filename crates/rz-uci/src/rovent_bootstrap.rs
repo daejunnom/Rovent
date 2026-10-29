@@ -1225,6 +1225,7 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap/storage_lifecycle/observation.rs"),
         include_str!("rovent_bootstrap/launch.rs"),
         include_str!("rovent_bootstrap/launch/collection.rs"),
+        include_str!("rovent_bootstrap/launch/collection_v2_observer.rs"),
         include_str!("rovent_bootstrap/launch/evidence.rs"),
         include_str!("rovent_bootstrap/launch/storage.rs"),
         include_str!("rovent_bootstrap/launch/v2_external.rs"),

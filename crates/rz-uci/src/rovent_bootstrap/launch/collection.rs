@@ -19,6 +19,8 @@ use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use rz_experiments::{RoventInputLock, RoventInputLockV2};
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use super::collection_v2_observer::{V2ObserverCustody, V2ObserverReclaimError};
 
 /// Explicit V2 P/C collection inputs. These owners are selected before the
 /// original lock is opened; they never project a V2 input lock into V1.
@@ -27,6 +29,68 @@ pub(super) struct CollectionLaunchV2<'a> {
     pub(super) observer: Box<dyn VirtualReviewCollectionObserver>,
     pub(super) hooks: Arc<dyn RoventPcCollectionHooksV2>,
     pub(super) admit_resource: Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>,
+    pub(super) startup_attempt: Arc<AtomicBool>,
+    pub(super) native_settled: Arc<AtomicBool>,
+}
+
+/// Startup/session failure returns the same hook Arc to the caller. It does
+/// not assert that the hook's own external work has stopped. Unknown physical
+/// completion remains quarantined if the failure is dropped without recovery.
+pub struct RoventPcCollectionLaunchFailureV2 {
+    pub error: RoventLaunchError,
+    hooks: Option<Arc<dyn RoventPcCollectionHooksV2>>,
+    panic_payload: Option<Box<dyn std::any::Any + Send>>,
+    observer_before_start: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    retained_observer: Option<V2ObserverCustody>,
+    observer_reclaim_error: Option<V2ObserverReclaimError>,
+    physical_unknown: bool,
+}
+
+impl RoventPcCollectionLaunchFailureV2 {
+    pub fn hooks(&self) -> &Arc<dyn RoventPcCollectionHooksV2> {
+        self.hooks.as_ref().expect("original collection hooks retained")
+    }
+
+    /// Transfer the original hook custody to a caller that will retain it
+    /// until its own teacher/process completion has been established.
+    pub fn take_hook_custody(&mut self) -> Option<Arc<dyn RoventPcCollectionHooksV2>> {
+        self.hooks.take()
+    }
+
+    /// Return the original observer after a verified no-worker or completed
+    /// native boundary. Teacher and publication are separate obligations.
+    pub fn take_settled_observer(&mut self) -> Option<Box<dyn VirtualReviewCollectionObserver>> {
+        self.observer_before_start.take()
+    }
+
+    /// Retained custody is not evidence of completion or safe reclamation.
+    pub fn observer_custody_retained(&self) -> bool {
+        self.retained_observer.is_some()
+    }
+
+    pub fn observer_reclaim_failure(&self) -> Option<&'static str> {
+        self.observer_reclaim_error.map(|error| match error {
+            V2ObserverReclaimError::ProxyStillOwned => "proxy_still_owned",
+            V2ObserverReclaimError::Poisoned => "poisoned",
+            V2ObserverReclaimError::NotPoisoned => "not_poisoned",
+            V2ObserverReclaimError::AlreadyReclaimed => "already_reclaimed",
+        })
+    }
+
+    pub fn physical_completion_unknown(&self) -> bool { self.physical_unknown }
+}
+
+impl Drop for RoventPcCollectionLaunchFailureV2 {
+    fn drop(&mut self) {
+        if self.physical_unknown {
+            if let Some(hooks) = self.hooks.take() {
+                std::mem::forget(hooks);
+            }
+            if let Some(payload) = self.panic_payload.take() {
+                std::mem::forget(payload);
+            }
+        }
+    }
 }
 
 /// Admit a P/C V2 collection using the actual V2 lock and original source
@@ -37,13 +101,65 @@ pub fn run_pc_collection_v2_with_resource_admission<'a>(
     observer: Box<dyn VirtualReviewCollectionObserver>,
     hooks: Arc<dyn RoventPcCollectionHooksV2>,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
-) -> Result<(), RoventLaunchError> {
-    super::run_pc_collection_v2_inner(arguments, CollectionLaunchV2 {
+) -> Result<(), RoventPcCollectionLaunchFailureV2> {
+    let original_hooks = Arc::clone(&hooks);
+    let startup_attempt = Arc::new(AtomicBool::new(false));
+    let native_settled = Arc::new(AtomicBool::new(false));
+    let mut observer_custody = V2ObserverCustody::new(observer);
+    let proxy = observer_custody.proxy().expect("new observer custody");
+    let inner_startup_attempt = Arc::clone(&startup_attempt);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::run_pc_collection_v2_inner(arguments, CollectionLaunchV2 {
         teacher_selections,
-        observer,
+        observer: proxy,
         hooks,
         admit_resource: Box::new(admit_resource),
-    })
+        startup_attempt: inner_startup_attempt,
+        native_settled: Arc::clone(&native_settled),
+    })));
+    match result {
+        Ok(Ok(())) => match observer_custody.try_reclaim_after_verified_boundary() {
+            Ok(original) => { drop(original); Ok(()) }
+            Err(reclaim_error) => Err(RoventPcCollectionLaunchFailureV2 {
+                error: super::error("PhysicalCompletionUnknown", "V2 collection observer custody remained active after session closure"),
+                hooks: Some(original_hooks),
+                panic_payload: None,
+                observer_before_start: None,
+                retained_observer: Some(observer_custody),
+                observer_reclaim_error: Some(reclaim_error),
+                physical_unknown: true,
+            }),
+        },
+        Ok(Err(error)) => {
+            let safe_native = !startup_attempt.load(Ordering::Acquire)
+                || native_settled.load(Ordering::Acquire);
+            let (original, reclaim_error) = if safe_native && error.stage != "PhysicalCompletionUnknown" {
+                match observer_custody.try_reclaim_after_verified_boundary() {
+                    Ok(original) => (Some(original), None),
+                    Err(reclaim_error) => (None, Some(reclaim_error)),
+                }
+            } else { (None, None) };
+            let physical_unknown = !safe_native || error.stage == "PhysicalCompletionUnknown";
+            let retained_observer = if original.is_none() { Some(observer_custody) } else { None };
+            Err(RoventPcCollectionLaunchFailureV2 {
+                error,
+                hooks: Some(original_hooks),
+                panic_payload: None,
+                observer_before_start: original,
+                retained_observer,
+                observer_reclaim_error: reclaim_error,
+                physical_unknown,
+            })
+        }
+        Err(payload) => Err(RoventPcCollectionLaunchFailureV2 {
+            error: super::error("PhysicalCompletionUnknown", "V2 collection launch panicked"),
+            hooks: Some(original_hooks),
+            panic_payload: Some(payload),
+            observer_before_start: None,
+            retained_observer: Some(observer_custody),
+            observer_reclaim_error: None,
+            physical_unknown: true,
+        }),
+    }
 }
 
 /// 부모 launch가 실제로 준비한 단일 native owner의 구체 질문 타입을 보존한다.

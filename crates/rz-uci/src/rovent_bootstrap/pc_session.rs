@@ -152,6 +152,9 @@ impl RoventPcCollectionHandoffV2 {
 /// acquire a root/teacher lock or wait for teacher I/O. They may instead pass
 /// work to an independently owned worker with bounded admission.
 pub trait RoventPcCollectionHooksV2: Send + Sync {
+    /// Bind the original startup control once, before native preparation.
+    /// This only registers the identity; it must not spawn or wait for work.
+    fn register_startup_control(&self, control: &super::RoventStartupControl) -> Result<(), AdaptiveManagerError>;
     fn admit(
         &self,
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
