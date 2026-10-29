@@ -286,7 +286,9 @@
       "crates/rz-uci/src/pals_adaptive_sources.rs",
       "crates/rz-uci/src/rovent_external_launch/actual_root.rs",
       "crates/rz-uci/src/rovent_root_admission.rs",
-      "crates/rz-uci/src/rovent_root_admission/preadmission.rs"
+      "crates/rz-uci/src/rovent_root_admission/preadmission.rs",
+      "crates/rz-uci/src/rovent_root_admission/source_seal.rs",
+      "crates/rz-uci/src/engine/driver_start.rs"
     ],
     "role_tickets": [
       "crates/rz-contracts/Cargo.toml",
@@ -508,6 +510,7 @@
       "crates/rz-uci/src/rovent_external_launch/collection_teacher.rs",
       "crates/rz-uci/src/rovent_external_launch/frontier_source.rs",
       "crates/rz-uci/src/rovent_ponder.rs",
+      "crates/rz-search/src/external_cpu/process_scope.rs",
       "crates/rz-uci/src/rovent_root_admission.rs",
       "crates/rz-uci/src/rovent_root_admission/preadmission.rs",
       "crates/rz-uci/src/rovent_root_admission/source_seal.rs",
@@ -832,6 +835,8 @@
       "crates/rz-arena/src/rovent_collect/launch/pc_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/observer_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/pc_hooks_lock_v2.rs",
+      "crates/rz-arena/src/rovent_collect/collection_hooks_core_v2.rs",
+      "crates/rz-arena/src/rovent_collect/own_hooks_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/publication_caller_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/historical_declarations_v2.rs",
       "crates/rz-arena/src/rovent_collect/historical_native_lock_v2.rs",
@@ -1309,6 +1314,8 @@
       "crates/rz-arena/src/rovent_collect/launch/pc_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/observer_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/pc_hooks_lock_v2.rs",
+      "crates/rz-arena/src/rovent_collect/collection_hooks_core_v2.rs",
+      "crates/rz-arena/src/rovent_collect/own_hooks_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/publication_caller_lock_v2.rs",
       "crates/rz-arena/src/rovent_collect/historical_declarations_v2.rs",
       "crates/rz-arena/src/rovent_collect/historical_native_lock_v2.rs",

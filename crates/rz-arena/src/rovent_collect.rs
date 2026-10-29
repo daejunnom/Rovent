@@ -1080,7 +1080,12 @@ mod observer;
 #[cfg(feature = "pals-collection-onnx")]
 mod observer_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod collection_hooks_core_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_hooks_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+#[allow(dead_code, unused_imports)]
+mod own_hooks_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(unused_imports)]
 pub(super) use pc_hooks_lock_v2::{

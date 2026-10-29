@@ -25,6 +25,7 @@ pub struct RoventPcCollectionRunV2 {
     worker_exit: Option<RoventPcCollectionWorkerExitV2>,
     worker_thread_panicked: bool,
     native_failure: Option<RoventPcCollectionLaunchFailureV2>,
+    native_failure_taken: bool,
     resource_error: Option<String>,
 }
 
@@ -50,14 +51,38 @@ impl RoventPcCollectionRunV2 {
 
     pub fn observation(&self) -> serde_json::Value {
         let resource = self.resource.lock().ok().map(|state| state.observation());
-        let owner = self.owner.try_status().ok().flatten();
+        let (owner_observation, owner) = match self.owner.try_status() {
+            Ok(Some(status)) => ("available", Some(status)),
+            Ok(None) => ("busy", None),
+            Err(_) => ("poisoned", None),
+        };
+        let worker_exit = match self.worker_exit.as_ref() {
+            Some(RoventPcCollectionWorkerExitV2::NoAdmission) => "no_admission",
+            Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved) => "retirement_and_handoff_observed",
+            Some(RoventPcCollectionWorkerExitV2::Deadline) => "deadline",
+            Some(RoventPcCollectionWorkerExitV2::AdmissionCanceled) => "admission_canceled",
+            Some(RoventPcCollectionWorkerExitV2::Panicked(_)) => "caught_panic",
+            None if self.worker_thread_panicked => "outer_panic",
+            None => "pending",
+        };
+        let worker_observation = self.worker.try_lock().ok().map(|worker| {
+            let failures = worker.failure_observation();
+            json!({"primary_failure":failures.primary.map(|failure|failure.kind()),
+                "additional_failures":failures.additional.iter().map(|failure|failure.kind()).collect::<Vec<_>>(),
+                "omitted_failures":failures.omitted,
+                "diagnostic_actors":worker.diagnostics().len()})
+        });
         json!({"schema":"rz-rovent-pc-lock-v2-run-observation/1",
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
+            "native_failure_transferred":self.native_failure_taken,
             "resource_error":self.resource_error,"resource":resource,
             "teacher_worker_returned":self.worker_exit.is_some(),
+            "teacher_worker_exit":worker_exit,
             "teacher_worker_running_or_unknown":self.worker_thread.is_some() || self.worker_thread_panicked
                 || !matches!(self.worker_exit.as_ref(), Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved)),
             "teacher_worker_thread_panicked":self.worker_thread_panicked,
+            "teacher_worker_observation":worker_observation,
+            "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
                 "incomplete_capture":status.incomplete_capture_count,
@@ -65,6 +90,51 @@ impl RoventPcCollectionRunV2 {
                 "failure":status.failure.map(|error|format!("{error:?}")),
                 "callback_lock_failure":status.callback_lock_failure})),
             "physical_completion_claimed":false,"corpus_published":false,"training_executed":false})
+    }
+
+    /// Move the original native failure to a caller that will retain/recover
+    /// it. Taking it never changes the original run into a success.
+    pub fn take_native_failure(&mut self) -> Option<RoventPcCollectionLaunchFailureV2> {
+        let failure = self.native_failure.take();
+        if failure.is_some() { self.native_failure_taken = true; }
+        failure
+    }
+
+    /// Transfer actual teacher diagnostic bytes only after the worker thread
+    /// has exited. A busy or poisoned owner stays retained as unknown.
+    pub fn take_teacher_diagnostics(
+        &mut self,
+    ) -> Result<BTreeMap<String, rz_search::external_cpu::collection_teacher::TeacherDiagnostics>, ArenaError> {
+        check(self.worker_thread.is_none() && !self.worker_thread_panicked,
+            "Collection /2 teacher worker has not exited cleanly")?;
+        self.worker.try_lock().map_err(|_| invalid("Collection /2 worker busy or poisoned"))
+            .map(|mut worker| worker.take_diagnostics())
+    }
+
+    /// Read the actor retirement observations independently of diagnostic
+    /// bytes. These values do not themselves authorize corpus publication.
+    pub fn teacher_retirement_observations(
+        &self,
+    ) -> Result<BTreeMap<String, rz_uci::rovent_external_launch::RoventTeacherRetirementObservationV2>, ArenaError> {
+        self.worker.try_lock().map_err(|_| invalid("Collection /2 worker busy or poisoned"))
+            .map(|worker| worker.teacher_observations().clone())
+    }
+
+    /// Give the caller the same collection owner only after its original
+    /// worker observed the same fenced handoff and teacher retirement. This
+    /// authorizes inspection/partial assembly, not final publication.
+    pub fn closed_owner(&self) -> Result<RoventCollectionOwnerLockV2, ArenaError> {
+        check(
+            matches!(self.worker_exit.as_ref(), Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved))
+                && self.worker.try_lock().is_ok_and(|worker| !worker.has_failure()),
+            "Collection /2 teacher/worker retirement is not observed",
+        )?;
+        let status = self.owner.try_status()?.ok_or_else(|| invalid("Collection /2 owner busy"))?;
+        check(status.admitted && status.settled && status.pending_count == 0
+            && status.incomplete_capture_count == 0 && status.failure.is_none()
+            && !status.callback_lock_failure,
+            "Collection /2 native observer is not settled")?;
+        Ok(self.owner.clone())
     }
 }
 
@@ -75,7 +145,7 @@ impl Drop for RoventPcCollectionRunV2 {
                 && status.pending_retired_count == 0 && status.incomplete_capture_count == 0
                 && status.retained_failed_captures == 0 && status.failure.is_none()
                 && !status.callback_lock_failure);
-        let physically_resolved = owner_resolved && self.native_failure.is_none()
+        let physically_resolved = owner_resolved && self.native_failure.is_none() && !self.native_failure_taken
             && self.resource_error.is_none()
             && self.worker.try_lock().is_ok_and(|worker| !worker.has_failure())
             && matches!(self.worker_exit.as_ref(), Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved));
@@ -157,7 +227,7 @@ pub fn run_rovent_pc_collection_lock_v2(
     stop.store(true, Ordering::Release);
     let mut run = RoventPcCollectionRunV2 {
         resource, original_lock, owner, bridge, worker, worker_thread: Some(worker_thread), worker_exit: None,
-        worker_thread_panicked: false, native_failure: native.err(), resource_error: None,
+        worker_thread_panicked: false, native_failure: native.err(), native_failure_taken: false, resource_error: None,
     };
     if let Ok(mut resource) = run.resource.lock() {
         if let Err(error) = resource.finish_live() {
