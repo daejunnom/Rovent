@@ -74,7 +74,7 @@ struct State {
 }
 
 /// Retains the actual product; observes its real run and finish calls only.
-pub(super) struct ObservedV2<T> {
+pub(in crate::rovent_bootstrap) struct ObservedV2<T> {
     inner: T,
     input_lock_sha256: String,
     state: Mutex<State>,
@@ -134,7 +134,7 @@ fn same_stderr_pipe(_: &ObservationSink) -> bool {
 }
 
 impl<T> ObservedV2<T> {
-    pub(super) fn new(inner: T, input_lock_sha256: String) -> Self {
+    pub(in crate::rovent_bootstrap) fn new(inner: T, input_lock_sha256: String) -> Self {
         let sink = nonblocking_stderr_pipe();
         let unavailable = sink.is_none();
         Self {
