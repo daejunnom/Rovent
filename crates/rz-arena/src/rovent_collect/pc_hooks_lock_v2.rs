@@ -31,6 +31,7 @@ pub(crate) struct RoventPcCollectionBridgeV2 {
 
 struct PcDeferredRootsV2 {
     originals: Vec<(RoventCollectionRootAdmissionV2, AdaptiveCollectionError)>,
+    active: Vec<rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2>,
     cleanup_failures: Vec<Arc<Mutex<RoventPcDeferredCleanupV2>>>,
     overflow: u64,
     first_overflow: Option<(RoventCollectionRootAdmissionV2, AdaptiveCollectionError)>,
@@ -134,7 +135,7 @@ impl RoventPcCollectionBridgeV2 {
             || self.roster_identity != previous.roster_identity
             || !self.core.same_original_startup(&previous.core)
             || self.core.installed_admission_for_recovery().is_some() {
-            return Ok(Some(false));
+            return Err(super::invalid("P/C prepared root original owner, startup, roster or admission mismatch"));
         }
         let slot = match self.worker.try_lock() {
             Ok(slot) => slot,
@@ -164,7 +165,7 @@ impl RoventPcCollectionBridgeV2 {
         let (core, worker) =
             CollectionBridgeCoreV2::new(owner.clone(), Arc::clone(&manifest), roster, handoff_matches, handoff_submit)?;
         Ok((Arc::new(Self { core, owner, manifest, roster_identity, worker: Mutex::new(None), deferred: Mutex::new(PcDeferredRootsV2 {
-            originals: Vec::with_capacity(256), cleanup_failures: Vec::new(), overflow: 0, first_overflow: None,
+            originals: Vec::with_capacity(256), active: Vec::new(), cleanup_failures: Vec::new(), overflow: 0, first_overflow: None,
         }) }), worker))
     }
 
@@ -184,11 +185,18 @@ impl RoventPcCollectionBridgeV2 {
             Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }),
             Err(error) => return Err(RoventPcCollectionAdmissionFailureV2 { error, admission, owners: Box::new(()) }),
         };
+        if deferred.active.len() >= 16 || deferred.active.try_reserve(1).is_err() {
+            return Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::Capacity("P/C active no-capture custody"),
+                admission, owners: Box::new(capability),
+            });
+        }
         // Prepare evidence before installing the native marker. Keep bounded
         // original root/causes; overflow remains explicitly summarized.
         let evidence = (admission.clone(), reason.clone());
         match self.core.try_install_no_capture(&capability) {
             Ok(true) => {
+                deferred.active.push(capability.clone());
                 if deferred.originals.len() < 256 { deferred.originals.push(evidence); }
                 else { deferred.overflow = deferred.overflow.saturating_add(1); if deferred.first_overflow.is_none() { deferred.first_overflow = Some(evidence); } }
                 Ok(RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { capability, reason })
@@ -215,7 +223,7 @@ impl RoventPcCollectionBridgeV2 {
                 "code":reason.code, "detail":reason.detail});
         Ok(Some(serde_json::json!({"retained": deferred.originals.iter().map(summarize).collect::<Vec<_>>(),
             "overflow_count": deferred.overflow, "first_overflow": deferred.first_overflow.as_ref().map(summarize),
-            "unresolved_cleanup_count": deferred.cleanup_failures.len()})))
+            "active_no_capture": deferred.active.len(), "unresolved_cleanup_count": deferred.cleanup_failures.len()})))
     }
 
     pub(crate) fn try_has_deferred(&self) -> Result<Option<bool>, ArenaError> {
@@ -224,6 +232,19 @@ impl RoventPcCollectionBridgeV2 {
             Err(std::sync::TryLockError::WouldBlock) => Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => Err(super::invalid("P/C deferred root custody poisoned")),
         }
+    }
+
+    pub(crate) fn try_owns_deferred(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+    ) -> Result<Option<bool>, AdaptiveManagerError> {
+        let deferred = match self.deferred.try_lock() {
+            Ok(deferred) => deferred,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) =>
+                return Err(AdaptiveManagerError::Invalid("P/C deferred root custody poisoned")),
+        };
+        Ok(Some(deferred.active.iter().any(|original| original.same_original_capability(capability))))
     }
 
     pub(crate) fn start_worker(&self, worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>, stop: Arc<std::sync::atomic::AtomicBool>, deadline: std::time::Instant) -> Result<(), PcWorkerStartErrorV2> {
@@ -296,7 +317,7 @@ impl RoventPcCollectionBridgeV2 {
     pub(crate) fn try_separate_root_for_next(
         &self,
         admission: &RoventCollectionRootAdmissionV2,
-        game_row_capacity: usize,
+        retained_row_limit: usize,
     ) -> Result<PcRootSeparationV2, ArenaError> {
         if !self.core.installed_admission_for_recovery()
             .is_some_and(|original| original.same_original_admission(admission)) {
@@ -322,8 +343,8 @@ impl RoventPcCollectionBridgeV2 {
             return Ok(PcRootSeparationV2::Pending);
         }
         if status.pending_retired_count != 0 {
-            if worker.separated_rows.len() >= game_row_capacity {
-                return Err(super::invalid("P/C separated retired rows exceed remaining game capacity"));
+            if worker.separated_rows.len() >= retained_row_limit {
+                return Err(super::invalid("P/C separated retired rows exceed custody limit"));
             }
             worker.separated_rows.try_reserve(1).map_err(|_| super::invalid("P/C separated row allocation"))?;
             match self.owner.try_take_settled_retired()? {
@@ -343,6 +364,26 @@ impl RoventPcCollectionBridgeV2 {
         }
         if !self.core.try_release_game_root(admission)? { return Ok(PcRootSeparationV2::Pending); }
         Ok(PcRootSeparationV2::Released { retained_rows: worker.separated_rows.len() })
+    }
+
+    /// Transfer one already separated original to the caller's bounded
+    /// publisher custody. The caller must retain the returned row on failure.
+    pub(crate) fn try_take_separated_row(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Option<Option<super::RoventRetiredLockV2Record>>, ArenaError> {
+        if !self.core.installed_admission_for_recovery()
+            .is_some_and(|original| original.same_original_admission(admission)) {
+            return Err(super::invalid("P/C separated row original admission mismatch"));
+        }
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("P/C separated row custody poisoned")),
+        };
+        let worker = slot.as_mut().ok_or_else(|| super::invalid("P/C separated row owner missing"))?;
+        if worker.separation_failed { return Err(super::invalid("P/C row separation failed; original retained")); }
+        Ok(Some(worker.separated_rows.pop_front()))
     }
 }
 
@@ -378,6 +419,13 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
             Ok(()) => Ok(RoventPcCollectionAdmissionOutcomeV2::Installed),
             Err(failure) if failure.before_start && failure.game_gate_status == CoreGameGateStatus::Busy =>
                 Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission: failure.admission }),
+            Err(failure) if failure.before_start
+                && failure.game_gate_status == CoreGameGateStatus::NotApplicable
+                && matches!(&failure.error, AdaptiveManagerError::Capacity(_)) => {
+                let reason = AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,
+                    "PcAdmissionCapacity", format!("{:?}", failure.error));
+                self.defer_before_start(port, failure.admission, reason)
+            }
             Err(failure) => Err(RoventPcCollectionAdmissionFailureV2 {
                 error: failure.error, admission: failure.admission, owners: failure.owners,
             }),
@@ -388,11 +436,20 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
         capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         fence: &rz_uci::pals_adaptive::RoleOnlyShutdownReceipt,
     ) -> Result<rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
-        self.core.try_finish_no_capture_role_only(capability, fence).map(|finished| {
-            if finished { rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready }
-            else { rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy }
-        }).map_err(|error| AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
-            AdaptiveCollectionStage::Settled, "PcNoCaptureFinish", error.to_string())))
+        let mut deferred = match self.deferred.try_lock() {
+            Ok(deferred) => deferred,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("P/C deferred root custody poisoned")),
+        };
+        let Some(index) = deferred.active.iter().position(|original| original.same_original_capability(capability)) else {
+            return Err(AdaptiveManagerError::Invalid("P/C original no-capture owner missing"));
+        };
+        match self.core.try_finish_no_capture_role_only(capability, fence) {
+            Ok(true) => { deferred.active.remove(index); Ok(rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready) }
+            Ok(false) => Ok(rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy),
+            Err(error) => Err(AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Settled, "PcNoCaptureFinish", error.to_string()))),
+        }
     }
     fn retain_deferred_cleanup(
         &self,
@@ -411,8 +468,7 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPcCustodyReturnV2::Busy),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("P/C deferred cleanup owner poisoned")),
         };
-        let belongs = deferred.originals.iter().chain(deferred.first_overflow.iter()).any(|(admission, _)|
-            item.capability().same_original_admission(admission));
+        let belongs = deferred.active.iter().any(|original| original.same_original_capability(item.capability()));
         if !belongs || !item.capability().matches_role_only_shutdown_receipt(item.fence()) {
             return Err(AdaptiveManagerError::Invalid("P/C deferred cleanup original root mismatch"));
         }

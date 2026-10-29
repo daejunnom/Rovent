@@ -40,7 +40,7 @@ pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
 /// It cannot reconstruct a root admission or claim teacher completion.
 pub const ROVENT_COLLECTION_LOCK_V2_LAUNCH_PLAN: &str = "rz-rovent-collection-lock-v2-launch/1";
 mod cohort;
-mod own_publisher_v2;
+pub(crate) mod own_publisher_v2;
 mod cohort_audit;
 mod cohort_driver;
 mod cohort_prepare;

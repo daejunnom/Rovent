@@ -1,0 +1,210 @@
+//! Resource-admitted, bounded preparation of P-C Collection workers.
+//!
+//! This owner never executes from a native manager callback.  It keeps the
+//! original secondary bridges, workers and consumer queues together; publishing
+//! a prepared root is not corpus publication or physical completion.
+use super::{invalid, ArenaError, RoventCollectionOwnerLockV2};
+use super::launch::own_publisher_v2::{OwnPumpConsumerV2, OwnPumpPollV2};
+use super::pc_hooks_lock_v2::{PcRootSeparationV2, PcWorkerStartErrorV2, RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2};
+use super::pc_root_router_v2::{PcPreparedSlotOutcomeV2, RoventPcRootRouterV2};
+use super::teacher::v2_session::RoventTeacherRosterEntryV2;
+use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
+use rz_search::external_cpu::ExternalGoConstraint;
+use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2;
+use rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2;
+use std::{sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::{Duration, Instant}};
+
+/// These are the actual objects created for a secondary root.  A returned
+/// entry is custody, not a receipt or proof that its rows were published.
+pub(crate) struct PcSecondarySlotV2 {
+    pub(crate) previous: Arc<RoventPcCollectionBridgeV2>,
+    pub(crate) previous_admission: RoventCollectionRootAdmissionV2,
+    pub(crate) bridge: Arc<RoventPcCollectionBridgeV2>,
+    pub(crate) worker: Arc<Mutex<RoventPcCollectionWorkerV2>>,
+    pub(crate) consumer: Arc<OwnPumpConsumerV2>,
+    pub(crate) retained_previous_rows: usize,
+    pub(crate) published_to_router: bool,
+}
+
+struct SupervisorState {
+    slots: Vec<PcSecondarySlotV2>,
+    pending: Option<PcSecondarySlotV2>,
+    error: Option<ArenaError>,
+}
+
+/// Owns the original supervisor thread and its exact slot state.  Callers
+/// must retain this object across native execution and inspect/join it before
+/// transferring slot custody to the game publisher.
+pub(crate) struct PcWorkerSupervisorV2 {
+    state: Arc<Mutex<SupervisorState>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    joined: bool,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+    transferred: bool,
+}
+
+impl PcWorkerSupervisorV2 {
+    /// Called only after original resource admission has succeeded.  It does
+    /// not extend any original deadline or create an external engine itself.
+    pub(crate) fn start(
+        router: Arc<RoventPcRootRouterV2>,
+        owner: RoventCollectionOwnerLockV2,
+        manifest: Arc<RoventCorpusManifestLockV2>,
+        roster: Vec<(String, usize, u32)>,
+        constraint: ExternalGoConstraint,
+        quantum: Duration,
+        maximum_roots: usize,
+        maximum_records: usize,
+        worker_deadline: Instant,
+    ) -> Result<Self, ArenaError> {
+        if !(2..=64).contains(&maximum_roots) || maximum_records == 0 || Instant::now() >= worker_deadline {
+            return Err(invalid("P/C worker supervisor bounds or deadline"));
+        }
+        let startup = router.original_startup().ok_or_else(|| invalid("P/C original startup control unavailable"))?.clone();
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(maximum_roots - 1).map_err(|_| invalid("P/C supervisor slot capacity"))?;
+        let state = Arc::new(Mutex::new(SupervisorState { slots, pending: None, error: None }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_state = Arc::clone(&state);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new().name("rovent-pc-root-supervisor-v2".into()).spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) && Instant::now() < worker_deadline {
+                let mut guard = match thread_state.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => break,
+                };
+                // The same supervisor drains each bounded receiver.  It does
+                // not hold a manager or producer lock while doing so.
+                let mut poll_error = None;
+                for slot in guard.slots.iter().chain(guard.pending.iter()) {
+                    match slot.consumer.poll() {
+                        Ok(OwnPumpPollV2::Received | OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected) => {},
+                        Ok(OwnPumpPollV2::Full) => { poll_error = Some(invalid("P/C secondary consumer capacity reached")); break; }
+                        Err(error) => { poll_error = Some(error); break; }
+                    }
+                }
+                if let Some(error) = poll_error { guard.error.get_or_insert(error); }
+                if guard.error.is_none() {
+                    if let Err(error) = supervisor_step(&mut guard, &router, &owner, &manifest, &roster,
+                        &startup, constraint, quantum, maximum_records, worker_deadline, &thread_stop) {
+                        guard.error = Some(error);
+                    }
+                }
+                drop(guard);
+                thread::sleep(Duration::from_millis(2));
+            }
+        }).map_err(|error| ArenaError::Io(error.to_string()))?;
+        Ok(Self { state, stop, thread: Some(thread), joined: false, panic: None, transferred: false })
+    }
+
+    pub(crate) fn request_stop(&self) { self.stop.store(true, Ordering::Release); }
+
+    /// Collect only an already-finished supervisor.  A still-running thread is
+    /// unknown and retains all of its original slot owners.
+    pub(crate) fn poll_join(&mut self) -> bool {
+        if self.joined { return true; }
+        if !self.thread.as_ref().is_some_and(JoinHandle::is_finished) { return false; }
+        match self.thread.take().expect("finished original supervisor").join() {
+            Ok(()) => {},
+            Err(payload) => self.panic = Some(payload),
+        }
+        self.joined = true;
+        true
+    }
+
+    /// Transfer the exact retained slots only after the supervisor has joined.
+    /// The caller assumes their complete lifetime, publication and recovery
+    /// obligations.  A pending slot is included even on failure.
+    pub(crate) fn take_joined_slots(&mut self) -> Result<Option<(Vec<PcSecondarySlotV2>, Option<ArenaError>)>, ArenaError> {
+        if !self.joined || self.panic.is_some() { return Ok(None); }
+        if self.transferred { return Err(invalid("P/C supervisor slots already transferred")); }
+        let mut state = self.state.try_lock().map_err(|_| invalid("P/C supervisor state busy or poisoned"))?;
+        if let Some(pending) = state.pending.take() { state.slots.push(pending); }
+        let slots = std::mem::take(&mut state.slots);
+        let error = state.error.take();
+        self.transferred = true;
+        Ok(Some((slots, error)))
+    }
+}
+
+impl Drop for PcWorkerSupervisorV2 {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if !self.joined || self.panic.is_some() || !self.transferred {
+            // Retain the original thread/state if a caller drops unresolved
+            // physical work or unpublished rows. This is not a completion.
+            std::mem::forget(Arc::clone(&self.state));
+            if let Some(thread) = self.thread.take() { std::mem::forget(thread); }
+            if let Some(payload) = self.panic.take() { std::mem::forget(payload); }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supervisor_step(
+    state: &mut SupervisorState,
+    router: &RoventPcRootRouterV2,
+    owner: &RoventCollectionOwnerLockV2,
+    manifest: &Arc<RoventCorpusManifestLockV2>,
+    roster: &[(String, usize, u32)],
+    startup: &rz_uci::rovent_bootstrap::RoventStartupControl,
+    constraint: ExternalGoConstraint,
+    quantum: Duration,
+    maximum_records: usize,
+    deadline: Instant,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), ArenaError> {
+    if !router.next_slot_unprepared() { return Ok(()); }
+    let Some((previous, admission)) = router.latest_installed() else { return Ok(()); };
+    // A published slot is merely ready; wait until it is itself installed
+    // before preparing another worker from the prior root.
+    if state.slots.last().is_some_and(|slot| slot.published_to_router
+        && Arc::ptr_eq(&slot.previous, &previous)
+        && slot.previous_admission.same_original_admission(&admission)) {
+        return Ok(());
+    }
+    if let Some(pending) = &state.pending {
+        if !Arc::ptr_eq(&pending.previous, &previous) || !pending.previous_admission.same_original_admission(&admission) {
+            return Err(invalid("P/C prepared worker previous original root changed"));
+        }
+    } else {
+        let Some(status) = owner.try_status()? else { return Ok(()); };
+        let Some(reserved) = status.game_reserved_slots else { return Err(invalid("P/C game record budget unknown")); };
+        if status.game_retired_total.checked_add(reserved).is_none_or(|used| used >= status.game_record_limit) {
+            return Ok(());
+        }
+        if !matches!(previous.try_separate_root_for_next(&admission, maximum_records)?, PcRootSeparationV2::Released { .. }) {
+            return Ok(());
+        }
+        let entries = roster.iter().map(|(actor, index, collection_owner)| RoventTeacherRosterEntryV2 {
+            actor_id: actor.clone(), source_index: *index, collection_owner: *collection_owner,
+        }).collect();
+        let (next, mut worker) = RoventPcCollectionBridgeV2::new(owner.clone(), Arc::clone(manifest), entries)?;
+        next.register_startup_control(startup).map_err(|error| invalid(format!("P/C original startup registration: {error:?}")))?;
+        let (consumer, sender) = OwnPumpConsumerV2::new(maximum_records);
+        worker.configure_row_pump(constraint, quantum)?;
+        worker.configure_pump_sender(sender)?;
+        let worker = Arc::new(Mutex::new(worker));
+        state.pending = Some(PcSecondarySlotV2 { previous, previous_admission: admission,
+            bridge: Arc::clone(&next), worker: Arc::clone(&worker), consumer,
+            retained_previous_rows: 0, published_to_router: false });
+        match next.start_worker(&worker, Arc::clone(stop), deadline) {
+            Ok(()) => {},
+            Err(PcWorkerStartErrorV2::BeforeStart(error) | PcWorkerStartErrorV2::Unknown(error)) => return Err(error),
+        }
+    }
+    let pending = state.pending.as_ref().expect("prepared original secondary slot");
+    match router.publish_next_prepared(&pending.previous, &pending.previous_admission, &pending.bridge, maximum_records)? {
+        PcPreparedSlotOutcomeV2::Pending => Ok(()),
+        PcPreparedSlotOutcomeV2::Published { retained_rows } => {
+            let mut pending = state.pending.take().expect("prepared original secondary slot");
+            pending.retained_previous_rows = retained_rows;
+            pending.published_to_router = true;
+            // Space was reserved for every possible secondary slot before the
+            // supervisor thread was started.
+            state.slots.push(pending);
+            Ok(())
+        }
+    }
+}

@@ -19,20 +19,20 @@ struct State {
 }
 
 pub(super) enum OwnOfferOutcomeV2 { Pending, Offered, FailedRetained }
-pub(super) enum OwnPumpPollV2 { Received, Empty, Full, Disconnected }
+pub(crate) enum OwnPumpPollV2 { Received, Empty, Full, Disconnected }
 
-pub(super) struct OwnPumpConsumerV2 {
+pub(crate) struct OwnPumpConsumerV2 {
     state: Mutex<State>,
 }
 
 impl OwnPumpConsumerV2 {
-    pub(super) fn new(maximum: usize) -> (Arc<Self>, SyncSender<PumpItemV2>) {
+    pub(crate) fn new(maximum: usize) -> (Arc<Self>, SyncSender<PumpItemV2>) {
         let (sender, receiver) = mpsc::sync_channel(16);
         (Arc::new(Self { state: Mutex::new(State { receiver, items: VecDeque::new(), maximum, disconnected: false, teacher_evidence: Vec::new(), commit_failures: Vec::new(), failed_items: Vec::new(), overflow_item: None }) }), sender)
     }
 
     /// Stops on full without removing the next original from the channel.
-    pub(super) fn poll(&self) -> Result<OwnPumpPollV2, ArenaError> {
+    pub(crate) fn poll(&self) -> Result<OwnPumpPollV2, ArenaError> {
         let mut state = self.state.lock().map_err(|_| ArenaError::Invalid("Own publisher custody poisoned".into()))?;
         if state.items.len().saturating_add(state.failed_items.len()).saturating_add(state.teacher_evidence.len()) >= state.maximum {
             if state.overflow_item.is_some() { return Ok(OwnPumpPollV2::Full); }
@@ -50,7 +50,7 @@ impl OwnPumpConsumerV2 {
         }
     }
 
-    pub(super) fn try_counts(&self) -> Result<Option<(usize, usize, usize, bool)>, ArenaError> {
+    pub(crate) fn try_counts(&self) -> Result<Option<(usize, usize, usize, bool)>, ArenaError> {
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -161,7 +161,7 @@ impl OwnPumpConsumerV2 {
 
     /// The thread has an explicit deadline. Expiry leaves the original
     /// receiver and all already received items in this owner.
-    pub(super) fn run(&self, stop: &AtomicBool, until: Instant) -> Result<(), ArenaError> {
+    pub(crate) fn run(&self, stop: &AtomicBool, until: Instant) -> Result<(), ArenaError> {
         while !stop.load(Ordering::Acquire) && Instant::now() < until {
             self.poll()?;
             thread::sleep(Duration::from_millis(2));

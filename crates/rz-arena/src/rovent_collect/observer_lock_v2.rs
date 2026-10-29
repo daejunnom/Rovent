@@ -48,10 +48,13 @@ struct DisabledRoot {
 pub enum RoventCollectionDisableReasonV2 {
     RetiredOutboxFull,
     TicketEvidenceLimit,
+    GameRecordLimit,
     ObserverFailure,
 }
 
 struct State {
+    game_record_limit: usize,
+    game_retired_total: usize,
     manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
     producer: Option<RoventCorpusProducerLockV2>,
     producer_root: Option<String>,
@@ -117,6 +120,21 @@ impl RoventCollectionOwnerLockV2 {
         manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
         metadata: RoventCollectionMetadata,
     ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
+        Self::new_shared_with_record_limit(manifest, metadata, rz_experiments::rovent_corpus::MAX_CORPUS_ROWS as u64)
+    }
+
+    /// The bounded value is owned once by the game Collection owner and is
+    /// shared by all of its root observers. Existing callers keep the legacy
+    /// corpus maximum through `new_shared`.
+    pub fn new_shared_with_record_limit(
+        manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
+        metadata: RoventCollectionMetadata,
+        maximum_records: u64,
+    ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
+        let game_record_limit = usize::try_from(maximum_records)
+            .map_err(|_| invalid("lock-v2 game record limit exceeds platform capacity"))?;
+        check(game_record_limit > 0 && game_record_limit <= rz_experiments::rovent_corpus::MAX_CORPUS_ROWS,
+            "lock-v2 game record limit is invalid")?;
         check(
             generation_identifier(&metadata.game_id)
                 && generation_identifier(&metadata.opening_id)
@@ -135,6 +153,8 @@ impl RoventCollectionOwnerLockV2 {
             Self {
                 game_gate: Arc::new(AtomicU64::new(0)),
                 state: Arc::new(Mutex::new(State {
+                    game_record_limit,
+                    game_retired_total: 0,
                     manifest,
                     producer: None,
                     producer_root: None,
@@ -550,6 +570,9 @@ impl RoventCollectionOwnerLockV2 {
         RoventCollectionOwnerStatusLockV2 {
             admitted: state.admitted,
             settled: state.settled,
+            game_record_limit: state.game_record_limit,
+            game_retired_total: state.game_retired_total,
+            game_reserved_slots: state.game_reserved_slots().ok(),
             pending_count: state.pending.len() + state.staged.len(),
             pending_retired_count: state.retired.len()
                 + self.retired_queued.load(Ordering::Acquire),
@@ -605,6 +628,11 @@ impl RoventCollectionOwnerLockV2 {
 pub struct RoventCollectionOwnerStatusLockV2 {
     pub admitted: bool,
     pub settled: bool,
+    /// Game-owner cap and monotonic retired count; not a publication count.
+    pub game_record_limit: usize,
+    pub game_retired_total: usize,
+    /// Unknown only on arithmetic overflow; never infer zero in that case.
+    pub game_reserved_slots: Option<usize>,
     pub pending_count: usize,
     pub pending_retired_count: usize,
     /// Unknown on contention or poison; neither permits owner release.
@@ -635,6 +663,26 @@ struct Observer<Q, O> {
 }
 
 impl State {
+    /// Pending and staged originals each reserve at most one future retired
+    /// row. Failed staged inputs keep their reservation until explicit
+    /// recovery; a row already retired is counted monotonically instead.
+    fn game_reserved_slots(&self) -> Result<usize, ArenaError> {
+        self.pending.len().checked_add(self.staged.len())
+            .and_then(|value| value.checked_add(self.failed_staged.len()))
+            .ok_or_else(|| invalid("lock-v2 game record reservation overflow"))
+    }
+
+    fn game_used_and_reserved(&self) -> Result<usize, ArenaError> {
+        self.game_retired_total.checked_add(self.game_reserved_slots()?)
+            .ok_or_else(|| invalid("lock-v2 game record total overflow"))
+    }
+
+    fn next_retired_record_count(&self) -> Result<usize, ArenaError> {
+        let next = self.game_retired_total.checked_add(1)
+            .ok_or_else(|| invalid("lock-v2 game retired record overflow"))?;
+        check(next <= self.game_record_limit, "lock-v2 game retired record limit exceeded")?;
+        Ok(next)
+    }
     fn is_disabled_ticket(&self, ticket: &RoleTicketEnvelope) -> Result<bool, ArenaError> {
         if self.pending.contains_key(&ticket.id)
             || self.staged.contains_key(&ticket.id)
@@ -929,8 +977,16 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
             if state.is_disabled_ticket(ticket)? {
                 return Ok(AdaptiveCollectionDispatchV2::DisabledBackpressure);
             }
+            let game_limit_reached = state.game_retired_total >= state.game_record_limit;
             if !state.staged.contains_key(&ticket.id)
-                && (state.outstanding_rows() >= CAPACITY
+                && !game_limit_reached
+                && state.game_used_and_reserved()? >= state.game_record_limit {
+                // Existing reservations can still retire or be cancelled;
+                // a transient full reservation is not a permanent boundary.
+                return Ok(AdaptiveCollectionDispatchV2::Busy);
+            }
+            if !state.staged.contains_key(&ticket.id)
+                && (game_limit_reached || state.outstanding_rows() >= CAPACITY
                     || state.handled_tickets.len() + state.pending.len()
                         >= rz_experiments::rovent_corpus::MAX_CORPUS_ROWS)
             {
@@ -939,7 +995,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                 if !state.staged.is_empty() {
                     return Ok(AdaptiveCollectionDispatchV2::Busy);
                 }
-                let reason = if state.outstanding_rows() >= CAPACITY {
+                let reason = if game_limit_reached {
+                    RoventCollectionDisableReasonV2::GameRecordLimit
+                } else if state.outstanding_rows() >= CAPACITY {
                     RoventCollectionDisableReasonV2::RetiredOutboxFull
                 } else {
                     RoventCollectionDisableReasonV2::TicketEvidenceLimit
@@ -1360,10 +1418,12 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                 pending.ticket == *ticket,
                 "lock-v2 ranking original ticket mismatch",
             )?;
+            let next_retired = state.next_retired_record_count()?;
             state.drain()?;
             let row = state
                 .producer_mut()?
                 .retire_root_ranking(accepted, output.proposer_ranking_output())?;
+            state.game_retired_total = next_retired;
             state.pending.remove(&ticket.id);
             state.handled_tickets.insert(ticket.id, *ticket);
             state.retain_row(row);
@@ -1466,8 +1526,10 @@ impl<Q, O> Observer<Q, O> {
                 pending.ticket == ticket && pending.accepted,
                 "lock-v2 consumption lacks original acceptance or outbox capacity",
             )?;
+            let next_retired = state.next_retired_record_count()?;
             state.drain()?;
             let row = state.producer_mut()?.retire_consumed(witness)?;
+            state.game_retired_total = next_retired;
             state.pending.remove(&ticket.id);
             state.handled_tickets.insert(ticket.id, ticket);
             state.retain_row(row);

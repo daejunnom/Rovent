@@ -261,6 +261,9 @@ impl RoventPcCollectionRunV2 {
             check(self.owner.try_status()?.is_some_and(|status| status.pending_retired_count == 0)
                 && self.worker.try_lock().is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
                 "P/C original rows remain outside the assembled corpus")?;
+            check(self.owner.try_status()?.is_some_and(|status|
+                status.game_reserved_slots == Some(0) && u64::try_from(status.game_retired_total) == Ok(assembly.records())),
+                "P/C assembled row count does not match the original game owner")?;
             assembly.flush()?;
             let directory = self.publication_dir.as_ref().expect("original output owner");
             let finished = assembly.finish()?;
@@ -385,12 +388,16 @@ impl RoventPcCollectionRunV2 {
             "corpus_published":self.pump_published,
             "publisher_receipt":self.publication,
             "publication_attempted":self.publication_attempted,
+            "assembly_records":self.publication_assembly.as_ref().map(|assembly| assembly.records()),
+            "published_records":self.publication.as_ref().map(|receipt| receipt.record_count),
             "late_retired_rows_retained":self.late_rows.len(),
             "teacher_worker_observation":worker_observation,
             "deferred_collection":deferred_observation,
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
+                "game_record_limit":status.game_record_limit,"game_retired_total":status.game_retired_total,
+                "game_reserved_slots":status.game_reserved_slots,
                 "pending_disabled_markers":status.pending_disabled_markers,
                 "collection_incomplete_due_to_backpressure":status.collection_disabled_first_ticket.is_some() || !status.prior_disabled_first_tickets.is_empty(),
                 "first_omitted_ticket":status.collection_disabled_first_ticket.as_ref().map(ticket_json),
@@ -612,7 +619,9 @@ fn run_rovent_pc_collection_lock_v2_inner(
     )?);
     plan.validate_registration(&manifest)?;
     let (owner, observer) =
-        RoventCollectionOwnerLockV2::new_shared(Arc::clone(&manifest), plan.metadata.clone())?;
+        RoventCollectionOwnerLockV2::new_shared_with_record_limit(
+            Arc::clone(&manifest), plan.metadata.clone(), plan.maximum_records,
+        )?;
     let roster = plan
         .teacher_slots
         .iter()
