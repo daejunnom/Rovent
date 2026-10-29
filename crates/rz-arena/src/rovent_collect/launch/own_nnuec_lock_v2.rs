@@ -368,9 +368,8 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
             collection_owner: entry.collection_owner,
         })
         .collect();
-    let (bridge, mut worker) =
+    let (bridge, worker) =
         RoventNnuecCollectionBridgeV2::new(owner.clone(), Arc::clone(&manifest), roster)?;
-    worker.configure_row_pump(plan.teacher_constraint, Duration::from_nanos(plan.teacher_soft_quantum_ns))?;
     let worker = Arc::new(Mutex::new(worker));
     let resource = Arc::new(Mutex::new(resources::CollectionResourceCustody::prepare(
         input_directory,

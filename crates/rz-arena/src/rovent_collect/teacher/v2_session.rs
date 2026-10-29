@@ -861,11 +861,22 @@ impl RoventCollectionTeacherSessionV2 {
         row: &RoventRetiredLockV2Record,
         completed: CompletedTeacherV2,
     ) -> Result<SealedTeacherPolicyV2, Box<TeacherPolicySealRejectionV2>> {
-        if let Err(error) = self.validate_pump_owner(permit) {
-            return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
-                cause: TeacherPolicySealFailureV2::Validation(error),
-                completed,
-            }));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.validate_pump_owner(permit)
+        })) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                    cause: TeacherPolicySealFailureV2::Validation(error),
+                    completed,
+                }))
+            }
+            Err(payload) => {
+                return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                    cause: TeacherPolicySealFailureV2::Panicked(payload),
+                    completed,
+                }))
+            }
         }
         let validation =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, ArenaError> {
@@ -930,11 +941,22 @@ impl RoventCollectionTeacherSessionV2 {
                 }));
             }
         };
-        let actor = self
-            .actors
-            .get_mut(&completed.actor_id)
-            .expect("validated actor");
-        let run = actor.running.as_mut().expect("validated running actor");
+        let Some(actor) = self.actors.get_mut(&completed.actor_id) else {
+            return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                cause: TeacherPolicySealFailureV2::Validation(invalid(
+                    "V2 completed teacher actor disappeared",
+                )),
+                completed,
+            }));
+        };
+        let Some(run) = actor.running.as_mut() else {
+            return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                cause: TeacherPolicySealFailureV2::Validation(invalid(
+                    "V2 completed teacher owner disappeared",
+                )),
+                completed,
+            }));
+        };
         let manifest_owner = Arc::clone(&self.lock_manifest);
         let CompletedTeacherV2 {
             actor_id,
