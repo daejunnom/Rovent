@@ -9020,6 +9020,15 @@ where
                     .roles
                     .iter()
                     .filter_map(|r| r.ticket)
+                    // A peer source is moved out of `roles` after native
+                    // acceptance. If shutdown arrives before search consumes
+                    // it, its actual ticket still owns an observer input and
+                    // must be retired at this same physical fence.
+                    .chain(
+                        self.accepted_roles
+                            .iter()
+                            .filter_map(|held| held.binding.ticket),
+                    )
                     .collect::<Vec<_>>();
                 let result = observer.settled(&tickets);
                 self.collection_v2_settlement = Some(result.clone());

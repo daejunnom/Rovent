@@ -2,7 +2,6 @@
 //! These hooks are admission/coordination only; they are not a teacher fence.
 
 use super::*;
-use crate::pals_adaptive::AdaptiveSearchDriver as _;
 use crate::pals_adaptive::{
     AdaptiveCollectionError, AdaptiveCollectionObserverBoxV2, AdaptiveCollectionV2ObserverStatus,
     RoventCollectionRootAdmissionV2, RoventNativeCollectionOriginV2,
@@ -38,6 +37,14 @@ pub struct RoventBoardCollectionHandoffV2<O> {
     pub(super) observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
     pub(super) settlement: Result<(), AdaptiveCollectionError>,
     pub(super) native_fence: AdaptiveShutdownReceipt,
+}
+
+/// Delivery never certifies teacher or physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventBoardCollectionDeliveryV2 {
+    Delivered,
+    Full,
+    Disconnected,
 }
 
 impl<O> RoventBoardCollectionHandoffV2<O> {
@@ -115,6 +122,7 @@ where
     pub error: SearchSessionFailure,
     pub origin: RoventNativeCollectionOriginV2,
     pub hooks: Arc<dyn RoventBoardCollectionHooksV2<B>>,
+    pub panic_payload: Option<Box<dyn Any + Send>>,
 }
 
 impl<B> AdaptiveSessionDriver<B>
@@ -122,14 +130,23 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    pub fn board_collection_delivery_v2(
+        &self,
+    ) -> Result<Option<RoventBoardCollectionDeliveryV2>, SearchSessionFailure> {
+        self.rovent_collection_delivery_v2.lock()
+            .map(|status| *status)
+            .map_err(|_| failure("RoventBoardCollectionDeliveryV2", "delivery state poisoned"))
+    }
     /// Installs only the actual loaded /2 owner on the still-idle session.
     /// A copied digest or a separately loaded model cannot stand in for it.
     pub fn register_rovent_collection_v2(
         &mut self,
         origin: RoventNativeCollectionOriginV2,
         hooks: Arc<dyn RoventBoardCollectionHooksV2<B>>,
+        control: &crate::rovent_bootstrap::RoventStartupControl,
     ) -> Result<(), Box<RoventBoardCollectionRegistrationRejectionV2<B>>> {
-        let valid = self.rovent_root_policy_v2.as_ref().is_some_and(|policy| {
+        let valid = origin.sources().matches_startup_control(control)
+            && self.rovent_root_policy_v2.as_ref().is_some_and(|policy| {
             policy.owner.v2().is_some_and(|lock| {
                 Arc::ptr_eq(lock, origin.sources().lock_owner())
                     && matches!(
@@ -142,15 +159,45 @@ where
             && self.rovent_collection_hooks_v2.is_none()
             && !self.closed.load(Ordering::Acquire)
             && self.state.try_lock().is_ok_and(|state| {
-                matches!(&*state, SessionState::Idle(owners)
-                    if owners.continuation.is_none() && owners.native_finished.is_none())
+                match &*state {
+                    SessionState::Idle(owners)
+                        if owners.continuation.is_none() && owners.native_finished.is_none()
+                            && !owners.native.is_quarantined() => {
+                        match (owners.native.native_acceptance_verifier(), owners.native.ready_clock()) {
+                            (Some(verifier), Some(clock)) => origin.matches_native_owner(&verifier, &clock),
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                }
             });
         if !valid {
             return Err(Box::new(RoventBoardCollectionRegistrationRejectionV2 {
                 error: failure("RoventBoardCollectionRegistrationV2", "original /2 lock or idle owner differs"),
                 origin,
                 hooks,
+                panic_payload: None,
             }));
+        }
+        match catch_unwind(AssertUnwindSafe(|| hooks.register_startup_control(control))) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(Box::new(RoventBoardCollectionRegistrationRejectionV2 {
+                    error: SearchSessionFailure::debug("RoventBoardCollectionControlV2", &error)
+                        .unknown_if_unclosed(),
+                    origin,
+                    hooks,
+                    panic_payload: None,
+                }));
+            }
+            Err(payload) => {
+                return Err(Box::new(RoventBoardCollectionRegistrationRejectionV2 {
+                    error: SearchSessionFailure::physical_completion_unknown(),
+                    origin,
+                    hooks,
+                    panic_payload: Some(payload),
+                }));
+            }
         }
         self.rovent_collection_origin_v2 = Some(origin);
         self.rovent_collection_hooks_v2 = Some(hooks);

@@ -27,7 +27,7 @@ use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
     AdaptiveCheckerMetadata, AdaptiveSessionAdmissionRejection, AdaptiveSessionCollectionHooks,
     AdaptiveSessionDriver, AdaptiveSessionOptions, AdaptiveSessionSources, PersistentCpuOwner,
-    RoventPcrSessionProfile,
+    RoventPcrSessionProfile, RoventBoardCollectionHooksV2, RoventBoardCollectionRegistrationRejectionV2,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::{
@@ -1188,6 +1188,10 @@ pub struct RoventOwnPcrV2StartupRejection {
     pub owners: RoventOwnPcrV2RejectedOwners,
     pub sources: Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV2>>,
     pub process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+    /// Original collection hook remains recoverable on any startup failure.
+    pub collection_hooks: Option<Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>>,
+    /// A failed registration may itself own state acquired by the callback.
+    pub collection_rejection: Option<Box<RoventBoardCollectionRegistrationRejectionV2<RoventNativeBackend<AdaptivePortQuestion>>>>,
 }
 
 impl RoventOwnPcrProductDriverV2 {
@@ -1199,6 +1203,33 @@ impl RoventOwnPcrProductDriverV2 {
         owners: Arc<OwnerRegistry>,
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventOwnPcrV2StartupRejection> {
+        Self::admit_own_board_pcr_v2(prepared, process, clock, owners, identity, root_policy, None)
+    }
+
+    /// Collection path retains the exact loaded native origin and hook owner.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub(crate) fn own_board_pcr_with_collection_hooks_v2(
+        prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>,
+    ) -> Result<Self, RoventOwnPcrV2StartupRejection> {
+        Self::admit_own_board_pcr_v2(prepared, process, clock, owners, identity, root_policy, Some(hooks))
+    }
+
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    fn admit_own_board_pcr_v2(
+        prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        collection_hooks: Option<Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>>,
     ) -> Result<Self, RoventOwnPcrV2StartupRejection> {
         let pins = Arc::clone(prepared.sources());
         let same_owner = Arc::ptr_eq(pins.lock_owner(), process.input_lock())
@@ -1229,12 +1260,17 @@ impl RoventOwnPcrProductDriverV2 {
                 owners: RoventOwnPcrV2RejectedOwners::Prepared(prepared),
                 sources: pins,
                 process,
+                collection_hooks,
+                collection_rejection: None,
             });
         }
-        if pins.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection {
+        let is_collection = pins.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection;
+        if is_collection != collection_hooks.is_some()
+            || is_collection != pins.collection_preload_sources().is_some()
+        {
             let mut failure = failure(
                 "RoventPcrV2CollectionUnsupported",
-                "V2 collection requires an actual collection origin and root hooks",
+                "V2 collection requires the original collection inputs and hook owner",
             );
             failure.physical_completion = DriverPhysicalCompletion::Unknown;
             return Err(RoventOwnPcrV2StartupRejection {
@@ -1242,16 +1278,15 @@ impl RoventOwnPcrProductDriverV2 {
                 owners: RoventOwnPcrV2RejectedOwners::Prepared(prepared),
                 sources: pins,
                 process,
+                collection_hooks,
+                collection_rejection: None,
             });
         }
         let admission_check = (|| -> Result<(), SearchSessionFailure> {
             pins.configuration()
                 .require_supported_native_capabilities()
                 .map_err(|error| SearchSessionFailure::debug("RoventPcrV2Capability", &error))?;
-            if pins.collection_preload_sources().is_some()
-                || identity.name.is_empty()
-                || identity.author.is_empty()
-            {
+            if identity.name.is_empty() || identity.author.is_empty() {
                 return Err(failure(
                     "RoventPcrV2Startup",
                     "unsupported collection inputs or empty engine identity",
@@ -1278,8 +1313,30 @@ impl RoventOwnPcrProductDriverV2 {
                 owners: RoventOwnPcrV2RejectedOwners::Prepared(prepared),
                 sources: pins,
                 process,
+                collection_hooks,
+                collection_rejection: None,
             });
         }
+        let collection_origin = if is_collection {
+            match prepared.collection_identity() {
+                Ok(origin) => Some(origin),
+                Err(error) => {
+                    let mut failure = SearchSessionFailure::debug("RoventPcrV2CollectionOrigin", &error);
+                    failure.physical_completion = DriverPhysicalCompletion::Unknown;
+                    return Err(RoventOwnPcrV2StartupRejection {
+                        failure,
+                        owners: RoventOwnPcrV2RejectedOwners::Prepared(prepared),
+                        sources: pins,
+                        process,
+                        collection_hooks,
+                        collection_rejection: None,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let original_control = prepared.startup_control().clone();
         let built = build_own_board_pcr!(pins, prepared, clock, identity);
         let (engine, cpu, metadata, registration, options, limits, profile) = match built {
             Ok(built) => built,
@@ -1290,6 +1347,8 @@ impl RoventOwnPcrProductDriverV2 {
                     owners: RoventOwnPcrV2RejectedOwners::Prepared(prepared),
                     sources: pins,
                     process,
+                    collection_hooks,
+                    collection_rejection: None,
                 });
             }
         };
@@ -1303,6 +1362,8 @@ impl RoventOwnPcrProductDriverV2 {
                 owners: RoventOwnPcrV2RejectedOwners::Prepared(prepared),
                 sources: pins,
                 process,
+                collection_hooks,
+                collection_rejection: None,
             });
         }
         let (native, _, _) = prepared.into_parts();
@@ -1331,6 +1392,8 @@ impl RoventOwnPcrProductDriverV2 {
                 owners: RoventOwnPcrV2RejectedOwners::Session(rejected),
                 sources: Arc::clone(&pins),
                 process: Arc::clone(&process),
+                collection_hooks: collection_hooks.clone(),
+                collection_rejection: None,
             }
         })?;
         if let Err(mut failure) =
@@ -1342,7 +1405,24 @@ impl RoventOwnPcrProductDriverV2 {
                 owners: RoventOwnPcrV2RejectedOwners::Driver(Box::new(driver)),
                 sources: pins,
                 process,
+                collection_hooks,
+                collection_rejection: None,
             });
+        }
+        if let Some(origin) = collection_origin {
+            let hooks = Arc::clone(collection_hooks.as_ref().expect("checked collection hooks"));
+            if let Err(rejected) = driver.register_rovent_collection_v2(origin, hooks, &original_control) {
+                let mut failure = rejected.error.clone();
+                failure.physical_completion = DriverPhysicalCompletion::Unknown;
+                return Err(RoventOwnPcrV2StartupRejection {
+                    failure,
+                    owners: RoventOwnPcrV2RejectedOwners::Driver(Box::new(driver)),
+                    sources: pins,
+                    process,
+                    collection_hooks,
+                    collection_rejection: Some(rejected),
+                });
+            }
         }
         Ok(Self {
             inner: Arc::new(driver),
@@ -1639,7 +1719,7 @@ impl RoventOwnNnuecProductDriverV2 {
     /// Retain the same original /2 collection hook and source owners through
     /// NNUEC product startup. Rejection returns them to their original caller.
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-    pub fn own_nnuec_pcr_with_collection_hooks_v2(
+    pub(crate) fn own_nnuec_pcr_with_collection_hooks_v2(
         prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
         loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
         process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,

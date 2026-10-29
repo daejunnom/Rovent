@@ -687,7 +687,11 @@ where
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     rovent_collection_panic_v2: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_revoke_v2: AtomicBool,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     rovent_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_delivery_v2: Mutex<Option<RoventBoardCollectionDeliveryV2>>,
     latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
     #[cfg(feature = "pals-adaptive")]
     latest_rovent_root_v2: Mutex<Option<Arc<RoventNativeRootReceiptV2>>>,
@@ -1481,7 +1485,11 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             rovent_collection_panic_v2: Mutex::new(Vec::new()),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_revoke_v2: AtomicBool::new(false),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             rovent_collection_handoff_v2: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_delivery_v2: Mutex::new(None),
             latest_rovent_root: Mutex::new(None),
             #[cfg(feature = "pals-adaptive")]
             latest_rovent_root_v2: Mutex::new(None),
@@ -2767,8 +2775,10 @@ where
                         if board_collection_v2_started {
                             if manager.phase() != ManagerPhase::Running {
                                 if !board_collection_v2_revoked {
-                                    if let Some(hooks) = &self.rovent_collection_hooks_v2 {
-                                        hooks.revoke();
+                                    if !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
+                                        if let Some(hooks) = &self.rovent_collection_hooks_v2 {
+                                            hooks.revoke();
+                                        }
                                     }
                                     board_collection_v2_revoked = true;
                                 }
@@ -2813,11 +2823,13 @@ where
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 if board_collection_v2_started {
                     self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
-                    if let Some(hooks) = &self.rovent_collection_hooks_v2 {
-                        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                    if !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
+                        if let Some(hooks) = &self.rovent_collection_hooks_v2 {
+                            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
                             // Both panic payloads can own resources. Retain a
                             // second one independently if revocation panics.
-                            self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
+                                self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
+                            }
                         }
                     }
                 }
@@ -2828,7 +2840,8 @@ where
             }
         };
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if board_collection_v2_started && !board_collection_v2_revoked {
+        if board_collection_v2_started && !board_collection_v2_revoked
+            && !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
             if let Some(hooks) = &self.rovent_collection_hooks_v2 {
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
                     self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
@@ -2873,6 +2886,15 @@ where
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if board_collection_v2_started {
+            // Board Collection uses the owned native researcher. A profiled
+            // external fence is a different owner and must not be relabeled.
+            let native_fence = match &receipt {
+                SessionRootFence::Native(original) => original.clone(),
+                SessionRootFence::Profiled(_) => {
+                    *state = SessionState::Manager(manager);
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+            };
             // Get the nonblocking destination while the fenced manager still
             // owns the original observer. A panic retains both owners.
             let sender = match catch_unwind(AssertUnwindSafe(|| {
@@ -2894,11 +2916,16 @@ where
                 }
             };
             let handoff = Arc::new(Mutex::new(RoventBoardCollectionHandoffV2 {
-                admission, observer, settlement, native_fence: receipt.clone(),
+                admission, observer, settlement, native_fence,
             }));
             *self.rovent_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()) =
                 Some(Arc::clone(&handoff));
-            let _delivery = sender.try_send(handoff);
+            let delivery = match sender.try_send(handoff) {
+                Ok(()) => RoventBoardCollectionDeliveryV2::Delivered,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => RoventBoardCollectionDeliveryV2::Full,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => RoventBoardCollectionDeliveryV2::Disconnected,
+            };
+            *self.rovent_collection_delivery_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(delivery);
             // Delivery or the native fence is not teacher retirement. The
             // same handoff remains retained even if the channel is full or
             // disconnected; neither condition permits a successful result.
@@ -3300,9 +3327,11 @@ where
             // A native process fence cannot attest the separately owned V2
             // teacher. Until a same-owner retirement handoff exists, do not
             // detach or discard the manager's original collection observer.
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
-                self.rovent_collection_panic_v2.lock()
-                    .unwrap_or_else(|poison| poison.into_inner()).push(payload);
+            if !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                    self.rovent_collection_panic_v2.lock()
+                        .unwrap_or_else(|poison| poison.into_inner()).push(payload);
+                }
             }
             return Err(SearchSessionFailure::physical_completion_unknown());
         }

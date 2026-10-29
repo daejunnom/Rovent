@@ -10,8 +10,10 @@ use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
 use crate::pals_native::ticketed::VirtualReviewCollectionObserver;
 use crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
 use crate::rovent_bootstrap::product::{RoventNativeProductDriver, RoventProductStartupRejection};
+use crate::rovent_bootstrap::product::RoventOwnPcrV2StartupRejection;
 use crate::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2;
 use crate::rovent_bootstrap::nnuec_session::RoventNnuecCollectionHooksV2;
+use crate::pals_adaptive::RoventBoardCollectionHooksV2;
 use crate::rovent_bootstrap::{
     PreparedRoventNative, RoventCollectionPreloadSources, RoventPinnedExternalRSource,
     RoventStartupControl, RoventTeacherSourceSelection,
@@ -19,7 +21,7 @@ use crate::rovent_bootstrap::{
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use rz_experiments::{RoventInputLock, RoventInputLockV2};
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use super::collection_v2_observer::{V2ObserverCustody, V2ObserverReclaimError};
 
@@ -28,7 +30,12 @@ use super::collection_v2_observer::{V2ObserverCustody, V2ObserverReclaimError};
 pub(super) enum CollectionHooksV2 {
     Pc(Arc<dyn RoventPcCollectionHooksV2>),
     OwnNnuec(Arc<dyn RoventNnuecCollectionHooksV2>),
+    OwnBoard(Arc<RoventOwnBoardCollectionHooksV2>),
 }
+
+pub type RoventOwnBoardCollectionHooksV2 = dyn RoventBoardCollectionHooksV2<
+    crate::rovent_bootstrap::RoventNativeBackend<AdaptivePortQuestion>,
+>;
 
 pub(super) struct CollectionLaunchV2<'a> {
     pub(super) teacher_selections: Vec<RoventTeacherSourceSelection>,
@@ -37,6 +44,7 @@ pub(super) struct CollectionLaunchV2<'a> {
     pub(super) admit_resource: Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>,
     pub(super) startup_attempt: Arc<AtomicBool>,
     pub(super) native_settled: Arc<AtomicBool>,
+    pub(super) board_product_custody: Arc<Mutex<Option<RoventOwnPcrV2StartupRejection>>>,
 }
 
 /// Startup/session failure returns the same hook Arc to the caller. It does
@@ -49,11 +57,34 @@ pub struct RoventCollectionLaunchFailureV2<H: ?Sized> {
     observer_before_start: Option<Box<dyn VirtualReviewCollectionObserver>>,
     retained_observer: Option<V2ObserverCustody>,
     observer_reclaim_error: Option<V2ObserverReclaimError>,
+    board_product_custody: Option<RoventOwnPcrV2StartupRejection>,
     physical_unknown: bool,
 }
 
 pub type RoventPcCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<dyn RoventPcCollectionHooksV2>;
 pub type RoventOwnNnuecCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<dyn RoventNnuecCollectionHooksV2>;
+pub type RoventOwnBoardCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<RoventOwnBoardCollectionHooksV2>;
+
+/// Retains an actual Board product rejection while its physical owners are
+/// unresolved. Borrowing permits inspection without releasing ownership.
+pub struct RoventBoardProductCustody {
+    original: Option<RoventOwnPcrV2StartupRejection>,
+}
+
+impl RoventBoardProductCustody {
+    pub fn original(&self) -> &RoventOwnPcrV2StartupRejection {
+        self.original.as_ref().expect("original Board product custody")
+    }
+}
+
+impl Drop for RoventBoardProductCustody {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            // No API has established both native and teacher retirement yet.
+            std::mem::forget(original);
+        }
+    }
+}
 
 impl<H: ?Sized> RoventCollectionLaunchFailureV2<H> {
     pub fn hooks(&self) -> &Arc<H> {
@@ -87,6 +118,14 @@ impl<H: ?Sized> RoventCollectionLaunchFailureV2<H> {
     }
 
     pub fn physical_completion_unknown(&self) -> bool { self.physical_unknown }
+
+    /// Transfer the exact Board product rejection; this transfers custody but
+    /// does not establish that its native or teacher owners have finished.
+    pub fn take_board_product_custody(&mut self) -> Option<RoventBoardProductCustody> {
+        self.board_product_custody.take().map(|original| RoventBoardProductCustody {
+            original: Some(original),
+        })
+    }
 }
 
 impl<H: ?Sized> Drop for RoventCollectionLaunchFailureV2<H> {
@@ -97,6 +136,9 @@ impl<H: ?Sized> Drop for RoventCollectionLaunchFailureV2<H> {
             }
             if let Some(payload) = self.panic_payload.take() {
                 std::mem::forget(payload);
+            }
+            if let Some(custody) = self.board_product_custody.take() {
+                std::mem::forget(custody);
             }
         }
     }
@@ -124,6 +166,16 @@ pub fn run_own_nnuec_collection_v2_with_resource_admission<'a>(
     run_collection_v2(arguments, teacher_selections, observer, Arc::clone(&hooks), CollectionHooksV2::OwnNnuec(hooks), admit_resource)
 }
 
+pub fn run_own_board_collection_v2_with_resource_admission<'a>(
+    arguments: Vec<String>,
+    teacher_selections: Vec<RoventTeacherSourceSelection>,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+    hooks: Arc<RoventOwnBoardCollectionHooksV2>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
+) -> Result<(), RoventOwnBoardCollectionLaunchFailureV2> {
+    run_collection_v2(arguments, teacher_selections, observer, Arc::clone(&hooks), CollectionHooksV2::OwnBoard(hooks), admit_resource)
+}
+
 fn run_collection_v2<'a, H: ?Sized>(
     arguments: Vec<String>,
     teacher_selections: Vec<RoventTeacherSourceSelection>,
@@ -134,6 +186,7 @@ fn run_collection_v2<'a, H: ?Sized>(
 ) -> Result<(), RoventCollectionLaunchFailureV2<H>> {
     let startup_attempt = Arc::new(AtomicBool::new(false));
     let native_settled = Arc::new(AtomicBool::new(false));
+    let board_product_slot = Arc::new(Mutex::new(None));
     let mut observer_custody = V2ObserverCustody::new(observer);
     let proxy = observer_custody.proxy().expect("new observer custody");
     let inner_startup_attempt = Arc::clone(&startup_attempt);
@@ -144,8 +197,20 @@ fn run_collection_v2<'a, H: ?Sized>(
         admit_resource: Box::new(admit_resource),
         startup_attempt: inner_startup_attempt,
         native_settled: Arc::clone(&native_settled),
+        board_product_custody: Arc::clone(&board_product_slot),
     })));
+    let board_product_custody = board_product_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
     match result {
+        Ok(Ok(())) if board_product_custody.is_some() => Err(RoventCollectionLaunchFailureV2 {
+            error: super::error("PhysicalCompletionUnknown", "a Board product rejection remained after apparent success"),
+            hooks: Some(original_hooks),
+            panic_payload: None,
+            observer_before_start: None,
+            retained_observer: Some(observer_custody),
+            observer_reclaim_error: None,
+            board_product_custody,
+            physical_unknown: true,
+        }),
         Ok(Ok(())) => match observer_custody.try_reclaim_after_verified_boundary() {
             Ok(original) => { drop(original); Ok(()) }
             Err(reclaim_error) => Err(RoventCollectionLaunchFailureV2 {
@@ -155,6 +220,7 @@ fn run_collection_v2<'a, H: ?Sized>(
                 observer_before_start: None,
                 retained_observer: Some(observer_custody),
                 observer_reclaim_error: Some(reclaim_error),
+                board_product_custody,
                 physical_unknown: true,
             }),
         },
@@ -176,6 +242,7 @@ fn run_collection_v2<'a, H: ?Sized>(
                 observer_before_start: original,
                 retained_observer,
                 observer_reclaim_error: reclaim_error,
+                board_product_custody,
                 physical_unknown,
             })
         }
@@ -186,6 +253,7 @@ fn run_collection_v2<'a, H: ?Sized>(
             observer_before_start: None,
             retained_observer: Some(observer_custody),
             observer_reclaim_error: None,
+            board_product_custody,
             physical_unknown: true,
         }),
     }
