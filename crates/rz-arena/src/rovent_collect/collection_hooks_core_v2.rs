@@ -37,6 +37,7 @@ const ADMISSION_RESERVED: u8 = 1;
 const ADMISSION_CLOSED: u8 = 2;
 const ADMISSION_INSTALLED: u8 = 3;
 const ADMISSION_CANCELED: u8 = 4;
+const ADMISSION_COMMITTING: u8 = 5;
 
 struct AdmissionSlot {
     admission: RoventCollectionRootAdmissionV2,
@@ -68,7 +69,44 @@ pub(crate) struct CollectionBridgeCoreV2<H> {
     installed_admission: OnceLock<RoventCollectionRootAdmissionV2>,
 }
 
+/// Exclusive transition for committing rows of the original single root.
+/// It excludes a new observer admission; it does not prove native completion,
+/// teacher retirement, or publication on its own.
+pub(crate) struct RoventCollectionCommitGateV2<'a, H> {
+    core: &'a CollectionBridgeCoreV2<H>,
+    admission: RoventCollectionRootAdmissionV2,
+}
+
+impl<H> RoventCollectionCommitGateV2<'_, H> {
+    pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        self.core.admission_phase.load(Ordering::Acquire) == ADMISSION_COMMITTING
+            && self.admission.same_original_admission(admission)
+    }
+
+    pub(crate) fn owner(&self) -> &RoventCollectionOwnerLockV2 {
+        &self.core.owner
+    }
+}
+
+impl<H> Drop for RoventCollectionCommitGateV2<'_, H> {
+    fn drop(&mut self) {
+        // A changed phase is not replaced: an unexpected owner transition
+        // must remain observable instead of being overwritten.
+        let _ = self.core.admission_phase.compare_exchange(
+            ADMISSION_COMMITTING, ADMISSION_INSTALLED, Ordering::AcqRel, Ordering::Acquire,
+        );
+    }
+}
+
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
+    /// Actual installed admission, retained even after the bridge closes.
+    /// This is custody identity only, not completion or publication evidence.
+    pub(crate) fn installed_admission_for_recovery(&self) -> Option<&RoventCollectionRootAdmissionV2> {
+        if !self.installed_published.load(Ordering::Acquire) {
+            return None;
+        }
+        self.installed_admission.get()
+    }
     /// The single-root bridge can no longer install another observer only
     /// after its admission has irrevocably closed. A reserved installation
     /// remains unknown and must never be represented as a no-capture root.
@@ -76,7 +114,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         if !self.revoked.load(Ordering::Acquire) {
             return false;
         }
-        if self.admission_phase.load(Ordering::Acquire) != ADMISSION_INSTALLED
+        if !matches!(self.admission_phase.load(Ordering::Acquire), ADMISSION_INSTALLED | ADMISSION_COMMITTING)
             || !self.installed_published.load(Ordering::Acquire) {
             return false;
         }
@@ -87,6 +125,21 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             && old.epoch == new.epoch
             && old.implementation == new.implementation
             && (new.game > old.game || (new.game == old.game && new.root > old.root))
+    }
+
+    pub(crate) fn try_begin_commit(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Option<RoventCollectionCommitGateV2<'_, H>>, ArenaError> {
+        if !self.revoked.load(Ordering::Acquire) || !self.installed_published.load(Ordering::Acquire)
+            || !self.installed_admission.get().is_some_and(|original| original.same_original_admission(admission)) {
+            return Err(ArenaError::Invalid("commit does not match the original closed collection root".into()));
+        }
+        match self.admission_phase.compare_exchange(ADMISSION_INSTALLED, ADMISSION_COMMITTING, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(Some(RoventCollectionCommitGateV2 { core: self, admission: admission.clone() })),
+            Err(ADMISSION_COMMITTING) => Ok(None),
+            Err(_) => Err(ArenaError::Invalid("original collection admission is not commit-ready".into())),
+        }
     }
 
     pub(crate) fn try_install_no_capture(
@@ -150,6 +203,10 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             handoff_receiver,
             handoff_matches,
             handoff_submit,
+            handoff_recovery: None,
+            handoff_identity: None,
+            handoff_recovery_failed: false,
+            handoff_disconnected: false,
             revoked,
             failed,
             admission_phase,
@@ -158,6 +215,8 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             roster,
             slot: None,
             handoff: None,
+            pending_handoff: None,
+            foreign_handoff: None,
             physical_ack: None,
             worker_ack: None,
             aggregate_ack: None,
@@ -191,6 +250,11 @@ pub(crate) type HandoffMatches<H> =
 /// On rejection the same opaque roster aggregate returns to its owner.
 pub(crate) type HandoffSubmit<H> =
     fn(&mut H, RoventTeacherScopeAggregateAckV2) -> Result<(), RoventTeacherScopeAggregateAckV2>;
+/// Custody recovery only. It grants no completion or publication evidence.
+pub(crate) type HandoffRecovery<H> = fn(
+    &RoventCollectionRootAdmissionV2,
+) -> Result<Option<Arc<Mutex<H>>>, &'static str>;
+pub(crate) type HandoffIdentity<H> = fn(&mut H, &RoventCollectionRootAdmissionV2) -> bool;
 
 pub(crate) struct CoreAdmissionFailure {
     pub(crate) error: AdaptiveManagerError,
@@ -353,6 +417,7 @@ pub(crate) enum WorkerFailure {
     Retirement(ArenaError),
     HandoffDisconnected,
     HandoffMismatch,
+    HandoffRecovery(&'static str),
     RootClosedBeforeStartup,
     WorkerPanicked,
     RetirementSealRejected,
@@ -375,6 +440,7 @@ impl WorkerFailure {
             Self::Retirement(_) => "retirement",
             Self::HandoffDisconnected => "handoff_disconnected",
             Self::HandoffMismatch => "handoff_mismatch",
+            Self::HandoffRecovery(_) => "handoff_recovery",
             Self::RootClosedBeforeStartup => "root_closed_before_startup",
             Self::WorkerPanicked => "worker_panicked",
             Self::RetirementSealRejected => "retirement_seal_rejected",
@@ -407,6 +473,10 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     handoff_receiver: mpsc::Receiver<Arc<Mutex<H>>>,
     handoff_matches: HandoffMatches<H>,
     handoff_submit: HandoffSubmit<H>,
+    handoff_recovery: Option<HandoffRecovery<H>>,
+    handoff_identity: Option<HandoffIdentity<H>>,
+    handoff_recovery_failed: bool,
+    handoff_disconnected: bool,
     revoked: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     admission_phase: Arc<AtomicU8>,
@@ -415,6 +485,10 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     roster: Vec<RoventTeacherRosterEntryV2>,
     slot: Option<Arc<AdmissionSlot>>,
     handoff: Option<Arc<Mutex<H>>>,
+    // Never discard an unexamined or different-root original sent through
+    // the channel. A single foreign handoff closes further channel reads.
+    pending_handoff: Option<Arc<Mutex<H>>>,
+    foreign_handoff: Option<Arc<Mutex<H>>>,
     physical_ack: Option<RoventTeacherScopePhysicalAckV2>,
     worker_ack: Option<RoventTeacherScopeWorkerAckV2>,
     aggregate_ack: Option<RoventTeacherScopeAggregateAckV2>,
@@ -470,6 +544,11 @@ pub(crate) enum HandoffObservationErrorV2 {
 }
 
 impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
+    /// Install before the worker starts; P-C keeps its existing channel path.
+    pub(crate) fn configure_handoff_recovery(&mut self, recovery: HandoffRecovery<H>, identity: HandoffIdentity<H>) {
+        self.handoff_recovery = Some(recovery);
+        self.handoff_identity = Some(identity);
+    }
     /// Configure from the registered launch plan before this worker starts.
     /// This does not begin a teacher or consume any source row.
     pub(crate) fn configure_row_pump(
@@ -494,18 +573,25 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             + self.pump_ready.len() + usize::from(self.pump_rejected.is_some())
     }
 
-    pub(crate) fn pump_ready_counts(&self) -> (usize, usize, usize) {
+    pub(crate) fn first_pump_item_mut(&mut self) -> Option<&mut PumpItemV2> {
+        self.pump_ready.front_mut()
+    }
+
+    pub(crate) fn pump_ready_counts(&self) -> (usize, usize, usize, usize) {
         let mut unlabeled = 0;
         let mut prepared = 0;
         let mut failed = 0;
+        let mut committed = 0;
         for item in &self.pump_ready {
             match item {
                 PumpItemV2::Unlabeled { .. } => unlabeled += 1,
-                PumpItemV2::Prepared { .. } => prepared += 1,
+                PumpItemV2::Prepared { sealed: Some(_), .. } => committed += 1,
+                PumpItemV2::Prepared { sealed: None, .. } => prepared += 1,
+                PumpItemV2::Committed { .. } => committed += 1,
                 PumpItemV2::Failed { .. } => failed += 1,
             }
         }
-        (unlabeled, prepared, failed)
+        (unlabeled, prepared, committed, failed)
     }
 
     fn poll_row_pump(&mut self) {
@@ -779,12 +865,47 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     }
 
     fn poll_handoff(&mut self) {
-        if self.handoff.is_none() {
+        if self.handoff.is_none() && self.pending_handoff.is_none() && self.foreign_handoff.is_none() {
             match self.handoff_receiver.try_recv() {
+                Ok(handoff) if self.handoff_identity.is_some() => self.pending_handoff = Some(handoff),
                 Ok(handoff) => self.handoff = Some(handoff),
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) if self.handoff_recovery.is_none() => {
                     self.record_failure(WorkerFailure::HandoffDisconnected)
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.handoff_disconnected = true,
+            }
+        }
+        if let (Some(identity), Some(slot), Some(pending)) =
+            (self.handoff_identity, self.slot.as_ref(), self.pending_handoff.as_ref()) {
+            let matched = match pending.try_lock() {
+                Ok(mut handoff) => Some(Ok(identity(&mut *handoff, &slot.admission))),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(())),
+            };
+            match matched {
+                Some(Ok(true)) => self.handoff = self.pending_handoff.take(),
+                Some(Ok(false)) => {
+                    self.foreign_handoff = self.pending_handoff.take();
+                    self.record_failure(WorkerFailure::HandoffMismatch);
+                }
+                Some(Err(())) => {
+                    self.foreign_handoff = self.pending_handoff.take();
+                    self.record_failure(WorkerFailure::HandoffRecovery("received handoff poisoned"));
+                }
+                None => {}
+            }
+        }
+        if self.handoff.is_none() && !self.handoff_recovery_failed
+            && (self.foreign_handoff.is_some() || self.handoff_disconnected) {
+            if let (Some(recover), Some(slot)) = (self.handoff_recovery, self.slot.as_ref()) {
+                match recover(&slot.admission) {
+                    Ok(Some(original)) => self.handoff = Some(original),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.handoff_recovery_failed = true;
+                        self.record_failure(WorkerFailure::HandoffRecovery(error));
+                    }
                 }
             }
         }

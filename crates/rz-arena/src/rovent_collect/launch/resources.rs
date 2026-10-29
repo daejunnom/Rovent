@@ -14,6 +14,9 @@ pub(super) struct CollectionResourceCustody {
     original: NativeResourceCustody,
 }
 impl CollectionResourceCustody {
+    pub(super) fn no_admission_started(&self) -> bool {
+        self.original.no_admission_started()
+    }
     pub(super) fn prepare(
         original_private_root: &Dir,
         pin: &RoventPublicationFile,

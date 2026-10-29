@@ -144,6 +144,10 @@ pub fn rovent_native_capture_channel() -> (
     )
 }
 impl RoventNativeCaptureRegistration {
+    pub(super) fn same_original_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registered, &other.registered)
+            && Arc::ptr_eq(&self.disabled_root, &other.disabled_root)
+    }
     pub(super) fn try_disabled_root_count(&self) -> Result<Option<usize>, ArenaError> {
         match self.disabled_root.try_lock() {
             Ok(markers) => Ok(Some(markers.len())),

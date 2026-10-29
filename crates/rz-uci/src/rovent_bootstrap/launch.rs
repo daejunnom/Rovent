@@ -1183,6 +1183,9 @@ fn run_pc_collection_v2_inner<'a>(
     collection: CollectionLaunchV2<'a>,
 ) -> Result<(), RoventLaunchError> {
     let arguments = Arguments::parse(&arguments)?;
+    *collection.parsed_storage_selected.lock().map_err(|_| {
+        error("Arguments", "storage selection observation poisoned")
+    })? = Some(arguments.storage.is_some());
     let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
     let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
         .map_err(|failure| error("Cwd", failure))?;

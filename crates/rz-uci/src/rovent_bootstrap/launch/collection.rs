@@ -45,6 +45,7 @@ pub(super) struct CollectionLaunchV2<'a> {
         Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>,
     pub(super) startup_attempt: Arc<AtomicBool>,
     pub(super) native_settled: Arc<AtomicBool>,
+    pub(super) parsed_storage_selected: Arc<Mutex<Option<bool>>>,
     pub(super) board_product_custody: Arc<Mutex<Option<RoventOwnPcrV2StartupRejection>>>,
 }
 
@@ -60,6 +61,7 @@ pub struct RoventCollectionLaunchFailureV2<H: ?Sized> {
     observer_reclaim_error: Option<V2ObserverReclaimError>,
     board_product_custody: Option<RoventOwnPcrV2StartupRejection>,
     physical_unknown: bool,
+    parsed_storage_selected: Option<bool>,
 }
 
 pub type RoventPcCollectionLaunchFailureV2 =
@@ -93,6 +95,16 @@ impl Drop for RoventBoardProductCustody {
 }
 
 impl<H: ?Sized> RoventCollectionLaunchFailureV2<H> {
+    /// Actual parser result from this launch. None means parsing did not
+    /// complete or its observation is unavailable, not that storage is off.
+    pub fn parsed_storage_selected(&self) -> Option<bool> {
+        self.parsed_storage_selected
+    }
+
+    /// The original observer was reclaimed by the verified native boundary.
+    pub fn settled_observer_available(&self) -> bool {
+        self.observer_before_start.is_some()
+    }
     pub fn hooks(&self) -> &Arc<H> {
         self.hooks
             .as_ref()
@@ -219,6 +231,7 @@ fn run_collection_v2<'a, H: ?Sized>(
 ) -> Result<(), RoventCollectionLaunchFailureV2<H>> {
     let startup_attempt = Arc::new(AtomicBool::new(false));
     let native_settled = Arc::new(AtomicBool::new(false));
+    let parsed_storage_selected = Arc::new(Mutex::new(None));
     let board_product_slot = Arc::new(Mutex::new(None));
     let mut observer_custody = V2ObserverCustody::new(observer);
     let proxy = observer_custody.proxy().expect("new observer custody");
@@ -233,6 +246,7 @@ fn run_collection_v2<'a, H: ?Sized>(
                 admit_resource: Box::new(admit_resource),
                 startup_attempt: inner_startup_attempt,
                 native_settled: Arc::clone(&native_settled),
+                parsed_storage_selected: Arc::clone(&parsed_storage_selected),
                 board_product_custody: Arc::clone(&board_product_slot),
             },
         )
@@ -241,6 +255,7 @@ fn run_collection_v2<'a, H: ?Sized>(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take();
+    let parsed_storage_selected = parsed_storage_selected.lock().ok().and_then(|value| *value);
     match result {
         Ok(Ok(())) if board_product_custody.is_some() => Err(RoventCollectionLaunchFailureV2 {
             error: super::error(
@@ -254,6 +269,7 @@ fn run_collection_v2<'a, H: ?Sized>(
             observer_reclaim_error: None,
             board_product_custody,
             physical_unknown: true,
+            parsed_storage_selected,
         }),
         Ok(Ok(())) => match observer_custody.try_reclaim_after_verified_boundary() {
             Ok(original) => {
@@ -272,6 +288,7 @@ fn run_collection_v2<'a, H: ?Sized>(
                 observer_reclaim_error: Some(reclaim_error),
                 board_product_custody,
                 physical_unknown: true,
+                parsed_storage_selected,
             }),
         },
         Ok(Err(error)) => {
@@ -301,6 +318,7 @@ fn run_collection_v2<'a, H: ?Sized>(
                 observer_reclaim_error: reclaim_error,
                 board_product_custody,
                 physical_unknown,
+                parsed_storage_selected,
             })
         }
         Err(payload) => Err(RoventCollectionLaunchFailureV2 {
@@ -312,6 +330,7 @@ fn run_collection_v2<'a, H: ?Sized>(
             observer_reclaim_error: None,
             board_product_custody,
             physical_unknown: true,
+            parsed_storage_selected,
         }),
     }
 }

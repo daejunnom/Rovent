@@ -90,7 +90,7 @@ use std::{
     num::NonZeroU16,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, TryLockError,
+        Arc, Mutex, OnceLock, TryLockError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -110,6 +110,7 @@ pub struct RoventNnuecCollectionHandoffV2 {
     settlement: Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
     native_fence: AdaptiveShutdownReceipt,
     collection_failures: Box<[crate::pals_adaptive::AdaptiveCollectionError]>,
+    handoff_delivery: Arc<OnceLock<Result<(), crate::pals_adaptive::AdaptiveCollectionError>>>,
     escrow_key: handoff_escrow_v2::HandoffEscrowKeyV2,
     teacher_physical_ack: Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
     teacher_aggregate_ack: Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
@@ -154,6 +155,11 @@ impl RoventNnuecTransferredHandoffV2 {
 }
 
 impl RoventNnuecCollectionHandoffV2 {
+    /// None means the send has not been observed. Even successful channel
+    /// delivery is not teacher retirement or publication evidence.
+    pub fn handoff_delivery(&self) -> Option<&Result<(), crate::pals_adaptive::AdaptiveCollectionError>> {
+        self.handoff_delivery.get()
+    }
     /// Lease the same original handoff. This transfers custody only; the
     /// Arena owner must independently verify worker, physical and publication
     /// outcomes. A dropped lease remains recoverable in the bounded registry.
@@ -240,6 +246,7 @@ impl RoventNnuecCollectionHandoffV2 {
         Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
         AdaptiveShutdownReceipt,
         Box<[crate::pals_adaptive::AdaptiveCollectionError]>,
+        Arc<OnceLock<Result<(), crate::pals_adaptive::AdaptiveCollectionError>>>,
         Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
         Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
     ) {
@@ -249,6 +256,7 @@ impl RoventNnuecCollectionHandoffV2 {
             self.settlement,
             self.native_fence,
             self.collection_failures,
+            self.handoff_delivery,
             self.teacher_physical_ack,
             self.teacher_aggregate_ack,
         )
@@ -260,6 +268,72 @@ impl RoventNnuecCollectionHandoffV2 {
 /// on this owner's actual root and teacher. Callbacks prove no physical fence.
 /// This seam does not authorize collection until the /2 corpus and teacher
 /// lifecycle consumers can retain and drain the same owners.
+/// Immutable original evidence for a root whose collection admission was
+/// still pending when the original search stopped. This is not a native or
+/// teacher failure and grants no collection or physical authority.
+pub struct RoventNnuecPendingCollectionV2 {
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub cause: Option<crate::pals_adaptive::AdaptiveCollectionError>,
+    pub reason: crate::pals_adaptive::AdaptiveCollectionError,
+}
+
+impl std::fmt::Debug for RoventNnuecPendingCollectionV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoventNnuecPendingCollectionV2")
+            .field("admission_sha256", &self.admission.raw_sha256())
+            .field("cause", &self.cause)
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventPendingEvidenceDispositionV2 {
+    OriginalRetained,
+    Summarized,
+    Busy,
+}
+
+#[derive(Clone, Debug)]
+pub enum RoventPendingJournalObservationV2 {
+    OriginalRetained,
+    Summarized,
+    Busy,
+    Failed(AdaptiveManagerError),
+    Panicked(Arc<RoventPendingJournalPanicV2>),
+}
+
+/// The original callback panic is separate from the native search result.
+pub struct RoventPendingJournalPanicV2 {
+    payload: Mutex<Option<Box<dyn Any + Send>>>,
+}
+
+impl RoventPendingJournalPanicV2 {
+    fn new(payload: Box<dyn Any + Send>) -> Self { Self { payload: Mutex::new(Some(payload)) } }
+
+    pub fn try_take_payload(&self) -> Result<Option<Box<dyn Any + Send>>, AdaptiveManagerError> {
+        match self.payload.try_lock() {
+            Ok(mut payload) => Ok(payload.take()),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => Err(AdaptiveManagerError::Invalid("pending callback panic custody poisoned")),
+        }
+    }
+}
+
+impl std::fmt::Debug for RoventPendingJournalPanicV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoventPendingJournalPanicV2").finish_non_exhaustive()
+    }
+}
+
+impl Drop for RoventPendingJournalPanicV2 {
+    fn drop(&mut self) {
+        if let Some(payload) = self.payload.get_mut().unwrap_or_else(|poison| poison.into_inner()).take() {
+            std::mem::forget(payload);
+        }
+    }
+}
+
 pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     /// Register the actual startup control before work can be spawned.
     fn register_startup_control(
@@ -293,6 +367,14 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
         _fence: &AdaptiveShutdownReceipt,
     ) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
         Err(AdaptiveManagerError::Invalid("no-capture root cleanup unsupported"))
+    }
+    /// Nonblocking: distinguish original retention, bounded summarization,
+    /// and Busy. No outcome claims durable storage or physical completion.
+    fn try_record_pending_stopped(
+        &self,
+        _event: &Arc<RoventNnuecPendingCollectionV2>,
+    ) -> Result<RoventPendingEvidenceDispositionV2, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("pending collection journal unsupported"))
     }
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
@@ -472,6 +554,12 @@ pub struct RoventNnuecRootReceiptV2 {
     /// Original preflight failure when deferred admission subsequently had to
     /// wait or stop. Its exact cause is separate from the terminal reason.
     pub collection_deferred_cause: Option<crate::pals_adaptive::AdaptiveCollectionError>,
+    /// Failure to deliver an already-fenced, escrowed Collection handoff.
+    pub collection_handoff_failure: Option<crate::pals_adaptive::AdaptiveCollectionError>,
+    /// Original pending observation and its independent journal outcome.
+    /// Arena persistence and native/teacher physical completion are separate.
+    pub collection_pending_event: Option<Arc<RoventNnuecPendingCollectionV2>>,
+    pub collection_pending_journal: Option<RoventPendingJournalObservationV2>,
     pub initial_retirement: Option<Arc<RoventNnuecInitialRetirementReceipt>>,
     pub counters: AdaptiveManagerCounters,
     pub stopped_before_research_execution: bool,
@@ -1755,6 +1843,9 @@ impl RoventNnuecSessionDriver {
         counters: AdaptiveManagerCounters,
         collection_deferred: Option<crate::pals_adaptive::AdaptiveCollectionError>,
         collection_deferred_cause: Option<crate::pals_adaptive::AdaptiveCollectionError>,
+        collection_handoff_failure: Option<crate::pals_adaptive::AdaptiveCollectionError>,
+        collection_pending_event: Option<Arc<RoventNnuecPendingCollectionV2>>,
+        collection_pending_journal: Option<RoventPendingJournalObservationV2>,
     ) -> NnuecRootReceipt {
         match admission {
             NnuecRootAdmission::V1(root) => {
@@ -1782,6 +1873,9 @@ impl RoventNnuecSessionDriver {
                     physical: Some(physical.clone()),
                     collection_deferred,
                     collection_deferred_cause,
+                    collection_handoff_failure,
+                    collection_pending_event,
+                    collection_pending_journal,
                     initial_retirement: None,
                     counters,
                     stopped_before_research_execution: false,
@@ -2769,6 +2863,9 @@ fn preparing_retirement_receipt_any(
                 physical: None,
                 collection_deferred: None,
                 collection_deferred_cause: None,
+                collection_handoff_failure: None,
+                collection_pending_event: None,
+                collection_pending_journal: None,
                 initial_retirement,
                 counters: AdaptiveManagerCounters::default(),
                 stopped_before_research_execution: true,

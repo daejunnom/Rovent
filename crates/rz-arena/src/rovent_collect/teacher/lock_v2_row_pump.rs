@@ -86,7 +86,12 @@ pub(crate) enum PumpItemV2 {
     },
     Prepared {
         row: RoventRetiredLockV2Record,
-        evidence: PreparedTeacherPolicyLockV2,
+        evidence: Option<PreparedTeacherPolicyLockV2>,
+        sealed: Option<SealedTeacherPolicyV2>,
+    },
+    Committed {
+        row: RoventRetiredLockV2Record,
+        sealed: SealedTeacherPolicyV2,
     },
     Failed {
         row: RoventRetiredLockV2Record,
@@ -407,7 +412,8 @@ impl RetiredRowPumpV2 {
             Stage::Unlabeled => Some(PumpItemV2::Unlabeled { row: entry.row }),
             Stage::Prepared(evidence) => Some(PumpItemV2::Prepared {
                 row: entry.row,
-                evidence,
+                evidence: Some(evidence),
+                sealed: None,
             }),
             Stage::Failed { error, evidence } => Some(PumpItemV2::Failed {
                 row: entry.row,

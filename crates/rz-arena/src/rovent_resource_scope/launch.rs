@@ -203,6 +203,16 @@ pub(crate) struct NativeResourceCustody {
     finished_attempted: bool,
 }
 impl NativeResourceCustody {
+    /// This resource owner never attempted admission or constructed a scope.
+    /// It does not say anything about UCI, storage, or another process owner.
+    pub(crate) fn no_admission_started(&self) -> bool {
+        !self.admission_attempted
+            && self.scope.is_none()
+            && self.scope_v2.is_none()
+            && self.failure.is_none()
+            && self.failure_v2.is_none()
+            && self.admission.is_none()
+    }
     /// Admit the original /2 lock and exact delegated FD before native model
     /// loading. An error retains the same owner and any partially entered OS
     /// scope; it is not converted to /1 or reported as successful admission.

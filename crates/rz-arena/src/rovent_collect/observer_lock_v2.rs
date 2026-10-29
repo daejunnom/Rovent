@@ -56,6 +56,8 @@ struct State {
     producer: Option<RoventCorpusProducerLockV2>,
     producer_root: Option<String>,
     prior_producers: Vec<(String, RoventCorpusProducerLockV2)>,
+    current_admission: Option<RoventCollectionRootAdmissionV2>,
+    settled_roots: Vec<RoventCollectionRootAdmissionV2>,
     registration: RoventNativeCaptureRegistration,
     receiver: RoventCapturedInputReceiver,
     metadata: RoventCollectionMetadata,
@@ -93,6 +95,10 @@ pub struct RoventCollectionOwnerLockV2 {
 }
 
 impl RoventCollectionOwnerLockV2 {
+    pub(crate) fn same_original_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+            && self.registration.same_original_owner(&other.registration)
+    }
     pub fn new(
         manifest: rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
         metadata: RoventCollectionMetadata,
@@ -127,6 +133,8 @@ impl RoventCollectionOwnerLockV2 {
                     producer: None,
                     producer_root: None,
                     prior_producers: Vec::new(),
+                    current_admission: None,
+                    settled_roots: Vec::new(),
                     registration,
                     receiver,
                     metadata,
@@ -340,6 +348,47 @@ impl RoventCollectionOwnerLockV2 {
             .ok_or_else(|| invalid("lock-v2 retired row's original producer missing"))?;
         producer.validate_admission(&row.admission)?;
         action(producer, row)
+    }
+
+    /// A short owner-only commit after the actual Own root handoff. The gate
+    /// prevents a competing observer admission while this producer is held.
+    /// Busy and all validation failures leave `row` and the caller's prepared
+    /// evidence untouched. This does not publish the row or prove teacher
+    /// retirement; those are separate owner obligations.
+    pub(crate) fn try_with_fenced_own_producer_mut<T>(
+        &self,
+        row: &mut RoventRetiredLockV2Record,
+        gate: &super::collection_hooks_core_v2::RoventCollectionCommitGateV2<
+            '_, rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2,
+        >,
+        handoff: &mut rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2,
+        action: impl FnOnce(&mut RoventCorpusProducerLockV2, &mut RoventRetiredLockV2Record) -> T,
+    ) -> Result<Option<T>, ArenaError> {
+        let (admission, _, settlement, fence) = handoff.parts_mut();
+        check(self.same_original_owner(gate.owner()) && gate.matches_admission(admission)
+            && row.admission.same_original_admission(admission)
+            && settlement.is_ok() && fence.authority == admission.root_admission().authority()
+            && fence.permits_semantic_closure(),
+            "lock-v2 commit gate/original handoff/physical fence mismatch")?;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+        };
+        check(gate.matches_admission(admission)
+            && state.settled_roots.iter().any(|original| original.same_original_admission(admission))
+            && (!state.admitted || state.settled) && state.pending.is_empty() && state.staged.is_empty(),
+            "lock-v2 original root not settled or observer callbacks still active")?;
+        let root = row.admission.raw_sha256();
+        let producer = if state.producer_root.as_deref() == Some(root) {
+            state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?
+        } else {
+            &mut state.prior_producers.iter_mut().find(|(id, _)| id == root)
+                .ok_or_else(|| invalid("lock-v2 retired row original producer missing"))?.1
+        };
+        producer.validate_admission(admission)?;
+        producer.validate_teacher_row(row)?;
+        Ok(Some(action(producer, row)))
     }
 
     pub fn take_retired(&self) -> Result<Option<RoventRetiredLockV2Record>, ArenaError> {
@@ -761,6 +810,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
             }
             state.producer = Some(producer);
             state.producer_root = Some(admission.raw_sha256().to_owned());
+            state.current_admission = Some(admission.clone());
             state.handled_tickets.clear();
             if let Some(disabled) = state.disabled.take() {
                 state.prior_disabled.push(disabled);
@@ -1309,6 +1359,13 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                     "native input capture failed before fenced cleanup: {failure:?}"
                 )));
             }
+            let admission = state.current_admission.as_ref()
+                .ok_or_else(|| invalid("lock-v2 settled root original admission missing"))?.clone();
+            state.producer()?.validate_admission(&admission)?;
+            check(state.settled_roots.len() <= RETAINED_ROOT_CAPACITY
+                && !state.settled_roots.iter().any(|original| original.same_original_admission(&admission)),
+                "lock-v2 settled root evidence duplicate/capacity")?;
+            state.settled_roots.push(admission);
             Ok(())
         })
     }

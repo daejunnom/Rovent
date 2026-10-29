@@ -1,7 +1,7 @@
 //! Move-only V2 teacher evidence is checked and transformed outside the
 //! producer lock. A later short producer commit only transfers the prepared
 //! target to the same original retired row.
-use super::collection::{ROVENT_COLLECTION_TEACHER_BINDING, scope_json};
+use super::collection::{scope_json, ROVENT_COLLECTION_TEACHER_BINDING};
 use super::v2_session::SealedTeacherPolicyV2;
 use super::*;
 
@@ -22,7 +22,6 @@ pub(crate) struct PrepareTeacherPolicyFailureV2 {
 
 pub(crate) struct CommitTeacherPolicyFailureV2 {
     pub(crate) error: ArenaError,
-    pub(crate) prepared: PreparedTeacherPolicyLockV2,
     pub(crate) panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
@@ -146,13 +145,16 @@ pub(crate) fn prepare_teacher_policy_lock_v2(
 
 impl RoventCorpusProducerLockV2 {
     /// Commit a prepared policy without observing the worker, root mutex or
-    /// filesystem. An error returns the original prepared evidence unchanged.
+    /// filesystem. The caller holds custody on every error and unwind.
     pub(crate) fn attach_prepared_teacher_policy_v2(
         &mut self,
         row: &mut RoventRetiredLockV2Record,
-        mut prepared: PreparedTeacherPolicyLockV2,
+        custody: &mut Option<PreparedTeacherPolicyLockV2>,
     ) -> Result<SealedTeacherPolicyV2, Box<CommitTeacherPolicyFailureV2>> {
         let validate = || -> Result<(), ArenaError> {
+            let prepared = custody
+                .as_ref()
+                .ok_or_else(|| invalid("V2 prepared policy custody is empty"))?;
             self.validate_teacher_row(row)?;
             check(
                 prepared.ticket == row.ticket
@@ -169,18 +171,25 @@ impl RoventCorpusProducerLockV2 {
                 "lock-v2 prepared policy no longer belongs to original row/producer",
             )
         };
-        if let Err(error) = validate() {
-            return Err(Box::new(CommitTeacherPolicyFailureV2 {
-                error,
-                prepared,
-                panic: None,
-            }));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(validate)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(Box::new(CommitTeacherPolicyFailureV2 {
+                    error,
+                    panic: None,
+                }))
+            }
+            Err(panic) => {
+                return Err(Box::new(CommitTeacherPolicyFailureV2 {
+                    error: invalid("V2 teacher policy commit validation panicked"),
+                    panic: Some(panic),
+                }))
+            }
         }
         let producer = self.teacher_target_producer_mut();
         let Some(sequence) = producer.sequence.checked_add(1) else {
             return Err(Box::new(CommitTeacherPolicyFailureV2 {
                 error: invalid("Rovent collector sequence exhausted"),
-                prepared,
                 panic: None,
             }));
         };
@@ -188,7 +197,7 @@ impl RoventCorpusProducerLockV2 {
         // Recoverable unwinds return the original evidence unchanged.
         let sources = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut sources = row.record.0.head_sources.clone();
-            let mut source = prepared.source.clone();
+            let mut source = custody.as_ref().expect("validated custody").source.clone();
             source.observed_sequence = sequence;
             sources.insert("policy".into(), source);
             sources
@@ -198,10 +207,15 @@ impl RoventCorpusProducerLockV2 {
             Err(panic) => {
                 return Err(Box::new(CommitTeacherPolicyFailureV2 {
                     error: invalid("V2 teacher policy commit preparation panicked"),
-                    prepared,
                     panic: Some(panic),
                 }));
             }
+        };
+        let Some(mut prepared) = custody.take() else {
+            return Err(Box::new(CommitTeacherPolicyFailureV2 {
+                error: invalid("V2 prepared policy custody disappeared"),
+                panic: None,
+            }));
         };
         prepared.target.observed_sequence = sequence;
         producer.sequence = sequence;

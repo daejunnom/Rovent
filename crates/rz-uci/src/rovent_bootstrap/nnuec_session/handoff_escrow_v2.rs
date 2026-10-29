@@ -37,6 +37,7 @@ pub enum HandoffEscrowErrorV2 {
     Busy,
     Poisoned,
     Capacity,
+    DuplicateAdmission,
     Stale,
     DifferentAdmission,
     DifferentHandoff,
@@ -94,6 +95,11 @@ impl HandoffEscrowReservationV2 {
             session_detached: AtomicBool::new(false),
         });
         let mut guard = lock_registry()?;
+        if guard.slots.iter().flatten().any(|existing| {
+            existing.admission.same_original_admission(admission)
+        }) {
+            return Err(HandoffEscrowErrorV2::DuplicateAdmission);
+        }
         let index = guard.slots.iter().position(Option::is_none)
             .ok_or(HandoffEscrowErrorV2::Capacity)?;
         guard.slots[index] = Some(Arc::clone(&entry));
@@ -147,6 +153,44 @@ impl Drop for HandoffEscrowReservationV2 {
 }
 
 impl HandoffEscrowKeyV2 {
+    /// Atomically locate and lease the only registered original for this
+    /// admission. Pending installation is `Ok(None)`. A stale or duplicate
+    /// root is never selected by enumeration order.
+    pub fn try_recover_for_admission(
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Option<HandoffEscrowLeaseV2>, HandoffEscrowErrorV2> {
+        let registry = lock_registry()?;
+        let mut matched = None;
+        for (index, entry) in registry.slots.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            if entry.admission.same_original_admission(admission) {
+                if matched.is_some() {
+                    return Err(HandoffEscrowErrorV2::DuplicateAdmission);
+                }
+                matched = Some((index, Arc::clone(entry)));
+            }
+        }
+        let Some((index, entry)) = matched else { return Ok(None) };
+        let slot = entry.original.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
+            TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
+        })?;
+        let Some(original) = slot.as_ref() else { return Ok(None) };
+        entry.leased.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| HandoffEscrowErrorV2::AlreadyLeased)?;
+        Ok(Some(HandoffEscrowLeaseV2 {
+            key: HandoffEscrowKeyV2 { index, entry: Arc::clone(&entry) },
+            original: Arc::clone(original),
+            armed: true,
+        }))
+    }
+
+    /// Check only whether this key was reserved for the same original root.
+    /// This does not claim its handoff or attest any physical completion.
+    pub fn same_original_admission(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        self.entry.admission.same_original_admission(admission)
+    }
+
     /// Recovery may also return an empty original reservation after its
     /// session disappeared. This never attests worker or model shutdown.
     pub fn try_cancel_empty(&self) -> Result<(), HandoffEscrowErrorV2> {

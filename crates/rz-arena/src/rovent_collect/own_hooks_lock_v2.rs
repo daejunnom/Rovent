@@ -1,7 +1,7 @@
 //! Typed adapter around the shared bounded single-root Collection /2 worker.
 //! This layer does not combine P-C and Own manager or handoff authority.
 use super::collection_hooks_core_v2::{
-    CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure,
+    CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure, RoventCollectionCommitGateV2,
 };
 use super::teacher::v2_session::{RoventTeacherRosterEntryV2, TeacherSessionRetirementSealV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2};
@@ -13,7 +13,10 @@ use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_bootstrap::nnuec_session::{
     RoventNnuecCollectionAdmissionFailureV2, RoventNnuecCollectionAdmissionPortV2,
     RoventNnuecCollectionAdmissionOutcomeV2, RoventNnuecCollectionHandoffV2,
-    RoventNnuecCollectionHooksV2,
+    RoventNnuecCollectionHooksV2, RoventNnuecPendingCollectionV2, RoventPendingEvidenceDispositionV2,
+};
+use rz_uci::rovent_bootstrap::nnuec_session::handoff_escrow_v2::{
+    HandoffEscrowErrorV2, HandoffEscrowKeyV2,
 };
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -24,6 +27,7 @@ pub(crate) type RoventNnuecCollectionWorkerV2 =
 pub(crate) struct RoventNnuecCollectionBridgeV2 {
     core: Arc<CollectionBridgeCoreV2<RoventNnuecCollectionHandoffV2>>,
     deferred: Mutex<DeferredCollectionHistoryV2>,
+    pending_stopped: Mutex<PendingCollectionSummaryV2>,
 }
 
 struct DeferredCollectionHistoryV2 {
@@ -32,6 +36,20 @@ struct DeferredCollectionHistoryV2 {
     first_summarized: Option<String>,
     summarized_reasons: Vec<(AdaptiveCollectionError, u64)>,
     other_summarized_reasons: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingCollectionSummaryV2 {
+    pub(crate) first: Option<Arc<RoventNnuecPendingCollectionV2>>,
+    pub(crate) summarized: u64,
+    pub(crate) reasons: Vec<(Option<AdaptiveCollectionError>, AdaptiveCollectionError, u64)>,
+    pub(crate) other: u64,
+}
+
+impl PendingCollectionSummaryV2 {
+    fn new() -> Self {
+        Self { first: None, summarized: 0, reasons: Vec::with_capacity(16), other: 0 }
+    }
 }
 
 fn handoff_matches(
@@ -53,15 +71,59 @@ fn handoff_submit(
     handoff.submit_teacher_aggregate_ack(ack)
 }
 
+fn handoff_identity(
+    handoff: &mut RoventNnuecCollectionHandoffV2,
+    expected: &RoventCollectionRootAdmissionV2,
+) -> bool {
+    handoff.parts_mut().0.same_original_admission(expected)
+}
+
+/// A completed channel delivery can also be observed through the same
+/// original root's bounded escrow. This returns custody, not completion
+/// evidence; a successfully queued duplicate is the identical original Arc.
+fn recover_root_handoff(
+    admission: &RoventCollectionRootAdmissionV2,
+) -> Result<Option<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>, &'static str> {
+    let lease = match HandoffEscrowKeyV2::try_recover_for_admission(admission) {
+        Ok(Some(lease)) => lease,
+        Ok(None) | Err(HandoffEscrowErrorV2::Busy | HandoffEscrowErrorV2::AlreadyLeased) => return Ok(None),
+        Err(HandoffEscrowErrorV2::DuplicateAdmission) => return Err("duplicate original admission in handoff escrow"),
+        Err(HandoffEscrowErrorV2::Poisoned) => return Err("handoff escrow poisoned"),
+        Err(_) => return Err("handoff escrow recovery failed"),
+    };
+    let original = Arc::clone(lease.original());
+    let should_recover = match original.try_lock() {
+        Ok(mut handoff) => {
+            let same = handoff.parts_mut().0.same_original_admission(admission);
+            if !same { return Err("recovered handoff admission differs from worker"); }
+            handoff.handoff_delivery().is_some()
+        }
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => return Err("recovered handoff poisoned"),
+    };
+    // Dropping this lease leaves the original in escrow; the worker now
+    // holds a second Arc and the outer owner later performs the actual
+    // transfer using the normal same-admission custody path.
+    if should_recover { Ok(Some(original)) } else { Ok(None) }
+}
+
 impl RoventNnuecCollectionBridgeV2 {
+    pub(crate) fn installed_admission_for_recovery(&self) -> Option<&RoventCollectionRootAdmissionV2> {
+        self.core.installed_admission_for_recovery()
+    }
+    pub(crate) fn try_begin_commit(&self, admission: &RoventCollectionRootAdmissionV2)
+        -> Result<Option<RoventCollectionCommitGateV2<'_, RoventNnuecCollectionHandoffV2>>, ArenaError> {
+        self.core.try_begin_commit(admission)
+    }
     pub(crate) fn new(
         owner: RoventCollectionOwnerLockV2,
         manifest: Arc<RoventCorpusManifestLockV2>,
         roster: Vec<RoventTeacherRosterEntryV2>,
     ) -> Result<(Arc<Self>, RoventNnuecCollectionWorkerV2), ArenaError> {
-        let (core, worker) =
+        let (core, mut worker) =
             CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
-        Ok((Arc::new(Self { core, deferred: Mutex::new(DeferredCollectionHistoryV2 {
+        worker.configure_handoff_recovery(recover_root_handoff, handoff_identity);
+        Ok((Arc::new(Self { core, pending_stopped: Mutex::new(PendingCollectionSummaryV2::new()), deferred: Mutex::new(DeferredCollectionHistoryV2 {
             retained: Vec::with_capacity(256), summarized: 0, first_summarized: None,
             summarized_reasons: Vec::with_capacity(16), other_summarized_reasons: 0,
         }) }), worker))
@@ -82,6 +144,14 @@ impl RoventNnuecCollectionBridgeV2 {
             Ok(roots) => Ok(Some(!roots.retained.is_empty() || roots.summarized != 0)),
             Err(std::sync::TryLockError::WouldBlock) => Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => Err(ArenaError::Invalid("deferred collection root custody poisoned".into())),
+        }
+    }
+
+    pub(crate) fn try_pending_stopped_observation(&self) -> Result<Option<PendingCollectionSummaryV2>, ArenaError> {
+        match self.pending_stopped.try_lock() {
+            Ok(summary) => Ok(Some(summary.clone())),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(ArenaError::Invalid("pending collection summary poisoned".into())),
         }
     }
 
@@ -142,6 +212,32 @@ impl RoventNnuecCollectionBridgeV2 {
 }
 
 impl RoventNnuecCollectionHooksV2 for RoventNnuecCollectionBridgeV2 {
+    fn try_record_pending_stopped(
+        &self, event: &Arc<RoventNnuecPendingCollectionV2>,
+    ) -> Result<RoventPendingEvidenceDispositionV2, AdaptiveManagerError> {
+        let prepared_cause = event.cause.clone();
+        let prepared_reason = event.reason.clone();
+        let mut pending = match self.pending_stopped.try_lock() {
+            Ok(pending) => pending,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPendingEvidenceDispositionV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("pending collection summary poisoned")),
+        };
+        if let Some(first) = &pending.first {
+            if Arc::ptr_eq(first, event) { return Ok(RoventPendingEvidenceDispositionV2::OriginalRetained); }
+        } else {
+            pending.first = Some(Arc::clone(event));
+            return Ok(RoventPendingEvidenceDispositionV2::OriginalRetained);
+        }
+        pending.summarized = pending.summarized.saturating_add(1);
+        if let Some((_, _, count)) = pending.reasons.iter_mut().find(|(cause, reason, _)| *cause == event.cause && *reason == event.reason) {
+            *count = count.saturating_add(1);
+        } else if pending.reasons.len() < 16 {
+            pending.reasons.push((prepared_cause, prepared_reason, 1));
+        } else {
+            pending.other = pending.other.saturating_add(1);
+        }
+        Ok(RoventPendingEvidenceDispositionV2::Summarized)
+    }
     fn register_startup_control(
         &self,
         control: &RoventStartupControl,
