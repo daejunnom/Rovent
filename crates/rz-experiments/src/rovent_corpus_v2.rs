@@ -925,6 +925,16 @@ fn validate_head_sources(
             .get(&head.actor_id)
             .ok_or_else(|| ManifestError::Integrity("unknown frozen teacher actor".into()))?;
         let raw = &head.raw_receipt;
+        // The collection teacher uses the actual submitted input scope; the
+        // profiled external teacher uses a top-level input digest. Keep both
+        // existing binding families distinct instead of rejecting a genuine
+        // Collection receipt because its digest is nested in the scope.
+        let binding = &raw["binding"];
+        let binding_input = if binding["schema"] == "rz-rovent-collection-teacher-binding/1" {
+            &binding["input_scope"]["input_sha256"]
+        } else {
+            &binding["input_sha256"]
+        };
         ensure(
             row.lineage.teacher_actor_id.as_ref() == Some(&head.actor_id)
                 && head.source == policy.source
@@ -938,7 +948,7 @@ fn validate_head_sources(
                 && raw["teacher_pin"]
                     == serde_json::to_value(pin)
                         .map_err(|e| ManifestError::Integrity(e.to_string()))?
-                && raw["binding"]["input_sha256"] == row.input_sha256,
+                && *binding_input == row.input_sha256,
             "new teacher policy frozen actor/profile/binary/original binding",
         )?;
     }
