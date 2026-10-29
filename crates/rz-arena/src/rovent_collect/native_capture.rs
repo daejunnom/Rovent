@@ -54,14 +54,23 @@ impl RoventCapturedLockInputV2 {
     }
 }
 type Registrations = Arc<Mutex<BTreeMap<RequestId, RegisteredInputCapture>>>;
-type DisabledRoot = Arc<
-    Mutex<
-        Option<(
-            rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
-            RoleTicketEnvelope,
-        )>,
-    >,
->;
+enum DisabledCaptureRoot {
+    AfterTicket {
+        admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+        first_ticket: RoleTicketEnvelope,
+    },
+    WholeRoot(rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2),
+}
+impl DisabledCaptureRoot {
+    fn authority(&self) -> rz_contracts::pals::SearchAuthority {
+        match self {
+            Self::AfterTicket { admission, .. } => admission.root_admission().authority(),
+            Self::WholeRoot(capability) => capability.authority(),
+        }
+    }
+}
+const MAX_RETAINED_DISABLED_ROOTS: usize = 256;
+type DisabledRoot = Arc<Mutex<Vec<DisabledCaptureRoot>>>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoventNativeCaptureFailure {
     pub stage: VirtualReviewCaptureFailureStage,
@@ -106,7 +115,7 @@ pub fn rovent_native_capture_channel() -> (
     RoventCapturedInputReceiver,
 ) {
     let registered = Arc::new(Mutex::new(BTreeMap::new()));
-    let disabled_root = Arc::new(Mutex::new(None));
+    let disabled_root = Arc::new(Mutex::new(Vec::new()));
     let failure = Arc::new(Mutex::new(CaptureFailureState::default()));
     let (sender, receiver) = mpsc::sync_channel(16);
     let (submitted_sender, submitted_receiver) = mpsc::sync_channel(16);
@@ -135,6 +144,13 @@ pub fn rovent_native_capture_channel() -> (
     )
 }
 impl RoventNativeCaptureRegistration {
+    pub(super) fn try_disabled_root_count(&self) -> Result<Option<usize>, ArenaError> {
+        match self.disabled_root.try_lock() {
+            Ok(markers) => Ok(Some(markers.len())),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(invalid("lock-v2 disabled root poisoned")),
+        }
+    }
     /// Test-only contention injection. The closure is controlled by the test;
     /// no ticket, admission, capture or physical completion is manufactured.
     #[cfg(feature = "test-fixtures")]
@@ -208,15 +224,64 @@ impl RoventNativeCaptureRegistration {
                 return Err(invalid("lock-v2 disabled root poisoned"));
             }
         };
-        check(disabled.is_none(), "lock-v2 capture root already disabled")?;
-        *disabled = Some((admission.clone(), *first_ticket));
+        check(disabled.len() < MAX_RETAINED_DISABLED_ROOTS
+            && !disabled.iter().any(|marker| marker.authority() == admission.root_admission().authority()),
+            "lock-v2 root authority marker duplicate or retained marker capacity")?;
+        disabled.push(DisabledCaptureRoot::AfterTicket {
+            admission: admission.clone(), first_ticket: *first_ticket,
+        });
         Ok(true)
     }
-    pub(super) fn clear_disabled_lock_v2_root(&self) -> Result<(), ArenaError> {
-        *self
-            .disabled_root
-            .lock()
-            .map_err(|_| invalid("lock-v2 disabled root poisoned"))? = None;
+    /// Install an original UCI-issued root capability before any ticket. An
+    /// existing marker is never replaced, even if its root has expired.
+    pub(super) fn try_install_whole_root_no_capture(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+    ) -> Result<bool, ArenaError> {
+        let mut marker = match self.disabled_root.try_lock() {
+            Ok(marker) => marker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 disabled root poisoned")),
+        };
+        if marker.iter().any(|entry| matches!(entry,
+            DisabledCaptureRoot::WholeRoot(original) if original.same_original_capability(capability))) {
+            return Ok(true);
+        }
+        check(marker.len() < MAX_RETAINED_DISABLED_ROOTS
+            && !marker.iter().any(|entry| entry.authority() == capability.authority()),
+            "lock-v2 root authority marker duplicate or retained marker capacity")?;
+        marker.push(DisabledCaptureRoot::WholeRoot(capability.clone()));
+        Ok(true)
+    }
+    /// The hook calls this only with the original root-run shutdown receipt.
+    /// This releases no native owner and does not claim collection success.
+    pub(super) fn try_finish_whole_root_no_capture(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        receipt: &rz_uci::pals_adaptive::AdaptiveShutdownReceipt,
+    ) -> Result<bool, ArenaError> {
+        let mut marker = match self.disabled_root.try_lock() {
+            Ok(marker) => marker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 disabled root poisoned")),
+        };
+        let index = marker.iter().position(|entry| matches!(entry,
+            DisabledCaptureRoot::WholeRoot(original)
+                if original.same_original_capability(capability) && original.matches_shutdown_receipt(receipt)))
+            .ok_or_else(|| invalid("whole-root no-capture marker, original capability or native fence mismatch"))?;
+        marker.remove(index);
+        Ok(true)
+    }
+    pub(super) fn clear_disabled_lock_v2_root(
+        &self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<(), ArenaError> {
+        let mut marker = self.disabled_root.lock()
+            .map_err(|_| invalid("lock-v2 disabled root poisoned"))?;
+        let index = marker.iter().position(|entry| matches!(entry,
+            DisabledCaptureRoot::AfterTicket { admission: original, .. } if original.same_original_admission(admission)))
+            .ok_or_else(|| invalid("lock-v2 disabled marker is absent or belongs to another original root"))?;
+        marker.remove(index);
         Ok(())
     }
     /// 원 dispatch observer가 ticket 발급 후 execute 전에 호출한다.
@@ -470,11 +535,6 @@ impl RoventNativeInputObserver {
         let ticket = context.ticket();
         let preparation = context.question();
         let prepared = context.prepared();
-        if self.failed_input.is_some() {
-            return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
-                "original failed capture remains owned".into(),
-            )));
-        }
         if prepared.representation != ticket.representation {
             return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
                 "Rovent prepared input representation differs from original ticket".into(),
@@ -489,24 +549,23 @@ impl RoventNativeInputObserver {
                     let disabled = self.disabled_root.lock().map_err(|_| {
                         RoleFailure::Backend("lock-v2 disabled root poisoned".into())
                     })?;
-                    let (admission, first_ticket) = disabled.as_ref().ok_or_else(|| {
-                        RoleFailure::Backend(
-                            "Rovent native input lacks original manager reservation".into(),
-                        )
-                    })?;
-                    if ticket.id.epoch != first_ticket.id.epoch
-                        || ticket.id.sequence < first_ticket.id.sequence
-                    {
+                    let mut matching = 0usize;
+                    for marker in disabled.iter() {
+                        let matches = match marker {
+                            DisabledCaptureRoot::AfterTicket { admission, first_ticket } => {
+                                ticket.id.epoch == first_ticket.id.epoch
+                                    && ticket.id.sequence >= first_ticket.id.sequence
+                                    && admission.validate_native_discard_owner(context).is_ok()
+                            }
+                            DisabledCaptureRoot::WholeRoot(capability) => capability.validate_native_discard_owner(context).is_ok(),
+                        };
+                        matching += usize::from(matches);
+                    }
+                    if matching != 1 {
                         return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
-                            "missing reservation predates disabled capture boundary".into(),
+                            "original native input has no unique same-root no-capture marker".into(),
                         )));
                     }
-                    // This path discards optional collection input only. A late
-                    // native callback may outlive logical root authority; it must
-                    // still match the original immutable root and physical owner.
-                    admission
-                        .validate_native_discard_owner(context)
-                        .map_err(|error| RoleFailure::Backend(error.to_string()))?;
                     return Ok(());
                 };
                 if let RegisteredInputCapture::LockV2 {
@@ -537,6 +596,16 @@ impl RoventNativeInputObserver {
                     admission
                         .validate_native_discard_owner(context)
                         .map_err(|error| RoleFailure::Backend(error.to_string()))?;
+                }
+                // A retained failed input prevents only another actual capture,
+                // which could otherwise overwrite it. A verified no-capture
+                // marker is independently safe and must still be consumed.
+                if self.failed_input.is_some()
+                    && !matches!(candidate, RegisteredInputCapture::LockV2DisabledPrior { .. })
+                {
+                    return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
+                        "original failed capture remains owned".into(),
+                    )));
                 }
                 registered.remove(&ticket.id).expect("checked registration")
             };

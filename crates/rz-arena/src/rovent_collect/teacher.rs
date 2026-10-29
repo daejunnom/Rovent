@@ -11,6 +11,8 @@ pub use collection::RoventCollectionTeacherBinding;
 // The live row pump is wired separately; this module alone is not a caller.
 #[allow(dead_code)]
 pub(super) mod lock_v2_policy;
+#[allow(dead_code)]
+pub(super) mod lock_v2_row_pump;
 mod session;
 mod v2_actor_preflight;
 #[cfg(feature = "pals-collection-onnx")]

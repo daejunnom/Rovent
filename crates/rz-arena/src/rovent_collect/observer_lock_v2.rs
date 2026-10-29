@@ -86,6 +86,7 @@ struct State {
 #[derive(Clone)]
 pub struct RoventCollectionOwnerLockV2 {
     state: Arc<Mutex<State>>,
+    registration: RoventNativeCaptureRegistration,
     callback_lock_failure: Arc<AtomicBool>,
     retired_receiver: Arc<Mutex<mpsc::Receiver<RoventRetiredLockV2Record>>>,
     retired_queued: Arc<AtomicUsize>,
@@ -116,6 +117,7 @@ impl RoventCollectionOwnerLockV2 {
             "lock-v2 collection metadata/opening is not registered",
         )?;
         let (registration, observer, receiver) = rovent_native_capture_channel();
+        let registration_for_owner = registration.clone();
         let (retired_sender, retired_receiver) = mpsc::sync_channel(CAPACITY);
         let retired_queued = Arc::new(AtomicUsize::new(0));
         Ok((
@@ -150,6 +152,7 @@ impl RoventCollectionOwnerLockV2 {
                     test_started: BTreeMap::new(),
                 })),
                 callback_lock_failure: Arc::new(AtomicBool::new(false)),
+            registration: registration_for_owner,
                 retired_receiver: Arc::new(Mutex::new(retired_receiver)),
                 retired_queued,
             },
@@ -164,6 +167,24 @@ impl RoventCollectionOwnerLockV2 {
             owner: self.clone(),
             marker: PhantomData,
         })
+    }
+
+    /// Installs no-capture only on the actual native observer's registration
+    /// owner. It does not touch the failed producer or its retained inputs.
+    pub(crate) fn try_install_whole_root_no_capture(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+    ) -> Result<bool, ArenaError> {
+        self.registration.try_install_whole_root_no_capture(capability)
+    }
+
+    /// Only the same original UCI root-run owner supplies the receipt here.
+    pub(crate) fn try_finish_whole_root_no_capture(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        receipt: &rz_uci::pals_adaptive::AdaptiveShutdownReceipt,
+    ) -> Result<bool, ArenaError> {
+        self.registration.try_finish_whole_root_no_capture(capability, receipt)
     }
 
     /// Exercise the real registration mutex without holding the manager
@@ -407,6 +428,7 @@ impl RoventCollectionOwnerLockV2 {
             pending_count: state.pending.len() + state.staged.len(),
             pending_retired_count: state.retired.len()
                 + self.retired_queued.load(Ordering::Acquire),
+            pending_disabled_markers: self.registration.try_disabled_root_count().ok().flatten(),
             collection_disabled_first_ticket: state
                 .disabled
                 .as_ref()
@@ -460,6 +482,8 @@ pub struct RoventCollectionOwnerStatusLockV2 {
     pub settled: bool,
     pub pending_count: usize,
     pub pending_retired_count: usize,
+    /// Unknown on contention or poison; neither permits owner release.
+    pub pending_disabled_markers: Option<usize>,
     /// A disabled root is incomplete, from this original ticket onward.
     pub collection_disabled_first_ticket: Option<RoleTicketEnvelope>,
     pub collection_disabled_reason: Option<RoventCollectionDisableReasonV2>,
@@ -1276,8 +1300,10 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                     && state.producer()?.incomplete_capture_count() == 0,
                 "lock-v2 fenced root retains unresolved inputs",
             )?;
+            if let Some(disabled) = state.disabled.as_ref() {
+                state.registration.clear_disabled_lock_v2_root(&disabled.admission)?;
+            }
             state.settled = true;
-            state.registration.clear_disabled_lock_v2_root()?;
             if let Some(failure) = capture_failure {
                 return Err(invalid(format!(
                     "native input capture failed before fenced cleanup: {failure:?}"

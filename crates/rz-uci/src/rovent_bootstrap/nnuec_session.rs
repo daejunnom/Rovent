@@ -7,6 +7,7 @@
 
 #[cfg(feature = "pals-adaptive-diagnostics")]
 pub(crate) mod diagnostics;
+pub mod handoff_escrow_v2;
 mod initial_cleanup;
 #[cfg(test)]
 pub(in crate::rovent_bootstrap) mod pre_materialization_tests;
@@ -37,6 +38,7 @@ use crate::pals_adaptive::{
     AdaptiveManagerSources, AdaptiveNnuecRetiredOwner, AdaptivePortDriver,
     AdaptiveRegisteredLedgerSources, AdaptiveSessionCollectionHooks, AdaptiveShutdownReceipt,
     ManagerPhase, RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2,
+    RoventNoCaptureRootCapabilityV2,
     RoventNativeCollectionOrigin, RoventNativeCollectionOriginV2,
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
@@ -108,11 +110,70 @@ pub struct RoventNnuecCollectionHandoffV2 {
     settlement: Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
     native_fence: AdaptiveShutdownReceipt,
     collection_failures: Box<[crate::pals_adaptive::AdaptiveCollectionError]>,
+    escrow_key: handoff_escrow_v2::HandoffEscrowKeyV2,
     teacher_physical_ack: Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
     teacher_aggregate_ack: Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
 }
 
+/// A non-clone lease. The registry retains the original on Drop.
+pub struct RoventNnuecTransferredHandoffV2 {
+    lease: handoff_escrow_v2::HandoffEscrowLeaseV2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventNnuecHandoffTransferErrorV2 {
+    Busy, Poisoned, DifferentHandoff, AlreadyTransferred, SessionUnavailable,
+}
+
+impl RoventNnuecTransferredHandoffV2 {
+    pub fn original(&self) -> &Arc<Mutex<RoventNnuecCollectionHandoffV2>> {
+        self.lease.original()
+    }
+
+    /// There is no longer a per-session slot. The root-specific registry
+    /// retains this exact owner until Arena explicitly completes custody.
+    /// This does not assert physical completion or publication.
+    pub fn try_release_session_slot(&mut self) -> Result<(), RoventNnuecHandoffTransferErrorV2> {
+        Ok(())
+    }
+
+    /// Release only registry custody after an outer owner already retains the
+    /// same original. This does not attest worker join, physical completion,
+    /// or publication; the concrete Arena owner must verify those separately.
+    pub fn try_release_escrow(
+        self,
+        admission: &RoventCollectionRootAdmissionV2,
+        outer_original: &Arc<Mutex<RoventNnuecCollectionHandoffV2>>,
+    ) -> Result<(), (handoff_escrow_v2::HandoffEscrowErrorV2, Self)> {
+        let Self { lease } = self;
+        match lease.try_release_custody(admission, outer_original) {
+            Ok(()) => Ok(()),
+            Err((error, lease)) => Err((error, Self { lease })),
+        }
+    }
+}
+
 impl RoventNnuecCollectionHandoffV2 {
+    /// Lease the same original handoff. This transfers custody only; the
+    /// Arena owner must independently verify worker, physical and publication
+    /// outcomes. A dropped lease remains recoverable in the bounded registry.
+    pub fn try_transfer_session_custody(
+        original: &Arc<Mutex<Self>>,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<RoventNnuecTransferredHandoffV2, RoventNnuecHandoffTransferErrorV2> {
+        let key = original.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => RoventNnuecHandoffTransferErrorV2::Busy,
+            TryLockError::Poisoned(_) => RoventNnuecHandoffTransferErrorV2::Poisoned,
+        })?.escrow_key.clone();
+        let lease = key.try_lease(admission, original).map_err(|error| match error {
+            handoff_escrow_v2::HandoffEscrowErrorV2::Busy => RoventNnuecHandoffTransferErrorV2::Busy,
+            handoff_escrow_v2::HandoffEscrowErrorV2::Poisoned => RoventNnuecHandoffTransferErrorV2::Poisoned,
+            handoff_escrow_v2::HandoffEscrowErrorV2::AlreadyLeased => RoventNnuecHandoffTransferErrorV2::AlreadyTransferred,
+            handoff_escrow_v2::HandoffEscrowErrorV2::DifferentAdmission | handoff_escrow_v2::HandoffEscrowErrorV2::DifferentHandoff => RoventNnuecHandoffTransferErrorV2::DifferentHandoff,
+            _ => RoventNnuecHandoffTransferErrorV2::SessionUnavailable,
+        })?;
+        Ok(RoventNnuecTransferredHandoffV2 { lease })
+    }
     /// Collection diagnostics do not imply a failure of the native search.
     pub fn collection_failures(&self) -> &[crate::pals_adaptive::AdaptiveCollectionError] {
         &self.collection_failures
@@ -209,13 +270,49 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
         &self,
         port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
-    ) -> Result<(), RoventNnuecCollectionAdmissionFailureV2>;
+    ) -> Result<RoventNnuecCollectionAdmissionOutcomeV2, RoventNnuecCollectionAdmissionFailureV2>;
+    /// A root whose escrow was unavailable must register the original
+    /// no-capture marker before its native requests can proceed.
+    fn defer_no_capture(
+        &self,
+        _port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
+        admission: RoventCollectionRootAdmissionV2,
+        reason: crate::pals_adaptive::AdaptiveCollectionError,
+    ) -> Result<RoventNnuecCollectionAdmissionOutcomeV2, RoventNnuecCollectionAdmissionFailureV2> {
+        Err(RoventNnuecCollectionAdmissionFailureV2 {
+            error: AdaptiveManagerError::Collection(reason),
+            admission,
+            owners: Box::new(()),
+        })
+    }
+    /// Remove only the marker belonging to this no-capture root after the
+    /// caller observed the actual same-root native fence.
+    fn finish_deferred(
+        &self,
+        _capability: &RoventNoCaptureRootCapabilityV2,
+        _fence: &AdaptiveShutdownReceipt,
+    ) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("no-capture root cleanup unsupported"))
+    }
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
     /// A bounded nonblocking handoff; delivery is not teacher retirement.
     fn handoff_sender(
         &self,
     ) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>;
+}
+
+/// Deferred is valid only before this root starts an observer or teacher and
+/// after its exact capability has been registered with the native observer.
+pub enum RoventNnuecCollectionAdmissionOutcomeV2 {
+    Installed,
+    /// The original admission has not started a collector, teacher or
+    /// marker. Retain and retry it only within its original deadline.
+    Pending { admission: RoventCollectionRootAdmissionV2 },
+    DeferredNoCapture {
+        capability: RoventNoCaptureRootCapabilityV2,
+        reason: crate::pals_adaptive::AdaptiveCollectionError,
+    },
 }
 
 /// Failure custody returned by the /2 hook. This must contain the original
@@ -242,6 +339,12 @@ pub struct RoventNnuecCollectionObserverRejectionV2 {
 }
 
 impl RoventNnuecCollectionAdmissionPortV2<'_> {
+    pub fn no_capture_capability(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<RoventNoCaptureRootCapabilityV2, AdaptiveManagerError> {
+        self.manager.no_capture_root_v2(admission)
+    }
     pub fn install(
         &mut self,
         admission: RoventCollectionRootAdmissionV2,
@@ -363,6 +466,12 @@ pub struct RoventNnuecRootReceiptV2 {
     pub root_admission: Arc<RoventRootAdmissionV2>,
     pub frontier: Option<FrontierSnapshot>,
     pub physical: Option<AdaptiveShutdownReceipt>,
+    /// No collector was started for this actual root. This is an incomplete
+    /// collection observation, not a search or native completion failure.
+    pub collection_deferred: Option<crate::pals_adaptive::AdaptiveCollectionError>,
+    /// Original preflight failure when deferred admission subsequently had to
+    /// wait or stop. Its exact cause is separate from the terminal reason.
+    pub collection_deferred_cause: Option<crate::pals_adaptive::AdaptiveCollectionError>,
     pub initial_retirement: Option<Arc<RoventNnuecInitialRetirementReceipt>>,
     pub counters: AdaptiveManagerCounters,
     pub stopped_before_research_execution: bool,
@@ -809,9 +918,6 @@ pub struct RoventNnuecSessionDriver {
     collection_hooks: RoventNnuecCollectionHooks,
     collection_origin_v2: Option<RoventNativeCollectionOriginV2>,
     collection_hooks_v2: Option<Arc<dyn RoventNnuecCollectionHooksV2>>,
-    /// The channel can lose its receiver after a successful send. Preserve
-    /// the same original handoff until outer custody is actually proven.
-    v2_handoff_custody: Mutex<Option<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>>,
     v2_revoke_panic: Mutex<Option<Box<dyn Any + Send>>>,
     selective_policy: Digest,
     frontier_limits: FrontierLimits,
@@ -1118,7 +1224,6 @@ impl RoventNnuecSessionDriver {
             collection_hooks: collection_hooks.unwrap_or_default(),
             collection_origin_v2: None,
             collection_hooks_v2: None,
-            v2_handoff_custody: Mutex::new(None),
             v2_revoke_panic: Mutex::new(None),
             selective_policy,
             frontier_limits,
@@ -1438,7 +1543,6 @@ impl RoventNnuecSessionDriver {
             collection_hooks: RoventNnuecCollectionHooks::default(),
             collection_origin_v2,
             collection_hooks_v2,
-            v2_handoff_custody: Mutex::new(None),
             v2_revoke_panic: Mutex::new(None),
             selective_policy,
             frontier_limits,
@@ -1649,6 +1753,8 @@ impl RoventNnuecSessionDriver {
         frontier: &FrontierSnapshot,
         physical: &AdaptiveShutdownReceipt,
         counters: AdaptiveManagerCounters,
+        collection_deferred: Option<crate::pals_adaptive::AdaptiveCollectionError>,
+        collection_deferred_cause: Option<crate::pals_adaptive::AdaptiveCollectionError>,
     ) -> NnuecRootReceipt {
         match admission {
             NnuecRootAdmission::V1(root) => {
@@ -1674,6 +1780,8 @@ impl RoventNnuecSessionDriver {
                     root_admission: Arc::clone(root),
                     frontier: Some(frontier.clone()),
                     physical: Some(physical.clone()),
+                    collection_deferred,
+                    collection_deferred_cause,
                     initial_retirement: None,
                     counters,
                     stopped_before_research_execution: false,
@@ -2433,16 +2541,6 @@ impl SearchSessionDriver for RoventNnuecSessionDriver {
 }
 impl Drop for RoventNnuecSessionDriver {
     fn drop(&mut self) {
-        // Outer delivery alone does not prove that the receiver retained the
-        // original observer/data. Unclaimed evidence is quarantined on drop.
-        if let Some(handoff) = self
-            .v2_handoff_custody
-            .get_mut()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-        {
-            std::mem::forget(handoff);
-        }
         let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
         if !matches!(state, State::Closed) {
             std::mem::forget(std::mem::replace(state, State::Moving));
@@ -2669,6 +2767,8 @@ fn preparing_retirement_receipt_any(
                 root_admission: root,
                 frontier: retired.frontier.take().map(|r| r.snapshot),
                 physical: None,
+                collection_deferred: None,
+                collection_deferred_cause: None,
                 initial_retirement,
                 counters: AdaptiveManagerCounters::default(),
                 stopped_before_research_execution: true,

@@ -312,20 +312,31 @@ fn run_child(config: Config) {
             Ok(())
         },
     )
-    .expect("run original V2 collection launch");
+    .unwrap_or_else(|error| panic!("V2_LAUNCH_ERROR: {error}"));
+    // Capture the original launch/resource outcome before waiting for the
+    // contention worker. A startup failure may mean no ticket will ever be
+    // staged; waiting first would replace the real error with a timeout.
+    let observation = run.observation();
+    eprintln!("ROVENT_V2_RUN_OBSERVATION {observation}");
+    assert!(
+        observation
+            .get("native_error")
+            .is_some_and(serde_json::Value::is_null),
+        "V2 launch reported a native failure; see the original observation report"
+    );
+    assert!(
+        observation
+            .get("resource_error")
+            .is_some_and(serde_json::Value::is_null),
+        "V2 launch reported a resource failure; see the original observation report"
+    );
     let result = observed_rx
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .expect("contention observer finished");
     result.expect("actual contention and completion checks");
     // Output is an observation only; retain the original run owner until after
     // the checks and do not treat this as publication or whole-plan success.
-    let observation = run.observation();
-    assert!(
-        observation
-            .get("native_error")
-            .is_some_and(serde_json::Value::is_null),
-        "V2 launch reported a native failure"
-    );
+    drop(run);
 }
 
 fn exercise_real_contention(

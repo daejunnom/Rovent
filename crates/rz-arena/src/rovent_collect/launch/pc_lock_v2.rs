@@ -2,7 +2,7 @@
 //! published corpus or a claim of native/teacher physical completion.
 use super::*;
 use crate::rovent_collect::pc_hooks_lock_v2::{
-    RoventPcCollectionBridgeV2, RoventPcCollectionWorkerExitV2, RoventPcCollectionWorkerV2,
+    RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2, PcWorkerExitKindV2,
 };
 use crate::rovent_collect::teacher::v2_session::RoventTeacherRosterEntryV2;
 use rz_experiments::RoventInputLockV2;
@@ -11,7 +11,6 @@ use rz_uci::rovent_bootstrap::launch::{
     RoventPcCollectionLaunchFailureV2, run_pc_collection_v2_with_resource_admission,
 };
 use std::sync::atomic::Ordering;
-use std::thread::JoinHandle;
 
 /// Keeps the original resource, native failure and teacher worker together.
 /// Neither the live readback nor the thread exit establishes publication.
@@ -21,8 +20,7 @@ pub struct RoventPcCollectionRunV2 {
     owner: RoventCollectionOwnerLockV2,
     bridge: Arc<RoventPcCollectionBridgeV2>,
     worker: Arc<Mutex<RoventPcCollectionWorkerV2>>,
-    worker_thread: Option<JoinHandle<RoventPcCollectionWorkerExitV2>>,
-    worker_exit: Option<RoventPcCollectionWorkerExitV2>,
+    worker_exit: Option<PcWorkerExitKindV2>,
     worker_thread_panicked: bool,
     native_failure: Option<RoventPcCollectionLaunchFailureV2>,
     native_failure_taken: bool,
@@ -33,22 +31,13 @@ impl RoventPcCollectionRunV2 {
     /// Collect only a thread that has already exited; never wait indefinitely
     /// or infer that a still-running worker has physically stopped.
     pub fn poll_worker(&mut self) -> bool {
-        if self
-            .worker_thread
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-        {
-            let handle = self.worker_thread.take().expect("finished worker retained");
-            match handle.join() {
-                Ok(exit) => self.worker_exit = Some(exit),
-                Err(payload) => {
-                    // The worker normally catches its own panic and returns
-                    // its owner; an outer panic cannot prove physical exit.
-                    std::mem::forget(payload);
-                    self.worker_thread_panicked = true;
-                    self.resource_error.get_or_insert_with(|| "teacher worker outer panic; original worker retained, physical completion unknown".into());
-                }
+        match self.bridge.poll_worker() {
+            Ok(Some(kind)) => {
+                self.worker_exit = Some(kind);
+                if kind == PcWorkerExitKindV2::OuterPanic { self.worker_thread_panicked = true; }
             }
+            Ok(None) => {}
+            Err(error) => { self.resource_error.get_or_insert_with(|| format!("teacher worker custody: {error:?}")); }
         }
         self.worker_exit.is_some() || self.worker_thread_panicked
     }
@@ -60,23 +49,7 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => ("busy", None),
             Err(_) => ("poisoned", None),
         };
-        let worker_exit = match self.worker_exit.as_ref() {
-            Some(RoventPcCollectionWorkerExitV2::NoAdmission) => "no_admission",
-            Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved) => {
-                "retirement_and_handoff_observed"
-            }
-            Some(RoventPcCollectionWorkerExitV2::Deadline) => "deadline",
-            Some(RoventPcCollectionWorkerExitV2::AdmissionCanceled) => "admission_canceled",
-            Some(RoventPcCollectionWorkerExitV2::PhysicalAckDelivered) => {
-                "physical_scope_ack_delivered"
-            }
-            Some(RoventPcCollectionWorkerExitV2::AggregateHandoffObserved) => {
-                "physical_aggregate_handoff_observed"
-            }
-            Some(RoventPcCollectionWorkerExitV2::Panicked(_)) => "caught_panic",
-            None if self.worker_thread_panicked => "outer_panic",
-            None => "pending",
-        };
+        let worker_exit = self.worker_exit.map(PcWorkerExitKindV2::label).unwrap_or("pending");
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
             json!({"primary_failure":failures.primary.map(|failure|failure.kind()),
@@ -90,13 +63,14 @@ impl RoventPcCollectionRunV2 {
             "resource_error":self.resource_error,"resource":resource,
             "teacher_worker_returned":self.worker_exit.is_some(),
             "teacher_worker_exit":worker_exit,
-            "teacher_worker_running_or_unknown":self.worker_thread.is_some() || self.worker_thread_panicked
-                || !matches!(self.worker_exit.as_ref(), Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved)),
+            "teacher_worker_running_or_unknown":self.worker_thread_panicked
+                || self.worker_exit != Some(PcWorkerExitKindV2::Retirement),
             "teacher_worker_thread_panicked":self.worker_thread_panicked,
             "teacher_worker_observation":worker_observation,
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
+                "pending_disabled_markers":status.pending_disabled_markers,
                 "collection_incomplete_due_to_backpressure":status.collection_disabled_first_ticket.is_some() || !status.prior_disabled_first_tickets.is_empty(),
                 "first_omitted_ticket":status.collection_disabled_first_ticket.as_ref().map(ticket_json),
                 "disable_reason":status.collection_disabled_reason.map(|reason|format!("{reason:?}")),
@@ -120,6 +94,13 @@ impl RoventPcCollectionRunV2 {
         failure
     }
 
+    /// Transfer the original outer worker panic only to a caller retaining
+    /// its potentially resource-owning payload. This never clears the unknown
+    /// physical state or turns the run into a successful completion.
+    pub fn take_worker_panic_payload(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        self.bridge.take_outer_panic()
+    }
+
     /// Transfer actual teacher diagnostic bytes only after the worker thread
     /// has exited. A busy or poisoned owner stays retained as unknown.
     pub fn take_teacher_diagnostics(
@@ -129,7 +110,7 @@ impl RoventPcCollectionRunV2 {
         ArenaError,
     > {
         check(
-            self.worker_thread.is_none() && !self.worker_thread_panicked,
+            self.worker_exit.is_some() && !self.worker_thread_panicked,
             "Collection /2 teacher worker has not exited cleanly",
         )?;
         self.worker
@@ -157,10 +138,7 @@ impl RoventPcCollectionRunV2 {
     /// authorizes inspection/partial assembly, not final publication.
     pub fn closed_owner(&self) -> Result<RoventCollectionOwnerLockV2, ArenaError> {
         check(
-            matches!(
-                self.worker_exit.as_ref(),
-                Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved)
-            ) && self
+            self.worker_exit == Some(PcWorkerExitKindV2::Retirement) && self
                 .worker
                 .try_lock()
                 .is_ok_and(|worker| !worker.has_failure()),
@@ -174,6 +152,7 @@ impl RoventPcCollectionRunV2 {
             status.admitted
                 && status.settled
                 && status.pending_count == 0
+                && status.pending_disabled_markers == Some(0)
                 && status.incomplete_capture_count == 0
                 && status.retained_failed_captures == 0
                 && status.retained_failed_staged == 0
@@ -196,6 +175,7 @@ impl Drop for RoventPcCollectionRunV2 {
                 status.admitted
                     && status.settled
                     && status.pending_count == 0
+                    && status.pending_disabled_markers == Some(0)
                     && status.collection_disabled_first_ticket.is_none()
                     && status.prior_disabled_first_tickets.is_empty()
                     && status.pending_retired_count == 0
@@ -213,10 +193,7 @@ impl Drop for RoventPcCollectionRunV2 {
                 .worker
                 .try_lock()
                 .is_ok_and(|worker| !worker.has_failure())
-            && matches!(
-                self.worker_exit.as_ref(),
-                Some(RoventPcCollectionWorkerExitV2::RetirementAndHandoffObserved)
-            );
+            && self.worker_exit == Some(PcWorkerExitKindV2::Retirement);
         if !physically_resolved {
             // A dropped observation must not release a still-running or
             // unverified owner. Keep the exact objects for process lifetime;
@@ -226,12 +203,6 @@ impl Drop for RoventPcCollectionRunV2 {
             std::mem::forget(self.owner.clone());
             std::mem::forget(Arc::clone(&self.bridge));
             std::mem::forget(Arc::clone(&self.worker));
-            if let Some(handle) = self.worker_thread.take() {
-                std::mem::forget(handle);
-            }
-            if let Some(exit) = self.worker_exit.take() {
-                std::mem::forget(exit);
-            }
         }
     }
 }
@@ -321,15 +292,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let admission_resource = Arc::clone(&resource);
     let admission_lock = Arc::clone(&original_lock);
     let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let thread_worker = Arc::clone(&worker);
-    let worker_thread = std::thread::Builder::new()
-        .name("rovent-pc-collection-v2".into())
-        .spawn(move || match thread_worker.lock() {
-            Ok(mut owner) => owner.run_until(worker_stop, worker_deadline),
-            Err(_) => panic!("teacher worker owner mutex poisoned before run"),
-        })
-        .map_err(io)?;
+    bridge.start_worker(&worker, Arc::clone(&stop), worker_deadline)?;
     let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> =
         bridge.clone();
     let native = run_pc_collection_v2_with_resource_admission(
@@ -367,7 +330,6 @@ fn run_rovent_pc_collection_lock_v2_inner(
         owner,
         bridge,
         worker,
-        worker_thread: Some(worker_thread),
         worker_exit: None,
         worker_thread_panicked: false,
         native_failure: native.err(),

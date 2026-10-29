@@ -169,6 +169,89 @@ pub enum RoventDispatchWitnessFailureV2 {
     Ticket(RoventTicketValidationErrorV2),
 }
 
+/// Exact live root and native owner selected by the manager for a whole-root
+/// optional collection bypass. The marker is not a native completion proof.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone)]
+pub struct RoventNoCaptureRootCapabilityV2 {
+    admission: RoventCollectionRootAdmissionV2,
+    verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub(super) enum RoventNoCaptureIssueErrorV2 {
+    Busy(rz_contracts::ContractError),
+    Rejected(AdaptiveCollectionError),
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventNoCaptureRootCapabilityV2 {
+    pub(super) fn new(
+        admission: RoventCollectionRootAdmissionV2,
+        verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+    ) -> Result<Self, RoventNoCaptureIssueErrorV2> {
+        admission.validate_native_identity(&verifier)
+            .map_err(RoventNoCaptureIssueErrorV2::Rejected)?;
+        if !admission.root_admission().original_context().try_accepts()
+            .map_err(|error| {
+                if error.code == rz_contracts::ErrorCode::ResourceExhausted {
+                    RoventNoCaptureIssueErrorV2::Busy(error)
+                } else {
+                    RoventNoCaptureIssueErrorV2::Rejected(AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::Dispatch, "NoCaptureRootUnavailable", error.to_string()))
+                }
+            })?
+        {
+            return Err(RoventNoCaptureIssueErrorV2::Rejected(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Dispatch, "NoCaptureRootRevoked", "original root is not live")));
+        }
+        Ok(Self { admission, verifier })
+    }
+
+    pub fn same_original_admission(&self, other: &RoventCollectionRootAdmissionV2) -> bool {
+        self.admission.same_original_admission(other)
+    }
+
+    /// Root identity is checked independently of the worker identity so a
+    /// duplicate root cannot be hidden by presenting a different worker.
+    pub fn same_original_root(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.admission.root_admission(), other.admission.root_admission())
+    }
+
+    pub fn same_root_admission(&self, other: &RoventCollectionRootAdmissionV2) -> bool {
+        Arc::ptr_eq(self.admission.root_admission(), other.root_admission())
+    }
+
+    /// Authority uniquely identifies the manager's active process/game/root
+    /// scope even when a start materializes a second admission object.
+    pub fn authority(&self) -> SearchAuthority {
+        self.admission.root_admission().authority()
+    }
+
+    pub fn same_original_capability(&self, other: &Self) -> bool {
+        self.admission.same_original_admission(&other.admission)
+            && self.verifier.same_owner(&other.verifier)
+    }
+
+    pub fn validate_native_discard_owner<V, Q, P>(
+        &self,
+        context: &crate::pals_native::ticketed::TicketOwnerDispatchContext<'_, V, Q, P>,
+    ) -> Result<(), AdaptiveCollectionError> {
+        if !context.same_owner(&self.verifier) {
+            return Err(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Dispatch, "NoCaptureWorkerMismatch", "different native owner"));
+        }
+        self.admission.validate_native_discard_owner(context)
+    }
+
+    /// Called on the actual root-run receipt; this does not attest teacher
+    /// retirement or any other root's physical completion.
+    pub fn matches_shutdown_receipt(&self, receipt: &super::AdaptiveShutdownReceipt) -> bool {
+        receipt.authority == self.admission.root_admission().authority()
+            && receipt.permits_root_reuse()
+    }
+}
+
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl<'a> RoventCollectionDispatchWitnessV2<'a> {
     pub(super) fn try_new(

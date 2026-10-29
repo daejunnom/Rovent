@@ -5,21 +5,21 @@
 //! a process permit or matching digest alone does not authorize a teacher go,
 //! completion, label, or publication.
 
-use super::super::{RoventRetiredLockV2Record, RoventSubmittedInputSeal, exact_rules_anchor};
-use super::v2_actor_preflight::{TeacherActorSourcePreflightV2, preflight_teacher_actor_source_v2};
-use super::{ArenaError, check, invalid};
-use rz_contracts::Digest;
+use super::super::{exact_rules_anchor, RoventRetiredLockV2Record, RoventSubmittedInputSeal};
+use super::v2_actor_preflight::{preflight_teacher_actor_source_v2, TeacherActorSourcePreflightV2};
+use super::{check, invalid, ArenaError};
 use rz_contracts::pals::Role;
+use rz_contracts::Digest;
 use rz_experiments::pals_data_v3::GenerationRoleV3;
 use rz_experiments::rovent_corpus::MAX_CORPUS_ROWS;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
-use rz_search::external_cpu::ExternalGoConstraint;
 use rz_search::external_cpu::collection_teacher::{
     TeacherCompletion, TeacherDispatch, TeacherInputScope, TeacherJob, TeacherJobId,
     TeacherWorkerRegistration,
 };
 use rz_search::external_cpu::process_scope::{CollectionProcessPermit, CollectionProcessScope};
+use rz_search::external_cpu::ExternalGoConstraint;
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionError, RoventCollectionRootAdmissionV2, RoventTeacherScopeCapabilityV2,
     RoventTeacherScopeClaimFailureV2, RoventTeacherScopePhysicalAckV2,
@@ -27,14 +27,14 @@ use rz_uci::pals_adaptive::{
 };
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
+    bind_collection_teacher_actor_v2, spawn_bound_collection_teacher_v2,
     BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
     RoventCollectionTeacherLifecycleV2, RoventCollectionTeacherOwnerV2,
     RoventTeacherPolicyCustodyV2, RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealErrorV2,
     RoventTeacherPolicySealFailureKindV2, RoventTeacherRetirementObservationV2,
     RoventTeacherRetirementTokenV2, RoventTeacherScopeAggregateAckV2,
     RoventTeacherWorkerTerminalTokenV2, TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2,
-    TeacherRecoveryKeyV2, VerifiedRoventExternalStartup, bind_collection_teacher_actor_v2,
-    spawn_bound_collection_teacher_v2,
+    TeacherRecoveryKeyV2, VerifiedRoventExternalStartup,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -244,6 +244,8 @@ impl From<rz_experiments::ManifestError> for TeacherSessionPrepareFailureV2 {
 /// do not prove a loaded worker or actual execution.
 #[allow(dead_code)]
 pub(crate) struct RoventCollectionTeacherSessionV2 {
+    pump_owner: Arc<()>,
+    pump_claimed: bool,
     admission: RoventCollectionRootAdmissionV2,
     startup_control: RoventStartupControl,
     lock_manifest: Arc<RoventCorpusManifestLockV2>,
@@ -257,8 +259,36 @@ pub(crate) struct RoventCollectionTeacherSessionV2 {
     issued_inputs: BTreeSet<(u32, rz_contracts::RequestId)>,
 }
 
+/// Non-cloneable authority for one session's collection data plane.
+pub(crate) struct TeacherPumpPermitV2 {
+    owner: Arc<()>,
+}
+
 #[allow(dead_code)]
 impl RoventCollectionTeacherSessionV2 {
+    /// One pump per original session. Dropping the token is not retirement.
+    pub(crate) fn claim_pump_owner(&mut self) -> Result<TeacherPumpPermitV2, ArenaError> {
+        check(
+            !self.pump_claimed,
+            "V2 teacher session pump already claimed",
+        )?;
+        self.pump_claimed = true;
+        Ok(TeacherPumpPermitV2 {
+            owner: Arc::clone(&self.pump_owner),
+        })
+    }
+    pub(crate) fn validate_pump_owner(
+        &self,
+        permit: &TeacherPumpPermitV2,
+    ) -> Result<(), ArenaError> {
+        check(
+            self.pump_claimed && Arc::ptr_eq(&self.pump_owner, &permit.owner),
+            "V2 teacher pump permit belongs to another session",
+        )
+    }
+    pub(crate) fn original_admission(&self) -> &RoventCollectionRootAdmissionV2 {
+        &self.admission
+    }
     /// Seal retirement only for this exact roster, after scope closure. No
     /// token is fabricated for an unstarted, failed-before-spawn, or unknown
     /// actor. An actor's actual worker registration must match the roster.
@@ -387,6 +417,8 @@ impl RoventCollectionTeacherSessionV2 {
             }
         })?;
         Ok(Self {
+            pump_owner: Arc::new(()),
+            pump_claimed: false,
             admission: admission.clone(),
             startup_control: startup_control.clone(),
             lock_manifest: Arc::clone(lock_manifest),
@@ -510,15 +542,20 @@ impl RoventCollectionTeacherSessionV2 {
 
     /// Access the same started worker; a dispatch or completion still needs
     /// the lifecycle's live-root validation and separate target provenance.
-    pub(crate) fn worker_mut(
-        &mut self,
-        actor_id: &str,
-    ) -> Option<&mut RoventCollectionTeacherLifecycleV2> {
+    fn worker_mut(&mut self, actor_id: &str) -> Option<&mut RoventCollectionTeacherLifecycleV2> {
         self.actors
             .get_mut(actor_id)?
             .running
             .as_mut()
             .map(|run| &mut run.lifecycle)
+    }
+
+    /// Retrieve diagnostics only; this does not expose the data-plane owner.
+    pub(crate) fn take_actor_diagnostics_after_join(
+        &mut self,
+        actor_id: &str,
+    ) -> Option<rz_search::external_cpu::collection_teacher::TeacherDiagnostics> {
+        self.worker_mut(actor_id)?.take_diagnostics_after_join()
     }
 
     pub(crate) fn try_physical_retirement(
@@ -637,10 +674,12 @@ impl RoventCollectionTeacherSessionV2 {
     /// lock. The borrowed row remains with the caller on every error.
     pub(crate) fn submit_retired(
         &mut self,
+        permit: &TeacherPumpPermitV2,
         row: &RoventRetiredLockV2Record,
         constraint: ExternalGoConstraint,
         soft_quantum: Duration,
     ) -> Result<TeacherSubmitOutcomeV2, ArenaError> {
+        self.validate_pump_owner(permit)?;
         if self.admission_closing {
             return Err(invalid("V2 teacher session admission is closed"));
         }
@@ -783,8 +822,10 @@ impl RoventCollectionTeacherSessionV2 {
     /// before considering any future target.
     pub(crate) fn take_completed_actor(
         &mut self,
+        permit: &TeacherPumpPermitV2,
         actor_id: &str,
     ) -> Result<Option<CompletedTeacherV2>, ArenaError> {
+        self.validate_pump_owner(permit)?;
         let actor = self
             .actors
             .get_mut(actor_id)
@@ -816,9 +857,16 @@ impl RoventCollectionTeacherSessionV2 {
     /// A rejection returns every original input and worker result unchanged.
     pub(crate) fn seal_completed_policy(
         &mut self,
+        permit: &TeacherPumpPermitV2,
         row: &RoventRetiredLockV2Record,
         completed: CompletedTeacherV2,
     ) -> Result<SealedTeacherPolicyV2, Box<TeacherPolicySealRejectionV2>> {
+        if let Err(error) = self.validate_pump_owner(permit) {
+            return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                cause: TeacherPolicySealFailureV2::Validation(error),
+                completed,
+            }));
+        }
         let validation =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, ArenaError> {
                 let original = row.submitted_input_seal();

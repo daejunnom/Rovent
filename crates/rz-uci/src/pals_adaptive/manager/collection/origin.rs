@@ -332,6 +332,13 @@ pub struct RoventTicketValidationErrorV2 {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventCollectionRootAdmissionV2 {
+    /// The original native root's clock domain, already checked against the
+    /// attached source clock at admission. This is identity only and does not
+    /// itself authorize or advance a request.
+    pub fn clock_domain(&self) -> rz_contracts::ClockDomain {
+        self.root_admission.runtime_clock().domain()
+    }
+
     /// Consume the original one-shot claim without creating a teacher scope.
     /// No compliant teacher scope was issued for this Start; this says nothing
     /// about teacher success or any unrelated OS process.

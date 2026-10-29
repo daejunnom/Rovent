@@ -2943,6 +2943,33 @@ where
         self.collection_admission_v2.as_ref()
     }
 
+    /// Issue the original no-capture scope only before any root role/observer
+    /// starts. The caller must still register it with the actual native input
+    /// observer and retain the cause; this does not prove physical completion.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn no_capture_root_v2(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<collection::RoventNoCaptureRootCapabilityV2, AdaptiveManagerError> {
+        if self.root_started || !self.roles.is_empty() || self.phase != ManagerPhase::Running
+            || self.collection_observer_v2.is_some() || self.collection_admission_v2.is_some()
+            || self.collection_observer.is_some() || self.collection_admission.is_some()
+            || admission.root_admission().authority() != self.registration.authority
+            || admission.root_admission().hard_deadline() != self.deadline
+            || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+        {
+            return Err(AdaptiveManagerError::Invalid("no-capture root scope or admission order"));
+        }
+        let verifier = self.native.native_acceptance_verifier().ok_or(
+            AdaptiveManagerError::Invalid("no-capture native verifier unavailable"),
+        )?;
+        collection::RoventNoCaptureRootCapabilityV2::new(admission.clone(), verifier)
+            .map_err(|error| match error {
+                collection::RoventNoCaptureIssueErrorV2::Busy(_original) => AdaptiveManagerError::AuxiliaryPending,
+                collection::RoventNoCaptureIssueErrorV2::Rejected(error) => error.into(),
+            })
+    }
+
     /// Install an observation-only V2 owner at the actual attached root.
     /// On error return the original admission and observer to the caller.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
