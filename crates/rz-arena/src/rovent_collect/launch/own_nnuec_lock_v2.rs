@@ -10,6 +10,10 @@ use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::rovent_bootstrap::launch::{
     RoventOwnNnuecCollectionLaunchFailureV2, run_own_nnuec_collection_v2_with_resource_admission,
 };
+use rz_uci::rovent_bootstrap::nnuec_session::{
+    RoventNnuecCollectionHandoffV2, RoventNnuecHandoffTransferErrorV2,
+    RoventNnuecTransferredHandoffV2,
+};
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 
@@ -24,12 +28,47 @@ pub struct RoventNnuecCollectionRunV2 {
     worker_thread: Option<JoinHandle<RoventNnuecCollectionWorkerExitV2>>,
     worker_exit: Option<RoventNnuecCollectionWorkerExitV2>,
     worker_thread_panicked: bool,
+    transferred_handoff: Option<RoventNnuecTransferredHandoffV2>,
+    handoff_transfer_error: Option<RoventNnuecHandoffTransferErrorV2>,
     native_failure: Option<RoventOwnNnuecCollectionLaunchFailureV2>,
     native_failure_taken: bool,
     resource_error: Option<String>,
 }
 
 impl RoventNnuecCollectionRunV2 {
+    /// Recover the session's original handoff only after joining this run's
+    /// original bridge worker. This is custody, not publication or a teacher
+    /// semantic-success receipt. The same run keeps the worker and rows.
+    pub fn try_transfer_joined_handoff(
+        &mut self,
+    ) -> Result<bool, RoventNnuecHandoffTransferErrorV2> {
+        if self.transferred_handoff.is_some() {
+            return Ok(true);
+        }
+        if self.worker_thread.is_some() || self.worker_exit.is_none() || self.worker_thread_panicked {
+            return Ok(false);
+        }
+        let handoff = {
+            let worker = self.worker.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => RoventNnuecHandoffTransferErrorV2::Busy,
+                std::sync::TryLockError::Poisoned(_) => RoventNnuecHandoffTransferErrorV2::Poisoned,
+            })?;
+            let Some(handoff) = worker.original_handoff() else { return Ok(false); };
+            handoff
+        };
+        let admission = {
+            let mut original = handoff.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => RoventNnuecHandoffTransferErrorV2::Busy,
+                std::sync::TryLockError::Poisoned(_) => RoventNnuecHandoffTransferErrorV2::Poisoned,
+            })?;
+            original.parts_mut().0.clone()
+        };
+        let custody = RoventNnuecCollectionHandoffV2::try_transfer_session_custody(&handoff, &admission)?;
+        self.transferred_handoff = Some(custody);
+        self.handoff_transfer_error = None;
+        Ok(true)
+    }
+
     /// Collect only a thread that has already exited; never wait indefinitely
     /// or infer that a still-running worker has physically stopped.
     pub fn poll_worker(&mut self) -> bool {
@@ -50,10 +89,20 @@ impl RoventNnuecCollectionRunV2 {
                 }
             }
         }
+        if self.worker_exit.is_some() && self.transferred_handoff.is_none() {
+            if let Err(error) = self.try_transfer_joined_handoff() {
+                self.handoff_transfer_error = Some(error);
+            }
+        }
         self.worker_exit.is_some() || self.worker_thread_panicked
     }
 
     pub fn observation(&self) -> serde_json::Value {
+        let (deferred_observation, deferred_roots) = match self.bridge.try_deferred_observations() {
+            Ok(Some(roots)) => ("available", Some(roots)),
+            Ok(None) => ("busy", None),
+            Err(_) => ("poisoned", None),
+        };
         let (resource_observation, resource) = match self.resource.try_lock() {
             Ok(state) => ("available", Some(state.observation())),
             Err(std::sync::TryLockError::WouldBlock) => ("busy", None),
@@ -83,6 +132,7 @@ impl RoventNnuecCollectionRunV2 {
         };
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
+            let (pump_unlabeled, pump_prepared, pump_failed) = worker.pump_ready_counts();
             let handoff = match worker.try_handoff_observation(|handoff| {
                 handoff.collection_failures().iter().map(|error| format!("{error:?}")).collect::<Vec<_>>()
             }) {
@@ -92,7 +142,9 @@ impl RoventNnuecCollectionRunV2 {
             json!({"primary_failure":failures.primary.map(|failure|failure.kind()),
                 "additional_failures":failures.additional.iter().map(|failure|failure.kind()).collect::<Vec<_>>(),
                 "omitted_failures":failures.omitted,
-                "diagnostic_actors":worker.diagnostics().len(),"handoff_collection":handoff})
+                "diagnostic_actors":worker.diagnostics().len(),"handoff_collection":handoff,
+                "pump_unpublished_rows":worker.pending_pump_rows(),
+                "pump_ready_unlabeled":pump_unlabeled,"pump_ready_prepared":pump_prepared,"pump_ready_failed":pump_failed})
         });
         json!({"schema":"rz-rovent-own-nnuec-lock-v2-run-observation/1",
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
@@ -115,9 +167,20 @@ impl RoventNnuecCollectionRunV2 {
                 "incomplete_capture":status.incomplete_capture_count,
                 "failed_captures":status.retained_failed_captures,
                 "failed_staged_inputs":status.retained_failed_staged,
+                "pending_disabled_markers":status.pending_disabled_markers,
                 "failure":status.failure.map(|error|format!("{error:?}")),
                 "callback_lock_failure":status.callback_lock_failure})),
-            "uci_handoff_slot_release":"unknown",
+            "deferred_collection_roots_observation":deferred_observation,
+            "deferred_collection_roots":deferred_roots.map(|(roots, summarized, first_summarized, reasons, other_reasons)| json!({
+                "retained":roots.into_iter().map(|(admission, reason)| json!({"admission_sha256":admission,"reason":format!("{reason:?}")})).collect::<Vec<_>>(),
+                "summarized_count":summarized,
+                "first_summarized_admission_sha256":first_summarized,
+                "summarized_by_reason":reasons.into_iter().map(|(reason,count)| json!({"stage":format!("{:?}",reason.stage),"code":reason.code,"detail":reason.detail,"count":count})).collect::<Vec<_>>(),
+                "other_summarized_reasons":other_reasons,
+            })),
+            "uci_handoff_custody":if self.transferred_handoff.is_some() { "leased_to_run" } else { "unknown" },
+            "uci_handoff_registry_released":false,
+            "uci_handoff_transfer_error":self.handoff_transfer_error.map(|error|format!("{error:?}")),
             "physical_completion_claimed":false,"corpus_published":false,"training_executed":false})
     }
 
@@ -190,7 +253,7 @@ impl RoventNnuecCollectionRunV2 {
             ) && self
                 .worker
                 .try_lock()
-                .is_ok_and(|worker| !worker.has_failure()),
+                .is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
             "Collection /2 teacher/worker retirement is not observed",
         )?;
         let status = self
@@ -204,6 +267,7 @@ impl RoventNnuecCollectionRunV2 {
                 && status.incomplete_capture_count == 0
                 && status.retained_failed_captures == 0
                 && status.retained_failed_staged == 0
+                && status.pending_disabled_markers == Some(0)
                 && status.failure.is_none()
                 && !status.callback_lock_failure,
             "Collection /2 native observer is not settled",
@@ -229,12 +293,14 @@ impl Drop for RoventNnuecCollectionRunV2 {
                     && status.incomplete_capture_count == 0
                     && status.retained_failed_captures == 0
                     && status.retained_failed_staged == 0
+                    && status.pending_disabled_markers == Some(0)
                     && status.failure.is_none()
                     && !status.callback_lock_failure
             });
         // This only decides whether the Arena-owned worker can be dropped.
         // UCI's independent retained handoff slot remains unknown.
         let arena_worker_resolved = owner_resolved
+            && self.bridge.try_has_deferred_observations().is_ok_and(|observation| observation == Some(false))
             && self.native_failure.is_none()
             && !self.native_failure_taken
             && self.resource_error.is_none()
@@ -244,7 +310,7 @@ impl Drop for RoventNnuecCollectionRunV2 {
             && self
                 .worker
                 .try_lock()
-                .is_ok_and(|worker| !worker.has_failure())
+                .is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows())
             && matches!(
                 self.worker_exit.as_ref(),
                 Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved)
@@ -302,8 +368,9 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
             collection_owner: entry.collection_owner,
         })
         .collect();
-    let (bridge, worker) =
+    let (bridge, mut worker) =
         RoventNnuecCollectionBridgeV2::new(owner.clone(), Arc::clone(&manifest), roster)?;
+    worker.configure_row_pump(plan.teacher_constraint, Duration::from_nanos(plan.teacher_soft_quantum_ns))?;
     let worker = Arc::new(Mutex::new(worker));
     let resource = Arc::new(Mutex::new(resources::CollectionResourceCustody::prepare(
         input_directory,
@@ -362,6 +429,8 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         worker_thread: Some(worker_thread),
         worker_exit: None,
         worker_thread_panicked: false,
+        transferred_handoff: None,
+        handoff_transfer_error: None,
         native_failure: native.err(),
         native_failure_taken: false,
         resource_error: None,

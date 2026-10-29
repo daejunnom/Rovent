@@ -6,7 +6,9 @@ use super::teacher::v2_session::{
     RoventCollectionTeacherSessionV2, RoventTeacherRosterEntryV2, TeacherSessionPrepareOwnerV2,
     TeacherSessionRetirementSealV2, TeacherSessionStartErrorV2,
 };
+use super::teacher::lock_v2_row_pump::{PumpItemV2, RetiredRowPumpV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2, check};
+use rz_search::external_cpu::ExternalGoConstraint;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::pals_adaptive::{
     AdaptiveManagerError, RoventCollectionRootAdmissionV2, RoventTeacherScopePhysicalAckV2,
@@ -19,7 +21,7 @@ use rz_uci::rovent_external_launch::{
     RoventTeacherScopeAggregateFailureV2, RoventTeacherWorkerTerminalTokenV2,
     TeacherRecoveryCustodianV2,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU8, Ordering},
@@ -62,9 +64,46 @@ pub(crate) struct CollectionBridgeCoreV2<H> {
     failed: Arc<AtomicBool>,
     startup: Arc<OnceLock<RoventStartupControl>>,
     startup_registration_started: AtomicBool,
+    installed_published: AtomicBool,
+    installed_admission: OnceLock<RoventCollectionRootAdmissionV2>,
 }
 
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
+    /// The single-root bridge can no longer install another observer only
+    /// after its admission has irrevocably closed. A reserved installation
+    /// remains unknown and must never be represented as a no-capture root.
+    pub(crate) fn closed_before_next_admission(&self, next: &RoventCollectionRootAdmissionV2) -> bool {
+        if !self.revoked.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.admission_phase.load(Ordering::Acquire) != ADMISSION_INSTALLED
+            || !self.installed_published.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(previous) = self.installed_admission.get() else { return false; };
+        let old = previous.root_admission().authority();
+        let new = next.root_admission().authority();
+        !previous.same_original_admission(next)
+            && old.epoch == new.epoch
+            && old.implementation == new.implementation
+            && (new.game > old.game || (new.game == old.game && new.root > old.root))
+    }
+
+    pub(crate) fn try_install_no_capture(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+    ) -> Result<bool, ArenaError> {
+        self.owner.try_install_whole_root_no_capture(capability)
+    }
+
+    pub(crate) fn try_finish_no_capture(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        receipt: &rz_uci::pals_adaptive::AdaptiveShutdownReceipt,
+    ) -> Result<bool, ArenaError> {
+        self.owner.try_finish_whole_root_no_capture(capability, receipt)
+    }
+
     pub(crate) fn new(
         owner: RoventCollectionOwnerLockV2,
         manifest: Arc<RoventCorpusManifestLockV2>,
@@ -97,8 +136,16 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             failed: Arc::clone(&failed),
             startup: Arc::clone(&startup),
             startup_registration_started: AtomicBool::new(false),
+            installed_published: AtomicBool::new(false),
+            installed_admission: OnceLock::new(),
         });
         let worker = CollectionWorkerCoreV2 {
+            owner: bridge.owner.clone(),
+            pump_config: None,
+            pump: None,
+            pump_ready: VecDeque::with_capacity(16),
+            pump_rejected: None,
+            pump_failed: false,
             admission_receiver,
             handoff_receiver,
             handoff_matches,
@@ -250,6 +297,10 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                         slot.admission.clone(),
                     ));
                 }
+                if self.installed_admission.set(slot.admission.clone()).is_err() {
+                    return Err(reject(AdaptiveManagerError::Invalid("Collection V2 original admission already installed"), slot.admission.clone()));
+                }
+                self.installed_published.store(true, Ordering::Release);
                 Ok(())
             }
             Err(original) => {
@@ -306,6 +357,8 @@ pub(crate) enum WorkerFailure {
     WorkerPanicked,
     RetirementSealRejected,
     AggregateRejected(&'static str),
+    RowPump(ArenaError),
+    RowPumpInputRejected,
 }
 
 impl WorkerFailure {
@@ -326,6 +379,8 @@ impl WorkerFailure {
             Self::WorkerPanicked => "worker_panicked",
             Self::RetirementSealRejected => "retirement_seal_rejected",
             Self::AggregateRejected(_) => "aggregate_rejected",
+            Self::RowPump(_) => "row_pump",
+            Self::RowPumpInputRejected => "row_pump_input_rejected",
         }
     }
 }
@@ -342,6 +397,12 @@ pub(crate) struct WorkerFailureObservation<'a> {
 /// Worker methods must be called from a separate owner, outside manager/root
 /// locks. The caller retains this value on every failure or unknown completion.
 pub(crate) struct CollectionWorkerCoreV2<H> {
+    owner: RoventCollectionOwnerLockV2,
+    pump_config: Option<(ExternalGoConstraint, Duration)>,
+    pump: Option<RetiredRowPumpV2>,
+    pump_ready: VecDeque<PumpItemV2>,
+    pump_rejected: Option<Box<(ArenaError, super::RoventRetiredLockV2Record)>>,
+    pump_failed: bool,
     admission_receiver: mpsc::Receiver<Arc<AdmissionSlot>>,
     handoff_receiver: mpsc::Receiver<Arc<Mutex<H>>>,
     handoff_matches: HandoffMatches<H>,
@@ -409,6 +470,90 @@ pub(crate) enum HandoffObservationErrorV2 {
 }
 
 impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
+    /// Configure from the registered launch plan before this worker starts.
+    /// This does not begin a teacher or consume any source row.
+    pub(crate) fn configure_row_pump(
+        &mut self,
+        constraint: ExternalGoConstraint,
+        soft_quantum: Duration,
+    ) -> Result<(), ArenaError> {
+        check(self.slot.is_none() && self.pump_config.is_none(), "row pump already configured or started")?;
+        check(soft_quantum >= rz_search::external_cpu::EXTERNAL_MIN_QUANTUM, "teacher quantum below minimum")?;
+        self.pump_config = Some((constraint, soft_quantum));
+        Ok(())
+    }
+
+    /// Unpublished and rejected rows remain in this original worker custody.
+    pub(crate) fn has_unpublished_pump_rows(&self) -> bool {
+        self.pump.as_ref().is_some_and(|pump| pump.len() != 0)
+            || !self.pump_ready.is_empty() || self.pump_rejected.is_some()
+    }
+
+    pub(crate) fn pending_pump_rows(&self) -> usize {
+        self.pump.as_ref().map_or(0, RetiredRowPumpV2::len)
+            + self.pump_ready.len() + usize::from(self.pump_rejected.is_some())
+    }
+
+    pub(crate) fn pump_ready_counts(&self) -> (usize, usize, usize) {
+        let mut unlabeled = 0;
+        let mut prepared = 0;
+        let mut failed = 0;
+        for item in &self.pump_ready {
+            match item {
+                PumpItemV2::Unlabeled { .. } => unlabeled += 1,
+                PumpItemV2::Prepared { .. } => prepared += 1,
+                PumpItemV2::Failed { .. } => failed += 1,
+            }
+        }
+        (unlabeled, prepared, failed)
+    }
+
+    fn poll_row_pump(&mut self) {
+        let Some((constraint, quantum)) = self.pump_config else { return; };
+        if self.session.is_none() || self.pump_failed || (self.failure.is_some() && self.pump.is_none()) { return; }
+        if self.pump.is_none() {
+            let session = self.session.as_mut().expect("original teacher session");
+            match RetiredRowPumpV2::new(session, 16, constraint, quantum) {
+                Ok(pump) => self.pump = Some(pump),
+                Err(error) => { self.pump_failed = true; self.record_failure(WorkerFailure::RowPump(error)); return; }
+            }
+        }
+        if self.pump_rejected.is_some() { return; }
+        let pump = self.pump.as_mut().expect("original session pump");
+        // The output and input together remain bounded. Never remove a row
+        // from its original outbox if this worker cannot retain it.
+        if self.pump_ready.len() < 16 {
+            if let Some(item) = pump.take_ready() { self.pump_ready.push_back(item); }
+        }
+        if self.pump_ready.len() + pump.len() < 16 {
+            match self.owner.take_retired() {
+                Ok(Some(row)) => {
+                    if let Err(original) = pump.enqueue(row) {
+                        self.pump_rejected = Some(original);
+                        self.pump_failed = true;
+                        self.record_failure(WorkerFailure::RowPumpInputRejected);
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => { self.pump_failed = true; self.record_failure(WorkerFailure::RowPump(error)); return; }
+            }
+        }
+        let session = self.session.as_mut().expect("same original teacher session");
+        if let Err(error) = pump.poll(session) {
+            self.pump_failed = true;
+            self.record_failure(WorkerFailure::RowPump(error));
+        }
+    }
+
+    /// Clone the actual handoff received by this worker.  This is solely an
+    /// ownership reference; it does not prove worker join, teacher closure,
+    /// settlement or publication.  Callers must first join the original
+    /// outer worker and retain its core.
+    pub(crate) fn original_handoff(&self) -> Option<Arc<Mutex<H>>> {
+        self.handoff.as_ref().map(Arc::clone)
+    }
+
     pub(crate) fn try_handoff_observation<T>(
         &self,
         observe: impl FnOnce(&H) -> T,
@@ -543,6 +688,7 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 }
             }
         }
+        self.poll_row_pump();
         if self.session.is_some()
             && self.next_actor < self.roster.len()
             && self.failure.is_none()
@@ -564,10 +710,8 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                     if self.tokens.contains_key(&item.actor_id) {
                         continue;
                     }
-                    if let Some(worker) = session.worker_mut(&item.actor_id) {
-                        if let Some(original) = worker.take_diagnostics_after_join() {
-                            self.diagnostics.insert(item.actor_id.clone(), original);
-                        }
+                    if let Some(original) = session.take_actor_diagnostics_after_join(&item.actor_id) {
+                        self.diagnostics.insert(item.actor_id.clone(), original);
                     }
                     if self.worker_tokens.contains_key(&item.actor_id) {
                         continue;
