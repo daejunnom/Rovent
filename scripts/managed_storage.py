@@ -287,7 +287,7 @@ class ManagedBuild:
     after checking the original process tree, paths and source ownership.
     """
     def __init__(self, root: Path, source: Path, *, slot_limit=8 * GiB,
-                 total_limit=12 * GiB, slots_limit=4, purpose=None, output_preservation=None):
+                 total_limit=18 * GiB, slots_limit=4, purpose=None, output_preservation=None):
         if output_preservation is not None:
             from managed_output_unattributed_preservation import UnattributedSelection
             if (type(output_preservation) is not UnattributedSelection
@@ -399,8 +399,14 @@ class ManagedBuild:
             remove_tree(slot, slot.parent)
             total -= amount
             count -= 1
-        if total > self.total_limit or count > self.slots_limit:
-            raise StorageError("storage budget cannot be met without deleting active/unknown data")
+        # A still-active or retained owned slot may itself exceed the aggregate
+        # threshold.  Warn rather than terminate its unrelated work; this is
+        # never authority to delete active/unknown data.  The slot-count
+        # boundary and per-slot post-run cleanup remain independent.
+        warn_output_threshold(total, self.total_limit, scope="managed_build_catalog",
+                              observed_bytes=total)
+        if count > self.slots_limit:
+            raise StorageError("slot limit cannot be met without deleting active/unknown data")
 
     def acquire(self) -> "ManagedBuild":
         checked(self.root)

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 sys.dont_write_bytecode = True
 from managed_storage import (ManagedBuild, StorageError, canonical_root, tree_size,
-                             DEFAULT_OUTPUT_WARNING_BYTES)
+                             DEFAULT_OUTPUT_WARNING_BYTES, warn_output_threshold)
 from managed_process import run_group
 from managed_outputs import sample_output_budget
 
@@ -135,8 +135,9 @@ def main(*, output_preservation=None) -> int:
                 # after that same cleanup; do not alter its type or message.
                 budget_failure = exc
                 raise
-            if tree_size(manager.root / "slots", allow_disappearing=True) > manager.total_limit:
-                raise StorageError("live managed build catalog exceeds 12 GiB")
+            build_total = tree_size(manager.root / "slots", allow_disappearing=True)
+            warn_output_threshold(build_total, manager.total_limit, scope="managed_build_catalog",
+                                  observed_bytes=build_total)
 
         # Set before even attempting dispatch: a launcher failure with uncertain
         # child creation must never use the no-child cleanup shortcut.

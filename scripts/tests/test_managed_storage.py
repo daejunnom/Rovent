@@ -305,6 +305,28 @@ class StorageTests(unittest.TestCase):
         dispatch.assert_called_once()
         manager.finish.assert_called_once_with(exit_code=0, tree_gone=True, supervisor_error=None)
 
+    def test_live_build_aggregate_threshold_warns_without_stopping_child(self):
+        import run_managed
+        manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
+                                  finish=Mock(return_value={}), root=self.root,
+                                  source=self.source, total_limit=4096,
+                                  _identity=lambda: {"token": "current"})
+        def supervise(_command, _source, _environment, _timeout, check_budget):
+            check_budget()
+            return 0, True, None
+        with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+             patch.object(run_managed, "canonical_root", return_value=self.root), \
+             patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+             patch.object(run_managed, "sample_output_budget", return_value=0), \
+             patch.object(run_managed, "tree_size", return_value=8192), \
+             patch.object(run_managed, "warn_output_threshold") as warning, \
+             patch.object(run_managed, "run_group", side_effect=supervise), \
+             patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+             patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(run_managed.main(), 0)
+        warning.assert_called_once_with(8192, 4096, scope="managed_build_catalog", observed_bytes=8192)
+        manager.finish.assert_called_once_with(exit_code=0, tree_gone=True, supervisor_error=None)
+
     def test_predispatch_corrupt_foreign_catalog_keeps_evidence_and_closes_own_build(self):
         import run_managed
         manager = ManagedBuild(self.root, self.source)
@@ -641,6 +663,19 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(receipt["post_run_budget_reset"])
         self.assertFalse(owner.target.exists())
         self.assertLessEqual(tree_size(owner.slot), owner.slot_limit)
+        self.assertTrue(self.model.exists())
+
+    def test_active_slot_over_aggregate_threshold_warns_and_owner_closes(self):
+        owner = self.acquire(slot_limit=4096, total_limit=6144)
+        (owner.target / "too-large").write_bytes(b"x" * 7000)
+        with patch("managed_storage.warn_output_threshold") as warning:
+            owner._prune()
+        self.assertGreater(warning.call_args.args[0], 6144)
+        self.assertTrue(owner.lock.exists())
+        self.assertTrue((owner.target / "too-large").exists())
+        receipt = owner.finish(exit_code=0, tree_gone=True)
+        self.assertTrue(receipt["post_run_budget_reset"])
+        self.assertFalse(owner.lock.exists())
         self.assertTrue(self.model.exists())
 
     @unittest.skipUnless(os.name == "posix", "POSIX directory deletion permissions")
