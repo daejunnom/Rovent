@@ -89,6 +89,51 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(owner.output.exists())
         self.assertEqual(json.loads((self.catalog / (owner.key + ".json")).read_text())["state"], "active")
 
+    def test_failed_post_publication_admission_retains_original_without_owner_leak(self):
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                owner = OutputLease(self.base / ("failed-" + str(deferred)), self.source,
+                                    catalog=self.catalog, deferred=deferred)
+                with patch.object(owner, "_seal_preservation_session", side_effect=OSError("seal failed")):
+                    with self.assertRaisesRegex(OSError, "seal failed"):
+                        owner.acquire()
+                row = json.loads((self.catalog / (owner.key + ".json")).read_text())
+                self.assertEqual(row["state"], "retained")
+                self.assertEqual(row["status"], "acquire_failed_before_dispatch")
+                self.assertEqual(row["tree_gone"], "not_started_by_lease")
+                self.assertEqual(row["physical_completion"], "not_inferred_from_output_lifecycle")
+                if not deferred:
+                    marker = json.loads((owner.output / ".rovezero-output.json").read_text())
+                    self.assertEqual(marker, row)
+                else:
+                    self.assertFalse(owner.output.exists())
+                independent = self.lease("next-" + str(deferred))
+                independent.finish(status="independent", tree_gone=True)
+
+    def test_failed_partial_publication_or_changed_identity_stays_unrecovered(self):
+        partial = OutputLease(self.base / "partial", self.source, catalog=self.catalog)
+        original_write = partial._write
+        def failed_publication():
+            original_write()
+            raise OSError("publication outcome uncertain")
+        with patch.object(partial, "_write", side_effect=failed_publication):
+            with self.assertRaisesRegex(OSError, "publication outcome uncertain"):
+                partial.acquire()
+        partial_row = json.loads((self.catalog / (partial.key + ".json")).read_text())
+        self.assertEqual(partial_row["state"], "active")
+
+        changed = OutputLease(self.base / "changed", self.source, catalog=self.catalog)
+        def change_marker_then_fail():
+            marker = changed.output / ".rovezero-output.json"
+            marker.write_text("{}")
+            raise OSError("seal failed after identity change")
+        with patch.object(changed, "_seal_preservation_session", side_effect=change_marker_then_fail):
+            with self.assertRaisesRegex(OSError, "seal failed after identity change"):
+                changed.acquire()
+        changed_row = json.loads((self.catalog / (changed.key + ".json")).read_text())
+        self.assertEqual(changed_row["state"], "active")
+        self.assertEqual((changed.output / ".rovezero-output.json").read_text(), "{}")
+
     def test_brief_catalog_lock_contention_is_retried_without_stealing_owner(self):
         candidate = OutputLease(self.base / "retry", self.source, catalog=self.catalog)
         original_acquire = candidate.guard.acquire

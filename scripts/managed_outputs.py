@@ -401,6 +401,7 @@ class OutputLease:
 
     def acquire(self):
         owner_lifetime = lifetime() if not self.deferred else None
+        published = False
         self.catalog.mkdir(parents=True, exist_ok=True)
         # Maintenance may hold the catalog briefly. Only actual OS lock
         # contention is retried; a failed identity check or any other error
@@ -471,6 +472,7 @@ class OutputLease:
             if self._preservation_enabled:
                 self._quarantine_view.bind_producer(self.record)
             self._write()
+            published = True
             self._seal_preservation_session()
             if self._preservation_enabled:
                 # Mandatory journal bytes also consume the original reservation.
@@ -481,13 +483,53 @@ class OutputLease:
             return self
         except BaseException as error:
             try:
-                self._close_preservation_journal(error)
+                if published:
+                    try:
+                        self._retain_failed_admission(error)
+                    except BaseException:
+                        # A partial write, changed identity or failed custody
+                        # check is not authority to recover an owner. Preserve
+                        # the original failure and leave the evidence in place.
+                        if hasattr(error, "add_note"):
+                            error.add_note("failed admission owner could not be retained; inspect original records")
             finally:
                 try:
-                    self._close_quarantine_view(error)
+                    self._close_preservation_journal(error)
                 finally:
-                    self._release_guard(error)
+                    try:
+                        self._close_quarantine_view(error)
+                    finally:
+                        self._release_guard(error)
             raise
+
+    def _retain_failed_admission(self, error):
+        """Close only this lease's fully published, never-dispatched admission.
+
+        No payload can be started through this lease before acquire returns.
+        A failed or partial publication, changed record, or uncertain identity
+        is left untouched. This retains files and does not infer GPU completion.
+        """
+        self.guard.assert_held()
+        original = self.record
+        if (original is None or self.outer is not None or original.get("state") != "active"
+                or original.get("pid") != os.getpid() or original.get("lifetime") != lifetime()
+                or _read(self.catalog / (self.key + ".json")) != original):
+            raise StorageError("failed admission owner identity is uncertain")
+        if self.deferred:
+            if original.get("identity") is not None or os.path.lexists(self.output):
+                raise StorageError("failed deferred admission output identity is uncertain")
+        elif (identity(self.output) != original.get("identity")
+              or _read(self.output / ".rovezero-output.json") != original):
+            raise StorageError("failed admission output identity is uncertain")
+        self._check_quarantine_view()
+        self.record = {**original, "state": "retained",
+                       "status": "acquire_failed_before_dispatch",
+                       "producer_status": "acquire_failed_before_dispatch",
+                       "tree_gone": "not_started_by_lease",
+                       "finished_ns": time.time_ns(),
+                       "admission_error_type": type(error).__name__,
+                       "physical_completion": "not_inferred_from_output_lifecycle"}
+        self._write()
 
     def create_deferred_directory(self):
         """Create and seal a fresh Linux directory before allowing producer work.
