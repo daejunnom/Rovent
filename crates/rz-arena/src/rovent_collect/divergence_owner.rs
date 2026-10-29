@@ -367,12 +367,40 @@ pub fn verify_historical_pc_divergence(
     manifest: &RoventCorpusManifestV2,
 ) -> Result<(), ArenaError> {
     record.validate(manifest)?;
+    verify_historical_pc_divergence_fields(record, manifest, None)
+}
+
+/// Caller validates the exact record/lock domain before entering this shared
+/// calculation. Future native evidence remains in its original domain.
+pub(super) fn verify_historical_pc_divergence_lock_v2(
+    record: &RoventTrainingRecordV2,
+    manifest: &RoventCorpusManifestV2,
+    lock: &rz_experiments::RoventInputLockV2,
+) -> Result<(), ArenaError> {
+    verify_historical_pc_divergence_fields(record, manifest, Some(lock))
+}
+
+fn verify_historical_pc_divergence_fields(
+    record: &RoventTrainingRecordV2,
+    manifest: &RoventCorpusManifestV2,
+    lock: Option<&rz_experiments::RoventInputLockV2>,
+) -> Result<(), ArenaError> {
     if let Some(head) = record.head_sources.get("divergence") {
         verify_raw(record, head)?;
         if let Some(visible) =
             visible_record_evidence(record, &head.raw_receipt["witness"]["source"])?
         {
-            verify_visible_history(&visible, manifest)?;
+            if let Some(lock) = lock {
+                super::historical_native_lock_v2::verify_historical_lock_v2_input(
+                    &visible.input,
+                    &visible.wire.input_sha256,
+                    &visible.wire.native,
+                    manifest,
+                    lock,
+                )?;
+            } else {
+                verify_visible_history(&visible, manifest)?;
+            }
         }
         if let Some(target) = &record.targets.divergence {
             verify_target(record, head, target)?;

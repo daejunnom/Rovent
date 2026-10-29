@@ -78,6 +78,7 @@ fn product_arguments_require_one_explicit_closed_selection_and_policy() {
     assert_eq!(args.external_r_sources, None);
     assert!(!args.startup_diagnostics);
     assert!(!args.lifecycle_diagnostics);
+    assert!(!args.lifecycle_diagnostics_v2);
     assert!(!args.initial_stop_source_diagnostics);
     assert!(args.storage.is_none());
     let mut lifecycle = arguments();
@@ -85,6 +86,13 @@ fn product_arguments_require_one_explicit_closed_selection_and_policy() {
     assert!(Arguments::parse(&lifecycle).unwrap().lifecycle_diagnostics);
     lifecycle.push("--lifecycle-diagnostics=stderr-v1".into());
     assert!(Arguments::parse(&lifecycle).is_err());
+    let mut lifecycle_v2 = arguments();
+    lifecycle_v2.push("--lifecycle-diagnostics=stderr-v2".into());
+    let v2 = Arguments::parse(&lifecycle_v2).unwrap();
+    assert!(v2.lifecycle_diagnostics_v2);
+    assert!(!v2.lifecycle_diagnostics);
+    lifecycle_v2.push("--lifecycle-diagnostics=stderr-v1".into());
+    assert!(Arguments::parse(&lifecycle_v2).is_err());
     let mut diagnostics = arguments();
     diagnostics.push("--startup-diagnostics=stderr-v1".into());
     assert!(Arguments::parse(&diagnostics).unwrap().startup_diagnostics);

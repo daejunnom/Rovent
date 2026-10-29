@@ -360,6 +360,24 @@ fn verify_original_native_key(
     replay: &super::rules_replay::RoventSubmittedRulesReplay,
     origin: &RoventNativeOriginEvidence,
 ) -> Result<(), ArenaError> {
+    verify_original_native_key_for_sources(
+        generation_input,
+        native,
+        replay,
+        &origin.weights_sha256,
+        &origin.backend_sha256,
+    )
+}
+
+/// Shared input/key calculation after the caller has verified its own exact
+/// origin domain and file identities. This never reconstructs an authority.
+pub(super) fn verify_original_native_key_for_sources(
+    generation_input: &GenerationInputV3,
+    native: &RoventNativeLifecycle,
+    replay: &super::rules_replay::RoventSubmittedRulesReplay,
+    weights_sha256: &str,
+    backend_sha256: &str,
+) -> Result<(), ArenaError> {
     let input = typed_virtual_input(&generation_input.encoded_model_input)?;
     let anchors = replay
         .selected_anchors
@@ -372,9 +390,9 @@ fn verify_original_native_key(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| invalid(error.to_string()))?;
     let identity = ReviewExecutionIdentity {
-        model_epoch: rz_eval::asset::parse_sha256(&origin.weights_sha256)
+        model_epoch: rz_eval::asset::parse_sha256(weights_sha256)
             .map_err(|error| invalid(error.to_string()))?,
-        backend: rz_eval::asset::parse_sha256(&origin.backend_sha256)
+        backend: rz_eval::asset::parse_sha256(backend_sha256)
             .map_err(|error| invalid(error.to_string()))?,
         rules_history: *history
             .first()

@@ -154,10 +154,28 @@ pub trait RoleOnlySearchDriver<Q> {
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoleOnlyCollectionV2ObserverStatus {
+    AdmissionNotCalled,
+    AdmissionFailed,
+    AdmissionPanicked,
+    AdmissionSucceededRecheckFailed,
+    AdmissionSucceededRecheckPanicked,
+    ManagerValidationPanicked,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub struct RoleOnlyCollectionV2Rejection<Q, O> {
     pub error: AdaptiveManagerError,
     pub admission: RoventCollectionRootAdmissionV2,
     pub observer: AdaptiveCollectionObserverBoxV2<Q, O>,
+    /// A callback that failed or panicked may have partially mutated the
+    /// original observer. None of these states grants reuse authority.
+    pub observer_status: RoleOnlyCollectionV2ObserverStatus,
+    /// Preserve the original panic object with the rejected owner. A panic
+    /// payload may itself own resources or panic during drop; callers must
+    /// retain it together with the original admission and observer.
+    pub panic_payload: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// Pure role configuration. R counts, R credit and R control are absent by type.
@@ -194,6 +212,9 @@ struct RoleOnlyBinding<Q, O> {
     collection_dispatched: bool,
     collection_abandoned: bool,
     consumption_recorded: bool,
+    // A failed readback after an attempted consume is neither proof of
+    // consumption nor proof that the input may be discarded.
+    consumption_unknown: bool,
 }
 
 pub struct RoleOnlyManagerSources<Q, B, D>
@@ -856,8 +877,10 @@ where
         admission: RoventCollectionRootAdmissionV2,
         mut observer: AdaptiveCollectionObserverBoxV2<Q, B::Output>,
     ) -> Result<(), RoleOnlyCollectionV2Rejection<Q, B::Output>> {
-        let result =
-            (|| {
+        let mut observer_called = false;
+        let mut observer_succeeded = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), AdaptiveManagerError> {
                 if self.collection.is_some()
                     || self.collection_admission.is_some()
                     || self.has_collection_v2()
@@ -892,14 +915,52 @@ where
                 )?;
                 admission.validate_native_owner(&verifier)?;
                 self.driver.validate_collection_admission_v2(&admission)?;
+                observer_called = true;
                 observer.admitted(&admission)?;
+                observer_succeeded = true;
+                // The callback may run until the root is revoked or expires.
+                // Never install a stale admission on its earlier observation.
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("P/C V2 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v2(&admission)?;
+                self.now()?;
                 Ok(())
-            })();
-        if let Err(error) = result {
+            },
+        ));
+        let rejected = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some((
+                error,
+                if observer_succeeded {
+                    RoleOnlyCollectionV2ObserverStatus::AdmissionSucceededRecheckFailed
+                } else if observer_called {
+                    RoleOnlyCollectionV2ObserverStatus::AdmissionFailed
+                } else {
+                    RoleOnlyCollectionV2ObserverStatus::AdmissionNotCalled
+                },
+                None,
+            )),
+            Err(payload) => Some((
+                AdaptiveManagerError::Invalid("P/C V2 collection admission panicked"),
+                if observer_succeeded {
+                    RoleOnlyCollectionV2ObserverStatus::AdmissionSucceededRecheckPanicked
+                } else if observer_called {
+                    RoleOnlyCollectionV2ObserverStatus::AdmissionPanicked
+                } else {
+                    RoleOnlyCollectionV2ObserverStatus::ManagerValidationPanicked
+                },
+                Some(payload),
+            )),
+        };
+        if let Some((error, observer_status, panic_payload)) = rejected {
             return Err(RoleOnlyCollectionV2Rejection {
                 error,
                 admission,
                 observer,
+                observer_status,
+                panic_payload,
             });
         }
         self.collection_admission_v2 = Some(admission);
@@ -1110,6 +1171,7 @@ where
                 collection_dispatched: false,
                 collection_abandoned: false,
                 consumption_recorded: false,
+                consumption_unknown: false,
             });
             self.counters.native_preparations += 1;
             changed = true;
@@ -1257,6 +1319,12 @@ where
         let mut changed = false;
         let mut index = 0;
         while index < self.bindings.len() {
+            if self.bindings[index].consumption_unknown {
+                // Preserve the original accepted output and input until an
+                // owner can resolve the unknown outcome; never replay it.
+                index += 1;
+                continue;
+            }
             if !self.bindings[index].retired || self.bindings[index].revoked_acceptance.is_some() {
                 index += 1;
                 continue;
@@ -1308,6 +1376,7 @@ where
                         {
                             Ok(consumed) => consumed,
                             Err(readback) => {
+                                self.bindings[index].consumption_unknown = true;
                                 self.record_failure(readback);
                                 false
                             }
@@ -2027,7 +2096,7 @@ where
                 // Only the actual owner fence permits releasing unconsumed
                 // revoked inputs or linear permits, never logical cancel.
                 for binding in &self.bindings {
-                    if !binding.consumption_recorded {
+                    if !binding.consumption_recorded && !binding.consumption_unknown {
                         self.driver
                             .role_discarded(&binding.input, binding.ticket.as_ref())?;
                     }
@@ -2035,13 +2104,16 @@ where
                 self.counters.unused_role_results += self
                     .bindings
                     .iter()
-                    .filter(|binding| !binding.consumption_recorded)
+                    .filter(|binding| !binding.consumption_recorded && !binding.consumption_unknown)
                     .count() as u64;
-                self.bindings.clear();
+                self.bindings.retain(|binding| binding.consumption_unknown);
                 self.acks.clear();
                 self.retained_receipts.clear();
                 self.retained_permits.clear();
-                if !self.retained_completions.is_empty() || self.native.is_quarantined() {
+                if !self.bindings.is_empty()
+                    || !self.retained_completions.is_empty()
+                    || self.native.is_quarantined()
+                {
                     self.phase = ManagerPhase::Quarantined;
                 } else {
                     self.phase = ManagerPhase::Finished;

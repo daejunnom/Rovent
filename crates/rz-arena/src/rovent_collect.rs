@@ -1057,6 +1057,11 @@ mod rules_replay;
 pub use rules_replay::*;
 mod external_scope;
 mod historical_declarations_v2;
+mod historical_native_lock_v2;
+pub use historical_native_lock_v2::{
+    VerifiedHistoricalNativeRootMetadataV2, verify_historical_lock_v2_record_evidence,
+    verify_historical_native_root_metadata_v2,
+};
 mod historical_scope;
 pub use external_scope::{
     RoventHistoricalExternalSource, verify_historical_external_source_input_lock,
@@ -1072,6 +1077,8 @@ pub use publication::{
 };
 mod publication_v2;
 pub use publication_v2::{ROVENT_CORPUS_PUBLICATION_V2, RoventCorpusPublicationV2};
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod publication_lock_v2;
 mod submitted_v3;
 pub use submitted_v3::{
     PublishedRoventRecordV2, RoventRetiredRecordV2, RoventSubmittedRecordMetadata,

@@ -108,6 +108,7 @@ struct Arguments {
     root_policy: RoventRootAdmissionPolicy,
     startup_diagnostics: bool,
     lifecycle_diagnostics: bool,
+    lifecycle_diagnostics_v2: bool,
     initial_stop_source_diagnostics: bool,
     storage: Option<StorageArguments>,
 }
@@ -136,6 +137,7 @@ impl Arguments {
         let mut root_policy = None;
         let mut startup_diagnostics = None;
         let mut lifecycle_diagnostics = None;
+        let mut lifecycle_diagnostics_v2 = false;
         let mut initial_stop_source_diagnostics = None;
         let mut storage_profile = None;
         let mut storage_sha256 = None;
@@ -209,6 +211,10 @@ impl Arguments {
                 "--lifecycle-diagnostics" if lifecycle_diagnostics.is_none() => {
                     lifecycle_diagnostics = Some(match value {
                         "stderr-v1" => true,
+                        "stderr-v2" => {
+                            lifecycle_diagnostics_v2 = true;
+                            false
+                        }
                         _ => {
                             return Err(error(
                                 "Arguments",
@@ -296,6 +302,7 @@ impl Arguments {
                 .ok_or_else(|| error("Arguments", "--root-policy is required"))?,
             startup_diagnostics: startup_diagnostics.unwrap_or(false),
             lifecycle_diagnostics: lifecycle_diagnostics.unwrap_or(false),
+            lifecycle_diagnostics_v2,
             initial_stop_source_diagnostics: initial_stop_source_diagnostics.unwrap_or(false),
             storage,
         })
@@ -700,6 +707,12 @@ fn run_inner<'a>(
             return run_v2_native(arguments, lock, root, cwd, lock_file);
         }
     };
+    if arguments.lifecycle_diagnostics_v2 {
+        return Err(error(
+            "InputLockUnsupportedV1",
+            "V2 lifecycle observation requires an original /2 lock",
+        ));
+    }
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
         return Err(error(
             "StartupWindow",
@@ -1379,7 +1392,12 @@ fn run_v2_native(
             )
             .map_err(|rejection| $reject(rejection, cleanup_until, &diagnostic))?;
             let completion = driver.physical_close_observation();
-            Ok((Arc::new(driver) as Arc<dyn SearchSessionDriver>, completion))
+            let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2 {
+                Arc::new(super::product::diagnostics_v2::ObservedV2::new(driver, lock.canonical_sha256.clone()))
+            } else {
+                Arc::new(driver)
+            };
+            Ok((driver, completion))
         }};
     }
     let assembled = (|| -> Result<_, RoventLaunchError> {

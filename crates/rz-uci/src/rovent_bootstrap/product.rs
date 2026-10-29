@@ -281,6 +281,7 @@ macro_rules! build_own_board_pcr {
 
 type PcrDriver = AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>>;
 mod diagnostics;
+pub(super) mod diagnostics_v2;
 mod storage;
 pub use diagnostics::{
     ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN, RoventLifecycleDiagnostics,

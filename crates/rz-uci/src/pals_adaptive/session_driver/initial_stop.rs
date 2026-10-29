@@ -139,6 +139,15 @@ where
             .map(|receipt| receipt.clone())
             .map_err(|_| poisoned("Rovent V2 initial receipt owner poisoned"))
     }
+    /// Best-effort observation never waits for the original receipt owner.
+    pub(crate) fn try_observe_rovent_initial_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventPcrInitialReceiptV2>>, &'static str> {
+        self.latest_rovent_initial_v2
+            .try_lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| "adaptive_v2_initial_busy_or_poisoned")
+    }
 
     pub fn latest_rovent_initial(
         &self,

@@ -3,13 +3,28 @@
 use super::*;
 use crate::rovent_root_admission::RoventRootAdmission;
 use rz_runtime::contracts::ContractClock;
-#[cfg(target_os = "linux")]
 use rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration;
 use rz_search::external_cpu::collection_teacher::{
     CollectionTeacherWorker, TeacherCompletion, TeacherDiagnostics, TeacherDispatch, TeacherJob,
 };
 use rz_search::external_cpu::process_scope::CollectionProcessPermit;
 use std::sync::Arc;
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod quarantine_v2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use quarantine_v2::ParkedTeacherV2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use quarantine_v2::TeacherRecoveryReservationV2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use quarantine_v2::{TeacherRecoveryCustodianV2, TeacherRecoveryKeyV2};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod actor_binding_v2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use actor_binding_v2::{
+    BoundCollectionTeacherActorV2, TeacherActorBindingErrorV2, bind_collection_teacher_actor_v2,
+    verify_collection_teacher_pin,
+};
 
 pub struct RoventCollectionTeacherOwner {
     launch: PreparedRoventExternalLaunch,
@@ -322,6 +337,17 @@ pub struct RoventCollectionTeacherOwnerV2 {
     custody: Option<crate::rovent_bootstrap::RoventCollectionTeacherSourceCustody>,
     frozen_actor: Digest,
     source_index: usize,
+    bound_source: Option<BoundTeacherOriginalSourceV2>,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+struct BoundTeacherOriginalSourceV2 {
+    _manifest: Arc<rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2>,
+    _actor_id: String,
+    _manifest_sha256: String,
+    _profile_bytes: Vec<u8>,
+    _executable: File,
+    _working_directory: File,
 }
 
 /// A post-spawn rejection retains the actual worker and its original source
@@ -513,6 +539,7 @@ impl RoventCollectionTeacherOwnerV2 {
                     custody: Some(custody),
                     frozen_actor,
                     source_index,
+                    bound_source: None,
                 };
                 Ok(owner)
             }
@@ -679,12 +706,236 @@ impl RoventCollectionTeacherOwnerV2 {
     }
 }
 
+/// The original declaration-bound actor is returned on every pre-spawn error.
+/// Once a worker exists, its lifecycle and recovery key are returned instead.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub enum BoundTeacherSpawnFailureV2 {
+    BeforeSpawn {
+        cause: BoundTeacherSpawnCauseV2,
+        actor: BoundCollectionTeacherActorV2,
+    },
+    AfterSpawn {
+        cause: BoundTeacherSpawnCauseV2,
+        lifecycle: RoventCollectionTeacherLifecycleV2,
+        recovery_key: TeacherRecoveryKeyV2,
+    },
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Debug)]
+pub enum BoundTeacherSpawnCauseV2 {
+    Root(rz_contracts::ContractError),
+    Source(rz_eval::error::BackendError),
+    Io(std::io::Error),
+    Checker(CheckerError),
+}
+
+/// Starts only the actor bound to the original /2 root and preload. It does
+/// not grant label or publication authority. The caller retains the borrowed
+/// process permit and must retain the returned recovery key beyond the session.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub fn spawn_bound_collection_teacher_v2(
+    actor: BoundCollectionTeacherActorV2,
+    permit: &CollectionProcessPermit,
+    startup_deadline: Instant,
+    cleanup_ceiling: Instant,
+    custodian: &mut TeacherRecoveryCustodianV2,
+) -> Result<(RoventCollectionTeacherLifecycleV2, TeacherRecoveryKeyV2), BoundTeacherSpawnFailureV2>
+{
+    let (reservation, recovery_key) = match TeacherRecoveryReservationV2::reserve() {
+        Ok(value) => value,
+        Err(cause) => {
+            return Err(BoundTeacherSpawnFailureV2::BeforeSpawn {
+                cause: BoundTeacherSpawnCauseV2::Checker(cause),
+                actor,
+            });
+        }
+    };
+    if let Err(cause) = custodian.register(&recovery_key) {
+        return Err(BoundTeacherSpawnFailureV2::BeforeSpawn {
+            cause: BoundTeacherSpawnCauseV2::Checker(cause),
+            actor,
+        });
+    }
+    let created = (|| -> Result<CollectionTeacherWorker, BoundTeacherSpawnCauseV2> {
+        reservation
+            .validate_before_spawn()
+            .map_err(BoundTeacherSpawnCauseV2::Checker)?;
+        let admission = actor.admission();
+        let root = admission.root_admission();
+        let control = actor.root_control();
+        let context = root.original_context();
+        let source = actor.source();
+        let lock = root
+            .owner()
+            .v2()
+            .ok_or(BoundTeacherSpawnCauseV2::Checker(invalid(
+                "teacher /2 original lock absent",
+            )))?;
+        if !Arc::ptr_eq(&control.cancellation, &context.control.cancellation)
+            || !source
+                .prepared
+                .original_lock_owner_v2()
+                .is_some_and(|owner| Arc::ptr_eq(owner, lock))
+            || source.index != actor.source_index()
+            || control.cleanup_until > context.shutdown_deadline
+            || startup_deadline > control.until
+            || cleanup_ceiling > control.cleanup_until
+            || actor.actor_digest() == Digest([0; 32])
+        {
+            return Err(BoundTeacherSpawnCauseV2::Checker(invalid(
+                "teacher /2 original source, root or deadline mismatch",
+            )));
+        }
+        control.check().map_err(BoundTeacherSpawnCauseV2::Source)?;
+        if !context
+            .try_accepts()
+            .map_err(BoundTeacherSpawnCauseV2::Root)?
+        {
+            return Err(BoundTeacherSpawnCauseV2::Checker(invalid(
+                "teacher /2 root revoked",
+            )));
+        }
+        let root_digest = root
+            .descriptor()
+            .digest()
+            .map_err(|_| BoundTeacherSpawnCauseV2::Checker(invalid("teacher /2 root digest")))?;
+        let registration = TeacherWorkerRegistration {
+            collection_owner: actor.collection_owner(),
+            authority: root.authority(),
+            original_deadline: root.hard_deadline(),
+            input_lock: root.startup_lock_digest(),
+            root_admission: root_digest,
+            root_budget: admission.root_budget(),
+            frozen_actor: actor.actor_digest(),
+        };
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (permit, registration);
+            Err(BoundTeacherSpawnCauseV2::Checker(
+                CheckerError::Unsupported("collection teacher requires Linux pinned ELF"),
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let executable = source
+                .executable
+                .try_clone()
+                .map_err(BoundTeacherSpawnCauseV2::Io)?;
+            let directory = source
+                .working_directory
+                .try_clone()
+                .map_err(BoundTeacherSpawnCauseV2::Io)?;
+            let pin = ExternalLaunchPin::from_owned_descriptors(executable, directory)
+                .map_err(BoundTeacherSpawnCauseV2::Checker)?;
+            let config = source
+                .prepared
+                .configuration()
+                .map_err(BoundTeacherSpawnCauseV2::Checker)?;
+            let clock = ExternalWorkerClock {
+                domain: root.runtime_clock().domain(),
+                origin: root.runtime_clock().origin(),
+            };
+            let hard = clock
+                .origin
+                .checked_add(std::time::Duration::from_nanos(root.hard_deadline().at.0))
+                .ok_or(BoundTeacherSpawnCauseV2::Checker(invalid(
+                    "teacher /2 hard deadline overflow",
+                )))?;
+            let profile_cleanup = hard.checked_add(config.shutdown_grace).ok_or(
+                BoundTeacherSpawnCauseV2::Checker(invalid("teacher /2 profile cleanup overflow")),
+            )?;
+            let ceiling = cleanup_ceiling.min(profile_cleanup);
+            if !context
+                .try_accepts()
+                .map_err(BoundTeacherSpawnCauseV2::Root)?
+            {
+                return Err(BoundTeacherSpawnCauseV2::Checker(invalid(
+                    "teacher /2 root revoked before worker startup",
+                )));
+            }
+            reservation
+                .validate_before_spawn()
+                .map_err(BoundTeacherSpawnCauseV2::Checker)?;
+            CollectionTeacherWorker::spawn_in_process_scope(
+                config,
+                source.prepared.profile().engine,
+                registration,
+                clock,
+                startup_deadline,
+                ceiling,
+                pin,
+                permit.clone(),
+            )
+            .map_err(BoundTeacherSpawnCauseV2::Checker)
+        }
+    })();
+    let worker = match created {
+        Ok(worker) => worker,
+        Err(cause) => return Err(BoundTeacherSpawnFailureV2::BeforeSpawn { cause, actor }),
+    };
+    // No fallible operation separates a spawned worker from this exact owner.
+    let parts = actor.into_parts();
+    let (index, launch, profile_bytes, executable, working_directory, custody) =
+        parts.source.into_parts();
+    let owner = RoventCollectionTeacherOwnerV2 {
+        launch,
+        worker,
+        admission: Some(parts.admission),
+        custody: Some(custody),
+        frozen_actor: parts.actor_digest,
+        source_index: index,
+        bound_source: Some(BoundTeacherOriginalSourceV2 {
+            _manifest: parts.manifest,
+            _actor_id: parts.actor_id,
+            _manifest_sha256: parts.manifest_sha256,
+            _profile_bytes: profile_bytes,
+            _executable: executable,
+            _working_directory: working_directory,
+        }),
+    };
+    let mut lifecycle = RoventCollectionTeacherLifecycleV2::new(owner, reservation);
+    let root = lifecycle
+        .owner
+        .as_ref()
+        .expect("retained teacher owner")
+        .admission()
+        .root_admission();
+    let observation = root.original_context().try_accepts();
+    match observation {
+        Ok(true) => Ok((lifecycle, recovery_key)),
+        Ok(false) => {
+            lifecycle.request_shutdown(cleanup_ceiling);
+            Err(BoundTeacherSpawnFailureV2::AfterSpawn {
+                cause: BoundTeacherSpawnCauseV2::Checker(invalid(
+                    "teacher /2 root revoked during worker startup",
+                )),
+                lifecycle,
+                recovery_key,
+            })
+        }
+        Err(error) => {
+            lifecycle.root_observation_error = Some(error);
+            // A contended root lock is not root revocation. Preserve the
+            // already-started owner so the caller can retry observation.
+            if error.code != rz_contracts::ErrorCode::ResourceExhausted {
+                lifecycle.request_shutdown(cleanup_ceiling);
+            }
+            Err(BoundTeacherSpawnFailureV2::AfterSpawn {
+                cause: BoundTeacherSpawnCauseV2::Root(error),
+                lifecycle,
+                recovery_key,
+            })
+        }
+    }
+}
+
 /// One observed retirement of the original teacher process. Even Confirmed
 /// does not mean its queued completions were recovered or its parent process
 /// scope closed. It is not root revocation, a native fence, or label authority.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Clone, Debug)]
-pub(crate) enum RoventTeacherPhysicalRetirementV2 {
+pub enum RoventTeacherPhysicalRetirementV2 {
     NotRequested,
     Pending,
     Confirmed(CheckerShutdown),
@@ -695,7 +946,7 @@ pub(crate) enum RoventTeacherPhysicalRetirementV2 {
 /// does not distinguish unpublished bytes from bytes taken by an earlier owner.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RoventTeacherDiagnosticsDispositionV2 {
+pub enum RoventTeacherDiagnosticsDispositionV2 {
     NotObserved,
     Recovered,
     UnavailableOrAlreadyTaken,
@@ -705,7 +956,7 @@ pub(crate) enum RoventTeacherDiagnosticsDispositionV2 {
 /// confirmed process retirement does not imply that its output was consumed.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Clone, Debug)]
-pub(crate) struct RoventTeacherRetirementObservationV2 {
+pub struct RoventTeacherRetirementObservationV2 {
     pub root_observation_error: Option<rz_contracts::ContractError>,
     pub worker_join: Option<Result<CheckerShutdown, CheckerError>>,
     pub physical: RoventTeacherPhysicalRetirementV2,
@@ -716,11 +967,13 @@ pub(crate) struct RoventTeacherRetirementObservationV2 {
     /// This wrapper does not know whether prior dispatches all produced and
     /// delivered terminals, even when the lower mailbox is currently empty.
     pub terminal_accounting: RoventTeacherTerminalAccountingV2,
+    /// Recovery of a poisoned registry was needed; do not infer its health.
+    pub registry_poisoned: bool,
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RoventTeacherTerminalAccountingV2 {
+pub enum RoventTeacherTerminalAccountingV2 {
     Unknown,
 }
 
@@ -729,28 +982,54 @@ pub(crate) enum RoventTeacherTerminalAccountingV2 {
 /// must call `observe_root` as part of its control loop; this type starts no
 /// watcher and does not independently authorize Collection execution.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-pub(crate) struct RoventCollectionTeacherLifecycleV2 {
+pub struct RoventCollectionTeacherLifecycleV2 {
     owner: Option<RoventCollectionTeacherOwnerV2>,
+    reservation: Option<TeacherRecoveryReservationV2>,
     shutdown_requested: bool,
     root_observation_error: Option<rz_contracts::ContractError>,
     diagnostics: RoventTeacherDiagnosticsDispositionV2,
+    cleanup_deadline: Instant,
+    registry_poisoned: bool,
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventCollectionTeacherLifecycleV2 {
-    pub(crate) fn new(owner: RoventCollectionTeacherOwnerV2) -> Self {
+    pub(crate) fn new(
+        owner: RoventCollectionTeacherOwnerV2,
+        reservation: TeacherRecoveryReservationV2,
+    ) -> Self {
+        let cleanup_deadline = owner
+            .admission()
+            .root_admission()
+            .original_context()
+            .shutdown_deadline;
         Self {
             owner: Some(owner),
+            reservation: Some(reservation),
             shutdown_requested: false,
             root_observation_error: None,
             diagnostics: RoventTeacherDiagnosticsDispositionV2::NotObserved,
+            cleanup_deadline,
+            registry_poisoned: false,
+        }
+    }
+
+    fn from_parked(reservation: TeacherRecoveryReservationV2, parked: ParkedTeacherV2) -> Self {
+        Self {
+            owner: Some(parked.owner),
+            reservation: Some(reservation),
+            shutdown_requested: parked.shutdown_requested,
+            root_observation_error: parked.root_observation_error,
+            diagnostics: parked.diagnostics,
+            cleanup_deadline: parked.cleanup_deadline,
+            registry_poisoned: parked.registry_poisoned,
         }
     }
 
     /// Observe the original root, and close teacher admission on revocation,
     /// expiry, or an unavailable observation. `false` does not distinguish
     /// those cases and is not itself the root's revocation operation.
-    pub(crate) fn observe_root(&mut self) -> Result<bool, rz_contracts::ContractError> {
+    pub fn observe_root(&mut self) -> Result<bool, rz_contracts::ContractError> {
         if self.shutdown_requested {
             return Ok(false);
         }
@@ -778,7 +1057,7 @@ impl RoventCollectionTeacherLifecycleV2 {
 
     /// The lower worker closes its mailbox and bounds the deadline by the
     /// original cleanup ceiling. A request is not evidence of physical exit.
-    pub(crate) fn request_shutdown(&mut self, until: Instant) {
+    pub fn request_shutdown(&mut self, until: Instant) {
         self.shutdown_requested = true;
         self.owner
             .as_ref()
@@ -787,7 +1066,9 @@ impl RoventCollectionTeacherLifecycleV2 {
             .request_shutdown(until);
     }
 
-    pub(crate) fn submit(&mut self, job: TeacherJob) -> Result<TeacherDispatch, CheckerError> {
+    /// Submit through the original live root and bound worker. The returned
+    /// dispatch is not a label or publication authority.
+    pub fn submit(&mut self, job: TeacherJob) -> Result<TeacherDispatch, CheckerError> {
         if !self
             .observe_root()
             .map_err(|_| invalid("teacher /2 root observation unavailable"))?
@@ -809,7 +1090,7 @@ impl RoventCollectionTeacherLifecycleV2 {
 
     /// The original completion remains available even after root revocation;
     /// the caller must preserve it and must not treat it as a valid label.
-    pub(crate) fn take_completion(&self) -> Option<TeacherCompletion> {
+    pub fn take_completion(&self) -> Option<TeacherCompletion> {
         self.owner
             .as_ref()
             .expect("retained teacher owner")
@@ -819,7 +1100,9 @@ impl RoventCollectionTeacherLifecycleV2 {
 
     /// Preserve the original live-root and private-dispatch validation for a
     /// completion. Retirement evidence alone never makes a label eligible.
-    pub(crate) fn validate_completion(
+    /// Validate a completion against its original dispatch and live root.
+    /// This does not itself authorize a training label or publication.
+    pub fn validate_completion(
         &mut self,
         completion: &TeacherCompletion,
         dispatch: &TeacherDispatch,
@@ -842,7 +1125,7 @@ impl RoventCollectionTeacherLifecycleV2 {
     }
 
     /// Recover the lower worker's original diagnostic bytes only after join.
-    pub(crate) fn take_diagnostics_after_join(&mut self) -> Option<TeacherDiagnostics> {
+    pub fn take_diagnostics_after_join(&mut self) -> Option<TeacherDiagnostics> {
         if self.diagnostics != RoventTeacherDiagnosticsDispositionV2::NotObserved {
             return None;
         }
@@ -861,7 +1144,7 @@ impl RoventCollectionTeacherLifecycleV2 {
 
     /// Poll without discarding reliable completions or consuming the owner.
     /// An error can coexist with separately confirmed process-exit evidence.
-    pub(crate) fn poll(&mut self) -> RoventTeacherRetirementObservationV2 {
+    pub fn poll(&mut self) -> RoventTeacherRetirementObservationV2 {
         if !self.shutdown_requested {
             let _ = self.observe_root();
         }
@@ -898,6 +1181,7 @@ impl RoventCollectionTeacherLifecycleV2 {
             reliable_reserved: occupancy.reliable_reserved,
             diagnostics: self.diagnostics,
             terminal_accounting: RoventTeacherTerminalAccountingV2::Unknown,
+            registry_poisoned: self.registry_poisoned,
         }
     }
 
@@ -906,7 +1190,7 @@ impl RoventCollectionTeacherLifecycleV2 {
     /// This returns the process owner only; it does not establish that every
     /// dispatched terminal was delivered, or authorize a Collection label.
     /// Failure returns the wrapper itself so the caller can keep polling.
-    pub(crate) fn try_finish(
+    pub fn try_finish(
         mut self,
     ) -> Result<
         (
@@ -915,7 +1199,7 @@ impl RoventCollectionTeacherLifecycleV2 {
         ),
         Self,
     > {
-        let observation = self.poll();
+        let mut observation = self.poll();
         if !matches!(
             &observation.physical,
             RoventTeacherPhysicalRetirementV2::Confirmed(_)
@@ -927,6 +1211,15 @@ impl RoventCollectionTeacherLifecycleV2 {
         {
             return Err(self);
         }
+        let poisoned = match self
+            .reservation
+            .as_mut()
+            .and_then(|reservation| reservation.release().ok())
+        {
+            Some(poisoned) => poisoned,
+            None => return Err(self),
+        };
+        observation.registry_poisoned |= poisoned;
         Ok((
             self.owner.take().expect("retained teacher owner"),
             observation,
@@ -938,16 +1231,31 @@ impl RoventCollectionTeacherLifecycleV2 {
 impl Drop for RoventCollectionTeacherLifecycleV2 {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
-            // The surrounding session failed to recover the owner explicitly.
-            // Close admission and quarantine the whole owner, including its
-            // worker/mailbox, rather than lose late completion or diagnostics.
-            let until = owner
-                .admission()
-                .root_admission()
-                .original_context()
-                .shutdown_deadline;
-            owner.worker.request_shutdown(until);
-            std::mem::forget(owner);
+            // No root mutex or worker operation is executed while holding the
+            // registry lock. The reservation was made before this spawn.
+            owner.worker.request_shutdown(self.cleanup_deadline);
+            let parked = ParkedTeacherV2 {
+                owner,
+                shutdown_requested: true,
+                root_observation_error: self.root_observation_error,
+                diagnostics: self.diagnostics,
+                cleanup_deadline: self.cleanup_deadline,
+                registry_poisoned: self.registry_poisoned,
+            };
+            match self.reservation.as_mut() {
+                Some(reservation) => {
+                    if let Err(parked) = reservation.park(parked) {
+                        // An impossible slot/custody violation must not drop
+                        // an unconfirmed worker or pretend recovery succeeded.
+                        quarantine_v2::mark_custody_violation();
+                        std::mem::forget(parked);
+                    }
+                }
+                None => {
+                    quarantine_v2::mark_custody_violation();
+                    std::mem::forget(parked);
+                }
+            }
         }
     }
 }
@@ -967,6 +1275,9 @@ impl Drop for RoventCollectionTeacherOwnerV2 {
                 && !p.ownership_lost
         });
         if !closed {
+            if let Some(source) = self.bound_source.take() {
+                std::mem::forget(source);
+            }
             if let Some(custody) = self.custody.take() {
                 std::mem::forget(custody);
             }

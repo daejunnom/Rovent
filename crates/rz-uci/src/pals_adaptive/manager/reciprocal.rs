@@ -165,6 +165,12 @@ where
                                     self.record_failure(error);
                                 }
                                 held.binding.consumption_recorded = true;
+                                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                                if let Some(observer) = &mut self.collection_observer_v2 {
+                                    if let Err(error) = observer.adaptive_consumed(proof, true) {
+                                        self.record_failure(error.into());
+                                    }
+                                }
                             }
                             self.observe_cpu_pc_head(
                                 &held.binding.input,
@@ -204,6 +210,9 @@ where
                     }
                     return Err(error);
                 }
+            }
+            if self.has_collection_failure() {
+                break;
             }
         }
         Ok(changed)
@@ -293,6 +302,13 @@ where
                 self.driver.role_consumed(&source, &work.input.view)?;
                 self.record_role_consumption(source, held.binding.physical)?;
                 held.binding.consumption_recorded = true;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if let Some(observer) = &mut self.collection_observer_v2 {
+                    if let Err(error) = observer.adaptive_consumed(accepted, false) {
+                        self.record_failure(error.into());
+                        return Ok(false);
+                    }
+                }
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }
             self.utility_role_committed(&work, accepted, output)?;
@@ -876,7 +892,10 @@ where
         // Semantic consumption is marked only after physical acceptance. This
         // is one canonical output even when several sealed parents joined it.
         self.driver.role_consumed(ticket, &work.input.view)?;
-        self.mark_role_consumed(index)?;
+        self.mark_role_consumed(index, false)?;
+        if self.has_collection_failure() {
+            return Ok(());
+        }
         self.utility_role_at(index, work, output)?;
         let now = self.check_running()?;
         self.machine.resolve_reciprocal_response(

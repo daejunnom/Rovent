@@ -910,6 +910,21 @@ pub trait AdaptiveSearchDriver<Q> {
             "driver has no actual Rovent collection frontier",
         ))
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_collection_admission_v2(
+        &self,
+        _: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual V2 collection frontier",
+        ))
+    }
+    /// A driver must not enable V2 observation until all acceptance and
+    /// consumption paths and the external teacher lifecycle are wired.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn collection_v2_observation_complete(&self) -> bool {
+        false
+    }
     fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
         Ok(None)
     }
@@ -2157,6 +2172,13 @@ where
     pub continuation: Option<AdaptiveSequenceContinuation>,
 }
 
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub(crate) struct AdaptiveCollectionV2Rejection<Q, O> {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub observer: AdaptiveCollectionObserverBoxV2<Q, O>,
+}
+
 /// The actual single writer owns native service handles and private CPU workers.
 /// tick is bounded and nonblocking. It does not execute inference/search or join
 /// a live worker. Two pending role questions retain independent submitted views.
@@ -2176,6 +2198,12 @@ where
     role_call_limit: Option<u64>,
     collection_observer: Option<AdaptiveCollectionObserverBox<Q, B::Output>>,
     collection_admission: Option<RoventCollectionRootAdmission>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_observer_v2: Option<AdaptiveCollectionObserverBoxV2<Q, B::Output>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_admission_v2: Option<RoventCollectionRootAdmissionV2>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_settlement: Option<Result<(), AdaptiveCollectionError>>,
     cpu_semantic: Option<cpu_semantic::CpuSemanticState<Q>>,
     utility_route: Option<utility_route::UtilityRouteState<Q>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -2794,6 +2822,12 @@ where
         ),
         AdaptiveManagerError,
     > {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.collection_observer_v2.is_some() || self.collection_admission_v2.is_some() {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 collection observer must be returned",
+            ));
+        }
         if self.nnuec.is_some() || self.own.iter().any(|slot| slot.nnuec_retirement.is_some()) {
             return Err(AdaptiveManagerError::Invalid(
                 "NNUEC requires actual actor retirement transfer",
@@ -2866,6 +2900,106 @@ where
     pub fn collection_root_admission(&self) -> Option<&RoventCollectionRootAdmission> {
         self.collection_admission.as_ref()
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn collection_root_admission_v2(&self) -> Option<&RoventCollectionRootAdmissionV2> {
+        self.collection_admission_v2.as_ref()
+    }
+
+    /// Install an observation-only V2 owner at the actual attached root.
+    /// On error return the original admission and observer to the caller.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn install_collection_observer_v2(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV2,
+        mut observer: AdaptiveCollectionObserverBoxV2<Q, B::Output>,
+    ) -> Result<(), AdaptiveCollectionV2Rejection<Q, B::Output>> {
+        let result =
+            (|| -> Result<(), AdaptiveManagerError> {
+                if self.root_started
+                    || !self.roles.is_empty()
+                    || self.phase != ManagerPhase::Running
+                    || self.collection_observer.is_some()
+                    || self.collection_admission.is_some()
+                    || self.collection_observer_v2.is_some()
+                    || self.collection_admission_v2.is_some()
+                {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "V2 collection observer installation order",
+                    ));
+                }
+                if !self.driver.collection_v2_observation_complete() {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "V2 adaptive collection observation is not fully connected",
+                    ));
+                }
+                let root = admission.root_admission();
+                if root.authority() != self.registration.authority
+                    || root.hard_deadline() != self.deadline
+                    || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+                {
+                    return Err(AdaptiveManagerError::Invalid("V2 collection root scope"));
+                }
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("V2 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v2(&admission)?;
+                observer.admitted(&admission)?;
+                Ok(())
+            })();
+        if let Err(error) = result {
+            return Err(AdaptiveCollectionV2Rejection {
+                error,
+                admission,
+                observer,
+            });
+        }
+        self.collection_admission_v2 = Some(admission);
+        self.collection_observer_v2 = Some(observer);
+        Ok(())
+    }
+
+    /// Return the original objects after the actual owner fence and an
+    /// attempted observer settlement. The original settlement result is
+    /// returned separately; teacher process retirement is separate.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn take_collection_observer_v2(
+        &mut self,
+    ) -> Result<
+        Option<(
+            RoventCollectionRootAdmissionV2,
+            AdaptiveCollectionObserverBoxV2<Q, B::Output>,
+            Result<(), AdaptiveCollectionError>,
+        )>,
+        AdaptiveManagerError,
+    > {
+        if self.collection_observer_v2.is_none() && self.collection_admission_v2.is_none() {
+            return Ok(None);
+        }
+        if self.collection_observer_v2.is_none() || self.collection_admission_v2.is_none() {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 collection owner mismatch",
+            ));
+        }
+        let receipt = self.shutdown_receipt()?;
+        if self.phase != ManagerPhase::Finished
+            || self.collection_v2_settlement.is_none()
+            || !(receipt.permits_root_reuse() || receipt.permits_archive_close())
+        {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        Ok(Some((
+            self.collection_admission_v2
+                .take()
+                .expect("checked admission"),
+            self.collection_observer_v2
+                .take()
+                .expect("checked observer"),
+            self.collection_v2_settlement
+                .take()
+                .expect("checked settlement"),
+        )))
+    }
     /// 실제 수집을 요청한 caller만 root 시작 전에 설치한다. 기존 dispatch
     /// observer와 native owner 입력 observer는 별도 원 소유 경계로 유지한다.
     pub fn set_collection_observer(
@@ -2876,6 +3010,7 @@ where
             || !self.roles.is_empty()
             || self.phase != ManagerPhase::Running
             || self.collection_observer.is_some()
+            || self.has_collection_v2()
         {
             return Err(AdaptiveManagerError::Invalid(
                 "collection observer installation order",
@@ -2899,6 +3034,7 @@ where
         if self.root_started
             || !self.roles.is_empty()
             || self.collection_admission.is_some()
+            || self.has_collection_v2()
             || self.phase != ManagerPhase::Running
             || admission.authority() != self.registration.authority
             || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
@@ -2909,6 +3045,21 @@ where
         }
         self.collection_admission = Some(admission);
         Ok(())
+    }
+    fn has_collection_v2(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            self.collection_admission_v2.is_some() || self.collection_observer_v2.is_some()
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            false
+        }
+    }
+    fn has_collection_failure(&self) -> bool {
+        self.failures
+            .iter()
+            .any(|error| matches!(error, AdaptiveManagerError::Collection(_)))
     }
     /// A same-root cooperative Collection failure closes new work but cannot
     /// discard already admitted native/CPU owners. The original typed failure
@@ -3908,6 +4059,12 @@ where
                 collection_failures.push(error);
             }
         }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(observer) = &mut self.collection_observer_v2 {
+            if let Err(error) = observer.native_event(&event) {
+                collection_failures.push(error);
+            }
+        }
         // 수집 오류가 non-Clone permit/receipt나 물리 완료 packet을 버리게
         // 해서는 안 된다. 원 runtime 처리를 먼저 마치고 오류를 따로 남긴다.
         let runtime_result = (|| -> Result<(), AdaptiveManagerError> {
@@ -4428,6 +4585,43 @@ where
                                             collection_failures.push(AdaptiveCollectionError::new(AdaptiveCollectionStage::Accepted,"MissingOriginalOutput","accepted native proof has no original retained output"));
                                         }
                                     }
+                                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                                    if let Some(observer) = &mut self.collection_observer_v2 {
+                                        let binding = &self.roles[index];
+                                        if let (Some(proof), Some(output), Some(admission)) = (
+                                            &binding.reciprocal_acceptance,
+                                            &binding.delivered,
+                                            &self.collection_admission_v2,
+                                        ) {
+                                            let raw = output.proposer_ranking_output();
+                                            let result = admission
+                                                .validate_output(proof.ticket(), raw)
+                                                .and_then(|()| {
+                                                    if proof.validates_output(raw) {
+                                                        Ok(())
+                                                    } else {
+                                                        Err(AdaptiveCollectionError::new(
+                                                            AdaptiveCollectionStage::Accepted,
+                                                            "AcceptedOutputMismatch",
+                                                            "V2 original accepted output differs",
+                                                        ))
+                                                    }
+                                                })
+                                                .and_then(|()| {
+                                                    observer.accepted(
+                                                        proof,
+                                                        &binding.input,
+                                                        output.as_ref(),
+                                                    )
+                                                });
+                                            if let Err(error) = result {
+                                                collection_failures.push(error);
+                                            }
+                                        } else {
+                                            collection_failures.push(AdaptiveCollectionError::new(AdaptiveCollectionStage::Accepted,
+                                                "MissingOriginalOutput", "V2 accepted proof has no original output or admission"));
+                                        }
+                                    }
                                 }
                                 Err(rejected) => {
                                     self.retained_native_receipts.push(rejected.receipt);
@@ -4680,7 +4874,10 @@ where
                             self.check_running()?,
                         )?;
                     }
-                    self.mark_role_consumed(index)?;
+                    self.mark_role_consumed(index, false)?;
+                    if self.has_collection_failure() {
+                        return Ok(());
+                    }
                     self.utility_role_at(index, &work, output.proposer_ranking_output())?;
                     self.resolve(work, StepExecution::Role(ticket.id), committed)?;
                 } else if purpose == RolePurpose::RootRanking {
@@ -4696,7 +4893,8 @@ where
                         return Err(AdaptiveManagerError::Capacity("root candidate fanout"));
                     }
                     self.driver.role_consumed(&ticket, &input.view)?;
-                    self.mark_role_consumed(index)?;
+                    self.mark_role_consumed(index, false)?;
+                    let mut ranking_observation_failed = false;
                     if self.reciprocal_routing.is_some() || self.peer_policy.is_some() {
                         if let Some(observer) = &mut self.collection_observer {
                             let proof = match self.collection_admission.as_ref() {
@@ -4715,9 +4913,45 @@ where
                                 observer.root_ranking(&proof, &input, output.as_ref())
                             });
                             if let Err(error) = result {
+                                ranking_observation_failed = true;
                                 self.record_failure(error.into());
                             }
                         }
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if let Some(observer) = &mut self.collection_observer_v2 {
+                            let result = self
+                                .collection_admission_v2
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AdaptiveCollectionError::new(
+                                        AdaptiveCollectionStage::Accepted,
+                                        "MissingV2Admission",
+                                        "V2 root ranking has no original admission",
+                                    )
+                                })
+                                .and_then(|admission| {
+                                    admission.validate_output(
+                                        &ticket,
+                                        output.proposer_ranking_output(),
+                                    )?;
+                                    RoventRootRankingAcceptanceV2::from_current_ranking(
+                                        &ranking, admission,
+                                    )
+                                })
+                                .and_then(|proof| {
+                                    observer.adaptive_root_ranking(&proof, &input, output.as_ref())
+                                });
+                            if let Err(error) = result {
+                                ranking_observation_failed = true;
+                                self.record_failure(error.into());
+                            }
+                        }
+                    }
+                    // The registry ranking and search consumption already
+                    // occurred. Preserve them, but do not issue candidates
+                    // after an observation failure or replay the commit.
+                    if ranking_observation_failed {
+                        return Ok(());
                     }
                     for candidate in candidates {
                         let input = candidate.input.clone();
@@ -4816,7 +5050,7 @@ where
                         self.validator_waiting.retain(|frame| *frame != parent);
                     }
                     self.driver.role_consumed(&ticket, &input.view)?;
-                    self.mark_role_consumed(index)?;
+                    self.mark_role_consumed(index, false)?;
                 } else {
                     return Err(AdaptiveManagerError::Invalid(
                         "role purpose lacks refinement work",
@@ -4844,7 +5078,7 @@ where
                 };
                 match consumed {
                     Ok(true) if !self.roles[index].consumption_recorded => {
-                        if let Err(observation) = self.mark_role_consumed(index) {
+                        if let Err(observation) = self.mark_role_consumed(index, true) {
                             self.record_failure(observation);
                         }
                     }
@@ -4881,7 +5115,11 @@ where
         }
         Ok(())
     }
-    fn mark_role_consumed(&mut self, index: usize) -> Result<(), AdaptiveManagerError> {
+    fn mark_role_consumed(
+        &mut self,
+        index: usize,
+        after_error_readback: bool,
+    ) -> Result<(), AdaptiveManagerError> {
         let binding = &self.roles[index];
         if binding.consumption_recorded {
             return Ok(());
@@ -4891,6 +5129,17 @@ where
         ))?;
         self.record_role_consumption(ticket, binding.physical)?;
         self.roles[index].consumption_recorded = true;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let (Some(observer), Some(accepted)) = (
+            self.collection_observer_v2.as_mut(),
+            self.roles[index].reciprocal_acceptance.as_ref(),
+        ) {
+            if let Err(error) = observer.adaptive_consumed(accepted, after_error_readback) {
+                self.record_failure(error.into());
+            }
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let _ = after_error_readback;
         let failures = if let (Some(state), Some(accepted), Some(output)) = (
             self.cpu_semantic.as_mut(),
             self.roles[index].reciprocal_acceptance.as_ref(),
@@ -5066,6 +5315,14 @@ where
                 }
                 return Err(error);
             }
+            // A collection failure closes normal admission, but once shutdown
+            // has started every already-admitted terminal still has to drain.
+            // The failure remains in `self.failures`, so using it as an
+            // unconditional stop condition here would repeatedly strand the
+            // remaining deferred receipts during draining.
+            if self.phase == ManagerPhase::Running && self.has_collection_failure() {
+                break;
+            }
         }
         Ok(changed)
     }
@@ -5096,6 +5353,22 @@ where
                     Some(observer) => observer.dispatch(&ticket, &self.roles[index].input),
                     None => Ok(()),
                 };
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let result = result.and_then(|()| match &mut self.collection_observer_v2 {
+                    Some(observer) => self
+                        .collection_admission_v2
+                        .as_ref()
+                        .ok_or_else(|| {
+                            AdaptiveCollectionError::new(
+                                AdaptiveCollectionStage::Dispatch,
+                                "MissingV2Admission",
+                                "V2 observer lost its original admission",
+                            )
+                        })?
+                        .validate_ticket(&ticket)
+                        .and_then(|()| observer.dispatch(&ticket, &self.roles[index].input)),
+                    None => Ok(()),
+                });
                 if let Err(error) = result {
                     let cancel = self.native.cancel(self.roles[index].preparation);
                     if cancel.is_ok() {
@@ -5107,6 +5380,12 @@ where
                         .map(|observer| observer.abandoned(&ticket));
                     if let Some(Err(other)) = abandoned {
                         self.record_failure(other.into());
+                    }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if let Some(observer) = &mut self.collection_observer_v2 {
+                        if let Err(other) = observer.abandoned(&ticket) {
+                            self.record_failure(other.into());
+                        }
                     }
                     if let Err(native) = cancel {
                         self.record_failure(error.into());
@@ -5147,6 +5426,12 @@ where
                         .map(|observer| observer.abandoned(&ticket));
                     if let Some(Err(other)) = abandoned {
                         self.record_failure(other.into());
+                    }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if let Some(observer) = &mut self.collection_observer_v2 {
+                        if let Err(other) = observer.abandoned(&ticket) {
+                            self.record_failure(other.into());
+                        }
                     }
                     return Err(error.into());
                 }
@@ -8531,6 +8816,19 @@ where
                     .filter_map(|r| r.ticket)
                     .collect::<Vec<_>>();
                 if let Err(error) = observer.settled(&tickets) {
+                    self.record_failure(error.into());
+                }
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if let Some(observer) = &mut self.collection_observer_v2 {
+                let tickets = self
+                    .roles
+                    .iter()
+                    .filter_map(|r| r.ticket)
+                    .collect::<Vec<_>>();
+                let result = observer.settled(&tickets);
+                self.collection_v2_settlement = Some(result.clone());
+                if let Err(error) = result {
                     self.record_failure(error.into());
                 }
             }

@@ -14,9 +14,10 @@ use super::{
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
-    AdaptiveManagerError, ManagerPhase, PcPortDriver, RoleOnlyExecutionManager,
-    RoleOnlyManagerRegistration, RoleOnlyManagerSources, RoleOnlyShutdownReceipt,
-    RoventCollectionRootAdmission, RoventNativeCollectionOrigin,
+    AdaptiveCollectionObserverBoxV2, AdaptiveManagerError, ManagerPhase, PcPortDriver,
+    RoleOnlyCollectionV2Rejection, RoleOnlyExecutionManager, RoleOnlyManagerRegistration,
+    RoleOnlyManagerSources, RoleOnlyShutdownReceipt, RoventCollectionRootAdmission,
+    RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin, RoventNativeCollectionOriginV2,
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
@@ -43,6 +44,7 @@ use rz_search::pals::rovent_frontier::{
 };
 use sha2::{Digest as _, Sha256};
 use std::{
+    any::Any,
     num::NonZeroU16,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
@@ -104,6 +106,81 @@ pub type RoventPcAdmissionObserver = Arc<
 >;
 pub type RoventPcClosureObserver =
     Arc<dyn Fn(&mut RoventPcSessionManager) -> Result<(), AdaptiveManagerError> + Send + Sync>;
+
+/// Failure keeps the original observer and root authority. The returned live
+/// objects are not completion evidence and may require separate quarantine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoventPcV2FrontierAdmissionStatus {
+    Rejected,
+    Panicked,
+}
+
+pub(crate) enum RoventPcV2ObserverAttachRejection {
+    BeforeAdmission {
+        error: AdaptiveManagerError,
+        status: RoventPcV2FrontierAdmissionStatus,
+        root: Arc<RoventRootAdmissionV2>,
+        observer: AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
+        // The original panic payload may itself own live resources. It must
+        // remain with the rejected root and observer until safely handled.
+        panic_payload: Option<Box<dyn Any + Send>>,
+    },
+    Manager(RoleOnlyCollectionV2Rejection<PcPortQuestion, VirtualReviewTicketOutput>),
+}
+
+/// Attach an observation-only V2 consumer to the existing manager and the
+/// actual frontier. Teacher process ownership and product launch remain
+/// separate and are not authorized by this operation.
+pub(crate) fn attach_pc_v2_collection_observer(
+    manager: &mut RoventPcSessionManager,
+    origin: &RoventNativeCollectionOriginV2,
+    root: Arc<RoventRootAdmissionV2>,
+    root_budget: Digest,
+    selective_policy: Digest,
+    observer: AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
+) -> Result<(), RoventPcV2ObserverAttachRejection> {
+    let admission = catch_unwind(AssertUnwindSafe(|| {
+        match manager.driver().port().rovent_frontier() {
+            Some(frontier) => RoventCollectionRootAdmissionV2::from_attached_frontier(
+                origin,
+                frontier,
+                Arc::clone(&root),
+                root_budget,
+                selective_policy,
+            )
+            .map_err(AdaptiveManagerError::from),
+            None => Err(AdaptiveManagerError::Invalid(
+                "P/C V2 collection has no actual attached frontier",
+            )),
+        }
+    }));
+    let admission = match admission {
+        Ok(Ok(admission)) => admission,
+        Ok(Err(error)) => {
+            return Err(RoventPcV2ObserverAttachRejection::BeforeAdmission {
+                error,
+                status: RoventPcV2FrontierAdmissionStatus::Rejected,
+                root,
+                observer,
+                panic_payload: None,
+            });
+        }
+        Err(payload) => {
+            return Err(RoventPcV2ObserverAttachRejection::BeforeAdmission {
+                error: AdaptiveManagerError::Invalid(
+                    "P/C V2 collection frontier admission panicked",
+                ),
+                status: RoventPcV2FrontierAdmissionStatus::Panicked,
+                root,
+                observer,
+                panic_payload: Some(payload),
+            });
+        }
+    };
+    manager
+        .install_collection_observer_v2(admission, observer)
+        .map_err(RoventPcV2ObserverAttachRejection::Manager)
+}
 #[derive(Default)]
 pub struct RoventPcCollectionHooks {
     pub root_admission: Option<RoventPcAdmissionObserver>,
@@ -1208,6 +1285,15 @@ impl RoventPcSessionDriver {
             .map(|value| value.clone())
             .map_err(|_| poisoned())
     }
+    /// Diagnostic sampling must not delay the original UCI response.
+    pub(crate) fn try_observe_root_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventPcRootReceiptV2>>, &'static str> {
+        self.latest_v2
+            .try_lock()
+            .map(|value| value.clone())
+            .map_err(|_| "pc_v2_root_busy_or_poisoned")
+    }
     pub fn latest_initial_v2(
         &self,
     ) -> Result<Option<Arc<RoventPcInitialReceiptV2>>, ContractError> {
@@ -1215,6 +1301,14 @@ impl RoventPcSessionDriver {
             .lock()
             .map(|value| value.clone())
             .map_err(|_| poisoned())
+    }
+    pub(crate) fn try_observe_initial_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventPcInitialReceiptV2>>, &'static str> {
+        self.latest_initial_v2
+            .try_lock()
+            .map(|value| value.clone())
+            .map_err(|_| "pc_v2_initial_busy_or_poisoned")
     }
     /// A failed transfer cannot silently discard the already recovered report.
     /// Only a closed root owner exposes this move; live work keeps its custody.

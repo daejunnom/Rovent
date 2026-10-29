@@ -63,6 +63,12 @@ impl AdaptiveModelNamespace {
         &self.value
     }
 
+    /// Read-only representation namespace recorded by this owner. These
+    /// values are not a ticket, native acceptance or physical completion.
+    pub fn representation_identity(&self) -> (Digest, Digest, PrecisionProfile, u64) {
+        (self.model, self.encoding, self.precision, self.frozen_epoch)
+    }
+
     /// Comparison-only identity of the actual registered mapping. This is not
     /// a representation key, cache hit or authority to issue a model request.
     pub(super) fn utility_cohort_digest(&self) -> Digest {

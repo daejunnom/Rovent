@@ -32,6 +32,17 @@ pub(crate) struct TeacherActorSourcePreflightV2 {
     manifest_digest: String,
 }
 
+impl TeacherActorSourcePreflightV2 {
+    /// Metadata needed for the same-root process roster. This does not expose
+    /// or replace the original pinned source descriptors held by this value.
+    pub(super) fn actor_digest(&self) -> Digest {
+        self.actor_digest
+    }
+    pub(super) fn collection_owner(&self) -> u32 {
+        self.collection_owner
+    }
+}
+
 /// Compare one manifest actor against the exact source duplicated from the
 /// root's original preload. The caller still checks the complete roster and
 /// unique actor/index/owner assignments when assembling the actual session.

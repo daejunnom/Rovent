@@ -117,6 +117,34 @@ pub trait AdaptiveCollectionObserver<Q, O>: Send {
 }
 pub type AdaptiveCollectionObserverBox<Q, O> = Box<dyn AdaptiveCollectionObserver<Q, O>>;
 
+/// Registry-issued root ranking paired with its original /2 root capability.
+/// This cannot be constructed from serialized metadata or used as a teacher
+/// result or physical-completion proof.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventRootRankingAcceptanceV2 {
+    ranking: ProposerRankingPublished,
+    admission: RoventCollectionRootAdmissionV2,
+}
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventRootRankingAcceptanceV2 {
+    pub(super) fn from_current_ranking(
+        ranking: &ProposerRankingPublished,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        admission.validate_ranking(ranking)?;
+        Ok(Self {
+            ranking: ranking.clone(),
+            admission: admission.clone(),
+        })
+    }
+    pub fn ranking(&self) -> &ProposerRankingPublished {
+        &self.ranking
+    }
+    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 {
+        &self.admission
+    }
+}
+
 /// The origin of a recorded search-consumption observation.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +183,33 @@ pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
         accepted: &AcceptedRoleStep,
         observation: RoleOnlySearchConsumptionV2,
     ) -> Result<(), AdaptiveCollectionError>;
+    /// Adaptive root ranking has its own registry proof and has already been
+    /// consumed by the root when this callback is invoked.
+    fn adaptive_root_ranking(
+        &mut self,
+        _accepted: &RoventRootRankingAcceptanceV2,
+        _input: &FrameInput<ReviewView, Q>,
+        _output: &O,
+    ) -> Result<(), AdaptiveCollectionError> {
+        Err(AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Accepted,
+            "AdaptiveRankingUnsupported",
+            "observer does not support adaptive V2 ranking",
+        ))
+    }
+    /// Reports an actual adaptive search-consumption transition after its
+    /// separate native acceptance. It never creates acceptance authority.
+    fn adaptive_consumed(
+        &mut self,
+        _accepted: &AcceptedRoleStep,
+        _after_error_readback: bool,
+    ) -> Result<(), AdaptiveCollectionError> {
+        Err(AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Accepted,
+            "AdaptiveConsumptionUnsupported",
+            "observer does not support adaptive V2 consumption",
+        ))
+    }
     fn abandoned(&mut self, ticket: &RoleTicketEnvelope) -> Result<(), AdaptiveCollectionError>;
     fn settled(&mut self, tickets: &[RoleTicketEnvelope]) -> Result<(), AdaptiveCollectionError>;
 }

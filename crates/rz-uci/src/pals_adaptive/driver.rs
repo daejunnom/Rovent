@@ -1529,6 +1529,56 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         }
         Ok(())
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_collection_admission_v2(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .as_ref()
+            .and_then(|port| port.rovent_frontier())
+            .ok_or(AdaptiveManagerError::Invalid(
+                "V2 collection requires the actual attached Rovent frontier",
+            ))?;
+        admission.validate_frontier(frontier)?;
+        let original = frontier.registration();
+        let root = admission.root_admission();
+        let namespace = admission
+            .native_origin()
+            .startup_snapshot()
+            .model_namespace()
+            .map_err(|_| AdaptiveManagerError::Invalid("V2 original Ready namespace"))?;
+        let active = root
+            .original_context()
+            .accepts()
+            .map_err(|_| AdaptiveManagerError::Invalid("V2 collection root unavailable"))?;
+        if !active
+            || root.authority() != self.authority
+            || root.authority() != original.authority
+            || root.hard_deadline() != original.original_deadline
+            || root.goal() != original.goal
+            || root.requested_nodes() != original.nodes
+            || admission.root_budget() != original.root_budget
+            || admission.selective_policy() != original.selective_policy
+            || admission
+                .native_origin()
+                .sources()
+                .lock()
+                .manifest
+                .engine
+                .mode
+                != original.mode
+            || original.model_namespace.as_ref() != &namespace
+            || !Arc::ptr_eq(admission.rules(), &original.root_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &original.root_moves)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 collection cap differs from the actual PCR registration",
+            ));
+        }
+        Ok(())
+    }
     fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
         Ok(self
             .port

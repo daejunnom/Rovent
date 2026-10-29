@@ -82,10 +82,26 @@ pub(super) fn verify_historical_submitted_review_fields(
     input_sha256: &str,
     native: &RoventNativeLifecycle,
 ) -> Result<(), ArenaError> {
+    verify_historical_submitted_review_fields_for_domain(
+        input,
+        input_sha256,
+        native,
+        ROVENT_NATIVE_RAW_V3_DOMAIN,
+    )
+}
+
+/// Checks the original submitted input without rewriting its raw schema.
+/// Callers must first validate their exact native domain and root authority.
+pub(super) fn verify_historical_submitted_review_fields_for_domain(
+    input: &rz_experiments::rovent_submitted_input::RoventSubmittedInputV1,
+    input_sha256: &str,
+    native: &RoventNativeLifecycle,
+    raw_domain: &str,
+) -> Result<(), ArenaError> {
     input.validate()?;
     let raw = &native.raw_submission;
     check(
-        raw["schema"] == ROVENT_NATIVE_RAW_V3_DOMAIN
+        raw["schema"] == raw_domain
             && input_sha256 == input.sha256()?
             && raw["input_sha256"] == input_sha256,
         "submitted review requires original raw3/submitted-input family and seal",

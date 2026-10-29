@@ -960,6 +960,157 @@ fn external_profiles_keep_teacher_checker_opponent_purpose_and_verified_pin_sepa
 }
 
 #[test]
+fn v2_pc_collection_can_declare_independent_teacher_without_changing_v1() {
+    for mode in [ExecutionMode::CpuPc, ExecutionMode::HybridPc] {
+        for shared_pool in [false, true] {
+            let mut original = manifest();
+            original.purpose = RoventPurpose::Collection;
+            original.engine.mode = mode;
+            original
+                .engine
+                .teachers
+                .push(external(RoventExternalPurpose::Teacher));
+            if mode.pc_compute() == PcCompute::Accelerator {
+                original.engine.pc.backend = RoventBackend::OrtCuda;
+                original.engine.pc.device = RoventDevice::Cuda {
+                    ordinal: 0,
+                    registered_device: "test-gpu/1".into(),
+                };
+                original.engine.pc.runtime_artifacts = vec![artifact("ort.so")];
+                original.engine.pc.ort_intra_threads = Some(1);
+                original.engine.pc.ort_inter_threads = Some(1);
+                original.engine.pc.ort_spinning = Some(false);
+                original.resources.gpu_devices = 1;
+            }
+            if shared_pool {
+                original.resources.pools[0]
+                    .actors
+                    .insert(RoventActor::Teacher);
+            } else {
+                original.resources.pools.push(RoventThreadPool {
+                    actors: BTreeSet::from([RoventActor::Teacher]),
+                    max_threads: 1,
+                    cpu_charge_millicpus: 1000,
+                });
+            }
+            assert!(original.validate().is_err(), "V1 stays P-C teacher-free");
+            let v2 = policy_manifest_v2(
+                original,
+                RoventRootTieDeclarationV2::NotApplicable {
+                    reason: RoventOwnRNotApplicableV2::PcOnly,
+                },
+            );
+            v2.validate().unwrap();
+            let lock = v2.lock().unwrap();
+            let bytes = serde_json::to_string(&lock).unwrap();
+            assert_eq!(RoventInputLockV2::from_json(&bytes).unwrap(), lock);
+        }
+    }
+}
+
+#[test]
+fn v2_pc_collection_teacher_preserves_pin_purpose_and_real_resource_checks() {
+    let mut original = manifest();
+    original.purpose = RoventPurpose::Collection;
+    original
+        .engine
+        .teachers
+        .push(external(RoventExternalPurpose::Teacher));
+    original.resources.pools.push(RoventThreadPool {
+        actors: BTreeSet::from([RoventActor::Teacher]),
+        max_threads: 1,
+        cpu_charge_millicpus: 1000,
+    });
+    let v2 = policy_manifest_v2(
+        original,
+        RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::PcOnly,
+        },
+    );
+    v2.validate().unwrap();
+    for purpose in [RoventPurpose::Validation, RoventPurpose::Deployment] {
+        let mut wrong = v2.clone();
+        wrong.purpose = purpose;
+        assert!(wrong.validate().is_err());
+    }
+    let mut wrong = v2.clone();
+    wrong.engine.teachers[0].purpose = RoventExternalPurpose::ArenaOpponent;
+    assert!(wrong.validate().is_err());
+    let mut wrong = v2.clone();
+    wrong.engine.teachers.push(wrong.engine.teachers[0].clone());
+    wrong.resources.pools[1].max_threads = 2;
+    assert!(wrong.validate().is_err(), "duplicate canonical teacher");
+    let mut wrong = v2.clone();
+    wrong.engine.teachers[0].profile.sha256 = "invalid".into();
+    assert!(wrong.validate().is_err());
+    let mut wrong = v2.clone();
+    wrong.resources.pools.pop();
+    assert!(
+        wrong.validate().is_err(),
+        "teacher must have a real CPU pool"
+    );
+    let mut wrong = v2.clone();
+    wrong.resources.cpu_quota_millicpus = 1000;
+    assert!(wrong.validate().is_err(), "all original pool charges count");
+    let mut wrong = v2;
+    wrong.engine.researcher = Some(RoventResearcher::Own {
+        implementation_sha256: sha_value('6'),
+        search_configuration_sha256: sha_value('7'),
+    });
+    assert!(
+        wrong.validate().is_err(),
+        "teacher does not authorize P-C R work"
+    );
+}
+
+#[test]
+fn v2_pcr_collection_keeps_the_original_r_and_teacher_validation() {
+    for mode in [ExecutionMode::CpuPcr, ExecutionMode::HybridPcr] {
+        let mut original = manifest();
+        original.purpose = RoventPurpose::Collection;
+        original.engine.mode = mode;
+        original.engine.researcher = Some(RoventResearcher::Own {
+            implementation_sha256: sha_value('6'),
+            search_configuration_sha256: sha_value('7'),
+        });
+        original
+            .engine
+            .teachers
+            .push(external(RoventExternalPurpose::Teacher));
+        original.resources.pools.push(RoventThreadPool {
+            actors: BTreeSet::from([RoventActor::OwnR, RoventActor::Teacher]),
+            max_threads: 2,
+            cpu_charge_millicpus: 1000,
+        });
+        if mode.pc_compute() == PcCompute::Accelerator {
+            original.engine.pc.backend = RoventBackend::OrtCuda;
+            original.engine.pc.device = RoventDevice::Cuda {
+                ordinal: 0,
+                registered_device: "test-gpu/1".into(),
+            };
+            original.engine.pc.runtime_artifacts = vec![artifact("ort.so")];
+            original.engine.pc.ort_intra_threads = Some(1);
+            original.engine.pc.ort_inter_threads = Some(1);
+            original.engine.pc.ort_spinning = Some(false);
+            original.resources.gpu_devices = 1;
+        }
+        original.validate().unwrap();
+        let v2 = policy_manifest_v2(
+            original,
+            RoventRootTieDeclarationV2::Own {
+                policy: RoventRootTiePolicyV2::RulesOrderConfirmed,
+                expected_search_identity: "own-r-fixture/1".into(),
+                expected_worker_conditions_sha256: sha_value('9'),
+            },
+        );
+        v2.validate().unwrap();
+        let mut wrong = v2;
+        wrong.engine.researcher = None;
+        assert!(wrong.validate().is_err());
+    }
+}
+
+#[test]
 fn pcr_mode_does_not_authorize_unregistered_teacher_or_nnuec_work() {
     let mut m = manifest();
     m.engine.mode = ExecutionMode::CpuPcr;

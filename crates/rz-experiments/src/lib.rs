@@ -18,6 +18,7 @@ mod pals_manifest_v5;
 mod pals_source_pins_v5;
 mod pals_startup_v5;
 pub mod rovent_corpus;
+pub mod rovent_corpus_lock_v2;
 pub mod rovent_corpus_v2;
 mod rovent_input_lock_owner;
 mod rovent_manifest;
@@ -172,6 +173,20 @@ impl<'de> Deserialize<'de> for UniqueValue {
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, ManifestError> {
     if input.len() > MAX_MANIFEST_BYTES {
         return Err(ManifestError::Parse("input exceeds 4 MiB limit".into()));
+    }
+    parse_bounded(input, MAX_MANIFEST_BYTES)
+}
+
+/// Same duplicate-key decoder with an explicit caller-owned byte limit. The
+/// existing public decoder retains its unchanged 4 MiB policy.
+pub(crate) fn parse_bounded<T: serde::de::DeserializeOwned>(
+    input: &str,
+    maximum: usize,
+) -> Result<T, ManifestError> {
+    if input.len() > maximum {
+        return Err(ManifestError::Parse(format!(
+            "input exceeds {maximum} bytes"
+        )));
     }
     let unique: UniqueValue =
         serde_json::from_str(input).map_err(|e| ManifestError::Parse(e.to_string()))?;

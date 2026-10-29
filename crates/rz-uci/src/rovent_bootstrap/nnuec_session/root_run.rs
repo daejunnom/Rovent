@@ -73,6 +73,9 @@ struct RootRunCustody {
     next_request_sequence: u64,
     game: Option<u64>,
     collection_admitted: bool,
+    /// The V2 teacher has no accepted physical retirement proof. This is a
+    /// separate state, never a replacement for the original collection error.
+    v2_teacher_retirement_unproven: bool,
     receipt: Option<NnuecRootReceipt>,
     result: Option<Box<PalsResult>>,
     work: Option<DriverWork>,
@@ -131,6 +134,7 @@ impl RootRunCustody {
             next_request_sequence: 0,
             game: None,
             collection_admitted: false,
+            v2_teacher_retirement_unproven: false,
             receipt: None,
             result: None,
             work: None,
@@ -813,7 +817,9 @@ impl RoventNnuecSessionDriver {
             policy: self.policy,
             first_request_sequence: run.next_request_sequence,
             native_cpu_node_limit: self.max_native_nodes,
-            endpoints: nnuec_endpoints(self.collection_origin.is_some()),
+            endpoints: nnuec_endpoints(
+                self.collection_origin.is_some() || self.collection_origin_v2.is_some(),
+            ),
             controller: self.controller,
             device_digest: self.snapshot.backend,
             cpu_device_digest: Digest(Sha256::digest(b"native-own-nnuec-v2-host-cpu").into()),
@@ -874,6 +880,9 @@ impl RoventNnuecSessionDriver {
         let root_budget = run.root_budget.expect("same original root budget");
         let mut collection_admitted = false;
         let mut collection_failure = None;
+        let mut v2_hook_started = false;
+        let mut v2_revoked = false;
+        let mut v2_admission_failure = None;
         let execution = {
             let manager = run.manager.as_mut().expect("actual admitted manager");
             #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -933,6 +942,56 @@ impl RoventNnuecSessionDriver {
                         }
                         collection_admitted = true;
                     }
+                    if let Some(origin) = &self.collection_origin_v2 {
+                        let original_admission = admission.v2().ok_or(
+                            AdaptiveManagerError::Invalid("V2 collection root owner is absent"),
+                        )?;
+                        let frontier = manager
+                            .driver()
+                            .port()
+                            .and_then(|port| port.rovent_frontier())
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "actual V2 NNUEC collection frontier absent",
+                            ))?;
+                        let cap = RoventCollectionRootAdmissionV2::from_attached_frontier(
+                            origin,
+                            frontier,
+                            Arc::clone(original_admission),
+                            root_budget,
+                            self.selective_policy,
+                        )?;
+                        let hooks = self.collection_hooks_v2.as_ref().ok_or(
+                            AdaptiveManagerError::Invalid("V2 collection hook owner absent"),
+                        )?;
+                        // A hook may start a physical teacher before it fails.
+                        // Mark the attempt first so failure requests revoke and
+                        // retains the original hook along with all root owners.
+                        v2_hook_started = true;
+                        let expected_cap = cap.clone();
+                        if let Err(rejected) = hooks.admit(manager, cap) {
+                            let error = if rejected.admission.same_original_admission(&expected_cap)
+                            {
+                                rejected.error.clone()
+                            } else {
+                                AdaptiveManagerError::Invalid(
+                                    "V2 rejected collection admission has a different root owner",
+                                )
+                            };
+                            v2_admission_failure = Some(rejected);
+                            return Err(error);
+                        }
+                        let installed = manager.collection_root_admission_v2().ok_or(
+                            AdaptiveManagerError::Invalid(
+                                "V2 collection observer was not installed",
+                            ),
+                        )?;
+                        if !installed.same_original_admission(&expected_cap) {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "V2 installed collection admission has a different root owner",
+                            ));
+                        }
+                        collection_admitted = true;
+                    }
                 }
                 // The same original gate precedes root input and every C pump.
                 if context.accepts().unwrap_or(false)
@@ -955,8 +1014,24 @@ impl RoventNnuecSessionDriver {
                         {
                             manager.begin_root_quiesce(context.shutdown_deadline)?;
                         }
-                        if collection_admitted && collection_failure.is_none() {
-                            if let Some(pump) = &self.collection_hooks.cooperative {
+                        if v2_hook_started
+                            && !v2_revoked
+                            && (!accepts
+                                || context.soft_expired(Instant::now())
+                                || manager.phase() != ManagerPhase::Running)
+                        {
+                            if let Some(hooks) = &self.collection_hooks_v2 {
+                                hooks.revoke();
+                            }
+                            v2_revoked = true;
+                        }
+                        if collection_admitted {
+                            if let Some(pump) = self
+                                .collection_hooks
+                                .cooperative
+                                .as_ref()
+                                .filter(|_| collection_failure.is_none())
+                            {
                                 match pump() {
                                     Ok(()) => {}
                                     Err(AdaptiveManagerError::Collection(error)) => {
@@ -968,6 +1043,25 @@ impl RoventNnuecSessionDriver {
                                             error,
                                             context.shutdown_deadline,
                                         )?;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            if let Some(hooks) = &self.collection_hooks_v2 {
+                                match hooks.pump() {
+                                    Ok(()) => {}
+                                    Err(AdaptiveManagerError::Collection(error)) => {
+                                        if !v2_revoked {
+                                            hooks.revoke();
+                                            v2_revoked = true;
+                                        }
+                                        if collection_failure.is_none() {
+                                            collection_failure = Some(error.clone());
+                                            manager.record_collection_caller_failure(
+                                                error,
+                                                context.shutdown_deadline,
+                                            )?;
+                                        }
                                     }
                                     Err(error) => return Err(error),
                                 }
@@ -1001,14 +1095,46 @@ impl RoventNnuecSessionDriver {
         match execution {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                if v2_hook_started {
+                    if let Some(hooks) = &self.collection_hooks_v2 {
+                        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                            self.retain_v2_revoke_panic(payload);
+                        }
+                    }
+                }
+                if let Some(rejected) = v2_admission_failure {
+                    return Err(run.retain_failure(
+                        "RoventNnuecExecution",
+                        error.to_string(),
+                        rejected,
+                    ));
+                }
                 return Err(run.retain_failure("RoventNnuecExecution", error.to_string(), error));
             }
             Err(payload) => {
+                if v2_hook_started {
+                    if let Some(hooks) = &self.collection_hooks_v2 {
+                        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                            self.retain_v2_revoke_panic(payload);
+                        }
+                    }
+                }
                 return Err(run.retain_panic(
                     "RoventNnuecExecutionPanic",
                     "actual root execution panicked; original panic and physical owners retained",
                     payload,
                 ));
+            }
+        }
+        if v2_hook_started && !v2_revoked {
+            if let Some(hooks) = &self.collection_hooks_v2 {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                    return Err(run.retain_panic(
+                        "RoventNnuecV2CollectionRevokePanic",
+                        "V2 collection revoke panicked; original hook and owners retained",
+                        payload,
+                    ));
+                }
             }
         }
         let physical = {
@@ -1090,6 +1216,27 @@ impl RoventNnuecSessionDriver {
                     Err(payload) => return Err(run.retain_panic("RoventNnuecCollectionClosurePanic",
                         "root closure panicked; original pending utility and physical owners retained", payload)),
                 }
+            }
+            if self.collection_hooks_v2.is_some() {
+                // The manager fence does not cover the teacher process. Do
+                // not invoke any publication/close callback before a typed,
+                // same-owner teacher retirement proof is wired in.
+                run.v2_teacher_retirement_unproven = true;
+                if let Some(detail) = run
+                    .semantic_failures
+                    .as_ref()
+                    .and_then(|errors| errors.first())
+                    .map(ToString::to_string)
+                {
+                    return Err(RootRunFailure {
+                        code: "RoventNnuecV2CollectionOriginalFailure",
+                        detail,
+                    });
+                }
+                return Err(run.fail(
+                    "RoventNnuecV2TeacherRetirementUnsupported",
+                    "V2 teacher retirement evidence is not yet connected",
+                ));
             }
         }
         let frontier = match run

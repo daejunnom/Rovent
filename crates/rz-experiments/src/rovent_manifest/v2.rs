@@ -81,7 +81,7 @@ impl RoventExecutionManifestV2 {
         )?;
         // This temporary value is private and validates shared declaration
         // fields only. It is never locked, returned, or used as admission.
-        RoventExecutionManifest {
+        let mut shared = RoventExecutionManifest {
             domain: ROVENT_EXECUTION_DOMAIN.into(),
             contract_revision: self.contract_revision.clone(),
             run_id: self.run_id.clone(),
@@ -94,8 +94,39 @@ impl RoventExecutionManifestV2 {
             output_bytes_max: self.output_bytes_max,
             agent_renewable: self.agent_renewable,
             provenance: self.provenance.clone(),
+        };
+        // /2 Collection may run independent CPU_T alongside P-C without
+        // adding an R researcher to the search. /1 deliberately continues to
+        // reject that combination. Validate the *actual* teacher and full
+        // resource declarations before omitting only their V1-only projection.
+        if self.purpose == RoventPurpose::Collection
+            && !self.engine.mode.has_native_r()
+            && !self.engine.teachers.is_empty()
+        {
+            require(
+                self.engine.teachers.len() <= 2,
+                "at most two Collection teachers may be declared",
+            )?;
+            let mut pins = BTreeSet::new();
+            for teacher in &self.engine.teachers {
+                teacher.validate()?;
+                require(
+                    teacher.purpose == RoventExternalPurpose::Teacher
+                        && pins.insert(&teacher.canonical_sha256),
+                    "invalid or duplicate Collection teacher profile",
+                )?;
+            }
+            self.resources.validate(&self.engine)?;
+            shared.engine.teachers.clear();
+            for pool in &mut shared.resources.pools {
+                pool.actors.remove(&RoventActor::Teacher);
+            }
+            shared
+                .resources
+                .pools
+                .retain(|pool| !pool.actors.is_empty());
         }
-        .validate()?;
+        shared.validate()?;
         self.startup_document.validate()?;
         require(
             sha(&self.startup_configuration_sha256)

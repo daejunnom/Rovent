@@ -17,6 +17,12 @@ pub const ROVENT_COLLECTION_ROOT_ADMISSION: &str = "rz-rovent-collection-root-ad
 pub const ROVENT_COLLECTION_EXTERNAL_ROOT_ADMISSION: &str = "rz-rovent-collection-root-admission/2";
 pub const ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE: &str =
     "rz-rovent-collection-profiled-external-source/1";
+/// These domains describe a /2 input-lock origin and attached root. The older
+/// collection-root-admission/2 domain is already used by V1 external R.
+pub const ROVENT_COLLECTION_NATIVE_ORIGIN_LOCK_V2: &str =
+    "rz-rovent-collection-native-origin-lock-v2/1";
+pub const ROVENT_COLLECTION_ROOT_ADMISSION_LOCK_V2: &str =
+    "rz-rovent-collection-root-admission-lock-v2/1";
 
 fn reject(message: impl Into<String>) -> AdaptiveCollectionError {
     AdaptiveCollectionError::new(
@@ -28,6 +34,27 @@ fn reject(message: impl Into<String>) -> AdaptiveCollectionError {
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 fn text_sha(value: Digest) -> String {
     value.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+fn mode_wire_v2(value: rz_contracts::rovent::ExecutionMode) -> &'static str {
+    use rz_contracts::rovent::ExecutionMode;
+    match value {
+        ExecutionMode::HybridPcr => "hybrid_pcr",
+        ExecutionMode::HybridPc => "hybrid_pc",
+        ExecutionMode::CpuPcr => "cpu_pcr",
+        ExecutionMode::CpuPc => "cpu_pc",
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+fn topology_wire_v2(value: crate::rovent_bootstrap::RoventStartupTopology) -> &'static str {
+    use crate::rovent_bootstrap::RoventStartupTopology;
+    match value {
+        RoventStartupTopology::RolesOnly => "roles_only",
+        RoventStartupTopology::OwnResearcher => "own_researcher",
+        RoventStartupTopology::ExternalResearcher => "external_researcher",
+    }
 }
 
 /// A /2 Collection origin is issued only for the original Ready native service
@@ -50,6 +77,11 @@ struct LoadedOriginV2 {
     namespace: AdaptiveModelNamespace,
     clock: rz_runtime::contracts::ContractSystemClock,
     _original_verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+    // The actual successful load and Ready observation, not a reconstructed
+    // snapshot from persisted declarations. It alone does not prove a run.
+    snapshot: crate::rovent_bootstrap::RoventNativeStartupSnapshot,
+    raw: Value,
+    raw_sha256: String,
     first_root: OnceLock<Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>>,
 }
 
@@ -98,6 +130,76 @@ impl RoventNativeCollectionOriginV2 {
         let namespace = snapshot
             .model_namespace()
             .map_err(|error| reject(error.to_string()))?;
+        let (representation_model, representation_encoding, representation_precision, frozen_epoch) =
+            namespace.representation_identity();
+        let representation_precision = match representation_precision {
+            rz_contracts::PrecisionProfile::Fp32 => "fp32",
+            _ => return Err(reject("unsupported /2 collection representation precision")),
+        };
+        let source_sha256 = rz_experiments::rovent_source_aggregate_sha256(
+            &lock.manifest.engine.source_commit,
+            &lock.manifest.engine.source_components,
+        )
+        .map_err(|error| reject(error.to_string()))?;
+        // Separate the startup observation from lock declarations. In
+        // particular, a source declaration is not executable attestation and
+        // a Ready event is not a completed neural request or GPU fence.
+        let raw = json!({
+            "schema": ROVENT_COLLECTION_NATIVE_ORIGIN_LOCK_V2,
+            "input_lock_domain": rz_experiments::ROVENT_LOCK_V2_DOMAIN,
+            "input_lock_sha256": text_sha(snapshot.input_lock),
+            "declaration": {
+                "purpose": "collection",
+                "mode": mode_wire_v2(lock.manifest.engine.mode),
+                "source_commit": lock.manifest.engine.source_commit,
+                "source_components": lock.manifest.engine.source_components,
+                "source_sha256_domain": rz_experiments::ROVENT_SOURCE_AGGREGATE_DOMAIN,
+                "source_sha256": source_sha256,
+                "model_semantics": pc.proposer.semantics,
+                "model_semantics_sha256": text_sha(Digest(rz_eval::pals_model::PalsModelProfile::VirtualReviewV1.registered_semantics_sha256())),
+                "encoding": pc.proposer.encoding,
+                "encoding_sha256": text_sha(Digest({use sha2::Digest as _; sha2::Sha256::digest(rz_eval::pals_model::virtual_review::ENCODING.as_bytes()).into()})),
+                "encoding_registry_sha256": text_sha(Digest(rz_eval::pals_model::virtual_review::registered_encoding_sha256())),
+                "model_implementation_sha256": pc.proposer.implementation_sha256,
+                "teacher_profiles": lock.manifest.engine.teachers,
+            },
+            "startup_observation": {
+                "domain": snapshot.domain,
+                "process_epoch": snapshot.process_epoch,
+                "mode": mode_wire_v2(snapshot.mode),
+                "topology": topology_wire_v2(snapshot.topology),
+                "weights_sha256": text_sha(snapshot.weights),
+                "export_manifest_sha256": text_sha(snapshot.export_manifest),
+                "backend_sha256": text_sha(snapshot.backend),
+                "runtime_library_sha256": text_sha(snapshot.runtime_library),
+                "runtime_bundle_codec_sha256": snapshot.runtime_bundle.map(text_sha),
+                "native_configuration_sha256": text_sha(snapshot.native_configuration),
+                "startup_configuration_sha256": text_sha(snapshot.startup_configuration),
+                "search_configuration_sha256": text_sha(snapshot.search_configuration),
+                "validator_loaded": snapshot.validator_loaded,
+                "physical_workers_created": snapshot.physical_workers_created,
+                "neural_service_executed": snapshot.neural_service_executed,
+            },
+            "registered_namespace": {
+                "value_semantics": namespace.value_identity().semantics,
+                "value_model": namespace.value_identity().model,
+                "value_encoding": namespace.value_identity().encoding,
+                "value_precision": namespace.value_identity().precision,
+                "representation_model_domain": "loaded_checkpoint_sha256",
+                "representation_model_sha256": text_sha(representation_model),
+                "representation_encoding_sha256": text_sha(representation_encoding),
+                "representation_precision": representation_precision,
+                "frozen_epoch": frozen_epoch,
+            },
+            "process_boundary_observation": "unknown",
+            "neural_completion": "unknown",
+            "physical_completion": "unknown",
+        });
+        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(
+            ROVENT_COLLECTION_NATIVE_ORIGIN_LOCK_V2,
+            &raw,
+        )
+        .map_err(|error| reject(error.to_string()))?;
         Ok(Self {
             original: Arc::new(LoadedOriginV2 {
                 sources,
@@ -108,6 +210,9 @@ impl RoventNativeCollectionOriginV2 {
                 namespace,
                 clock,
                 _original_verifier: verifier,
+                snapshot: snapshot.clone(),
+                raw,
+                raw_sha256,
                 first_root: OnceLock::new(),
             }),
         })
@@ -125,6 +230,54 @@ impl RoventNativeCollectionOriginV2 {
     ) -> &Arc<crate::rovent_bootstrap::RoventCollectionPreloadSources> {
         &self.original.preload
     }
+
+    /// Original Ready observation. It is not a liveness, inference, process
+    /// boundary or physical-completion attestation.
+    pub fn startup_snapshot(&self) -> &crate::rovent_bootstrap::RoventNativeStartupSnapshot {
+        &self.original.snapshot
+    }
+
+    /// Historical projection only; serialized metadata cannot reconstruct
+    /// this origin or create a verifier, worker or live root capability.
+    pub fn raw_receipt(&self) -> &Value {
+        &self.original.raw
+    }
+    pub fn raw_sha256(&self) -> &str {
+        &self.original.raw_sha256
+    }
+
+    /// Original /2 lock metadata, not the byte identity of its input file.
+    pub fn original_input_lock(&self) -> &rz_experiments::RoventInputLockV2 {
+        self.original.sources.lock()
+    }
+
+    /// Original retained bundle metadata bytes joined to the codec digest
+    /// reported by this same Ready load. The artifact SHA is a separate file
+    /// byte pin; neither digest attests execution or physical completion.
+    pub fn runtime_bundle_publication_bytes(
+        &self,
+    ) -> Result<Option<(rz_experiments::ArtifactRef, Vec<u8>)>, AdaptiveCollectionError> {
+        let original = self
+            .original
+            .sources
+            .runtime_bundle_publication_bytes()
+            .map_err(|error| reject(error.to_string()))?;
+        match (&original, self.original.snapshot.runtime_bundle) {
+            (Some((_, bytes)), Some(expected)) => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| reject("original /2 bundle metadata is not UTF-8"))?;
+                let spec = rz_eval::runtime_pin::CudaRuntimeBundleSpec::from_json(text)
+                    .map_err(|error| reject(error.to_string()))?;
+                let actual = Digest(spec.digest().map_err(|error| reject(error.to_string()))?);
+                if actual != expected {
+                    return Err(reject("original /2 bundle differs from Ready codec digest"));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(reject("original /2 bundle metadata/Ready presence differs")),
+        }
+        Ok(original)
+    }
 }
 
 /// A /2 root capability issued only at the successful real Frontier attach.
@@ -136,9 +289,13 @@ pub struct RoventCollectionRootAdmissionV2 {
     root_admission: Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
     rules: Arc<ContractState>,
     root_moves: Arc<RootMoveDomain>,
+    frontier_root_path: rz_search::pals::rovent_frontier::FrontierPath,
+    native_ledger: Option<rz_search::cpu_worker::CpuLedgerIdentity>,
     root_state: rz_contracts::StateIdentity,
     root_budget: Digest,
     selective_policy: Digest,
+    raw: Arc<Value>,
+    raw_sha256: Arc<str>,
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -206,15 +363,68 @@ impl RoventCollectionRootAdmissionV2 {
             .descriptor()
             .verify_against(lock)
             .map_err(|error| reject(error.to_string()))?;
+        root_admission
+            .allocation_clock()
+            .verify_against(root_admission.descriptor(), lock)
+            .map_err(|error| reject(error.to_string()))?;
+        let descriptor_digest = root_admission
+            .descriptor()
+            .digest()
+            .map_err(|error| reject(error.to_string()))?;
+        let allocation_digest = root_admission
+            .allocation_clock()
+            .digest()
+            .map_err(|error| reject(error.to_string()))?;
+        let raw = json!({
+            "schema": ROVENT_COLLECTION_ROOT_ADMISSION_LOCK_V2,
+            "native_origin": original.raw_receipt(),
+            "native_origin_sha256": original.raw_sha256(),
+            "process_epoch": registration.authority.epoch.0,
+            "game_generation": registration.authority.game.0,
+            "root_generation": registration.authority.root.0,
+            "implementation_sha256": text_sha(registration.authority.implementation),
+            "deadline_clock": registration.original_deadline.clock.0.0,
+            "deadline_tick": registration.original_deadline.at.0,
+            "root_budget_sha256": text_sha(root_budget),
+            "selective_policy_sha256": text_sha(selective_policy),
+            "root_state": {"owner": root_state.owner.0,
+                "revision": root_state.revision.0, "semantic": text_sha(root_state.semantic)},
+            "store_root_state": registration.root_state.0,
+            "root_moves": registration.root_moves.allowed().iter()
+                .map(|movement| movement.to_string()).collect::<Vec<_>>(),
+            "depth_plies": registration.goal.depth_plies.map(|value| value.get()),
+            "mate_moves": registration.goal.mate_moves.map(|value| value.get()),
+            "requested_nodes": registration.nodes,
+            "root_descriptor": root_admission.descriptor(),
+            "root_descriptor_sha256": text_sha(descriptor_digest),
+            "allocation_clock": root_admission.allocation_clock(),
+            "allocation_clock_sha256": text_sha(allocation_digest),
+        });
+        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(
+            ROVENT_COLLECTION_ROOT_ADMISSION_LOCK_V2,
+            &raw,
+        )
+        .map_err(|error| reject(error.to_string()))?;
+        if !root_admission
+            .original_context()
+            .accepts()
+            .map_err(|error| reject(error.to_string()))?
+        {
+            return Err(reject("original /2 root revoked during attach"));
+        }
         let _ = loaded.first_root.set(Arc::clone(&root_admission));
         Ok(Self {
             original: original.clone(),
             root_admission,
             rules: Arc::clone(&registration.root_rules),
             root_moves: Arc::clone(&registration.root_moves),
+            frontier_root_path: frontier.root_path(),
+            native_ledger: registration.native_ledger.clone(),
             root_state,
             root_budget,
             selective_policy,
+            raw: Arc::new(raw),
+            raw_sha256: raw_sha256.into(),
         })
     }
 
@@ -234,11 +444,43 @@ impl RoventCollectionRootAdmissionV2 {
     pub fn root_moves(&self) -> &Arc<RootMoveDomain> {
         &self.root_moves
     }
+    /// Compare this issued admission or one of its clones. A separately
+    /// issued origin is not equivalent merely because it uses the same worker.
+    /// A match does not establish current liveness or physical completion.
+    pub fn same_original_admission(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.original.original, &other.original.original)
+            && Arc::ptr_eq(&self.root_admission, &other.root_admission)
+            && Arc::ptr_eq(&self.rules, &other.rules)
+            && Arc::ptr_eq(&self.root_moves, &other.root_moves)
+            && self.frontier_root_path == other.frontier_root_path
+            && self.native_ledger == other.native_ledger
+    }
+    /// Match only the same attached in-process frontier and ledger; this
+    /// comparison neither recreates them nor certifies later liveness.
+    pub(crate) fn validate_frontier(
+        &self,
+        frontier: &RoventFrontier,
+    ) -> Result<(), AdaptiveCollectionError> {
+        if frontier.root_path() != self.frontier_root_path
+            || frontier.registration().native_ledger != self.native_ledger
+        {
+            return Err(reject("frontier or ledger differs from original /2 attach"));
+        }
+        Ok(())
+    }
     pub fn root_budget(&self) -> Digest {
         self.root_budget
     }
     pub fn selective_policy(&self) -> Digest {
         self.selective_policy
+    }
+
+    /// Metadata captured at actual attach; this cannot recreate a live root.
+    pub fn raw_receipt(&self) -> &Value {
+        &self.raw
+    }
+    pub fn raw_sha256(&self) -> &str {
+        &self.raw_sha256
     }
 
     /// Match the manager's verifier to the original Ready worker. Matching a

@@ -39,6 +39,15 @@ mod collection_teacher;
 pub use collection_teacher::RoventCollectionTeacherOwner;
 #[cfg(feature = "onnx-cpu")]
 pub use collection_teacher::RoventCollectionTeacherOwnerV2;
+#[cfg(feature = "onnx-cpu")]
+pub use collection_teacher::{
+    BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
+    RoventCollectionTeacherLifecycleV2, RoventTeacherDiagnosticsDispositionV2,
+    RoventTeacherPhysicalRetirementV2, RoventTeacherRetirementObservationV2,
+    RoventTeacherTerminalAccountingV2, TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2,
+    TeacherRecoveryKeyV2, bind_collection_teacher_actor_v2, spawn_bound_collection_teacher_v2,
+    verify_collection_teacher_pin,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

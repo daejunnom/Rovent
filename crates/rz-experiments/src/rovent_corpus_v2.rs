@@ -315,7 +315,29 @@ impl RoventNativeLifecycle {
         &self,
         manifest: &RoventCorpusManifest,
     ) -> Result<(), ManifestError> {
-        self.validate_domain(manifest, ROVENT_NATIVE_RAW_V3_DOMAIN)?;
+        self.validate_submitted_input_for_domain(
+            manifest,
+            ROVENT_NATIVE_RAW_V3_DOMAIN,
+            validate_submitted_root_admission,
+            |root| root["native_origin"]["purpose"] == "collection",
+        )
+    }
+
+    /// Shared receipt checks only. The caller must supply the exact raw
+    /// domain and root validator for its own separately registered family.
+    /// It does not recreate a live native, root, or physical authority.
+    pub(crate) fn validate_submitted_input_for_domain<F, P>(
+        &self,
+        manifest: &RoventCorpusManifest,
+        domain: &str,
+        validate_root: F,
+        root_is_collection: P,
+    ) -> Result<(), ManifestError>
+    where
+        F: FnOnce(&serde_json::Value, &serde_json::Value) -> Result<(), ManifestError>,
+        P: FnOnce(&serde_json::Value) -> bool,
+    {
+        self.validate_domain(manifest, domain)?;
         for (raw, names) in [
             (
                 &self.raw_submission,
@@ -396,12 +418,12 @@ impl RoventNativeLifecycle {
             )?;
         }
         let root = &self.raw_retirement["root_admission"];
-        validate_submitted_root_admission(root, &self.raw_retirement["root_admission_sha256"])?;
+        validate_root(root, &self.raw_retirement["root_admission_sha256"])?;
         ensure(
             matches!(self.head.as_str(), "proposer" | "critic")
                 && self.raw_submission["rules_replay"]["schema"]
                     == "rz-rovent-submitted-rules-replay/1"
-                && root["native_origin"]["purpose"] == "collection"
+                && root_is_collection(root)
                 && matches!(
                     self.raw_retirement["acceptance_kind"].as_str(),
                     Some("accepted_role_step" | "root_ranking_published")
@@ -680,11 +702,15 @@ impl RoventTrainingRecordV2 {
         )
     }
     pub fn sha256(&self) -> Result<String, ManifestError> {
+        self.sha256_for_domain(ROVENT_TRAINING_RECORD_V2_DOMAIN)
+    }
+
+    pub(crate) fn sha256_for_domain(&self, domain: &str) -> Result<String, ManifestError> {
         let mut raw =
             serde_json::to_value(self).map_err(|e| ManifestError::Integrity(e.to_string()))?;
         raw["record_sha256"] = serde_json::json!("");
         raw["input"] = serde_json::json!({"sealed_input_sha256":self.input_sha256});
-        generation_digest(ROVENT_TRAINING_RECORD_V2_DOMAIN, &raw)
+        generation_digest(domain, &raw)
     }
     pub fn seal(&mut self, manifest: &RoventCorpusManifestV2) -> Result<(), ManifestError> {
         self.input_sha256 = self.input.sha256()?;
@@ -697,12 +723,22 @@ impl RoventTrainingRecordV2 {
         self.input.validate()?;
         self.native
             .validate_submitted_input_v3(&manifest.common_registration_projection())?;
+        self.validate_record_body(manifest, ROVENT_TRAINING_RECORD_V2_DOMAIN)
+    }
+
+    /// Pure shared record/target checks after the caller validates its own
+    /// explicit native lifecycle domain. No record is relabeled or published.
+    pub(crate) fn validate_record_body(
+        &self,
+        manifest: &RoventCorpusManifestV2,
+        record_domain: &str,
+    ) -> Result<(), ManifestError> {
         ensure(
-            self.schema == ROVENT_TRAINING_RECORD_V2_DOMAIN
+            self.schema == record_domain
                 && self.role == self.input.role
                 && self.input_sha256 == self.input.sha256()?
                 && self.origin_sha256 == self.origin(manifest)?
-                && self.record_sha256 == self.sha256()?
+                && self.record_sha256 == self.sha256_for_domain(record_domain)?
                 && self.input.model_epoch == manifest.model_epoch
                 && self.input.context_epoch == manifest.context_epoch
                 && manifest.opening_splits.get(&self.input.opening_id) == Some(&self.split)

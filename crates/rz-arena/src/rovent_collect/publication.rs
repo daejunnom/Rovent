@@ -342,6 +342,30 @@ impl RoventPublicationSourceSnapshot {
             .ok_or_else(|| invalid("publication source metadata byte overflow"))
     }
 }
+
+// The durable file writer shares only the already captured metadata bytes.
+// Implementing this trait cannot create a live admission or publication proof.
+#[cfg(target_os = "linux")]
+pub(super) trait PublicationSourceBytes {
+    fn canonical_lock_sha256(&self) -> &str;
+    fn lock_bytes(&self) -> &[u8];
+    fn runtime_bundle(&self) -> Option<(&rz_experiments::ArtifactRef, &[u8])>;
+}
+
+#[cfg(target_os = "linux")]
+impl PublicationSourceBytes for RoventPublicationSourceSnapshot {
+    fn canonical_lock_sha256(&self) -> &str {
+        &self.lock.canonical_sha256
+    }
+    fn lock_bytes(&self) -> &[u8] {
+        &self.lock_bytes
+    }
+    fn runtime_bundle(&self) -> Option<(&rz_experiments::ArtifactRef, &[u8])> {
+        self.bundle
+            .as_ref()
+            .map(|(pin, bytes)| (pin, bytes.as_slice()))
+    }
+}
 impl FinishedRoventCorpus {
     pub(super) fn from_writer(writer: RoventCorpusWriter) -> Result<Self, ArenaError> {
         check(
@@ -444,18 +468,18 @@ impl FinishedRoventCorpus {
 /// 기존 내구성 I/O만 공유한다. 원 writer의 private admission source와 형식별
 /// validator를 요구하며 공개 metadata를 live 권한으로 되살리지 않는다.
 #[cfg(target_os = "linux")]
-pub(super) struct RoventPublicationMaterial<'a> {
+pub(super) struct RoventPublicationMaterial<'a, S> {
     pub manifest_bytes: &'a [u8],
     pub index_bytes: &'a [u8],
     pub chunks: &'a [RoventCorpusChunk],
-    pub admissions: &'a BTreeMap<String, Arc<RoventPublicationSourceSnapshot>>,
+    pub admissions: &'a BTreeMap<String, Arc<S>>,
 }
 #[cfg(target_os = "linux")]
-pub(super) fn publish_original_payloads<P: serde::Serialize>(
+pub(super) fn publish_original_payloads<P: serde::Serialize, S: PublicationSourceBytes>(
     directory: &cap_std::fs::Dir,
     until: std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
-    material: RoventPublicationMaterial<'_>,
+    material: RoventPublicationMaterial<'_, S>,
     build: impl FnOnce(
         RoventPublicationFile,
         RoventPublicationFile,
@@ -556,7 +580,7 @@ pub(super) fn publish_original_payloads<P: serde::Serialize>(
     if material
         .admissions
         .values()
-        .any(|source| source.bundle.is_some())
+        .any(|source| source.runtime_bundle().is_some())
     {
         directory.create_dir("runtime-bundles").map_err(io)?;
     }
@@ -565,23 +589,23 @@ pub(super) fn publish_original_payloads<P: serde::Serialize>(
     let mut admissions = Vec::with_capacity(material.admissions.len());
     for (native_sha, source) in material.admissions {
         active()?;
-        let canonical = &source.lock.canonical_sha256;
+        let canonical = source.canonical_lock_sha256();
         let input_lock = match locks.get(canonical) {
             Some(pin) => pin.clone(),
             None => {
                 let pin = put(
                     directory,
                     &format!("input-locks/{canonical}.json"),
-                    &source.lock_bytes,
+                    source.lock_bytes(),
                 )?;
                 payload_bytes = payload_bytes
                     .checked_add(pin.bytes)
                     .ok_or_else(|| invalid("publication payload overflow"))?;
-                locks.insert(canonical.clone(), pin.clone());
+                locks.insert(canonical.to_owned(), pin.clone());
                 pin
             }
         };
-        let runtime_bundle_manifest = if let Some((original, bytes)) = &source.bundle {
+        let runtime_bundle_manifest = if let Some((original, bytes)) = source.runtime_bundle() {
             Some(match bundles.get(&original.sha256) {
                 Some(pin) => pin.clone(),
                 None => {
@@ -607,7 +631,7 @@ pub(super) fn publish_original_payloads<P: serde::Serialize>(
         admissions.push(RoventPublicationAdmission {
             native_admission_sha256: native_sha.clone(),
             input_lock,
-            canonical_input_lock_sha256: canonical.clone(),
+            canonical_input_lock_sha256: canonical.to_owned(),
             runtime_bundle_manifest,
         });
     }

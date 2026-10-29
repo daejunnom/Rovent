@@ -11,6 +11,7 @@ enum ConsumeFault {
     #[default]
     None,
     ErrorAfterCommit,
+    ReadbackUnknownAfterCommit,
     DeadlineBeforeCommit,
 }
 
@@ -89,7 +90,10 @@ impl RoleOnlySearchDriver<u64> for RoleOnlyFixture {
         self.submitted.remove(&accepted.ticket().id).unwrap();
         self.consumed
             .push((*accepted.ticket(), input.view.sequence()));
-        if matches!(self.consume_fault, ConsumeFault::ErrorAfterCommit) {
+        if matches!(
+            self.consume_fault,
+            ConsumeFault::ErrorAfterCommit | ConsumeFault::ReadbackUnknownAfterCommit
+        ) {
             return Err(AdaptiveManagerError::Invalid(
                 "fixture error after actual consume",
             ));
@@ -118,6 +122,11 @@ impl RoleOnlySearchDriver<u64> for RoleOnlyFixture {
         ticket: &RoleTicketEnvelope,
         _: &FrameInput<ReviewView, u64>,
     ) -> Result<bool, AdaptiveManagerError> {
+        if matches!(self.consume_fault, ConsumeFault::ReadbackUnknownAfterCommit) {
+            return Err(AdaptiveManagerError::Invalid(
+                "fixture consumption readback unknown",
+            ));
+        }
         Ok(self.consumed.iter().any(|(recorded, _)| recorded == ticket))
     }
     fn is_complete(&self) -> bool {
@@ -569,6 +578,60 @@ impl AdaptiveCollectionObserver<u64, RoleOutput> for RoleOnlyObserverFixture {
     }
 }
 
+#[test]
+fn missing_v1_collection_admission_stops_adaptive_ranking_fanout() {
+    use rz_contracts::rovent::{ExecutionMode, SearchRecipient};
+
+    // This injects only an observer into the existing CPU native/registry
+    // fixture. No Collection admission or observer ranking callback is made:
+    // the failure is the missing original admission, not a fabricated proof.
+    let (mut manager, facts, root, until) = fixture_with_registered_role_limit_window(
+        FixtureScope::OwnCpuReciprocal,
+        true,
+        4096,
+        None,
+        None,
+        Duration::from_secs(15),
+    );
+    manager
+        .configure_rovent_reciprocal(RoventReciprocalPolicy {
+            mode: ExecutionMode::CpuPcr,
+            root_budget: Digest([92; 32]),
+            recipient: SearchRecipient::Proposer,
+            max_questions_per_job: 1,
+            node_interval: 1,
+            first_question_sequence: 1,
+        })
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    manager.collection_observer = Some(Box::new(RoleOnlyObserverFixture {
+        events,
+        reject_accepted: false,
+    }));
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.failures().next().is_some()
+    });
+
+    assert!(manager.failures().any(|error| matches!(error,
+        AdaptiveManagerError::Collection(error)
+            if error.code == "MissingRoventRootAdmission")));
+    // Registry acceptance and the original root consumption happened, but
+    // no candidate frame or subsequent CPU/NN work may be admitted.
+    assert!(manager.root_ranking_proof.is_some());
+    assert_eq!(manager.counters().submitted_role_tickets, 1);
+    assert_eq!(manager.counters().consumed_role_outputs, 1);
+    assert_eq!(manager.driver().consumed.len(), 1);
+    assert_eq!(facts.accepted.lock().unwrap().len(), 1);
+    assert_eq!(manager.machine.frames().count(), 0);
+    assert!(manager.driver().actual_cpu.is_empty());
+
+    let receipt = manager.run_until(until, &AtomicBool::new(false)).unwrap();
+    assert!(receipt.permits_archive_close(), "{receipt:?}");
+    assert!(facts.finish_called.load(Ordering::Acquire));
+    assert_eq!(receipt.pending_tickets, 0);
+}
+
 fn finish_role_only_test_native(
     manager: RoleOnlyExecutionManager<u64, NativeFixture, RoleOnlyFixture>,
     facts: &NativeFacts,
@@ -666,6 +729,54 @@ fn role_only_consume_error_with_positive_readback_is_not_discarded_twice() {
     let driver = finish_role_only_test_native(manager, &facts);
     assert_eq!(driver.consumed.len(), 1);
     assert_eq!(driver.discarded, 0);
+}
+
+#[test]
+fn role_only_unknown_consumption_is_retained_without_duplicate_discard() {
+    let (mut manager, facts, until) = role_only_fixture(false);
+    manager.driver_mut().ready.truncate(1);
+    manager.driver_mut().strict_discard = true;
+    manager.driver_mut().consume_fault = ConsumeFault::ReadbackUnknownAfterCommit;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    manager
+        .install_collection_observer_fixture(Box::new(RoleOnlyObserverFixture {
+            events: Arc::clone(&events),
+            reject_accepted: false,
+        }))
+        .unwrap();
+    while manager.failures().next().is_none() {
+        assert!(Instant::now() < until);
+        manager.tick().unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    let cleanup_until = Instant::now() + WINDOW;
+    manager.begin_shutdown(cleanup_until).unwrap();
+    loop {
+        manager.tick().unwrap();
+        let receipt = manager.shutdown_receipt().unwrap();
+        if receipt.quarantined && receipt.native_physical_shutdown_confirmed {
+            assert!(receipt.retained_outputs > 0);
+            assert_eq!(receipt.counters.consumed_role_outputs, 0);
+            assert_eq!(receipt.counters.unused_role_results, 0);
+            break;
+        }
+        assert!(Instant::now() < cleanup_until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(facts.finish_called.load(Ordering::Acquire));
+    assert_eq!(manager.driver().consumed.len(), 1);
+    assert_eq!(manager.driver().discarded, 0);
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| *event == "abandoned")
+    );
+    assert!(manager.failures().any(|error| matches!(
+        error,
+        AdaptiveManagerError::Invalid("fixture consumption readback unknown")
+    )));
 }
 
 #[test]

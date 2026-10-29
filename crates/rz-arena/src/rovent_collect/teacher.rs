@@ -10,6 +10,8 @@ mod collection;
 pub use collection::RoventCollectionTeacherBinding;
 mod session;
 mod v2_actor_preflight;
+#[cfg(feature = "pals-collection-onnx")]
+mod v2_session;
 pub use session::*;
 mod pump;
 pub use pump::*;

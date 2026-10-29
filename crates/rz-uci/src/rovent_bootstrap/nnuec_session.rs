@@ -36,7 +36,8 @@ use crate::pals_adaptive::{
     AdaptiveManagerError, AdaptiveManagerRegistration, AdaptiveManagerSources,
     AdaptiveNnuecRetiredOwner, AdaptivePortDriver, AdaptiveRegisteredLedgerSources,
     AdaptiveSessionCollectionHooks, AdaptiveShutdownReceipt, ManagerPhase,
-    RoventCollectionRootAdmission, RoventNativeCollectionOrigin,
+    RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin,
+    RoventNativeCollectionOriginV2,
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
@@ -98,6 +99,30 @@ type Manager =
     AdaptiveExecutionManager<AdaptivePortQuestion, Backend, AdaptivePortDriver<AdaptivePortModel>>;
 type SemanticOwner = ResearcherPreparingOwner<AdaptivePortModel>;
 pub type RoventNnuecCollectionHooks = AdaptiveSessionCollectionHooks<Backend>;
+
+/// /2 collection is an independent, live owner. The hook keeps its teacher
+/// and publication custody. `revoke` is nonblocking, idempotent and acts only
+/// on this owner's actual root and teacher. Callbacks prove no physical fence.
+/// This internal seam is not connected to product launch until the /2 corpus
+/// and teacher lifecycle consumers can retain and drain the same owners.
+pub(crate) trait RoventNnuecCollectionHooksV2: Send + Sync {
+    fn admit(
+        &self,
+        manager: &mut Manager,
+        admission: RoventCollectionRootAdmissionV2,
+    ) -> Result<(), RoventNnuecCollectionAdmissionFailureV2>;
+    fn pump(&self) -> Result<(), AdaptiveManagerError>;
+    fn revoke(&self);
+}
+
+/// Failure custody returned by the /2 hook. This must contain the original
+/// admission and any observer/teacher owners acquired during the attempt;
+/// the session retains the whole value when admission fails.
+pub(crate) struct RoventNnuecCollectionAdmissionFailureV2 {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub owners: Box<dyn Any + Send>,
+}
 type RootReturn =
     Result<(Box<Idle>, SearchSessionReport, NnuecRootReceipt), (State, SearchSessionFailure)>;
 
@@ -610,6 +635,7 @@ pub struct RoventNnuecSessionV2Rejection {
     pub prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
     pub loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
     pub process: Arc<super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2>,
+    pub(crate) collection_hooks: Option<Arc<dyn RoventNnuecCollectionHooksV2>>,
 }
 #[derive(Clone, Debug)]
 pub struct RoventNnuecInitialReceiptV2 {
@@ -646,6 +672,9 @@ pub struct RoventNnuecSessionDriver {
     root_policy: RoventRootAdmissionPolicy,
     collection_origin: Option<RoventNativeCollectionOrigin>,
     collection_hooks: RoventNnuecCollectionHooks,
+    collection_origin_v2: Option<RoventNativeCollectionOriginV2>,
+    collection_hooks_v2: Option<Arc<dyn RoventNnuecCollectionHooksV2>>,
+    v2_revoke_panic: Mutex<Option<Box<dyn Any + Send>>>,
     selective_policy: Digest,
     frontier_limits: FrontierLimits,
     execution_limits: AdaptiveExecutionLimits,
@@ -667,6 +696,15 @@ pub struct RoventNnuecSessionDriver {
     nnuec_diagnostics: diagnostics::NnuecDiagnosticJournal,
 }
 impl RoventNnuecSessionDriver {
+    /// A secondary revoke panic must not replace the original root error or
+    /// release resources hidden in its payload while physical state is unknown.
+    fn retain_v2_revoke_panic(&self, payload: Box<dyn Any + Send>) {
+        match self.v2_revoke_panic.try_lock() {
+            Ok(mut retained) if retained.is_none() => *retained = Some(payload),
+            _ => std::mem::forget(payload),
+        }
+    }
+
     /// Source/configuration-derived identity only. The declared own-NNUEC
     /// assembly is checked without loading weights or constructing any native
     /// session, Ready, clock, worker or root authority.
@@ -940,6 +978,9 @@ impl RoventNnuecSessionDriver {
             root_policy,
             collection_origin,
             collection_hooks: collection_hooks.unwrap_or_default(),
+            collection_origin_v2: None,
+            collection_hooks_v2: None,
+            v2_revoke_panic: Mutex::new(None),
             selective_policy,
             frontier_limits,
             execution_limits,
@@ -978,184 +1019,246 @@ impl RoventNnuecSessionDriver {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventNnuecSessionV2Rejection> {
-        let built =
-            (|| -> Result<_, SearchSessionFailure> {
-                let sources = prepared.sources();
-                if !Arc::ptr_eq(sources.lock_owner(), process.input_lock())
-                    || !process.matches_startup_control(prepared.startup_control())
-                    || sources.private_root_path() != process.private_cwd()
-                    || !sources
-                        .same_original_root(process.original_root())
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecV2Root", &e))?
-                {
-                    return Err(failure(
-                        "RoventNnuecV2Custody",
-                        "original V2 source, process and control differ",
-                    ));
+        Self::new_v2_inner(
+            prepared,
+            loaded,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            None,
+        )
+    }
+
+    /// Internal /2 seam only. Product launch continues to use `new_v2` and
+    /// rejects collection until its teacher and corpus owners are connected.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
+    pub(crate) fn new_v2_with_collection_hooks(
+        prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
+        loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
+        process: Arc<super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: Arc<dyn RoventNnuecCollectionHooksV2>,
+    ) -> Result<Self, RoventNnuecSessionV2Rejection> {
+        Self::new_v2_inner(
+            prepared,
+            loaded,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            Some(hooks),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    fn new_v2_inner(
+        prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
+        loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
+        process: Arc<super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        collection_hooks_v2: Option<Arc<dyn RoventNnuecCollectionHooksV2>>,
+    ) -> Result<Self, RoventNnuecSessionV2Rejection> {
+        let built = (|| -> Result<_, SearchSessionFailure> {
+            let sources = prepared.sources();
+            if !Arc::ptr_eq(sources.lock_owner(), process.input_lock())
+                || !process.matches_startup_control(prepared.startup_control())
+                || sources.private_root_path() != process.private_cwd()
+                || !sources
+                    .same_original_root(process.original_root())
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecV2Root", &e))?
+            {
+                return Err(failure(
+                    "RoventNnuecV2Custody",
+                    "original V2 source, process and control differ",
+                ));
+            }
+            let collection_origin_v2 = match (
+                sources.lock().manifest.purpose,
+                sources.collection_preload_sources().is_some(),
+                collection_hooks_v2.is_some(),
+            ) {
+                (rz_experiments::RoventPurpose::Collection, true, true) => {
+                    Some(prepared.collection_identity().map_err(|error| {
+                        SearchSessionFailure::debug("RoventNnuecV2CollectionOrigin", &error)
+                    })?)
                 }
-                if sources.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection
-                    || sources.collection_preload_sources().is_some()
-                {
+                (rz_experiments::RoventPurpose::Collection, _, _) | (_, true, _) | (_, _, true) => {
                     return Err(failure(
                         "RoventNnuecV2CollectionUnsupported",
-                        "original V2 collection hooks are not connected",
+                        "V2 collection requires original preload and an explicit V2 hook owner",
                     ));
                 }
-                let document = sources.configuration();
-                document
-                    .require_supported_native_capabilities()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecCapability", &e))?;
-                let fields = document.fields();
-                let ExecutionConfiguration::OwnResearcher {
-                    event_order,
-                    queues,
-                    max_rounds,
-                    max_native_nodes,
-                    cpu_depth,
-                    cpu_nodes_per_task,
-                    cpu_plan,
-                    value,
-                    controller,
-                    ..
-                } = fields.execution
-                else {
-                    return Err(failure(
-                        "RoventNnuecStartup",
-                        "actual own-R configuration required",
-                    ));
-                };
-                if !matches!(value, ResearchValueConfiguration::NnuecV2 { .. })
-                    || !prepared.snapshot().mode.has_native_r()
-                    || prepared.snapshot().process_epoch != clock.epoch().0
-                    || prepared.snapshot().input_lock != loaded.input_lock_digest()
-                    || !loaded.matches_sources(prepared.sources())
-                    || identity.name.is_empty()
-                    || identity.author.is_empty()
-                {
-                    return Err(failure(
-                        "RoventNnuecStartup",
-                        "loaded NNUEC/source/process identity mismatch",
-                    ));
-                }
-                let collection_origin = None;
-                let original_owner = rz_experiments::RoventOriginalInputLock::from_v2(Arc::clone(
-                    sources.lock_owner(),
-                ))
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecV2Lock", &e.error))?;
-                let ready = prepared
-                    .service
-                    .ready_clock()
-                    .ok_or_else(|| failure("RoventNnuecStartup", "actual native Ready absent"))?;
-                let original = clock.runtime_clock();
-                if prepared.service.is_quarantined()
-                    || prepared.service.native_acceptance_verifier().is_none()
-                    || ready.domain() != original.domain()
-                    || ready.origin() != original.origin()
-                {
-                    return Err(SearchSessionFailure::physical_completion_unknown());
-                }
-                let control = controller
-                    .actual(*event_order)
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecController", &e))?;
-                // One initial Bound materializes exactly one physical researcher.
-                // Wider declarations are rejected rather than silently resized.
-                if control.max_workers != 1 || control.initial_workers != 1 {
-                    return Err(failure(
-                        "RoventNnuecWorkers",
-                        "this same-source assembly requires one declared own worker",
-                    ));
-                }
-                let limits = queues
+                _ => None,
+            };
+            let document = sources.configuration();
+            document
+                .require_supported_native_capabilities()
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecCapability", &e))?;
+            let fields = document.fields();
+            let ExecutionConfiguration::OwnResearcher {
+                event_order,
+                queues,
+                max_rounds,
+                max_native_nodes,
+                cpu_depth,
+                cpu_nodes_per_task,
+                cpu_plan,
+                value,
+                controller,
+                ..
+            } = fields.execution
+            else {
+                return Err(failure(
+                    "RoventNnuecStartup",
+                    "actual own-R configuration required",
+                ));
+            };
+            if !matches!(value, ResearchValueConfiguration::NnuecV2 { .. })
+                || !prepared.snapshot().mode.has_native_r()
+                || prepared.snapshot().process_epoch != clock.epoch().0
+                || prepared.snapshot().input_lock != loaded.input_lock_digest()
+                || !loaded.matches_sources(prepared.sources())
+                || identity.name.is_empty()
+                || identity.author.is_empty()
+            {
+                return Err(failure(
+                    "RoventNnuecStartup",
+                    "loaded NNUEC/source/process identity mismatch",
+                ));
+            }
+            let collection_origin = None;
+            let original_owner =
+                rz_experiments::RoventOriginalInputLock::from_v2(Arc::clone(sources.lock_owner()))
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecV2Lock", &e.error))?;
+            let ready = prepared
+                .service
+                .ready_clock()
+                .ok_or_else(|| failure("RoventNnuecStartup", "actual native Ready absent"))?;
+            let original = clock.runtime_clock();
+            if prepared.service.is_quarantined()
+                || prepared.service.native_acceptance_verifier().is_none()
+                || ready.domain() != original.domain()
+                || ready.origin() != original.origin()
+            {
+                return Err(SearchSessionFailure::physical_completion_unknown());
+            }
+            let control = controller
+                .actual(*event_order)
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecController", &e))?;
+            // One initial Bound materializes exactly one physical researcher.
+            // Wider declarations are rejected rather than silently resized.
+            if control.max_workers != 1 || control.initial_workers != 1 {
+                return Err(failure(
+                    "RoventNnuecWorkers",
+                    "this same-source assembly requires one declared own worker",
+                ));
+            }
+            let limits = queues
+                .actual()
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecQueues", &e))?;
+            if cpu_plan.paused_bytes_limit != limits.paused_bytes_per_worker_max {
+                return Err(failure(
+                    "RoventNnuecQueues",
+                    "actual paused-owner budget differs from queues",
+                ));
+            }
+            let root_tie_policy = document
+                .own_r_root_tie_policy()
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecTiePolicy", &e))?
+                .ok_or_else(|| failure("RoventNnuecTiePolicy", "own-R policy is required"))?;
+            let plan = DeferredNnuecCpuPlan::new_with_root_tie_policy(
+                cpu_plan
                     .actual()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecQueues", &e))?;
-                if cpu_plan.paused_bytes_limit != limits.paused_bytes_per_worker_max {
-                    return Err(failure(
-                        "RoventNnuecQueues",
-                        "actual paused-owner budget differs from queues",
-                    ));
-                }
-                let root_tie_policy = document
-                    .own_r_root_tie_policy()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecTiePolicy", &e))?
-                    .ok_or_else(|| failure("RoventNnuecTiePolicy", "own-R policy is required"))?;
-                let plan = DeferredNnuecCpuPlan::new_with_root_tie_policy(
-                    cpu_plan
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?,
-                    cpu_plan.ordering(),
-                    cpu_plan.paused_bytes_limit,
-                    cpu_plan.preserve_paused_side_scope,
-                    limits.worker_commands_max,
-                    cpu_plan.affinity(),
-                    root_tie_policy,
-                )
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?;
-                let source = DeferredNnuecRSource::new(Arc::clone(loaded.model()), plan);
-                let model =
-                    AdaptivePortModel::new_with_namespace(
-                        prepared.snapshot().role_model_identity(),
-                        Some(prepared.snapshot().model_value_identity().map_err(|e| {
-                            SearchSessionFailure::debug("RoventNnuecNamespace", &e)
-                        })?),
-                        prepared
-                            .snapshot()
-                            .model_namespace()
-                            .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
-                    )
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?;
-                let owner = ResearcherPreparingOwner::new_selected(
-                    ResearcherSemanticProfile {
-                        config: PalsConfig {
-                            beam_width: fields.semantic.beam_width,
-                            line_plies: fields.semantic.line_plies,
-                            max_nodes: fields.semantic.max_nodes,
-                            max_records: fields.semantic.max_records,
-                            max_role_calls: fields.semantic.max_role_calls,
-                            cpu_nodes_per_task: *cpu_nodes_per_task,
-                        },
-                        maximum_root_prefix_plies: fields.semantic.maximum_root_prefix_plies,
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?,
+                cpu_plan.ordering(),
+                cpu_plan.paused_bytes_limit,
+                cpu_plan.preserve_paused_side_scope,
+                limits.worker_commands_max,
+                cpu_plan.affinity(),
+                root_tie_policy,
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?;
+            let source = DeferredNnuecRSource::new(Arc::clone(loaded.model()), plan);
+            let model = AdaptivePortModel::new_with_namespace(
+                prepared.snapshot().role_model_identity(),
+                Some(
+                    prepared
+                        .snapshot()
+                        .model_value_identity()
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
+                ),
+                prepared
+                    .snapshot()
+                    .model_namespace()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?;
+            let owner = ResearcherPreparingOwner::new_selected(
+                ResearcherSemanticProfile {
+                    config: PalsConfig {
+                        beam_width: fields.semantic.beam_width,
+                        line_plies: fields.semantic.line_plies,
+                        max_nodes: fields.semantic.max_nodes,
+                        max_records: fields.semantic.max_records,
+                        max_role_calls: fields.semantic.max_role_calls,
+                        cpu_nodes_per_task: *cpu_nodes_per_task,
                     },
-                    model,
-                    ResolverPolicy::ModelWdlRestricted,
-                    document.post_repair_policy_for(prepared.snapshot().mode),
-                    fields
-                        .review
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecReview", &e))?,
-                    fields
-                        .index
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecIndex", &e))?,
-                    source,
-                )
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecSemantic", &e))?;
-                let implementation =
-                    Self::implementation_digest_from_metadata(document, root_policy)
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?;
-                Ok((
-                    owner,
-                    original_owner,
-                    collection_origin,
-                    implementation,
-                    Digest(document.search_configuration_digest().map_err(|e| {
-                        SearchSessionFailure::debug("RoventNnuecConfiguration", &e)
-                    })?),
-                    fields
-                        .frontier
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecFrontier", &e))?,
-                    limits,
-                    control,
-                    event_order.actual(),
-                    *max_rounds,
-                    *max_native_nodes,
-                    *cpu_depth,
-                ))
-            })();
+                    maximum_root_prefix_plies: fields.semantic.maximum_root_prefix_plies,
+                },
+                model,
+                ResolverPolicy::ModelWdlRestricted,
+                document.post_repair_policy_for(prepared.snapshot().mode),
+                fields
+                    .review
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecReview", &e))?,
+                fields
+                    .index
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecIndex", &e))?,
+                source,
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventNnuecSemantic", &e))?;
+            let implementation =
+                Self::implementation_digest_from_metadata(document, root_policy)
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?;
+            Ok((
+                owner,
+                original_owner,
+                collection_origin,
+                collection_origin_v2,
+                implementation,
+                Digest(
+                    document
+                        .search_configuration_digest()
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?,
+                ),
+                fields
+                    .frontier
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecFrontier", &e))?,
+                limits,
+                control,
+                event_order.actual(),
+                *max_rounds,
+                *max_native_nodes,
+                *cpu_depth,
+            ))
+        })();
         let (
             owner,
             original_owner,
             collection_origin,
+            collection_origin_v2,
             implementation,
             selective_policy,
             frontier_limits,
@@ -1173,6 +1276,7 @@ impl RoventNnuecSessionDriver {
                     prepared,
                     loaded,
                     process,
+                    collection_hooks: collection_hooks_v2,
                 });
             }
         };
@@ -1193,6 +1297,9 @@ impl RoventNnuecSessionDriver {
             root_policy,
             collection_origin,
             collection_hooks: RoventNnuecCollectionHooks::default(),
+            collection_origin_v2,
+            collection_hooks_v2,
+            v2_revoke_panic: Mutex::new(None),
             selective_policy,
             frontier_limits,
             execution_limits,
@@ -1325,6 +1432,15 @@ impl RoventNnuecSessionDriver {
             .map(|r| r.clone())
             .map_err(|_| poisoned())
     }
+    /// Diagnostic sampling must not delay the original UCI response.
+    pub(crate) fn try_observe_root_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventNnuecRootReceiptV2>>, &'static str> {
+        self.latest_v2
+            .try_lock()
+            .map(|r| r.clone())
+            .map_err(|_| "nnuec_v2_root_busy_or_poisoned")
+    }
     pub fn latest_initial_v2(
         &self,
     ) -> Result<Option<Arc<RoventNnuecInitialReceiptV2>>, ContractError> {
@@ -1332,6 +1448,14 @@ impl RoventNnuecSessionDriver {
             .lock()
             .map(|r| r.clone())
             .map_err(|_| poisoned())
+    }
+    pub(crate) fn try_observe_initial_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventNnuecInitialReceiptV2>>, &'static str> {
+        self.latest_initial_v2
+            .try_lock()
+            .map(|r| r.clone())
+            .map_err(|_| "nnuec_v2_initial_busy_or_poisoned")
     }
     pub(crate) fn storage_observation(
         &self,
@@ -1981,17 +2105,58 @@ impl RoventNnuecSessionDriver {
 
     fn finish(&self, until: Instant) -> Result<(), SearchSessionFailure> {
         self.closed.store(true, Ordering::Release);
+        let (v2_teacher_unproven, revoke_panicked) = if let Some(hooks) = &self.collection_hooks_v2
+        {
+            // Request the separate teacher shutdown but continue draining any
+            // independently recoverable native, actor and storage owners.
+            let panicked = match catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                Ok(()) => false,
+                Err(payload) => {
+                    self.retain_v2_revoke_panic(payload);
+                    true
+                }
+            };
+            (true, panicked)
+        } else {
+            (false, false)
+        };
+        let revoke_panicked = revoke_panicked
+            || (v2_teacher_unproven
+                && self
+                    .v2_revoke_panic
+                    .try_lock()
+                    .map(|retained| retained.is_some())
+                    .unwrap_or(true));
+        let teacher_unknown = || {
+            if revoke_panicked {
+                unknown(
+                    "RoventNnuecV2RevokePanic",
+                    "V2 teacher revoke panicked; original payload and owners retained",
+                )
+            } else {
+                SearchSessionFailure::physical_completion_unknown()
+            }
+        };
         let mut state = self
             .state
             .try_lock()
             .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
         if matches!(*state, State::Closed) {
-            return Ok(());
+            return if v2_teacher_unproven {
+                Err(teacher_unknown())
+            } else {
+                Ok(())
+            };
         }
         let idle = match &mut *state {
             State::Idle(idle) => idle,
             State::Retained { _owners } => {
-                return self.drain_retained_storage(_owners.as_mut(), until);
+                let drained = self.drain_retained_storage(_owners.as_mut(), until);
+                return match drained {
+                    Err(error) => Err(error),
+                    Ok(()) if v2_teacher_unproven => Err(teacher_unknown()),
+                    Ok(()) => Ok(()),
+                };
             }
             _ => return Err(SearchSessionFailure::physical_completion_unknown()),
         };
@@ -2027,6 +2192,11 @@ impl RoventNnuecSessionDriver {
                     }
                     return Err(rejected.failure);
                 }
+            }
+            if v2_teacher_unproven {
+                // Native/actor shutdown is known, but the hook and its actual
+                // teacher owner must remain quarantined rather than Closed.
+                return Err(teacher_unknown());
             }
             *state = State::Closed;
             Ok(())
@@ -2157,6 +2327,21 @@ impl Drop for RoventNnuecSessionDriver {
             self.sources.forget_original();
             if let Some(process) = &self.process_v2 {
                 std::mem::forget(Arc::clone(process));
+            }
+            // A /2 hook owns its teacher/collector and may have started a
+            // physical worker before a callback failed or panicked. The
+            // unresolved owner must outlive this session just like the native
+            // and source owners; a successful callback is not a fence.
+            if let Some(hooks) = self.collection_hooks_v2.take() {
+                std::mem::forget(hooks);
+            }
+            if let Some(payload) = self
+                .v2_revoke_panic
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                std::mem::forget(payload);
             }
             let storage = self
                 .storage

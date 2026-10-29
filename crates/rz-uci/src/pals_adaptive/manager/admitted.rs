@@ -68,6 +68,12 @@ where
             role_call_limit,
             collection_observer: None,
             collection_admission: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_observer_v2: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_admission_v2: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_settlement: None,
             roles: Vec::with_capacity(limits.role_tickets_max),
             acknowledgements: VecDeque::with_capacity(limits.role_tickets_max),
             own: own_workers

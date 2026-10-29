@@ -432,6 +432,16 @@ where
             .map(|receipt| receipt.clone())
             .map_err(|_| poisoned("Rovent V2 root observation mutex poisoned"))
     }
+    /// Best-effort observation never waits for the original receipt owner.
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn try_observe_rovent_root_v2(
+        &self,
+    ) -> Result<Option<Arc<RoventNativeRootReceiptV2>>, &'static str> {
+        self.latest_rovent_root_v2
+            .try_lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| "adaptive_v2_root_busy_or_poisoned")
+    }
     pub(super) fn observe_rovent_root(
         &self,
         manager: &SessionManager<B>,

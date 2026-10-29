@@ -156,7 +156,10 @@ where
             }
             _ => {}
         }
-        self.mark_role_consumed(index)?;
+        self.mark_role_consumed(index, false)?;
+        if self.has_collection_failure() {
+            return Ok(());
+        }
         // A local leaf may be only shallow horizon progress. Only the owner's
         // next explicit NoQuestion can release the root continuation barrier.
         self.goal_continuation_pending = true;
