@@ -2,7 +2,7 @@
 //! published corpus or a claim of native/teacher physical completion.
 use super::*;
 use crate::rovent_collect::pc_hooks_lock_v2::{
-    RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2, PcWorkerExitKindV2,
+    RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2, PcWorkerExitKindV2, PcWorkerStartErrorV2,
 };
 use crate::rovent_collect::teacher::v2_session::RoventTeacherRosterEntryV2;
 use rz_experiments::RoventInputLockV2;
@@ -10,7 +10,12 @@ use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::rovent_bootstrap::launch::{
     RoventPcCollectionLaunchFailureV2, run_pc_collection_v2_with_resource_admission,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+const WORKER_NOT_STARTED: u8 = 0;
+const WORKER_STARTING: u8 = 1;
+const WORKER_STARTED: u8 = 2;
+const WORKER_START_FAILED: u8 = 3;
 
 /// Keeps the original resource, native failure and teacher worker together.
 /// Neither the live readback nor the thread exit establishes publication.
@@ -20,6 +25,7 @@ pub struct RoventPcCollectionRunV2 {
     owner: RoventCollectionOwnerLockV2,
     bridge: Arc<RoventPcCollectionBridgeV2>,
     worker: Arc<Mutex<RoventPcCollectionWorkerV2>>,
+    worker_start: Arc<AtomicU8>,
     worker_exit: Option<PcWorkerExitKindV2>,
     worker_thread_panicked: bool,
     native_failure: Option<RoventPcCollectionLaunchFailureV2>,
@@ -31,6 +37,8 @@ impl RoventPcCollectionRunV2 {
     /// Collect only a thread that has already exited; never wait indefinitely
     /// or infer that a still-running worker has physically stopped.
     pub fn poll_worker(&mut self) -> bool {
+        let start = self.worker_start.load(Ordering::Acquire);
+        if matches!(start, WORKER_NOT_STARTED | WORKER_START_FAILED) { return true; }
         match self.bridge.poll_worker() {
             Ok(Some(kind)) => {
                 self.worker_exit = Some(kind);
@@ -49,7 +57,11 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => ("busy", None),
             Err(_) => ("poisoned", None),
         };
-        let worker_exit = self.worker_exit.map(PcWorkerExitKindV2::label).unwrap_or("pending");
+        let start = self.worker_start.load(Ordering::Acquire);
+        let worker_exit = self.worker_exit.map(PcWorkerExitKindV2::label).unwrap_or_else(|| match start {
+            WORKER_NOT_STARTED => "not_started", WORKER_STARTING => "start_unknown",
+            WORKER_START_FAILED => "start_failed", _ => "pending",
+        });
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
             json!({"primary_failure":failures.primary.map(|failure|failure.kind()),
@@ -61,10 +73,13 @@ impl RoventPcCollectionRunV2 {
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
             "native_failure_transferred":self.native_failure_taken,
             "resource_error":self.resource_error,"resource":resource,
+            "teacher_worker_start":match start { WORKER_NOT_STARTED => "not_started", WORKER_STARTING => "unknown", WORKER_STARTED => "started", WORKER_START_FAILED => "failed_before_start", _ => "unknown" },
             "teacher_worker_returned":self.worker_exit.is_some(),
             "teacher_worker_exit":worker_exit,
-            "teacher_worker_running_or_unknown":self.worker_thread_panicked
-                || self.worker_exit != Some(PcWorkerExitKindV2::Retirement),
+            "teacher_worker_running_or_unknown": match start {
+                WORKER_NOT_STARTED | WORKER_START_FAILED => false,
+                _ => self.worker_thread_panicked || self.worker_exit != Some(PcWorkerExitKindV2::Retirement),
+            },
             "teacher_worker_thread_panicked":self.worker_thread_panicked,
             "teacher_worker_observation":worker_observation,
             "collection_owner_observation":owner_observation,
@@ -271,7 +286,6 @@ fn run_rovent_pc_collection_lock_v2_inner(
     plan.validate_registration(&manifest)?;
     let (owner, observer) =
         RoventCollectionOwnerLockV2::new_shared(Arc::clone(&manifest), plan.metadata.clone())?;
-    on_owner(&owner)?;
     let roster = plan
         .teacher_slots
         .iter()
@@ -292,7 +306,12 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let admission_resource = Arc::clone(&resource);
     let admission_lock = Arc::clone(&original_lock);
     let stop = Arc::new(AtomicBool::new(false));
-    bridge.start_worker(&worker, Arc::clone(&stop), worker_deadline)?;
+    let worker_start = Arc::new(AtomicU8::new(WORKER_NOT_STARTED));
+    let admission_bridge = Arc::clone(&bridge);
+    let admission_worker = Arc::clone(&worker);
+    let admission_owner = owner.clone();
+    let admission_stop = Arc::clone(&stop);
+    let admission_worker_start = Arc::clone(&worker_start);
     let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> =
         bridge.clone();
     let native = run_pc_collection_v2_with_resource_admission(
@@ -306,6 +325,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
                 detail: "Collection /2 lock custody poisoned".into(),
             })?;
             *original = Some(Arc::clone(lock));
+            drop(original);
             manifest.validate(lock).map_err(|error| RoventLaunchError {
                 stage: "collection_manifest_v2",
                 detail: error.to_string(),
@@ -320,7 +340,27 @@ fn run_rovent_pc_collection_lock_v2_inner(
                 .map_err(|error| RoventLaunchError {
                     stage: "resource_admission",
                     detail: error.to_string(),
-                })
+                })?;
+            // cgroup entry applies to the whole process and must happen
+            // before test callbacks or the collection worker create threads.
+            on_owner(&admission_owner).map_err(|error| RoventLaunchError {
+                stage: "collection_owner_callback", detail: error.to_string(),
+            })?;
+            admission_worker_start.store(WORKER_STARTING, Ordering::Release);
+            match admission_bridge.start_worker(&admission_worker, admission_stop, worker_deadline) {
+                Ok(()) => admission_worker_start.store(WORKER_STARTED, Ordering::Release),
+                Err(error) => {
+                    let error = match error {
+                        PcWorkerStartErrorV2::BeforeStart(error) => {
+                            admission_worker_start.store(WORKER_START_FAILED, Ordering::Release);
+                            error
+                        }
+                        PcWorkerStartErrorV2::Unknown(error) => error,
+                    };
+                    return Err(RoventLaunchError { stage: "collection_worker_start", detail: error.to_string() });
+                }
+            }
+            Ok(())
         },
     );
     stop.store(true, Ordering::Release);
@@ -330,6 +370,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
         owner,
         bridge,
         worker,
+        worker_start,
         worker_exit: None,
         worker_thread_panicked: false,
         native_failure: native.err(),

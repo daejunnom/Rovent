@@ -2,11 +2,8 @@
 //! Run only under the project's managed process/resource supervisor. The JSON
 //! config path comes from ROVENT_V2_CPU_CONTENTION_CONFIG and supplies all
 //! source/asset pins and launch arguments; no machine-specific pins are here.
-#![cfg(all(
-    target_os = "linux",
-    feature = "pals-collection-onnx",
-    feature = "test-fixtures"
-))]
+#[cfg(target_os = "linux")]
+mod linux {
 
 use cap_std::{ambient_authority, fs::Dir};
 use rz_arena::rovent_collect::launch::{
@@ -133,8 +130,22 @@ impl Drop for ChildGuard {
     }
 }
 
-#[test]
-#[ignore = "requires explicitly registered V2 CPU assets and a managed finite execution scope"]
+pub(super) fn run() {
+    let arguments: Vec<_> = std::env::args_os().collect();
+    let explicitly_selected = std::env::var_os(CHILD).is_some()
+        || arguments.windows(2).any(|pair| pair[0].as_os_str() == "--exact" && pair[1].as_os_str() == "real_v2_capture_contention")
+        || arguments.iter().any(|arg| arg.as_os_str() == "--run-v2-contention");
+    if !explicitly_selected {
+        eprintln!("SKIPPED: V2 CPU contention was not explicitly selected");
+        return;
+    }
+    if std::env::var_os(CONFIG).is_none() {
+        eprintln!("NOT_RUN: V2 CPU contention requires registered assets and a managed execution scope");
+        std::process::exit(2);
+    }
+    real_v2_capture_contention();
+}
+
 fn real_v2_capture_contention() {
     let config_path =
         std::env::var_os(CONFIG).expect("set the externally registered CPU contention config path");
@@ -176,13 +187,11 @@ fn real_v2_capture_contention() {
         .open(&config.stderr_report)
         .expect("create registered stderr report");
     let child = Command::new(std::env::current_exe().expect("test executable"))
-        .args([
-            "--exact",
-            "real_v2_capture_contention",
-            "--ignored",
-            "--nocapture",
-        ])
+        // A harness=false process starts on its only thread. The outer
+        // supervisor owns the process group and the child enters the cgroup
+        // before the original launcher starts worker/test threads.
         .current_dir(&config.working_directory)
+        .arg("--run-v2-contention")
         .env(CHILD, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -237,7 +246,13 @@ fn real_v2_capture_contention() {
                 let _ = writeln!(stdin, "stop");
                 let _ = stdin.flush();
             }
-            Ok(Event::BestMove) => bestmove = true,
+            Ok(Event::BestMove) if native => bestmove = true,
+            Ok(Event::BestMove) => {
+                // Separate output streams do not establish the engine's real
+                // ordering. Without the stop after our observed completion,
+                // this run is insufficient evidence and cannot pass.
+                break;
+            }
             Ok(Event::UciOk | Event::ReadyOk) => {}
             Ok(Event::OutputFailure) => break,
             Err(_) => break,
@@ -398,4 +413,19 @@ fn exercise_real_contention(
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+}
+
+#[cfg(target_os = "linux")]
+fn main() { linux::run(); }
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    let arguments: Vec<_> = std::env::args_os().collect();
+    if arguments.windows(2).any(|pair| pair[0].as_os_str() == "--exact" && pair[1].as_os_str() == "real_v2_capture_contention")
+        || arguments.iter().any(|arg| arg.as_os_str() == "--run-v2-contention") {
+        eprintln!("NOT_RUN: V2 CPU contention requires Linux");
+        std::process::exit(2);
+    }
+    eprintln!("SKIPPED: V2 CPU contention requires Linux");
 }

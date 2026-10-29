@@ -17,6 +17,12 @@ native-validation-diagnostics = ["rz-uci/pals-adaptive-diagnostics", "rz-uci/nat
 native-cuda-batch = ["native-cuda", "rz-uci/experimental-batch", "rz-eval/experimental-batch"]
 pals-followup-cuda-warm = ["native-cuda", "rz-uci/experimental-io-binding", "rz-eval/experimental-io-binding"]
 
+[[test]]
+name = "collection_v2_contention"
+path = "tests/collection_v2_contention.rs"
+harness = false
+required-features = ["pals-collection-onnx", "test-fixtures"]
+
 [[bin]]
 name = "rz-arena-fixture-engine"
 path = "src/bin/fixture-engine.rs"

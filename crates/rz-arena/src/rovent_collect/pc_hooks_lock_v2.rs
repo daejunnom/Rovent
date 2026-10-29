@@ -43,6 +43,10 @@ struct PcJoinedWorkerV2 {
 pub(crate) enum PcWorkerExitKindV2 {
     NoAdmission, Retirement, Deadline, AdmissionCanceled, PhysicalAck, Aggregate, CaughtPanic, OuterPanic,
 }
+pub(crate) enum PcWorkerStartErrorV2 {
+    BeforeStart(ArenaError),
+    Unknown(ArenaError),
+}
 impl PcWorkerExitKindV2 {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -106,9 +110,9 @@ impl RoventPcCollectionBridgeV2 {
         Ok((Arc::new(Self { core, worker: Mutex::new(None) }), worker))
     }
 
-    pub(crate) fn start_worker(&self, worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>, stop: Arc<std::sync::atomic::AtomicBool>, deadline: std::time::Instant) -> Result<(), ArenaError> {
-        let mut slot = self.worker.try_lock().map_err(|_| super::invalid("PC V2 worker custodian busy or poisoned"))?;
-        super::check(slot.is_none(), "PC V2 worker already registered")?;
+    pub(crate) fn start_worker(&self, worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>, stop: Arc<std::sync::atomic::AtomicBool>, deadline: std::time::Instant) -> Result<(), PcWorkerStartErrorV2> {
+        let mut slot = self.worker.try_lock().map_err(|_| PcWorkerStartErrorV2::Unknown(super::invalid("PC V2 worker custodian busy or poisoned")))?;
+        if slot.is_some() { return Err(PcWorkerStartErrorV2::Unknown(super::invalid("PC V2 worker already registered"))); }
         let original = Arc::clone(worker);
         let handle = std::thread::Builder::new().name("rovent-pc-collection-v2".into()).spawn(move || {
             let exit = match original.lock() {
@@ -116,7 +120,7 @@ impl RoventPcCollectionBridgeV2 {
                 Err(_) => panic!("PC V2 original worker mutex poisoned"),
             };
             exit
-        }).map_err(|error| ArenaError::Io(error.to_string()))?;
+        }).map_err(|error| PcWorkerStartErrorV2::BeforeStart(ArenaError::Io(error.to_string())))?;
         *slot = Some(PcWorkerCustodianV2 { original: Arc::clone(worker), handle: Some(handle), exit: None, exit_kind: None, panic: None, transferred: false });
         Ok(())
     }
