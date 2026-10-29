@@ -499,6 +499,9 @@ impl RoventNnuecCollectionRunV2 {
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
+                "game_record_limit":status.game_record_limit,
+                "game_retired_total":status.game_retired_total,
+                "game_reserved_slots":status.game_reserved_slots,
                 "collection_incomplete_due_to_backpressure":status.collection_disabled_first_ticket.is_some() || !status.prior_disabled_first_tickets.is_empty(),
                 "first_omitted_ticket":status.collection_disabled_first_ticket.as_ref().map(ticket_json),
                 "disable_reason":status.collection_disabled_reason.map(|reason|format!("{reason:?}")),
@@ -513,6 +516,16 @@ impl RoventNnuecCollectionRunV2 {
             "deferred_collection_roots_observation":deferred_observation,
             "pending_stopped_observation":pending_observation,
             "before_start_failure":self.bridge.before_start_failure().map(|error|format!("{error:?}")),
+            "sealed_pending":self.bridge.sealed_pending_event().map(|event|json!({
+                "admission_sha256":event.admission.raw_sha256(),
+                "cause":event.cause.as_ref().map(|cause|format!("{cause:?}")),
+                "reason":format!("{:?}",event.reason)
+            })),
+            "first_pending_original":self.bridge.first_pending_event().map(|event|json!({
+                "admission_sha256":event.admission.raw_sha256(),
+                "cause":event.cause.as_ref().map(|cause|format!("{cause:?}")),
+                "reason":format!("{:?}",event.reason)
+            })),
             "pending_stopped":pending_stopped.map(|summary| json!({
                 "first":summary.first.map(|event| json!({
                     "admission_sha256":event.admission.raw_sha256(),
@@ -598,6 +611,8 @@ impl RoventNnuecCollectionRunV2 {
     /// worker observed the same fenced handoff and teacher retirement. This
     /// authorizes inspection/partial assembly, not final publication.
     pub fn closed_owner(&self) -> Result<RoventCollectionOwnerLockV2, ArenaError> {
+        check(self.bridge.first_pending_event().is_none(), "Collection /2 original pending event retained")?;
+        check(self.bridge.sealed_pending_event().is_none(), "Collection /2 sealed pending event retained")?;
         check(self.bridge.before_start_failure().is_none(), "Collection /2 before-start failure retained")?;
         check(self.bridge.try_has_deferred_observations()? == Some(false),
             "Collection /2 deferred observations retained or busy")?;
@@ -676,6 +691,8 @@ impl Drop for RoventNnuecCollectionRunV2 {
         // This only decides whether the Arena-owned worker can be dropped.
         // UCI's independent retained handoff slot remains unknown.
         let arena_worker_resolved = owner_resolved
+            && self.bridge.first_pending_event().is_none()
+            && self.bridge.sealed_pending_event().is_none()
             && self.bridge.before_start_failure().is_none()
             && self.bridge.try_has_deferred_observations().is_ok_and(|observation| observation == Some(false))
             && self.bridge.try_pending_stopped_observation().is_ok_and(|observation|
@@ -751,7 +768,9 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
     )?);
     plan.validate_registration(&manifest)?;
     let (owner, observer) =
-        RoventCollectionOwnerLockV2::new_shared(Arc::clone(&manifest), plan.metadata.clone())?;
+        RoventCollectionOwnerLockV2::new_shared_with_record_limit(
+            Arc::clone(&manifest), plan.metadata.clone(), plan.maximum_records,
+        )?;
     let roster = plan
         .teacher_slots
         .iter()
@@ -920,7 +939,8 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         if run.publisher_thread.is_some() { std::thread::sleep(Duration::from_millis(2)); }
     }
     if run.publisher_exit.as_ref().is_some_and(Result::is_ok) && run.worker_exit.is_some() {
-        let until = Instant::now().checked_add(run.publisher_timeout).unwrap_or(cleanup_deadline);
+        let until = Instant::now().checked_add(run.publisher_timeout)
+            .map_or(cleanup_deadline, |publication_until| publication_until.min(cleanup_deadline));
         match run.finish_publisher(until) {
             Ok(()) => run.publisher_status = "published",
             Err(error) => { run.publisher_status = "partial"; run.publisher_error = Some(error); }
