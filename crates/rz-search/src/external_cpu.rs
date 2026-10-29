@@ -1981,8 +1981,18 @@ mod process {
             let mut buffer = [0u8; 65_536];
             let mut total = 4u64;
             loop {
-                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-                    return Err(error("spawn", "hash_cancel_or_deadline"));
+                // Report both conditions when both are observed at this check.
+                // They are independent observations, not an ordering claim:
+                // cancellation can race with the deadline and is read first.
+                let cancelled = cancel.load(Ordering::Acquire);
+                let expired = Instant::now() >= deadline;
+                match (cancelled, expired) {
+                    (false, false) => {}
+                    (true, false) => return Err(error("spawn", "hash_cancelled")),
+                    (false, true) => return Err(error("spawn", "hash_deadline_expired")),
+                    (true, true) => {
+                        return Err(error("spawn", "hash_cancelled_and_deadline_expired"));
+                    }
                 }
                 let count = program
                     .read_at(&mut buffer, total)
@@ -4127,6 +4137,36 @@ mod tests {
             assert_eq!(partial.completion, ExternalCompletion::Pending);
             assert_eq!(partial.best_move, None);
             assert!(attempt.process.cleanup_complete);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hash_stop_reports_cancel_and_deadline_independently_without_spawning() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let config = fixture_config("fake_uci_normal");
+        for (cancelled, expired, expected) in [
+            (true, false, "hash_cancelled"),
+            (false, true, "hash_deadline_expired"),
+            (true, true, "hash_cancelled_and_deadline_expired"),
+        ] {
+            let deadline = if expired {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(10)
+            };
+            let failure = match process::OwnedProcess::spawn(
+                &config,
+                deadline,
+                &AtomicBool::new(cancelled),
+                None,
+            ) {
+                Ok(_) => panic!("a stopped hash must not spawn the teacher process"),
+                Err(failure) => failure,
+            };
+            assert_eq!(failure.error, error("spawn", expected));
+            assert!(failure.process.cleanup_complete);
+            assert!(failure.process.process_identity.is_none());
         }
     }
 
