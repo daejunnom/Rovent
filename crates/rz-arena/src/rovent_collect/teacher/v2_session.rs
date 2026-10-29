@@ -11,7 +11,7 @@ use rz_contracts::Digest;
 use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
 use rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration;
 use rz_search::external_cpu::process_scope::{CollectionProcessPermit, CollectionProcessScope};
-use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2;
+use rz_uci::pals_adaptive::{RoventCollectionRootAdmissionV2, RoventTeacherScopeCapabilityV2};
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
     BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
@@ -97,7 +97,9 @@ pub(crate) struct RoventCollectionTeacherSessionV2 {
     manifest: Arc<RoventCorpusManifestV2>,
     manifest_digest: Digest,
     actors: BTreeMap<String, ActorSourceV2>,
-    scope: Option<CollectionProcessScope>,
+    root_scope: RoventTeacherScopeCapabilityV2,
+    admission_closing: bool,
+    root_scope_closed: bool,
 }
 
 #[allow(dead_code)]
@@ -110,7 +112,7 @@ impl RoventCollectionTeacherSessionV2 {
         self,
         actors: BTreeMap<String, RoventTeacherRetirementTokenV2>,
     ) -> Result<TeacherSessionRetirementSealV2, Box<TeacherSessionRetirementSealRejectionV2>> {
-        let complete = self.scope.is_none()
+        let complete = self.root_scope_closed
             && !self.actors.is_empty()
             && actors.len() == self.actors.len()
             && self.actors.iter().all(|(actor_id, actor)| {
@@ -202,13 +204,25 @@ impl RoventCollectionTeacherSessionV2 {
             root.original_context().accepts()?,
             "V2 teacher root closed during roster preparation",
         )?;
+        // Claim only after all reversible roster/source/scope preparation has
+        // succeeded. A claim is never reissued after failure or unknown work.
+        let root_scope = admission
+            .claim_teacher_scope(scope)
+            .map_err(|(error, scope)| {
+                // No worker has been started at this point. Close the rejected
+                // original issuer before releasing its preflight resources.
+                scope.close_admission();
+                invalid(error.to_string())
+            })?;
         Ok(Self {
             admission: admission.clone(),
             startup_control: startup_control.clone(),
             manifest: Arc::clone(manifest),
             manifest_digest,
             actors,
-            scope: Some(scope),
+            root_scope,
+            admission_closing: false,
+            root_scope_closed: false,
         })
     }
 
@@ -228,7 +242,7 @@ impl RoventCollectionTeacherSessionV2 {
     ) -> Result<TeacherRecoveryKeyV2, TeacherSessionStartErrorV2> {
         // A previously allocated permit must not permit a new spawn after
         // this session has closed its process scope for retirement.
-        if self.scope.is_none() {
+        if self.admission_closing {
             return Err(TeacherSessionStartErrorV2::Admission(invalid(
                 "V2 teacher session admission is closed",
             )));
@@ -264,11 +278,8 @@ impl RoventCollectionTeacherSessionV2 {
             actor.bound = Some(bound);
         }
         if actor.permit.is_none() {
-            let scope = self.scope.as_ref().ok_or_else(|| {
-                TeacherSessionStartErrorV2::Admission(invalid("V2 teacher scope closed"))
-            })?;
             actor.permit = Some(
-                scope
+                self.root_scope
                     .permit(self.manifest_digest, actor.registration)
                     .map_err(|error| {
                         TeacherSessionStartErrorV2::Admission(invalid(error.to_string()))
@@ -281,6 +292,7 @@ impl RoventCollectionTeacherSessionV2 {
         match spawn_bound_collection_teacher_v2(
             bound,
             permit,
+            &self.root_scope,
             startup_deadline,
             cleanup_ceiling,
             custodian,
@@ -346,13 +358,14 @@ impl RoventCollectionTeacherSessionV2 {
 
     /// Close the process scope before requesting each original worker's
     /// bounded shutdown. Requests are not physical-completion evidence.
-    pub(crate) fn request_shutdown(&mut self, until: Instant) {
-        self.close_admission();
+    pub(crate) fn request_shutdown(&mut self, until: Instant) -> Result<(), ArenaError> {
+        let close_result = self.close_admission();
         for actor in self.actors.values_mut() {
             if let Some(run) = actor.running.as_mut() {
                 run.lifecycle.request_shutdown(until);
             }
         }
+        close_result
     }
 
     /// Poll only the original actor owner. This can observe the root mutex,
@@ -383,7 +396,13 @@ impl RoventCollectionTeacherSessionV2 {
             return Ok(None);
         };
         match run.lifecycle.try_finish() {
-            Ok((owner, observation)) => Ok(Some((owner, observation))),
+            Ok((owner, observation)) => {
+                // The original worker and its pipes are physically retired;
+                // this retained issuer permit no longer needs to hold the
+                // global process gate for subsequent roots.
+                drop(actor.permit.take());
+                Ok(Some((owner, observation)))
+            }
             Err(lifecycle) => {
                 actor.running = Some(RunningTeacherV2 {
                     lifecycle,
@@ -409,7 +428,11 @@ impl RoventCollectionTeacherSessionV2 {
             return Ok(None);
         };
         match run.lifecycle.try_retire() {
-            Ok(token) => Ok(Some(token)),
+            Ok(token) => {
+                // Never release this on a logical stop or unknown completion.
+                drop(actor.permit.take());
+                Ok(Some(token))
+            }
             Err(lifecycle) => {
                 actor.running = Some(RunningTeacherV2 {
                     lifecycle,
@@ -426,11 +449,19 @@ impl RoventCollectionTeacherSessionV2 {
         match self.admission.root_admission().original_context().accepts() {
             Ok(true) => Ok(()),
             Ok(false) => {
-                self.close_admission();
+                if let Err(close_error) = self.close_admission() {
+                    return Err(invalid(format!(
+                        "V2 teacher root is no longer accepting; scope closure failed: {close_error}"
+                    )));
+                }
                 Err(invalid("V2 teacher root is no longer accepting"))
             }
             Err(error) => {
-                self.close_admission();
+                if let Err(close_error) = self.close_admission() {
+                    return Err(invalid(format!(
+                        "V2 teacher root observation failed: {error}; scope closure failed: {close_error}"
+                    )));
+                }
                 Err(ArenaError::Contract(error))
             }
         }
@@ -438,9 +469,18 @@ impl RoventCollectionTeacherSessionV2 {
 
     /// Closes admission, not worker processes. The eventual owner must request
     /// and observe each worker's shutdown and physical drain separately.
-    pub(crate) fn close_admission(&mut self) {
-        if let Some(scope) = self.scope.take() {
-            scope.close_admission();
+    pub(crate) fn close_admission(&mut self) -> Result<(), ArenaError> {
+        // Block new work immediately, including when the capability's
+        // nonblocking close is temporarily unavailable and must be retried.
+        self.admission_closing = true;
+        let result = if self.root_scope_closed {
+            Ok(())
+        } else {
+            self.root_scope.close().map_err(|error| invalid(error.to_string()))
+        };
+        if result.is_ok() {
+            self.root_scope_closed = true;
         }
+        result
     }
 }

@@ -1,5 +1,8 @@
 //! Source/Rules/control fixtures only. No engine, provider or worker starts.
 
+#[path = "shared_teacher_scope_tests.rs"]
+mod shared_teacher_scope_tests;
+
 use super::*;
 use crate::bridge::BuildSearchSettings;
 use crate::engine::driver_start_fixture::{FixtureStart, issue_start};

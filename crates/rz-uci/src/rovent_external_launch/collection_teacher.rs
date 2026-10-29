@@ -386,7 +386,15 @@ impl RoventCollectionTeacherOwnerV2 {
         cleanup_ceiling: Instant,
         cancel: &AtomicBool,
         permit: &CollectionProcessPermit,
+        scope: &crate::pals_adaptive::RoventTeacherScopeCapabilityV2,
     ) -> Result<Self, RoventCollectionTeacherSpawnRejectionV2> {
+        let _scope_guard = match scope.begin_spawn(&admission, permit) {
+            Ok(guard) => guard,
+            Err(_) => return Err(RoventCollectionTeacherSpawnRejectionV2::BeforeSpawn {
+                cause: invalid("teacher /2 scope invalid, closed, or contended"),
+                admission,
+            }),
+        };
         let created: Result<Self, CheckerError> = (|| {
             let root = admission.root_admission();
             let original = root
@@ -427,7 +435,7 @@ impl RoventCollectionTeacherOwnerV2 {
                 || cleanup_ceiling > control.cleanup_until
                 || !root
                     .original_context()
-                    .accepts()
+                    .try_accepts()
                     .map_err(|_| invalid("teacher /2 root revoked"))?
                 || frozen_actor == Digest([0; 32])
                 || clock.domain != root.runtime_clock().domain()
@@ -516,7 +524,7 @@ impl RoventCollectionTeacherOwnerV2 {
                 };
                 if !root
                     .original_context()
-                    .accepts()
+                    .try_accepts()
                     .map_err(|_| invalid("teacher /2 root revoked"))?
                     || cancel.load(Ordering::Acquire)
                 {
@@ -557,7 +565,7 @@ impl RoventCollectionTeacherOwnerV2 {
             .admission()
             .root_admission()
             .original_context()
-            .accepts();
+            .try_accepts();
         let cause = match validity {
             Ok(true) if !cancel.load(Ordering::Acquire) => return Ok(owner),
             Ok(_) => invalid("teacher /2 revoked during worker startup"),
@@ -725,6 +733,7 @@ pub enum BoundTeacherSpawnFailureV2 {
 #[derive(Debug)]
 pub enum BoundTeacherSpawnCauseV2 {
     Root(rz_contracts::ContractError),
+    Scope(crate::pals_adaptive::AdaptiveCollectionError),
     Source(rz_eval::error::BackendError),
     Io(std::io::Error),
     Checker(CheckerError),
@@ -829,11 +838,22 @@ impl Drop for SpawnedTeacherGuardV2 {
 pub fn spawn_bound_collection_teacher_v2(
     actor: BoundCollectionTeacherActorV2,
     permit: &CollectionProcessPermit,
+    scope: &crate::pals_adaptive::RoventTeacherScopeCapabilityV2,
     startup_deadline: Instant,
     cleanup_ceiling: Instant,
     custodian: &mut TeacherRecoveryCustodianV2,
 ) -> Result<(RoventCollectionTeacherLifecycleV2, TeacherRecoveryKeyV2), BoundTeacherSpawnFailureV2>
 {
+    // Serialize this complete spawn attempt with scope close. A stale root or
+    // another root's capability cannot start a worker even with a separately
+    // fabricated process permit. This guard is released only on return.
+    let _scope_guard = match scope.begin_spawn(actor.admission(), permit) {
+        Ok(guard) => guard,
+        Err(error) => return Err(BoundTeacherSpawnFailureV2::BeforeSpawn {
+            cause: BoundTeacherSpawnCauseV2::Scope(error),
+            actor,
+        }),
+    };
     let (reservation, recovery_key) = match TeacherRecoveryReservationV2::reserve() {
         Ok(value) => value,
         Err(cause) => {

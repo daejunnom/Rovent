@@ -87,6 +87,19 @@ struct LoadedOriginV2 {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventNativeCollectionOriginV2 {
+    /// Compare the actual loaded verifier and clock, not a reconstructed
+    /// model or lock digest. Call before any collection hook can spawn work.
+    pub(crate) fn matches_native_owner(
+        &self,
+        verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
+        clock: &rz_runtime::contracts::ContractSystemClock,
+    ) -> bool {
+        use rz_runtime::contracts::ContractClock;
+        self.original._original_verifier.same_owner(verifier)
+            && self.original.clock.domain() == clock.domain()
+            && self.original.clock.origin() == clock.origin()
+    }
+
     /// Called from the actual Ready owner, never from serialized observations.
     pub(crate) fn from_loaded_ready<Q: crate::pals_adaptive::NativeQuestionProjection>(
         owner: crate::rovent_bootstrap::RoventCollectionReadyOwnerV2<'_, Q>,
@@ -300,6 +313,39 @@ pub struct RoventCollectionRootAdmissionV2 {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventCollectionRootAdmissionV2 {
+    /// Claim this exact live root's sole teacher process scope. A claim is
+    /// never reissued, including after failed or physically unknown work.
+    /// Do all reversible roster/source preflight before calling this method.
+    pub fn claim_teacher_scope(&self, scope: rz_search::external_cpu::process_scope::CollectionProcessScope)
+        -> Result<RoventTeacherScopeCapabilityV2, (AdaptiveCollectionError, rz_search::external_cpu::process_scope::CollectionProcessScope)> {
+        match self.root_admission.original_context().accepts() {
+            Ok(true) => {}
+            Ok(false) => return Err((reject("teacher scope root is revoked"), scope)),
+            Err(error) => return Err((reject(error.to_string()), scope)),
+        }
+        let root_digest = match self.root_admission.descriptor().digest() {
+            Ok(digest) => digest,
+            Err(error) => return Err((reject(error.to_string()), scope)),
+        };
+        if !scope.is_unissued_for_root(
+            self.root_admission.authority(), self.root_admission.hard_deadline(),
+            self.root_admission.startup_lock_digest(), root_digest, self.root_budget,
+        ) {
+            return Err((reject("teacher scope is shared, used, closed, or belongs to another root"), scope));
+        }
+        if !self.root_admission.claim_teacher_scope_once() {
+            return Err((reject("teacher scope already claimed for this original root"), scope));
+        }
+        match self.root_admission.original_context().accepts() {
+            Ok(true) => {}
+            Ok(false) => return Err((reject("teacher scope root revoked during claim"), scope)),
+            Err(error) => return Err((reject(error.to_string()), scope)),
+        }
+        Ok(RoventTeacherScopeCapabilityV2 {
+            admission: self.clone(),
+            scope: std::sync::Mutex::new(Some(scope)),
+        })
+    }
     /// Call immediately after the real port has attached the Frontier and
     /// checked its Rules, Store, namespace, restriction and ledger owners.
     pub(crate) fn from_attached_frontier(
@@ -574,6 +620,60 @@ impl RoventCollectionRootAdmissionV2 {
             ));
         }
         Ok(())
+    }
+}
+
+/// Non-cloneable authority for one original root's teacher scope. Closing an
+/// old capability only touches its own root even when a later generation has
+/// already started. It is not a physical-retirement or publication proof.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventTeacherScopeCapabilityV2 {
+    admission: RoventCollectionRootAdmissionV2,
+    scope: std::sync::Mutex<Option<rz_search::external_cpu::process_scope::CollectionProcessScope>>,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventTeacherScopeCapabilityV2 {
+    pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+
+    /// Call outside manager/root locks. Contention or poisoning is not a
+    /// closure acknowledgement and leaves the capability with its owner.
+    pub fn close(&self) -> Result<(), AdaptiveCollectionError> {
+        let mut slot = self.scope.try_lock().map_err(|_| reject("teacher scope close unavailable"))?;
+        if let Some(scope) = slot.take() {
+            scope.close_admission();
+            // Outstanding physical permits retain the original issuer Arc.
+            // Releasing the issuer here does not attest their completion.
+            drop(scope);
+        }
+        Ok(())
+    }
+
+    pub fn permit(
+        &self,
+        manifest: Digest,
+        registration: rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration,
+    ) -> Result<rz_search::external_cpu::process_scope::CollectionProcessPermit, rz_search::cpu_checker::CheckerError> {
+        let slot = self.scope.try_lock().map_err(|_| rz_search::cpu_checker::CheckerError::Invalid("teacher scope permit unavailable"))?;
+        let scope = slot.as_ref().ok_or(rz_search::cpu_checker::CheckerError::Invalid("teacher scope closed"))?;
+        scope.permit(manifest, registration)
+    }
+
+    pub(crate) fn begin_spawn<'a>(
+        &'a self,
+        admission: &RoventCollectionRootAdmissionV2,
+        permit: &rz_search::external_cpu::process_scope::CollectionProcessPermit,
+    ) -> Result<std::sync::MutexGuard<'a, Option<rz_search::external_cpu::process_scope::CollectionProcessScope>>, AdaptiveCollectionError> {
+        let slot = self.scope.try_lock().map_err(|_| reject("teacher scope spawn unavailable"))?;
+        let scope = slot.as_ref().ok_or_else(|| reject("teacher scope closed"))?;
+        if !self.matches_admission(admission) || !permit.belongs_to(scope)
+            || !self.admission.root_admission.original_context().try_accepts().map_err(|e| reject(e.to_string()))?
+        {
+            return Err(reject("teacher scope is closed, stale, or has a different root"));
+        }
+        Ok(slot)
     }
 }
 

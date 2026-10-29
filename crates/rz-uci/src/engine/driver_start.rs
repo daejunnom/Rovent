@@ -21,6 +21,7 @@ pub(crate) mod fixture;
 
 #[derive(Debug)]
 pub(crate) struct DriverStartSource {
+    teacher_scope_claimed: std::sync::atomic::AtomicBool,
     ticket: SearchTicket,
     authority: SearchAuthority,
     root: PositionSnapshot,
@@ -64,6 +65,7 @@ impl DriverStartSource {
             ));
         }
         Ok(Arc::new(Self {
+            teacher_scope_claimed: std::sync::atomic::AtomicBool::new(false),
             ticket: ticket.clone(),
             authority: context.authority,
             root: root.snapshot(),
@@ -79,6 +81,15 @@ impl DriverStartSource {
             cleanup: context.shutdown_deadline,
             effective_clock: context.effective_clock.clone(),
         }))
+    }
+
+    /// All root-admission materializations of this same actual UCI Start
+    /// share one teacher scope claim; later Starts own different cells.
+    pub(crate) fn claim_teacher_scope_once(&self) -> bool {
+        self.teacher_scope_claimed.compare_exchange(
+            false, true, std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ).is_ok()
     }
 
     /// Validation does not require a live deadline: an original stopped Start

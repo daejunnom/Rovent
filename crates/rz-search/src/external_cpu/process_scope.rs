@@ -78,6 +78,29 @@ pub struct CollectionProcessScope {
     inner: Arc<Inner>,
 }
 impl CollectionProcessScope {
+    /// Admission requires an unshared, unused issuer for exactly one root.
+    /// Copied digests alone are not a permit; the issuer remains an opaque
+    /// object and later permit checks compare its actual Arc identity.
+    pub fn is_unissued_for_root(
+        &self,
+        authority: rz_contracts::pals::SearchAuthority,
+        deadline: rz_contracts::Deadline,
+        input_lock: Digest,
+        root_admission: Digest,
+        root_budget: Digest,
+    ) -> bool {
+        Arc::strong_count(&self.inner) == 1
+            && !self.inner.closed.load(Ordering::Acquire)
+            && !self.inner.members.is_empty()
+            && self.inner.members.iter().all(|member| {
+                let r = member.registration;
+                r.authority == authority && r.original_deadline == deadline
+                    && r.input_lock == input_lock && r.root_admission == root_admission
+                    && r.root_budget == root_budget
+                    && member.state.load(Ordering::Acquire) == UNISSUED
+            })
+    }
+
     /// The upper owner retains and validates the opaque original root cap.
     /// Digests here bind a physical resource scope, never recreate that cap.
     pub fn new(
@@ -192,6 +215,11 @@ pub struct CollectionProcessPermit {
     index: usize,
 }
 impl CollectionProcessPermit {
+    /// Compare opaque issuer identity, not copied roster or digest fields.
+    pub fn belongs_to(&self, scope: &CollectionProcessScope) -> bool {
+        Arc::ptr_eq(&self.inner, &scope.inner)
+    }
+
     pub(crate) fn validate(
         &self,
         registration: TeacherWorkerRegistration,
@@ -361,6 +389,32 @@ mod tests {
         gate: &Arc<Gate>,
     ) -> Result<ProcessLease, CheckerError> {
         ProcessLease::acquire_in_gate(permit, Arc::clone(gate))
+    }
+    #[test]
+    fn collection_scope_root_and_issuer_identity_are_not_interchangeable() {
+        let first = scope(&Arc::new(Gate::default()));
+        let second = scope(&Arc::new(Gate::default()));
+        let registration = registration(5);
+        assert!(first.is_unissued_for_root(
+            registration.authority, registration.original_deadline,
+            registration.input_lock, registration.root_admission, registration.root_budget,
+        ));
+        assert!(!first.is_unissued_for_root(
+            registration.authority, registration.original_deadline,
+            registration.input_lock, registration.root_admission, Digest([99; 32]),
+        ));
+        let permit = first.permit(Digest([9; 32]), registration).unwrap();
+        assert!(permit.belongs_to(&first));
+        assert!(!permit.belongs_to(&second));
+        assert!(!first.is_unissued_for_root(
+            registration.authority, registration.original_deadline,
+            registration.input_lock, registration.root_admission, registration.root_budget,
+        ));
+        drop(permit);
+        assert!(!first.is_unissued_for_root(
+            registration.authority, registration.original_deadline,
+            registration.input_lock, registration.root_admission, registration.root_budget,
+        ));
     }
     #[test]
     fn legacy_remains_singleton_and_not_started_release_is_not_physical() {
