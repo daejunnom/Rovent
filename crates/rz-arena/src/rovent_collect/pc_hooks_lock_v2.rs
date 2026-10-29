@@ -10,7 +10,7 @@ use rz_uci::pals_adaptive::{AdaptiveManagerError, RoventCollectionRootAdmissionV
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_bootstrap::pc_session::{
     RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionPortV2,
-    RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2,
+    RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2, RoventPcCustodyReturnV2,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -30,6 +30,7 @@ struct PcWorkerCustodianV2 {
     exit_kind: Option<PcWorkerExitKindV2>,
     panic: Option<Box<dyn std::any::Any + Send>>,
     transferred: bool,
+    returned: Option<Arc<Mutex<RoventPcCollectionRootCustodyV2>>>,
 }
 
 /// The real joined worker core and its exit travel together. This object is
@@ -121,7 +122,7 @@ impl RoventPcCollectionBridgeV2 {
             };
             exit
         }).map_err(|error| PcWorkerStartErrorV2::BeforeStart(ArenaError::Io(error.to_string())))?;
-        *slot = Some(PcWorkerCustodianV2 { original: Arc::clone(worker), handle: Some(handle), exit: None, exit_kind: None, panic: None, transferred: false });
+        *slot = Some(PcWorkerCustodianV2 { original: Arc::clone(worker), handle: Some(handle), exit: None, exit_kind: None, panic: None, transferred: false, returned: None });
         Ok(())
     }
 
@@ -138,6 +139,39 @@ impl RoventPcCollectionBridgeV2 {
 
     pub(crate) fn take_outer_panic(&self) -> Option<Box<dyn std::any::Any + Send>> {
         self.worker.try_lock().ok()?.as_mut()?.panic.take()
+    }
+
+    /// Inspect only the same joined/returned root. This confirms the native
+    /// fence and observer settlement but does not publish any retained row.
+    pub(crate) fn returned_handoff_settled(&self) -> Result<bool, AdaptiveManagerError> {
+        let slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 worker custodian poisoned; original retained")),
+        };
+        let Some(owner) = slot.as_ref() else { return Ok(false); };
+        let Some(custody) = &owner.returned else { return Ok(false); };
+        let custody = match custody.try_lock() {
+            Ok(custody) => custody,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 original custody poisoned")),
+        };
+        let Some(joined) = custody.original_worker().downcast_ref::<PcJoinedWorkerV2>() else { return Ok(false); };
+        if !Arc::ptr_eq(&joined._worker, &owner.original) { return Ok(false); }
+        let core = match owner.original.try_lock() {
+            Ok(core) => core,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 original worker poisoned; original retained")),
+        };
+        if core.has_failure() || !core.original_handoff().is_some_and(|actual| Arc::ptr_eq(&actual, custody.handoff())) { return Ok(false); }
+        let mut handoff = match custody.handoff().try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 original handoff poisoned")),
+        };
+        if handoff.teacher_aggregate_ack().is_none() { return Ok(false); }
+        let (_, _, settlement, fence) = handoff.parts_mut();
+        Ok(settlement.is_ok() && fence.permits_semantic_closure())
     }
 }
 
@@ -205,5 +239,39 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
         Ok(Some(RoventPcCollectionRootCustodyV2::from_joined_worker(
             Arc::clone(handoff), Box::new(PcJoinedWorkerV2 { _worker: Arc::clone(&owner.original), _exit: exit }),
         )))
+    }
+    fn return_root_custody(&self, custody: Arc<Mutex<RoventPcCollectionRootCustodyV2>>) -> Result<RoventPcCustodyReturnV2, AdaptiveManagerError> {
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPcCustodyReturnV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 worker custodian poisoned; original retained")),
+        };
+        let owner = slot.as_mut().ok_or(AdaptiveManagerError::Invalid("PC V2 worker unregistered"))?;
+        if let Some(original) = &owner.returned {
+            if !Arc::ptr_eq(original, &custody) { return Err(AdaptiveManagerError::Invalid("PC V2 different custody already retained")); }
+        }
+        if !owner.transferred { return Err(AdaptiveManagerError::Invalid("PC V2 custody has not been transferred")); }
+        let original = match custody.try_lock() {
+            Ok(original) => original,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPcCustodyReturnV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 original custody poisoned")),
+        };
+        let joined = original.original_worker().downcast_ref::<PcJoinedWorkerV2>()
+            .ok_or(AdaptiveManagerError::Invalid("PC V2 original worker custody type mismatch"))?;
+        if !Arc::ptr_eq(&joined._worker, &owner.original) {
+            return Err(AdaptiveManagerError::Invalid("PC V2 original worker mismatch"));
+        }
+        let core = match owner.original.try_lock() {
+            Ok(core) => core,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPcCustodyReturnV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 original worker poisoned; original retained")),
+        };
+        if !core.original_handoff().is_some_and(|actual| Arc::ptr_eq(&actual, original.handoff())) {
+            return Err(AdaptiveManagerError::Invalid("PC V2 original handoff mismatch"));
+        }
+        drop(core);
+        drop(original);
+        if owner.returned.is_none() { owner.returned = Some(custody); }
+        Ok(RoventPcCustodyReturnV2::Accepted)
     }
 }

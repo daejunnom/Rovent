@@ -152,8 +152,11 @@ impl RoventPcCollectionRunV2 {
     /// worker observed the same fenced handoff and teacher retirement. This
     /// authorizes inspection/partial assembly, not final publication.
     pub fn closed_owner(&self) -> Result<RoventCollectionOwnerLockV2, ArenaError> {
+        let fenced = self.worker_exit == Some(PcWorkerExitKindV2::Retirement)
+            || (self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
+                && self.bridge.returned_handoff_settled().map_err(|error| invalid(format!("P/C returned handoff: {error:?}")))?);
         check(
-            self.worker_exit == Some(PcWorkerExitKindV2::Retirement) && self
+            fenced && self.native_failure.is_none() && !self.native_failure_taken && self.resource_error.is_none() && self
                 .worker
                 .try_lock()
                 .is_ok_and(|worker| !worker.has_failure()),
@@ -208,7 +211,9 @@ impl Drop for RoventPcCollectionRunV2 {
                 .worker
                 .try_lock()
                 .is_ok_and(|worker| !worker.has_failure())
-            && self.worker_exit == Some(PcWorkerExitKindV2::Retirement);
+            && (self.worker_exit == Some(PcWorkerExitKindV2::Retirement)
+                || (self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
+                    && self.bridge.returned_handoff_settled().unwrap_or(false)));
         if !physically_resolved {
             // A dropped observation must not release a still-running or
             // unverified owner. Keep the exact objects for process lifetime;

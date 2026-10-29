@@ -202,6 +202,12 @@ pub struct RoventPcCollectionRootCustodyV2 {
     original_worker: Box<dyn Any + Send>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventPcCustodyReturnV2 {
+    Accepted,
+    Busy,
+}
+
 impl RoventPcCollectionRootCustodyV2 {
     /// The adapter constructs this only after joining the original worker.
     pub fn from_joined_worker(
@@ -216,6 +222,14 @@ impl RoventPcCollectionRootCustodyV2 {
 
     pub fn matches_handoff(&self, handoff: &Arc<Mutex<RoventPcCollectionHandoffV2>>) -> bool {
         Arc::ptr_eq(&self.handoff, handoff)
+    }
+
+    pub fn handoff(&self) -> &Arc<Mutex<RoventPcCollectionHandoffV2>> {
+        &self.handoff
+    }
+
+    pub fn original_worker(&self) -> &(dyn Any + Send) {
+        self.original_worker.as_ref()
     }
 
     pub fn into_parts(self) -> (Arc<Mutex<RoventPcCollectionHandoffV2>>, Box<dyn Any + Send>) {
@@ -255,6 +269,14 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
         _handoff: &Arc<Mutex<RoventPcCollectionHandoffV2>>,
     ) -> Result<Option<RoventPcCollectionRootCustodyV2>, AdaptiveManagerError> {
         Ok(None)
+    }
+    /// Retain the exact joined custody before allowing the root to finish.
+    /// Success transfers no semantic or publication authority.
+    fn return_root_custody(
+        &self,
+        _custody: Arc<Mutex<RoventPcCollectionRootCustodyV2>>,
+    ) -> Result<RoventPcCustodyReturnV2, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("P/C V2 custody receiver unavailable"))
     }
 }
 
@@ -731,7 +753,7 @@ pub struct RoventPcSessionDriver {
     collection_hooks_v2: Option<Arc<dyn RoventPcCollectionHooksV2>>,
     collection_v2_outstanding: AtomicBool,
     retained_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionHandoffV2>>>>,
-    retained_collection_custody_v2: Mutex<Option<RoventPcCollectionRootCustodyV2>>,
+    retained_collection_custody_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionRootCustodyV2>>>>,
     retained_collection_failure_v2: Mutex<Option<RoventPcCollectionAdmissionFailureV2>>,
     retained_collection_panic_v2: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
     selective_policy: Digest,
@@ -2396,6 +2418,7 @@ impl RoventPcSessionDriver {
             let signal = manager.activity_signal();
             let hook = self.collection_hooks_v2.as_ref().expect("started hook");
             let mut custody_state = String::from("worker join not yet observed");
+            let mut joined = None;
             loop {
                 let observed = signal.version();
                 let result =
@@ -2403,15 +2426,16 @@ impl RoventPcSessionDriver {
                 match result {
                     Ok(Ok(Some(custody))) => {
                         let matches = custody.matches_handoff(&handoff);
+                        let custody = Arc::new(Mutex::new(custody));
                         *self
                             .retained_collection_custody_v2
                             .lock()
-                            .unwrap_or_else(|p| p.into_inner()) = Some(custody);
-                        custody_state = if matches {
-                            "same root worker joined; publication custody retained but not yet transferred"
+                            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&custody));
+                        if matches {
+                            joined = Some(custody);
                         } else {
-                            "foreign joined worker custody retained; original root unresolved"
-                        }.into();
+                            custody_state = "foreign joined worker custody retained; original root unresolved".into();
+                        }
                         break;
                     }
                     Ok(Ok(None)) if Instant::now() < context.shutdown_deadline => {
@@ -2441,14 +2465,56 @@ impl RoventPcSessionDriver {
                     }
                 }
             }
-            // Publication/row custody has no transfer path yet. Keep the
-            // worker, observer and manager instead of fabricating completion.
-            *state = State::Manager(manager);
-            self.closed.store(true, Ordering::Release);
-            return Err(physical_unknown_at(
-                "RoventPcV2CollectionCustodyPending",
-                custody_state,
-            ));
+            let mut returned = false;
+            if let Some(custody) = joined {
+                loop {
+                    let observed = signal.version();
+                    let aggregate_ready = match handoff.try_lock() {
+                        Ok(original) => original.teacher_aggregate_ack().is_some(),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            if Instant::now() >= context.shutdown_deadline { break; }
+                            signal.wait_changed(observed, context.shutdown_deadline
+                                .saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                            continue;
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            custody_state = "original handoff lock poisoned".into();
+                            break;
+                        }
+                    };
+                    if !aggregate_ready {
+                        custody_state = "joined worker lacks original aggregate physical proof".into();
+                        break;
+                    }
+                    match catch_unwind(AssertUnwindSafe(|| hook.return_root_custody(Arc::clone(&custody)))) {
+                        Ok(Ok(RoventPcCustodyReturnV2::Accepted)) => { returned = true; break; }
+                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) if Instant::now() < context.shutdown_deadline => {
+                            signal.wait_changed(observed, context.shutdown_deadline
+                                .saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                        }
+                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) => {
+                            custody_state = "custody receiver remained busy until the original deadline".into();
+                            break;
+                        }
+                        Ok(Err(error)) => { custody_state = format!("custody receiver failed: {error:?}"); break; }
+                        Err(payload) => {
+                            self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                            custody_state = "custody receiver panicked; original owner retained".into();
+                            break;
+                        }
+                    }
+                }
+            }
+            if !returned {
+                *state = State::Manager(manager);
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at("RoventPcV2CollectionCustodyPending", custody_state));
+            }
+            // The collection owner retains the exact joined worker and handoff.
+            // It separately records publication and settlement outcomes.
+            self.retained_collection_custody_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
+            self.retained_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
+            self.collection_v2_outstanding.store(false, Ordering::Release);
         }
         if let Some(observer) = &self.collection_hooks.root_closure {
             if let Err(error) = observer(&mut manager) {
