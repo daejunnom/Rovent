@@ -450,6 +450,24 @@ class NativeBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Core5Missing'):
             bundle.component_inventory(changed, [row], selected_profile=True)
 
+    def test_selected_component_names_follow_v5_utf8_text_contract(self):
+        row = {'path': 'crates/example/src/lib.rs', 'bytes': 1,
+               'sha256': hashlib.sha256(b'x').hexdigest()}
+        base = {'domain': 'rz-pals-source-inventory-v5/1',
+                'algorithm': 'sha256-domain-u64le;sorted-path-u64le-utf8;size-u64le;sha256-raw32',
+                'components': {name: [row['path']] for name in bundle.CORE5}}
+        for name in ('new-model', '검토 모델', 'é' * 512, 'a' * 1024):
+            with self.subTest(valid=name[:20]):
+                catalog = copy.deepcopy(base)
+                catalog['components'][name] = [row['path']]
+                self.assertIn(name, bundle.component_inventory(catalog, [row], selected_profile=True))
+        for name in ('', '   ', 'bad\nname', 'bad\x85name', 'é' * 513, 'a' * 1025, '\ud800'):
+            with self.subTest(invalid=repr(name[:20])):
+                catalog = copy.deepcopy(base)
+                catalog['components'][name] = [row['path']]
+                with self.assertRaisesRegex(RuntimeError, 'CatalogSourceMissing'):
+                    bundle.component_inventory(catalog, [row], selected_profile=True)
+
     def test_warm_requires_both_registered_source_and_explicit_exact_feature_target(self):
         name = bundle.WARM[2]
         features = bundle.WARM[3].split(',')

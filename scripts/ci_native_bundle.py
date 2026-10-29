@@ -236,6 +236,17 @@ def source_inventory(source, tree_raw):
     return sorted(rows, key=lambda row: row['path']), controls
 
 
+def selected_component_name_valid(name):
+    """Match the V5 manifest's UTF-8 length, nonblank and control rules."""
+    if type(name) is not str or not name.strip():
+        return False
+    try:
+        byte_count = len(name.encode('utf-8'))
+    except UnicodeError:
+        return False
+    return byte_count <= 1024 and not any(ord(ch) <= 0x1f or 0x7f <= ord(ch) <= 0x9f for ch in name)
+
+
 def component_inventory(catalog, rows, *, selected_profile=False):
     require(set(catalog) == {'domain', 'algorithm', 'components'}
             and catalog['domain'] == 'rz-pals-source-inventory-v5/1'
@@ -247,7 +258,7 @@ def component_inventory(catalog, rows, *, selected_profile=False):
     result = {}
     for name, paths in catalog['components'].items():
         if selected_profile:
-            require(type(name) is str and re.fullmatch('[a-z][a-z0-9_]{0,127}', name) is not None
+            require(selected_component_name_valid(name)
                     and type(paths) is list and all(type(p) is str for p in paths), 'CatalogSourceMissing')
         require(1 <= len(paths) <= 256 and len(set(paths)) == len(paths)
                 and all(p in by_path for p in paths), 'CatalogSourceMissing')
