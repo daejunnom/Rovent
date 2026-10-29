@@ -25,6 +25,10 @@ pub use actor_binding_v2::{
     BoundCollectionTeacherActorV2, TeacherActorBindingErrorV2, bind_collection_teacher_actor_v2,
     verify_collection_teacher_pin,
 };
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod policy_seal_v2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use policy_seal_v2::{RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealFailureV2};
 
 pub struct RoventCollectionTeacherOwner {
     launch: PreparedRoventExternalLaunch,
@@ -658,7 +662,21 @@ impl RoventCollectionTeacherOwnerV2 {
             .original_context()
             .accepts()
             .map_err(|_| invalid("teacher /2 root revoked"))?
-            || !completion.matches_submission(dispatch)
+        {
+            return Err(invalid("collection teacher completion lacks original private dispatch"));
+        }
+        self.validate_completion_provenance(completion, dispatch)
+    }
+
+    /// Private dispatch and physical checks only. The caller must establish
+    /// live root authority separately; in particular this must not reacquire
+    /// the UCI authority mutex while a linearization guard is already held.
+    fn validate_completion_provenance(
+        &self,
+        completion: &TeacherCompletion,
+        dispatch: &TeacherDispatch,
+    ) -> Result<(), CheckerError> {
+        if !completion.matches_submission(dispatch)
             || dispatch.input_scope().input_lock
                 != self.admission().root_admission().startup_lock_digest()
             || dispatch.input_scope().root_budget != self.admission().root_budget()

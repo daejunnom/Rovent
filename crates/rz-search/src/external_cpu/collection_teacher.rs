@@ -76,13 +76,19 @@ pub struct TeacherJob {
 pub struct TeacherDispatch {
     id: TeacherJobId,
     input_scope: TeacherInputScope,
+    // Exact Rules history actually submitted to this worker, not a digest
+    // supplied by a caller. The immutable history nodes are shared.
+    original_position: rz_position::PositionSnapshot,
+    original_root_moves: Option<Arc<[BoardMove]>>,
     requested: ExternalGoConstraint,
     original_deadline: Deadline,
     profile: ExternalEngineProfile,
     process: ExternalProcessIdentity,
     evaluation_namespace: ContractDigest,
     root_restriction: ContractDigest,
-    admission: Arc<()>,
+    // Every clone shares the same one-shot policy claim. This bit prevents
+    // replay only; it does not establish liveness, provenance or a label.
+    admission: Arc<AtomicBool>,
 }
 
 impl TeacherDispatch {
@@ -91,6 +97,12 @@ impl TeacherDispatch {
     }
     pub fn input_scope(&self) -> TeacherInputScope {
         self.input_scope
+    }
+    pub fn original_position(&self) -> &rz_position::PositionSnapshot {
+        &self.original_position
+    }
+    pub fn original_root_moves(&self) -> Option<&[BoardMove]> {
+        self.original_root_moves.as_deref()
     }
     pub fn constraint(&self) -> ExternalGoConstraint {
         self.requested
@@ -165,6 +177,8 @@ impl TeacherCompletion {
         Arc::ptr_eq(&self.dispatch.admission, &submitted.admission)
             && self.dispatch.id == submitted.id
             && self.dispatch.input_scope == submitted.input_scope
+            && self.dispatch.original_position.same_state(&submitted.original_position)
+            && self.dispatch.original_root_moves == submitted.original_root_moves
             && self.dispatch.requested == submitted.requested
             && self.dispatch.original_deadline == submitted.original_deadline
             && self.dispatch.profile == submitted.profile
@@ -176,6 +190,17 @@ impl TeacherCompletion {
     /// Strict submission match including the terminal's process evidence.
     pub fn matches_submission(&self, submitted: &TeacherDispatch) -> bool {
         self.matches_dispatch_identity(submitted) && self.process == Some(submitted.process)
+    }
+
+    /// Claim this original physical terminal once for a higher-level policy
+    /// decision. The caller must first verify the original dispatch, root
+    /// authority, deadline, outcome and physical provenance. A successful CAS
+    /// alone is not an acceptance or a publication capability.
+    pub fn try_claim_policy_once(&self, submitted: &TeacherDispatch) -> bool {
+        self.matches_submission(submitted)
+            && self.dispatch.admission.compare_exchange(
+                false, true, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok()
     }
 }
 
@@ -477,13 +502,15 @@ impl CollectionTeacherWorker {
         let dispatch = TeacherDispatch {
             id: job.id,
             input_scope: job.input_scope,
+            original_position: job.position.snapshot(),
+            original_root_moves: job.root_moves.as_deref().map(Arc::from),
             requested: job.constraint,
             original_deadline: job.original_deadline,
             profile: self.profile,
             process,
             evaluation_namespace: external_evaluation_namespace(&self.config.identity)?,
             root_restriction: external_root_restriction_digest(job.root_moves.as_deref()),
-            admission: Arc::new(()),
+            admission: Arc::new(AtomicBool::new(false)),
         };
         self.mailbox
             .admit(
@@ -1270,19 +1297,73 @@ mod tests {
     }
 
     #[test]
-    fn full_queue_preserves_atomic_cancel_and_reserved_terminal_after_close() {
+    fn original_terminal_policy_claim_is_shared_once_across_clones() {
         let (job, _, config, _) = fixture();
-        let mailbox = Mailbox::new(1, 2, CompletionSignal::default()).unwrap();
         let dispatch = TeacherDispatch {
             id: job.id,
             input_scope: job.input_scope,
+            original_position: job.position.snapshot(),
+            original_root_moves: job.root_moves.as_deref().map(Arc::from),
             requested: job.constraint,
             original_deadline: job.original_deadline,
             profile: ExternalEngineProfile::Reckless090EmbeddedNnue,
             process: ExternalProcessIdentity::default(),
             evaluation_namespace: external_evaluation_namespace(&config.identity).unwrap(),
             root_restriction: external_root_restriction_digest(None),
-            admission: Arc::new(()),
+            admission: Arc::new(AtomicBool::new(false)),
+        };
+        // This deliberately uses a failed terminal: the lower one-shot bit
+        // is replay protection, not successful evidence or label authority.
+        let completion = TeacherCompletion {
+            dispatch: dispatch.clone(),
+            process: Some(dispatch.process),
+            result: Err(error("fixture", "not_authority")),
+            attempt: None,
+            controls: ControlSnapshot::default(),
+            timing: ProfiledExternalTiming::default(),
+            go_issue: ExternalGoIssue::NotIssued,
+            issued_constraint: None,
+            issued_go: None,
+        };
+        let mut substituted = dispatch.clone();
+        substituted.admission = Arc::new(AtomicBool::new(false));
+        assert!(!completion.try_claim_policy_once(&substituted));
+        let mut different_position = dispatch.clone();
+        let mut moved = Position::startpos();
+        moved.make_move(BoardMove::from_uci("e2e4").unwrap()).unwrap();
+        different_position.original_position = moved.snapshot();
+        assert!(!completion.try_claim_policy_once(&different_position));
+        let mut different_restriction = dispatch.clone();
+        different_restriction.original_root_moves = Some(Arc::from(
+            [BoardMove::from_uci("e2e4").unwrap()].as_slice(),
+        ));
+        assert!(!completion.try_claim_policy_once(&different_restriction));
+        let mut contenders = Vec::new();
+        for _ in 0..8 {
+            let d = dispatch.clone();
+            let c = completion.clone();
+            contenders.push(std::thread::spawn(move || c.try_claim_policy_once(&d)));
+        }
+        assert_eq!(contenders.into_iter().map(|t| t.join().unwrap()).filter(|won| *won).count(), 1);
+        assert!(!completion.try_claim_policy_once(&dispatch));
+    }
+
+    #[test]
+    fn full_queue_preserves_atomic_cancel_and_reserved_terminal_after_close() {
+        let (job, _, config, _) = fixture();
+        let mailbox = Mailbox::new(1, 2, CompletionSignal::default()).unwrap();
+        let dispatch = TeacherDispatch {
+            id: job.id,
+            input_scope: job.input_scope,
+            original_position: job.position.snapshot(),
+            original_root_moves: job.root_moves.as_deref().map(Arc::from),
+            requested: job.constraint,
+            original_deadline: job.original_deadline,
+            profile: ExternalEngineProfile::Reckless090EmbeddedNnue,
+            process: ExternalProcessIdentity::default(),
+            evaluation_namespace: external_evaluation_namespace(&config.identity).unwrap(),
+            root_restriction: external_root_restriction_digest(None),
+            admission: Arc::new(AtomicBool::new(false)),
         };
         let controls = job.control.clone();
         assert!(
@@ -1732,11 +1813,11 @@ mod tests {
         assert!(missing_process.matches_dispatch_identity(&first));
         assert!(!missing_process.matches_submission(&first));
         assert!(!missing_process.matches_dispatch_identity(&TeacherDispatch {
-            admission: Arc::new(()),
+            admission: Arc::new(AtomicBool::new(false)),
             ..first.clone()
         }));
         assert!(!completion.matches_submission(&TeacherDispatch {
-            admission: Arc::new(()),
+            admission: Arc::new(AtomicBool::new(false)),
             ..first.clone()
         }));
         let next = worker.submit(second.clone()).unwrap();

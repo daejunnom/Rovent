@@ -43,6 +43,7 @@ pub use collection_teacher::RoventCollectionTeacherOwnerV2;
 pub use collection_teacher::{
     BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
     RoventCollectionTeacherLifecycleV2, RoventTeacherDiagnosticsDispositionV2,
+    RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealFailureV2,
     RoventTeacherPhysicalRetirementV2, RoventTeacherRetirementObservationV2,
     RoventTeacherRetirementTokenV2,
     RoventTeacherTerminalAccountingV2, TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2,
