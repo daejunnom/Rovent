@@ -512,6 +512,7 @@ impl RoventNnuecCollectionRunV2 {
                 "callback_lock_failure":status.callback_lock_failure})),
             "deferred_collection_roots_observation":deferred_observation,
             "pending_stopped_observation":pending_observation,
+            "before_start_failure":self.bridge.before_start_failure().map(|error|format!("{error:?}")),
             "pending_stopped":pending_stopped.map(|summary| json!({
                 "first":summary.first.map(|event| json!({
                     "admission_sha256":event.admission.raw_sha256(),
@@ -597,6 +598,7 @@ impl RoventNnuecCollectionRunV2 {
     /// worker observed the same fenced handoff and teacher retirement. This
     /// authorizes inspection/partial assembly, not final publication.
     pub fn closed_owner(&self) -> Result<RoventCollectionOwnerLockV2, ArenaError> {
+        check(self.bridge.before_start_failure().is_none(), "Collection /2 before-start failure retained")?;
         check(self.bridge.try_has_deferred_observations()? == Some(false),
             "Collection /2 deferred observations retained or busy")?;
         let pending = self.bridge.try_pending_stopped_observation()?
@@ -674,6 +676,7 @@ impl Drop for RoventNnuecCollectionRunV2 {
         // This only decides whether the Arena-owned worker can be dropped.
         // UCI's independent retained handoff slot remains unknown.
         let arena_worker_resolved = owner_resolved
+            && self.bridge.before_start_failure().is_none()
             && self.bridge.try_has_deferred_observations().is_ok_and(|observation| observation == Some(false))
             && self.bridge.try_pending_stopped_observation().is_ok_and(|observation|
                 observation.is_some_and(|summary| summary.first.is_none() && summary.summarized == 0 && summary.other == 0))

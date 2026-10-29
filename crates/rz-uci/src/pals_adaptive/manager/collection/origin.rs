@@ -87,6 +87,11 @@ struct LoadedOriginV2 {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventNativeCollectionOriginV2 {
+    /// Compare the original in-process origin owner, not copied metadata.
+    /// This identity check grants no root, dispatch or completion authority.
+    pub fn same_original_origin(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.original, &other.original)
+    }
     /// Compare the actual loaded verifier and clock, not a reconstructed
     /// model or lock digest. Call before any collection hook can spawn work.
     pub(crate) fn matches_native_owner(

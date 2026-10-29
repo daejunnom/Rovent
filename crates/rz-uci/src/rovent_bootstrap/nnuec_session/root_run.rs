@@ -896,6 +896,8 @@ impl RoventNnuecSessionDriver {
         let mut collection_failure = None;
         let mut v2_hook_started = false;
         let mut v2_revoked = false;
+        let mut v2_hook_admission = None;
+        let mut v2_root_hook_failure = None;
         let mut v2_admission_failure = None;
         let mut no_capture_v2 = None;
         let mut pending_collection_v2 = None;
@@ -983,6 +985,7 @@ impl RoventNnuecSessionDriver {
                             AdaptiveManagerError::Invalid("V2 collection hook owner absent"),
                         )?;
                         let expected_cap = cap.clone();
+                        v2_hook_admission = Some(expected_cap.clone());
                         // Reserve recovery capacity before this root can
                         // install an observer or start a teacher.
                         let escrow_error = match handoff_escrow_v2::HandoffEscrowReservationV2::try_reserve(&cap) {
@@ -1132,7 +1135,8 @@ impl RoventNnuecSessionDriver {
                                 || manager.phase() != ManagerPhase::Running)
                         {
                             if let Some(hooks) = &self.collection_hooks_v2 {
-                                hooks.revoke();
+                                hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission"))
+                                    .map_err(|failure| { let error = failure.error.clone(); v2_root_hook_failure.get_or_insert(failure); error })?;
                             }
                             v2_revoked = true;
                         }
@@ -1163,11 +1167,13 @@ impl RoventNnuecSessionDriver {
                                 .as_ref()
                                 .filter(|_| collection_failure.is_none())
                             {
-                                match hooks.pump() {
+                                match hooks.pump_root(v2_hook_admission.as_ref().expect("root hook admission"))
+                                    .map_err(|failure| { let error = failure.error.clone(); v2_root_hook_failure.get_or_insert(failure); error }) {
                                     Ok(()) => {}
                                     Err(AdaptiveManagerError::Collection(error)) => {
                                         if !v2_revoked {
-                                            hooks.revoke();
+                                            hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission"))
+                                                .map_err(|failure| { let error = failure.error.clone(); v2_root_hook_failure.get_or_insert(failure); error })?;
                                             v2_revoked = true;
                                         }
                                         if collection_failure.is_none() {
@@ -1268,10 +1274,15 @@ impl RoventNnuecSessionDriver {
             Ok(Err(error)) => {
                 if v2_hook_started {
                     if let Some(hooks) = &self.collection_hooks_v2 {
-                        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
-                            self.retain_v2_revoke_panic(payload);
+                        match catch_unwind(AssertUnwindSafe(|| hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission")))) {
+                            Ok(Ok(())) => {},
+                            Ok(Err(failure)) => return Err(run.retain_failure("RoventNnuecV2Revoke", "original root revoke failed", (error, v2_admission_failure, v2_root_hook_failure, failure))),
+                            Err(payload) => self.retain_v2_revoke_panic(payload),
                         }
                     }
+                }
+                if let Some(original) = v2_root_hook_failure {
+                    return Err(run.retain_failure("RoventNnuecExecution", error.to_string(), (error, v2_admission_failure, original)));
                 }
                 if let Some(rejected) = v2_admission_failure {
                     return Err(run.retain_failure(
@@ -1285,8 +1296,10 @@ impl RoventNnuecSessionDriver {
             Err(payload) => {
                 if v2_hook_started {
                     if let Some(hooks) = &self.collection_hooks_v2 {
-                        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
-                            self.retain_v2_revoke_panic(payload);
+                        match catch_unwind(AssertUnwindSafe(|| hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission")))) {
+                            Ok(Ok(())) => {},
+                            Ok(Err(failure)) => return Err(run.retain_failure("RoventNnuecV2Revoke", "original root revoke failed after execution panic", (payload, v2_root_hook_failure, failure))),
+                            Err(revoke_payload) => self.retain_v2_revoke_panic(revoke_payload),
                         }
                     }
                 }
@@ -1299,12 +1312,14 @@ impl RoventNnuecSessionDriver {
         }
         if v2_hook_started && !v2_revoked {
             if let Some(hooks) = &self.collection_hooks_v2 {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
-                    return Err(run.retain_panic(
+                match catch_unwind(AssertUnwindSafe(|| hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission")))) {
+                    Ok(Ok(())) => {},
+                    Ok(Err(failure)) => return Err(run.retain_failure("RoventNnuecV2Revoke", "original root revoke failed", failure)),
+                    Err(payload) => return Err(run.retain_panic(
                         "RoventNnuecV2CollectionRevokePanic",
                         "V2 collection revoke panicked; original hook and owners retained",
                         payload,
-                    ));
+                    )),
                 }
             }
         }
@@ -1435,9 +1450,11 @@ impl RoventNnuecSessionDriver {
                     self.collection_hooks_v2
                         .as_ref()
                         .expect("started hook")
-                        .handoff_sender()
+                        .handoff_sender_root(v2_hook_admission.as_ref().expect("root hook admission"))
                 })) {
-                    Ok(sender) => sender,
+                    Ok(Ok(sender)) => sender,
+                    Ok(Err(failure)) => return Err(run.retain_failure(
+                        "RoventNnuecV2HandoffSender", "original root handoff sender unavailable", failure)),
                     Err(payload) => {
                         return Err(run.retain_panic(
                             "RoventNnuecV2HandoffSenderPanic",

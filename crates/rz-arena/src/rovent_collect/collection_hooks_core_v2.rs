@@ -122,6 +122,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         let old = previous.root_admission().authority();
         let new = next.root_admission().authority();
         !previous.same_original_admission(next)
+            && previous.same_original_origin(next)
             && old.epoch == new.epoch
             && old.implementation == new.implementation
             && (new.game > old.game || (new.game == old.game && new.root > old.root))
@@ -270,6 +271,8 @@ pub(crate) struct CoreAdmissionFailure {
     pub(crate) error: AdaptiveManagerError,
     pub(crate) admission: RoventCollectionRootAdmissionV2,
     pub(crate) owners: Box<dyn std::any::Any + Send>,
+    /// True only before the original observer install callback was entered.
+    pub(crate) before_start: bool,
 }
 
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
@@ -302,6 +305,10 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             error,
             admission,
             owners: Box::new(()),
+            before_start: true,
+        };
+        let reject_started = |error, admission| CoreAdmissionFailure {
+            error, admission, owners: Box::new(()), before_start: false,
         };
         if self.startup.get().is_none()
             || self.revoked.load(Ordering::Acquire)
@@ -316,7 +323,9 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                 )
                 .is_err()
         {
-            return Err(reject(AdaptiveManagerError::AdmissionClosed, admission));
+            // The phase/owner may belong to an earlier or concurrent attempt;
+            // this guard alone does not prove this root never installed.
+            return Err(reject_started(AdaptiveManagerError::AdmissionClosed, admission));
         }
         // Reserve the bounded outbox before installing the observer. The
         // consumer cannot use the root until the release-store of INSTALLED.
@@ -356,7 +365,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                     )
                     .is_err()
                 {
-                    return Err(reject(
+                    return Err(reject_started(
                         AdaptiveManagerError::Deadline,
                         slot.admission.clone(),
                     ));
@@ -366,13 +375,13 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                     .compare_exchange(RESERVING, INSTALLED, Ordering::AcqRel, Ordering::Acquire)
                     .is_err()
                 {
-                    return Err(reject(
+                    return Err(reject_started(
                         AdaptiveManagerError::Deadline,
                         slot.admission.clone(),
                     ));
                 }
                 if self.installed_admission.set(slot.admission.clone()).is_err() {
-                    return Err(reject(AdaptiveManagerError::Invalid("Collection V2 original admission already installed"), slot.admission.clone()));
+                    return Err(reject_started(AdaptiveManagerError::Invalid("Collection V2 original admission already installed"), slot.admission.clone()));
                 }
                 self.installed_published.store(true, Ordering::Release);
                 Ok(())
@@ -383,6 +392,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                     error: original.error,
                     admission: original.admission,
                     owners: original.owners,
+                    before_start: false,
                 })
             }
         }
@@ -437,6 +447,23 @@ pub(crate) enum WorkerFailure {
 }
 
 impl WorkerFailure {
+    /// Diagnostic projection only; original errors and recovery owners remain
+    /// in the worker. Limit the emitted text without changing failure state.
+    pub(crate) fn diagnostic(&self) -> String {
+        let detail = match self {
+            Self::Preparation(error) | Self::Retirement(error) | Self::RowPump(error) => format!("{error:?}"),
+            Self::ActorStart(TeacherSessionStartErrorV2::Admission(error)) => format!("{error:?}"),
+            Self::ActorStart(TeacherSessionStartErrorV2::Binding(error)) => format!("{error:?}"),
+            Self::ActorStart(TeacherSessionStartErrorV2::BeforeSpawn(cause))
+            | Self::ActorStart(TeacherSessionStartErrorV2::AfterSpawn { cause, .. }) => format!("{cause:?}"),
+            Self::Shutdown(error) => format!("{error:?}"),
+            Self::TeacherWorkerJoin { actor_id, error } => format!("actor={actor_id} error={error:?}"),
+            Self::TeacherRegistryPoisoned { actor_id } => format!("actor={actor_id}"),
+            Self::HandoffRecovery(detail) | Self::AggregateRejected(detail) => (*detail).to_owned(),
+            _ => String::new(),
+        };
+        detail.chars().take(4096).collect()
+    }
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Preparation(_) => "preparation",

@@ -38,6 +38,7 @@ pub struct RoventPcCollectionRunV2 {
     publication_dir: Option<Dir>,
     publication_attempted: bool,
     publication: Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
+    late_rows: std::collections::VecDeque<RoventRetiredLockV2Record>,
     worker_start: Arc<AtomicU8>,
     worker_exit: Option<PcWorkerExitKindV2>,
     worker_thread_panicked: bool,
@@ -47,6 +48,109 @@ pub struct RoventPcCollectionRunV2 {
 }
 
 impl RoventPcCollectionRunV2 {
+    /// Write serializable failure observations and original recovered teacher
+    /// byte streams without consuming their owners. A partial write is left
+    /// in place and a later attempt cannot silently replace it.
+    pub fn write_failure_evidence(&self, publication_failure: Option<&str>) -> Result<bool, ArenaError> {
+        use sha2::{Digest as _, Sha256};
+        let mut raw = Vec::<(String, Vec<u8>)>::new();
+        let observation = self.observation();
+        let (worker_evidence, mut complete) = if self.worker_exit.is_some() && !self.worker_thread_panicked {
+            match self.worker.try_lock() {
+                Ok(worker) => {
+                    let diagnostics = worker.diagnostics();
+                    let bytes = diagnostics.values().try_fold(0usize, |total, value| {
+                        total.checked_add(value.stdout().len())?.checked_add(value.stderr().len())
+                    });
+                    if !bytes.is_some_and(|n| n <= 4 * 1024 * 1024) {
+                        (json!({"status":"diagnostics_over_limit"}), false)
+                    } else {
+                        let mut entries = Vec::new();
+                        for (index, (actor, value)) in diagnostics.iter().enumerate() {
+                            let stdout = format!("teacher-{index}-stdout.bin");
+                            let stderr = format!("teacher-{index}-stderr.bin");
+                            entries.push(json!({"actor":actor,
+                                "stdout":{"path":&stdout,"bytes":value.stdout().len(),"sha256":format!("{:x}", Sha256::digest(value.stdout()))},
+                                "stderr":{"path":&stderr,"bytes":value.stderr().len(),"sha256":format!("{:x}", Sha256::digest(value.stderr()))}}));
+                            raw.push((stdout, value.stdout().to_vec()));
+                            raw.push((stderr, value.stderr().to_vec()));
+                        }
+                        let failure = worker.failure_observation();
+                        let retirement = format!("{:?}", worker.teacher_observations());
+                        if retirement.len() > 256 * 1024 {
+                            raw.clear();
+                            (json!({"status":"retirement_observation_over_limit"}), false)
+                        } else {
+                            (json!({"status":"observed", "primary_failure":failure.primary.map(|f| json!({"kind":f.kind(),"detail":f.diagnostic()})),
+                                "additional_failures":failure.additional.iter().map(|f| json!({"kind":f.kind(),"detail":f.diagnostic()})).collect::<Vec<_>>(),
+                                "omitted_failures":failure.omitted, "teacher_retirement_observation_debug":retirement,
+                                "teacher_diagnostics":entries}), failure.omitted == 0)
+                        }
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => (json!({"status":"worker_busy"}), false),
+                Err(std::sync::TryLockError::Poisoned(_)) => (json!({"status":"worker_poisoned"}), false),
+            }
+        } else { (json!({"status":"worker_not_joined_or_panicked"}), false) };
+        // A serialized late record is diagnostic data only; it cannot
+        // reconstruct the original in-process admission or producer owner.
+        let mut late_entries = Vec::new();
+        let mut late_bytes = 0usize;
+        for (index, row) in self.late_rows.iter().enumerate() {
+            let bytes = serde_json::to_vec(&row.record).map_err(|e| invalid(e.to_string()))?;
+            let Some(next) = late_bytes.checked_add(bytes.len()) else { complete = false; break; };
+            if next > 4 * 1024 * 1024 { complete = false; break; }
+            late_bytes = next;
+            let name = format!("late-row-{index}.json");
+            late_entries.push(json!({"path":&name, "bytes":bytes.len(),
+                "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
+            raw.push((name, bytes));
+        }
+        let mut evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
+            "raw_files_complete_only_when_receipt_exists":true,
+            "publication_failure":publication_failure.map(|s| s.chars().take(4096).collect::<String>()),
+            "run_observation":observation, "worker_evidence":worker_evidence,
+            "late_rows_total":self.late_rows.len(), "late_rows_serialized":late_entries}))
+            .map_err(|e| invalid(e.to_string()))?;
+        if evidence.len() > 1024 * 1024 {
+            raw.clear();
+            complete = false;
+            evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
+                "status":"metadata_over_limit", "worker_exit":self.worker_exit.map(PcWorkerExitKindV2::label),
+                "worker_thread_panicked":self.worker_thread_panicked,
+                "physical_completion":"not_recorded",
+                "publication_failure":publication_failure.map(|s| s.chars().take(4096).collect::<String>()),
+                "native_failure_present":self.native_failure.is_some(), "resource_failure_present":self.resource_error.is_some(),
+                "detail":"Original owner remains in custody; detailed metadata exceeded 1 MiB"}))
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        let parent = self.publication_directory.parent().ok_or_else(|| invalid("P/C output parent"))?;
+        let leaf = self.publication_directory.file_name().ok_or_else(|| invalid("P/C output leaf"))?;
+        let root = Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?;
+        let directory = match root.open_dir_nofollow(leaf) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                root.create_dir(leaf).map_err(io)?;
+                root.open_dir_nofollow(leaf).map_err(io)?
+            }
+            Err(error) => return Err(io(error)),
+        };
+        directory.create_dir("pc-failure-evidence").map_err(io)?;
+        let directory = directory.open_dir_nofollow("pc-failure-evidence").map_err(io)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true).follow(FollowSymlinks::No);
+        // Preserve the planned metadata even if a later raw byte write fails;
+        // only receipt.json records completion of all listed writes.
+        let mut planned = directory.open_with("planned.json", &options).map_err(io)?;
+        planned.write_all(&evidence).and_then(|_| planned.sync_all()).map_err(io)?;
+        for (name, bytes) in raw {
+            let mut file = directory.open_with(name, &options).map_err(io)?;
+            file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(io)?;
+        }
+        let mut file = directory.open_with("receipt.json", &options).map_err(io)?;
+        file.write_all(&evidence).and_then(|_| file.sync_all()).map_err(io)?;
+        Ok(complete)
+    }
     /// Complete a single-root publication using only the original joined
     /// worker, settled handoff and received rows. Failures retain the owner,
     /// consumer and any assembly; they never imply physical completion.
@@ -58,8 +162,36 @@ impl RoventPcCollectionRunV2 {
             && matches!(self.worker_exit, Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement))
             && self.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C handoff: {e:?}")))?
             && self.closed_owner().is_ok(), "P/C original worker, native fence or teacher aggregate unavailable")?;
-        check(self.worker.try_lock().is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
-            "P/C worker has pending or failed original rows")?;
+        // The original observer may retire rows just before its root fence.
+        // Recover them after the original worker joined, outside the native
+        // manager; never synthesize a teacher result for those late rows.
+        loop {
+            check(Instant::now() < until, "P/C late retired row recovery deadline reached")?;
+            let Some(status) = self.owner.try_status()? else {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            if status.pending_retired_count == 0 { break; }
+            check(self.late_rows.len() < self.publication_maximum_records as usize,
+                "P/C late retired row recovery capacity reached")?;
+            self.late_rows.try_reserve(1).map_err(|_| invalid("P/C late row custody capacity"))?;
+            match self.owner.try_take_settled_retired()? {
+                Some(Some(row)) => self.late_rows.push_back(row),
+                Some(None) => break,
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        match self.worker.try_lock() {
+            Ok(worker) => {
+                check(!worker.has_failure(), "P/C worker has retained failure")?;
+                check(!worker.has_unpublished_pump_rows(), "P/C worker has unpublished pump rows")?;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return Err(invalid("P/C worker observation busy")),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C worker observation poisoned")),
+        }
+        check(self.late_rows.iter().all(|row| row.submitted_input_seal().teacher_actor_id.is_none()
+            || row.record.0.input.legal_moves.is_empty()),
+            "P/C late retired rows require teacher evidence; originals retained")?;
         check(self.owner.try_status()?.is_some_and(|status| status.pending_retired_count == 0),
             "P/C owner still retains or queues retired original rows")?;
         check(matches!(self.bridge.try_has_deferred()?, Some(false))
@@ -106,6 +238,23 @@ impl RoventPcCollectionRunV2 {
                         OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
                     },
                 }
+            }
+            while !self.late_rows.is_empty() {
+                check(Instant::now() < until, "P/C late row publication deadline expired")?;
+                let row = self.late_rows.pop_front().expect("late original row retained");
+                if let Err(original) = assembly.offer(row) {
+                    let (error, row) = *original;
+                    self.late_rows.push_front(row);
+                    return Err(error);
+                }
+                let advanced = match self.try_advance_consumer_assembly(&mut assembly) {
+                    Err(error) if assembly.chunk_flush_required()? => {
+                        assembly.flush()?;
+                        self.try_advance_consumer_assembly(&mut assembly).map_err(|retry| invalid(format!("P/C append before flush: {error}; retry: {retry}")))?
+                    }
+                    other => other?,
+                };
+                check(advanced, "P/C late row original commit gate remained busy")?;
             }
             check(assembly.records() > 0 && matches!(self.pump_consumer.try_has_failures()?, Some(false)),
                 "P/C publication has no valid rows or retains a teacher failure")?;
@@ -198,9 +347,13 @@ impl RoventPcCollectionRunV2 {
         });
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
+            let (unlabeled, prepared, failed, committed) = worker.pump_ready_counts();
             json!({"primary_failure":failures.primary.map(|failure|failure.kind()),
+                "worker_failed":worker.has_failure(),
                 "additional_failures":failures.additional.iter().map(|failure|failure.kind()).collect::<Vec<_>>(),
                 "omitted_failures":failures.omitted,
+                "pending_pump_rows":worker.pending_pump_rows(),
+                "ready_unlabeled":unlabeled,"ready_prepared":prepared,"ready_failed":failed,"ready_committed":committed,
                 "diagnostic_actors":worker.diagnostics().len()})
         });
         let deferred_observation = match self.bridge.try_deferred_observation() {
@@ -225,6 +378,7 @@ impl RoventPcCollectionRunV2 {
             "corpus_published":self.pump_published,
             "publisher_receipt":self.publication,
             "publication_attempted":self.publication_attempted,
+            "late_retired_rows_retained":self.late_rows.len(),
             "teacher_worker_observation":worker_observation,
             "deferred_collection":deferred_observation,
             "collection_owner_observation":owner_observation,
@@ -364,7 +518,10 @@ impl Drop for RoventPcCollectionRunV2 {
             && (self.worker_exit == Some(PcWorkerExitKindV2::Retirement)
                 || (self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
                     && self.bridge.returned_handoff_settled().unwrap_or(false)));
-        if !physically_resolved {
+        // Native completion does not release the producer while any original
+        // row, unpublished assembly or consumer may still depend on it.
+        let collection_custody_resolved = self.pump_published && self.late_rows.is_empty();
+        if !physically_resolved || !collection_custody_resolved {
             // A dropped observation must not release a still-running or
             // unverified owner. Keep the exact objects for process lifetime;
             // this is quarantine, not a physical-completion receipt.
@@ -380,6 +537,7 @@ impl Drop for RoventPcCollectionRunV2 {
             if let Some(payload) = self.pump_thread_panic.take() { std::mem::forget(payload); }
             if let Some(assembly) = self.publication_assembly.take() { std::mem::forget(assembly); }
             if let Some(directory) = self.publication_dir.take() { std::mem::forget(directory); }
+            if !self.late_rows.is_empty() { std::mem::forget(std::mem::take(&mut self.late_rows)); }
         }
     }
 }
@@ -565,6 +723,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
         publication_dir: None,
         publication_attempted: false,
         publication: None,
+        late_rows: std::collections::VecDeque::new(),
         worker_start,
         worker_exit: None,
         worker_thread_panicked: false,

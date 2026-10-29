@@ -123,7 +123,14 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                 Ok(false) => ("partial", None),
                 Err(error) => ("partial", Some(error.to_string())),
             };
-            let observation = run.observation();
+            let failure_evidence = if publication != "published" {
+                match run.write_failure_evidence(publication_error.as_deref()) {
+                    Ok(complete) => serde_json::json!({"status":if complete { "written" } else { "partial" }, "path":"pc-failure-evidence/receipt.json"}),
+                    Err(error) => serde_json::json!({"status":"unavailable", "error":error.to_string()}),
+                }
+            } else { serde_json::json!({"status":"not_needed"}) };
+            let mut observation = run.observation();
+            if let Some(object) = observation.as_object_mut() { object.insert("failure_evidence".into(), failure_evidence); }
             let accepted = run.closed_owner().is_ok()
                 && observation
                     .get("native_error")

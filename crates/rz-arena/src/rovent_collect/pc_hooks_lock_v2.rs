@@ -277,6 +277,7 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                         error: original.error.clone(),
                         admission: original.admission.clone(),
                         owners: Box::new(original),
+                        before_start: false,
                     })
             })
             .map(|()| RoventPcCollectionAdmissionOutcomeV2::Installed)

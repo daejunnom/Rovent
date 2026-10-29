@@ -452,6 +452,30 @@ impl RoventCollectionOwnerLockV2 {
         Ok(None)
     }
 
+    /// Distinguish contention from a genuinely empty, settled root outbox.
+    /// The original row remains with its owner on Busy or any error.
+    pub(crate) fn try_take_settled_retired(
+        &self,
+    ) -> Result<Option<Option<RoventRetiredLockV2Record>>, ArenaError> {
+        let receiver = match self.retired_receiver.try_lock() {
+            Ok(receiver) => receiver,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 retired receiver poisoned")),
+        };
+        if let Ok(row) = receiver.try_recv() {
+            self.retired_queued.fetch_sub(1, Ordering::AcqRel);
+            return Ok(Some(Some(row)));
+        }
+        if self.retired_queued.load(Ordering::Acquire) != 0 { return Ok(None); }
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+        };
+        check(state.settled, "lock-v2 retained recovery requires a settled root")?;
+        Ok(Some(state.retired.pop_front()))
+    }
+
     /// Exceptional send failures retain their original row in the manager.
     /// This recovery is only available after settlement; the caller must also
     /// exclude a concurrent next-root admission while it holds the owner.

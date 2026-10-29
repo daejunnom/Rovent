@@ -382,6 +382,28 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     fn handoff_sender(
         &self,
     ) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>;
+
+    /// Compatibility forwarding is for the existing single-root hook only.
+    /// A multi-root implementation must override all three methods and
+    /// route using this same original admission, never a latest-root slot.
+    fn pump_root(&self, _admission: &RoventCollectionRootAdmissionV2) -> Result<(), RoventNnuecRootHookFailureV2> {
+        self.pump().map_err(|error| RoventNnuecRootHookFailureV2 { admission: _admission.clone(), error })
+    }
+    fn revoke_root(&self, _admission: &RoventCollectionRootAdmissionV2) -> Result<(), RoventNnuecRootHookFailureV2> {
+        self.revoke();
+        Ok(())
+    }
+    fn handoff_sender_root(&self, _admission: &RoventCollectionRootAdmissionV2)
+        -> Result<std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>, RoventNnuecRootHookFailureV2> {
+        Ok(self.handoff_sender())
+    }
+}
+
+/// A root-specific hook failure keeps the same original admission. It never
+/// establishes native or teacher physical completion.
+pub struct RoventNnuecRootHookFailureV2 {
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub error: AdaptiveManagerError,
 }
 
 /// Deferred is valid only before this root starts an observer or teacher and

@@ -14,11 +14,12 @@ use rz_uci::rovent_bootstrap::nnuec_session::{
     RoventNnuecCollectionAdmissionFailureV2, RoventNnuecCollectionAdmissionPortV2,
     RoventNnuecCollectionAdmissionOutcomeV2, RoventNnuecCollectionHandoffV2,
     RoventNnuecCollectionHooksV2, RoventNnuecPendingCollectionV2, RoventPendingEvidenceDispositionV2,
+    RoventNnuecRootHookFailureV2,
 };
 use rz_uci::rovent_bootstrap::nnuec_session::handoff_escrow_v2::{
     HandoffEscrowErrorV2, HandoffEscrowKeyV2,
 };
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 pub(crate) use super::collection_hooks_core_v2::CollectionWorkerExitV2 as RoventNnuecCollectionWorkerExitV2;
 pub(crate) type RoventNnuecCollectionWorkerV2 =
@@ -28,6 +29,8 @@ pub(crate) struct RoventNnuecCollectionBridgeV2 {
     core: Arc<CollectionBridgeCoreV2<RoventNnuecCollectionHandoffV2>>,
     deferred: Mutex<DeferredCollectionHistoryV2>,
     pending_stopped: Mutex<PendingCollectionSummaryV2>,
+    original_attempt: OnceLock<RoventCollectionRootAdmissionV2>,
+    before_start_failure: OnceLock<AdaptiveManagerError>,
 }
 
 struct DeferredCollectionHistoryV2 {
@@ -108,6 +111,18 @@ fn recover_root_handoff(
 }
 
 impl RoventNnuecCollectionBridgeV2 {
+    /// Original pre-install failure remains available even if no-capture
+    /// registration stayed pending until the root deadline.
+    pub(crate) fn before_start_failure(&self) -> Option<&AdaptiveManagerError> {
+        self.before_start_failure.get()
+    }
+    fn verify_original_attempt(&self, admission: &RoventCollectionRootAdmissionV2) -> Result<(), RoventNnuecRootHookFailureV2> {
+        if self.original_attempt.get().is_some_and(|original| original.same_original_admission(admission)) {
+            Ok(())
+        } else {
+            Err(RoventNnuecRootHookFailureV2 { admission: admission.clone(), error: AdaptiveManagerError::Invalid("Collection V2 root hook admission mismatch") })
+        }
+    }
     pub(crate) fn installed_admission_for_recovery(&self) -> Option<&RoventCollectionRootAdmissionV2> {
         self.core.installed_admission_for_recovery()
     }
@@ -123,7 +138,7 @@ impl RoventNnuecCollectionBridgeV2 {
         let (core, mut worker) =
             CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
         worker.configure_handoff_recovery(recover_root_handoff, handoff_identity);
-        Ok((Arc::new(Self { core, pending_stopped: Mutex::new(PendingCollectionSummaryV2::new()), deferred: Mutex::new(DeferredCollectionHistoryV2 {
+        Ok((Arc::new(Self { core, original_attempt: OnceLock::new(), before_start_failure: OnceLock::new(), pending_stopped: Mutex::new(PendingCollectionSummaryV2::new()), deferred: Mutex::new(DeferredCollectionHistoryV2 {
             retained: Vec::with_capacity(256), summarized: 0, first_summarized: None,
             summarized_reasons: Vec::with_capacity(16), other_summarized_reasons: 0,
         }) }), worker))
@@ -249,6 +264,19 @@ impl RoventNnuecCollectionHooksV2 for RoventNnuecCollectionBridgeV2 {
         port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
     ) -> Result<RoventNnuecCollectionAdmissionOutcomeV2, RoventNnuecCollectionAdmissionFailureV2> {
+        if let (Some(first), Some(error)) = (self.original_attempt.get(), self.before_start_failure.get()) {
+            let previous = first.root_admission().authority();
+            let next = admission.root_admission().authority();
+            let same = first.same_original_admission(&admission);
+            let later = first.native_origin().same_original_origin(admission.native_origin())
+                && previous.epoch == next.epoch && previous.implementation == next.implementation
+                && (next.game > previous.game || (next.game == previous.game && next.root > previous.root));
+            if same || later {
+                let reason = AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,
+                    "RoventCollectionBeforeStart", format!("{error:?}"));
+                return self.defer_before_start(port, admission, reason);
+            }
+        }
         // A previous single-root bridge can no longer start work for this
         // admission. Only this known pre-install state may be deferred; an
         // in-progress reservation is not evidence that no worker was started.
@@ -257,21 +285,34 @@ impl RoventNnuecCollectionHooksV2 for RoventNnuecCollectionBridgeV2 {
                 "RoventCollectionPreviousRootRetained", "prior single-root collector remains closed; this root has no collection");
             return self.defer_before_start(port, admission, reason);
         }
-        self.core
+        let _ = self.original_attempt.set(admission.clone());
+        if let Err(failure) = self.verify_original_attempt(&admission) {
+            return Err(RoventNnuecCollectionAdmissionFailureV2 {
+                error: failure.error, admission: failure.admission, owners: Box::new(()),
+            });
+        }
+        match self.core
             .admit(admission, |admission, owner| {
                 port.install(admission, owner.observer())
                     .map_err(|original| CoreAdmissionFailure {
                         error: original.error.clone(),
                         admission: original.admission.clone(),
                         owners: Box::new(original),
+                        before_start: false,
                     })
-            })
-            .map(|()| RoventNnuecCollectionAdmissionOutcomeV2::Installed)
-            .map_err(|failure| RoventNnuecCollectionAdmissionFailureV2 {
-                error: failure.error,
-                admission: failure.admission,
-                owners: failure.owners,
-            })
+            }) {
+            Ok(()) => Ok(RoventNnuecCollectionAdmissionOutcomeV2::Installed),
+            Err(failure) if failure.before_start => {
+                let _ = self.before_start_failure.set(failure.error.clone());
+                let error = self.before_start_failure.get().expect("before-start failure retained");
+                let reason = AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,
+                    "RoventCollectionBeforeStart", format!("{error:?}"));
+                self.defer_before_start(port, failure.admission, reason)
+            }
+            Err(failure) => Err(RoventNnuecCollectionAdmissionFailureV2 {
+                error: failure.error, admission: failure.admission, owners: failure.owners,
+            }),
+        }
     }
     fn finish_deferred(
         &self,
@@ -301,5 +342,19 @@ impl RoventNnuecCollectionHooksV2 for RoventNnuecCollectionBridgeV2 {
     }
     fn handoff_sender(&self) -> mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>> {
         self.core.handoff_sender()
+    }
+    fn pump_root(&self, admission: &RoventCollectionRootAdmissionV2) -> Result<(), RoventNnuecRootHookFailureV2> {
+        self.verify_original_attempt(admission)?;
+        self.core.pump().map_err(|error| RoventNnuecRootHookFailureV2 { admission: admission.clone(), error })
+    }
+    fn revoke_root(&self, admission: &RoventCollectionRootAdmissionV2) -> Result<(), RoventNnuecRootHookFailureV2> {
+        self.verify_original_attempt(admission)?;
+        self.core.revoke();
+        Ok(())
+    }
+    fn handoff_sender_root(&self, admission: &RoventCollectionRootAdmissionV2)
+        -> Result<mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>, RoventNnuecRootHookFailureV2> {
+        self.verify_original_attempt(admission)?;
+        Ok(self.core.handoff_sender())
     }
 }

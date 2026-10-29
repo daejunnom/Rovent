@@ -314,6 +314,13 @@ fn prepare_completed_teacher_policy(
                 "exit_observed":p.exit_observed,"stdout_drained":p.stdout_drained,"stderr_drained":p.stderr_drained,
                 "exit_code":p.exit_code,"exit_signal":p.exit_signal,"cleanup_complete":p.cleanup_complete,
                 "quarantined":p.quarantined,"ownership_lost":p.ownership_lost,"stdout_bytes":p.stdout_bytes,"stderr_bytes":p.stderr_bytes}});
+    // Relative durations are meaningful only when both original observations
+    // exist and occur in order. Missing, reversed or unrepresentable values
+    // remain null; absolute process-local Instants are never serialized.
+    let elapsed_ns = |start: Option<std::time::Instant>, end: Option<std::time::Instant>| {
+        start.zip(end).and_then(|(start, end)| end.checked_duration_since(start))
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+    };
     let body = json!({"schema":HEAD_DOMAIN,"kind":"teacher_policy","actor_id":actor_id,
             "input_sha256":input_sha256,"anchor":input.rules_anchor,"teacher_pin":pin,"binding":binding_raw,
             "completion":{"profile":r.profile,"purpose":r.purpose,"issued_go":r.issued_go,"requested":r.requested,"issued":r.issued,
@@ -322,7 +329,15 @@ fn prepare_completed_teacher_policy(
                 "option_application_observed":r.option_application_observed,"model_loading_observed":startup.model_loading_observed(),"attempt":attempt_json,
                 "stop_control":outcome.stop_control.map(|c|json!({"sequence":c.sequence,"action":format!("{:?}",c.action)})),
                 "timing":{"go_issued":timing.go_issued_at.is_some(),"stop_sent":timing.stop_sent_at.is_some(),
-                    "bestmove_drained":timing.bestmove_drained_at.is_some(),"ready_completed":timing.ready_completed_at.is_some()}}});
+                    "bestmove_drained":timing.bestmove_drained_at.is_some(),"ready_completed":timing.ready_completed_at.is_some(),
+                    "durations_ns":{"admitted_to_run_started":elapsed_ns(timing.admitted_at, timing.run_started_at),
+                        "run_started_to_go_issued":elapsed_ns(timing.run_started_at, timing.go_issued_at),
+                        "go_issued_to_stop_sent":elapsed_ns(timing.go_issued_at, timing.stop_sent_at),
+                        "go_issued_to_bestmove_drained":elapsed_ns(timing.go_issued_at, timing.bestmove_drained_at),
+                        "stop_sent_to_bestmove_drained":elapsed_ns(timing.stop_sent_at, timing.bestmove_drained_at),
+                        "bestmove_drained_to_ready_completed":elapsed_ns(timing.bestmove_drained_at, timing.ready_completed_at),
+                        "ready_completed_to_returned":elapsed_ns(timing.ready_completed_at, timing.returned_at),
+                        "admitted_to_returned":elapsed_ns(timing.admitted_at, timing.returned_at)}}}});
     let seal = generation_digest(HEAD_DOMAIN, &body)?;
     let target = GenerationPolicyTargetV3 {
         observed_sequence: sequence,
