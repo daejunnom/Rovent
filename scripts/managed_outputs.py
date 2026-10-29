@@ -264,6 +264,10 @@ class OutputLease:
         self.reserve, self.total_limit, self.days = reserve, total_limit, retention_days
         self._maintenance_due = False
         self._foreign_usage_snapshot = {}
+        # Only the ordinary guard-held lease may reuse admission accounting.
+        # The values are reservations, never a physical-usage observation or
+        # permission to alter another producer's files.
+        self._plain_usage_snapshot_ready = False
         self._foreign_estimate_reported = False
         self._last_own_usage = None
         self.deferred = deferred
@@ -480,6 +484,10 @@ class OutputLease:
                     raise OutputBudgetError("preservation evidence exceeds original output reservation")
                 warn_output_threshold(self._output_usage(self._quarantine_view.rows() if self.unattributed_preservation is not None else _catalog_rows(self.catalog)),
                                       self.total_limit, scope="output_accounted")
+            self._plain_usage_snapshot_ready = not (
+                self.unattributed_preservation is not None or self._preservation_enabled
+                or self.quarantine_receipts is not None or self.quarantine_transition_receipts is not None
+            )
             return self
         except BaseException as error:
             try:
@@ -676,9 +684,25 @@ class OutputLease:
         if (_read(self.catalog / (self.key + ".json")) != self.record
                 or (not self.deferred and _read(self.output / ".rovezero-output.json") != self.record)):
             raise StorageError("output owner changed; preserve all records")
-        rows = self._rows()
-        self._seal_preservation_session()
-        actual = self._output_usage(rows, allow_disappearing=True)
+        if self._plain_usage_snapshot_ready:
+            # The exclusive catalog guard remains held throughout this lease.
+            # Revalidate our own row, directory and actual bytes on every call;
+            # other owners' previously observed reservations are accounting
+            # only. Reopening every unrelated path here causes expensive remote
+            # filesystem round trips and supplies no deletion authority.
+            target = checked(self.output)
+            pending = self.record.get("deferred") is True and self.record.get("identity") is None
+            if ((pending and self.record["state"] != "active" and target.exists())
+                    or (not pending and self.record.get("identity") != identity(target))):
+                raise StorageError("output custody changed or missing; preserve catalog")
+            self._last_own_usage = tree_size(target, allow_disappearing=True)
+            actual = self._last_own_usage + sum(
+                value for value in self._foreign_usage_snapshot.values() if value is not None
+            )
+        else:
+            rows = self._rows()
+            self._seal_preservation_session()
+            actual = self._output_usage(rows, allow_disappearing=True)
         self._maintenance_due |= actual > self.total_limit
         own_usage = (tree_size(self.output, allow_disappearing=True)
                      if self._quarantine_view is not None else self._last_own_usage)

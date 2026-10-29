@@ -77,6 +77,36 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(sample_output_budget(self.catalog), 19 * 1024 ** 3 + 1600)
             self.assertTrue(warning.called)
 
+    def test_repeated_budget_check_uses_guarded_foreign_reservations(self):
+        old = self.lease("foreign", reserve=8192)
+        old_file = old.output / "unique-result.pgn"
+        old_file.write_bytes(b"keep")
+        old.finish(status="closed", tree_gone=True)
+        owner = self.lease("own", reserve=4096)
+        data = owner.output / "data"
+        data.write_bytes(b"x" * 10)
+        with patch("managed_outputs._catalog_rows", side_effect=AssertionError("repeat foreign census")):
+            with patch("managed_outputs.warn_output_threshold") as warn:
+                owner.check_budget()
+                owner.check_budget()
+                self.assertEqual(warn.call_args.args[0], owner._last_own_usage + 8192)
+            data.write_bytes(b"x" * 5000)
+            with self.assertRaises(OutputBudgetError):
+                owner.check_budget()
+            data.unlink()
+            owner.finish(status="closed", tree_gone=True)
+        self.assertEqual(old_file.read_bytes(), b"keep")
+
+    def test_repeated_budget_check_still_rejects_changed_own_marker(self):
+        owner = self.lease(reserve=4096)
+        marker = owner.output / ".rovezero-output.json"
+        original = marker.read_bytes()
+        marker.write_text("{}", encoding="utf-8")
+        with self.assertRaises(StorageError):
+            owner.check_budget()
+        marker.write_bytes(original)
+        owner.finish(status="closed", tree_gone=True)
+
     def test_live_and_interrupted_output_owner_never_stolen(self):
         owner = self.lease()
         with self.assertRaises(StorageError):
