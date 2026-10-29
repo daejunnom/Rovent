@@ -1063,6 +1063,35 @@ pub enum RoventTeacherTerminalAccountingV2 {
     Unknown,
 }
 
+/// Proof that this exact actor owner passed `try_finish`'s physical and
+/// terminal checks. It is not a roster-wide proof, a successful worker result,
+/// or authority to consume a teacher label or publish a corpus row.
+/// The fields are private so a caller cannot promote a copied observation to
+/// physical retirement evidence.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventTeacherRetirementTokenV2 {
+    owner: RoventCollectionTeacherOwnerV2,
+    observation: RoventTeacherRetirementObservationV2,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventTeacherRetirementTokenV2 {
+    pub fn matches_admission(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> bool {
+        self.owner.admission().same_original_admission(admission)
+    }
+
+    pub fn owner(&self) -> &RoventCollectionTeacherOwnerV2 {
+        &self.owner
+    }
+
+    pub fn observation(&self) -> &RoventTeacherRetirementObservationV2 {
+        &self.observation
+    }
+}
+
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Default)]
 struct TeacherTerminalLedgerV2 {
@@ -1111,6 +1140,12 @@ pub struct RoventCollectionTeacherLifecycleV2 {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventCollectionTeacherLifecycleV2 {
+    /// The retained original owner, without transferring lifecycle custody.
+    /// A borrowed owner by itself is not a dispatch or retirement proof.
+    pub fn owner(&self) -> &RoventCollectionTeacherOwnerV2 {
+        self.owner.as_ref().expect("retained teacher owner")
+    }
+
     pub(crate) fn new(
         owner: RoventCollectionTeacherOwnerV2,
         reservation: TeacherRecoveryReservationV2,
@@ -1282,7 +1317,10 @@ impl RoventCollectionTeacherLifecycleV2 {
             return None;
         }
         let worker = &mut self.owner.as_mut().expect("retained teacher owner").worker;
-        worker.shutdown_snapshot()?;
+        // Diagnostics can remain useful even when the original worker join
+        // failed. Reading this clone does not consume the retained join result;
+        // poll() continues to report that error separately from physical exit.
+        let _join_snapshot = worker.shutdown_snapshot()?;
         let diagnostics = worker.take_diagnostics_after_join();
         self.diagnostics = if diagnostics.is_some() {
             RoventTeacherDiagnosticsDispositionV2::Recovered
@@ -1386,6 +1424,14 @@ impl RoventCollectionTeacherLifecycleV2 {
             self.owner.take().expect("retained teacher owner"),
             observation,
         ))
+    }
+
+    /// Issue an opaque token only through the same physical retirement path.
+    /// A failure returns the original lifecycle and retains recovery custody.
+    pub fn try_retire(self) -> Result<RoventTeacherRetirementTokenV2, Self> {
+        self.try_finish().map(|(owner, observation)| {
+            RoventTeacherRetirementTokenV2 { owner, observation }
+        })
     }
 }
 

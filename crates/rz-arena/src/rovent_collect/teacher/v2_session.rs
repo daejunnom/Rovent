@@ -16,7 +16,7 @@ use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
     BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
     RoventCollectionTeacherLifecycleV2, RoventCollectionTeacherOwnerV2,
-    RoventTeacherRetirementObservationV2,
+    RoventTeacherRetirementObservationV2, RoventTeacherRetirementTokenV2,
     TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2, TeacherRecoveryKeyV2,
     bind_collection_teacher_actor_v2, spawn_bound_collection_teacher_v2,
 };
@@ -47,6 +47,33 @@ struct RunningTeacherV2 {
     recovery_key: TeacherRecoveryKeyV2,
 }
 
+/// Proof for one particular session, not for other sessions that may have
+/// been prepared with the same root. Retains all original actor tokens.
+#[allow(dead_code)]
+pub(crate) struct TeacherSessionRetirementSealV2 {
+    session: RoventCollectionTeacherSessionV2,
+    actors: BTreeMap<String, RoventTeacherRetirementTokenV2>,
+}
+
+#[allow(dead_code)]
+impl TeacherSessionRetirementSealV2 {
+    pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        self.session.admission.same_original_admission(admission)
+    }
+
+    pub(crate) fn actor_count(&self) -> usize {
+        self.actors.len()
+    }
+}
+
+/// A failed seal preserves both the original session and every handed-in
+/// token; the caller must not treat the rejected roster as complete.
+#[allow(dead_code)]
+pub(crate) struct TeacherSessionRetirementSealRejectionV2 {
+    pub(crate) session: RoventCollectionTeacherSessionV2,
+    pub(crate) actors: BTreeMap<String, RoventTeacherRetirementTokenV2>,
+}
+
 /// A started worker remains owned by the session even on `AfterSpawn`.
 /// Its recovery key is already registered with the external custodian.
 pub(crate) enum TeacherSessionStartErrorV2 {
@@ -75,6 +102,36 @@ pub(crate) struct RoventCollectionTeacherSessionV2 {
 
 #[allow(dead_code)]
 impl RoventCollectionTeacherSessionV2 {
+    /// Seal retirement only for this exact roster, after scope closure. No
+    /// token is fabricated for an unstarted, failed-before-spawn, or unknown
+    /// actor. An actor's actual worker registration must match the roster.
+    /// This does not prove a different session with the same root is closed.
+    pub(crate) fn try_seal_retirement(
+        self,
+        actors: BTreeMap<String, RoventTeacherRetirementTokenV2>,
+    ) -> Result<TeacherSessionRetirementSealV2, Box<TeacherSessionRetirementSealRejectionV2>> {
+        let complete = self.scope.is_none()
+            && !self.actors.is_empty()
+            && actors.len() == self.actors.len()
+            && self.actors.iter().all(|(actor_id, actor)| {
+                actor.spawn_attempted
+                    && actor.running.is_none()
+                    && actors.get(actor_id).is_some_and(|token| {
+                        token.matches_admission(&self.admission)
+                            && token.owner().source_index() == actor.source_index
+                            && token.owner().worker().registration() == actor.registration
+                    })
+            });
+        if complete {
+            Ok(TeacherSessionRetirementSealV2 { session: self, actors })
+        } else {
+            Err(Box::new(TeacherSessionRetirementSealRejectionV2 {
+                session: self,
+                actors,
+            }))
+        }
+    }
+
     pub(crate) fn prepare(
         admission: &RoventCollectionRootAdmissionV2,
         startup_control: &RoventStartupControl,
@@ -169,6 +226,13 @@ impl RoventCollectionTeacherSessionV2 {
         cleanup_ceiling: Instant,
         custodian: &mut TeacherRecoveryCustodianV2,
     ) -> Result<TeacherRecoveryKeyV2, TeacherSessionStartErrorV2> {
+        // A previously allocated permit must not permit a new spawn after
+        // this session has closed its process scope for retirement.
+        if self.scope.is_none() {
+            return Err(TeacherSessionStartErrorV2::Admission(invalid(
+                "V2 teacher session admission is closed",
+            )));
+        }
         self.require_live_root()
             .map_err(TeacherSessionStartErrorV2::Admission)?;
         let actor = self.actors.get_mut(actor_id).ok_or_else(|| {
@@ -265,6 +329,12 @@ impl RoventCollectionTeacherSessionV2 {
             .map(|run| &mut run.lifecycle)
     }
 
+    /// Original preflight registration for this roster entry. Callers must
+    /// still bind the actual worker, dispatch and completion before labeling.
+    pub(crate) fn registered(&self, actor_id: &str) -> Option<&super::RoventRegisteredTeacher> {
+        self.actors.get(actor_id).map(|actor| actor.original.registered())
+    }
+
     /// Access a clone of the key already registered with the custodian.
     pub(crate) fn recovery_key(&self, actor_id: &str) -> Option<TeacherRecoveryKeyV2> {
         self.actors
@@ -314,6 +384,32 @@ impl RoventCollectionTeacherSessionV2 {
         };
         match run.lifecycle.try_finish() {
             Ok((owner, observation)) => Ok(Some((owner, observation))),
+            Err(lifecycle) => {
+                actor.running = Some(RunningTeacherV2 {
+                    lifecycle,
+                    recovery_key: run.recovery_key,
+                });
+                Ok(None)
+            }
+        }
+    }
+
+    /// Recover an opaque per-actor retirement token through the original
+    /// lifecycle. A non-started or unresolved actor never yields a token.
+    /// The token alone is not a proof that the entire roster is retired.
+    pub(crate) fn try_retire_actor(
+        &mut self,
+        actor_id: &str,
+    ) -> Result<Option<RoventTeacherRetirementTokenV2>, ArenaError> {
+        let actor = self
+            .actors
+            .get_mut(actor_id)
+            .ok_or_else(|| invalid("V2 teacher actor absent"))?;
+        let Some(run) = actor.running.take() else {
+            return Ok(None);
+        };
+        match run.lifecycle.try_retire() {
+            Ok(token) => Ok(Some(token)),
             Err(lifecycle) => {
                 actor.running = Some(RunningTeacherV2 {
                     lifecycle,

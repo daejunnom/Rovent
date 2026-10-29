@@ -44,6 +44,7 @@ pub use collection_teacher::{
     BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
     RoventCollectionTeacherLifecycleV2, RoventTeacherDiagnosticsDispositionV2,
     RoventTeacherPhysicalRetirementV2, RoventTeacherRetirementObservationV2,
+    RoventTeacherRetirementTokenV2,
     RoventTeacherTerminalAccountingV2, TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2,
     TeacherRecoveryKeyV2, bind_collection_teacher_actor_v2, spawn_bound_collection_teacher_v2,
     verify_collection_teacher_pin,

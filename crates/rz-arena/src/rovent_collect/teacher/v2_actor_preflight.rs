@@ -41,6 +41,11 @@ impl TeacherActorSourcePreflightV2 {
     pub(super) fn collection_owner(&self) -> u32 {
         self.collection_owner
     }
+    /// The original declaration only; it does not establish an actual spawn,
+    /// dispatch, completion, or eligibility of a teacher target.
+    pub(super) fn registered(&self) -> &RoventRegisteredTeacher {
+        &self.registered
+    }
 }
 
 /// Compare one manifest actor against the exact source duplicated from the
