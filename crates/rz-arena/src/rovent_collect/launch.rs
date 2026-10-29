@@ -533,7 +533,10 @@ impl CollectionCaller {
         Ok(())
     }
     fn activate(&mut self) -> Result<(), ArenaError> {
-        let Some(admission) = self.pending_admission.take() else {
+        // Keep the original admission in the caller until session creation
+        // succeeds. Roster/scope validation can fail, and a failure must not
+        // silently discard the only caller-owned root evidence.
+        let Some(admission) = self.pending_admission.as_ref().cloned() else {
             return Ok(());
         };
         let roster = self
@@ -548,6 +551,7 @@ impl CollectionCaller {
                 admission.clone(),
                 &roster,
             )?;
+        self.pending_admission = None;
         self.active = Some(RootCaller {
             admission,
             pump: teacher::RoventCollectionTeacherPump::new_submitted_input_v1(
