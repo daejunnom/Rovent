@@ -585,8 +585,8 @@ class TransitionTests(unittest.TestCase):
 
     def test_output_lease_and_sampler_reject_changed_transition_inputs_without_mutation(self):
         first = self.move(self.anchor())["receipt"]
-        with self.assertRaisesRegex(StorageError, "interrupted output"):
-            outputs.OutputLease(self.base / "legacy", self.base / "source", catalog=self.catalog).acquire()
+        with self.assertRaisesRegex(StorageError, "overlapping output"):
+            outputs.OutputLease(self.target / "nested", self.base / "source", catalog=self.catalog).acquire()
         owner = outputs.OutputLease(self.base / "new-run", self.base / "source", catalog=self.catalog,
             reserve=4096, quarantine_transition_receipts=[first]).acquire()
         self.addCleanup(owner._close_quarantine_view)
@@ -734,7 +734,7 @@ class TransitionTests(unittest.TestCase):
         self.assertEqual(len(self.actions), 3)
         self.assert_originals_unchanged()
 
-    def test_history_metadata_can_exhaust_global18gib_before_publication(self):
+    def test_history_metadata_above_global_warning_does_not_block_dry_run(self):
         anchor = self.anchor()
         registry_bytes = sum(len(raw) for path, raw in self.files.items() if path.parent == self.registry)
         other = self.base / "retained-large"
@@ -745,8 +745,10 @@ class TransitionTests(unittest.TestCase):
                    state="retained", reserved_bytes=self.payload_sizes[other])
         self.put(self.catalog / (key + ".json"), v1._encode(row))
         before = dict(self.files)
-        with self.assertRaisesRegex(StorageError, "metadata exceeds18GiB"):
-            self.move(anchor)
+        with patch.object(successor, "warn_output_threshold") as warning:
+            result = self.move(anchor, apply=False)
+            self.assertFalse(result["applied"])
+            self.assertGreater(warning.call_args.args[0], 18 * v1.GiB)
         self.assertEqual(self.files, before)
         self.assert_originals_unchanged()
 

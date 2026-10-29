@@ -61,7 +61,7 @@ class SealedRecoveryPredicates(unittest.TestCase):
         for changes in ({"identity": None}, {"identity": [True, 10]}, {"identity": [7, 0]},
                         {"deferred": 1}, {"deferred": False}, {"state": "retained"},
                         {"tree_gone": True}, {"physical_completion": "confirmed"},
-                        {"reserved_bytes": True}, {"catalog_limit_bytes": 18 * GiB + 1}):
+                        {"reserved_bytes": True}, {"catalog_limit_bytes": 2**63}):
             with self.subTest(changes=changes), self.assertRaises(StorageError):
                 self.eligible(row=dict(self.row, **changes))
         with self.assertRaisesRegex(StorageError, "digest changed"):
@@ -593,15 +593,17 @@ class UnboundAbsentRecoveryLinuxTests(unittest.TestCase):
         self.assertEqual(self.unbound_path.read_bytes(), self.original_raw)
         self.assert_preserved()
 
-    def test_catalog_quota_or_live_row_mutation_does_not_commit(self):
+    def test_catalog_warning_allows_dry_run_but_live_row_mutation_does_not_commit(self):
         actual_usage = preservation.CatalogView.checked_usage
         def overflow(view):
             rows, _ = actual_usage(view)
             return rows, 18 * GiB + 1
         with patch.object(preservation.CatalogView, "checked_usage", side_effect=overflow, autospec=True):
-            with patch.object(recovery, "write_record") as commit:
-                with self.assertRaisesRegex(StorageError, "catalog budget exceeded"):
-                    self.recover(apply=True)
+            with patch.object(recovery, "write_record") as commit, \
+                    patch.object(recovery, "warn_output_threshold") as warning:
+                result = self.recover(apply=False)
+                self.assertFalse(result["applied"])
+                warning.assert_called()
                 commit.assert_not_called()
         original_absence = recovery._AbsentDeferredOutput.check
         modified = [False]

@@ -47,7 +47,8 @@ class StorageTests(unittest.TestCase):
         payload.write_bytes(b"original retained evidence")
         record = self.output_catalog / (("a" * 64) + ".json")
         row = {"schema": outputs.SCHEMA, "key": "a" * 64,
-               "output": str(target), "identity": expected, "reserved_bytes": 4096}
+               "output": str(target), "identity": expected, "reserved_bytes": 4096,
+               "deferred": True}
         raw = json.dumps(row).encode()
         record.write_bytes(raw)
         return target, payload, record, raw
@@ -92,6 +93,120 @@ class StorageTests(unittest.TestCase):
                 size_call.assert_called_once_with(checked(target), allow_disappearing=True)
                 self.assertEqual(record.read_bytes(), raw)
 
+    def test_supervisor_sampling_keeps_unrelated_identity_and_reservation_failures_isolated(self):
+        target, payload, record, raw = self.sampled_identity_fixture([67, 11])
+        scope = {"root": str(self.root), "owner": {"token": "current"},
+                 "scope": "inherited_outer_process_group_or_job"}
+        with patch.object(outputs, "identity") as identity_call, \
+             patch.object(outputs, "tree_size") as size_call, \
+             patch.object(sys, "stderr", new_callable=io.StringIO) as log:
+            cache = {}
+            self.assertEqual(outputs.sample_output_budget(self.output_catalog, supervisor_scope=scope,
+                                                          foreign_cache=cache), 4096)
+        identity_call.assert_not_called()
+        size_call.assert_not_called()
+        self.assertIn("reserved accounting", log.getvalue())
+        self.assertTrue(cache["__unknown_ownership__"])
+        self.assertEqual(record.read_bytes(), raw)
+        self.assertTrue(payload.exists())
+
+    def test_supervisor_rechecks_own_output_and_never_walks_foreign_tree(self):
+        target, _payload, record, _raw = self.sampled_identity_fixture([67, 11])
+        scope = {"root": str(self.root), "owner": {"token": "current"},
+                 "scope": "inherited_outer_process_group_or_job"}
+        cache = {}
+        with patch.object(outputs, "identity", return_value=[67, 11]), \
+             patch.object(outputs, "tree_size", return_value=23) as size, \
+             patch.object(sys, "stderr", new_callable=io.StringIO) as log:
+            for _ in range(3):
+                self.assertEqual(outputs.sample_output_budget(self.output_catalog,
+                                 supervisor_scope=scope, foreign_cache=cache), 4096)
+        self.assertEqual(size.call_count, 0)
+        self.assertIn("reserved accounting", log.getvalue())
+        row = json.loads(record.read_text())
+        row["outer_supervisor"] = scope
+        record.write_text(json.dumps(row))
+        with patch.object(outputs, "identity", return_value=[67, 11]), \
+             patch.object(outputs, "tree_size", return_value=23) as size:
+            for _ in range(2):
+                self.assertEqual(outputs.sample_output_budget(self.output_catalog,
+                                 supervisor_scope=scope, foreign_cache=cache), 23)
+        self.assertEqual(size.call_count, 2)
+
+    def test_supervised_row_owner_change_or_disappearance_is_not_success(self):
+        target, _payload, record, _raw = self.sampled_identity_fixture([67, 11])
+        scope = {"root": str(self.root), "owner": {"token": "current"},
+                 "scope": "inherited_outer_process_group_or_job"}
+        row = json.loads(record.read_text())
+        row["outer_supervisor"] = scope
+        record.write_text(json.dumps(row))
+        cache = {}
+        with patch.object(outputs, "identity", return_value=[67, 11]):
+            outputs.sample_output_budget(self.output_catalog, supervisor_scope=scope, foreign_cache=cache)
+            row["outer_supervisor"] = None
+            record.write_text(json.dumps(row))
+            with self.assertRaisesRegex(StorageError, "disappeared or changed owner"):
+                outputs.sample_output_budget(self.output_catalog, supervisor_scope=scope, foreign_cache=cache)
+            record.unlink()
+            with self.assertRaisesRegex(StorageError, "disappeared or changed owner"):
+                outputs.sample_output_budget(self.output_catalog, supervisor_scope=scope, foreign_cache=cache)
+
+    def test_marker_retaining_owner_detects_forged_catalog_owner(self):
+        target, _payload, record, _raw = self.sampled_identity_fixture([67, 11])
+        scope = {"root": str(self.root), "owner": {"token": "current"},
+                 "scope": "inherited_outer_process_group_or_job"}
+        row = json.loads(record.read_text())
+        row["deferred"] = False
+        row["outer_supervisor"] = scope
+        (target / ".rovezero-output.json").write_text(json.dumps(row))
+        row["outer_supervisor"] = None
+        record.write_text(json.dumps(row))
+        with self.assertRaisesRegex(StorageError, "owner or marker changed"):
+            outputs.sample_output_budget(self.output_catalog, supervisor_scope=scope, foreign_cache={})
+
+    def test_bounded_reobservation_accepts_transient_marker_publication(self):
+        _target, _payload, record, _raw = self.sampled_identity_fixture([67, 11])
+        scope = {"root": str(self.root), "owner": {"token": "current"},
+                 "scope": "inherited_outer_process_group_or_job"}
+        old = json.loads(record.read_text())
+        old.update(deferred=False, outer_supervisor=scope, state="active")
+        new = {**old, "state": "retained"}
+        with patch.object(outputs, "_read", side_effect=[old.copy(), new.copy(), new.copy(), new.copy()]), \
+             patch.object(outputs, "identity", return_value=[67, 11]), \
+             patch.object(outputs, "tree_size", return_value=23), \
+             patch.object(outputs.time, "sleep") as sleep:
+            self.assertEqual(outputs.sample_output_budget(self.output_catalog, supervisor_scope=scope,
+                                                          foreign_cache={}), 23)
+        sleep.assert_called_once_with(0.005)
+
+    def test_unreadable_foreign_marker_is_recorded_as_unknown_custody(self):
+        _target, _payload, record, _raw = self.sampled_identity_fixture([67, 11])
+        row = json.loads(record.read_text())
+        row["deferred"] = False
+        record.write_text(json.dumps(row))
+        scope = {"root": str(self.root), "owner": {"token": "current"},
+                 "scope": "inherited_outer_process_group_or_job"}
+        cache = {}
+        with patch.object(outputs, "identity", return_value=[67, 11]), \
+             patch.object(sys, "stderr", new_callable=io.StringIO):
+            outputs.sample_output_budget(self.output_catalog, supervisor_scope=scope, foreign_cache=cache)
+        self.assertTrue(cache["__unknown_ownership__"])
+
+    def test_output_parent_identity_alias_of_protected_root_is_rejected(self):
+        protected = self.base / "protected"
+        alias = self.base / "different-path"
+        protected.mkdir()
+        alias.mkdir()
+        original_stat = Path.stat
+        shared = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=9, st_ino=44)
+        def stat_with_alias(path, *args, **kwargs):
+            if path == protected or path == alias:
+                return shared
+            return original_stat(path, *args, **kwargs)
+        with patch.object(Path, "stat", autospec=True, side_effect=stat_with_alias):
+            with self.assertRaisesRegex(StorageError, "directory identity"):
+                outputs._reject_identity_ancestor_overlap(alias / "new", protected)
+
     def test_run_managed_preserves_budget_failure_after_original_supervisor_stringifies_it(self):
         import run_managed
         target, payload, record, raw = self.sampled_identity_fixture([67, 11])
@@ -112,7 +227,13 @@ class StorageTests(unittest.TestCase):
             return {"failure": arguments["supervisor_error"], "tree_gone": arguments["tree_gone"]}
 
         manager = SimpleNamespace(acquire=lambda: None, environment=lambda: {}, finish=finish,
-                                  root=self.root, source=self.source, total_limit=12 << 30)
+                                  root=self.root, source=self.source, total_limit=12 << 30,
+                                  _identity=lambda: {"token": "current"})
+        row = json.loads(record.read_text())
+        row["outer_supervisor"] = {"root": str(self.root), "owner": manager._identity(),
+                                   "scope": "inherited_outer_process_group_or_job"}
+        raw = json.dumps(row).encode()
+        record.write_bytes(raw)
         error_stream = io.StringIO()
         with patch.object(run_managed, "ManagedBuild", return_value=manager):
             with patch.object(run_managed, "canonical_root", return_value=self.root):
@@ -142,7 +263,8 @@ class StorageTests(unittest.TestCase):
         original = StorageError("pre-existing output accounting failure")
         manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
                                   finish=Mock(return_value={}), root=self.root,
-                                  source=self.source, total_limit=12 << 30)
+                                  source=self.source, total_limit=12 << 30,
+                                  _identity=lambda: {"token": "current"})
         with patch.object(run_managed, "ManagedBuild", return_value=manager), \
              patch.object(run_managed, "canonical_root", return_value=self.root), \
              patch.object(run_managed.shutil, "which", return_value=sys.executable), \
@@ -152,10 +274,12 @@ class StorageTests(unittest.TestCase):
              patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
              patch.object(sys, "stderr", io.StringIO()):
             self.assertEqual(run_managed.main(), 125)
-        sample.assert_called_once_with()
+        sample.assert_called_once_with(supervisor_scope={"root": str(self.root), "owner": {"token": "current"},
+                                                       "scope": "inherited_outer_process_group_or_job"},
+                                       foreign_cache={})
         dispatch.assert_not_called()
-        manager.acquire.assert_not_called()
-        manager.finish.assert_not_called()
+        manager.acquire.assert_called_once_with()
+        manager.finish.assert_called_once_with(exit_code=125, tree_gone=True, _not_dispatched=True)
         observed.assert_called_once_with(original)
         self.assertEqual(original.args, ("pre-existing output accounting failure",))
 
@@ -163,7 +287,8 @@ class StorageTests(unittest.TestCase):
         import run_managed
         manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
                                   finish=Mock(return_value={}), root=self.root,
-                                  source=self.source, total_limit=12 << 30)
+                                  source=self.source, total_limit=12 << 30,
+                                  _identity=lambda: {"token": "current"})
         def supervise(_command, _source, _environment, _timeout, check_budget):
             check_budget()
             return 0, True, None
@@ -179,6 +304,50 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(sample.call_count, 2)
         dispatch.assert_called_once()
         manager.finish.assert_called_once_with(exit_code=0, tree_gone=True, supervisor_error=None)
+
+    def test_predispatch_corrupt_foreign_catalog_keeps_evidence_and_closes_own_build(self):
+        import run_managed
+        manager = ManagedBuild(self.root, self.source)
+        foreign = self.output_catalog / ("f" * 64 + ".json")
+        foreign.write_bytes(b"{broken")
+        with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+             patch.object(run_managed, "canonical_root", return_value=self.root), \
+             patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+             patch.object(run_managed, "sample_output_budget", side_effect=StorageError("pre-dispatch observation failed")), \
+             patch.object(run_managed, "run_group") as dispatch, \
+             patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+             patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(run_managed.main(), 125)
+        dispatch.assert_not_called()
+        self.assertFalse(manager.lock.exists())
+        self.assertEqual(foreign.read_bytes(), b"{broken")
+        receipt = json.loads((manager.slot / "last-run.json").read_text())
+        self.assertEqual(receipt["output_finalization"], "not_needed_no_child_dispatched")
+
+    def test_unreadable_unrelated_catalog_row_does_not_stop_execution_or_claim_custody(self):
+        import run_managed
+        manager = ManagedBuild(self.root, self.source)
+        foreign = self.output_catalog / ("f" * 64 + ".json")
+        foreign.write_bytes(b"{broken")
+        with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+             patch.object(run_managed, "canonical_root", return_value=self.root), \
+             patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+             patch.object(run_managed, "run_group", return_value=(0, True, None)), \
+             patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+             patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(run_managed.main(), 0)
+        self.assertFalse(manager.lock.exists())
+        self.assertEqual(foreign.read_bytes(), b"{broken")
+        receipt = json.loads((manager.slot / "last-run.json").read_text())
+        self.assertEqual(receipt["output_custody_scope"], "unknown")
+
+    def test_no_dispatch_closure_refuses_any_launch_attempt(self):
+        manager = self.acquire()
+        manager._dispatch_started = True
+        with self.assertRaisesRegex(StorageError, "no-dispatch closure"):
+            manager.finish(exit_code=125, tree_gone=True, _not_dispatched=True)
+        self.assertTrue(manager.lock.exists())
+        manager.finish(exit_code=125, tree_gone=True)
 
     def test_run_managed_closes_original_owner_for_every_pre_dispatch_failure(self):
         import run_managed
@@ -246,7 +415,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(read_record(self.root / "closure.json"),
                          {"schema": original_owner["schema"], "owner": original_owner, "tree_gone": True})
         self.assertEqual(self.model.read_bytes(), b"retained-original")
-        self.assertEqual({path.name for path in self.output_catalog.iterdir()}, {"catalog.lock"})
+        self.assertEqual({path.name for path in self.output_catalog.iterdir()}, set())
 
     def test_run_managed_pre_dispatch_cleanup_preserves_first_error_and_cleanup_note(self):
         import run_managed
@@ -274,7 +443,7 @@ class StorageTests(unittest.TestCase):
                             self.assertEqual(run_managed.main(), 125)
                             observed.assert_called_once_with(original)
                     dispatch.assert_not_called()
-                    manager.finish.assert_called_once_with(exit_code=125, tree_gone=True)
+                    manager.finish.assert_called_once_with(exit_code=125, tree_gone=True, _not_dispatched=True)
                     self.assertEqual(original.args, ("first environment failure",))
                     self.assertEqual(original.__notes__, [
                         "pre-dispatch original manager cleanup failed: " + cleanup_type.__name__
@@ -313,7 +482,7 @@ class StorageTests(unittest.TestCase):
                         self.assertEqual(run_managed.main(), 125)
                         observed.assert_called_once_with(original)
                 dispatch.assert_not_called()
-                manager.finish.assert_called_once_with(exit_code=125, tree_gone=True)
+                manager.finish.assert_called_once_with(exit_code=125, tree_gone=True, _not_dispatched=True)
                 self.assertEqual(original.args, ("first pre-dispatch failure with closed stderr",))
                 self.assertEqual(original.__notes__, [
                     "pre-dispatch original manager cleanup failed: RuntimeError: cleanup failed with closed stderr"])

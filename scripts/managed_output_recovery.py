@@ -18,7 +18,7 @@ import time
 import managed_output_quarantine as custody
 import managed_output_quarantine_transition as transitions
 import managed_outputs as outputs
-from managed_storage import GiB, StorageError, checked, read_record_snapshot, write_record
+from managed_storage import GiB, StorageError, checked, read_record_snapshot, write_record, warn_output_threshold
 from storage_guard import lifetime, reboot_proves_dead
 
 
@@ -53,9 +53,9 @@ def _eligible(row, key, digest, expected_sha256, target, now):
     _need(type(row.get("pid")) is int and row["pid"] > 0
           and type(row.get("token")) is str and bool(row["token"]),
           "original producer attribution required")
-    _need(type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] <= 18 * GiB
+    _need(type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] < 2**63
           and type(row.get("catalog_limit_bytes")) is int
-          and row["reserved_bytes"] <= row["catalog_limit_bytes"] <= 18 * GiB,
+          and 0 < row["catalog_limit_bytes"] < 2**63,
           "original bounded reservation required")
     _need("tree_gone" not in row or row["tree_gone"] is False,
           "active output must not assert completed tree retirement")
@@ -226,9 +226,9 @@ def recover_sealed_output_after_reboot(catalog, key, expected_sha256, *,
                     _eligible(row, key, digest, expected_sha256, target, lifetime())
                 _disjoint(current_rows, key, observed, catalog, view, until)
                 used = view.usage(current_rows)
-                _need(used <= row["catalog_limit_bytes"]
-                      and observed.snapshot["regular_bytes"] <= row["reserved_bytes"],
-                      "original sealed recovery reservation or catalog budget exceeded")
+                warn_output_threshold(used, row["catalog_limit_bytes"], scope="sealed-recovery")
+                _need(observed.snapshot["regular_bytes"] <= row["reserved_bytes"],
+                      "original sealed recovery reservation exceeded")
                 _remaining(until)
                 guard.assert_held()
                 return used
@@ -276,9 +276,9 @@ def _unbound_eligible(row, key, digest, expected_sha256, target, now):
     _need(type(row.get("pid")) is int and row["pid"] > 0
           and type(row.get("token")) is str and bool(row["token"]),
           "original producer attribution required")
-    _need(type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] <= 18 * GiB
+    _need(type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] < 2**63
           and type(row.get("catalog_limit_bytes")) is int
-          and row["reserved_bytes"] <= row["catalog_limit_bytes"] <= 18 * GiB,
+          and 0 < row["catalog_limit_bytes"] < 2**63,
           "original bounded reservation required")
     _need("tree_gone" not in row or row["tree_gone"] is False,
           "unbound recovery must not infer completed tree retirement")
@@ -438,7 +438,7 @@ def recover_unbound_absent_output_after_reboot(catalog, key, expected_sha256, *,
                               *(other for _, item, other in current_rows if item["key"] != key)):
                     _need(not (target.is_relative_to(other) or other.is_relative_to(target)),
                           "unbound output overlaps protected catalog or output")
-                _need(used <= row["catalog_limit_bytes"], "original unbound recovery catalog budget exceeded")
+                warn_output_threshold(used, row["catalog_limit_bytes"], scope="unbound-recovery")
                 # Usage traversals are observations, not authority to skip the
                 # final held-parent absence/namespace and current-view checks.
                 absent.check()

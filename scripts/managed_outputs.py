@@ -15,8 +15,8 @@ import sys
 import time
 import uuid
 
-from managed_storage import (GiB, StorageError, canonical_root, checked, tree_size,
-                             write_record, read_record_snapshot)
+from managed_storage import (GiB, CatalogBusy, StorageError, canonical_root, checked, tree_size,
+                             write_record, read_record_snapshot, warn_output_threshold)
 from storage_guard import CatalogGuard, lifetime, reboot_proves_dead
 
 SCHEMA = "rovezero.managed-output.v1"
@@ -25,6 +25,73 @@ MAX_RUNS = 1024
 
 class OutputBudgetError(StorageError):
     pass
+
+
+def _warn_unrelated_output(message):
+    """Report a protected independent row; this is not a recovery authority."""
+    try:
+        print("managed_output_unrelated_warning=" + message, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _scope_owns_row(row, target, supervisor_scope, row_path=None, *, strict=False):
+    """Cross-check the bound marker before classifying a directory as foreign."""
+    declared = row.get("outer_supervisor") == supervisor_scope
+    if row.get("deferred") is True:
+        # Without a directory marker this cannot prove a foreign owner.
+        return True if declared else None
+    try:
+        marker = _read(target / ".rovezero-output.json")
+    except (StorageError, OSError):
+        if declared:
+            raise
+        _warn_unrelated_output("foreign marker unavailable; custody remains unknown")
+        return None
+    marker_owned = marker.get("outer_supervisor") == supervisor_scope
+    if marker != row:
+        if declared or marker_owned:
+            if declared != marker_owned:
+                raise StorageError("supervised output owner or marker changed")
+            # The writer publishes marker and catalog in separate atomic
+            # renames. Allow only a short, bounded re-observation of that
+            # transition; a persistent mismatch or changed owner stays fatal.
+            if row_path is not None:
+                for _ in range(2):
+                    time.sleep(0.005)
+                    refreshed = _read(row_path)
+                    refreshed_marker = _read(target / ".rovezero-output.json")
+                    if (refreshed.get("output") != row.get("output") or
+                            refreshed.get("outer_supervisor") != supervisor_scope):
+                        break
+                    if refreshed == refreshed_marker:
+                        row.clear()
+                        row.update(refreshed)
+                        return True
+            if strict:
+                raise StorageError("supervised output owner or marker changed")
+            _warn_unrelated_output("live owner marker transition unresolved; finalization will recheck")
+            return "unresolved_owned"
+        _warn_unrelated_output("foreign owner and marker differ; custody remains unknown")
+        return None
+    return declared
+
+
+def _reject_identity_ancestor_overlap(output, target):
+    """Reject bind-mounted aliases of an existing protected directory."""
+    try:
+        protected = target.stat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(protected.st_mode):
+        return
+    for ancestor in (output.parent, *output.parent.parents):
+        try:
+            observed = ancestor.stat()
+        except FileNotFoundError:
+            continue
+        if (observed.st_dev, observed.st_ino) == (protected.st_dev, protected.st_ino):
+            raise StorageError("overlapping output directory identity")
 
 
 def canonical_catalog():
@@ -77,7 +144,7 @@ def _attach_sampled_identity_observation(error, record_key, target, expected, ob
         pass
 
 
-def _catalog_rows(catalog):
+def _catalog_rows(catalog, *, independent_output=None):
     rows = []
     entries = list(catalog.iterdir())
     if len(entries) > MAX_RUNS + 1:
@@ -90,11 +157,20 @@ def _catalog_rows(catalog):
         key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()
         pending = row.get("deferred") is True and row.get("identity") is None
         if (path.name != key + ".json" or row.get("key") != key
-                or row.get("state") not in {"active", "retained", "interrupted_retained"}
-                or (pending and row["state"] != "active" and target.exists())
-                or (not pending and row.get("identity") != identity(target))
-                or (not row.get("deferred") and _read(target / ".rovezero-output.json") != row)):
+                or row.get("state") not in {"active", "retained", "interrupted_retained"}):
             raise StorageError("output custody changed or missing; preserve catalog")
+        try:
+            if ((pending and row["state"] != "active" and target.exists())
+                    or (not pending and row.get("identity") != identity(target))
+                    or (not row.get("deferred") and _read(target / ".rovezero-output.json") != row)):
+                raise StorageError("output custody changed or missing; preserve catalog")
+        except (StorageError, OSError) as error:
+            if (independent_output is None or independent_output.is_relative_to(target)
+                    or target.is_relative_to(independent_output)):
+                raise
+            # Keep the row in the path census so it cannot be adopted or
+            # overwritten. No identity, completion or deletion is inferred.
+            _warn_unrelated_output(type(error).__name__ + "; custody retained; total may be incomplete")
         rows.append((path, row, target))
     return rows
 
@@ -181,10 +257,15 @@ class OutputLease:
         for other in (self.source, self.catalog):
             if self.output.is_relative_to(other) or other.is_relative_to(self.output):
                 raise StorageError("output, checkout and catalog must be disjoint")
-        if (not 0 < reserve <= total_limit <= 18 * GiB
+        if (type(reserve) is not int or type(total_limit) is not int
+                or not 0 < reserve < 1 << 63 or not 0 < total_limit < 1 << 63
                 or not 1 <= retention_days <= 365):
             raise StorageError("finite output reservation and retention required")
         self.reserve, self.total_limit, self.days = reserve, total_limit, retention_days
+        self._maintenance_due = False
+        self._foreign_usage_snapshot = {}
+        self._foreign_estimate_reported = False
+        self._last_own_usage = None
         self.deferred = deferred
         self.quarantine_receipts = None if quarantine_receipts is None else tuple(dict(pin) for pin in quarantine_receipts)
         self.quarantine_transition_receipts = (None if quarantine_transition_receipts is None
@@ -224,7 +305,8 @@ class OutputLease:
                 self.unattributed_preservation, self.guard, output=self.output,
                 source=self.source, producer_record=self.record)
             return self._quarantine_view.rows()
-        rows = _catalog_rows(self.catalog)
+        explicit = self._preservation_enabled or self.quarantine_receipts is not None or self.quarantine_transition_receipts is not None
+        rows = _catalog_rows(self.catalog) if explicit else _catalog_rows(self.catalog, independent_output=self.output)
         if self._preservation_enabled:
             from managed_output_preservation_session import observe_new_output
             previous, self._quarantine_view = self._quarantine_view, None
@@ -235,6 +317,7 @@ class OutputLease:
                 if previous is not None:
                     previous.close(sys.exc_info()[1])
             return rows
+
         elif self.quarantine_transition_receipts is not None:
             from managed_output_quarantine_transition import validate_transitions
             validator, pins = validate_transitions, self.quarantine_transition_receipts
@@ -250,6 +333,11 @@ class OutputLease:
             if previous is not None:
                 previous.close(sys.exc_info()[1])
         return rows
+
+    def register_cpu_static_packing_artifact(self, pin):
+        """Register one weight-free CPU graph, not model or GPU evidence."""
+        from managed_output_regenerable import register_cpu_static_packing_artifact
+        return register_cpu_static_packing_artifact(self, pin)
 
 
     def _check_quarantine_view(self):
@@ -301,27 +389,70 @@ class OutputLease:
     def _output_usage(self, rows, *, allow_disappearing=False):
         if self._quarantine_view is not None:
             return self._quarantine_view.usage(rows)
-        return sum(tree_size(target, allow_disappearing=allow_disappearing) for _, _, target in rows)
+        foreign = [(row, target) for _, row, target in rows if target != self.output]
+        self._foreign_usage_snapshot = {row["key"]: row["reserved_bytes"] for row, _ in foreign}
+        if foreign and not self._foreign_estimate_reported:
+            _warn_unrelated_output("other-owner usage is reserved accounting; actual usage is unknown")
+            self._foreign_estimate_reported = True
+        own_total = sum(tree_size(target, allow_disappearing=allow_disappearing)
+                        for _, _, target in rows if target == self.output)
+        self._last_own_usage = own_total
+        return own_total + sum(value for value in self._foreign_usage_snapshot.values() if value is not None)
 
     def acquire(self):
         owner_lifetime = lifetime() if not self.deferred else None
         self.catalog.mkdir(parents=True, exist_ok=True)
-        self.guard.acquire()
+        # Maintenance may hold the catalog briefly. Only actual OS lock
+        # contention is retried; a failed identity check or any other error
+        # remains an immediate failure. Never steal an active owner.
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                self.guard.acquire()
+                break
+            except CatalogBusy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.1, remaining))
         try:
             rows = self._rows()
             custody_keys = self._quarantine_view.keys if self._quarantine_view is not None else frozenset()
-            if any(row["state"] == "active" and row["key"] not in custody_keys for _, row, _ in rows):
+            # Explicit historical custody selections retain their original
+            # stricter contract. In the ordinary path an unrelated interrupted
+            # row remains protected by the disjoint-path check below; it is
+            # not an authority to cancel another producer.
+            explicit_custody = self._quarantine_view is not None
+            if explicit_custody and any(row["state"] == "active" and row["key"] not in custody_keys for _, row, _ in rows):
                 raise StorageError("interrupted output requires explicit recovery")
             if len(rows) >= MAX_RUNS:
                 raise StorageError("output catalog full; archive review required")
             if any(self.output.is_relative_to(target) or target.is_relative_to(self.output)
                    for _, _, target in rows):
                 raise StorageError("overlapping output registration")
+            for _, _, target in rows:
+                _reject_identity_ancestor_overlap(self.output, target)
             used = self._output_usage(rows)
-            if any(row["key"] not in custody_keys and tree_size(target) > row["reserved_bytes"] for _, row, target in rows):
-                raise StorageError("previous output exceeds its reservation; archive review required")
-            if used + self.reserve > self.total_limit:
-                raise StorageError("retained results plus reservation exceed output catalog budget")
+            for _, row, target in rows:
+                if not explicit_custody:
+                    # The other owner's actual bytes are unknown. Its record
+                    # is preserved and its reservation is accounted above.
+                    continue
+                try:
+                    amount = tree_size(target)
+                    if amount is None:
+                        continue
+                    exceeds_reservation = amount > row["reserved_bytes"]
+                except (StorageError, OSError) as error:
+                    if explicit_custody:
+                        raise
+                    _warn_unrelated_output(type(error).__name__ + "; custody retained; total is incomplete")
+                    continue
+                if row["key"] not in custody_keys and exceeds_reservation:
+                    if explicit_custody:
+                        raise StorageError("previous output exceeds its reservation; archive review required")
+                    _warn_unrelated_output("reservation exceeded; retained for owner review")
+            warn_output_threshold(used + self.reserve, self.total_limit, scope="output_admission_reserved")
             if self.output.exists():
                 raise StorageError("only fresh output can be registered; no historical adoption")
             if not self.deferred:
@@ -343,9 +474,10 @@ class OutputLease:
             self._seal_preservation_session()
             if self._preservation_enabled:
                 # Mandatory journal bytes also consume the original reservation.
-                if (tree_size(self.output) > self.reserve
-                        or self._output_usage(self._quarantine_view.rows() if self.unattributed_preservation is not None else _catalog_rows(self.catalog)) > self.total_limit):
+                if tree_size(self.output) > self.reserve:
                     raise OutputBudgetError("preservation evidence exceeds original output reservation")
+                warn_output_threshold(self._output_usage(self._quarantine_view.rows() if self.unattributed_preservation is not None else _catalog_rows(self.catalog)),
+                                      self.total_limit, scope="output_actual")
             return self
         except BaseException as error:
             try:
@@ -505,8 +637,12 @@ class OutputLease:
         rows = self._rows()
         self._seal_preservation_session()
         actual = self._output_usage(rows, allow_disappearing=True)
-        if tree_size(self.output, allow_disappearing=True) > self.reserve or actual > self.total_limit:
+        self._maintenance_due |= actual > self.total_limit
+        own_usage = (tree_size(self.output, allow_disappearing=True)
+                     if self._quarantine_view is not None else self._last_own_usage)
+        if own_usage > self.reserve:
             raise OutputBudgetError("managed output byte budget exceeded; evidence retained")
+        warn_output_threshold(actual, self.total_limit, scope="output_actual")
         self._check_created_directory()
         self._check_quarantine_view()
 
@@ -546,6 +682,21 @@ class OutputLease:
                         self._release_guard(sys.exc_info()[1] or error)
         if error:
             raise error
+        if self._maintenance_due and tree_gone is True and self.outer is None:
+            # The lease guard has been released. This best-effort maintenance
+            # never removes output evidence or treats OS exit as a GPU fence.
+            try:
+                from managed_output_maintenance import cleanup_completed_builds_for_output
+                result = cleanup_completed_builds_for_output(self, seconds=5)
+                try:
+                    print("managed_storage_maintenance=" + json.dumps(result, sort_keys=True), file=sys.stderr)
+                except (OSError, ValueError):
+                    pass
+            except Exception as maintenance_error:
+                try:
+                    print("managed_storage_maintenance_warning=" + type(maintenance_error).__name__, file=sys.stderr)
+                except (OSError, ValueError):
+                    pass
         return self.record
 
 
@@ -592,25 +743,42 @@ def recover_output(catalog, key, expected_sha256):
         return row
 
 
-def finalize_supervised_outputs(root, owner, catalog=None):
+def finalize_supervised_outputs(root, owner, catalog=None, *, foreign_cache=None):
     """Called only by the original supervisor after its owned tree is gone."""
     catalog = checked(catalog or canonical_catalog())
     if not catalog.exists():
+        if foreign_cache is not None and foreign_cache.get("__owned_rows__"):
+            raise StorageError("previously observed supervised output catalog disappeared")
         return
     with CatalogGuard(catalog / "catalog.lock") as guard:
-        sample_output_budget(catalog)
+        expected = {"root": str(root), "owner": owner,
+                    "scope": "inherited_outer_process_group_or_job"}
+        sample_output_budget(catalog, supervisor_scope=expected, foreign_cache=foreign_cache, strict_scope=True)
         entries = list(catalog.iterdir())
         if len(entries) > MAX_RUNS + 1:
             raise StorageError("output catalog bound exceeded")
         for path in entries:
             if path.name == "catalog.lock":
                 continue
-            row = _read(path)
-            expected = {"root": str(root), "owner": owner,
-                        "scope": "inherited_outer_process_group_or_job"}
-            if row.get("outer_supervisor") != expected or row.get("state") != "active":
+            try:
+                row = _read(path)
+            except (StorageError, OSError):
+                if foreign_cache is None or path.name in foreign_cache.get("__owned_rows__", set()):
+                    raise
+                foreign_cache["__unknown_ownership__"] = True
+                _warn_unrelated_output("unreadable output row retained; ownership unknown")
                 continue
-            target = checked(Path(row["output"]))
+            try:
+                target = checked(Path(row["output"]))
+            except (StorageError, OSError):
+                if (foreign_cache is None or row.get("outer_supervisor") == expected
+                        or path.name in foreign_cache.get("__owned_rows__", set())):
+                    raise
+                foreign_cache["__unknown_ownership__"] = True
+                _warn_unrelated_output("unreadable output path retained; ownership unknown")
+                continue
+            if not _scope_owns_row(row, target, expected, path, strict=True) or row.get("state") != "active":
+                continue
             if row.get("identity") != identity(target) or _read(target / ".rovezero-output.json") != row:
                 raise StorageError("supervised output custody changed; preserve it")
             row.update(state="retained", tree_gone=True, closure="original_outer_supervisor",
@@ -618,17 +786,26 @@ def finalize_supervised_outputs(root, owner, catalog=None):
             guard.assert_held()
             write_record(target / ".rovezero-output.json", row)
             write_record(path, row)
-        sample_output_budget(catalog)
+        sample_output_budget(catalog, supervisor_scope=expected, foreign_cache=foreign_cache, strict_scope=True)
 
 
 def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_guard=None,
-                         quarantine_transition_receipts=None):
-    """Sampled length cap, never a quota or physical completion witness.
+                         quarantine_transition_receipts=None, supervisor_scope=None,
+                         foreign_cache=None, strict_scope=False):
+    """Sample lengths, never a quota or physical completion witness.
 
     V1 calls remain read-only without acquiring the producer's held gate. Aware
     calls use an explicit original guard (live owner: prefer check_budget); only
-    independent sampling may omit it and acquire that gate. Busy/errors propagate.
+    independent sampling may omit it and acquire that gate. A supervisor scope
+    isolates unrelated retained output errors. With a foreign cache, unrelated
+    totals are estimates and may omit unreadable rows; the caller's own output
+    remains sampled on every call. Busy/own-custody errors propagate.
     """
+    if supervisor_scope is not None and (type(supervisor_scope) is not dict or
+            quarantine_receipts is not None or quarantine_transition_receipts is not None or quarantine_guard is not None):
+        raise StorageError("supervisor scope cannot be combined with custody selectors")
+    if foreign_cache is not None and (supervisor_scope is None or type(foreign_cache) is not dict):
+        raise StorageError("foreign accounting cache requires an explicit supervisor scope")
     if quarantine_receipts is not None and quarantine_transition_receipts is not None:
         raise StorageError("V1 and transition custody selectors are mutually exclusive")
     catalog = checked(catalog or canonical_catalog())
@@ -643,6 +820,7 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
         try:
             total = view.usage(_catalog_rows(catalog))
             view.check()
+            warn_output_threshold(total, scope="output_actual")
             return total
         finally:
             view.close(sys.exc_info()[1])
@@ -655,33 +833,92 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
         try:
             total = view.usage(_catalog_rows(catalog))
             view.check()
+            warn_output_threshold(total, scope="output_actual")
             return total
         finally:
             view.close(sys.exc_info()[1])
     if quarantine_guard is not None:
         raise StorageError("custody guard without explicit receipt pins is not a typed selection")
     if not catalog.exists():
+        if foreign_cache is not None and foreign_cache.get("__owned_rows__"):
+            raise StorageError("previously observed supervised output catalog disappeared")
         return 0
     total = 0
+    owned_seen = set()
     entries = list(catalog.iterdir())
     if len(entries) > MAX_RUNS + 1:
         raise StorageError("output catalog entry bound exceeded")
     for path in entries:
         if path.name == "catalog.lock":
             continue
-        row = _read(path)
-        target = checked(Path(row["output"]))
-        if row.get("identity") is not None and row["identity"] != (observed_identity := identity(target)):
-            error = StorageError("live output identity changed")
-            _attach_sampled_identity_observation(error, row.get("key"), target,
-                                                 row["identity"], observed_identity)
-            raise error
-        amount = tree_size(target, allow_disappearing=True)
+        try:
+            row = _read(path)
+        except (StorageError, OSError) as error:
+            previously_owned = foreign_cache.get("__owned_rows__", set()) if foreign_cache is not None else set()
+            if supervisor_scope is None or (strict_scope and (foreign_cache is None or path.name in previously_owned)):
+                raise
+            _warn_unrelated_output(type(error).__name__ + "; live catalog observation unknown; finalization will recheck")
+            if foreign_cache is not None:
+                foreign_cache["__unknown_ownership__"] = True
+                if path.name in foreign_cache.get("__owned_rows__", set()):
+                    owned_seen.add(path.name)
+            continue
+        try:
+            target = checked(Path(row["output"]))
+        except (StorageError, OSError) as error:
+            previously_owned = foreign_cache.get("__owned_rows__", set()) if foreign_cache is not None else set()
+            if (supervisor_scope is None or row.get("outer_supervisor") == supervisor_scope
+                    or path.name in previously_owned):
+                raise
+            _warn_unrelated_output(type(error).__name__ + "; protected foreign path; actual usage unknown")
+            if foreign_cache is not None:
+                foreign_cache["__unknown_ownership__"] = True
+            total += row["reserved_bytes"]
+            continue
+        owned = (_scope_owns_row(row, target, supervisor_scope, path)
+                 if supervisor_scope is not None else False)
+        if owned == "unresolved_owned":
+            if strict_scope:
+                raise StorageError("supervised output owner or marker changed")
+            owned_seen.add(path.name)
+            if foreign_cache is not None:
+                foreign_cache["__unknown_ownership__"] = True
+            total += row["reserved_bytes"]
+            continue
+        if owned is None and foreign_cache is not None:
+            foreign_cache["__unknown_ownership__"] = True
+        if owned:
+            owned_seen.add(path.name)
+        unrelated = supervisor_scope is not None and not owned
+        if unrelated:
+            if foreign_cache is not None and not foreign_cache.get("__estimate_reported__"):
+                _warn_unrelated_output("other-owner usage is reserved accounting; actual usage is unknown")
+                foreign_cache["__estimate_reported__"] = True
+            total += row["reserved_bytes"]
+            continue
+        try:
+            if row.get("identity") is not None and row["identity"] != (observed_identity := identity(target)):
+                error = StorageError("live output identity changed")
+                _attach_sampled_identity_observation(error, row.get("key"), target,
+                                                     row["identity"], observed_identity)
+                raise error
+            amount = tree_size(target, allow_disappearing=True)
+        except (StorageError, OSError) as error:
+            if not unrelated:
+                raise
+            _warn_unrelated_output(type(error).__name__ + "; retained; total is incomplete")
+            continue
         if amount > row["reserved_bytes"]:
-            raise StorageError("managed output exceeds reservation")
+            if not unrelated:
+                raise StorageError("managed output exceeds reservation")
+            _warn_unrelated_output("reservation exceeded; retained for owner review")
         total += amount
-    if total > 18 * GiB:
-        raise StorageError("retained output catalog exceeds 18GiB")
+    if supervisor_scope is not None and foreign_cache is not None:
+        previously_owned = foreign_cache.setdefault("__owned_rows__", set())
+        if previously_owned - owned_seen:
+            raise StorageError("previously observed supervised output disappeared or changed owner")
+        previously_owned.update(owned_seen)
+    warn_output_threshold(total, scope="output_reserved_estimate" if supervisor_scope is not None else "output_actual")
     return total
 
 

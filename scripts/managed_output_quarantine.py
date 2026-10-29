@@ -19,7 +19,7 @@ import stat
 import sys
 import time
 
-from managed_storage import StorageError, checked, tree_size, GiB
+from managed_storage import StorageError, checked, tree_size, GiB, warn_output_threshold
 from storage_guard import CatalogGuard, lifetime, reboot_proves_dead
 
 SCHEMA = "rovezero.interrupted-unbound-custody.v1"
@@ -448,8 +448,8 @@ def _original(held, catalog, pin, now):
     _need(str(target) == row["output"] and hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest() == key
           and row["key"] == key and row["schema"] == "rovezero.managed-output.v1"
           and row["state"] == "active" and row.get("deferred") is True and row.get("identity") is None
-          and type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] <= 18 * GiB
-          and row.get("catalog_limit_bytes") == 18 * GiB
+          and type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] < 2**63
+          and type(row.get("catalog_limit_bytes")) is int and 0 < row["catalog_limit_bytes"] < 2**63
           and type(row.get("pid")) is int and row["pid"] > 0
           and reboot_proves_dead(row.get("lifetime"), now), "original unbound active row/reboot contract is not proven")
     for other in (checked(catalog), registry_path(catalog), checked(Path(row["source"]))):
@@ -496,7 +496,7 @@ class QuarantineValidation:
                 self.held.tick()
                 _need(amount <= row["reserved_bytes"], "managed output exceeds reservation")
             total += amount
-        _need(total <= 18 * GiB, "custody charges and registry exceed 18GiB")
+        warn_output_threshold(total, scope="custody")
         return total
 
     def close(self, primary=None):
@@ -642,7 +642,8 @@ def publish_custody_quarantine(catalog, original_row_pin, publisher_source_pin, 
             _need(len(receipt_raw) <= RECEIPT_LIMIT, "custody receipt bound exceeded")
             added = len(raw) + len(snapshot_raw) + len(receipt_raw)
             _need(previous.registry_bytes + added <= REGISTRY_LIMIT, "custody registry metadata bound exceeded")
-            _need(previous.usage(rows) - observation.snapshot["regular_bytes"] + row["reserved_bytes"] + added <= 18 * GiB, "custody reservation plus registry metadata exceeds18GiB")
+            warn_output_threshold(previous.usage(rows) - observation.snapshot["regular_bytes"]
+                                  + row["reserved_bytes"] + added, scope="custody-publication")
             held.check()
             previous.check()
             observation.check()

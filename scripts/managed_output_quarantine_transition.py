@@ -17,7 +17,7 @@ import sys
 import time
 
 import managed_output_quarantine as v1
-from managed_storage import StorageError, checked, reject_credential_names
+from managed_storage import StorageError, checked, reject_credential_names, warn_output_threshold
 from storage_guard import lifetime, reboot_proves_dead
 
 SCHEMA = "rovezero.interrupted-unbound-custody-transition.v1"
@@ -552,7 +552,7 @@ def publish_custody_transition(catalog, original_row_pin, predecessor_pin, curre
                 _need(raw == content, "partial artifact content differs; preserve blocked attempt")
             additional = sum(len(content) for kind, (content, _) in contents.items() if prefix + "." + kind + ".json" not in existing)
             _need(view.registry_bytes + additional <= REGISTRY_LIMIT, "transition registry metadata bound exceeded")
-            _need(view.usage(rows) + additional <= 18 * v1.GiB, "transition history/partial metadata exceeds18GiB")
+            warn_output_threshold(view.usage(rows) + additional, scope="custody-transition")
             view.check()
             if not apply:
                 return {"applied": False, "receipt_issued": False, "generation": generation,

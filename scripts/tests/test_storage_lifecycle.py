@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from managed_storage import ManagedBuild, StorageError, recover_build, tree_size, write_record
+from managed_storage import CatalogBusy, ManagedBuild, StorageError, recover_build, tree_size, write_record
 from managed_outputs import (OutputLease, OutputBudgetError, publish_runtime,
                              recover_output, sample_output_budget)
 from storage_guard import CatalogGuard, lifetime
@@ -53,24 +53,72 @@ class LifecycleTests(unittest.TestCase):
         evidence.write_bytes(b"x" * 7000)
         first.finish(status="failed_evidence_preserved", tree_gone=True)
         with patch("managed_outputs.time.time_ns", return_value=10**30):
-            with self.assertRaisesRegex(StorageError, "budget"):
-                self.lease("next", reserve=12000, total_limit=18000)
+            next_owner = self.lease("next", reserve=12000, total_limit=18000)
+            next_owner.finish(status="completed", tree_gone=True)
         self.assertEqual(evidence.stat().st_size, 7000)
-        self.assertFalse((self.base / "next").exists())
+        self.assertTrue((self.base / "next").exists())
         self.assertGreater(sample_output_budget(self.catalog), 7000)
+
+    def test_total_warning_does_not_erase_evidence_or_replace_per_run_limit(self):
+        owner = self.lease(reserve=4096, total_limit=1024)
+        payload = owner.output / "observed.bin"
+        payload.write_bytes(b"x" * 1600)
+        with patch("managed_outputs.warn_output_threshold") as warning:
+            owner.check_budget()
+            self.assertTrue(warning.called)
+        owner.finish(status="completed", tree_gone=True)
+        self.assertEqual(payload.stat().st_size, 1600)
+
+        other = self.lease("larger-reservation", reserve=20 * 1024 ** 3)
+        other.finish(status="completed", tree_gone=True)
+        with patch("managed_outputs.tree_size", side_effect=lambda path, **_: (
+                 19 * 1024 ** 3 if path == other.output else 1600)), \
+             patch("managed_outputs.warn_output_threshold") as warning:
+            self.assertEqual(sample_output_budget(self.catalog), 19 * 1024 ** 3 + 1600)
+            self.assertTrue(warning.called)
 
     def test_live_and_interrupted_output_owner_never_stolen(self):
         owner = self.lease()
         with self.assertRaises(StorageError):
             self.lease("second")
         owner.guard.release()  # Simulate lost gate; not a child closure proof.
-        with self.assertRaisesRegex(StorageError, "interrupted"):
-            self.lease("second")
+        independent = self.lease("second")
+        independent.finish(status="independent-complete", tree_gone=True)
         with self.assertRaises(StorageError):
             recover_output(self.catalog, owner.key, pin(self.catalog / (owner.key + ".json")))
         self.assertTrue(owner.output.exists())
+        self.assertEqual(json.loads((self.catalog / (owner.key + ".json")).read_text())["state"], "active")
 
-    def test_unknown_tree_keeps_admission_closed_until_real_outer_closure(self):
+    def test_brief_catalog_lock_contention_is_retried_without_stealing_owner(self):
+        candidate = OutputLease(self.base / "retry", self.source, catalog=self.catalog)
+        original_acquire = candidate.guard.acquire
+        first = True
+        def acquire_after_contention():
+            nonlocal first
+            if first:
+                first = False
+                raise CatalogBusy("busy")
+            return original_acquire()
+        with patch.object(candidate.guard, "acquire", side_effect=acquire_after_contention) as attempts, \
+             patch("managed_outputs.time.sleep") as sleeper:
+            candidate.acquire()
+        self.addCleanup(candidate.guard.release)
+        self.assertEqual(attempts.call_count, 2)
+        sleeper.assert_called_once()
+        candidate.finish(status="complete", tree_gone=True)
+
+    def test_persistent_catalog_lock_contention_exits_without_creating_output(self):
+        candidate = OutputLease(self.base / "busy", self.source, catalog=self.catalog)
+        with patch.object(candidate.guard, "acquire", side_effect=CatalogBusy("busy")) as attempts, \
+             patch("managed_outputs.time.monotonic", side_effect=[0.0, 0.1, 2.1]), \
+             patch("managed_outputs.time.sleep") as sleeper:
+            with self.assertRaises(CatalogBusy):
+                candidate.acquire()
+        self.assertEqual(attempts.call_count, 2)
+        sleeper.assert_called_once()
+        self.assertFalse(candidate.output.exists())
+
+    def test_unknown_tree_is_preserved_while_independent_root_proceeds(self):
         build = ManagedBuild(self.build, self.source).acquire()
         self.addCleanup(build.guard.release)
         with patch.dict(os.environ, {"RZ_MANAGED_BUILD_ROOT": str(build.root),
@@ -78,8 +126,9 @@ class LifecycleTests(unittest.TestCase):
             owner = self.lease(outer_supervised=True)
         owner.finish(status="child_returned_outer_closure_pending", tree_gone="unknown")
         self.assertEqual(owner.record['state'], 'active')
-        with self.assertRaisesRegex(StorageError, "interrupted"):
-            self.lease('blocked')
+        independent = self.lease('independent')
+        independent.finish(status='independent-complete', tree_gone=True)
+        self.assertEqual(json.loads((self.catalog / (owner.key + '.json')).read_text())['state'], 'active')
         with patch('managed_outputs.canonical_catalog', return_value=self.catalog):
             build.finish(exit_code=0, tree_gone=True)
         row = json.loads((self.catalog / (owner.key + '.json')).read_text())
@@ -148,9 +197,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(owner.output.exists())
         later = self.lease("later")
         later.finish(status="completed", tree_gone=True)
+        original_row = (self.catalog / (owner.key + ".json")).read_bytes()
         owner.output.write_bytes(b"unrelated-later-file")
-        with self.assertRaisesRegex(StorageError, "custody"):
-            self.lease("next")
+        independent = self.lease("next")
+        independent.finish(status="independent-complete", tree_gone=True)
+        self.assertEqual((self.catalog / (owner.key + ".json")).read_bytes(), original_row)
+        self.assertEqual(owner.output.read_bytes(), b"unrelated-later-file")
+        with self.assertRaisesRegex(StorageError, "custody changed"):
+            self.lease("not-created.json")
 
     def test_historical_and_overlapping_outputs_are_rejected(self):
         historical = self.base / "historical"
@@ -776,15 +830,15 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
         self.assertEqual(result["identity"], [7, 30])
         self.assertNotIn("physical_completion", result)
 
-    def test_active_bound_row_still_blocks_other_root_admission(self):
+    def test_active_bound_row_blocks_overlapping_root_admission(self):
         self.owner.create_deferred_directory()
-        other = OutputLease(self.base / "different", self.owner.source, catalog=self.catalog)
+        other = OutputLease(self.target / "nested", self.owner.source, catalog=self.catalog)
         other._rows = Mock(return_value=[(self.row_path, copy.deepcopy(self.disk), self.target)])
         attempted_directories = []
         def record_mkdir(path, *args, **kwargs):
             attempted_directories.append(path)
         with patch.object(Path, "mkdir", autospec=True, side_effect=record_mkdir):
-            with self.assertRaisesRegex(StorageError, "interrupted output"):
+            with self.assertRaisesRegex(StorageError, "overlapping output"):
                 other.acquire()
         self.assertNotIn(other.output, attempted_directories)
         self.assertTrue(all(path == self.catalog for path in attempted_directories))
@@ -1098,9 +1152,9 @@ class InterruptedUnboundQuarantineTests(unittest.TestCase):
 
     def test_default_admission_blocks_and_explicit_boundaries_preserve_owner(self):
         receipt = self.publish()
-        with self.assertRaisesRegex(StorageError, "interrupted output"):
-            OutputLease(self.base / "default", self.base / "source", catalog=self.catalog).acquire()
-        self.assertNotIn(self.base / "default", self.infos)
+        with self.assertRaisesRegex(StorageError, "overlapping output"):
+            OutputLease(self.target / "nested", self.base / "source", catalog=self.catalog).acquire()
+        self.assertNotIn(self.target / "nested", self.infos)
         owner = OutputLease(self.base / "fresh", self.base / "source", catalog=self.catalog,
                             quarantine_receipts=[receipt], reserve=4096).acquire()
         self.addCleanup(owner._close_quarantine_view)
@@ -1210,12 +1264,11 @@ class InterruptedUnboundQuarantineTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageError, "partial custody"):
             self.view([])
 
-    def test_charge_keeps_reservation_and_registry_metadata_can_exhaust_cap(self):
+    def test_charge_keeps_reservation_and_warns_when_metadata_exceeds_threshold(self):
         self.old["reserved_bytes"] = 18 * 1024 ** 3
         self.reset_old()
-        with self.assertRaisesRegex(StorageError, "registry metadata exceeds"):
-            self.publish()
-        self.assertFalse(self.actions)
+        receipt = self.publish()
+        self.assertGreater(self.view([receipt]).usage(self.o._catalog_rows(self.catalog)), 18 * 1024 ** 3)
         self.assertEqual(self.files[self.row_path], self.old_raw)
 
     def test_old_path_ancestors_descendants_and_other_active_row_stay_blocked(self):

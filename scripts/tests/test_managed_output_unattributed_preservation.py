@@ -201,7 +201,7 @@ class UnattributedInventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageError, "selection inputs changed"):
             self.inventory(selection)
 
-    def test_conservative_charge_over18g_is_rejected(self):
+    def test_conservative_charge_over18g_warns_and_preserves_rows(self):
         details = {row["key"]: {"charge_bytes": 4 * GiB} for row in self.rows}
         view = object.__new__(policy.CatalogView)
         view.details, view.archive_charge = details, 0
@@ -210,8 +210,13 @@ class UnattributedInventoryTests(unittest.TestCase):
         view.selection_document = lambda: {}
         rows = [(self.catalog / (row["key"] + ".json"), row, target)
                 for row, target in zip(self.rows, self.targets)]
-        with self.assertRaisesRegex(StorageError, "exceed18GiB"):
-            view.usage(rows)
+        original = [dict(row) for row in self.rows]
+        with patch.object(policy, "warn_output_threshold") as warning:
+            charge = view.usage(rows)
+        self.assertGreater(charge, 18 * GiB)
+        self.assertEqual(charge, 24 * GiB + len(policy.custody._encode({})))
+        warning.assert_called_once_with(charge, scope="unattributed-preservation")
+        self.assertEqual(self.rows, original)
 
     def _mock_history(self, held, catalog, rows, tips, guard):
         # Explicit unit-only historical seam. This is NOT old chain validation,
@@ -559,15 +564,16 @@ class DefaultBranchTests(unittest.TestCase):
         sample.assert_called_once_with()
         manager._assert_owner.assert_not_called()
 
-    def test_run_managed_none_keeps_original_sampler_with_legacy_manager_consumer(self):
+    def test_run_managed_default_uses_scoped_sampler_with_legacy_manager_consumer(self):
         import run_managed
         observations = {"dispatched": False, "before": False, "during": False}
-        def sample():
+        def sample(**kwargs):
+            self.assertEqual(kwargs["supervisor_scope"]["owner"], {"token": "fixture"})
             observations["during" if observations["dispatched"] else "before"] = True
             return 0
         manager = types.SimpleNamespace(acquire=lambda: None, environment=lambda: {},
             finish=lambda **arguments: {"fixture_only": True}, root=Path.cwd(),
-            source=Path.cwd(), total_limit=12 * GiB)
+            source=Path.cwd(), total_limit=12 * GiB, _identity=lambda: {"token": "fixture"})
         def supervisor(command, source, environment, timeout, check_budget):
             self.assertTrue(observations["before"], "budget must be sampled before dispatch")
             observations["dispatched"] = True
@@ -582,7 +588,7 @@ class DefaultBranchTests(unittest.TestCase):
              patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
              patch.object(sys, "stderr", io.StringIO()):
             self.assertEqual(run_managed.main(), 0)
-        original_sampler.assert_called_with()
+        self.assertEqual(original_sampler.call_count, 2)
         self.assertTrue(observations["during"], "budget must be sampled during execution")
         self.assertFalse(hasattr(manager, "sample_output_budget"))
 

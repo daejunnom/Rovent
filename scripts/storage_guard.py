@@ -6,6 +6,7 @@ unobserved descendants may still own files until a verified reboot.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -58,7 +59,7 @@ class CatalogGuard:
         self.parent_identity = None
 
     def acquire(self):
-        from managed_storage import StorageError, checked
+        from managed_storage import CatalogBusy, StorageError, checked
         checked(self.path)
         parent = self.path.parent.stat()
         self.parent_identity = (parent.st_dev, parent.st_ino)
@@ -75,10 +76,20 @@ class CatalogGuard:
                     stream.write(b"0")
                     stream.flush()
                 stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                try:
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise CatalogBusy("catalog lock is held; retry may be possible") from exc
+                    raise
             else:
                 import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    if exc.errno in (errno.EACCES, errno.EAGAIN):
+                        raise CatalogBusy("catalog lock is held; retry may be possible") from exc
+                    raise
         except OSError as exc:
             stream.close()
             raise StorageError("catalog is active or lock unavailable; preserve it") from exc

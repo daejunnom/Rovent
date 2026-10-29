@@ -31,7 +31,7 @@ from types import CodeType, FunctionType, MethodType, ModuleType
 import zipfile
 
 import storage_artifact_review as review
-from managed_storage import GiB, StorageError, checked, read_record_snapshot
+from managed_storage import GiB, StorageError, checked, read_record_snapshot, warn_output_threshold
 from managed_outputs import _catalog_rows, _refuse_custody_registry
 from storage_guard import CatalogGuard, lifetime, owner_proven_dead
 
@@ -428,17 +428,16 @@ def _budget(rows, selected, reserved, written, inputs):
     total, extra = 0, max(0, reserved - written)
     for _, row, output in rows:
         inputs.tick()
-        _need(type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] <= 18 * GiB
+        _need(type(row.get("reserved_bytes")) is int and 0 < row["reserved_bytes"] < 2**63
               and type(row.get("catalog_limit_bytes")) is int
-              and row["reserved_bytes"] <= row["catalog_limit_bytes"] <= 18 * GiB,
+              and 0 < row["catalog_limit_bytes"] < 2**63,
               "original output reservation and total limit required")
         amount = _tree_bytes(output, inputs)
         if row["key"] == selected:
             amount += extra
         _need(amount <= row["reserved_bytes"], "retirement journal exceeds original output reservation")
         total += amount
-    _need(all(total <= row["catalog_limit_bytes"] for _, row, _ in rows),
-          "retirement journal exceeds original aggregate output budget")
+    warn_output_threshold(total, scope="code-retirement")
     return total
 
 
@@ -1122,9 +1121,9 @@ def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowe
             "code": plan["code"], "artifact": plan["artifact"], "research": plan["research"],
             "census": census, **producer_state, "physical_completion_attested": False, "observation_limits": list(_LIMITS)}
         reserved = len(_encode(header)) + 1024 + 16384
-        _need(reserved <= _JOURNAL_CAP and usage + reserved <= 18 * GiB
-              and all(usage + reserved <= item[1]["catalog_limit_bytes"] for item in rows)
-              and _tree_bytes(output, inputs) + reserved <= row["reserved_bytes"], "original journal/output/18GiB budget required")
+        warn_output_threshold(usage + reserved, scope="code-retirement")
+        _need(reserved <= _JOURNAL_CAP
+              and _tree_bytes(output, inputs) + reserved <= row["reserved_bytes"], "original journal/output reservation required")
         name = ".rovezero-code-retirement-" + prepared._pin["sha256"] + ".jsonl"
         evidence["journal_path"] = str(output / name)
         journal = _Journal(inputs, output, name, reserved)
@@ -1141,10 +1140,9 @@ def _retire_prepared_normal_deferred_selected_code(prepared, *, profile, borrowe
               and final_producer_state["no_unprotected_active_producers"], "original catalog rows/history or protected producers changed")
         _need(_numeric_source_function(current_guard, "lifetime")() == now
               and _numeric_original_owner_dead(current_guard, row, now), "original owner or observer lifetime changed")
-        _need(final_usage + max(0, reserved - journal.written) <= 18 * GiB
-              and all(final_usage + max(0, reserved - journal.written) <= item[1]["catalog_limit_bytes"] for item in rows)
-              and _tree_bytes(output, inputs) + max(0, reserved - journal.written) <= row["reserved_bytes"],
-              "original final journal/output/18GiB budget required")
+        warn_output_threshold(final_usage + max(0, reserved - journal.written), scope="code-retirement")
+        _need(_tree_bytes(output, inputs) + max(0, reserved - journal.written) <= row["reserved_bytes"],
+              "original final journal/output reservation required")
         inputs.hash_file(path)
         _process_census(targets, inputs.fds() | {same_guard.stream.fileno(), journal.fd}, inputs.tick)
         inputs.check(); same_guard.assert_held(); journal.check()

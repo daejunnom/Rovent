@@ -25,7 +25,8 @@ import managed_output_preservation_session as legacy
 import managed_output_quarantine as custody
 import managed_output_quarantine_transition as transitions
 from managed_storage import (GiB, StorageError, checked, read_record_snapshot,
-                             reject_credential_names, tree_size, write_record)
+                             reject_credential_names, tree_size, write_record,
+                             warn_output_threshold)
 from storage_guard import CatalogGuard, lifetime
 
 SCHEMA = "rovezero.unattributed-output-preservation.v1"
@@ -523,7 +524,7 @@ def _rows(catalog, selected, *, read_only_budget=False):
              and row.get("state") in {"active", "retained", "interrupted_retained"}
              and not (pending and row["state"] != "active" and target.exists()), "original catalog schema/key/state changed")
         need(type(row.get("reserved_bytes")) is int and type(row.get("catalog_limit_bytes")) is int
-             and 0 < row["reserved_bytes"] <= row["catalog_limit_bytes"] <= 18 * GiB,
+             and 0 < row["reserved_bytes"] < 2**63 and 0 < row["catalog_limit_bytes"] < 2**63,
              "every current/preserved row requires its positive original reservation")
         if key not in selected:
             need(pending or row.get("identity") == outputs.identity(target), "unselected row identity changed")
@@ -575,8 +576,9 @@ def _inventory(held, catalog, selection, *, read_only_budget=False):
         marker = held.read(item["marker"], MAX_METADATA)
         need(marker == raw, "original catalog and marker raw bytes differ")
         reserve = row.get("reserved_bytes")
-        need(type(reserve) is int and 0 < reserve <= 18 * GiB
-             and row.get("catalog_limit_bytes") == 18 * GiB, "original finite reservation required")
+        need(type(reserve) is int and 0 < reserve < 2**63
+             and type(row.get("catalog_limit_bytes")) is int
+             and 0 < row["catalog_limit_bytes"] < 2**63, "original finite reservation required")
         tree = _Tree(held, target, reserve)
         # A later namespace may report the recorded numbers again.  Neither
         # equality nor inequality authenticates an old owner; both observations
@@ -668,7 +670,7 @@ class CatalogView:
                 amount = tree_size(target, allow_disappearing=True)
                 need(amount <= row["reserved_bytes"], "retained producer exceeds reservation")
                 total += amount
-        need(total <= 18 * GiB, "conservative corpus/archives/registry/new reservations exceed18GiB")
+        warn_output_threshold(total, scope="unattributed-preservation")
         return total
 
     def selection_document(self):
@@ -938,7 +940,7 @@ class ReadOnlyBudgetObserver:
                     need(actual <= row["reserved_bytes"], "sampled current output exceeds reservation")
                     amount = row["reserved_bytes"] if row["state"] == "active" else actual
                 total += amount
-            need(total <= 18 * GiB, "conservative read-only total exceeds18GiB")
+            warn_output_threshold(total, scope="unattributed-read-only")
             held.check()
             self.manager._assert_owner()
             return total

@@ -15,10 +15,42 @@ from storage_guard import CatalogGuard, lifetime, reboot_proves_dead, owner_prov
 GiB = 1024 ** 3
 SCHEMA = "rovezero.managed-build.v1"
 MAX_ENTRIES = 100_000
+DEFAULT_OUTPUT_WARNING_BYTES = 18 * GiB
+_warned_output_scopes: set[str] = set()
+
+
+def warn_output_threshold(total, threshold=DEFAULT_OUTPUT_WARNING_BYTES, *, scope="output"):
+    """Warn once per over-threshold interval; never grant cleanup authority.
+
+    Diagnostic delivery failures cannot stop the producer or change custody.
+    Per-producer reservations and physical completion checks remain separate.
+    """
+    if type(total) is not int or type(threshold) is not int or total < 0 or threshold <= 0:
+        return False
+    label = scope if type(scope) is str and scope.isascii() and len(scope) <= 64 else "output"
+    if total <= threshold:
+        _warned_output_scopes.discard(label)
+        return False
+    if label not in _warned_output_scopes:
+        if len(_warned_output_scopes) < 64:
+            _warned_output_scopes.add(label)
+        try:
+            import sys
+            sys.stderr.write(
+                f"rovezero_storage_warning: {label} accounts for {total} bytes "
+                f"(warning threshold {threshold} bytes); safe cleanup is due\n"
+            )
+        except Exception:
+            pass
+    return True
 
 
 class StorageError(RuntimeError):
     pass
+
+
+class CatalogBusy(StorageError):
+    """A catalog's non-blocking OS lock is held by another owner."""
 
 
 def reject_credential_names(path: Path) -> None:
@@ -284,6 +316,10 @@ class ManagedBuild:
         self.token = uuid.uuid4().hex
         self.acquired = False
         self.finished = False
+        # Only the original runner can transition this before calling its
+        # process launcher. An attempted launch is conservatively dispatched.
+        self._dispatch_started = False
+        self._foreign_output_cache = None
         self.record = {}
         self.before = 0
         self.lifetime = lifetime()
@@ -436,21 +472,45 @@ class ManagedBuild:
             self._output_budget_observer = create_budget_observer(self, self.output_preservation)
         return self._output_budget_observer.sample()
 
-    def finish(self, *, exit_code: int, tree_gone: bool, supervisor_error=None) -> dict:
+    def finish(self, *, exit_code: int, tree_gone: bool, supervisor_error=None,
+               _not_dispatched: bool = False) -> dict:
         self._assert_owner()
-        if not tree_gone:
+        if _not_dispatched and (self._dispatch_started or self.output_preservation is not None
+                                or self._output_budget_observer is not None):
+            raise StorageError("no-dispatch closure is unavailable; preserve original owner")
+        if tree_gone is not True:
             # Keep lease and inputs: uncertain cleanup is not ordinary success.
             raise StorageError("process cleanup unverified; slot and lease retained")
         # Durable original-supervisor witness precedes destructive cleanup.
         # It is bound to this exact token, owner birth, boot and root inode.
-        write_record(self.root / "closure.json", {"schema": SCHEMA,
-                     "owner": self._identity(), "tree_gone": True})
-        from managed_outputs import finalize_supervised_outputs
-        if self.output_preservation is None:
-            finalize_supervised_outputs(self.root, self._identity())
-        else:
-            from managed_output_unattributed_preservation import finalize_original_manager
-            finalize_original_manager(self, self.output_preservation)
+        expected_closure = {"schema": SCHEMA, "owner": self._identity(), "tree_gone": True}
+        closure_path = self.root / "closure.json"
+        write_record(closure_path, expected_closure)
+        closure_snapshot = read_record_snapshot(closure_path)
+        if closure_snapshot[0] != expected_closure:
+            raise StorageError("original terminal closure changed; preserve owner")
+        if not _not_dispatched:
+            from managed_outputs import finalize_supervised_outputs
+            if self.output_preservation is None:
+                # The original owner remains held. Only a typed OS lock
+                # contention is retried, with a bounded deadline; other
+                # custody or I/O errors retain their original failure.
+                until = time.monotonic() + 2.0
+                while True:
+                    self._assert_owner()
+                    if read_record_snapshot(closure_path) != closure_snapshot:
+                        raise StorageError("original terminal closure changed; preserve owner")
+                    try:
+                        finalize_supervised_outputs(self.root, self._identity(), foreign_cache=self._foreign_output_cache)
+                        break
+                    except CatalogBusy:
+                        remaining = until - time.monotonic()
+                        if remaining <= 0:
+                            raise
+                        time.sleep(min(0.1, remaining))
+            else:
+                from managed_output_unattributed_preservation import finalize_original_manager
+                finalize_original_manager(self, self.output_preservation)
         observed = tree_size(self.slot)
         remove_tree(self.scratch, self.slot)
         reset = tree_size(self.slot) > self.slot_limit
@@ -466,6 +526,11 @@ class ManagedBuild:
                   "retained_slot_bytes": tree_size(self.slot),
                   "slot_limit_bytes": self.slot_limit,
                   "catalog_limit_bytes": self.total_limit, "maximum_slots": self.slots_limit}
+        if _not_dispatched:
+            result["output_finalization"] = "not_needed_no_child_dispatched"
+        elif self._foreign_output_cache is not None:
+            result["output_custody_scope"] = ("unknown" if self._foreign_output_cache.get("__unknown_ownership__")
+                                               else "sampled_without_conflict")
         write_record(self.slot / "last-run.json", result)
         self._prune()
         self._assert_owner()

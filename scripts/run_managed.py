@@ -8,7 +8,8 @@ import shutil
 import sys
 from pathlib import Path
 sys.dont_write_bytecode = True
-from managed_storage import ManagedBuild, StorageError, canonical_root, tree_size
+from managed_storage import (ManagedBuild, StorageError, canonical_root, tree_size,
+                             DEFAULT_OUTPUT_WARNING_BYTES)
 from managed_process import run_group
 from managed_outputs import sample_output_budget
 
@@ -82,25 +83,38 @@ def main(*, output_preservation=None) -> int:
         parser.error("command must resolve to an executable, not a shell batch file")
     command[0] = program
     budget_failure = None
+    output_warning_seen = False
+
+    def note_output_total(total):
+        nonlocal output_warning_seen
+        if type(total) is int and total > DEFAULT_OUTPUT_WARNING_BYTES:
+            output_warning_seen = True
+
     try:
         manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose,
                                output_preservation=output_preservation)
-        if output_preservation is None:
-            # Detect an existing catalog failure before acquiring a build
-            # owner: its finalizer would sample the same catalog again.
-            sample_output_budget()
         manager.acquire()
         try:
             environment = manager.environment()
             if output_preservation is not None:
-                manager.sample_output_budget()
+                note_output_total(manager.sample_output_budget())
+            else:
+                output_scope = {"root": str(manager.root), "owner": manager._identity(),
+                                "scope": "inherited_outer_process_group_or_job"}
+                foreign_output_cache = {}
+                manager._foreign_output_cache = foreign_output_cache
+                note_output_total(sample_output_budget(supervisor_scope=output_scope,
+                                                       foreign_cache=foreign_output_cache))
             # The same budget is still sampled while the child runs; the
             # earlier check is not a waiver for a later failure.
         except BaseException as error:
             # This try ends before run_group: no payload child was dispatched.
             # Keep the first failure if original-owner cleanup also fails.
             try:
-                manager.finish(exit_code=125, tree_gone=True)
+                if output_preservation is None:
+                    manager.finish(exit_code=125, tree_gone=True, _not_dispatched=True)
+                else:
+                    manager.finish(exit_code=125, tree_gone=True)
             except BaseException as cleanup_error:
                 error.add_note("pre-dispatch original manager cleanup failed: "
                                + type(cleanup_error).__name__ + ": " + str(cleanup_error)[:2048])
@@ -111,9 +125,10 @@ def main(*, output_preservation=None) -> int:
             nonlocal budget_failure
             try:
                 if output_preservation is None:
-                    sample_output_budget()  # Preserve the original default monkeypatch/consumer seam.
+                    note_output_total(sample_output_budget(supervisor_scope=output_scope,
+                                                           foreign_cache=foreign_output_cache))
                 else:
-                    manager.sample_output_budget()
+                    note_output_total(manager.sample_output_budget())
             except StorageError as exc:
                 # run_group preserves the original failure string while it
                 # drains children. Keep this original instance for diagnostics
@@ -123,9 +138,29 @@ def main(*, output_preservation=None) -> int:
             if tree_size(manager.root / "slots", allow_disappearing=True) > manager.total_limit:
                 raise StorageError("live managed build catalog exceeds 12 GiB")
 
+        # Set before even attempting dispatch: a launcher failure with uncertain
+        # child creation must never use the no-child cleanup shortcut.
+        manager._dispatch_started = True
         code, gone, failure = run_group(command, manager.source, environment, args.timeout, check_budget)
         receipt = manager.finish(exit_code=code, tree_gone=gone, supervisor_error=failure)
         print("managed_storage=" + json.dumps(receipt, sort_keys=True), file=sys.stderr)
+        if output_warning_seen and gone is True:
+            # Run only after the original owner finalized and released its
+            # guard. A later owner, uncertain physical state, or inaccessible
+            # candidate is preserved by the maintenance routine. Maintenance
+            # is observationally separate from the completed command.
+            try:
+                from managed_output_maintenance import cleanup_completed_builds
+                cleanup = cleanup_completed_builds(manager, seconds=5)
+                try:
+                    print("managed_storage_maintenance=" + json.dumps(cleanup, sort_keys=True), file=sys.stderr)
+                except (OSError, ValueError):
+                    pass
+            except Exception as error:
+                try:
+                    print("managed_storage_maintenance_warning=" + type(error).__name__, file=sys.stderr)
+                except (OSError, ValueError):
+                    pass
         if budget_failure is not None:
             _emit_storage_failure_observation(budget_failure)
             _emit_custody_deadline_observation(budget_failure)

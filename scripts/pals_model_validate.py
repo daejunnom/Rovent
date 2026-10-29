@@ -498,6 +498,15 @@ def main():
                     "assets": packing_pins, "scope": "python_artifact_rust_fixed_body_check_only",
                     "rust_body_exit_status": 0, "native_validation": "not_performed",
                     "provider_run_fence_authority": False, "registration_authenticity_authority": False}
+                try:
+                    # Only this weight-free CPU graph is recreatable scratch.
+                    # Registration failure is diagnostic and never cancels the
+                    # independent neural-network validation.
+                    output_lease.register_cpu_static_packing_artifact(
+                        packing_pins["device_public_pack.onnx"])
+                except Exception as error:
+                    receipt["device_packing_reclamation_registration"] = {
+                        "status": "not_registered", "error_type": type(error).__name__}
             cli = [str(python), "-m", "rz_pals_model.cli"]
             initialization = output / "initialization"
             export = output / "export-pc"
