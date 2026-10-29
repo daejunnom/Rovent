@@ -12,7 +12,8 @@ use crate::rovent_training_process::{
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::Dir;
 use rz_experiments::{
-    ArtifactRef, RoventDevice, RoventInputLock, RoventObserved, RoventResourceObservation,
+    ArtifactRef, RoventDevice, RoventInputLock, RoventInputLockV2, RoventObserved,
+    RoventResourceObservation, RoventResourcePlan,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -56,6 +57,85 @@ pub struct RoventNativeResourceScope {
     lock: Arc<RoventInputLock>,
     resources: Arc<RoventTrainingResources>,
     entry: RoventNativeProcessEntry,
+}
+
+/// The same OS resource owner for a native /2 launch. The original typed
+/// lock is retained rather than converting it into a /1 declaration.
+pub struct RoventNativeResourceScopeV2 {
+    lock: Arc<RoventInputLockV2>,
+    resources: Arc<RoventTrainingResources>,
+    entry: RoventNativeProcessEntry,
+}
+
+pub enum RoventNativeResourceFailureV2 {
+    BeforePreparation { error: ArenaError, lock: Arc<RoventInputLockV2>, delegated: File },
+    Preparation { failure: Box<RoventTrainingResourceFailure>, lock: Arc<RoventInputLockV2> },
+    Entry { error: ArenaError, lock: Arc<RoventInputLockV2>, resources: Arc<RoventTrainingResources> },
+}
+
+impl std::fmt::Debug for RoventNativeResourceFailureV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforePreparation { error, .. } => f.debug_tuple("BeforePreparation").field(error).finish(),
+            Self::Preparation { failure, .. } => f.debug_tuple("Preparation").field(failure).finish(),
+            Self::Entry { error, .. } => f.debug_tuple("Entry").field(error).finish(),
+        }
+    }
+}
+impl std::fmt::Display for RoventNativeResourceFailureV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforePreparation { error, .. } | Self::Entry { error, .. } => error.fmt(f),
+            Self::Preparation { failure, .. } => failure.error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for RoventNativeResourceFailureV2 {}
+impl RoventNativeResourceFailureV2 {
+    pub fn observation(&self) -> Value {
+        match self {
+            Self::BeforePreparation { error, lock, .. } => json!({"schema":"rz-rovent-native-resource-failure/2",
+                "stage":"before_preparation","input_lock_sha256":lock.canonical_sha256,"error":error.to_string(),"delegated_descriptor_retained":true,"automatic_cleanup":false}),
+            Self::Preparation { failure, lock } => json!({"schema":"rz-rovent-native-resource-failure/2",
+                "stage":"preparation","input_lock_sha256":lock.canonical_sha256,"resource_failure":failure.observation(),"automatic_cleanup":false}),
+            Self::Entry { error, lock, resources } => json!({"schema":"rz-rovent-native-resource-failure/2",
+                "stage":"self_entry_or_readback","input_lock_sha256":lock.canonical_sha256,"error":error.to_string(),
+                "resource_policy":resources.policy(),"actual_partial_migration_must_be_preserved":true,"automatic_cleanup":false}),
+        }
+    }
+}
+
+impl RoventNativeResourceScopeV2 {
+    pub fn prepare(
+        lock: Arc<RoventInputLockV2>, delegated: File, delegated_path: &Path,
+        leaf_name: &str, options: RoventNativeResourceOptions,
+    ) -> Result<Self, Box<RoventNativeResourceFailureV2>> {
+        let plan = (|| -> Result<_, ArenaError> {
+            lock.validate()?;
+            resource_policy(&lock.manifest.engine.pc.device, &lock.manifest.resources, options)
+        })();
+        let policy = match plan {
+            Ok(policy) => policy,
+            Err(error) => return Err(Box::new(RoventNativeResourceFailureV2::BeforePreparation { error, lock, delegated })),
+        };
+        let resources = match RoventTrainingResources::prepare(delegated, delegated_path, leaf_name, policy) {
+            Ok(resources) => Arc::new(resources),
+            Err(failure) => return Err(Box::new(RoventNativeResourceFailureV2::Preparation { failure, lock })),
+        };
+        let entry = match resources.enter_current_native_process() {
+            Ok(entry) => entry,
+            Err(error) => return Err(Box::new(RoventNativeResourceFailureV2::Entry { error, lock, resources })),
+        };
+        Ok(Self { lock, resources, entry })
+    }
+
+    pub fn matches_input_lock(&self, lock: &Arc<RoventInputLockV2>) -> bool {
+        Arc::ptr_eq(&self.lock, lock)
+    }
+
+    pub fn observe(&self) -> RoventNativeResourceSnapshot {
+        observe_native(&self.resources, &self.entry, &self.lock.canonical_sha256, &self.lock.manifest.resources)
+    }
 }
 
 /// All actual descriptors survive partial preparation/entry failures. There
@@ -178,9 +258,19 @@ impl RoventNativeResourceScope {
     /// Failed/racing probes remain explicit Unknown in the returned snapshot;
     /// the actual FD/process owner is always retained for subsequent cleanup.
     pub fn observe(&self) -> RoventNativeResourceSnapshot {
-        let tree = self.resources.observe_native_process_tree(&self.entry);
-        let total = self.resources.observe_total_parent_scope();
-        let startup = self.resources.native_startup_json();
+        observe_native(&self.resources, &self.entry, &self.lock.canonical_sha256, &self.lock.manifest.resources)
+    }
+}
+
+fn observe_native(
+    resources: &RoventTrainingResources,
+    entry: &RoventNativeProcessEntry,
+    lock_sha256: &str,
+    declared: &RoventResourcePlan,
+) -> RoventNativeResourceSnapshot {
+        let tree = resources.observe_native_process_tree(entry);
+        let total = resources.observe_total_parent_scope();
+        let startup = resources.native_startup_json();
         // A failed probe does not establish that controls were unapplied.
         // A leaf file alone also cannot establish application to this tree.
         let applied = (startup.is_ok() && tree.is_ok()).then_some(true);
@@ -194,9 +284,9 @@ impl RoventNativeResourceScope {
         let inventory_complete = tree.is_ok();
         let raw = json!({
             "schema":ROVENT_NATIVE_RESOURCE_EVIDENCE,
-            "input_lock_sha256":self.lock.canonical_sha256,
-            "declared_resource_plan":self.lock.manifest.resources,
-            "actual_leaf_policy":self.resources.policy(),
+            "input_lock_sha256":lock_sha256,
+            "declared_resource_plan":declared,
+            "actual_leaf_policy":resources.policy(),
             "leaf_readback":startup.as_ref().ok(),"leaf_readback_error":startup.err().map(|error|error.to_string()),
             "native_tree":tree.as_ref().ok(),"native_tree_error":tree.err().map(|error|error.to_string()),
             "held_common_ancestor":total.as_ref().ok(),"ancestor_probe_error":total.err().map(|error|error.to_string()),
@@ -212,7 +302,6 @@ impl RoventNativeResourceScope {
             limits,
             inventory_complete,
         }
-    }
 }
 
 fn policy(
@@ -220,7 +309,15 @@ fn policy(
     options: RoventNativeResourceOptions,
 ) -> Result<RoventTrainingResourcePolicy, ArenaError> {
     lock.validate()?;
-    let device = match &lock.manifest.engine.pc.device {
+    resource_policy(&lock.manifest.engine.pc.device, &lock.manifest.resources, options)
+}
+
+fn resource_policy(
+    declared_device: &RoventDevice,
+    plan: &RoventResourcePlan,
+    options: RoventNativeResourceOptions,
+) -> Result<RoventTrainingResourcePolicy, ArenaError> {
+    let device = match declared_device {
         RoventDevice::Cpu => "cpu".into(),
         RoventDevice::Cuda { ordinal, .. } => format!("cuda:{ordinal}"),
     };
@@ -229,7 +326,6 @@ fn policy(
             "explicit native device/sorted affinity differs from the original plan",
         ));
     }
-    let plan = &lock.manifest.resources;
     let policy = RoventTrainingResourcePolicy {
         cpu_quota_millicpus: plan.cpu_quota_millicpus,
         memory_high_bytes: plan.memory_high_bytes,

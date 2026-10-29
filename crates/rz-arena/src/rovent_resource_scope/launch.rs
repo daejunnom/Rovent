@@ -193,13 +193,48 @@ pub(crate) struct NativeResourceCustody {
     delegated: Option<File>,
     scope: Option<RoventNativeResourceScope>,
     failure: Option<Box<RoventNativeResourceFailure>>,
+    scope_v2: Option<RoventNativeResourceScopeV2>,
+    failure_v2: Option<Box<RoventNativeResourceFailureV2>>,
     admission: Option<RoventResourceObservation>,
     finished_live: Option<RoventResourceObservation>,
     finished_live_error: Option<String>,
     admission_attempted: bool,
+    admission_v2_succeeded: bool,
     finished_attempted: bool,
 }
 impl NativeResourceCustody {
+    /// Admit the original /2 lock and exact delegated FD before native model
+    /// loading. An error retains the same owner and any partially entered OS
+    /// scope; it is not converted to /1 or reported as successful admission.
+    pub(crate) fn admit_v2(&mut self, lock: &Arc<RoventInputLockV2>) -> Result<(), ArenaError> {
+        if self.admission_attempted {
+            return Err(invalid("native resource callback replay"));
+        }
+        self.admission_attempted = true;
+        let original: Vec<_> = lock.manifest.provenance.iter()
+            .filter(|artifact| Path::new(&artifact.path) == self.pin.path).collect();
+        if original.len() != 1 || original[0].sha256 != self.pin.sha256 || original[0].bytes != self.pin.bytes {
+            return Err(invalid("resource plan is not the original unique /2 input-lock provenance file"));
+        }
+        let delegated = self.delegated.take().ok_or_else(|| invalid("original delegated descriptor missing"))?;
+        match RoventNativeResourceScopeV2::prepare(
+            Arc::clone(lock), delegated, &self.plan.delegated_cgroup_path,
+            &self.plan.leaf_name, self.plan.options.clone(),
+        ) {
+            Ok(scope) => self.scope_v2 = Some(scope),
+            Err(failure) => {
+                let error = invalid(failure.to_string());
+                self.failure_v2 = Some(failure);
+                return Err(error);
+            }
+        }
+        let snapshot = self.scope_v2.as_ref().expect("stored original /2 scope").observe();
+        self.admission = Some(snapshot.write_evidence(&self.directory, Path::new("admission-readback.json"))?);
+        snapshot.require_admission(self.plan.profile)?;
+        self.admission_v2_succeeded = true;
+        Ok(())
+    }
+
     pub(crate) fn admit(&mut self, lock: &Arc<RoventInputLock>) -> Result<(), ArenaError> {
         if self.admission_attempted {
             return Err(invalid("native resource callback replay"));
@@ -254,8 +289,9 @@ impl NativeResourceCustody {
         }
         self.finished_attempted = true;
         let result: Result<(), ArenaError> = (|| {
-            if let Some(scope) = &self.scope {
-                let snapshot = scope.observe();
+            let snapshot = self.scope.as_ref().map(RoventNativeResourceScope::observe)
+                .or_else(|| self.scope_v2.as_ref().map(RoventNativeResourceScopeV2::observe));
+            if let Some(snapshot) = snapshot {
                 self.finished_live =
                     Some(snapshot.write_evidence(
                         &self.directory,
@@ -270,12 +306,31 @@ impl NativeResourceCustody {
         }
         result
     }
+    /// Only a successful readback for the same live /2 owner can be reported
+    /// as resource admission. This still does not attest final peaks, native
+    /// physical completion, teacher retirement or corpus publication.
+    pub(crate) fn validate_success_v2(&self, lock: &Arc<RoventInputLockV2>) -> Result<(), ArenaError> {
+        if !self.admission_attempted
+            || !self.admission_v2_succeeded
+            || !self.finished_attempted
+            || self.scope.is_some()
+            || self.failure.is_some()
+            || self.failure_v2.is_some()
+            || !self.scope_v2.as_ref().is_some_and(|scope| scope.matches_input_lock(lock))
+            || self.admission.is_none()
+            || self.finished_live.is_none()
+            || self.finished_live_error.is_some()
+        {
+            return Err(invalid("original /2 resource scope and successful live readbacks required"));
+        }
+        Ok(())
+    }
     pub(crate) fn observation(&self) -> Value {
         json!({"schema":"rz-rovent-resource-custody/1","plan_pin":self.pin,
             "evidence_directory":self.plan.evidence_directory,"profile":self.plan.profile,
             "admission_attempted":self.admission_attempted,"finished_attempted":self.finished_attempted,
-            "original_plan_descriptor_retained":true,"original_delegated_descriptor_retained":self.delegated.is_some()||self.scope.is_some()||self.failure.is_some(),
-            "original_scope_retained":self.scope.is_some(),"resource_failure":self.failure.as_ref().map(|failure|failure.observation()),
+            "original_plan_descriptor_retained":true,"original_delegated_descriptor_retained":self.delegated.is_some()||self.scope.is_some()||self.failure.is_some()||self.scope_v2.is_some()||self.failure_v2.is_some(),
+            "original_scope_retained":self.scope.is_some()||self.scope_v2.is_some(),"resource_failure":self.failure.as_ref().map(|failure|failure.observation()).or_else(||self.failure_v2.as_ref().map(|failure|failure.observation())),
             "admission":self.admission,"finished_live":self.finished_live,"finished_live_error":self.finished_live_error,
             "controlled_comparison_accepted":false,"automatic_cleanup":false})
     }
@@ -387,10 +442,13 @@ pub(crate) fn prepare_resource_custody(
         delegated: Some(delegated),
         scope: None,
         failure: None,
+        scope_v2: None,
+        failure_v2: None,
         admission: None,
         finished_live: None,
         finished_live_error: None,
         admission_attempted: false,
+        admission_v2_succeeded: false,
         finished_attempted: false,
     })
 }
