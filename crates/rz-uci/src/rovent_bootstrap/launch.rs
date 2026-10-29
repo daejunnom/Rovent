@@ -64,10 +64,11 @@ pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
 };
-use collection::CollectionLaunch;
+use collection::{CollectionLaunch, CollectionLaunchV2};
 pub use collection::{
     RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
     run_collection_with_driver, run_collection_with_resource_admission,
+    run_pc_collection_v2_with_resource_admission,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
@@ -704,7 +705,7 @@ fn run_inner<'a>(
                     "V1-only launch callbacks cannot consume /2",
                 ));
             }
-            return run_v2_native(arguments, lock, root, cwd, lock_file);
+            return run_v2_native(arguments, lock, root, cwd, lock_file, None);
         }
     };
     if arguments.lifecycle_diagnostics_v2 {
@@ -1170,32 +1171,56 @@ fn prepare_launch_native<Q: NativeQuestionProjection>(
     })
 }
 
-/// /2 native products retain their original process, selected files and lock
-/// through actual UCI drain. Collection, storage and V1 diagnostics remain
-/// unsupported here; the separate V2 lifecycle observer is opt-in.
-fn run_v2_native(
+fn run_pc_collection_v2_inner<'a>(
+    arguments: Vec<String>,
+    collection: CollectionLaunchV2<'a>,
+) -> Result<(), RoventLaunchError> {
+    let arguments = Arguments::parse(&arguments)?;
+    let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
+    let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
+        .map_err(|failure| error("Cwd", failure))?;
+    let lock_file = root.open_with(
+        &arguments.input_lock,
+        cap_std::fs::OpenOptions::new().read(true),
+    ).map_err(|failure| error("InputLock", failure))?.into_std();
+    let lock = match parse_launch_lock(&read_bounded(&lock_file, MAX_LOCK_BYTES)?)? {
+        LaunchInputLock::V2(lock) => lock,
+        LaunchInputLock::V1(_) => return Err(error("InputLockUnsupportedV1", "V2 collection requires an original /2 lock")),
+    };
+    run_v2_native(arguments, lock, root, cwd, lock_file, Some(collection))
+}
+
+/// /2 products retain their original process, selected files and lock through
+/// UCI drain. V2 P/C Collection is admitted only through its typed entry.
+fn run_v2_native<'a>(
     arguments: Arguments,
     lock: Arc<RoventInputLockV2>,
     root: Dir,
     cwd: PathBuf,
     lock_file: File,
+    collection: Option<CollectionLaunchV2<'a>>,
 ) -> Result<(), RoventLaunchError> {
     if arguments.storage.is_some()
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
         || arguments.initial_stop_source_diagnostics
-        || !matches!(
-            lock.manifest.purpose,
-            rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment
-        )
+        || !matches!((lock.manifest.purpose, collection.is_some()),
+            (rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment, false)
+            | (rz_experiments::RoventPurpose::Collection, true))
     {
         return Err(error(
             "InputLockUnsupportedV2",
             "the /2 native route does not support this asset, storage, or diagnostic",
         ));
     }
-    let topology = super::admitted_topology_v2(&lock)
-        .map_err(|failure| error("InputLockUnsupportedV2", failure))?;
+    let topology = if collection.is_some() {
+        super::admitted_pc_collection_topology_v2(&lock)
+    } else {
+        super::admitted_topology_v2(&lock)
+    }.map_err(|failure| error("InputLockUnsupportedV2", failure))?;
+    if collection.is_some() && !matches!(topology, super::RoventStartupTopology::RolesOnly) {
+        return Err(error("InputLockUnsupportedV2", "typed V2 P/C collection requires roles-only topology"));
+    }
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
         return Err(error(
             "StartupWindow",
@@ -1233,6 +1258,15 @@ fn run_v2_native(
     let view = boundary
         .startup_view()
         .map_err(|failure| error("ProcessBoundary", failure))?;
+    let (teacher_selections, observer, hooks, resource) = match collection {
+        Some(request) => (Some(request.teacher_selections), Some(request.observer), Some(request.hooks), Some(request.admit_resource)),
+        None => (None, None, None, None),
+    };
+    if let Some(resource) = resource {
+        control.check().map_err(|failure| error("ResourceAdmission", failure))?;
+        resource(&lock)?;
+        control.check().map_err(|failure| error("ResourceAdmission", failure))?;
+    }
     let selected: Vec<_> = lock
         .manifest
         .provenance
@@ -1250,16 +1284,27 @@ fn run_v2_native(
         .map_err(|failure| error("Assets", failure))?;
     let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
     let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
-    let sources = Arc::new(
-        RoventPinnedNativeSources::<RoventInputLockV2>::open_v2(
+    let sources = Arc::new(match teacher_selections {
+        Some(selections) => {
+            let preload = Arc::new(RoventCollectionPreloadSources::open_v2(
+                Arc::clone(&lock),
+                root.try_clone().map_err(|failure| error("Cwd", failure))?,
+                &cwd,
+                selections,
+                &control,
+            ).map_err(|failure| error("CollectionSources", failure))?);
+            RoventPinnedNativeSources::<RoventInputLockV2>::open_v2_with_collection(
+                Arc::clone(&lock), source_root, cwd, selection, &control, preload,
+            )
+        }
+        None => RoventPinnedNativeSources::<RoventInputLockV2>::open_v2(
             Arc::clone(&lock),
             source_root,
             cwd,
             selection,
             &control,
-        )
-        .map_err(|failure| error("Assets", failure))?,
-    );
+        ),
+    }.map_err(|failure| error("Assets", failure))?);
     sources
         .configuration()
         .require_supported_native_capabilities()
@@ -1401,6 +1446,28 @@ fn run_v2_native(
         }};
     }
     let assembled = (|| -> Result<_, RoventLaunchError> {
+        if let (Some(observer), Some(hooks)) = (observer, hooks) {
+            let prepared = super::prepare_native_v2_collection::<PcPortQuestion>(
+                Arc::clone(&sources), resources, clock.runtime_clock(), control.clone(), observer,
+            ).map_err(|rejection| reject_factory(rejection, cleanup_until, &diagnostic))?;
+            let driver = super::product::RoventNativeProductDriverV2::pc_with_collection_hooks_v2(
+                prepared, loaded_nnuec, Arc::clone(&boundary), clock.clone(),
+                Arc::clone(&owners), identity, arguments.root_policy, hooks,
+            ).map_err(|rejection| {
+                // The rejection contains the actual native, hook and process
+                // owners. No teacher-retirement proof is available here.
+                let detail = error("ProductAssembly", &rejection.failure);
+                let _quarantine = Box::leak(Box::new(rejection));
+                error("PhysicalCompletionUnknown", detail)
+            })?;
+            let completion = driver.physical_close_observation();
+            let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2 {
+                Arc::new(super::product::diagnostics_v2::ObservedV2::new(driver, lock.canonical_sha256.clone()))
+            } else {
+                Arc::new(driver)
+            };
+            return Ok((driver, completion));
+        }
         match (topology, loaded_nnuec, external) {
             (super::RoventStartupTopology::RolesOnly, None, None) => launch_v2_product!(
                 PcPortQuestion,

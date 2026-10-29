@@ -14,7 +14,7 @@ use super::{
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
-    AdaptiveCollectionObserverBoxV2, AdaptiveManagerError, ManagerPhase, PcPortDriver,
+    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV2, AdaptiveManagerError, ManagerPhase, PcPortDriver,
     RoleOnlyCollectionV2Rejection, RoleOnlyExecutionManager, RoleOnlyManagerRegistration,
     RoleOnlyManagerSources, RoleOnlyShutdownReceipt, RoventCollectionRootAdmission,
     RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin, RoventNativeCollectionOriginV2,
@@ -107,6 +107,44 @@ pub type RoventPcAdmissionObserver = Arc<
 pub type RoventPcClosureObserver =
     Arc<dyn Fn(&mut RoventPcSessionManager) -> Result<(), AdaptiveManagerError> + Send + Sync>;
 
+/// The original collection objects after native fence and settlement. Only
+/// the session can construct this value; receiving it is not evidence that
+/// the separate teacher process has retired or its outputs were consumed.
+pub struct RoventPcCollectionHandoffV2 {
+    admission: RoventCollectionRootAdmissionV2,
+    observer: AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
+    settlement: Result<(), AdaptiveCollectionError>,
+    native_fence: RoleOnlyShutdownReceipt,
+}
+
+impl RoventPcCollectionHandoffV2 {
+    /// Inspect or operate on the original observer while the session retains
+    /// another Arc to this handoff. Borrowing cannot move out its owners.
+    pub fn parts_mut(
+        &mut self,
+    ) -> (
+        &RoventCollectionRootAdmissionV2,
+        &mut AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
+        &Result<(), AdaptiveCollectionError>,
+        &RoleOnlyShutdownReceipt,
+    ) {
+        (&self.admission, &mut self.observer, &self.settlement, &self.native_fence)
+    }
+
+    /// Transfer the original objects to their collection owner without
+    /// replacing the admission or synthesizing a native fence.
+    pub fn into_parts(
+        self,
+    ) -> (
+        RoventCollectionRootAdmissionV2,
+        AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
+        Result<(), AdaptiveCollectionError>,
+        RoleOnlyShutdownReceipt,
+    ) {
+        (self.admission, self.observer, self.settlement, self.native_fence)
+    }
+}
+
 /// An original V2 collection owner. The hook must retain its teacher and
 /// publication custody; these callbacks do not prove physical completion.
 /// `admit`, `pump`, and `revoke` run while the root's session owner is held:
@@ -121,6 +159,10 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
     ) -> Result<(), RoventPcCollectionAdmissionFailureV2>;
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
+    /// Return a bounded channel reserved for this original root. The session
+    /// sends directly with `try_send` and retains another Arc whether delivery
+    /// fails, the receiver is dropped, or teacher completion is unresolved.
+    fn handoff_sender(&self) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>;
 }
 
 /// The rejected admission and every acquired observer/teacher owner remain
@@ -594,6 +636,7 @@ pub struct RoventPcSessionDriver {
     collection_origin_v2: Option<RoventNativeCollectionOriginV2>,
     collection_hooks_v2: Option<Arc<dyn RoventPcCollectionHooksV2>>,
     collection_v2_outstanding: AtomicBool,
+    retained_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionHandoffV2>>>>,
     retained_collection_failure_v2: Mutex<Option<RoventPcCollectionAdmissionFailureV2>>,
     retained_collection_panic_v2: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
     selective_policy: Digest,
@@ -922,6 +965,7 @@ impl RoventPcSessionDriver {
             collection_origin_v2,
             collection_hooks_v2,
             collection_v2_outstanding: AtomicBool::new(false),
+            retained_collection_handoff_v2: Mutex::new(None),
             retained_collection_failure_v2: Mutex::new(None),
             retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
@@ -1229,6 +1273,7 @@ impl RoventPcSessionDriver {
             collection_origin_v2: None,
             collection_hooks_v2: None,
             collection_v2_outstanding: AtomicBool::new(false),
+            retained_collection_handoff_v2: Mutex::new(None),
             retained_collection_failure_v2: Mutex::new(None),
             retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
@@ -2174,12 +2219,45 @@ impl RoventPcSessionDriver {
             }
         };
         if v2_hook_started {
-            // The native fence does not cover the teacher process. Until a
-            // same-owner retirement proof and observer handoff are wired,
-            // keep the actual manager, observer and hook together.
+            // Acquire the channel before removing any owner from the manager.
+            // A hook panic therefore leaves the actual observer in place.
+            let sender = match catch_unwind(AssertUnwindSafe(|| {
+                self.collection_hooks_v2.as_ref().expect("started hook").handoff_sender()
+            })) {
+                Ok(sender) => sender,
+                Err(payload) => {
+                    self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                    *state = State::Manager(manager);
+                    self.closed.store(true, Ordering::Release);
+                    return Err(physical_unknown_at("RoventPcV2HandoffSenderPanic", "original observer and manager retained"));
+                }
+            };
+            let (admission, observer, settlement) = match manager.take_collection_observer_v2() {
+                Ok(Some(original)) => original,
+                _ => {
+                    *state = State::Manager(manager);
+                    self.closed.store(true, Ordering::Release);
+                    return Err(physical_unknown_at("RoventPcV2HandoffUnavailable", "original observer and manager retained"));
+                }
+            };
+            let handoff = Arc::new(Mutex::new(RoventPcCollectionHandoffV2 {
+                admission,
+                observer,
+                settlement,
+                native_fence: physical.clone(),
+            }));
+            *self.retained_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
+            if sender.try_send(handoff).is_err() {
+                *state = State::Manager(manager);
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at("RoventPcV2HandoffUndelivered", "original handoff and manager retained"));
+            }
+            // Delivery transfers the observer, but is not teacher retirement.
+            // Keep the original manager and hook until same-owner retirement
+            // is observed by a separate worker.
             *state = State::Manager(manager);
             self.closed.store(true, Ordering::Release);
-            return Err(physical_unknown_at("RoventPcV2TeacherRetirementUnsupported", "teacher retirement and observer handoff are not connected"));
+            return Err(physical_unknown_at("RoventPcV2TeacherRetirementUnsupported", "observer handoff sent; same-owner teacher retirement not yet confirmed"));
         }
         if let Some(observer) = &self.collection_hooks.root_closure {
             if let Err(error) = observer(&mut manager) {
@@ -2774,6 +2852,9 @@ impl Drop for RoventPcSessionDriver {
             }
             if let Some(hooks) = self.collection_hooks_v2.take() {
                 std::mem::forget(hooks);
+            }
+            if let Some(handoff) = self.retained_collection_handoff_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+                std::mem::forget(handoff);
             }
             if let Some(failure) = self.retained_collection_failure_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
                 std::mem::forget(failure);

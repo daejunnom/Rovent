@@ -10,14 +10,41 @@ use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
 use crate::pals_native::ticketed::VirtualReviewCollectionObserver;
 use crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
 use crate::rovent_bootstrap::product::{RoventNativeProductDriver, RoventProductStartupRejection};
+use crate::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2;
 use crate::rovent_bootstrap::{
     PreparedRoventNative, RoventCollectionPreloadSources, RoventPinnedExternalRSource,
     RoventStartupControl, RoventTeacherSourceSelection,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
-use rz_experiments::RoventInputLock;
+use rz_experiments::{RoventInputLock, RoventInputLockV2};
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
 use std::sync::Arc;
+
+/// Explicit V2 P/C collection inputs. These owners are selected before the
+/// original lock is opened; they never project a V2 input lock into V1.
+pub(super) struct CollectionLaunchV2<'a> {
+    pub(super) teacher_selections: Vec<RoventTeacherSourceSelection>,
+    pub(super) observer: Box<dyn VirtualReviewCollectionObserver>,
+    pub(super) hooks: Arc<dyn RoventPcCollectionHooksV2>,
+    pub(super) admit_resource: Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>,
+}
+
+/// Admit a P/C V2 collection using the actual V2 lock and original source
+/// owners. Teacher retirement and publication are separate evidence.
+pub fn run_pc_collection_v2_with_resource_admission<'a>(
+    arguments: Vec<String>,
+    teacher_selections: Vec<RoventTeacherSourceSelection>,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+    hooks: Arc<dyn RoventPcCollectionHooksV2>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
+) -> Result<(), RoventLaunchError> {
+    super::run_pc_collection_v2_inner(arguments, CollectionLaunchV2 {
+        teacher_selections,
+        observer,
+        hooks,
+        admit_resource: Box::new(admit_resource),
+    })
+}
 
 /// 부모 launch가 실제로 준비한 단일 native owner의 구체 질문 타입을 보존한다.
 /// 다른 variant나 질문 타입으로 바꾸는 변환 경로는 제공하지 않는다.

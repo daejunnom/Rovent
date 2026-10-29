@@ -1136,6 +1136,22 @@ pub(crate) fn admitted_topology_v2(
     admitted_native_topology_fields(engine, &lock.manifest.coordinator, explicit_purpose)
 }
 
+/// Collection is a distinct admission: the original V2 lock must explicitly
+/// declare teachers, and P/C still uses the same native capability checks.
+pub(crate) fn admitted_pc_collection_topology_v2(
+    lock: &RoventInputLockV2,
+) -> Result<RoventStartupTopology, BackendError> {
+    lock.validate()
+        .map_err(|_| fail(K::IdentityMismatch, "Rovent lock validation failed"))?;
+    let engine = &lock.manifest.engine;
+    let explicit = lock.manifest.purpose == RoventPurpose::Collection && !engine.teachers.is_empty();
+    let topology = admitted_native_topology_fields(engine, &lock.manifest.coordinator, explicit)?;
+    if topology != RoventStartupTopology::RolesOnly {
+        return Err(fail(K::UnsupportedModel, "V2 P/C collection requires roles-only topology"));
+    }
+    Ok(topology)
+}
+
 fn admitted_native_topology_fields(
     engine: &RoventEngineDeclaration,
     coordinator: &RoventCoordinatorDeclaration,

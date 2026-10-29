@@ -13,7 +13,10 @@ use super::nnuec_session::{
     RoventNnuecSessionV2Rejection,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
-use super::pc_session::{RoventPcCollectionHooks, RoventPcSessionDriver};
+use super::pc_session::{
+    RoventPcCollectionHooks, RoventPcCollectionHooksV2, RoventPcSessionDriver,
+    RoventPcSessionV2Rejection,
+};
 use super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2;
 use super::{
     PreparedRoventNative, PreparedRoventNativeV2, RoventNativeBackend, RoventPinnedExternalRSource,
@@ -917,8 +920,7 @@ impl Drop for RoventNativeProductDriver {
     }
 }
 
-/// PC-only /2 product owner. Collection, storage, NNUEC and R assembly are
-/// separate capabilities and are intentionally absent from this constructor.
+/// PC-only /2 product owner. Storage and R assembly are separate capabilities.
 /// The original V2 pinned sources remain held with the same session until its
 /// physical finish; an unknown finish quarantines both owners.
 pub struct RoventNativeProductDriverV2 {
@@ -936,6 +938,39 @@ pub struct RoventProductV2StartupRejection {
 }
 
 impl RoventNativeProductDriverV2 {
+    /// Assemble a collection session from the same prepared source and hook
+    /// owners. On rejection all original owners are returned intact. This
+    /// constructor alone does not establish teacher retirement or publication.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn pc_with_collection_hooks_v2(
+        prepared: PreparedRoventNativeV2<PcPortQuestion>,
+        loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: Arc<dyn RoventPcCollectionHooksV2>,
+    ) -> Result<Self, RoventPcSessionV2Rejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventPcSessionDriver::new_v2_collection(
+            prepared,
+            loaded,
+            Arc::clone(&process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+            hooks,
+        )?;
+        Ok(Self {
+            inner: Arc::new(driver),
+            sources,
+            process,
+            physically_closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn pc(
         prepared: PreparedRoventNativeV2<PcPortQuestion>,
