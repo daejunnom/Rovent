@@ -904,6 +904,33 @@ where
         self.collection_admission_v2.as_ref()
     }
 
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn no_capture_root_v2(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<super::collection::RoventNoCaptureRootCapabilityV2, AdaptiveManagerError> {
+        if self.collection.is_some() || self.collection_admission.is_some()
+            || self.has_collection_v2() || self.phase != ManagerPhase::Running
+            || self.registry.cumulative_observation().admitted != 0
+            || !self.bindings.is_empty() || self.pending_input.is_some()
+            || admission.root_admission().authority() != self.registration.authority
+            || admission.root_admission().hard_deadline() != self.deadline
+            || admission.root_budget() != self.registration.root_budget
+            || admission.native_origin().sources().lock().manifest.engine.mode != self.registration.mode
+        {
+            return Err(AdaptiveManagerError::Invalid("P/C no-capture root scope or admission order"));
+        }
+        self.driver.validate_collection_admission_v2(admission)?;
+        let verifier = self.native.native_acceptance_verifier().ok_or(
+            AdaptiveManagerError::Invalid("P/C no-capture native verifier unavailable"),
+        )?;
+        super::collection::RoventNoCaptureRootCapabilityV2::new(admission.clone(), verifier)
+            .map_err(|error| match error {
+                super::collection::RoventNoCaptureIssueErrorV2::Busy(_) => AdaptiveManagerError::AuxiliaryPending,
+                super::collection::RoventNoCaptureIssueErrorV2::Rejected(error) => error.into(),
+            })
+    }
+
     /// Internal V2 admission preserves its original objects on every failure.
     /// Installing an observer is not authority to start a teacher or a product.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]

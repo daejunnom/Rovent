@@ -69,6 +69,11 @@ impl RoventPcCollectionRunV2 {
                 "omitted_failures":failures.omitted,
                 "diagnostic_actors":worker.diagnostics().len()})
         });
+        let deferred_observation = match self.bridge.try_deferred_observation() {
+            Ok(Some(value)) => json!({"status":"available", "detail":value}),
+            Ok(None) => json!({"status":"busy"}),
+            Err(error) => json!({"status":"failed", "error":error.to_string()}),
+        };
         json!({"schema":"rz-rovent-pc-lock-v2-run-observation/1",
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
             "native_failure_transferred":self.native_failure_taken,
@@ -82,6 +87,7 @@ impl RoventPcCollectionRunV2 {
             },
             "teacher_worker_thread_panicked":self.worker_thread_panicked,
             "teacher_worker_observation":worker_observation,
+            "deferred_collection":deferred_observation,
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
@@ -204,13 +210,14 @@ impl Drop for RoventPcCollectionRunV2 {
                     && !status.callback_lock_failure
             });
         let physically_resolved = owner_resolved
+            && matches!(self.bridge.try_has_deferred(), Ok(Some(false)))
             && self.native_failure.is_none()
             && !self.native_failure_taken
             && self.resource_error.is_none()
             && self
                 .worker
                 .try_lock()
-                .is_ok_and(|worker| !worker.has_failure())
+                .is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows())
             && (self.worker_exit == Some(PcWorkerExitKindV2::Retirement)
                 || (self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
                     && self.bridge.returned_handoff_settled().unwrap_or(false)));

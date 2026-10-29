@@ -1527,10 +1527,9 @@ impl RoventNnuecSessionDriver {
                     run.collection_handoff_failure = Some(error);
                 }
                 }
-                // The bounded channel now owns the very same handoff.  The
-                // Arena worker retains it together with the original teacher
-                // and collection data; UCI records only the native fence.
-                // Its join and corpus publication are separate outer results.
+                // Escrow retains the original whether delivery succeeds or
+                // fails. A successful send is only a channel observation;
+                // teacher join and corpus publication remain outer results.
             }
         }
         let frontier = match run

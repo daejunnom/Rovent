@@ -46,6 +46,7 @@ pub struct RoventNnuecCollectionRunV2 {
     worker_custody_poisoned: bool,
     transferred_handoff: Option<RoventNnuecTransferredHandoffV2>,
     recovered_handoff: Option<HandoffEscrowLeaseV2>,
+    escrow_recovery_error: Option<ArenaError>,
     handoff_transfer_error: Option<RoventNnuecHandoffTransferErrorV2>,
     commit_failure: Option<Box<CommitTeacherPolicyFailureV2>>,
     native_failure: Option<RoventOwnNnuecCollectionLaunchFailureV2>,
@@ -55,11 +56,36 @@ pub struct RoventNnuecCollectionRunV2 {
 }
 
 impl RoventNnuecCollectionRunV2 {
+    /// Advance a caller-owned assembly with this run's original root gate and
+    /// handoff. The assembly keeps the original row on busy/error; success is
+    /// only in-memory assembly, not corpus publication or teacher retirement.
+    pub fn try_advance_assembly(&self, assembly: &mut RoventCorpusAssemblyLockV2) -> Result<bool, ArenaError> {
+        if self.worker_thread.is_some() || self.worker_exit.is_none()
+            || self.worker_thread_panicked || self.worker_custody_poisoned
+            || matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::Panicked(_)))
+        { return Ok(false); }
+        let worker = match self.worker.try_lock() {
+            Ok(worker) => worker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 worker poisoned")),
+        };
+        let Some(handoff) = worker.original_handoff() else { return Ok(false); };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 handoff poisoned")),
+        };
+        let admission = handoff.parts_mut().0.clone();
+        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(false); };
+        assembly.try_advance_fenced_own(&gate, &mut handoff)
+    }
     /// Recover only the original installed admission after the Arena worker
     /// has stopped. The lease preserves custody and proves no completion.
-    pub fn try_recover_undelivered_handoff(&mut self) -> Result<bool, ArenaError> {
+    pub fn try_recover_original_handoff(&mut self) -> Result<bool, ArenaError> {
         if self.recovered_handoff.is_some() { return Ok(true); }
-        if self.worker_thread.is_some() || (self.worker_exit.is_none() && !self.worker_not_started) {
+        if self.worker_thread.is_some() || self.worker_custody_poisoned
+            || (self.worker_exit.is_none() && !self.worker_not_started && !self.worker_thread_panicked)
+        {
             return Ok(false);
         }
         let Some(admission) = self.bridge.installed_admission_for_recovery() else { return Ok(false); };
@@ -81,6 +107,12 @@ impl RoventNnuecCollectionRunV2 {
         if !delivery_observed { return Ok(false); }
         self.recovered_handoff = Some(lease);
         Ok(true)
+    }
+
+    /// Transfer the original recovery error for a caller to retain. It is a
+    /// collection observation, not a native or teacher physical failure.
+    pub fn take_escrow_recovery_error(&mut self) -> Option<ArenaError> {
+        self.escrow_recovery_error.take()
     }
 
     /// Transfer the original UCI failure and resource observation only for a
@@ -229,6 +261,13 @@ impl RoventNnuecCollectionRunV2 {
                 self.handoff_transfer_error = Some(error);
             }
         }
+        if (self.worker_exit.is_some() || self.worker_thread_panicked) && self.transferred_handoff.is_none()
+            && self.recovered_handoff.is_none() && self.escrow_recovery_error.is_none()
+        {
+            if let Err(error) = self.try_recover_original_handoff() {
+                self.escrow_recovery_error = Some(error);
+            }
+        }
         self.worker_exit.is_some() || self.worker_thread_panicked || self.worker_not_started
             || (self.worker_custody_poisoned && self.worker_thread.is_none())
     }
@@ -317,6 +356,12 @@ impl RoventNnuecCollectionRunV2 {
             "teacher_worker_custody_poisoned":self.worker_custody_poisoned,
             "recovered_handoff_lease_retained":self.recovered_handoff.is_some(),
             "recovered_handoff_delivery":recovered_delivery,
+            "escrow_recovery_error":self.escrow_recovery_error.as_ref().map(|error|error.to_string()),
+            "escrow_recovery_state":if self.transferred_handoff.is_some() { "transferred" }
+                else if self.recovered_handoff.is_some() { "recovered" }
+                else if self.escrow_recovery_error.is_some() { "failed" }
+                else if self.bridge.installed_admission_for_recovery().is_some() { "pending" }
+                else { "no_installed_admission_observed" },
             "teacher_worker_observation":worker_observation,
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
@@ -493,6 +538,7 @@ impl Drop for RoventNnuecCollectionRunV2 {
             && self.resource_error.is_none()
             && !self.worker_custody_poisoned
             && self.commit_failure.is_none()
+            && self.escrow_recovery_error.is_none()
             && self
                 .collection_failures()
                 .is_ok_and(|failures| failures.is_empty())
@@ -562,6 +608,8 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         .collect();
     let (bridge, worker) =
         RoventNnuecCollectionBridgeV2::new(owner.clone(), Arc::clone(&manifest), roster)?;
+    // The consumer is not yet wired to offer, flush, and publish all original
+    // rows. Keep the teacher row pump disabled until the bounded publisher is live.
     let worker = Arc::new(Mutex::new(worker));
     let resource = Arc::new(Mutex::new(resources::CollectionResourceCustody::prepare(
         input_directory,
@@ -641,6 +689,7 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         worker_custody_poisoned: slot_poisoned,
         transferred_handoff: None,
         recovered_handoff: None,
+        escrow_recovery_error: None,
         handoff_transfer_error: None,
         commit_failure: None,
         native_failure: native.err(),

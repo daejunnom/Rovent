@@ -250,6 +250,17 @@ impl RoventNoCaptureRootCapabilityV2 {
         receipt.authority == self.admission.root_admission().authority()
             && receipt.permits_root_reuse()
     }
+
+    /// The P/C-only receipt carries its own native fence and root budget.
+    /// This checks the original root and physical closure, not publication.
+    pub fn matches_role_only_shutdown_receipt(
+        &self,
+        receipt: &super::role_only::RoleOnlyShutdownReceipt,
+    ) -> bool {
+        receipt.authority == self.admission.root_admission().authority()
+            && receipt.root_budget == self.admission.root_budget()
+            && receipt.permits_semantic_closure()
+    }
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]

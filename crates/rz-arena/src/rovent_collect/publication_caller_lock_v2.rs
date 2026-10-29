@@ -26,6 +26,37 @@ pub struct RoventCorpusAssemblyLockV2 {
 }
 
 impl RoventCorpusAssemblyLockV2 {
+    /// Advance an Own row only while the original root's commit gate and
+    /// native handoff fence exclude concurrent observer callbacks. Busy
+    /// leaves the same row and writer in this assembly.
+    pub(crate) fn try_advance_fenced_own(
+        &mut self,
+        gate: &super::collection_hooks_core_v2::RoventCollectionCommitGateV2<
+            '_, rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2,
+        >,
+        handoff: &mut rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2,
+    ) -> Result<bool, ArenaError> {
+        check(self.finished.is_none() && self.chunk.is_none(), "lock-v2 assembly closed or chunk pending")?;
+        if let Some(row) = self.pending.as_mut() {
+            match self.owner.try_with_fenced_own_producer_mut(row, gate, handoff, |producer, row| producer.seal_retired(row))? {
+                None => return Ok(false),
+                Some(result) => result?,
+            }
+            let row = self.pending.take().expect("fenced row retained");
+            self.sealed = Some(PublishedRoventLockV2Record {
+                record: row.record,
+                manifest_sha256: row.manifest_sha256,
+                admission: row.admission,
+            });
+        }
+        if let Some(row) = self.sealed.as_ref() {
+            let next = self.records.checked_add(1).ok_or_else(|| invalid("lock-v2 record count overflow"))?;
+            self.writer.as_mut().ok_or_else(|| invalid("lock-v2 writer missing"))?.append(row)?;
+            self.sealed = None;
+            self.records = next;
+        }
+        Ok(true)
+    }
     /// The writer is bound to the original admitted lock, not to reconstructed
     /// receipt bytes. The directory must already be owned by the caller.
     pub fn new(

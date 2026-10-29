@@ -7,7 +7,7 @@ use super::teacher::v2_session::{
     TeacherSessionRetirementSealV2, TeacherSessionStartErrorV2,
 };
 use super::teacher::lock_v2_row_pump::{PumpItemV2, RetiredRowPumpV2};
-use super::{ArenaError, RoventCollectionOwnerLockV2, check};
+use super::{ArenaError, RoventCollectionOwnerLockV2, check, invalid};
 use rz_search::external_cpu::ExternalGoConstraint;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::pals_adaptive::{
@@ -197,6 +197,8 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             pump_config: None,
             pump: None,
             pump_ready: VecDeque::with_capacity(16),
+            pump_sender: None,
+            pump_sender_failed: false,
             pump_rejected: None,
             pump_failed: false,
             admission_receiver,
@@ -467,6 +469,8 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     pump_config: Option<(ExternalGoConstraint, Duration)>,
     pump: Option<RetiredRowPumpV2>,
     pump_ready: VecDeque<PumpItemV2>,
+    pump_sender: Option<mpsc::SyncSender<PumpItemV2>>,
+    pump_sender_failed: bool,
     pump_rejected: Option<Box<(ArenaError, super::RoventRetiredLockV2Record)>>,
     pump_failed: bool,
     admission_receiver: mpsc::Receiver<Arc<AdmissionSlot>>,
@@ -543,6 +547,9 @@ pub(crate) enum HandoffObservationErrorV2 {
     Poisoned,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PumpSendOutcomeV2 { Empty, Sent, Full }
+
 impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     /// Install before the worker starts; P-C keeps its existing channel path.
     pub(crate) fn configure_handoff_recovery(&mut self, recovery: HandoffRecovery<H>, identity: HandoffIdentity<H>) {
@@ -575,6 +582,42 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
 
     pub(crate) fn first_pump_item_mut(&mut self) -> Option<&mut PumpItemV2> {
         self.pump_ready.front_mut()
+    }
+
+    /// Install the original bounded consumer before the worker starts.
+    /// The receiver must retain every item until publication or recovery.
+    pub(crate) fn configure_pump_sender(&mut self, sender: mpsc::SyncSender<PumpItemV2>) -> Result<(), ArenaError> {
+        check(self.slot.is_none() && self.pump_sender.is_none(), "pump sender must be registered before root admission")?;
+        self.pump_sender = Some(sender);
+        Ok(())
+    }
+
+    /// Transfer one exact row to a bounded publisher channel. A full or
+    /// disconnected channel restores the original item at the front before
+    /// returning. This does not itself establish publication or quiescence.
+    pub(crate) fn try_send_first_pump_item(
+        &mut self,
+        sender: &mpsc::SyncSender<PumpItemV2>,
+    ) -> Result<PumpSendOutcomeV2, ArenaError> {
+        let Some(item) = self.pump_ready.front() else { return Ok(PumpSendOutcomeV2::Empty); };
+        let row = match item {
+            PumpItemV2::Unlabeled { row } | PumpItemV2::Prepared { row, .. }
+            | PumpItemV2::Committed { row, .. } | PumpItemV2::Failed { row, .. } => row,
+        };
+        let admission = self.slot.as_ref().ok_or_else(|| invalid("P/C or Own pump root admission absent"))?;
+        check(row.admission.same_original_admission(&admission.admission), "pump row belongs to a different original root")?;
+        let item = self.pump_ready.pop_front().expect("checked original pump item");
+        match sender.try_send(item) {
+            Ok(()) => Ok(PumpSendOutcomeV2::Sent),
+            Err(mpsc::TrySendError::Full(item)) => {
+                self.pump_ready.push_front(item);
+                Ok(PumpSendOutcomeV2::Full)
+            }
+            Err(mpsc::TrySendError::Disconnected(item)) => {
+                self.pump_ready.push_front(item);
+                Err(invalid("original pump publisher channel disconnected"))
+            }
+        }
     }
 
     pub(crate) fn pump_ready_counts(&self) -> (usize, usize, usize, usize) {
@@ -628,6 +671,16 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         let session = self.session.as_mut().expect("same original teacher session");
         if let Err(error) = pump.poll(session) {
             self.pump_failed = true;
+            self.record_failure(WorkerFailure::RowPump(error));
+        }
+    }
+
+    fn poll_pump_sender(&mut self) {
+        if self.pump_sender_failed { return; }
+        let Some(sender) = self.pump_sender.clone() else { return; };
+        if let Err(error) = self.try_send_first_pump_item(&sender) {
+            // The original item was restored before reporting the failure.
+            self.pump_sender_failed = true;
             self.record_failure(WorkerFailure::RowPump(error));
         }
     }
@@ -775,6 +828,7 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             }
         }
         self.poll_row_pump();
+        self.poll_pump_sender();
         if self.session.is_some()
             && self.next_actor < self.roster.len()
             && self.failure.is_none()

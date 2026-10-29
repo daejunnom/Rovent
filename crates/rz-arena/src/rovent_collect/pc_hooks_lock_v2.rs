@@ -6,11 +6,12 @@ use super::collection_hooks_core_v2::{
 use super::teacher::v2_session::{RoventTeacherRosterEntryV2, TeacherSessionRetirementSealV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2};
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
-use rz_uci::pals_adaptive::{AdaptiveManagerError, RoventCollectionRootAdmissionV2};
+use rz_uci::pals_adaptive::{AdaptiveCollectionError, AdaptiveCollectionStage, AdaptiveManagerError, RoventCollectionRootAdmissionV2};
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_bootstrap::pc_session::{
     RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionPortV2,
     RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2, RoventPcCustodyReturnV2,
+    RoventPcCollectionAdmissionOutcomeV2,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -21,6 +22,13 @@ pub(crate) type RoventPcCollectionWorkerV2 = CollectionWorkerCoreV2<RoventPcColl
 pub(crate) struct RoventPcCollectionBridgeV2 {
     core: Arc<CollectionBridgeCoreV2<RoventPcCollectionHandoffV2>>,
     worker: Mutex<Option<PcWorkerCustodianV2>>,
+    deferred: Mutex<PcDeferredRootsV2>,
+}
+
+struct PcDeferredRootsV2 {
+    originals: Vec<(RoventCollectionRootAdmissionV2, AdaptiveCollectionError)>,
+    overflow: u64,
+    first_overflow: Option<(RoventCollectionRootAdmissionV2, AdaptiveCollectionError)>,
 }
 
 struct PcWorkerCustodianV2 {
@@ -108,7 +116,66 @@ impl RoventPcCollectionBridgeV2 {
     ) -> Result<(Arc<Self>, RoventPcCollectionWorkerV2), ArenaError> {
         let (core, worker) =
             CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
-        Ok((Arc::new(Self { core, worker: Mutex::new(None) }), worker))
+        Ok((Arc::new(Self { core, worker: Mutex::new(None), deferred: Mutex::new(PcDeferredRootsV2 {
+            originals: Vec::with_capacity(256), overflow: 0, first_overflow: None,
+        }) }), worker))
+    }
+
+    fn defer_before_start(
+        &self, port: &mut RoventPcCollectionAdmissionPortV2<'_>,
+        admission: RoventCollectionRootAdmissionV2, reason: AdaptiveCollectionError,
+    ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
+        let mut deferred = match self.deferred.try_lock() {
+            Ok(deferred) => deferred,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::Invalid("P/C deferred root custody poisoned"), admission, owners: Box::new(()),
+            }),
+        };
+        let capability = match port.no_capture_capability(&admission) {
+            Ok(capability) => capability,
+            Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }),
+            Err(error) => return Err(RoventPcCollectionAdmissionFailureV2 { error, admission, owners: Box::new(()) }),
+        };
+        // Prepare evidence before installing the native marker. Keep bounded
+        // original root/causes; overflow remains explicitly summarized.
+        let evidence = (admission.clone(), reason.clone());
+        match self.core.try_install_no_capture(&capability) {
+            Ok(true) => {
+                if deferred.originals.len() < 256 { deferred.originals.push(evidence); }
+                else { deferred.overflow = deferred.overflow.saturating_add(1); if deferred.first_overflow.is_none() { deferred.first_overflow = Some(evidence); } }
+                Ok(RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { capability, reason })
+            }
+            Ok(false) => Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }),
+            Err(error) => Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Dispatch, "RoventNoCaptureMarker", error.to_string())),
+                admission, owners: Box::new(error),
+            }),
+        }
+    }
+
+    /// Copy bounded reporting metadata, retaining the original admissions and
+    /// reasons in the bridge. Busy is unknown and never means zero omissions.
+    pub(crate) fn try_deferred_observation(&self) -> Result<Option<serde_json::Value>, ArenaError> {
+        let deferred = match self.deferred.try_lock() {
+            Ok(deferred) => deferred,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("P/C deferred root custody poisoned")),
+        };
+        let summarize = |(admission, reason): &(RoventCollectionRootAdmissionV2, AdaptiveCollectionError)|
+            serde_json::json!({"root_admission_sha256": admission.raw_sha256(), "stage": format!("{:?}", reason.stage),
+                "code":reason.code, "detail":reason.detail});
+        Ok(Some(serde_json::json!({"retained": deferred.originals.iter().map(summarize).collect::<Vec<_>>(),
+            "overflow_count": deferred.overflow, "first_overflow": deferred.first_overflow.as_ref().map(summarize)})))
+    }
+
+    pub(crate) fn try_has_deferred(&self) -> Result<Option<bool>, ArenaError> {
+        match self.deferred.try_lock() {
+            Ok(deferred) => Ok(Some(!deferred.originals.is_empty() || deferred.overflow != 0)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(super::invalid("P/C deferred root custody poisoned")),
+        }
     }
 
     pub(crate) fn start_worker(&self, worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>, stop: Arc<std::sync::atomic::AtomicBool>, deadline: std::time::Instant) -> Result<(), PcWorkerStartErrorV2> {
@@ -186,7 +253,13 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
         &self,
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
-    ) -> Result<(), RoventPcCollectionAdmissionFailureV2> {
+    ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
+        if self.core.closed_before_next_admission(&admission) {
+            return self.defer_before_start(port, admission, AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Dispatch, "PcCollectionCapacity",
+                "The previous root's bounded collection worker remains owned; this root is not captured",
+            ));
+        }
         self.core
             .admit(admission, |admission, owner| {
                 port.install(admission, owner.observer())
@@ -196,6 +269,7 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                         owners: Box::new(original),
                     })
             })
+            .map(|()| RoventPcCollectionAdmissionOutcomeV2::Installed)
             .map_err(|failure| RoventPcCollectionAdmissionFailureV2 {
                 error: failure.error,
                 admission: failure.admission,

@@ -12,7 +12,7 @@ use crate::pals_native::ticketed::{
     VirtualReviewPreparedTicket,
 };
 use crate::rovent_bootstrap::pc_session::{
-    RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionPortV2,
+    RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionPortV2,
     RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2,
 };
 use rz_contracts::pals::{RepresentationKey, Role, RoleOutput, SearchAuthority};
@@ -76,7 +76,7 @@ impl RoventPcCollectionHooksV2 for Hooks {
         &self,
         _: &mut RoventPcCollectionAdmissionPortV2<'_>,
         _: RoventCollectionRootAdmissionV2,
-    ) -> Result<(), RoventPcCollectionAdmissionFailureV2> {
+    ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         unreachable!("invalid CLI cannot admit a root")
     }
