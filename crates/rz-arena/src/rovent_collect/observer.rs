@@ -147,6 +147,9 @@ struct CollectionState {
     slots: BTreeMap<RequestId, u64>,
     retired: VecDeque<CollectionRetiredFamily>,
     failure: Option<AdaptiveCollectionError>,
+    // Captures withheld after a collection error remain owned until this
+    // observer is explicitly disposed; they never become publication proof.
+    failed_captures: Vec<super::native_capture::RoventFailedCapturedInput>,
 }
 
 /// caller는 root 사이에도 이 원 owner를 보존한다. 공개 record를 읽어 이
@@ -188,6 +191,7 @@ impl RoventCollectionOwnerV2 {
                 slots: BTreeMap::new(),
                 retired: VecDeque::new(),
                 failure: None,
+                failed_captures: Vec::new(),
             })),
         };
         Ok((Self { original }, observer))
@@ -283,6 +287,7 @@ impl RoventCollectionOwner {
                     slots: BTreeMap::new(),
                     retired: VecDeque::new(),
                     failure: None,
+                    failed_captures: Vec::new(),
                 })),
             },
             observer,
@@ -562,7 +567,17 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
     }
     fn settled(&mut self, tickets: &[RoleTicketEnvelope]) -> Result<(), AdaptiveCollectionError> {
         self.apply(AdaptiveCollectionStage::Settled, |state| {
-            state.drain_captures()?;
+            // This callback is made only after the original native owner fence.
+            // Failed/queued inputs are retained, never admitted or published.
+            let capture_failure = state.receiver.capture_failure()?;
+            if capture_failure.is_some() {
+                if let Some(input) = state.receiver.take_failed_input_for_cleanup()? {
+                    state.failed_captures.push(input);
+                }
+                state.failed_captures.extend(state.receiver.take_queued_inputs_for_cleanup());
+            } else {
+                state.drain_captures()?;
+            }
             for ticket in tickets {
                 state.current(ticket)?;
                 state.cancel_collector_copy(ticket)?;
@@ -575,6 +590,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
             state.actual_position = None;
             state.actual_history.clear();
             // 원 완료·퇴역 row와 최초 오류는 caller가 회수할 때까지 보존한다.
+            if let Some(failure) = capture_failure {
+                return Err(invalid(format!("native input capture failed before fenced cleanup: {failure:?}")));
+            }
             Ok(())
         })
     }

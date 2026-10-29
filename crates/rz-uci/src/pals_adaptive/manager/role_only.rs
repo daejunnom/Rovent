@@ -4,7 +4,9 @@
 use super::collection::{AdaptiveCollectionObserver, RoventCollectionRootAdmission};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use super::collection::{
-    AdaptiveCollectionObserverBoxV2, RoleOnlySearchConsumptionV2, RoventCollectionRootAdmissionV2,
+    AdaptiveCollectionObserverBoxV2, RoleOnlySearchConsumptionV2,
+    RoventCollectionAcceptedWitnessV2, RoventCollectionConsumedWitnessV2,
+    RoventCollectionRootAdmissionV2,
 };
 use super::*;
 use rz_search::cpu_value::nnuec::v2::Model as SharedNnuecModel;
@@ -346,6 +348,8 @@ where
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_admission_v2: Option<RoventCollectionRootAdmissionV2>,
     collection_settled: bool,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_settlement: Option<Result<(), AdaptiveCollectionError>>,
 }
 
 impl<Q, B, D> RoleOnlyExecutionManager<Q, B, D>
@@ -452,6 +456,8 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_admission_v2: None,
             collection_settled: false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_settlement: None,
         })
     }
     pub fn driver(&self) -> &D {
@@ -977,6 +983,7 @@ where
         Option<(
             RoventCollectionRootAdmissionV2,
             AdaptiveCollectionObserverBoxV2<Q, B::Output>,
+            Result<(), AdaptiveCollectionError>,
         )>,
         AdaptiveManagerError,
     > {
@@ -991,6 +998,7 @@ where
         let receipt = self.shutdown_receipt()?;
         if self.phase != ManagerPhase::Finished
             || !self.collection_settled
+            || self.collection_v2_settlement.is_none()
             || !receipt.permits_semantic_closure()
         {
             return Err(AdaptiveManagerError::PhysicalUnknown);
@@ -1000,6 +1008,7 @@ where
                 .take()
                 .expect("checked admission"),
             self.collection_v2.take().expect("checked observer"),
+            self.collection_v2_settlement.take().expect("checked settlement"),
         )))
     }
 
@@ -1206,13 +1215,16 @@ where
                 }
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 if let Some(observer) = &mut self.collection_v2 {
-                    self.collection_admission_v2
-                        .as_ref()
+                    let verifier = self.native.native_acceptance_verifier();
+                    let (admission, verifier) = self.collection_admission_v2.as_ref()
+                        .zip(verifier.as_ref())
                         .ok_or(AdaptiveManagerError::Invalid(
-                            "P/C V2 collection admission absent",
-                        ))?
-                        .validate_ticket(&ticket)?;
-                    observer.dispatch(&ticket, &binding.input)?;
+                            "P/C V2 collection admission or verifier absent",
+                        ))?;
+                    let witness = super::collection::RoventCollectionDispatchWitnessV2::new(
+                        admission, verifier, &ticket,
+                    )?;
+                    observer.dispatch(witness, &binding.input)?;
                 }
                 self.bindings[index].collection_dispatched = true;
             }
@@ -1389,12 +1401,26 @@ where
                             let accepted = self.bindings[index].accepted.as_ref().ok_or(
                                 AdaptiveManagerError::Invalid("P/C V2 consumed proof absent"),
                             )?;
+                            let output = self.bindings[index].delivered.as_ref().ok_or(
+                                AdaptiveManagerError::Invalid("P/C V2 consumed output absent"),
+                            )?;
+                            let admission = self.collection_admission_v2.as_ref().ok_or(
+                                AdaptiveManagerError::Invalid("P/C V2 collection admission absent"),
+                            )?;
+                            let verifier = self.native.native_acceptance_verifier().ok_or(
+                                AdaptiveManagerError::Invalid("P/C V2 native verifier absent"),
+                            )?;
+                            let witness = RoventCollectionAcceptedWitnessV2::new(
+                                admission, &verifier, accepted, output.proposer_ranking_output(),
+                            )?;
                             let observation = if returned.is_ok() {
                                 RoleOnlySearchConsumptionV2::DriverReturnedSuccess
                             } else {
                                 RoleOnlySearchConsumptionV2::DriverReadbackAfterError
                             };
-                            if let Err(error) = observer.consumed(accepted, observation) {
+                            if let Err(error) = observer.consumed(
+                                RoventCollectionConsumedWitnessV2::new(witness), observation,
+                            ) {
                                 // Consumption already happened. Keep both that
                                 // fact and the observer error without replay.
                                 self.record_failure(AdaptiveManagerError::Collection(error));
@@ -1469,6 +1495,11 @@ where
         if binding.consumption_recorded {
             return Ok(());
         }
+        // The driver has already confirmed semantic consumption. Preserve that
+        // fact before fallible accounting: a counter error must not make the
+        // shutdown path discard or count this result as unused.
+        self.bindings[index].consumption_recorded = true;
+        let binding = &self.bindings[index];
         let ticket = binding
             .ticket
             .ok_or(AdaptiveManagerError::Invalid("P/C consumed ticket missing"))?;
@@ -1506,7 +1537,6 @@ where
         }
         self.counters = counters;
         self.accounting = accounting;
-        self.bindings[index].consumption_recorded = true;
         Ok(())
     }
     fn event(&mut self, event: TicketNativeEvent<B::Output>) -> Result<(), AdaptiveManagerError> {
@@ -1772,16 +1802,38 @@ where
                     let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
                         "P/C actual acceptance receipt absent",
                     ))?;
-                    self.accounting
-                        .observe_owner_acceptance(ticket.role, self.bindings[index].physical)?;
-                    match self.bindings[index]
-                        .physical
-                        .filter(|e| e.measurement_complete)
-                        .and_then(|e| e.completed_nn_inputs)
-                    {
-                        Some(count) => self.counters.accepted_nn_inputs += count,
-                        None => self.counters.accepted_nn_input_count_unknown += 1,
-                    }
+                    let mut accounting = self.accounting;
+                    let accounting_result = (|| {
+                        accounting.observe_owner_acceptance(ticket.role, self.bindings[index].physical)?;
+                        let count = self.bindings[index]
+                            .physical
+                            .filter(|e| e.measurement_complete)
+                            .and_then(|e| e.completed_nn_inputs);
+                        let (inputs, unknown) = match count {
+                            Some(count) => (
+                                self.counters.accepted_nn_inputs.checked_add(count),
+                                Some(self.counters.accepted_nn_input_count_unknown),
+                            ),
+                            None => (
+                                Some(self.counters.accepted_nn_inputs),
+                                self.counters.accepted_nn_input_count_unknown.checked_add(1),
+                            ),
+                        };
+                        Ok::<_, AdaptiveManagerError>((
+                            inputs.ok_or(AdaptiveManagerError::Capacity("P/C native accepted NN count"))?,
+                            unknown.ok_or(AdaptiveManagerError::Capacity("P/C native accepted unknown count"))?,
+                        ))
+                    })();
+                    let (inputs, unknown) = match accounting_result {
+                        Ok(counts) => counts,
+                        Err(error) => {
+                            self.retained_receipts.push(receipt);
+                            return Err(error);
+                        }
+                    };
+                    self.accounting = accounting;
+                    self.counters.accepted_nn_inputs = inputs;
+                    self.counters.accepted_nn_input_count_unknown = unknown;
                     if self.phase == ManagerPhase::Running && self.now().is_ok() {
                         match self.registry.accept_reciprocal_native(
                             receipt,
@@ -1824,18 +1876,18 @@ where
                                         ),
                                     )?;
                                     let role_output = output.proposer_ranking_output();
-                                    self.collection_admission_v2
+                                    let admission = self.collection_admission_v2
                                         .as_ref()
                                         .ok_or(AdaptiveManagerError::Invalid(
                                             "P/C V2 collection admission absent",
-                                        ))?
-                                        .validate_output(accepted.ticket(), role_output)?;
-                                    if !accepted.validates_output(role_output) {
-                                        return Err(AdaptiveManagerError::Invalid(
-                                            "P/C V2 accepted output differs",
-                                        ));
-                                    }
-                                    observer.accepted(accepted, &binding.input, output.as_ref())?;
+                                        ))?;
+                                    let verifier = self.native.native_acceptance_verifier().ok_or(
+                                        AdaptiveManagerError::Invalid("P/C V2 native verifier absent"),
+                                    )?;
+                                    let witness = RoventCollectionAcceptedWitnessV2::new(
+                                        admission, &verifier, accepted, role_output,
+                                    )?;
+                                    observer.accepted(witness, &binding.input, output.as_ref())?;
                                 }
                             }
                             Err(rejected) => {
@@ -1989,10 +2041,21 @@ where
                 .as_mut()
                 .and_then(|observer| observer.native_event(&event).err());
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            let collection_failure_v2 = self
-                .collection_v2
-                .as_mut()
-                .and_then(|observer| observer.native_event(&event).err());
+            let collection_failure_v2 = self.collection_v2.as_mut().and_then(|observer| {
+                let verifier = self.native.native_acceptance_verifier();
+                self.collection_admission_v2.as_ref().zip(verifier.as_ref())
+                    .ok_or_else(|| AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::NativeEvent,
+                        "NativeOwnerUnavailable",
+                        "original admission or native verifier unavailable",
+                    ))
+                    .and_then(|(admission, verifier)| {
+                        super::collection::RoventCollectionNativeEventWitnessV2::new(
+                            admission, verifier, &event,
+                        )
+                    })
+                    .and_then(|witness| observer.native_event(witness)).err()
+            });
             if let Err(error) = self.event(event) {
                 self.record_failure(error);
             }
@@ -2071,24 +2134,21 @@ where
                 && self.phase != ManagerPhase::Quarantined
             {
                 if !self.collection_settled {
+                    let remaining: Vec<_> = self.bindings.iter()
+                        .filter_map(|binding| binding.ticket).collect();
                     if let Some(observer) = &mut self.collection {
-                        let remaining: Vec<_> = self
-                            .bindings
-                            .iter()
-                            .filter_map(|binding| binding.ticket)
-                            .collect();
-                        observer
-                            .settled(&remaining)
-                            .map_err(AdaptiveManagerError::Collection)?;
+                        let result = observer.settled(&remaining);
+                        if let Err(error) = result {
+                            self.record_failure(AdaptiveManagerError::Collection(error));
+                        }
                     }
                     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                     if let Some(observer) = &mut self.collection_v2 {
-                        let remaining: Vec<_> = self
-                            .bindings
-                            .iter()
-                            .filter_map(|binding| binding.ticket)
-                            .collect();
-                        observer.settled(&remaining)?;
+                        let result = observer.settled(&remaining);
+                        self.collection_v2_settlement = Some(result.clone());
+                        if let Err(error) = result {
+                            self.record_failure(AdaptiveManagerError::Collection(error));
+                        }
                     }
                     self.collection_settled = true;
                 }

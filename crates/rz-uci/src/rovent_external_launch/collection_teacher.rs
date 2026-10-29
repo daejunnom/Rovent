@@ -1044,8 +1044,8 @@ pub struct RoventTeacherRetirementObservationV2 {
     pub reliable_queued: usize,
     pub reliable_reserved: usize,
     pub diagnostics: RoventTeacherDiagnosticsDispositionV2,
-    /// This wrapper does not know whether prior dispatches all produced and
-    /// delivered terminals, even when the lower mailbox is currently empty.
+    /// This wrapper tracks actual terminal delivery for its own accepted
+    /// dispatches. It does not track label consumption or publication.
     pub terminal_accounting: RoventTeacherTerminalAccountingV2,
     /// Recovery of a poisoned registry was needed; do not infer its health.
     pub registry_poisoned: bool,

@@ -36,6 +36,7 @@ use crate::pals_adaptive::{
     AdaptiveManagerError, AdaptiveManagerRegistration, AdaptiveManagerSources,
     AdaptiveNnuecRetiredOwner, AdaptivePortDriver, AdaptiveRegisteredLedgerSources,
     AdaptiveSessionCollectionHooks, AdaptiveShutdownReceipt, ManagerPhase,
+    AdaptiveCollectionObserverBoxV2,
     RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin,
     RoventNativeCollectionOriginV2,
 };
@@ -103,12 +104,12 @@ pub type RoventNnuecCollectionHooks = AdaptiveSessionCollectionHooks<Backend>;
 /// /2 collection is an independent, live owner. The hook keeps its teacher
 /// and publication custody. `revoke` is nonblocking, idempotent and acts only
 /// on this owner's actual root and teacher. Callbacks prove no physical fence.
-/// This internal seam is not connected to product launch until the /2 corpus
-/// and teacher lifecycle consumers can retain and drain the same owners.
-pub(crate) trait RoventNnuecCollectionHooksV2: Send + Sync {
+/// This seam does not authorize collection until the /2 corpus and teacher
+/// lifecycle consumers can retain and drain the same owners.
+pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     fn admit(
         &self,
-        manager: &mut Manager,
+        port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
     ) -> Result<(), RoventNnuecCollectionAdmissionFailureV2>;
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
@@ -118,10 +119,37 @@ pub(crate) trait RoventNnuecCollectionHooksV2: Send + Sync {
 /// Failure custody returned by the /2 hook. This must contain the original
 /// admission and any observer/teacher owners acquired during the attempt;
 /// the session retains the whole value when admission fails.
-pub(crate) struct RoventNnuecCollectionAdmissionFailureV2 {
+pub struct RoventNnuecCollectionAdmissionFailureV2 {
     pub error: AdaptiveManagerError,
     pub admission: RoventCollectionRootAdmissionV2,
     pub owners: Box<dyn Any + Send>,
+}
+
+/// Narrow admission access to the actual session manager. This borrowed port
+/// cannot manufacture admission or worker authority, and cannot escape a root.
+pub struct RoventNnuecCollectionAdmissionPortV2<'a> {
+    manager: &'a mut Manager,
+}
+
+pub struct RoventNnuecCollectionObserverRejectionV2 {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
+}
+
+impl RoventNnuecCollectionAdmissionPortV2<'_> {
+    pub fn install(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV2,
+        observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
+    ) -> Result<(), RoventNnuecCollectionObserverRejectionV2> {
+        self.manager.install_collection_observer_v2(admission, observer)
+            .map_err(|failure| RoventNnuecCollectionObserverRejectionV2 {
+                error: failure.error,
+                admission: failure.admission,
+                observer: failure.observer,
+            })
+    }
 }
 type RootReturn =
     Result<(Box<Idle>, SearchSessionReport, NnuecRootReceipt), (State, SearchSessionFailure)>;
@@ -635,7 +663,7 @@ pub struct RoventNnuecSessionV2Rejection {
     pub prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
     pub loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
     pub process: Arc<super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2>,
-    pub(crate) collection_hooks: Option<Arc<dyn RoventNnuecCollectionHooksV2>>,
+    pub collection_hooks: Option<Arc<dyn RoventNnuecCollectionHooksV2>>,
 }
 #[derive(Clone, Debug)]
 pub struct RoventNnuecInitialReceiptV2 {
@@ -1034,7 +1062,7 @@ impl RoventNnuecSessionDriver {
     /// Internal /2 seam only. Product launch continues to use `new_v2` and
     /// rejects collection until its teacher and corpus owners are connected.
     #[allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
-    pub(crate) fn new_v2_with_collection_hooks(
+    pub fn new_v2_with_collection_hooks(
         prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
         loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
         process: Arc<super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2>,

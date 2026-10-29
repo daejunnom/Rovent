@@ -36,6 +36,50 @@ pub struct TicketPreparation<V, Q> {
     pub query: Q,
 }
 
+/// Borrowed context produced only on the native worker after it validates
+/// the original ticket against its held preparation. It conveys no acceptance
+/// or physical-completion authority and cannot be constructed or cloned by a
+/// backend caller. The exact question and prepared input remain borrowed.
+pub struct TicketOwnerDispatchContext<'a, V, Q, P> {
+    verifier: &'a NativeAcceptanceVerifier,
+    ticket: &'a RoleTicketEnvelope,
+    question: &'a TicketPreparation<V, Q>,
+    prepared: &'a P,
+}
+
+impl<'a, V, Q, P> TicketOwnerDispatchContext<'a, V, Q, P> {
+    pub fn ticket(&self) -> &'a RoleTicketEnvelope { self.ticket }
+    pub fn question(&self) -> &'a TicketPreparation<V, Q> { self.question }
+    pub fn prepared(&self) -> &'a P { self.prepared }
+    pub fn same_owner(&self, verifier: &NativeAcceptanceVerifier) -> bool {
+        self.verifier.same_owner(verifier)
+    }
+
+    /// Internal projection retains the same ticket and exact original view.
+    /// The projection owner must first validate that `prepared` is the
+    /// projection retained with this original service preparation.
+    pub(crate) fn project<Q2, P2>(
+        self,
+        question: &'a TicketPreparation<V, Q2>,
+        prepared: &'a P2,
+    ) -> Result<TicketOwnerDispatchContext<'a, V, Q2, P2>, RoleFailure> {
+        if question.question != self.question.question
+            || question.seal != self.question.seal
+            || question.role != self.question.role
+            || question.deadline != self.question.deadline
+            || !Arc::ptr_eq(&question.view, &self.question.view)
+        {
+            return Err(RoleFailure::InvalidOutput);
+        }
+        Ok(TicketOwnerDispatchContext {
+            verifier: self.verifier,
+            ticket: self.ticket,
+            question,
+            prepared,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparedTicketSeal {
     pub preparation: PreparationId,
@@ -146,6 +190,15 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
         prepared: &Self::Prepared,
         canceled: &AtomicBool,
     ) -> TicketPhysicalResult<Self::Output>;
+    /// The service uses this entrypoint for actual dispatch. Existing backends
+    /// retain their original execution behavior through this default method.
+    fn run_owned(
+        &mut self,
+        context: TicketOwnerDispatchContext<'_, V, Q, Self::Prepared>,
+        canceled: &AtomicBool,
+    ) -> TicketPhysicalResult<Self::Output> {
+        self.run(context.ticket, context.question, context.prepared, canceled)
+    }
     fn output_host_bytes(&self, output: &Self::Output) -> u64;
     /// Exact original P/V head digest for an owner acknowledgement. Other
     /// payloads/backends retain the historical acceptance path explicitly.
@@ -1095,7 +1148,7 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
     *shared
         .acceptance_verifier
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(acceptance_verifier);
+        .unwrap_or_else(|e| e.into_inner()) = Some(acceptance_verifier.clone());
     *shared.ready_clock.lock().unwrap_or_else(|e| e.into_inner()) = Some(clock.clone());
     *shared.ready_cpu.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(rz_runtime::adaptive::observe_current_cpu_thread(
@@ -1382,7 +1435,15 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                     service_started = Some(started_at);
                     let _ = events.send(TicketNativeEvent::OwnerRunStarted { ticket, started_at });
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        backend.run(&ticket, &value.question, &value.prepared, &value.canceled)
+                        backend.run_owned(
+                            TicketOwnerDispatchContext {
+                                verifier: &acceptance_verifier,
+                                ticket: &ticket,
+                                question: &value.question,
+                                prepared: &value.prepared,
+                            },
+                            &value.canceled,
+                        )
                     }))
                     .unwrap_or(TicketPhysicalResult {
                         physical: PhysicalRoleCompletion::Unknown,

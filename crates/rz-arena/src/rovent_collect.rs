@@ -1052,7 +1052,11 @@ pub use native_capture::*;
 #[cfg(feature = "pals-collection-onnx")]
 mod observer;
 #[cfg(feature = "pals-collection-onnx")]
+mod observer_lock_v2;
+#[cfg(feature = "pals-collection-onnx")]
 pub use observer::*;
+#[cfg(feature = "pals-collection-onnx")]
+pub use observer_lock_v2::*;
 mod rules_replay;
 pub use rules_replay::*;
 mod external_scope;
@@ -1080,16 +1084,23 @@ pub use publication_v2::{ROVENT_CORPUS_PUBLICATION_V2, RoventCorpusPublicationV2
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod publication_lock_v2;
 mod submitted_v3;
+mod submitted_lock_v2;
+pub use submitted_lock_v2::{PublishedRoventLockV2Record, RoventRetiredLockV2Record};
 pub use submitted_v3::{
     PublishedRoventRecordV2, RoventRetiredRecordV2, RoventSubmittedRecordMetadata,
     RoventSubmittedReviewEvidence, capture_rovent_submitted_input,
 };
 mod producer_v2;
 pub use producer_v2::{
-    RoventCapturedInputV2, RoventCorpusProducerV2, RoventInputCaptureReservationV2,
+    RoventCapturedInputV2, RoventCorpusProducerLockV2, RoventCorpusProducerV2,
+    RoventInputCaptureReservationV2,
 };
 mod writer_v2;
 pub use writer_v2::{FinishedRoventCorpusV2, RoventCorpusWriterV2};
+#[cfg(target_os = "linux")]
+mod writer_lock_v2;
+#[cfg(target_os = "linux")]
+pub use writer_lock_v2::{FinishedRoventCorpusLockV2, RoventCorpusWriterLockV2};
 mod historical_v2;
 mod submitted_review_historical;
 pub use historical_v2::verify_historical_submitted_record_evidence;

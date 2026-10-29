@@ -10,6 +10,7 @@ use rz_experiments::rovent_submitted_input::{
 
 pub struct RoventInputCaptureReservationV2 {
     original: RoventInputCaptureReservation,
+    native_domain: &'static str,
 }
 pub struct RoventCapturedInputV2 {
     original: RoventCapturedInput,
@@ -42,7 +43,7 @@ impl RoventInputCaptureReservationV2 {
         let input_sha256 = captured.sha256()?;
         let replay =
             RoventSubmittedRulesReplay::capture(&self.original.context.actual_position, view)?;
-        let raw = json!({"schema":ROVENT_NATIVE_RAW_V3_DOMAIN,"kind":"submitted","sequence":self.original.context.capture_sequence,
+        let raw = json!({"schema":self.native_domain,"kind":"submitted","sequence":self.original.context.capture_sequence,
             "process_epoch":ticket.id.epoch.0,"game_generation":ticket.authority.game.0,"root_generation":ticket.authority.root.0,
             "request_sequence":ticket.id.sequence,"head":role_name(ticket.role),"source_sha256":self.original.source_sha256,
             "model_sha256":hex(ticket.representation.model),"encoding_sha256":hex(ticket.representation.encoding),
@@ -85,6 +86,303 @@ pub struct RoventCorpusProducerV2 {
     manifest: RoventCorpusManifestV2,
     original: RoventCorpusProducer,
     inputs: BTreeMap<(u64, u64), rz_experiments::rovent_submitted_input::RoventSubmittedInputV1>,
+}
+
+/// Preparation and native-event custody for the distinct input-lock /2
+/// corpus family. This is not a source of retirement or publication authority:
+/// an accepted manager-issued witness must still be joined to the original
+/// physical completion before an opaque row can be emitted.
+pub struct RoventCorpusProducerLockV2 {
+    manifest: rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
+    admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    original: RoventCorpusProducerV2,
+}
+
+impl RoventCorpusProducerLockV2 {
+    pub fn new(
+        manifest: rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
+        admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<Self, ArenaError> {
+        let lock = admission.native_origin().original_input_lock();
+        manifest.validate(lock)?;
+        rz_experiments::rovent_corpus_lock_v2::native::validate_lock_v2_root_metadata(
+            admission.raw_receipt(),
+            &json!(admission.raw_sha256()),
+            lock,
+        )?;
+        let manifest_sha256 = manifest.sha256(lock)?;
+        let mut original = RoventCorpusProducerV2::new(manifest.registration.clone())?;
+        original.original.manifest_sha256 = manifest_sha256;
+        original.original.native_domain =
+            rz_experiments::rovent_corpus_lock_v2::native::ROVENT_LOCK_V2_NATIVE_RAW_DOMAIN;
+        Ok(Self {
+            manifest,
+            admission,
+            original,
+        })
+    }
+
+    pub fn manifest(&self) -> &rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2 {
+        &self.manifest
+    }
+
+    pub fn incomplete_capture_count(&self) -> usize {
+        self.original.incomplete_capture_count()
+    }
+
+    pub(super) fn validate_admission(
+        &self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<(), ArenaError> {
+        check(self.admission.same_original_admission(admission),
+            "lock-v2 collection admission differs from original owner")
+    }
+
+    /// Reserve only for a ticket whose manager dispatch witness was checked by
+    /// the collection observer. The native callback owns the actual capture.
+    pub(super) fn reserve_input(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        context: GenerationCaptureContextV3,
+        lineage: RoventLineage,
+    ) -> Result<RoventInputCaptureReservationV2, ArenaError> {
+        self.admission
+            .validate_ticket(ticket)
+            .map_err(|error| invalid(error.to_string()))?;
+        self.original.reserve_input(context, lineage)
+    }
+
+    pub(super) fn admit_captured_input(
+        &mut self,
+        captured: RoventCapturedInputV2,
+    ) -> Result<(), ArenaError> {
+        // The private receiver only admits the registered native callback.
+        // Do not require a still-live root here: a late completion must remain
+        // drainable after logical cancellation, without regaining authority.
+        self.original.admit_captured_input(captured)
+    }
+
+    pub(super) fn discard_reserved_input(&mut self, sequence: u64) -> bool {
+        self.original.discard_reserved_input(sequence)
+    }
+
+    /// Only a manager-issued original-worker event can reach the physical
+    /// completion accounting. The witness does not itself establish completion.
+    pub fn observe_native_event<O: ProposerRankingOutput>(
+        &mut self,
+        witness: rz_uci::pals_adaptive::RoventCollectionNativeEventWitnessV2<'_, O>,
+    ) -> Result<(), ArenaError> {
+        check(
+            self.admission.same_original_admission(witness.admission()),
+            "lock-v2 native event belongs to another original admission",
+        )?;
+        self.original.observe_native_event(witness.event())
+    }
+
+    pub fn discard_unpublished(&mut self, id: RequestId) -> bool {
+        self.original.discard_unpublished(id)
+    }
+
+    /// Consumes the manager-issued witness for an actually accepted and
+    /// search-consumed result. The pending service completion is checked
+    /// separately; the witness itself is not a physical-completion claim.
+    pub fn retire_consumed(
+        &mut self,
+        witness: rz_uci::pals_adaptive::RoventCollectionConsumedWitnessV2<'_>,
+    ) -> Result<RoventRetiredLockV2Record, ArenaError> {
+        check(
+            self.admission.same_original_admission(witness.admission()),
+            "lock-v2 consumption belongs to another original admission",
+        )?;
+        let accepted = witness.accepted();
+        self.retire_original(*accepted.ticket(), accepted.output_digest(), "accepted_role_step")
+    }
+
+    /// The manager's original root-ranking publication is a separate proof;
+    /// it must match this owner and the actual native output and completion.
+    pub fn retire_root_ranking(
+        &mut self,
+        accepted: &rz_uci::pals_adaptive::RoventRootRankingAcceptanceV2,
+        output: &RoleOutput,
+    ) -> Result<RoventRetiredLockV2Record, ArenaError> {
+        check(
+            self.admission.same_original_admission(accepted.admission()),
+            "lock-v2 ranking belongs to another original admission",
+        )?;
+        let source = accepted.ranking().source();
+        accepted.admission().validate_output(&source.ticket, output)
+            .map_err(|error| invalid(error.to_string()))?;
+        check(
+            native_acceptance_output_digest(output).map_err(|error| invalid(error.to_string()))?
+                == source.output_digest,
+            "lock-v2 original ranking/output digest mismatch",
+        )?;
+        self.retire_original(source.ticket, source.output_digest, "root_ranking_published")
+    }
+
+    fn retire_original(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+        output_digest: Digest,
+        acceptance_kind: &str,
+    ) -> Result<RoventRetiredLockV2Record, ArenaError> {
+        let key = (ticket.id.epoch.0, ticket.id.sequence);
+        let producer = &mut self.original.original;
+        let pending = producer.pending.get(&key)
+            .ok_or_else(|| invalid("lock-v2 retirement has no original input"))?;
+        let completed = pending.completed.as_ref()
+            .ok_or_else(|| invalid("lock-v2 retirement before physical completion"))?;
+        let input = self.original.inputs.get(&key)
+            .ok_or_else(|| invalid("lock-v2 retained input is missing"))?;
+        check(
+            pending.ticket == ticket
+                && completed.output_digest == hex(output_digest)
+                && input.sha256()? == pending.input_sha256
+                && !producer.retired.contains(&key)
+                && producer.retired.len() < MAX_CORPUS_ROWS,
+            "lock-v2 accepted result differs from original physical completion",
+        )?;
+        let split = *producer.manifest.opening_splits.get(&input.opening_id)
+            .ok_or_else(|| invalid("lock-v2 opening split is not registered"))?;
+        let sequence = producer.sequence.checked_add(1)
+            .ok_or_else(|| invalid("Rovent collector sequence exhausted"))?;
+        let raw = json!({"schema":producer.native_domain,"kind":"retired","sequence":sequence,
+            "process_epoch":ticket.id.epoch.0,"game_generation":ticket.authority.game.0,"root_generation":ticket.authority.root.0,
+            "request_sequence":ticket.id.sequence,"head":role_name(ticket.role),"source_sha256":producer.manifest.source_sha256,
+            "input_sha256":pending.input_sha256,"submitted_sha256":completed.raw_submission_sha256,
+            "completed_sha256":completed.raw_completion_sha256,"output_digest":completed.output_digest,
+            "accepted_retired":true,"ticket":ticket_json(&ticket),"acceptance_kind":acceptance_kind,
+            "root_admission":self.admission.raw_receipt(),"root_admission_sha256":self.admission.raw_sha256()});
+        let raw_sha256 = generation_digest(producer.native_domain, &raw)?;
+        // No fallible operations remain before the original pending/input
+        // owners are transferred to the retired row.
+        producer.sequence = sequence;
+        let pending = producer.pending.remove(&key).expect("checked pending");
+        let input = self.original.inputs.remove(&key).expect("checked input");
+        let mut native = pending.completed.expect("checked physical completion");
+        native.raw_retirement = raw;
+        native.raw_retirement_sha256 = raw_sha256;
+        native.retired_sequence = sequence;
+        native.accepted_retired = true;
+        producer.retired.insert(key);
+        Ok(RoventRetiredLockV2Record {
+            manifest_sha256: producer.manifest_sha256.clone(),
+            ticket,
+            admission: self.admission.clone(),
+            record: rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2(
+                RoventTrainingRecordV2 {
+                    schema: rz_experiments::rovent_corpus_lock_v2::record::ROVENT_TRAINING_RECORD_LOCK_V2_DOMAIN.into(),
+                    role: pending.input.role,
+                    split,
+                    input,
+                    input_sha256: pending.input_sha256,
+                    origin_sha256: String::new(),
+                    record_sha256: String::new(),
+                    lineage: pending.lineage,
+                    native,
+                    head_sources: BTreeMap::new(),
+                    targets: RoventTargetsV2::default(),
+                    divergence_index: None,
+                    nnuec_input: None,
+                    nnuec_input_sha256: None,
+                    nnuec_model_sha256: None,
+                    nnuec_semantics: None,
+                    nnuec_wdl: None,
+                },
+            ),
+        })
+    }
+
+    /// Keep the original row with the caller on validation failure.
+    pub fn seal_retired(
+        &self,
+        row: &mut RoventRetiredLockV2Record,
+    ) -> Result<(), ArenaError> {
+        check(
+            row.manifest_sha256 == self.original.original.manifest_sha256
+                && row.admission.same_original_admission(&self.admission)
+                && row.record.0.native.raw_retirement["root_admission_sha256"]
+                    == self.admission.raw_sha256()
+                && row.record.0.native.raw_retirement["root_admission"]
+                    == *self.admission.raw_receipt(),
+            "lock-v2 retired record lost original owner",
+        )?;
+        let mut candidate = row.record.clone();
+        candidate.seal(&self.manifest, self.admission.native_origin().original_input_lock())?;
+        row.record = candidate;
+        Ok(())
+    }
+
+    /// Publication of the in-process row does not write files. On failure the
+    /// caller gets the original row and its admission back for recovery.
+    pub fn publish(
+        &self,
+        mut row: RoventRetiredLockV2Record,
+    ) -> Result<PublishedRoventLockV2Record, Box<(ArenaError, RoventRetiredLockV2Record)>> {
+        if let Err(error) = self.seal_retired(&mut row) {
+            return Err(Box::new((error, row)));
+        }
+        Ok(PublishedRoventLockV2Record {
+            record: row.record,
+            manifest_sha256: row.manifest_sha256,
+            admission: row.admission,
+        })
+    }
+
+    /// Attach only an actual completed Rules trajectory containing this
+    /// exact input anchor. No teacher score is converted into a WDL target.
+    pub fn attach_actual_wdl(
+        &mut self,
+        row: &mut RoventRetiredLockV2Record,
+        outcome: &RoventRulesOutcome,
+    ) -> Result<(), ArenaError> {
+        check(
+            row.manifest_sha256 == self.original.original.manifest_sha256
+                && row.admission.same_original_admission(&self.admission),
+            "lock-v2 WDL row belongs to another producer",
+        )?;
+        let record = &mut row.record.0;
+        let input = &record.input;
+        check(
+            record.targets.wdl.is_none()
+                && outcome.authority.game_id == input.game_id
+                && outcome.authority.anchors.contains(&input.rules_anchor),
+            "lock-v2 WDL is not an actual trajectory member",
+        )?;
+        let sequence = self.original.original.sequence.checked_add(1)
+            .ok_or_else(|| invalid("Rovent collector sequence exhausted"))?;
+        let raw = json!({"schema":HEAD_DOMAIN,"kind":"rules_wdl","input_sha256":record.input_sha256,
+            "anchor":input.rules_anchor,"trajectory":outcome.authority,"rules_receipt":outcome.receipt,"rules_replay":outcome.replay});
+        let raw_sha = generation_digest(HEAD_DOMAIN, &raw)?;
+        let target = GenerationWdlTargetV3 {
+            observed_sequence: sequence,
+            question_id: input.question_id.clone(),
+            view_sha256: input.view_sha256.clone(),
+            raw_evidence_sha256: raw_sha.clone(),
+            source: "rules_selfplay_trajectory".into(),
+            game_id: input.game_id.clone(),
+            anchor: input.rules_anchor.clone(),
+            trajectory_membership_sha256: outcome.authority.sha256()?,
+            rules_result_sha256: outcome.authority.result_evidence_sha256.clone(),
+            ending: outcome.authority.ending,
+            outcome: outcome.authority.outcome,
+        };
+        input.wdl_probabilities(&target)?;
+        let head = RoventHeadSource {
+            actor_id: record.lineage.actor_id.clone(),
+            source: target.source.clone(),
+            binary_sha256: None,
+            profile_sha256: None,
+            raw_receipt: raw,
+            raw_receipt_sha256: raw_sha,
+            observed_sequence: sequence,
+            anchor: input.rules_anchor.clone(),
+        };
+        self.original.original.sequence = sequence;
+        record.head_sources.insert("wdl".into(), head);
+        record.targets.wdl = Some(target);
+        Ok(())
+    }
 }
 impl RoventCorpusProducerV2 {
     /// 원 C row를 보존한 caller가 실제 후속 cycle witness를 나중에 붙인다.
@@ -170,6 +468,7 @@ impl RoventCorpusProducerV2 {
     ) -> Result<RoventInputCaptureReservationV2, ArenaError> {
         Ok(RoventInputCaptureReservationV2 {
             original: self.original.reserve_input(context, lineage)?,
+            native_domain: self.original.native_domain,
         })
     }
     pub fn admit_captured_input(

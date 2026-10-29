@@ -968,7 +968,8 @@ impl RoventNnuecSessionDriver {
                         // retains the original hook along with all root owners.
                         v2_hook_started = true;
                         let expected_cap = cap.clone();
-                        if let Err(rejected) = hooks.admit(manager, cap) {
+                        let mut port = RoventNnuecCollectionAdmissionPortV2 { manager: &mut *manager };
+                        if let Err(rejected) = hooks.admit(&mut port, cap) {
                             let error = if rejected.admission.same_original_admission(&expected_cap)
                             {
                                 rejected.error.clone()

@@ -1909,6 +1909,9 @@ struct RoleBinding<Q, O> {
     revoked_acceptance: Option<RoleFailure>,
     native_acceptance_recorded: bool,
     consumption_recorded: bool,
+    // A failed owner readback cannot establish whether search consumed the
+    // accepted result. Retain its binding rather than retry or count it unused.
+    consumption_unknown: bool,
     purpose: RolePurpose,
     reciprocal_acceptance: Option<rz_search::pals::coordinator::AcceptedRoleStep>,
     goal_local: Option<GoalLocalInput<Q>>,
@@ -3679,6 +3682,7 @@ where
             revoked_acceptance: None,
             native_acceptance_recorded: false,
             consumption_recorded: false,
+            consumption_unknown: false,
             purpose,
             reciprocal_acceptance: None,
             goal_local: None,
@@ -4061,7 +4065,17 @@ where
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if let Some(observer) = &mut self.collection_observer_v2 {
-            if let Err(error) = observer.native_event(&event) {
+            let verifier = self.native.native_acceptance_verifier();
+            let result = self.collection_admission_v2.as_ref().zip(
+                verifier.as_ref(),
+            ).ok_or_else(|| AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::NativeEvent,
+                "NativeOwnerUnavailable",
+                "original admission or native verifier unavailable",
+            )).and_then(|(admission, verifier)| {
+                collection::RoventCollectionNativeEventWitnessV2::new(admission, verifier, &event)
+            }).and_then(|witness| observer.native_event(witness));
+            if let Err(error) = result {
                 collection_failures.push(error);
             }
         }
@@ -4526,21 +4540,41 @@ where
                     }
                     if accepted && !self.roles[index].native_acceptance_recorded {
                         let mut native_accounting = self.native_accounting;
-                        native_accounting
-                            .observe_owner_acceptance(ticket.role, self.roles[index].physical)?;
-                        match self.roles[index]
-                            .physical
-                            .filter(|physical| physical.measurement_complete)
-                            .and_then(|physical| physical.completed_nn_inputs)
-                        {
-                            Some(count) => {
-                                self.counters.accepted_nn_inputs =
-                                    self.counters.accepted_nn_inputs.checked_add(count).ok_or(
-                                        AdaptiveManagerError::Capacity("native accepted NN count"),
-                                    )?;
+                        let accounting_result = (|| {
+                            native_accounting.observe_owner_acceptance(
+                                ticket.role,
+                                self.roles[index].physical,
+                            )?;
+                            let count = self.roles[index]
+                                .physical
+                                .filter(|physical| physical.measurement_complete)
+                                .and_then(|physical| physical.completed_nn_inputs);
+                            let (inputs, unknown) = match count {
+                                Some(count) => (
+                                    self.counters.accepted_nn_inputs.checked_add(count),
+                                    Some(self.counters.accepted_nn_input_count_unknown),
+                                ),
+                                None => (
+                                    Some(self.counters.accepted_nn_inputs),
+                                    self.counters.accepted_nn_input_count_unknown.checked_add(1),
+                                ),
+                            };
+                            Ok::<_, AdaptiveManagerError>((
+                                inputs.ok_or(AdaptiveManagerError::Capacity("native accepted NN count"))?,
+                                unknown.ok_or(AdaptiveManagerError::Capacity("native accepted unknown count"))?,
+                            ))
+                        })();
+                        let (inputs, unknown) = match accounting_result {
+                            Ok(counts) => counts,
+                            Err(error) => {
+                                if let Some(receipt) = native_receipt {
+                                    self.retained_native_receipts.push(receipt);
+                                }
+                                return Err(error);
                             }
-                            None => self.counters.accepted_nn_input_count_unknown += 1,
-                        }
+                        };
+                        self.counters.accepted_nn_inputs = inputs;
+                        self.counters.accepted_nn_input_count_unknown = unknown;
                         self.roles[index].native_acceptance_recorded = true;
                         self.native_accounting = native_accounting;
                     }
@@ -4586,6 +4620,9 @@ where
                                         }
                                     }
                                     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                                    let collection_verifier =
+                                        self.native.native_acceptance_verifier();
+                                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                                     if let Some(observer) = &mut self.collection_observer_v2 {
                                         let binding = &self.roles[index];
                                         if let (Some(proof), Some(output), Some(admission)) = (
@@ -4594,26 +4631,21 @@ where
                                             &self.collection_admission_v2,
                                         ) {
                                             let raw = output.proposer_ranking_output();
-                                            let result = admission
-                                                .validate_output(proof.ticket(), raw)
-                                                .and_then(|()| {
-                                                    if proof.validates_output(raw) {
-                                                        Ok(())
-                                                    } else {
-                                                        Err(AdaptiveCollectionError::new(
-                                                            AdaptiveCollectionStage::Accepted,
-                                                            "AcceptedOutputMismatch",
-                                                            "V2 original accepted output differs",
-                                                        ))
-                                                    }
-                                                })
-                                                .and_then(|()| {
-                                                    observer.accepted(
-                                                        proof,
-                                                        &binding.input,
-                                                        output.as_ref(),
+                                            let result = collection_verifier
+                                                .as_ref()
+                                                .ok_or_else(|| AdaptiveCollectionError::new(
+                                                    AdaptiveCollectionStage::Accepted,
+                                                    "NativeVerifierUnavailable",
+                                                    "V2 original native verifier unavailable",
+                                                ))
+                                                .and_then(|verifier| {
+                                                    RoventCollectionAcceptedWitnessV2::new(
+                                                        admission, verifier, proof, raw,
                                                     )
-                                                });
+                                                })
+                                                .and_then(|witness| observer.accepted(
+                                                    witness, &binding.input, output.as_ref(),
+                                                ));
                                             if let Err(error) = result {
                                                 collection_failures.push(error);
                                             }
@@ -4796,6 +4828,11 @@ where
             .iter()
             .position(|binding| binding.ticket == Some(ticket))
             .ok_or(AdaptiveManagerError::Invalid("unknown semantic retirement"))?;
+        if self.roles[index].consumption_unknown {
+            return Err(AdaptiveManagerError::Invalid(
+                "semantic consumption remains unknown",
+            ));
+        }
         if accepted
             && self.roles[index].purpose == RolePurpose::RoventRefinement
             && self.phase == ManagerPhase::Running
@@ -5083,7 +5120,12 @@ where
                         }
                     }
                     Ok(_) => {}
-                    Err(readback) => self.record_failure(readback),
+                    Err(readback) => {
+                        if !self.roles[index].consumption_recorded {
+                            self.roles[index].consumption_unknown = true;
+                        }
+                        self.record_failure(readback);
+                    }
                 }
                 if self.roles[index].consumption_recorded {
                     if let Some(work) = &utility_work {
@@ -5120,23 +5162,42 @@ where
         index: usize,
         after_error_readback: bool,
     ) -> Result<(), AdaptiveManagerError> {
-        let binding = &self.roles[index];
-        if binding.consumption_recorded {
+        if self.roles[index].consumption_recorded {
             return Ok(());
         }
-        let ticket = binding.ticket.ok_or(AdaptiveManagerError::Invalid(
+        // Driver confirmed consumption before this method. Preserve that fact
+        // even if the separate accounting or observer path fails.
+        self.roles[index].consumption_recorded = true;
+        let ticket = self.roles[index].ticket.ok_or(AdaptiveManagerError::Invalid(
             "original consumed role ticket missing",
         ))?;
-        self.record_role_consumption(ticket, binding.physical)?;
-        self.roles[index].consumption_recorded = true;
+        let physical = self.roles[index].physical;
+        self.record_role_consumption(ticket, physical)?;
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if let (Some(observer), Some(accepted)) = (
-            self.collection_observer_v2.as_mut(),
+        if let (Some(accepted), Some(output)) = (
             self.roles[index].reciprocal_acceptance.as_ref(),
+            self.roles[index].delivered.as_ref(),
         ) {
-            if let Err(error) = observer.adaptive_consumed(accepted, after_error_readback) {
+            let verifier = self.native.native_acceptance_verifier();
+            let observed = collection::notify_adaptive_consumed_v2(
+                &mut self.collection_observer_v2,
+                self.collection_admission_v2.as_ref(),
+                verifier.as_ref(),
+                accepted,
+                output.proposer_ranking_output(),
+                after_error_readback,
+            );
+            if let Err(error) = observed {
                 self.record_failure(error.into());
             }
+        } else if self.collection_observer_v2.is_some()
+            && self.roles[index].reciprocal_acceptance.is_some()
+        {
+            self.record_failure(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Accepted,
+                "MissingOriginalOutput",
+                "V2 consumed proof has no retained output",
+            ).into());
         }
         #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
         let _ = after_error_readback;
@@ -5355,18 +5416,20 @@ where
                 };
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 let result = result.and_then(|()| match &mut self.collection_observer_v2 {
-                    Some(observer) => self
-                        .collection_admission_v2
-                        .as_ref()
-                        .ok_or_else(|| {
-                            AdaptiveCollectionError::new(
+                    Some(observer) => {
+                        let verifier = self.native.native_acceptance_verifier();
+                        let (admission, verifier) = self.collection_admission_v2.as_ref()
+                            .zip(verifier.as_ref())
+                            .ok_or_else(|| AdaptiveCollectionError::new(
                                 AdaptiveCollectionStage::Dispatch,
                                 "MissingV2Admission",
-                                "V2 observer lost its original admission",
-                            )
-                        })?
-                        .validate_ticket(&ticket)
-                        .and_then(|()| observer.dispatch(&ticket, &self.roles[index].input)),
+                                "V2 observer lost its original admission or native verifier",
+                            ))?;
+                        let witness = collection::RoventCollectionDispatchWitnessV2::new(
+                            admission, verifier, &ticket,
+                        )?;
+                        observer.dispatch(witness, &self.roles[index].input)
+                    },
                     None => Ok(()),
                 });
                 if let Err(error) = result {
@@ -8781,6 +8844,19 @@ where
                     .is_none_or(|binding| binding.pending_slice.is_none())
             })
         {
+            // A physical fence cannot resolve an ambiguous semantic commit.
+            // Keep the original bindings and driver custody intact; in
+            // particular do not discard a GoalLocal input or count its result
+            // as unused when owner readback failed.
+            if self.roles.iter().any(|binding| binding.consumption_unknown)
+                || self
+                    .accepted_roles
+                    .iter()
+                    .any(|held| held.binding.consumption_unknown)
+            {
+                self.phase = ManagerPhase::Quarantined;
+                return Ok(changed);
+            }
             self.release_nnuec_custody()?;
             self.driver.close_rovent_goal_admission()?;
             self.discard_goal_local_custody()?;

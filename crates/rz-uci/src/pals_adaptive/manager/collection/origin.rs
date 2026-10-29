@@ -494,15 +494,32 @@ impl RoventCollectionRootAdmissionV2 {
             .original_context()
             .accepts()
             .map_err(|error| reject(error.to_string()))?
-            || !self
-                .original
-                .original
-                ._original_verifier
-                .same_owner(verifier)
         {
-            return Err(reject(
-                "native verifier is not the original /2 worker verifier",
-            ));
+            return Err(reject("original /2 root no longer accepts"));
+        }
+        self.validate_native_identity(verifier)
+    }
+
+    /// Identity only: physical events may arrive after root revocation.
+    pub(super) fn validate_native_identity(
+        &self,
+        verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
+    ) -> Result<(), AdaptiveCollectionError> {
+        if !self.original.original._original_verifier.same_owner(verifier) {
+            return Err(reject("native verifier is not the original /2 worker verifier"));
+        }
+        Ok(())
+    }
+
+    /// Check the real service-issued dispatch against this root and its
+    /// original worker. This is not native completion or output acceptance.
+    pub fn validate_native_dispatch_owner<V, Q, P>(
+        &self,
+        context: &crate::pals_native::ticketed::TicketOwnerDispatchContext<'_, V, Q, P>,
+    ) -> Result<(), AdaptiveCollectionError> {
+        self.validate_ticket(context.ticket())?;
+        if !context.same_owner(&self.original.original._original_verifier) {
+            return Err(reject("dispatch does not belong to the original /2 worker"));
         }
         Ok(())
     }

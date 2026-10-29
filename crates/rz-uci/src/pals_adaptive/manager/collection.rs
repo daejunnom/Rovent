@@ -153,6 +153,111 @@ pub enum RoleOnlySearchConsumptionV2 {
     DriverReadbackAfterError,
 }
 
+/// Manager-observed original reservation, before native execution. This is
+/// not a physical execution or completion proof.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventCollectionDispatchWitnessV2<'a> {
+    admission: &'a RoventCollectionRootAdmissionV2,
+    ticket: &'a RoleTicketEnvelope,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl<'a> RoventCollectionDispatchWitnessV2<'a> {
+    pub(super) fn new(
+        admission: &'a RoventCollectionRootAdmissionV2,
+        verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
+        ticket: &'a RoleTicketEnvelope,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        admission.validate_native_owner(verifier)?;
+        admission.validate_ticket(ticket)?;
+        Ok(Self { admission, ticket })
+    }
+    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 { self.admission }
+    pub fn ticket(&self) -> &RoleTicketEnvelope { self.ticket }
+}
+
+/// A single callback's original native acceptance, tied to the same live /2
+/// root and worker. It is neither cloneable nor serializable and cannot be
+/// constructed by an observer or reconstructed from a stored receipt.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventCollectionAcceptedWitnessV2<'a> {
+    admission: &'a RoventCollectionRootAdmissionV2,
+    accepted: &'a AcceptedRoleStep,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl<'a> RoventCollectionAcceptedWitnessV2<'a> {
+    pub(super) fn new(
+        admission: &'a RoventCollectionRootAdmissionV2,
+        verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
+        accepted: &'a AcceptedRoleStep,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        admission.validate_native_owner(verifier)?;
+        admission.validate_output(accepted.ticket(), output)?;
+        if !accepted.validates_output(output) {
+            return Err(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Accepted,
+                "AcceptedOutputMismatch",
+                "original accepted output differs",
+            ));
+        }
+        Ok(Self { admission, accepted })
+    }
+
+    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 {
+        self.admission
+    }
+
+    pub fn accepted(&self) -> &AcceptedRoleStep {
+        self.accepted
+    }
+}
+
+/// A separate single callback witness made only after the manager has
+/// recorded actual search consumption. It does not imply teacher retirement.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventCollectionConsumedWitnessV2<'a> {
+    acceptance: RoventCollectionAcceptedWitnessV2<'a>,
+}
+
+/// An event polled from the original native worker. This establishes identity
+/// only; completion and search acceptance retain their separate contracts.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventCollectionNativeEventWitnessV2<'a, O> {
+    admission: &'a RoventCollectionRootAdmissionV2,
+    event: &'a TicketNativeEvent<O>,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl<'a, O> RoventCollectionNativeEventWitnessV2<'a, O> {
+    pub(super) fn new(
+        admission: &'a RoventCollectionRootAdmissionV2,
+        verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
+        event: &'a TicketNativeEvent<O>,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        admission.validate_native_identity(verifier)?;
+        Ok(Self { admission, event })
+    }
+    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 { self.admission }
+    pub fn event(&self) -> &TicketNativeEvent<O> { self.event }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl<'a> RoventCollectionConsumedWitnessV2<'a> {
+    pub(super) fn new(acceptance: RoventCollectionAcceptedWitnessV2<'a>) -> Self {
+        Self { acceptance }
+    }
+
+    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 {
+        self.acceptance.admission()
+    }
+
+    pub fn accepted(&self) -> &AcceptedRoleStep {
+        self.acceptance.accepted()
+    }
+}
+
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 /// Observer for an original V2 root. Accepted is native-owner acceptance,
 /// not a claim that the search has consumed the result. A teacher process and
@@ -165,14 +270,14 @@ pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
     ) -> Result<(), AdaptiveCollectionError>;
     fn dispatch(
         &mut self,
-        ticket: &RoleTicketEnvelope,
+        ticket: RoventCollectionDispatchWitnessV2<'_>,
         input: &FrameInput<ReviewView, Q>,
     ) -> Result<(), AdaptiveCollectionError>;
-    fn native_event(&mut self, event: &TicketNativeEvent<O>)
+    fn native_event(&mut self, event: RoventCollectionNativeEventWitnessV2<'_, O>)
     -> Result<(), AdaptiveCollectionError>;
     fn accepted(
         &mut self,
-        accepted: &AcceptedRoleStep,
+        accepted: RoventCollectionAcceptedWitnessV2<'_>,
         input: &FrameInput<ReviewView, Q>,
         output: &O,
     ) -> Result<(), AdaptiveCollectionError>;
@@ -180,7 +285,7 @@ pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
     /// separate observation from native acceptance and carries its readback path.
     fn consumed(
         &mut self,
-        accepted: &AcceptedRoleStep,
+        accepted: RoventCollectionConsumedWitnessV2<'_>,
         observation: RoleOnlySearchConsumptionV2,
     ) -> Result<(), AdaptiveCollectionError>;
     /// Adaptive root ranking has its own registry proof and has already been
@@ -201,7 +306,7 @@ pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
     /// separate native acceptance. It never creates acceptance authority.
     fn adaptive_consumed(
         &mut self,
-        _accepted: &AcceptedRoleStep,
+        _accepted: RoventCollectionConsumedWitnessV2<'_>,
         _after_error_readback: bool,
     ) -> Result<(), AdaptiveCollectionError> {
         Err(AdaptiveCollectionError::new(
@@ -216,3 +321,32 @@ pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub type AdaptiveCollectionObserverBoxV2<Q, O> = Box<dyn AdaptiveCollectionObserverV2<Q, O>>;
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub(super) fn notify_adaptive_consumed_v2<Q, O>(
+    observer: &mut Option<AdaptiveCollectionObserverBoxV2<Q, O>>,
+    admission: Option<&RoventCollectionRootAdmissionV2>,
+    verifier: Option<&rz_search::pals::coordinator::NativeAcceptanceVerifier>,
+    accepted: &AcceptedRoleStep,
+    output: &rz_contracts::pals::RoleOutput,
+    after_error_readback: bool,
+) -> Result<(), AdaptiveCollectionError> {
+    let Some(observer) = observer.as_mut() else {
+        return Ok(());
+    };
+    let missing = || AdaptiveCollectionError::new(
+        AdaptiveCollectionStage::Accepted,
+        "OriginalOwnerUnavailable",
+        "V2 consumption has no original admission or native verifier",
+    );
+    let witness = RoventCollectionAcceptedWitnessV2::new(
+        admission.ok_or_else(missing)?,
+        verifier.ok_or_else(missing)?,
+        accepted,
+        output,
+    )?;
+    observer.adaptive_consumed(
+        RoventCollectionConsumedWitnessV2::new(witness),
+        after_error_readback,
+    )
+}

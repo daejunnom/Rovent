@@ -285,6 +285,7 @@ struct DriverFixture {
     semantic_owner_busy: bool,
     fail_role_once: bool,
     fail_after_role_consumption_once: bool,
+    fail_role_consumption_readback: bool,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     fail_publish_closed_once: bool,
     raw_cpu_receipts: Vec<ExecutionId>,
@@ -838,6 +839,11 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         ticket: &RoleTicketEnvelope,
         view: &ReviewView,
     ) -> Result<bool, AdaptiveManagerError> {
+        if self.fail_role_consumption_readback {
+            return Err(AdaptiveManagerError::Semantic(
+                "authored role consumption readback failure".into(),
+            ));
+        }
         assert_eq!(ticket.view.view_digest.0, view.seal_digest());
         Ok(self.consumed.iter().any(|old| old == ticket))
     }
@@ -977,6 +983,7 @@ fn fixture_with_registered_role_limit_window(
         semantic_owner_busy: false,
         fail_role_once: false,
         fail_after_role_consumption_once: false,
+        fail_role_consumption_readback: false,
         #[cfg(feature = "pals-adaptive-diagnostics")]
         fail_publish_closed_once: false,
         raw_cpu_receipts: Vec::new(),
@@ -2194,6 +2201,36 @@ fn next_view_failure_preserves_actual_original_role_consumption() {
 }
 
 #[test]
+fn failed_consumption_readback_retains_binding_after_real_owner_fence() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    manager.driver_mut().fail_after_role_consumption_once = true;
+    manager.driver_mut().fail_role_consumption_readback = true;
+    facts.child_gate.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.failures().next().is_some()
+    });
+
+    let receipt = shutdown(&mut manager, until);
+    assert!(receipt.native_physical_shutdown_confirmed);
+    assert!(receipt.quarantined);
+    assert!(!receipt.permits_archive_close());
+    let original = manager
+        .roles
+        .iter()
+        .find(|binding| binding.consumption_unknown)
+        .expect("uncertain original binding must remain in custody");
+    assert!(!original.consumption_recorded);
+    assert!(manager.driver().consumed.contains(&original.ticket.unwrap()));
+    assert!(manager.failures().any(|error| matches!(
+        error,
+        AdaptiveManagerError::Semantic(detail)
+            if detail == "authored role consumption readback failure"
+    )));
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
+#[test]
 fn original_prepared_echo_after_cancel_retirement_never_recancels_or_admits() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
     let preparation = manager.prepare_root_ranking(root).unwrap();
@@ -2755,6 +2792,7 @@ mod adaptive_partial_feedback {
                 semantic_owner_busy: false,
                 fail_role_once: false,
                 fail_after_role_consumption_once: false,
+                fail_role_consumption_readback: false,
                 #[cfg(feature = "pals-adaptive-diagnostics")]
                 fail_publish_closed_once: false,
                 raw_cpu_receipts: Vec::new(),

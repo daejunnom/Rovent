@@ -25,6 +25,8 @@ pub const ROVENT_RECOVERY_SOURCE_KIND: &str = "historical_exact_pins";
 const MAX_METADATA_BYTES: u64 = 16 << 20;
 mod corpus_family;
 use corpus_family::*;
+mod lock_v2_archive;
+pub use lock_v2_archive::*;
 
 /// Borrowed lineage of an already admitted original row; no replay or learner
 /// authority can be created from this projection.

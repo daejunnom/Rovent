@@ -140,6 +140,11 @@ where
         let mut changed = false;
         let mut index = 0;
         while index < self.accepted_roles.len() {
+            if self.accepted_roles[index].binding.consumption_unknown {
+                return Err(AdaptiveManagerError::Invalid(
+                    "accepted role consumption remains unknown",
+                ));
+            }
             if self.accepted_roles[index].child.is_some() {
                 index += 1;
                 continue;
@@ -166,10 +171,15 @@ where
                                 }
                                 held.binding.consumption_recorded = true;
                                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                                if let Some(observer) = &mut self.collection_observer_v2 {
-                                    if let Err(error) = observer.adaptive_consumed(proof, true) {
-                                        self.record_failure(error.into());
-                                    }
+                                if let Err(error) = collection::notify_adaptive_consumed_v2(
+                                    &mut self.collection_observer_v2,
+                                    self.collection_admission_v2.as_ref(),
+                                    self.native.native_acceptance_verifier().as_ref(),
+                                    proof,
+                                    output.proposer_ranking_output(),
+                                    true,
+                                ) {
+                                    self.record_failure(error.into());
                                 }
                             }
                             self.observe_cpu_pc_head(
@@ -188,7 +198,15 @@ where
                             }
                         }
                         Ok(false) => {}
-                        Err(error) => self.record_failure(error),
+                        Err(error) => {
+                            // The source may have been consumed before the
+                            // original transition failed. Keep the owner and
+                            // do not later classify this result as unused.
+                            if !held.binding.consumption_recorded {
+                                held.binding.consumption_unknown = true;
+                            }
+                            self.record_failure(error);
+                        }
                     }
                 }
             }
@@ -300,14 +318,19 @@ where
                 self.driver
                     .accept_accepted_role_source(&work, accepted, output)?;
                 self.driver.role_consumed(&source, &work.input.view)?;
-                self.record_role_consumption(source, held.binding.physical)?;
                 held.binding.consumption_recorded = true;
+                self.record_role_consumption(source, held.binding.physical)?;
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                if let Some(observer) = &mut self.collection_observer_v2 {
-                    if let Err(error) = observer.adaptive_consumed(accepted, false) {
-                        self.record_failure(error.into());
-                        return Ok(false);
-                    }
+                if let Err(error) = collection::notify_adaptive_consumed_v2(
+                    &mut self.collection_observer_v2,
+                    self.collection_admission_v2.as_ref(),
+                    self.native.native_acceptance_verifier().as_ref(),
+                    accepted,
+                    output,
+                    false,
+                ) {
+                    self.record_failure(error.into());
+                    return Ok(false);
                 }
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }
@@ -496,8 +519,8 @@ where
             .commit_role(&current, &source, output, held.binding.physical)?;
         self.driver.role_consumed(&source, &work.input.view)?;
         if !held.binding.consumption_recorded {
-            self.record_role_consumption(source, held.binding.physical)?;
             held.binding.consumption_recorded = true;
+            self.record_role_consumption(source, held.binding.physical)?;
             if let Some(accepted) = &held.binding.reciprocal_acceptance {
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }

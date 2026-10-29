@@ -6,7 +6,7 @@
 
 use crate::pals_native::ticketed::{
     NativeTicketQuestion, TicketExecutionEvidence, TicketNativeBackend, TicketPhysicalResult,
-    TicketPreparation,
+    TicketPreparation, TicketOwnerDispatchContext,
 };
 use rz_contracts::pals::RepresentationKey;
 use rz_contracts::pals_adaptive::RoleTicketEnvelope;
@@ -189,6 +189,32 @@ where
         self.last_executed = Some(*ticket);
         self.backend
             .run(ticket, &prepared.question, &prepared.prepared, canceled)
+    }
+
+    fn run_owned(
+        &mut self,
+        context: TicketOwnerDispatchContext<'_, ReviewView, Q, Self::Prepared>,
+        canceled: &AtomicBool,
+    ) -> TicketPhysicalResult<Self::Output> {
+        self.last_executed = None;
+        let ticket = context.ticket();
+        let source = context.question();
+        let prepared = context.prepared();
+        if !matches_original(ticket, source, prepared) {
+            return TicketPhysicalResult {
+                physical: PhysicalRoleCompletion::Confirmed,
+                output: Err(RoleFailure::InvalidOutput),
+            };
+        }
+        let projected = match context.project(&prepared.question, &prepared.prepared) {
+            Ok(projected) => projected,
+            Err(error) => return TicketPhysicalResult {
+                physical: PhysicalRoleCompletion::Confirmed,
+                output: Err(error),
+            },
+        };
+        self.last_executed = Some(*ticket);
+        self.backend.run_owned(projected, canceled)
     }
 
     fn output_host_bytes(&self, output: &Self::Output) -> u64 {
