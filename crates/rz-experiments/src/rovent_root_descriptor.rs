@@ -194,9 +194,11 @@ impl RoventRootDescriptor {
             &manifest.engine.search,
             &manifest.coordinator,
             &manifest.resources,
-            manifest.wall_time_max_ms,
-            manifest.cleanup_max_ms,
-            manifest.output_bytes_max,
+            ExecutionLimits {
+                wall_time_max_ms: manifest.wall_time_max_ms,
+                cleanup_max_ms: manifest.cleanup_max_ms,
+                output_bytes_max: manifest.output_bytes_max,
+            },
         )
     }
 
@@ -300,9 +302,11 @@ impl RoventRootDescriptorV2 {
             &manifest.engine.search,
             &manifest.coordinator,
             &manifest.resources,
-            manifest.wall_time_max_ms,
-            manifest.cleanup_max_ms,
-            manifest.output_bytes_max,
+            ExecutionLimits {
+                wall_time_max_ms: manifest.wall_time_max_ms,
+                cleanup_max_ms: manifest.cleanup_max_ms,
+                output_bytes_max: manifest.output_bytes_max,
+            },
         )
     }
 
@@ -329,16 +333,25 @@ impl RoventRootDescriptorV2 {
     }
 }
 
+struct ExecutionLimits {
+    wall_time_max_ms: u64,
+    cleanup_max_ms: u64,
+    output_bytes_max: u64,
+}
+
 fn verify_declarations(
     input: &RoventRootDescriptorInput,
     canonical_sha256: &str,
     search: &RoventSearchDeclaration,
     coordinator: &RoventCoordinatorDeclaration,
     resources: &RoventResourcePlan,
-    wall_time_max_ms: u64,
-    cleanup_max_ms: u64,
-    output_bytes_max: u64,
+    execution_limits: ExecutionLimits,
 ) -> Result<(), ManifestError> {
+    let ExecutionLimits {
+        wall_time_max_ms,
+        cleanup_max_ms,
+        output_bytes_max,
+    } = execution_limits;
     let ceilings = &input.declared_ceilings;
     require(
         input.startup_lock_sha256 == canonical_sha256
