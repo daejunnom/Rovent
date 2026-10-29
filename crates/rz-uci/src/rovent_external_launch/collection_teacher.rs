@@ -730,6 +730,98 @@ pub enum BoundTeacherSpawnCauseV2 {
     Checker(CheckerError),
 }
 
+/// Keeps the original actor and worker under the pre-reserved recovery slot
+/// during the short handoff to the lifecycle. This only covers unwinding
+/// after `spawn_in_process_scope` returns a worker; it cannot recover from an
+/// abort or from an unobserved failure inside the lower spawn implementation.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+struct SpawnedTeacherGuardV2 {
+    actor: Option<BoundCollectionTeacherActorV2>,
+    worker: Option<CollectionTeacherWorker>,
+    reservation: Option<TeacherRecoveryReservationV2>,
+    cleanup_deadline: Instant,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+fn owner_from_spawned_actor_v2(
+    actor: BoundCollectionTeacherActorV2,
+    worker: CollectionTeacherWorker,
+) -> RoventCollectionTeacherOwnerV2 {
+    // Both conversions below only move the original fields. They must remain
+    // allocation-free and non-fallible while the worker has no other owner.
+    let parts = actor.into_parts();
+    let (index, launch, profile_bytes, executable, working_directory, custody) =
+        parts.source.into_parts();
+    RoventCollectionTeacherOwnerV2 {
+        launch,
+        worker,
+        admission: Some(parts.admission),
+        custody: Some(custody),
+        frozen_actor: parts.actor_digest,
+        source_index: index,
+        bound_source: Some(BoundTeacherOriginalSourceV2 {
+            _manifest: parts.manifest,
+            _actor_id: parts.actor_id,
+            _manifest_sha256: parts.manifest_sha256,
+            _profile_bytes: profile_bytes,
+            _executable: executable,
+            _working_directory: working_directory,
+        }),
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl SpawnedTeacherGuardV2 {
+    fn into_lifecycle(mut self) -> RoventCollectionTeacherLifecycleV2 {
+        let actor = self.actor.take().expect("spawn guard retains actor");
+        let worker = self.worker.take().expect("spawn guard retains worker");
+        let reservation = self
+            .reservation
+            .take()
+            .expect("spawn guard retains recovery reservation");
+        let owner = owner_from_spawned_actor_v2(actor, worker);
+        RoventCollectionTeacherLifecycleV2::new(owner, reservation, self.cleanup_deadline)
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl Drop for SpawnedTeacherGuardV2 {
+    fn drop(&mut self) {
+        if self.actor.is_none() && self.worker.is_none() && self.reservation.is_none() {
+            return;
+        }
+        if self.actor.is_none() || self.worker.is_none() || self.reservation.is_none() {
+            // An impossible partial handoff must not silently destroy a
+            // remaining worker or release a possibly occupied reservation.
+            quarantine_v2::mark_custody_violation();
+            if let Some(actor) = self.actor.take() {
+                std::mem::forget(actor);
+            }
+            if let Some(worker) = self.worker.take() {
+                std::mem::forget(worker);
+            }
+            if let Some(reservation) = self.reservation.take() {
+                std::mem::forget(reservation);
+            }
+            return;
+        }
+        if let (Some(actor), Some(worker), Some(reservation)) = (
+            self.actor.take(),
+            self.worker.take(),
+            self.reservation.take(),
+        ) {
+            let owner = owner_from_spawned_actor_v2(actor, worker);
+            // Lifecycle Drop requests shutdown and parks the same owner in
+            // the already registered recovery slot; it never claims exit.
+            drop(RoventCollectionTeacherLifecycleV2::new(
+                owner,
+                reservation,
+                self.cleanup_deadline,
+            ));
+        }
+    }
+}
+
 /// Starts only the actor bound to the original /2 root and preload. It does
 /// not grant label or publication authority. The caller retains the borrowed
 /// process permit and must retain the returned recovery key beyond the session.
@@ -757,6 +849,7 @@ pub fn spawn_bound_collection_teacher_v2(
             actor,
         });
     }
+    let cleanup_deadline = actor.admission().root_admission().original_context().shutdown_deadline;
     let created = (|| -> Result<CollectionTeacherWorker, BoundTeacherSpawnCauseV2> {
         reservation
             .validate_before_spawn()
@@ -874,27 +967,14 @@ pub fn spawn_bound_collection_teacher_v2(
         Ok(worker) => worker,
         Err(cause) => return Err(BoundTeacherSpawnFailureV2::BeforeSpawn { cause, actor }),
     };
-    // No fallible operation separates a spawned worker from this exact owner.
-    let parts = actor.into_parts();
-    let (index, launch, profile_bytes, executable, working_directory, custody) =
-        parts.source.into_parts();
-    let owner = RoventCollectionTeacherOwnerV2 {
-        launch,
-        worker,
-        admission: Some(parts.admission),
-        custody: Some(custody),
-        frozen_actor: parts.actor_digest,
-        source_index: index,
-        bound_source: Some(BoundTeacherOriginalSourceV2 {
-            _manifest: parts.manifest,
-            _actor_id: parts.actor_id,
-            _manifest_sha256: parts.manifest_sha256,
-            _profile_bytes: profile_bytes,
-            _executable: executable,
-            _working_directory: working_directory,
-        }),
-    };
-    let mut lifecycle = RoventCollectionTeacherLifecycleV2::new(owner, reservation);
+    // No fallible operation occurs between the returned worker and this guard.
+    let mut lifecycle = SpawnedTeacherGuardV2 {
+        actor: Some(actor),
+        worker: Some(worker),
+        reservation: Some(reservation),
+        cleanup_deadline,
+    }
+    .into_lifecycle();
     let root = lifecycle
         .owner
         .as_ref()
@@ -974,7 +1054,43 @@ pub struct RoventTeacherRetirementObservationV2 {
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoventTeacherTerminalAccountingV2 {
+    /// Every accepted dispatch has had its matching terminal delivered to the
+    /// caller. This is not a statement that the caller consumed a label.
+    Delivered { submitted: u64, delivered: u64 },
+    /// A submitted dispatch still awaits a matching terminal.
+    Pending { submitted: u64, delivered: u64 },
+    /// A missing or mismatched terminal prevents a complete accounting.
     Unknown,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Default)]
+struct TeacherTerminalLedgerV2 {
+    pending: Option<TeacherDispatch>,
+    unmatched: Option<TeacherCompletion>,
+    submitted: u64,
+    delivered: u64,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl TeacherTerminalLedgerV2 {
+    fn observation(&self) -> RoventTeacherTerminalAccountingV2 {
+        if self.unmatched.is_some() || self.delivered > self.submitted {
+            RoventTeacherTerminalAccountingV2::Unknown
+        } else if self.pending.is_some() {
+            RoventTeacherTerminalAccountingV2::Pending {
+                submitted: self.submitted,
+                delivered: self.delivered,
+            }
+        } else if self.submitted == self.delivered {
+            RoventTeacherTerminalAccountingV2::Delivered {
+                submitted: self.submitted,
+                delivered: self.delivered,
+            }
+        } else {
+            RoventTeacherTerminalAccountingV2::Unknown
+        }
+    }
 }
 
 /// Owns the original /2 teacher across admission closure, shutdown and join.
@@ -990,6 +1106,7 @@ pub struct RoventCollectionTeacherLifecycleV2 {
     diagnostics: RoventTeacherDiagnosticsDispositionV2,
     cleanup_deadline: Instant,
     registry_poisoned: bool,
+    terminal_ledger: TeacherTerminalLedgerV2,
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -997,12 +1114,8 @@ impl RoventCollectionTeacherLifecycleV2 {
     pub(crate) fn new(
         owner: RoventCollectionTeacherOwnerV2,
         reservation: TeacherRecoveryReservationV2,
+        cleanup_deadline: Instant,
     ) -> Self {
-        let cleanup_deadline = owner
-            .admission()
-            .root_admission()
-            .original_context()
-            .shutdown_deadline;
         Self {
             owner: Some(owner),
             reservation: Some(reservation),
@@ -1011,6 +1124,7 @@ impl RoventCollectionTeacherLifecycleV2 {
             diagnostics: RoventTeacherDiagnosticsDispositionV2::NotObserved,
             cleanup_deadline,
             registry_poisoned: false,
+            terminal_ledger: TeacherTerminalLedgerV2::default(),
         }
     }
 
@@ -1023,12 +1137,12 @@ impl RoventCollectionTeacherLifecycleV2 {
             diagnostics: parked.diagnostics,
             cleanup_deadline: parked.cleanup_deadline,
             registry_poisoned: parked.registry_poisoned,
+            terminal_ledger: parked.terminal_ledger,
         }
     }
 
-    /// Observe the original root, and close teacher admission on revocation,
-    /// expiry, or an unavailable observation. `false` does not distinguish
-    /// those cases and is not itself the root's revocation operation.
+    /// Observe the original root without waiting for its mutex. Contention is
+    /// an unavailable observation, not proof that the root was revoked.
     pub fn observe_root(&mut self) -> Result<bool, rz_contracts::ContractError> {
         if self.shutdown_requested {
             return Ok(false);
@@ -1041,7 +1155,7 @@ impl RoventCollectionTeacherLifecycleV2 {
             .root_admission()
             .original_context();
         let until = context.shutdown_deadline;
-        match context.accepts() {
+        match context.try_accepts() {
             Ok(true) => Ok(true),
             Ok(false) => {
                 self.request_shutdown(until);
@@ -1049,7 +1163,9 @@ impl RoventCollectionTeacherLifecycleV2 {
             }
             Err(error) => {
                 self.root_observation_error = Some(error);
-                self.request_shutdown(until);
+                if error.code != rz_contracts::ErrorCode::ResourceExhausted {
+                    self.request_shutdown(until);
+                }
                 Err(error)
             }
         }
@@ -1069,6 +1185,14 @@ impl RoventCollectionTeacherLifecycleV2 {
     /// Submit through the original live root and bound worker. The returned
     /// dispatch is not a label or publication authority.
     pub fn submit(&mut self, job: TeacherJob) -> Result<TeacherDispatch, CheckerError> {
+        if self.terminal_ledger.pending.is_some() || self.terminal_ledger.unmatched.is_some() {
+            return Err(invalid("teacher /2 previous terminal unresolved"));
+        }
+        let next_submitted = self
+            .terminal_ledger
+            .submitted
+            .checked_add(1)
+            .ok_or_else(|| invalid("teacher /2 dispatch accounting overflow"))?;
         if !self
             .observe_root()
             .map_err(|_| invalid("teacher /2 root observation unavailable"))?
@@ -1080,6 +1204,10 @@ impl RoventCollectionTeacherLifecycleV2 {
             .as_mut()
             .expect("retained teacher owner")
             .submit(job);
+        if let Ok(dispatch) = &result {
+            self.terminal_ledger.pending = Some(dispatch.clone());
+            self.terminal_ledger.submitted = next_submitted;
+        }
         if result.is_err() {
             // A root can close between the two admission observations. Preserve
             // the original submit error while arranging shutdown on that race.
@@ -1090,12 +1218,36 @@ impl RoventCollectionTeacherLifecycleV2 {
 
     /// The original completion remains available even after root revocation;
     /// the caller must preserve it and must not treat it as a valid label.
-    pub fn take_completion(&self) -> Option<TeacherCompletion> {
-        self.owner
+    pub fn take_completion(&mut self) -> Option<TeacherCompletion> {
+        if self.terminal_ledger.unmatched.is_some() {
+            return None;
+        }
+        let completion = self.owner
             .as_ref()
             .expect("retained teacher owner")
             .worker
-            .take_completion()
+            .take_completion()?;
+        if self
+            .terminal_ledger
+            .pending
+            .as_ref()
+            .is_some_and(|dispatch| completion.matches_dispatch_identity(dispatch))
+        {
+            self.terminal_ledger.pending = None;
+            // submitted was checked before issuing and only one dispatch is
+            // pending, so delivered cannot overflow here.
+            self.terminal_ledger.delivered += 1;
+            Some(completion)
+        } else {
+            self.terminal_ledger.unmatched = Some(completion);
+            None
+        }
+    }
+
+    /// Inspect the original unmatched terminal without granting label or
+    /// publication authority. It remains retained with the owner on drop.
+    pub fn unmatched_completion(&self) -> Option<&TeacherCompletion> {
+        self.terminal_ledger.unmatched.as_ref()
     }
 
     /// Preserve the original live-root and private-dispatch validation for a
@@ -1130,9 +1282,7 @@ impl RoventCollectionTeacherLifecycleV2 {
             return None;
         }
         let worker = &mut self.owner.as_mut().expect("retained teacher owner").worker;
-        if worker.shutdown_snapshot().is_none() {
-            return None;
-        }
+        worker.shutdown_snapshot()?;
         let diagnostics = worker.take_diagnostics_after_join();
         self.diagnostics = if diagnostics.is_some() {
             RoventTeacherDiagnosticsDispositionV2::Recovered
@@ -1172,6 +1322,15 @@ impl RoventCollectionTeacherLifecycleV2 {
         } else {
             RoventTeacherPhysicalRetirementV2::Unknown(process)
         };
+        let terminal_accounting = match self.terminal_ledger.observation() {
+            RoventTeacherTerminalAccountingV2::Pending { .. }
+                if joined.is_some() && occupancy.reliable_queued == 0 =>
+            {
+                // A joined worker cannot later publish the missing terminal.
+                RoventTeacherTerminalAccountingV2::Unknown
+            }
+            observation => observation,
+        };
         RoventTeacherRetirementObservationV2 {
             root_observation_error: self.root_observation_error,
             worker_join: joined,
@@ -1180,15 +1339,14 @@ impl RoventCollectionTeacherLifecycleV2 {
             reliable_queued: occupancy.reliable_queued,
             reliable_reserved: occupancy.reliable_reserved,
             diagnostics: self.diagnostics,
-            terminal_accounting: RoventTeacherTerminalAccountingV2::Unknown,
+            terminal_accounting,
             registry_poisoned: self.registry_poisoned,
         }
     }
 
-    /// Return the same owner only after its physical process is known closed,
-    /// the observable queues are empty and diagnostic availability was observed.
-    /// This returns the process owner only; it does not establish that every
-    /// dispatched terminal was delivered, or authorize a Collection label.
+    /// Return the same owner only after physical closure, empty observable
+    /// queues, observed diagnostics and matching delivery of every terminal.
+    /// Delivery still does not prove label consumption or publication.
     /// Failure returns the wrapper itself so the caller can keep polling.
     pub fn try_finish(
         mut self,
@@ -1208,6 +1366,10 @@ impl RoventCollectionTeacherLifecycleV2 {
             || observation.reliable_queued != 0
             || observation.reliable_reserved != 0
             || observation.diagnostics == RoventTeacherDiagnosticsDispositionV2::NotObserved
+            || !matches!(
+                observation.terminal_accounting,
+                RoventTeacherTerminalAccountingV2::Delivered { .. }
+            )
         {
             return Err(self);
         }
@@ -1241,6 +1403,7 @@ impl Drop for RoventCollectionTeacherLifecycleV2 {
                 diagnostics: self.diagnostics,
                 cleanup_deadline: self.cleanup_deadline,
                 registry_poisoned: self.registry_poisoned,
+                terminal_ledger: std::mem::take(&mut self.terminal_ledger),
             };
             match self.reservation.as_mut() {
                 Some(reservation) => {

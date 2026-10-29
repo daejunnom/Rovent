@@ -157,7 +157,11 @@ impl TeacherCompletion {
     pub fn process_identity(&self) -> Option<ExternalProcessIdentity> {
         self.process
     }
-    pub fn matches_submission(&self, submitted: &TeacherDispatch) -> bool {
+    /// Matches the original private dispatch even if the terminal cannot
+    /// provide a process observation. This establishes the terminal's
+    /// submission identity only: it does not validate the process, outcome,
+    /// Rules state, or authorization to use the result as a label.
+    pub fn matches_dispatch_identity(&self, submitted: &TeacherDispatch) -> bool {
         Arc::ptr_eq(&self.dispatch.admission, &submitted.admission)
             && self.dispatch.id == submitted.id
             && self.dispatch.input_scope == submitted.input_scope
@@ -167,7 +171,11 @@ impl TeacherCompletion {
             && self.dispatch.process == submitted.process
             && self.dispatch.evaluation_namespace == submitted.evaluation_namespace
             && self.dispatch.root_restriction == submitted.root_restriction
-            && self.process == Some(submitted.process)
+    }
+
+    /// Strict submission match including the terminal's process evidence.
+    pub fn matches_submission(&self, submitted: &TeacherDispatch) -> bool {
+        self.matches_dispatch_identity(submitted) && self.process == Some(submitted.process)
     }
 }
 
@@ -1717,6 +1725,16 @@ mod tests {
         let completion = wait_completion(&worker, hard);
         assert_native_stop_ready(&completion, &first, ExternalCompletion::StoppedCanceled);
         assert_eq!(completion.controls().cancel_ack, 7);
+        // Delivery identity survives a missing process observation; the
+        // strict submission/label check must still reject that terminal.
+        let mut missing_process = completion.clone();
+        missing_process.process = None;
+        assert!(missing_process.matches_dispatch_identity(&first));
+        assert!(!missing_process.matches_submission(&first));
+        assert!(!missing_process.matches_dispatch_identity(&TeacherDispatch {
+            admission: Arc::new(()),
+            ..first.clone()
+        }));
         assert!(!completion.matches_submission(&TeacherDispatch {
             admission: Arc::new(()),
             ..first.clone()

@@ -15,7 +15,8 @@ use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2;
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
     BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
-    RoventCollectionTeacherLifecycleV2, RoventTeacherRetirementObservationV2,
+    RoventCollectionTeacherLifecycleV2, RoventCollectionTeacherOwnerV2,
+    RoventTeacherRetirementObservationV2,
     TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2, TeacherRecoveryKeyV2,
     bind_collection_teacher_actor_v2, spawn_bound_collection_teacher_v2,
 };
@@ -292,6 +293,35 @@ impl RoventCollectionTeacherSessionV2 {
     ) -> Option<RoventTeacherRetirementObservationV2> {
         self.worker_mut(actor_id)
             .map(RoventCollectionTeacherLifecycleV2::poll)
+    }
+
+    /// Return the same actor owner only when the lifecycle confirms physical
+    /// closure, diagnostics and delivery of every submitted terminal. An
+    /// unresolved owner is restored to the session so it can be polled again
+    /// or parked by the existing recovery path. This does not certify label
+    /// consumption or authorize publication.
+    pub(crate) fn try_finish_actor(
+        &mut self,
+        actor_id: &str,
+    ) -> Result<Option<(RoventCollectionTeacherOwnerV2, RoventTeacherRetirementObservationV2)>, ArenaError>
+    {
+        let actor = self
+            .actors
+            .get_mut(actor_id)
+            .ok_or_else(|| invalid("V2 teacher actor absent"))?;
+        let Some(run) = actor.running.take() else {
+            return Ok(None);
+        };
+        match run.lifecycle.try_finish() {
+            Ok((owner, observation)) => Ok(Some((owner, observation))),
+            Err(lifecycle) => {
+                actor.running = Some(RunningTeacherV2 {
+                    lifecycle,
+                    recovery_key: run.recovery_key,
+                });
+                Ok(None)
+            }
+        }
     }
 
     /// The root observation can block on its mutex; callers must not hold a

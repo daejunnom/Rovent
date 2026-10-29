@@ -119,6 +119,7 @@ pub(super) struct ParkedTeacherV2 {
     pub(super) diagnostics: RoventTeacherDiagnosticsDispositionV2,
     pub(super) cleanup_deadline: Instant,
     pub(super) registry_poisoned: bool,
+    pub(super) terminal_ledger: TeacherTerminalLedgerV2,
 }
 
 impl TeacherRecoveryReservationV2 {
