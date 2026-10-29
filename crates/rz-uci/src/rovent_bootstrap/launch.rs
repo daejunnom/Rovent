@@ -67,11 +67,12 @@ pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
 };
-use collection::{CollectionLaunch, CollectionLaunchV2};
+use collection::{CollectionHooksV2, CollectionLaunch, CollectionLaunchV2};
 pub use collection::{
-    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, RoventPcCollectionLaunchFailureV2, run_collection,
+    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, RoventCollectionLaunchFailureV2,
+    RoventPcCollectionLaunchFailureV2, RoventOwnNnuecCollectionLaunchFailureV2, run_collection,
     run_collection_with_driver, run_collection_with_resource_admission,
-    run_pc_collection_v2_with_resource_admission,
+    run_pc_collection_v2_with_resource_admission, run_own_nnuec_collection_v2_with_resource_admission,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
@@ -1217,12 +1218,16 @@ fn run_v2_native<'a>(
         ));
     }
     let topology = if collection.is_some() {
-        super::admitted_pc_collection_topology_v2(&lock)
+        super::admitted_collection_topology_v2(&lock)
     } else {
         super::admitted_topology_v2(&lock)
     }.map_err(|failure| error("InputLockUnsupportedV2", failure))?;
-    if collection.is_some() && !matches!(topology, super::RoventStartupTopology::RolesOnly) {
-        return Err(error("InputLockUnsupportedV2", "typed V2 P/C collection requires roles-only topology"));
+    if let Some(request) = &collection {
+        if !matches!((&request.hooks, topology),
+            (CollectionHooksV2::Pc(_), super::RoventStartupTopology::RolesOnly)
+            | (CollectionHooksV2::OwnNnuec(_), super::RoventStartupTopology::OwnResearcher)) {
+            return Err(error("InputLockUnsupportedV2", "typed V2 collection hook and engine topology differ"));
+        }
     }
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
         return Err(error(
@@ -1243,8 +1248,11 @@ fn run_v2_native<'a>(
         cancellation: Arc::new(AtomicBool::new(false)),
     };
     if let Some(request) = &collection {
-        request.hooks.register_startup_control(&control)
-            .map_err(|failure| error("PhysicalCompletionUnknown", failure))?;
+        let registered = match &request.hooks {
+            CollectionHooksV2::Pc(hooks) => hooks.register_startup_control(&control),
+            CollectionHooksV2::OwnNnuec(hooks) => hooks.register_startup_control(&control),
+        };
+        registered.map_err(|failure| error("PhysicalCompletionUnknown", failure))?;
     }
     let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
     let binary = lock
@@ -1454,37 +1462,64 @@ fn run_v2_native<'a>(
     }
     let assembled = (|| -> Result<_, RoventLaunchError> {
         if let (Some(observer), Some(hooks)) = (observer, hooks) {
+            if matches!(&hooks, CollectionHooksV2::OwnNnuec(_)) && loaded_nnuec.is_none() {
+                return Err(error("InputLockUnsupportedV2", "Own NNUEC Collection requires its original loaded model"));
+            }
             if let Some(attempt) = &startup_attempt {
                 attempt.store(true, std::sync::atomic::Ordering::Release);
             }
-            let prepared = super::prepare_native_v2_collection::<PcPortQuestion>(
-                Arc::clone(&sources), resources, clock.runtime_clock(), control.clone(), observer,
-            ).map_err(|rejection| {
-                let failure = reject_factory(rejection, cleanup_until, &diagnostic);
-                if failure.stage != "PhysicalCompletionUnknown" {
-                    if let Some(settled) = &native_settled {
-                        settled.store(true, std::sync::atomic::Ordering::Release);
-                    }
+            macro_rules! collection_native {
+                ($question:ty) => {
+                    super::prepare_native_v2_collection::<$question>(
+                        Arc::clone(&sources), resources, clock.runtime_clock(), control.clone(), observer,
+                    ).map_err(|rejection| {
+                        let failure = reject_factory(rejection, cleanup_until, &diagnostic);
+                        if failure.stage != "PhysicalCompletionUnknown" {
+                            if let Some(settled) = &native_settled {
+                                settled.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        failure
+                    })?
+                };
+            }
+            macro_rules! collection_driver {
+                ($driver:expr, $reject:path) => {{
+                    let driver = $driver.map_err(|rejection| {
+                        let failure = $reject(rejection, cleanup_until, &diagnostic);
+                        if failure.stage != "PhysicalCompletionUnknown" {
+                            if let Some(settled) = &native_settled {
+                                settled.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        failure
+                    })?;
+                    let completion = driver.physical_close_observation();
+                    let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2 {
+                        Arc::new(super::product::diagnostics_v2::ObservedV2::new(driver, lock.canonical_sha256.clone()))
+                    } else {
+                        Arc::new(driver)
+                    };
+                    (driver, completion)
+                }};
+            }
+            return Ok(match hooks {
+                CollectionHooksV2::Pc(hooks) => {
+                    let prepared = collection_native!(PcPortQuestion);
+                    collection_driver!(super::product::RoventNativeProductDriverV2::pc_with_collection_hooks_v2(
+                        prepared, loaded_nnuec, Arc::clone(&boundary), clock.clone(),
+                        Arc::clone(&owners), identity, arguments.root_policy, hooks,
+                    ), reject_pc_collection_product_v2)
                 }
-                failure
-            })?;
-            let driver = super::product::RoventNativeProductDriverV2::pc_with_collection_hooks_v2(
-                prepared, loaded_nnuec, Arc::clone(&boundary), clock.clone(),
-                Arc::clone(&owners), identity, arguments.root_policy, hooks,
-            ).map_err(|rejection| {
-                // The rejection contains the actual native, hook and process
-                // owners. No teacher-retirement proof is available here.
-                let detail = error("ProductAssembly", &rejection.failure);
-                let _quarantine = Box::leak(Box::new(rejection));
-                error("PhysicalCompletionUnknown", detail)
-            })?;
-            let completion = driver.physical_close_observation();
-            let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2 {
-                Arc::new(super::product::diagnostics_v2::ObservedV2::new(driver, lock.canonical_sha256.clone()))
-            } else {
-                Arc::new(driver)
-            };
-            return Ok((driver, completion));
+                CollectionHooksV2::OwnNnuec(hooks) => {
+                    let prepared = collection_native!(AdaptivePortQuestion);
+                    let loaded = loaded_nnuec.expect("checked original NNUEC owner");
+                    collection_driver!(super::product::RoventOwnNnuecProductDriverV2::own_nnuec_pcr_with_collection_hooks_v2(
+                        prepared, loaded, Arc::clone(&boundary), clock.clone(),
+                        Arc::clone(&owners), identity, arguments.root_policy, hooks,
+                    ), reject_own_nnuec_product_v2)
+                }
+            });
         }
         match (topology, loaded_nnuec, external) {
             (super::RoventStartupTopology::RolesOnly, None, None) => launch_v2_product!(
@@ -1735,6 +1770,26 @@ fn reject_product(
             NativeStartupDiagnosticPhase::Error
         },
     );
+    if !confirmed {
+        let _quarantine = Box::leak(Box::new(failure));
+        return error("PhysicalCompletionUnknown", detail);
+    }
+    detail
+}
+
+fn reject_pc_collection_product_v2(
+    mut failure: super::pc_session::RoventPcSessionV2Rejection,
+    until: Instant,
+    diagnostic: &NativeStartupDiagnostic,
+) -> RoventLaunchError {
+    let detail = error("ProductAssembly", &failure.failure);
+    diagnostic.emit(NativeStartupDiagnosticStage::ProductDrain, NativeStartupDiagnosticPhase::Entry);
+    let confirmed = drain_native(&mut failure.prepared.service, until);
+    diagnostic.emit(NativeStartupDiagnosticStage::ProductDrain, if confirmed {
+        NativeStartupDiagnosticPhase::Exit
+    } else {
+        NativeStartupDiagnosticPhase::Error
+    });
     if !confirmed {
         let _quarantine = Box::leak(Box::new(failure));
         return error("PhysicalCompletionUnknown", detail);

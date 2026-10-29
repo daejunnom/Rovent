@@ -9,7 +9,7 @@ use super::external_session::{
 };
 use super::launch::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use super::nnuec_session::{
-    RoventNnuecCollectionHooks, RoventNnuecSessionDriver, RoventNnuecSessionRejection,
+    RoventNnuecCollectionHooks, RoventNnuecCollectionHooksV2, RoventNnuecSessionDriver, RoventNnuecSessionRejection,
     RoventNnuecSessionV2Rejection,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
@@ -1636,6 +1636,36 @@ pub struct RoventOwnNnuecV2StartupRejection {
     pub rejected: RoventNnuecSessionV2Rejection,
 }
 impl RoventOwnNnuecProductDriverV2 {
+    /// Retain the same original /2 collection hook and source owners through
+    /// NNUEC product startup. Rejection returns them to their original caller.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn own_nnuec_pcr_with_collection_hooks_v2(
+        prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,
+        loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: Arc<dyn RoventNnuecCollectionHooksV2>,
+    ) -> Result<Self, RoventOwnNnuecV2StartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventNnuecSessionDriver::new_v2_with_collection_hooks(
+            prepared, loaded, Arc::clone(&process), clock, owners, identity, root_policy, hooks,
+        )
+        .map_err(|rejected| {
+            let mut failure = rejected.failure.clone();
+            failure.physical_completion = DriverPhysicalCompletion::Unknown;
+            RoventOwnNnuecV2StartupRejection { failure, rejected }
+        })?;
+        Ok(Self {
+            inner: Arc::new(driver),
+            sources,
+            process,
+            physically_closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     pub fn own_nnuec_pcr(
         prepared: PreparedRoventNativeV2<AdaptivePortQuestion>,

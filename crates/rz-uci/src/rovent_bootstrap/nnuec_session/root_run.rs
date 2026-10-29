@@ -73,6 +73,9 @@ struct RootRunCustody {
     next_request_sequence: u64,
     game: Option<u64>,
     collection_admitted: bool,
+    /// Original collection owners remain retained even if bounded delivery
+    /// fails or the teacher's physical retirement remains unknown.
+    collection_handoff_v2: Option<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>,
     /// The V2 teacher has no accepted physical retirement proof. This is a
     /// separate state, never a replacement for the original collection error.
     v2_teacher_retirement_unproven: bool,
@@ -134,6 +137,7 @@ impl RootRunCustody {
             next_request_sequence: 0,
             game: None,
             collection_admitted: false,
+            collection_handoff_v2: None,
             v2_teacher_retirement_unproven: false,
             receipt: None,
             result: None,
@@ -1219,9 +1223,39 @@ impl RoventNnuecSessionDriver {
                 }
             }
             if self.collection_hooks_v2.is_some() {
-                // The manager fence does not cover the teacher process. Do
-                // not invoke any publication/close callback before a typed,
-                // same-owner teacher retirement proof is wired in.
+                // Obtain the bounded sender before removing the original
+                // observer from the fenced manager. A panic leaves it there.
+                let sender = match catch_unwind(AssertUnwindSafe(|| {
+                    self.collection_hooks_v2.as_ref().expect("started hook").handoff_sender()
+                })) {
+                    Ok(sender) => sender,
+                    Err(payload) => return Err(run.retain_panic(
+                        "RoventNnuecV2HandoffSenderPanic",
+                        "original observer and manager retained",
+                        payload,
+                    )),
+                };
+                let (admission, observer, settlement) = match run.manager.as_mut()
+                    .expect("same fenced manager").take_collection_observer_v2()
+                {
+                    Ok(Some(original)) => original,
+                    _ => return Err(run.fail(
+                        "RoventNnuecV2HandoffUnavailable",
+                        "original observer and manager retained",
+                    )),
+                };
+                let handoff = Arc::new(Mutex::new(RoventNnuecCollectionHandoffV2 {
+                    admission, observer, settlement, native_fence: physical.clone(),
+                }));
+                run.collection_handoff_v2 = Some(Arc::clone(&handoff));
+                if sender.try_send(handoff).is_err() {
+                    return Err(run.fail(
+                        "RoventNnuecV2HandoffUndelivered",
+                        "original handoff and manager retained",
+                    ));
+                }
+                // Delivery is not proof that the separate teacher retired.
+                // The same handoff remains in retained root custody.
                 run.v2_teacher_retirement_unproven = true;
                 if let Some(detail) = run
                     .semantic_failures

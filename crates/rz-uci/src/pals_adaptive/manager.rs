@@ -2178,10 +2178,26 @@ where
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveCollectionV2ObserverStatus {
+    AdmissionNotCalled,
+    AdmissionFailed,
+    AdmissionPanicked,
+    AdmissionSucceededRecheckFailed,
+    AdmissionSucceededRecheckPanicked,
+    ManagerValidationPanicked,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub(crate) struct AdaptiveCollectionV2Rejection<Q, O> {
     pub error: AdaptiveManagerError,
     pub admission: RoventCollectionRootAdmissionV2,
     pub observer: AdaptiveCollectionObserverBoxV2<Q, O>,
+    /// Failed or panicked callbacks may have changed this original observer;
+    /// the status does not grant permission to reuse it.
+    pub observer_status: AdaptiveCollectionV2ObserverStatus,
+    /// A panic payload can own resources. Keep it with the rejected observer.
+    pub panic_payload: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// The actual single writer owns native service handles and private CPU workers.
@@ -2919,8 +2935,10 @@ where
         admission: RoventCollectionRootAdmissionV2,
         mut observer: AdaptiveCollectionObserverBoxV2<Q, B::Output>,
     ) -> Result<(), AdaptiveCollectionV2Rejection<Q, B::Output>> {
-        let result =
-            (|| -> Result<(), AdaptiveManagerError> {
+        let mut observer_called = false;
+        let mut observer_succeeded = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), AdaptiveManagerError> {
                 if self.root_started
                     || !self.roles.is_empty()
                     || self.phase != ManagerPhase::Running
@@ -2950,14 +2968,52 @@ where
                 )?;
                 admission.validate_native_owner(&verifier)?;
                 self.driver.validate_collection_admission_v2(&admission)?;
+                observer_called = true;
                 observer.admitted(&admission)?;
+                observer_succeeded = true;
+                // The callback can race expiration or revoke. Do not install
+                // an admission based only on the earlier scope observation.
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("V2 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v2(&admission)?;
+                self.check_running()?;
                 Ok(())
-            })();
-        if let Err(error) = result {
+            },
+        ));
+        let rejected = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some((
+                error,
+                if observer_succeeded {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionSucceededRecheckFailed
+                } else if observer_called {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionFailed
+                } else {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionNotCalled
+                },
+                None,
+            )),
+            Err(payload) => Some((
+                AdaptiveManagerError::Invalid("adaptive V2 collection admission panicked"),
+                if observer_succeeded {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionSucceededRecheckPanicked
+                } else if observer_called {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionPanicked
+                } else {
+                    AdaptiveCollectionV2ObserverStatus::ManagerValidationPanicked
+                },
+                Some(payload),
+            )),
+        };
+        if let Some((error, observer_status, panic_payload)) = rejected {
             return Err(AdaptiveCollectionV2Rejection {
                 error,
                 admission,
                 observer,
+                observer_status,
+                panic_payload,
             });
         }
         self.collection_admission_v2 = Some(admission);
@@ -4989,7 +5045,13 @@ where
                     self.driver.role_consumed(&ticket, &input.view)?;
                     self.mark_role_consumed(index, false)?;
                     let mut ranking_observation_failed = false;
-                    if self.reciprocal_routing.is_some() || self.peer_policy.is_some() {
+                    // Collection observes the actual root ranking even when
+                    // no optional reciprocal/peer routing was configured.
+                    if self.reciprocal_routing.is_some()
+                        || self.peer_policy.is_some()
+                        || self.collection_observer.is_some()
+                        || self.has_collection_v2()
+                    {
                         if let Some(observer) = &mut self.collection_observer {
                             let proof = match self.collection_admission.as_ref() {
                                 Some(admission) => {

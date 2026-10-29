@@ -101,12 +101,43 @@ type Manager =
 type SemanticOwner = ResearcherPreparingOwner<AdaptivePortModel>;
 pub type RoventNnuecCollectionHooks = AdaptiveSessionCollectionHooks<Backend>;
 
+/// Original NNUEC collection objects handed off after the native root fence.
+/// The handoff does not attest retirement of a separate teacher process.
+pub struct RoventNnuecCollectionHandoffV2 {
+    admission: RoventCollectionRootAdmissionV2,
+    observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
+    settlement: Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
+    native_fence: AdaptiveShutdownReceipt,
+}
+
+impl RoventNnuecCollectionHandoffV2 {
+    pub fn parts_mut(&mut self) -> (
+        &RoventCollectionRootAdmissionV2,
+        &mut AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
+        &Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
+        &AdaptiveShutdownReceipt,
+    ) {
+        (&self.admission, &mut self.observer, &self.settlement, &self.native_fence)
+    }
+
+    pub fn into_parts(self) -> (
+        RoventCollectionRootAdmissionV2,
+        AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
+        Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
+        AdaptiveShutdownReceipt,
+    ) {
+        (self.admission, self.observer, self.settlement, self.native_fence)
+    }
+}
+
 /// /2 collection is an independent, live owner. The hook keeps its teacher
 /// and publication custody. `revoke` is nonblocking, idempotent and acts only
 /// on this owner's actual root and teacher. Callbacks prove no physical fence.
 /// This seam does not authorize collection until the /2 corpus and teacher
 /// lifecycle consumers can retain and drain the same owners.
 pub trait RoventNnuecCollectionHooksV2: Send + Sync {
+    /// Register the actual startup control before work can be spawned.
+    fn register_startup_control(&self, control: &super::RoventStartupControl) -> Result<(), AdaptiveManagerError>;
     fn admit(
         &self,
         port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
@@ -114,6 +145,8 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     ) -> Result<(), RoventNnuecCollectionAdmissionFailureV2>;
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
+    /// A bounded nonblocking handoff; delivery is not teacher retirement.
+    fn handoff_sender(&self) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>;
 }
 
 /// Failure custody returned by the /2 hook. This must contain the original
@@ -135,6 +168,8 @@ pub struct RoventNnuecCollectionObserverRejectionV2 {
     pub error: AdaptiveManagerError,
     pub admission: RoventCollectionRootAdmissionV2,
     pub observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
+    pub observer_status: crate::pals_adaptive::AdaptiveCollectionV2ObserverStatus,
+    pub panic_payload: Option<Box<dyn Any + Send>>,
 }
 
 impl RoventNnuecCollectionAdmissionPortV2<'_> {
@@ -148,6 +183,8 @@ impl RoventNnuecCollectionAdmissionPortV2<'_> {
                 error: failure.error,
                 admission: failure.admission,
                 observer: failure.observer,
+                observer_status: failure.observer_status,
+                panic_payload: failure.panic_payload,
             })
     }
 }

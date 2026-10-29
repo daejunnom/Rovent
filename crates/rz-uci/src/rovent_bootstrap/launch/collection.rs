@@ -11,6 +11,7 @@ use crate::pals_native::ticketed::VirtualReviewCollectionObserver;
 use crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
 use crate::rovent_bootstrap::product::{RoventNativeProductDriver, RoventProductStartupRejection};
 use crate::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2;
+use crate::rovent_bootstrap::nnuec_session::RoventNnuecCollectionHooksV2;
 use crate::rovent_bootstrap::{
     PreparedRoventNative, RoventCollectionPreloadSources, RoventPinnedExternalRSource,
     RoventStartupControl, RoventTeacherSourceSelection,
@@ -24,10 +25,15 @@ use super::collection_v2_observer::{V2ObserverCustody, V2ObserverReclaimError};
 
 /// Explicit V2 P/C collection inputs. These owners are selected before the
 /// original lock is opened; they never project a V2 input lock into V1.
+pub(super) enum CollectionHooksV2 {
+    Pc(Arc<dyn RoventPcCollectionHooksV2>),
+    OwnNnuec(Arc<dyn RoventNnuecCollectionHooksV2>),
+}
+
 pub(super) struct CollectionLaunchV2<'a> {
     pub(super) teacher_selections: Vec<RoventTeacherSourceSelection>,
     pub(super) observer: Box<dyn VirtualReviewCollectionObserver>,
-    pub(super) hooks: Arc<dyn RoventPcCollectionHooksV2>,
+    pub(super) hooks: CollectionHooksV2,
     pub(super) admit_resource: Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>,
     pub(super) startup_attempt: Arc<AtomicBool>,
     pub(super) native_settled: Arc<AtomicBool>,
@@ -36,9 +42,9 @@ pub(super) struct CollectionLaunchV2<'a> {
 /// Startup/session failure returns the same hook Arc to the caller. It does
 /// not assert that the hook's own external work has stopped. Unknown physical
 /// completion remains quarantined if the failure is dropped without recovery.
-pub struct RoventPcCollectionLaunchFailureV2 {
+pub struct RoventCollectionLaunchFailureV2<H: ?Sized> {
     pub error: RoventLaunchError,
-    hooks: Option<Arc<dyn RoventPcCollectionHooksV2>>,
+    hooks: Option<Arc<H>>,
     panic_payload: Option<Box<dyn std::any::Any + Send>>,
     observer_before_start: Option<Box<dyn VirtualReviewCollectionObserver>>,
     retained_observer: Option<V2ObserverCustody>,
@@ -46,14 +52,17 @@ pub struct RoventPcCollectionLaunchFailureV2 {
     physical_unknown: bool,
 }
 
-impl RoventPcCollectionLaunchFailureV2 {
-    pub fn hooks(&self) -> &Arc<dyn RoventPcCollectionHooksV2> {
+pub type RoventPcCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<dyn RoventPcCollectionHooksV2>;
+pub type RoventOwnNnuecCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<dyn RoventNnuecCollectionHooksV2>;
+
+impl<H: ?Sized> RoventCollectionLaunchFailureV2<H> {
+    pub fn hooks(&self) -> &Arc<H> {
         self.hooks.as_ref().expect("original collection hooks retained")
     }
 
     /// Transfer the original hook custody to a caller that will retain it
     /// until its own teacher/process completion has been established.
-    pub fn take_hook_custody(&mut self) -> Option<Arc<dyn RoventPcCollectionHooksV2>> {
+    pub fn take_hook_custody(&mut self) -> Option<Arc<H>> {
         self.hooks.take()
     }
 
@@ -80,7 +89,7 @@ impl RoventPcCollectionLaunchFailureV2 {
     pub fn physical_completion_unknown(&self) -> bool { self.physical_unknown }
 }
 
-impl Drop for RoventPcCollectionLaunchFailureV2 {
+impl<H: ?Sized> Drop for RoventCollectionLaunchFailureV2<H> {
     fn drop(&mut self) {
         if self.physical_unknown {
             if let Some(hooks) = self.hooks.take() {
@@ -102,7 +111,27 @@ pub fn run_pc_collection_v2_with_resource_admission<'a>(
     hooks: Arc<dyn RoventPcCollectionHooksV2>,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventPcCollectionLaunchFailureV2> {
-    let original_hooks = Arc::clone(&hooks);
+    run_collection_v2(arguments, teacher_selections, observer, Arc::clone(&hooks), CollectionHooksV2::Pc(hooks), admit_resource)
+}
+
+pub fn run_own_nnuec_collection_v2_with_resource_admission<'a>(
+    arguments: Vec<String>,
+    teacher_selections: Vec<RoventTeacherSourceSelection>,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+    hooks: Arc<dyn RoventNnuecCollectionHooksV2>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
+) -> Result<(), RoventOwnNnuecCollectionLaunchFailureV2> {
+    run_collection_v2(arguments, teacher_selections, observer, Arc::clone(&hooks), CollectionHooksV2::OwnNnuec(hooks), admit_resource)
+}
+
+fn run_collection_v2<'a, H: ?Sized>(
+    arguments: Vec<String>,
+    teacher_selections: Vec<RoventTeacherSourceSelection>,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+    original_hooks: Arc<H>,
+    hooks: CollectionHooksV2,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
+) -> Result<(), RoventCollectionLaunchFailureV2<H>> {
     let startup_attempt = Arc::new(AtomicBool::new(false));
     let native_settled = Arc::new(AtomicBool::new(false));
     let mut observer_custody = V2ObserverCustody::new(observer);
@@ -119,7 +148,7 @@ pub fn run_pc_collection_v2_with_resource_admission<'a>(
     match result {
         Ok(Ok(())) => match observer_custody.try_reclaim_after_verified_boundary() {
             Ok(original) => { drop(original); Ok(()) }
-            Err(reclaim_error) => Err(RoventPcCollectionLaunchFailureV2 {
+            Err(reclaim_error) => Err(RoventCollectionLaunchFailureV2 {
                 error: super::error("PhysicalCompletionUnknown", "V2 collection observer custody remained active after session closure"),
                 hooks: Some(original_hooks),
                 panic_payload: None,
@@ -140,7 +169,7 @@ pub fn run_pc_collection_v2_with_resource_admission<'a>(
             } else { (None, None) };
             let physical_unknown = !safe_native || error.stage == "PhysicalCompletionUnknown";
             let retained_observer = if original.is_none() { Some(observer_custody) } else { None };
-            Err(RoventPcCollectionLaunchFailureV2 {
+            Err(RoventCollectionLaunchFailureV2 {
                 error,
                 hooks: Some(original_hooks),
                 panic_payload: None,
@@ -150,7 +179,7 @@ pub fn run_pc_collection_v2_with_resource_admission<'a>(
                 physical_unknown,
             })
         }
-        Err(payload) => Err(RoventPcCollectionLaunchFailureV2 {
+        Err(payload) => Err(RoventCollectionLaunchFailureV2 {
             error: super::error("PhysicalCompletionUnknown", "V2 collection launch panicked"),
             hooks: Some(original_hooks),
             panic_payload: Some(payload),
