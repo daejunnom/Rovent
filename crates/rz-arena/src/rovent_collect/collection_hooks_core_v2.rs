@@ -122,7 +122,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         let old = previous.root_admission().authority();
         let new = next.root_admission().authority();
         !previous.same_original_admission(next)
-            && previous.same_original_origin(next)
+            && previous.native_origin().same_original_origin(next.native_origin())
             && old.epoch == new.epoch
             && old.implementation == new.implementation
             && (new.game > old.game || (new.game == old.game && new.root > old.root))
