@@ -64,6 +64,19 @@ struct Entry {
     stage: Stage,
 }
 
+/// Observations only; stage counts grant no completion or target authority.
+#[derive(Default)]
+pub(crate) struct PumpStageCountsV2 {
+    pub queued: usize,
+    pub unlabeled: usize,
+    pub transition_unknown: usize,
+    pub pending: usize,
+    pub completed: usize,
+    pub sealed: usize,
+    pub prepared: usize,
+    pub failed: usize,
+}
+
 /// Serial submission deliberately limits this worker to one outstanding
 /// teacher job. Overflow returns the unmodified row to its owner.
 pub(crate) struct RetiredRowPumpV2 {
@@ -251,6 +264,23 @@ impl RetiredRowPumpV2 {
     }
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn stage_counts(&self) -> PumpStageCountsV2 {
+        let mut counts = PumpStageCountsV2::default();
+        for entry in &self.entries {
+            match &entry.stage {
+                Stage::Queued => counts.queued += 1,
+                Stage::Unlabeled => counts.unlabeled += 1,
+                Stage::TransitionUnknown => counts.transition_unknown += 1,
+                Stage::Pending { .. } => counts.pending += 1,
+                Stage::Completed(_) => counts.completed += 1,
+                Stage::Sealed(_) => counts.sealed += 1,
+                Stage::Prepared(_) => counts.prepared += 1,
+                Stage::Failed { .. } => counts.failed += 1,
+            }
+        }
+        counts
     }
 
     /// One bounded state transition. Must run outside the producer mutex; seal

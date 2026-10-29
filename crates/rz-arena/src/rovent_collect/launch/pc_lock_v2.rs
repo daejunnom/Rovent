@@ -348,11 +348,18 @@ impl RoventPcCollectionRunV2 {
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
             let (unlabeled, prepared, failed, committed) = worker.pump_ready_counts();
+            let stages = worker.pump_stage_counts().map(|v| json!({
+                "queued":v.queued, "unlabeled":v.unlabeled, "transition_unknown":v.transition_unknown,
+                "pending":v.pending, "completed":v.completed, "sealed":v.sealed,
+                "prepared":v.prepared, "failed":v.failed,
+            }));
             json!({"primary_failure":failures.primary.map(|failure|failure.kind()),
                 "worker_failed":worker.has_failure(),
                 "additional_failures":failures.additional.iter().map(|failure|failure.kind()).collect::<Vec<_>>(),
                 "omitted_failures":failures.omitted,
                 "pending_pump_rows":worker.pending_pump_rows(),
+                "pump_stages":stages,
+                "teacher_startup_observations_debug":format!("{:?}", worker.teacher_startups()),
                 "ready_unlabeled":unlabeled,"ready_prepared":prepared,"ready_failed":failed,"ready_committed":committed,
                 "diagnostic_actors":worker.diagnostics().len()})
         });
@@ -643,8 +650,13 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let publication_manifest = Arc::clone(&manifest);
     let publication_directory = plan.output_directory.clone();
     let publication_maximum_records = plan.maximum_records;
+    // Route by the original admission even for the current one-root
+    // profile. Additional router slots remain unavailable until the
+    // supervisor proves the preceding root has released shared custody.
     let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> =
-        bridge.clone();
+        Arc::new(crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
+            Arc::clone(&bridge), plan.maximum_roots as usize,
+        )?);
     let native = run_pc_collection_v2_with_resource_admission(
         arguments,
         plan.teacher_sources,

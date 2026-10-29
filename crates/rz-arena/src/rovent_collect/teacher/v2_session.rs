@@ -266,6 +266,14 @@ pub(crate) struct TeacherPumpPermitV2 {
 
 #[allow(dead_code)]
 impl RoventCollectionTeacherSessionV2 {
+    /// Historical worker startup observation, not a current liveness or
+    /// teacher-label authority. The actual worker owns the report.
+    pub(crate) fn actor_startup_report(
+        &self,
+        actor_id: &str,
+    ) -> Option<rz_search::external_cpu::worker::ExternalWorkerStartup> {
+        self.actors.get(actor_id)?.running.as_ref()?.lifecycle.owner().worker().startup_report()
+    }
     /// One pump per original session. Dropping the token is not retirement.
     pub(crate) fn claim_pump_owner(&mut self) -> Result<TeacherPumpPermitV2, ArenaError> {
         check(

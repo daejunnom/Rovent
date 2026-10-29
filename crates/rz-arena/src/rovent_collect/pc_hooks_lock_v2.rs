@@ -1,7 +1,7 @@
 //! Typed adapter around the shared bounded single-root Collection /2 worker.
 //! This layer does not combine P-C and Own manager or handoff authority.
 use super::collection_hooks_core_v2::{
-    CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure,
+    CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure, CoreGameGateStatus,
 };
 use super::teacher::v2_session::{RoventTeacherRosterEntryV2, TeacherSessionRetirementSealV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2};
@@ -22,6 +22,9 @@ pub(crate) type RoventPcCollectionWorkerV2 = CollectionWorkerCoreV2<RoventPcColl
 
 pub(crate) struct RoventPcCollectionBridgeV2 {
     core: Arc<CollectionBridgeCoreV2<RoventPcCollectionHandoffV2>>,
+    owner: RoventCollectionOwnerLockV2,
+    manifest: Arc<RoventCorpusManifestLockV2>,
+    roster_identity: Vec<(String, usize, u32)>,
     worker: Mutex<Option<PcWorkerCustodianV2>>,
     deferred: Mutex<PcDeferredRootsV2>,
 }
@@ -41,6 +44,8 @@ struct PcWorkerCustodianV2 {
     panic: Option<Box<dyn std::any::Any + Send>>,
     transferred: bool,
     returned: Option<Arc<Mutex<RoventPcCollectionRootCustodyV2>>>,
+    separated_rows: std::collections::VecDeque<super::RoventRetiredLockV2Record>,
+    separation_failed: bool,
 }
 
 /// The real joined worker core and its exit travel together. This object is
@@ -57,6 +62,12 @@ pub(crate) enum PcWorkerExitKindV2 {
 pub(crate) enum PcWorkerStartErrorV2 {
     BeforeStart(ArenaError),
     Unknown(ArenaError),
+}
+
+/// A separation step is custody only, not publication or a teacher result.
+pub(crate) enum PcRootSeparationV2 {
+    Pending,
+    Released { retained_rows: usize },
 }
 impl PcWorkerExitKindV2 {
     pub(crate) fn label(self) -> &'static str {
@@ -111,6 +122,31 @@ fn handoff_submit(
 }
 
 impl RoventPcCollectionBridgeV2 {
+    pub(crate) fn closed_before_next_admission(&self, next: &RoventCollectionRootAdmissionV2) -> bool {
+        self.core.closed_before_next_admission(next)
+    }
+    /// The replacement slot must already own the same game inputs and a live
+    /// worker started by the resource-admitted supervisor. No root is
+    /// installed or allowed solely by this readiness observation.
+    pub(crate) fn try_prepared_for_same_owner(&self, previous: &Self) -> Result<Option<bool>, ArenaError> {
+        if !self.owner.same_original_owner(&previous.owner)
+            || !Arc::ptr_eq(&self.manifest, &previous.manifest)
+            || self.roster_identity != previous.roster_identity
+            || !self.core.same_original_startup(&previous.core)
+            || self.core.installed_admission_for_recovery().is_some() {
+            return Ok(Some(false));
+        }
+        let slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("P/C prepared worker custody poisoned")),
+        };
+        Ok(Some(slot.as_ref().is_some_and(|worker|
+            worker.handle.as_ref().is_some_and(|thread| !thread.is_finished())
+                && !worker.transferred && worker.returned.is_none()
+                && worker.exit.is_none() && worker.panic.is_none()
+                && worker.separated_rows.is_empty() && !worker.separation_failed)))
+    }
     pub(crate) fn installed_admission_for_recovery(&self) -> Option<&RoventCollectionRootAdmissionV2> {
         self.core.installed_admission_for_recovery()
     }
@@ -123,14 +159,16 @@ impl RoventPcCollectionBridgeV2 {
         manifest: Arc<RoventCorpusManifestLockV2>,
         roster: Vec<RoventTeacherRosterEntryV2>,
     ) -> Result<(Arc<Self>, RoventPcCollectionWorkerV2), ArenaError> {
+        let roster_identity = roster.iter().map(|entry|
+            (entry.actor_id.clone(), entry.source_index, entry.collection_owner)).collect();
         let (core, worker) =
-            CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
-        Ok((Arc::new(Self { core, worker: Mutex::new(None), deferred: Mutex::new(PcDeferredRootsV2 {
+            CollectionBridgeCoreV2::new(owner.clone(), Arc::clone(&manifest), roster, handoff_matches, handoff_submit)?;
+        Ok((Arc::new(Self { core, owner, manifest, roster_identity, worker: Mutex::new(None), deferred: Mutex::new(PcDeferredRootsV2 {
             originals: Vec::with_capacity(256), cleanup_failures: Vec::new(), overflow: 0, first_overflow: None,
         }) }), worker))
     }
 
-    fn defer_before_start(
+    pub(crate) fn defer_before_start(
         &self, port: &mut RoventPcCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2, reason: AdaptiveCollectionError,
     ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
@@ -199,7 +237,7 @@ impl RoventPcCollectionBridgeV2 {
             };
             exit
         }).map_err(|error| PcWorkerStartErrorV2::BeforeStart(ArenaError::Io(error.to_string())))?;
-        *slot = Some(PcWorkerCustodianV2 { original: Arc::clone(worker), handle: Some(handle), exit: None, exit_kind: None, panic: None, transferred: false, returned: None });
+        *slot = Some(PcWorkerCustodianV2 { original: Arc::clone(worker), handle: Some(handle), exit: None, exit_kind: None, panic: None, transferred: false, returned: None, separated_rows: std::collections::VecDeque::new(), separation_failed: false });
         Ok(())
     }
 
@@ -250,6 +288,62 @@ impl RoventPcCollectionBridgeV2 {
         let (_, _, settlement, fence) = handoff.parts_mut();
         Ok(settlement.is_ok() && fence.permits_semantic_closure())
     }
+
+    /// Move at most one original retired row into this original joined
+    /// worker's bounded custody. Once the original outbox is empty, release
+    /// only this root's game gate. The supervisor calls this outside manager
+    /// callbacks and must retain this bridge until its rows are consumed.
+    pub(crate) fn try_separate_root_for_next(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+        game_row_capacity: usize,
+    ) -> Result<PcRootSeparationV2, ArenaError> {
+        if !self.core.installed_admission_for_recovery()
+            .is_some_and(|original| original.same_original_admission(admission)) {
+            return Err(super::invalid("P/C root separation original admission mismatch"));
+        }
+        if !self.returned_handoff_settled().map_err(|error| super::invalid(format!("P/C original handoff: {error:?}")))? {
+            return Ok(PcRootSeparationV2::Pending);
+        }
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PcRootSeparationV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("P/C original worker custody poisoned")),
+        };
+        let worker = slot.as_mut().ok_or_else(|| super::invalid("P/C original worker custody missing"))?;
+        if worker.separation_failed {
+            return Err(super::invalid("P/C root separation previously failed; originals retained"));
+        }
+        if worker.returned.is_none() || worker.handle.is_some() || worker.panic.is_some() {
+            return Ok(PcRootSeparationV2::Pending);
+        }
+        let Some(status) = self.owner.try_status()? else { return Ok(PcRootSeparationV2::Pending); };
+        if !status.admitted || !status.settled || status.pending_count != 0 {
+            return Ok(PcRootSeparationV2::Pending);
+        }
+        if status.pending_retired_count != 0 {
+            if worker.separated_rows.len() >= game_row_capacity {
+                return Err(super::invalid("P/C separated retired rows exceed remaining game capacity"));
+            }
+            worker.separated_rows.try_reserve(1).map_err(|_| super::invalid("P/C separated row allocation"))?;
+            match self.owner.try_take_settled_retired()? {
+                Some(Some(row)) => {
+                    if !row.admission.same_original_admission(admission) {
+                        // Preserve the original row even when its root is not
+                        // the one expected by this supervisor.
+                        worker.separated_rows.push_back(row);
+                        worker.separation_failed = true;
+                        return Err(super::invalid("P/C separated row belongs to another root"));
+                    }
+                    worker.separated_rows.push_back(row);
+                    return Ok(PcRootSeparationV2::Pending);
+                }
+                Some(None) | None => return Ok(PcRootSeparationV2::Pending),
+            }
+        }
+        if !self.core.try_release_game_root(admission)? { return Ok(PcRootSeparationV2::Pending); }
+        Ok(PcRootSeparationV2::Released { retained_rows: worker.separated_rows.len() })
+    }
 }
 
 impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
@@ -270,7 +364,7 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                 "The previous root's bounded collection worker remains owned; this root is not captured",
             ));
         }
-        self.core
+        match self.core
             .admit(admission, |admission, owner| {
                 port.install(admission, owner.observer())
                     .map_err(|original| CoreAdmissionFailure {
@@ -278,14 +372,16 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                         admission: original.admission.clone(),
                         owners: Box::new(original),
                         before_start: false,
+                        game_gate_status: CoreGameGateStatus::NotApplicable,
                     })
-            })
-            .map(|()| RoventPcCollectionAdmissionOutcomeV2::Installed)
-            .map_err(|failure| RoventPcCollectionAdmissionFailureV2 {
-                error: failure.error,
-                admission: failure.admission,
-                owners: failure.owners,
-            })
+            }) {
+            Ok(()) => Ok(RoventPcCollectionAdmissionOutcomeV2::Installed),
+            Err(failure) if failure.before_start && failure.game_gate_status == CoreGameGateStatus::Busy =>
+                Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission: failure.admission }),
+            Err(failure) => Err(RoventPcCollectionAdmissionFailureV2 {
+                error: failure.error, admission: failure.admission, owners: failure.owners,
+            }),
+        }
     }
     fn finish_deferred(
         &self,
@@ -330,11 +426,31 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
     fn pump(&self) -> Result<(), AdaptiveManagerError> {
         self.core.pump()
     }
+    fn pump_root(&self, root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
+        if !self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(root)) {
+            return Err(AdaptiveManagerError::Invalid("P/C root-scoped pump admission mismatch"));
+        }
+        self.core.pump()
+    }
     fn revoke(&self) {
         self.core.revoke();
     }
+    fn revoke_root(&self, root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
+        if !self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(root)) {
+            return Err(AdaptiveManagerError::Invalid("P/C root-scoped revoke admission mismatch"));
+        }
+        self.core.revoke();
+        Ok(())
+    }
     fn handoff_sender(&self) -> mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>> {
         self.core.handoff_sender()
+    }
+    fn handoff_sender_root(&self, root: &RoventCollectionRootAdmissionV2)
+        -> Result<mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>, AdaptiveManagerError> {
+        if !self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(root)) {
+            return Err(AdaptiveManagerError::Invalid("P/C root-scoped handoff admission mismatch"));
+        }
+        Ok(self.core.handoff_sender())
     }
     fn try_take_root_custody(&self, handoff: &Arc<Mutex<RoventPcCollectionHandoffV2>>) -> Result<Option<RoventPcCollectionRootCustodyV2>, AdaptiveManagerError> {
         let mut slot = match self.worker.try_lock() {

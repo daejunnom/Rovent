@@ -1104,6 +1104,8 @@ mod observer_lock_v2;
 mod own_hooks_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_hooks_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod pc_root_router_v2;
 #[cfg(feature = "pals-collection-onnx")]
 pub use observer::*;
 #[cfg(feature = "pals-collection-onnx")]

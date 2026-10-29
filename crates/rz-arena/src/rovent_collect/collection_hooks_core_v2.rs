@@ -24,7 +24,7 @@ use rz_uci::rovent_external_launch::{
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -38,6 +38,62 @@ const ADMISSION_CLOSED: u8 = 2;
 const ADMISSION_INSTALLED: u8 = 3;
 const ADMISSION_CANCELED: u8 = 4;
 const ADMISSION_COMMITTING: u8 = 5;
+
+// One shared word per actual game owner. The upper bits are a monotonic
+// generation, so a late root cannot release a newer root's state.
+const GAME_PHASE_MASK: u64 = 7;
+const GAME_IDLE: u64 = 0;
+const GAME_INSTALLING: u64 = 1;
+const GAME_ACTIVE: u64 = 2;
+const GAME_COMMITTING: u64 = 3;
+const GAME_UNKNOWN: u64 = 4;
+
+struct GameInstallGuard<'a> {
+    gate: &'a AtomicU64,
+    generation: u64,
+    install_entered: bool,
+    installed: bool,
+}
+enum GameInstallAttempt<'a> {
+    Ready(GameInstallGuard<'a>),
+    Busy,
+    Unknown,
+}
+impl GameInstallGuard<'_> {
+    fn enter(&mut self) { self.install_entered = true; }
+    fn mark_installed(&mut self) -> Result<(), AdaptiveManagerError> {
+        let expected = self.generation | GAME_INSTALLING;
+        self.gate.compare_exchange(expected, self.generation | GAME_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AdaptiveManagerError::Invalid("Collection game installation state changed"))?;
+        self.installed = true;
+        Ok(())
+    }
+}
+impl Drop for GameInstallGuard<'_> {
+    fn drop(&mut self) {
+        if self.installed { return; }
+        let replacement = self.generation | if self.install_entered { GAME_UNKNOWN } else { GAME_IDLE };
+        let _ = self.gate.compare_exchange(self.generation | GAME_INSTALLING, replacement, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+fn try_game_install(gate: &AtomicU64) -> Result<GameInstallAttempt<'_>, AdaptiveManagerError> {
+    let previous = gate.load(Ordering::Acquire);
+    match previous & GAME_PHASE_MASK {
+        GAME_IDLE => {},
+        GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING => return Ok(GameInstallAttempt::Busy),
+        _ => return Ok(GameInstallAttempt::Unknown),
+    }
+    let generation = (previous & !GAME_PHASE_MASK).checked_add(GAME_PHASE_MASK + 1)
+        .ok_or(AdaptiveManagerError::Invalid("Collection game generation exhausted"))?;
+    match gate.compare_exchange(previous, generation | GAME_INSTALLING, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(GameInstallAttempt::Ready(GameInstallGuard { gate, generation, install_entered: false, installed: false })),
+        Err(actual) => match actual & GAME_PHASE_MASK {
+            GAME_IDLE | GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING => Ok(GameInstallAttempt::Busy),
+            _ => Ok(GameInstallAttempt::Unknown),
+        },
+    }
+}
 
 struct AdmissionSlot {
     admission: RoventCollectionRootAdmissionV2,
@@ -58,6 +114,8 @@ impl Drop for AdmissionReservationGuard {
 /// own copies until retirement. A channel transfer is not completion evidence.
 pub(crate) struct CollectionBridgeCoreV2<H> {
     owner: RoventCollectionOwnerLockV2,
+    game_gate: Arc<AtomicU64>,
+    game_generation: AtomicU64,
     admissions: mpsc::SyncSender<Arc<AdmissionSlot>>,
     handoffs: mpsc::SyncSender<Arc<Mutex<H>>>,
     admission_phase: Arc<AtomicU8>,
@@ -75,11 +133,14 @@ pub(crate) struct CollectionBridgeCoreV2<H> {
 pub(crate) struct RoventCollectionCommitGateV2<'a, H> {
     core: &'a CollectionBridgeCoreV2<H>,
     admission: RoventCollectionRootAdmissionV2,
+    game_commit: u64,
+    game_restore: u64,
 }
 
 impl<H> RoventCollectionCommitGateV2<'_, H> {
     pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
         self.core.admission_phase.load(Ordering::Acquire) == ADMISSION_COMMITTING
+            && self.core.game_gate.load(Ordering::Acquire) == self.game_commit
             && self.admission.same_original_admission(admission)
     }
 
@@ -95,10 +156,27 @@ impl<H> Drop for RoventCollectionCommitGateV2<'_, H> {
         let _ = self.core.admission_phase.compare_exchange(
             ADMISSION_COMMITTING, ADMISSION_INSTALLED, Ordering::AcqRel, Ordering::Acquire,
         );
+        let _ = self.core.game_gate.compare_exchange(
+            self.game_commit, self.game_restore, Ordering::AcqRel, Ordering::Acquire,
+        );
     }
 }
 
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
+    /// The supervisor reuses the same original cancellation owner and
+    /// deadlines; an absent registration is not a ready startup control.
+    pub(crate) fn startup_control_for_supervisor(&self) -> Option<RoventStartupControl> {
+        self.startup.get().cloned()
+    }
+    /// Compare the actual registered startup control, including its original
+    /// cancellation Arc. Equal copied deadline values alone are insufficient.
+    pub(crate) fn same_original_startup(&self, other: &Self) -> bool {
+        match (self.startup.get(), other.startup.get()) {
+            (Some(left), Some(right)) => Arc::ptr_eq(&left.cancellation, &right.cancellation)
+                && left.until == right.until && left.cleanup_until == right.cleanup_until,
+            _ => false,
+        }
+    }
     /// Actual installed admission, retained even after the bridge closes.
     /// This is custody identity only, not completion or publication evidence.
     pub(crate) fn installed_admission_for_recovery(&self) -> Option<&RoventCollectionRootAdmissionV2> {
@@ -106,6 +184,38 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             return None;
         }
         self.installed_admission.get()
+    }
+    /// The concrete supervisor must first verify the original joined worker,
+    /// same handoff, native fence and teacher aggregate, and move this root's
+    /// original rows into bounded custody. This method then independently
+    /// checks the still-current owner and original generation before release.
+    /// Busy is retryable; unknown/mismatched state is never released.
+    pub(crate) fn try_release_game_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<bool, ArenaError> {
+        if !self.revoked.load(Ordering::Acquire)
+            || !self.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(admission)) {
+            return Err(ArenaError::Invalid("Collection game release original root mismatch".into()));
+        }
+        let Some(status) = self.owner.try_status()? else { return Ok(false); };
+        if !status.admitted || !status.settled || status.pending_count != 0 || status.pending_retired_count != 0 {
+            return Ok(false);
+        }
+        let generation = self.game_generation.load(Ordering::Acquire);
+        if generation == 0 { return Err(ArenaError::Invalid("Collection game release generation unavailable".into())); }
+        let current = self.game_gate.load(Ordering::Acquire);
+        if current == (generation | GAME_IDLE) { return Ok(true); }
+        if current == (generation | GAME_COMMITTING) { return Ok(false); }
+        if current != (generation | GAME_ACTIVE) {
+            return Err(ArenaError::Invalid("Collection game release generation or state mismatch".into()));
+        }
+        match self.game_gate.compare_exchange(current, generation | GAME_IDLE, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(true),
+            Err(actual) if actual == (generation | GAME_COMMITTING) => Ok(false),
+            Err(actual) if actual == (generation | GAME_IDLE) => Ok(true),
+            Err(_) => Err(ArenaError::Invalid("Collection game release raced or state unknown".into())),
+        }
     }
     /// The single-root bridge can no longer install another observer only
     /// after its admission has irrevocably closed. A reserved installation
@@ -136,10 +246,29 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             || !self.installed_admission.get().is_some_and(|original| original.same_original_admission(admission)) {
             return Err(ArenaError::Invalid("commit does not match the original closed collection root".into()));
         }
+        let previous = self.game_gate.load(Ordering::Acquire);
+        let phase = previous & GAME_PHASE_MASK;
+        let generation = self.game_generation.load(Ordering::Acquire);
+        if !matches!(phase, GAME_IDLE | GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING) {
+            return Err(ArenaError::Invalid("Collection game owner state unknown".into()));
+        }
+        if phase != GAME_IDLE && !(phase == GAME_ACTIVE && previous & !GAME_PHASE_MASK == generation) {
+            return Ok(None);
+        }
+        let commit = (previous & !GAME_PHASE_MASK) | GAME_COMMITTING;
+        if self.game_gate.compare_exchange(previous, commit, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Ok(None);
+        }
         match self.admission_phase.compare_exchange(ADMISSION_INSTALLED, ADMISSION_COMMITTING, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => Ok(Some(RoventCollectionCommitGateV2 { core: self, admission: admission.clone() })),
-            Err(ADMISSION_COMMITTING) => Ok(None),
-            Err(_) => Err(ArenaError::Invalid("original collection admission is not commit-ready".into())),
+            Ok(_) => Ok(Some(RoventCollectionCommitGateV2 { core: self, admission: admission.clone(), game_commit: commit, game_restore: previous })),
+            Err(ADMISSION_COMMITTING) => {
+                let _ = self.game_gate.compare_exchange(commit, previous, Ordering::AcqRel, Ordering::Acquire);
+                Ok(None)
+            }
+            Err(_) => {
+                let _ = self.game_gate.compare_exchange(commit, previous, Ordering::AcqRel, Ordering::Acquire);
+                Err(ArenaError::Invalid("original collection admission is not commit-ready".into()))
+            }
         }
     }
 
@@ -189,8 +318,11 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         let failed = Arc::new(AtomicBool::new(false));
         let admission_phase = Arc::new(AtomicU8::new(ADMISSION_OPEN));
         let startup = Arc::new(OnceLock::new());
+        let game_gate = owner.game_gate();
         let bridge = Arc::new(Self {
             owner,
+            game_gate,
+            game_generation: AtomicU64::new(0),
             admissions,
             handoffs,
             admission_phase: Arc::clone(&admission_phase),
@@ -245,6 +377,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             tokens: BTreeMap::new(),
             worker_tokens: BTreeMap::new(),
             teacher_observations: BTreeMap::new(),
+            teacher_startups: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
             next_actor: 0,
             shutdown_requested: false,
@@ -267,12 +400,16 @@ pub(crate) type HandoffRecovery<H> = fn(
 ) -> Result<Option<Arc<Mutex<H>>>, &'static str>;
 pub(crate) type HandoffIdentity<H> = fn(&mut H, &RoventCollectionRootAdmissionV2) -> bool;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreGameGateStatus { NotApplicable, Busy, Unknown }
+
 pub(crate) struct CoreAdmissionFailure {
     pub(crate) error: AdaptiveManagerError,
     pub(crate) admission: RoventCollectionRootAdmissionV2,
     pub(crate) owners: Box<dyn std::any::Any + Send>,
     /// True only before the original observer install callback was entered.
     pub(crate) before_start: bool,
+    pub(crate) game_gate_status: CoreGameGateStatus,
 }
 
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
@@ -306,9 +443,11 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             admission,
             owners: Box::new(()),
             before_start: true,
+            game_gate_status: CoreGameGateStatus::NotApplicable,
         };
         let reject_started = |error, admission| CoreAdmissionFailure {
             error, admission, owners: Box::new(()), before_start: false,
+            game_gate_status: CoreGameGateStatus::NotApplicable,
         };
         if self.startup.get().is_none()
             || self.revoked.load(Ordering::Acquire)
@@ -327,6 +466,31 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             // this guard alone does not prove this root never installed.
             return Err(reject_started(AdaptiveManagerError::AdmissionClosed, admission));
         }
+        let mut game_install = match try_game_install(&self.game_gate) {
+            Ok(GameInstallAttempt::Ready(guard)) => guard,
+            Ok(GameInstallAttempt::Busy) => {
+                let _ = self.admission_phase.compare_exchange(
+                    ADMISSION_RESERVED, ADMISSION_OPEN, Ordering::AcqRel, Ordering::Acquire,
+                );
+                let mut failure = reject(AdaptiveManagerError::AuxiliaryPending, admission);
+                failure.game_gate_status = CoreGameGateStatus::Busy;
+                return Err(failure);
+            }
+            Ok(GameInstallAttempt::Unknown) => {
+                let _ = self.admission_phase.compare_exchange(
+                    ADMISSION_RESERVED, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire,
+                );
+                let mut failure = reject(AdaptiveManagerError::Invalid("Collection game owner state unknown"), admission);
+                failure.game_gate_status = CoreGameGateStatus::Unknown;
+                return Err(failure);
+            }
+            Err(error) => {
+                let _ = self.admission_phase.compare_exchange(
+                    ADMISSION_RESERVED, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire,
+                );
+                return Err(reject(error, admission));
+            }
+        };
         // Reserve the bounded outbox before installing the observer. The
         // consumer cannot use the root until the release-store of INSTALLED.
         let slot = Arc::new(AdmissionSlot {
@@ -351,6 +515,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         if self.admission_phase.load(Ordering::Acquire) != ADMISSION_RESERVED {
             return Err(reject(AdaptiveManagerError::Deadline, admission));
         }
+        game_install.enter();
         match install(admission, &self.owner) {
             Ok(()) => {
                 // The deadline may have closed admission while install ran.
@@ -383,6 +548,10 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                 if self.installed_admission.set(slot.admission.clone()).is_err() {
                     return Err(reject_started(AdaptiveManagerError::Invalid("Collection V2 original admission already installed"), slot.admission.clone()));
                 }
+                self.game_generation.store(game_install.generation, Ordering::Release);
+                if let Err(error) = game_install.mark_installed() {
+                    return Err(reject_started(error, slot.admission.clone()));
+                }
                 self.installed_published.store(true, Ordering::Release);
                 Ok(())
             }
@@ -393,6 +562,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                     admission: original.admission,
                     owners: original.owners,
                     before_start: false,
+                    game_gate_status: CoreGameGateStatus::NotApplicable,
                 })
             }
         }
@@ -548,6 +718,7 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     // Never drop or replace them on a no-child or unknown observation.
     worker_tokens: BTreeMap<String, RoventTeacherWorkerTerminalTokenV2>,
     teacher_observations: BTreeMap<String, RoventTeacherRetirementObservationV2>,
+    teacher_startups: BTreeMap<String, rz_search::external_cpu::worker::ExternalWorkerStartup>,
     diagnostics: BTreeMap<String, rz_search::external_cpu::collection_teacher::TeacherDiagnostics>,
     next_actor: usize,
     shutdown_requested: bool,
@@ -613,6 +784,10 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     pub(crate) fn pending_pump_rows(&self) -> usize {
         self.pump.as_ref().map_or(0, RetiredRowPumpV2::len)
             + self.pump_ready.len() + usize::from(self.pump_rejected.is_some())
+    }
+
+    pub(crate) fn pump_stage_counts(&self) -> Option<super::teacher::lock_v2_row_pump::PumpStageCountsV2> {
+        self.pump.as_ref().map(RetiredRowPumpV2::stage_counts)
     }
 
     pub(crate) fn first_pump_item_mut(&mut self) -> Option<&mut PumpItemV2> {
@@ -859,6 +1034,16 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 match session.start_actor(actor, until, cleanup_until, &mut self.custodian) {
                     Ok(_) => self.next_actor += 1,
                     Err(error) => self.record_failure(WorkerFailure::ActorStart(error)),
+                }
+            }
+        }
+        // Preserve actual startup observations before retirement consumes the
+        // worker owner. Missing startup remains unobserved, not successful.
+        if let Some(session) = &self.session {
+            for item in &self.roster {
+                if self.teacher_startups.contains_key(&item.actor_id) { continue; }
+                if let Some(startup) = session.actor_startup_report(&item.actor_id) {
+                    self.teacher_startups.insert(item.actor_id.clone(), startup);
                 }
             }
         }
@@ -1317,6 +1502,11 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         &self,
     ) -> &BTreeMap<String, RoventTeacherRetirementObservationV2> {
         &self.teacher_observations
+    }
+    pub(crate) fn teacher_startups(
+        &self,
+    ) -> &BTreeMap<String, rz_search::external_cpu::worker::ExternalWorkerStartup> {
+        &self.teacher_startups
     }
 
     pub(crate) fn diagnostics(

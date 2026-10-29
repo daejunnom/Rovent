@@ -299,10 +299,12 @@ impl RoventNnuecCollectionHooksV2 for RoventNnuecCollectionBridgeV2 {
                         admission: original.admission.clone(),
                         owners: Box::new(original),
                         before_start: false,
+                        game_gate_status: super::collection_hooks_core_v2::CoreGameGateStatus::NotApplicable,
                     })
             }) {
             Ok(()) => Ok(RoventNnuecCollectionAdmissionOutcomeV2::Installed),
-            Err(failure) if failure.before_start => {
+            Err(failure) if failure.before_start
+                && failure.game_gate_status != super::collection_hooks_core_v2::CoreGameGateStatus::Unknown => {
                 let _ = self.before_start_failure.set(failure.error.clone());
                 let error = self.before_start_failure.get().expect("before-start failure retained");
                 let reason = AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,

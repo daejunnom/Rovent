@@ -16,7 +16,7 @@ use std::{
     marker::PhantomData,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
 };
@@ -88,6 +88,7 @@ struct State {
 #[derive(Clone)]
 pub struct RoventCollectionOwnerLockV2 {
     state: Arc<Mutex<State>>,
+    game_gate: Arc<AtomicU64>,
     registration: RoventNativeCaptureRegistration,
     callback_lock_failure: Arc<AtomicBool>,
     retired_receiver: Arc<Mutex<mpsc::Receiver<RoventRetiredLockV2Record>>>,
@@ -97,7 +98,11 @@ pub struct RoventCollectionOwnerLockV2 {
 impl RoventCollectionOwnerLockV2 {
     pub(crate) fn same_original_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+            && Arc::ptr_eq(&self.game_gate, &other.game_gate)
             && self.registration.same_original_owner(&other.registration)
+    }
+    pub(crate) fn game_gate(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.game_gate)
     }
     pub fn new(
         manifest: rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
@@ -128,6 +133,7 @@ impl RoventCollectionOwnerLockV2 {
         let retired_queued = Arc::new(AtomicUsize::new(0));
         Ok((
             Self {
+                game_gate: Arc::new(AtomicU64::new(0)),
                 state: Arc::new(Mutex::new(State {
                     manifest,
                     producer: None,

@@ -295,12 +295,26 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
     }
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
+    /// Scoped hooks must act only on this original admission. Legacy global
+    /// hooks are retained for compatibility but are not safe for reuse.
+    fn pump_root(&self, _root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("P/C root-scoped pump unsupported"))
+    }
+    fn revoke_root(&self, _root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("P/C root-scoped revoke unsupported"))
+    }
     /// Return a bounded channel reserved for this original root. The session
     /// sends directly with `try_send` and retains another Arc whether delivery
     /// fails, the receiver is dropped, or teacher completion is unresolved.
     fn handoff_sender(
         &self,
     ) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>;
+    fn handoff_sender_root(
+        &self,
+        _root: &RoventCollectionRootAdmissionV2,
+    ) -> Result<std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("P/C root-scoped handoff unsupported"))
+    }
     /// Nonblocking; `None` preserves the still-running original worker.
     fn try_take_root_custody(
         &self,
@@ -2145,6 +2159,7 @@ impl RoventPcSessionDriver {
         let mut v2_hook_started = false;
         let mut v2_hook_revoked = false;
         let mut v2_admission_failure = None;
+        let mut v2_current_admission = None;
         let mut no_capture_v2 = None;
         let run = catch_unwind(AssertUnwindSafe(
             || -> Result<(), crate::pals_adaptive::AdaptiveManagerError> {
@@ -2183,6 +2198,7 @@ impl RoventPcSessionDriver {
                         self.selective_policy,
                     )?;
                     let expected = admission.clone();
+                    v2_current_admission = Some(expected.clone());
                     let hook =
                         self.collection_hooks_v2
                             .as_ref()
@@ -2307,13 +2323,17 @@ impl RoventPcSessionDriver {
                             || manager.phase() != ManagerPhase::Running)
                     {
                         if let Some(hook) = &self.collection_hooks_v2 {
-                            hook.revoke();
+                            hook.revoke_root(v2_current_admission.as_ref().ok_or(
+                                AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
+                            )?)?;
                         }
                         v2_hook_revoked = true;
                     }
                     if v2_hook_started {
                         if let Some(hook) = &self.collection_hooks_v2 {
-                            hook.pump()?;
+                            hook.pump_root(v2_current_admission.as_ref().ok_or(
+                                AdaptiveManagerError::Invalid("P/C pump original root unavailable"),
+                            )?)?;
                         }
                     }
                     if let Some(pump) = &self.collection_hooks.cooperative {
@@ -2383,19 +2403,33 @@ impl RoventPcSessionDriver {
         };
         if v2_hook_started && !v2_hook_revoked {
             if let Some(hook) = &self.collection_hooks_v2 {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hook.revoke())) {
-                    let mut retained = self
-                        .retained_collection_panic_v2
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    retained.0 = original_panic.take();
-                    retained.1 = Some(payload);
-                    *state = State::Manager(manager);
-                    self.closed.store(true, Ordering::Release);
-                    return Err(physical_unknown_at(
-                        "RoventPcV2CollectionRevokePanic",
-                        "original hook and manager retained",
-                    ));
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let root = v2_current_admission.as_ref().ok_or(
+                        AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
+                    )?;
+                    hook.revoke_root(root)
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        if let Some(payload) = original_panic.take() {
+                            self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                        }
+                        *state = State::Manager(manager);
+                        self.closed.store(true, Ordering::Release);
+                        return Err(physical_unknown_at("RoventPcV2CollectionRevoke", error));
+                    }
+                    Err(payload) => {
+                        let mut retained = self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner());
+                        retained.0 = original_panic.take();
+                        retained.1 = Some(payload);
+                        *state = State::Manager(manager);
+                        self.closed.store(true, Ordering::Release);
+                        return Err(physical_unknown_at(
+                            "RoventPcV2CollectionRevokePanic",
+                            "original hook and manager retained",
+                        ));
+                    }
                 }
             }
         }
@@ -2528,9 +2562,16 @@ impl RoventPcSessionDriver {
                 self.collection_hooks_v2
                     .as_ref()
                     .expect("started hook")
-                    .handoff_sender()
+                    .handoff_sender_root(v2_current_admission.as_ref().ok_or(
+                        AdaptiveManagerError::Invalid("P/C handoff original root unavailable"),
+                    )?)
             })) {
-                Ok(sender) => sender,
+                Ok(Ok(sender)) => sender,
+                Ok(Err(error)) => {
+                    *state = State::Manager(manager);
+                    self.closed.store(true, Ordering::Release);
+                    return Err(physical_unknown_at("RoventPcV2HandoffSender", error));
+                }
                 Err(payload) => {
                     self.retained_collection_panic_v2
                         .lock()
@@ -2567,6 +2608,13 @@ impl RoventPcSessionDriver {
                 .retained_collection_handoff_v2
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
+            let same_root = handoff.lock().unwrap_or_else(|p| p.into_inner())
+                .admission.same_original_admission(v2_current_admission.as_ref().expect("started root"));
+            if !same_root {
+                *state = State::Manager(manager);
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at("RoventPcV2HandoffRoot", "original handoff and manager retained"));
+            }
             if sender.try_send(Arc::clone(&handoff)).is_err() {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
