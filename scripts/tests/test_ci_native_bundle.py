@@ -429,6 +429,27 @@ class NativeBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'CatalogSourceMissing'):
             bundle.component_inventory(catalog, rows)
 
+    def test_selected_component_catalog_is_bounded_without_a_fixed_count(self):
+        row = {'path': 'crates/example/src/lib.rs', 'bytes': 1,
+               'sha256': hashlib.sha256(b'x').hexdigest()}
+        catalog = {'domain': 'rz-pals-source-inventory-v5/1',
+                   'algorithm': 'sha256-domain-u64le;sorted-path-u64le-utf8;size-u64le;sha256-raw32',
+                   'components': {name: [row['path']] for name in bundle.CORE5}}
+        catalog['components'].update({f'extra_{number}': [row['path']] for number in range(21)})
+        result = bundle.component_inventory(catalog, [row], selected_profile=True)
+        self.assertEqual(set(result), set(catalog['components']))
+        with self.assertRaisesRegex(RuntimeError, 'CatalogFraming'):
+            bundle.component_inventory(catalog, [row])  # Full-bundle contract remains fixed.
+        for bad in ([row['path'], row['path']], ['crates/unknown/src/lib.rs']):
+            changed = copy.deepcopy(catalog)
+            changed['components']['model_native'] = bad
+            with self.subTest(paths=bad), self.assertRaisesRegex(RuntimeError, 'CatalogSourceMissing'):
+                bundle.component_inventory(changed, [row], selected_profile=True)
+        changed = copy.deepcopy(catalog)
+        del changed['components'][bundle.CORE5[0]]
+        with self.assertRaisesRegex(RuntimeError, 'Core5Missing'):
+            bundle.component_inventory(changed, [row], selected_profile=True)
+
     def test_warm_requires_both_registered_source_and_explicit_exact_feature_target(self):
         name = bundle.WARM[2]
         features = bundle.WARM[3].split(',')
@@ -772,12 +793,12 @@ class RuntimeLoaderBundleTests(unittest.TestCase):
                   'src_path': str(source / self.logical), 'edition': '2024',
                   'required-features': list(required)}
         metadata = {'workspace_root': str(source), 'packages': [{
-            'name': 'rz-eval', 'id': 'SYNTHETIC_LOADER_PACKAGE',
-            'manifest_path': str(source / 'crates/rz-eval/Cargo.toml'), 'targets': [target]}]}
-        output = target_root / 'release/examples/runtime_loader_check'
+            'name': self.spec[0], 'id': 'SYNTHETIC_LOADER_PACKAGE',
+            'manifest_path': str(source / 'crates' / self.spec[0] / 'Cargo.toml'), 'targets': [target]}]}
+        output = target_root / 'release/examples' / self.spec[2]
         messages = [{'reason': 'compiler-artifact', 'package_id': 'SYNTHETIC_LOADER_PACKAGE',
                      'target': copy.deepcopy(target), 'executable': str(output),
-                     'profile': {'test': False}, 'features': ['onnx']},
+                     'profile': {'test': False}, 'features': self.spec[3].split(',')},
                     {'reason': 'build-finished', 'success': True}]
         return metadata, messages, output
 
@@ -805,7 +826,8 @@ class RuntimeLoaderBundleTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             admit(messages, registered=set())
 
-    def run_fixture(self, *, result=(0, True, None), required=('onnx',), profile='runtime-loader-only'):
+    def run_fixture(self, *, result=(0, True, None), required=('onnx',), profile='runtime-loader-only',
+                    gpu_components=None, gpu_getters=None, partial_custody_error=None):
         temporary = tempfile.TemporaryDirectory(prefix='ci-runtime-loader-fixture-')
         self.addCleanup(temporary.cleanup)
         base = Path(temporary.name).resolve()
@@ -816,6 +838,10 @@ class RuntimeLoaderBundleTests(unittest.TestCase):
         source_file.write_bytes(b'// synthetic source; not compiled\n')
         (source / 'Cargo.lock').write_bytes(b'synthetic lock\n')
         (source / 'rust-toolchain.toml').write_text('[toolchain]\nchannel="1.96.0"\n', encoding='utf-8')
+        if gpu_components is not None:
+            inventory = source / 'crates/rz-experiments/src/pals_source_inventory_v5.json'
+            inventory.parent.mkdir(parents=True, exist_ok=True)
+            inventory.write_text('{}', encoding='utf-8')
         rows = [{'path': self.logical, **bundle.file_pin(source_file)}]
         controls = {'synthetic_control': {'bytes': 1, 'sha256': 'a' * 64}}
         metadata, messages, output = self.metadata(source, root / 'target-native', required)
@@ -834,7 +860,7 @@ class RuntimeLoaderBundleTests(unittest.TestCase):
                 raw = json.dumps(metadata).encode()
             elif argv[1:2] == ['build']:
                 self.assertEqual(argv[argv.index('--example') + 1], self.spec[2])
-                self.assertEqual(argv[argv.index('--features') + 1], 'onnx')
+                self.assertEqual(argv[argv.index('--features') + 1], self.spec[3])
                 if result != (0, True, None):
                     os.write(2, b'synthetic original loader compiler failure\n')
                     return result
@@ -857,10 +883,31 @@ class RuntimeLoaderBundleTests(unittest.TestCase):
             stack.enter_context(patch.object(bundle.shutil, 'which', side_effect=lambda name: '/synthetic/' + name))
             stack.enter_context(patch.object(bundle, 'source_inventory', return_value=(rows, controls)))
             stack.enter_context(patch.object(bundle, 'run_group', side_effect=supervise))
-            for name in ('component_inventory', 'warm_spec', 'validate_functional_specs',
+            for name in ('warm_spec', 'validate_functional_specs',
                          'validate_registry', 'validate_rovent_build_metadata'):
                 stack.enter_context(patch.object(bundle, name,
                     side_effect=AssertionError('unrelated full-bundle admission requested')))
+            if gpu_components is None:
+                stack.enter_context(patch.object(bundle, 'component_inventory',
+                    side_effect=AssertionError('unrelated full-bundle admission requested')))
+            else:
+                stack.enter_context(patch.object(bundle, 'component_inventory', return_value=gpu_components))
+            if gpu_getters is not None:
+                def fake_getter(build, *, results, label, validate, **_kwargs):
+                    value = gpu_getters[label]
+                    try:
+                        validate(value)
+                    except (bundle.MetadataMismatch, ValueError, UnicodeError) as error:
+                        results[label] = {'status': 'failed_metadata',
+                                          'error': {'type': type(error).__name__, 'message': str(error)}}
+                        return None
+                    results[label] = {'status': 'verified'}
+                    return value
+                stack.enter_context(patch.object(bundle, 'collect_metadata_getter', side_effect=fake_getter))
+                stack.enter_context(patch.object(bundle, 'validate_registry'))
+            if partial_custody_error is not None:
+                stack.enter_context(patch.object(bundle, 'preserve_partial_binary_bundle',
+                                                 side_effect=partial_custody_error))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             stack.enter_context(patch.object(bundle.sys, 'stderr', io.StringIO()))
             code = bundle.run(source, root, head, 60, **({} if profile is None else {'profile': profile}))
@@ -929,6 +976,73 @@ class RuntimeLoaderBundleTests(unittest.TestCase):
         self.assertFalse(any(row[1:2] == ['build'] for row in dispatched))
         self.assertNotIn(self.spec, bundle.SPECS)
         bundle.validate_functional_specs(bundle.SPECS)
+
+    def test_selected_gpu_profiles_do_not_require_unrelated_targets(self):
+        components = {name: hashlib.sha256(name.encode()).hexdigest() for name in bundle.CORE5}
+        for profile, logical in (
+                ('gpu-numeric-only', 'crates/rz-eval/examples/virtual_review_numeric_capture.rs'),
+                ('gpu-inflight-only', 'crates/rz-uci/examples/virtual_review_gpu_inflight_validation.rs')):
+            with self.subTest(profile=profile):
+                self.spec = bundle.GPU_SELECTED_PROFILES[profile][0]
+                self.logical = logical
+                getters = ({'native-source-pins': dict(components), 'static-model-registry': {}}
+                           if profile == 'gpu-numeric-only' else None)
+                code, root, receipt, dispatched = self.run_fixture(
+                    profile=profile, required=tuple(self.spec[3].split(',')),
+                    gpu_components=components, gpu_getters=getters)
+                self.assertEqual(code, 0)
+                self.assertEqual(receipt['requested_targets'], [list(self.spec)])
+                self.assertEqual(set(receipt['binaries']), {self.spec[2]})
+                self.assertEqual(len([row for row in dispatched if row[1:2] == ['build']]), 1)
+                for flag in ('full_native_bundle_admitted', 'gpu_validation_admitted',
+                             'physical_completion_attested', 'neural_execution', 'gpu_execution'):
+                    self.assertIs(receipt[flag], False)
+                pins = json.loads((root / 'artifact/source-file-pins.json').read_bytes())
+                self.assertEqual(pins['source_components'], components)
+                self.assertEqual(receipt['binary_bundle'], bundle.file_pin(
+                    root / 'artifact' / bundle.GPU_SELECTED_PROFILES[profile][2]))
+
+    def test_selected_numeric_rejects_its_own_source_mismatch(self):
+        self.spec = bundle.GPU_NUMERIC_SPEC
+        self.logical = 'crates/rz-eval/examples/virtual_review_numeric_capture.rs'
+        components = {name: hashlib.sha256(name.encode()).hexdigest() for name in bundle.CORE5}
+        wrong = dict(components)
+        wrong[bundle.CORE5[0]] = hashlib.sha256(b'different source').hexdigest()
+        code, root, receipt, _ = self.run_fixture(
+            profile='gpu-numeric-only', required=tuple(self.spec[3].split(',')),
+            gpu_components=components,
+            gpu_getters={'native-source-pins': wrong, 'static-model-registry': {}})
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertFalse(receipt['physical_completion_attested'])
+        self.assertNotIn('binary_bundle', receipt)
+        self.assertEqual(receipt['metadata_getters']['native-source-pins']['status'], 'failed_metadata')
+        self.assertEqual(receipt['selected_getter_failure'], 'SelectedNumericStaticMetadataFailed')
+        partial = root / 'artifact' / receipt['partial_binary_bundle_file']
+        self.assertEqual(receipt['partial_binary_bundle'], bundle.file_pin(partial))
+        with tarfile.open(partial, 'r:gz') as archive:
+            self.assertEqual(archive.getnames(), ['bin/' + self.spec[2]])
+            self.assertEqual(archive.extractfile('bin/' + self.spec[2]).read(),
+                             b'\x7fELF-synthetic-fixture-never-executed')
+
+    def test_selected_numeric_reports_getter_and_custody_failure_separately(self):
+        self.spec = bundle.GPU_NUMERIC_SPEC
+        self.logical = 'crates/rz-eval/examples/virtual_review_numeric_capture.rs'
+        components = {name: hashlib.sha256(name.encode()).hexdigest() for name in bundle.CORE5}
+        wrong = dict(components)
+        wrong[bundle.CORE5[0]] = hashlib.sha256(b'different source').hexdigest()
+        code, _root, receipt, _ = self.run_fixture(
+            profile='gpu-numeric-only', required=tuple(self.spec[3].split(',')),
+            gpu_components=components,
+            gpu_getters={'native-source-pins': wrong, 'static-model-registry': {}},
+            partial_custody_error=OSError('synthetic custody failure'))
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertEqual(receipt['metadata_getters']['native-source-pins']['status'], 'failed_metadata')
+        self.assertEqual(receipt['selected_getter_failure'], 'SelectedNumericStaticMetadataFailed')
+        self.assertEqual(receipt['partial_custody_error']['type'], 'OSError')
+        self.assertNotIn('partial_binary_bundle', receipt)
+        self.assertNotIn('binary_bundle', receipt)
 
 
 if __name__ == '__main__':

@@ -68,6 +68,15 @@ WARM = ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
         'pals-adaptive,onnx-cpu,experimental-io-binding')
 RUNTIME_LOADER_SPEC = ('rz-eval', 'example', 'runtime_loader_check', 'onnx')
 RUNTIME_LOADER_SUCCESS = 'SAME_HEAD_RUNTIME_LOADER_ELF_AND_SOURCE_PROVENANCE_VERIFIED'
+GPU_NUMERIC_SPEC = ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts')
+GPU_INFLIGHT_SPEC = ('rz-uci', 'example', 'virtual_review_gpu_inflight_validation',
+                     'pals-adaptive,onnx-cuda,experimental-io-binding,native-validation-diagnostics')
+GPU_SELECTED_PROFILES = {
+    'gpu-numeric-only': (GPU_NUMERIC_SPEC, 'SAME_HEAD_GPU_NUMERICAL_CAPTURE_ELF_VERIFIED',
+                         'gpu-numerical-capture-binaries.tar.gz'),
+    'gpu-inflight-only': (GPU_INFLIGHT_SPEC, 'SAME_HEAD_GPU_INFLIGHT_DIAGNOSTIC_ELF_VERIFIED',
+                          'gpu-inflight-diagnostic-binaries.tar.gz'),
+}
 # This standalone example calls the CUDA-enabled eval backend directly. Its
 # required features do not certify the separate engine/native_bootstrap path.
 FUNCTIONAL_SPECS = (
@@ -227,14 +236,19 @@ def source_inventory(source, tree_raw):
     return sorted(rows, key=lambda row: row['path']), controls
 
 
-def component_inventory(catalog, rows):
+def component_inventory(catalog, rows, *, selected_profile=False):
     require(set(catalog) == {'domain', 'algorithm', 'components'}
             and catalog['domain'] == 'rz-pals-source-inventory-v5/1'
             and catalog['algorithm'] == 'sha256-domain-u64le;sorted-path-u64le-utf8;size-u64le;sha256-raw32'
-            and len(catalog['components']) == 25, 'CatalogFraming')
+            and type(catalog['components']) is dict
+            and ((1 <= len(catalog['components']) <= 256) if selected_profile
+                 else len(catalog['components']) == 25), 'CatalogFraming')
     by_path = {row['path']: row for row in rows}
     result = {}
     for name, paths in catalog['components'].items():
+        if selected_profile:
+            require(type(name) is str and re.fullmatch('[a-z][a-z0-9_]{0,127}', name) is not None
+                    and type(paths) is list and all(type(p) is str for p in paths), 'CatalogSourceMissing')
         require(1 <= len(paths) <= 256 and len(set(paths)) == len(paths)
                 and all(p in by_path for p in paths), 'CatalogSourceMissing')
         domain = b'rz-pals-source-component-v5/1'
@@ -365,7 +379,8 @@ def cleanup_compiler_outputs(root, artifact, receipt, *,
     from managed_storage import remove_tree, write_record
     require((success_status, bundle_filename) in (
         ('SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED', 'native-validation-binaries.tar.gz'),
-        (RUNTIME_LOADER_SUCCESS, 'runtime-loader-diagnostic-binaries.tar.gz')),
+        (RUNTIME_LOADER_SUCCESS, 'runtime-loader-diagnostic-binaries.tar.gz'),
+        *((item[1], item[2]) for item in GPU_SELECTED_PROFILES.values())),
         'ClosedCompileCleanupProfile')
     require(receipt['status'] == success_status
             and all(row.get('original_tree_cleanup_verified') is True for row in receipt['commands'])
@@ -538,15 +553,18 @@ def build_runtime_loader_target(build, *, cargo, env, metadata, source, private,
 
 
 def preserve_runtime_loader_sources(artifact, source, expected_head, rows, controls,
-                                    lock, lock_pin, lock_meta):
+                                    lock, lock_pin, lock_meta, *, components=None):
     """Save actual source/lock provenance without querying another target or loading ORT."""
     pins = [{key: row[key] for key in ('path', 'bytes', 'sha256')} for row in rows]
-    write_json(artifact / 'source-file-pins.json', {
-        'schema': 'rovezero.ci-runtime-loader-source-pins/1',
-        'source_commit': expected_head, 'files': pins})
-    write_json(artifact / 'git-source-provenance.json', {
-        'schema': 'rovezero.ci-runtime-loader-source-provenance/1',
-        'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls})
+    source_pins = {'schema': 'rovezero.ci-runtime-loader-source-pins/1',
+                   'source_commit': expected_head, 'files': pins}
+    provenance = {'schema': 'rovezero.ci-runtime-loader-source-provenance/1',
+                  'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls}
+    if components is not None:
+        source_pins.update(schema='rovezero.ci-selected-gpu-source-pins/1', source_components=components)
+        provenance['schema'] = 'rovezero.ci-selected-gpu-source-provenance/1'
+    write_json(artifact / 'source-file-pins.json', source_pins)
+    write_json(artifact / 'git-source-provenance.json', provenance)
     lock.seek(0)
     with (artifact / 'Cargo.lock').open('xb') as target:
         shutil.copyfileobj(lock, target, 65536)
@@ -731,10 +749,15 @@ def validate_rules_descriptor(value, encoder_sha256):
 
 
 def run(source, root, expected_head, seconds, *, profile='native-validation'):
-    require(profile in ('native-validation', 'runtime-loader-only'), 'ExplicitBuildProfile')
+    require(profile in ('native-validation', 'runtime-loader-only', *GPU_SELECTED_PROFILES), 'ExplicitBuildProfile')
     loader_only = profile == 'runtime-loader-only'
-    success_status = RUNTIME_LOADER_SUCCESS if loader_only else 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED'
-    bundle_filename = 'runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'native-validation-binaries.tar.gz'
+    selected_gpu = GPU_SELECTED_PROFILES.get(profile)
+    single_target = loader_only or selected_gpu is not None
+    if selected_gpu:
+        _, success_status, bundle_filename = selected_gpu
+    else:
+        success_status = RUNTIME_LOADER_SUCCESS if loader_only else 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED'
+        bundle_filename = 'runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'native-validation-binaries.tar.gz'
     require(sys.platform == 'linux' and platform.machine() in ('x86_64', 'AMD64')
             and re.fullmatch('[a-f0-9]{40}', expected_head)
             and 1 <= seconds <= MAX_BUILD_SECONDS, 'LinuxFiniteBuildProfile')
@@ -759,7 +782,9 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
         # reserved original process group before returning an unsuccessful row.
         raise KeyboardInterrupt('OwnedBuildCancelled')
     signal.signal(signal.SIGTERM, cancelled)
-    receipt = {'schema': 'rovezero.ci-runtime-loader-diagnostic/1' if loader_only else 'rovezero.ci-cpu-validation-bundle/1',
+    receipt = {'schema': ('rovezero.ci-selected-gpu-build/1' if selected_gpu else
+                          'rovezero.ci-runtime-loader-diagnostic/1' if loader_only else
+                          'rovezero.ci-cpu-validation-bundle/1'),
                'status': 'FAILED_NOT_ADMITTED',
                'source_commit': expected_head, 'commands': build.commands,
                'resource': {'cpu_affinity_actual': affinity, 'build_jobs': 2, 'seconds': seconds,
@@ -770,12 +795,19 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
                'optimizer_updates': 0, 'mapped_image': None, 'numerical_or_runtime_acceptance': None,
                'host': {'machine': platform.machine(), 'libc_observed': platform.libc_ver(),
                         'glibc_compatibility_claim': None},
-               'metadata_getter_scope': 'source_and_selected_Cargo_provenance_only_no_ELF_execution' if loader_only else 'static_source_inventory_core5_registry_rules_only',
+               'metadata_getter_scope': ('selected_numeric_core5_and_registry_only' if profile == 'gpu-numeric-only'
+                                         else 'source_and_selected_Cargo_provenance_only_no_ELF_execution'
+                                         if single_target else 'static_source_inventory_core5_registry_rules_only'),
                'binaries': {}, 'target_failures': []}
     if loader_only:
         receipt.update(diagnostic_profile=profile, diagnostic_binary_executed=False,
                        runtime_loaded=False, model_loaded=False, session_created=False,
                        full_native_bundle_admitted=False)
+    if selected_gpu:
+        receipt.update(diagnostic_profile=profile, runtime_loaded=False, model_loaded=False,
+                       session_created=False, full_native_bundle_admitted=False,
+                       selected_target_only=True, gpu_validation_admitted=False,
+                       physical_completion_attested=False)
     receipt['uploaded_command_log_directory'] = 'command-logs'
     env = {key: os.environ[key] for key in ('PATH', 'HOME', 'RUSTUP_HOME') if key in os.environ}
     for folder in ('cargo-home', 'tmp'):
@@ -797,7 +829,13 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
                              *sorted(SINGLETONS), *PREFIXES, CONTROL], env)
         rows, controls = source_inventory(source, tree)
         if not loader_only:
-            components = component_inventory(strict_json((source / 'crates/rz-experiments/src/pals_source_inventory_v5.json').read_bytes()), rows)
+            catalog = strict_json((source / 'crates/rz-experiments/src/pals_source_inventory_v5.json').read_bytes())
+            # Full-bundle framing remains its existing versioned contract.
+            # Selected targets admit a bounded current catalog and still bind
+            # every digest to actual sources; the native consumer validates
+            # its own embedded map before executing.
+            components = (component_inventory(catalog, rows, selected_profile=True) if selected_gpu
+                          else component_inventory(catalog, rows))
         lock, lock_pin, lock_meta, _ = pinned_file(source / 'Cargo.lock')
         toolchain = tomllib.loads((source / 'rust-toolchain.toml').read_text())
         require(toolchain['toolchain']['channel'] == '1.96.0', 'RegisteredRustToolchain')
@@ -808,11 +846,12 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
         metadata = strict_json(build.command('cargo-metadata', [tools['cargo'], 'metadata', '--locked', '--no-deps',
                                                              '--no-default-features', '--format-version', '1'], env))
         require(metadata['workspace_root'] == str(source), 'ActualCargoWorkspace')
-        if loader_only:
+        if single_target:
             warm = None
-            selected_specs = (RUNTIME_LOADER_SPEC,)
+            selected_specs = (selected_gpu[0] if selected_gpu else RUNTIME_LOADER_SPEC,)
             preserve_runtime_loader_sources(artifact, source, expected_head, rows, controls,
-                                            lock, lock_pin, lock_meta)
+                                            lock, lock_pin, lock_meta,
+                                            components=components if selected_gpu else None)
         else:
             manifest = tomllib.loads((source / 'crates/rz-uci/Cargo.toml').read_text())
             warm, receipt['warm_status'] = warm_spec(manifest, {r['path'] for r in rows})
@@ -837,18 +876,48 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
             build_selected_targets(build, **target_arguments, specs=selected_specs, warm=warm)
         if receipt['target_failures']:
             recheck_registered_inputs()
-            head_label = 'git-head-final' if loader_only else 'git-head-before-static-getters'
+            head_label = 'git-head-final' if single_target else 'git-head-before-static-getters'
             require(build.command(head_label, [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                     'HeadChangedDuringBuild')
-            partial_filename = 'partial-runtime-loader-diagnostic-binaries.tar.gz' if loader_only else 'partial-native-validation-binaries.tar.gz'
+            partial_filename = ('partial-' + bundle_filename if single_target else
+                                'partial-native-validation-binaries.tar.gz')
             preserve_partial_binary_bundle(build, artifact, private, receipt, partial_filename)
-            if loader_only:
-                raise RuntimeError('RequiredRuntimeLoaderTargetFailed')
+            if single_target:
+                raise RuntimeError('RequiredSelectedTargetFailed' if selected_gpu else 'RequiredRuntimeLoaderTargetFailed')
         else:
             require(set(receipt['binaries']) == {spec[2] for spec in selected_specs}, 'CompleteSelectedTargetRoster')
         if warm and warm[2] in receipt['binaries']:
             receipt['warm_status'] = 'BUILT_SAME_HEAD_NOT_EXECUTED_OR_NUMERICALLY_ADMITTED'
-        if loader_only:
+        if single_target:
+            if selected_gpu and profile == 'gpu-numeric-only':
+                getters = receipt['metadata_getters'] = {}
+                def selected_getter(label, arguments, validate):
+                    return collect_metadata_getter(build, artifact=artifact, private=private,
+                        binaries=receipt['binaries'], results=getters, label=label,
+                        target=GPU_NUMERIC_SPEC[2], arguments=arguments, env=env,
+                        validate=validate, failure_check=recheck_registered_inputs)
+                selected_getter('native-source-pins', ['--source-pins'],
+                    lambda value: metadata_require(value == {name: components[name] for name in CORE5},
+                                                   'NativeCore5SourceMismatch'))
+                selected_getter('static-model-registry', ['--model-registry'], validate_registry)
+                if not all(row['status'] == 'verified' for row in getters.values()):
+                    # Preserve the successfully built target even when its own
+                    # later getter fails. Neither the ELF nor the archive is
+                    # admitted for numerical/GPU use by this failure path.
+                    receipt['selected_getter_failure'] = 'SelectedNumericStaticMetadataFailed'
+                    try:
+                        recheck_registered_inputs()
+                        require(build.command('git-head-before-partial', [tools['git'], 'rev-parse', 'HEAD'],
+                                              env).decode().strip() == expected_head,
+                                'HeadChangedDuringBuild')
+                        preserve_partial_binary_bundle(build, artifact, private, receipt,
+                                                       'partial-' + bundle_filename)
+                    except Exception as error:
+                        # Keep the original getter verdict and expose the
+                        # separate evidence-custody failure explicitly.
+                        receipt['partial_custody_error'] = {
+                            'type': type(error).__name__, 'message': str(error)[:2048]}
+                    raise RuntimeError('SelectedNumericStaticMetadataFailed')
             recheck_registered_inputs()
             require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                     'HeadChangedDuringBuild')
@@ -858,6 +927,8 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
                            Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
                            binary_bundle=bundle_pin, binary_bundle_file=bundle_filename,
                            metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
+            if selected_gpu:
+                receipt.update(component_count=len(components), source_components=components)
         else:
             getters = receipt['metadata_getters'] = {}
 
@@ -966,7 +1037,7 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
         require(tree_size(artifact) <= ARTIFACT_CAP, 'Artifact512MiBCap')
         if receipt['status'] == success_status:
             try:
-                if loader_only:
+                if single_target:
                     cleanup_compiler_outputs(root, artifact, receipt, success_status=success_status,
                                              bundle_filename=bundle_filename)
                 else:
@@ -992,6 +1063,7 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--expected-head', required=True)
     parser.add_argument('--timeout', type=int, default=2700)
-    parser.add_argument('--profile', choices=('native-validation', 'runtime-loader-only'), default='native-validation')
+    parser.add_argument('--profile', choices=('native-validation', 'runtime-loader-only', *GPU_SELECTED_PROFILES),
+                        default='native-validation')
     args = parser.parse_args()
     sys.exit(run(args.source_root, args.output_root, args.expected_head, args.timeout, profile=args.profile))
