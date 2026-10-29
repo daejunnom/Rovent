@@ -12,6 +12,7 @@ use rz_uci::rovent_bootstrap::pc_session::{
     RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionPortV2,
     RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2, RoventPcCustodyReturnV2,
     RoventPcCollectionAdmissionOutcomeV2,
+    RoventPcDeferredCleanupV2,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -27,6 +28,7 @@ pub(crate) struct RoventPcCollectionBridgeV2 {
 
 struct PcDeferredRootsV2 {
     originals: Vec<(RoventCollectionRootAdmissionV2, AdaptiveCollectionError)>,
+    cleanup_failures: Vec<Arc<Mutex<RoventPcDeferredCleanupV2>>>,
     overflow: u64,
     first_overflow: Option<(RoventCollectionRootAdmissionV2, AdaptiveCollectionError)>,
 }
@@ -109,6 +111,13 @@ fn handoff_submit(
 }
 
 impl RoventPcCollectionBridgeV2 {
+    pub(crate) fn installed_admission_for_recovery(&self) -> Option<&RoventCollectionRootAdmissionV2> {
+        self.core.installed_admission_for_recovery()
+    }
+    pub(crate) fn try_begin_commit(&self, admission: &RoventCollectionRootAdmissionV2)
+        -> Result<Option<super::collection_hooks_core_v2::RoventCollectionCommitGateV2<'_, RoventPcCollectionHandoffV2>>, ArenaError> {
+        self.core.try_begin_commit(admission)
+    }
     pub(crate) fn new(
         owner: RoventCollectionOwnerLockV2,
         manifest: Arc<RoventCorpusManifestLockV2>,
@@ -117,7 +126,7 @@ impl RoventPcCollectionBridgeV2 {
         let (core, worker) =
             CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
         Ok((Arc::new(Self { core, worker: Mutex::new(None), deferred: Mutex::new(PcDeferredRootsV2 {
-            originals: Vec::with_capacity(256), overflow: 0, first_overflow: None,
+            originals: Vec::with_capacity(256), cleanup_failures: Vec::new(), overflow: 0, first_overflow: None,
         }) }), worker))
     }
 
@@ -167,7 +176,8 @@ impl RoventPcCollectionBridgeV2 {
             serde_json::json!({"root_admission_sha256": admission.raw_sha256(), "stage": format!("{:?}", reason.stage),
                 "code":reason.code, "detail":reason.detail});
         Ok(Some(serde_json::json!({"retained": deferred.originals.iter().map(summarize).collect::<Vec<_>>(),
-            "overflow_count": deferred.overflow, "first_overflow": deferred.first_overflow.as_ref().map(summarize)})))
+            "overflow_count": deferred.overflow, "first_overflow": deferred.first_overflow.as_ref().map(summarize),
+            "unresolved_cleanup_count": deferred.cleanup_failures.len()})))
     }
 
     pub(crate) fn try_has_deferred(&self) -> Result<Option<bool>, ArenaError> {
@@ -275,6 +285,46 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                 admission: failure.admission,
                 owners: failure.owners,
             })
+    }
+    fn finish_deferred(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        fence: &rz_uci::pals_adaptive::RoleOnlyShutdownReceipt,
+    ) -> Result<rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
+        self.core.try_finish_no_capture_role_only(capability, fence).map(|finished| {
+            if finished { rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready }
+            else { rz_uci::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy }
+        }).map_err(|error| AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Settled, "PcNoCaptureFinish", error.to_string())))
+    }
+    fn retain_deferred_cleanup(
+        &self,
+        cleanup: Arc<Mutex<RoventPcDeferredCleanupV2>>,
+    ) -> Result<RoventPcCustodyReturnV2, AdaptiveManagerError> {
+        let mut deferred = match self.deferred.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPcCustodyReturnV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("P/C deferred root custody poisoned")),
+        };
+        if deferred.cleanup_failures.iter().any(|original| Arc::ptr_eq(original, &cleanup)) {
+            return Ok(RoventPcCustodyReturnV2::Accepted);
+        }
+        let item = match cleanup.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RoventPcCustodyReturnV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("P/C deferred cleanup owner poisoned")),
+        };
+        let belongs = deferred.originals.iter().chain(deferred.first_overflow.iter()).any(|(admission, _)|
+            item.capability().same_original_admission(admission));
+        if !belongs || !item.capability().matches_role_only_shutdown_receipt(item.fence()) {
+            return Err(AdaptiveManagerError::Invalid("P/C deferred cleanup original root mismatch"));
+        }
+        drop(item);
+        if deferred.cleanup_failures.len() >= 256 || deferred.cleanup_failures.try_reserve(1).is_err() {
+            return Err(AdaptiveManagerError::Invalid("P/C deferred cleanup custody capacity"));
+        }
+        deferred.cleanup_failures.push(cleanup);
+        Ok(RoventPcCustodyReturnV2::Accepted)
     }
     fn pump(&self) -> Result<(), AdaptiveManagerError> {
         self.core.pump()

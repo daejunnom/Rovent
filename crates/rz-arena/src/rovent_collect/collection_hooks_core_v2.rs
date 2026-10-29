@@ -157,6 +157,14 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         self.owner.try_finish_whole_root_no_capture(capability, receipt)
     }
 
+    pub(crate) fn try_finish_no_capture_role_only(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        receipt: &rz_uci::pals_adaptive::RoleOnlyShutdownReceipt,
+    ) -> Result<bool, ArenaError> {
+        self.owner.try_finish_whole_root_no_capture_role_only(capability, receipt)
+    }
+
     pub(crate) fn new(
         owner: RoventCollectionOwnerLockV2,
         manifest: Arc<RoventCorpusManifestLockV2>,

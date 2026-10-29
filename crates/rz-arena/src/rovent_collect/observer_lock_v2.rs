@@ -195,6 +195,14 @@ impl RoventCollectionOwnerLockV2 {
         self.registration.try_finish_whole_root_no_capture(capability, receipt)
     }
 
+    pub(crate) fn try_finish_whole_root_no_capture_role_only(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        receipt: &rz_uci::pals_adaptive::RoleOnlyShutdownReceipt,
+    ) -> Result<bool, ArenaError> {
+        self.registration.try_finish_whole_root_no_capture_role_only(capability, receipt)
+    }
+
     /// Exercise the real registration mutex without holding the manager
     /// state mutex. The test controls when the closure returns and releases it.
     #[cfg(feature = "test-fixtures")]
@@ -379,6 +387,44 @@ impl RoventCollectionOwnerLockV2 {
             && state.settled_roots.iter().any(|original| original.same_original_admission(admission))
             && (!state.admitted || state.settled) && state.pending.is_empty() && state.staged.is_empty(),
             "lock-v2 original root not settled or observer callbacks still active")?;
+        let root = row.admission.raw_sha256();
+        let producer = if state.producer_root.as_deref() == Some(root) {
+            state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?
+        } else {
+            &mut state.prior_producers.iter_mut().find(|(id, _)| id == root)
+                .ok_or_else(|| invalid("lock-v2 retired row original producer missing"))?.1
+        };
+        producer.validate_admission(admission)?;
+        producer.validate_teacher_row(row)?;
+        Ok(Some(action(producer, row)))
+    }
+
+    /// P-C counterpart: authority comes from its original RoleOnly handoff,
+    /// and the same commit gate excludes a competing root admission.
+    pub(crate) fn try_with_fenced_pc_producer_mut<T>(
+        &self,
+        row: &mut RoventRetiredLockV2Record,
+        gate: &super::collection_hooks_core_v2::RoventCollectionCommitGateV2<
+            '_, rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
+        >,
+        handoff: &mut rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
+        action: impl FnOnce(&mut RoventCorpusProducerLockV2, &mut RoventRetiredLockV2Record) -> T,
+    ) -> Result<Option<T>, ArenaError> {
+        let (admission, _, settlement, fence) = handoff.parts_mut();
+        check(self.same_original_owner(gate.owner()) && gate.matches_admission(admission)
+            && row.admission.same_original_admission(admission)
+            && settlement.is_ok() && fence.authority == admission.root_admission().authority()
+            && fence.root_budget == admission.root_budget() && fence.permits_semantic_closure(),
+            "lock-v2 P/C commit gate/original handoff/physical fence mismatch")?;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+        };
+        check(gate.matches_admission(admission)
+            && state.settled_roots.iter().any(|original| original.same_original_admission(admission))
+            && (!state.admitted || state.settled) && state.pending.is_empty() && state.staged.is_empty(),
+            "lock-v2 P/C original root not settled or observer callbacks still active")?;
         let root = row.admission.raw_sha256();
         let producer = if state.producer_root.as_deref() == Some(root) {
             state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?

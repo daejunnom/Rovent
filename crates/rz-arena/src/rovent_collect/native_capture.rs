@@ -276,6 +276,27 @@ impl RoventNativeCaptureRegistration {
         marker.remove(index);
         Ok(true)
     }
+
+    /// Remove the exact P-C no-capture marker only after its original
+    /// RoleOnly root receipt proves native closure for the same capability.
+    pub(super) fn try_finish_whole_root_no_capture_role_only(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+        receipt: &rz_uci::pals_adaptive::RoleOnlyShutdownReceipt,
+    ) -> Result<bool, ArenaError> {
+        let mut marker = match self.disabled_root.try_lock() {
+            Ok(marker) => marker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 disabled root poisoned")),
+        };
+        let index = marker.iter().position(|entry| matches!(entry,
+            DisabledCaptureRoot::WholeRoot(original)
+                if original.same_original_capability(capability)
+                    && original.matches_role_only_shutdown_receipt(receipt)))
+            .ok_or_else(|| invalid("P/C no-capture marker, original capability or native fence mismatch"))?;
+        marker.remove(index);
+        Ok(true)
+    }
     pub(super) fn clear_disabled_lock_v2_root(
         &self,
         admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,

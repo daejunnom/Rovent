@@ -21,6 +21,7 @@ use rz_uci::rovent_bootstrap::nnuec_session::handoff_escrow_v2::{
 };
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
+use super::own_publisher_v2::{OwnPumpConsumerV2, OwnOfferOutcomeV2, OwnPumpPollV2};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnPumpCommitProgressV2 {
@@ -49,6 +50,23 @@ pub struct RoventNnuecCollectionRunV2 {
     escrow_recovery_error: Option<ArenaError>,
     handoff_transfer_error: Option<RoventNnuecHandoffTransferErrorV2>,
     commit_failure: Option<Box<CommitTeacherPolicyFailureV2>>,
+    publisher: Arc<OwnPumpConsumerV2>,
+    publisher_sender: std::sync::mpsc::SyncSender<PumpItemV2>,
+    publisher_stop: Arc<AtomicBool>,
+    publisher_thread: Option<JoinHandle<Result<(), ArenaError>>>,
+    publisher_exit: Option<Result<(), ArenaError>>,
+    publisher_unknown: bool,
+    publisher_assembly: Option<RoventCorpusAssemblyLockV2>,
+    publisher_directory: Option<Dir>,
+    publisher_output_parent: Option<Dir>,
+    publisher_manifest: Arc<RoventCorpusManifestLockV2>,
+    publisher_output: PathBuf,
+    publisher_max_records: u64,
+    publisher_timeout: Duration,
+    publisher_status: &'static str,
+    publisher_error: Option<ArenaError>,
+    publisher_panic: Option<Box<dyn std::any::Any + Send>>,
+    publisher_receipt: Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
     native_failure: Option<RoventOwnNnuecCollectionLaunchFailureV2>,
     native_failure_taken: bool,
     pre_admission_failure_transferred: bool,
@@ -56,6 +74,105 @@ pub struct RoventNnuecCollectionRunV2 {
 }
 
 impl RoventNnuecCollectionRunV2 {
+    /// Drain and assemble this run's original rows after both worker joins.
+    /// A failure retains the consumer, assembly and output directory in run.
+    fn finish_publisher(&mut self, until: Instant) -> Result<(), ArenaError> {
+        use crate::rovent_collect::collection_hooks_core_v2::PumpSendOutcomeV2;
+        check(self.worker_exit.is_some() && self.publisher_exit.as_ref().is_some_and(Result::is_ok)
+            && self.worker_thread.is_none() && self.publisher_thread.is_none()
+            && !self.worker_thread_panicked && !self.publisher_unknown && !self.worker_custody_poisoned,
+            "Own publisher worker joins not confirmed")?;
+        let admission = {
+            let worker = self.worker.try_lock().map_err(|_| invalid("Own publisher worker busy"))?;
+            let handoff = worker.original_handoff().ok_or_else(|| invalid("Own original handoff missing"))?;
+            let mut handoff = handoff.try_lock().map_err(|_| invalid("Own handoff busy"))?;
+            let admission = handoff.parts_mut().0.clone();
+            check(handoff.teacher_aggregate_ack().is_some(), "Own teacher aggregate not observed")?;
+            admission
+        };
+        if self.publisher_assembly.is_none() {
+            let parent = self.publisher_output.parent().ok_or_else(|| invalid("Own output parent"))?;
+            let leaf = self.publisher_output.file_name().ok_or_else(|| invalid("Own output leaf"))?;
+            self.publisher_output_parent = Some(Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?);
+            let original_parent = self.publisher_output_parent.as_ref().expect("parent retained");
+            original_parent.create_dir(leaf).map_err(io)?;
+            self.publisher_directory = Some(original_parent.open_dir_nofollow(leaf).map_err(io)?);
+            let directory = self.publisher_directory.as_ref().expect("directory retained");
+            directory.create_dir("chunks").map_err(io)?;
+            self.publisher_assembly = Some(RoventCorpusAssemblyLockV2::new(
+                &self.owner, directory, &self.publisher_manifest, &admission, self.publisher_max_records,
+            )?);
+        }
+        let mut assembly = self.publisher_assembly.take().expect("publisher assembly installed");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), ArenaError> {
+            loop {
+                check(Instant::now() < until, "Own publisher deadline elapsed")?;
+                let sent = self.worker.try_lock().map_err(|_| invalid("Own publisher worker busy"))?
+                    .try_send_first_pump_item(&self.publisher_sender)?;
+                let polled = self.publisher.poll()?;
+                let counts = self.publisher.try_counts()?.ok_or_else(|| invalid("Own publisher custody busy"))?;
+                if counts.0 == 0 {
+                    if matches!(sent, PumpSendOutcomeV2::Empty) && matches!(polled, OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected) { break; }
+                    if matches!(polled, OwnPumpPollV2::Full) { return Err(invalid("Own publisher custody full")); }
+                    continue;
+                }
+                match self.try_offer_consumer_item(&self.publisher, &mut assembly)? {
+                    OwnOfferOutcomeV2::Pending => return Err(invalid("Own publisher root gate busy")),
+                    OwnOfferOutcomeV2::FailedRetained => continue,
+                    OwnOfferOutcomeV2::Offered => {}
+                }
+                match self.try_advance_assembly(&mut assembly) {
+                    Ok(true) => {},
+                    Ok(false) => return Err(invalid("Own publisher root gate busy")),
+                    Err(original) => {
+                        if !assembly.chunk_flush_required()? { return Err(original); }
+                        assembly.flush()?;
+                        if !self.try_advance_assembly(&mut assembly)? { return Err(invalid("Own publisher root gate busy")); }
+                    }
+                }
+            }
+            check(!self.publisher.try_has_failures()?.ok_or_else(|| invalid("Own publisher custody busy"))?, "Own collection has retained failed rows")?;
+            self.closed_owner()?;
+            check(self.native_failure.is_none() && !self.native_failure_taken && self.resource_error.is_none(), "Own native/resource failure retained")?;
+            assembly.flush()?;
+            let directory = self.publisher_directory.as_ref().ok_or_else(|| invalid("Own output directory missing"))?;
+            let cancelled = AtomicBool::new(false);
+            self.publisher_receipt = Some(assembly.finish()?.publish_atomic(directory, until, &cancelled)?);
+            Ok(())
+        }));
+        self.publisher_assembly = Some(assembly);
+        match result {
+            Ok(result) => result,
+            Err(payload) => { self.publisher_panic = Some(payload); Err(invalid("Own publisher panicked; original custody retained")) }
+        }
+    }
+    /// Move one original consumer item to assembly only under the exact
+    /// original root gate and handoff. This is not a publication receipt.
+    pub(super) fn try_offer_consumer_item(
+        &self,
+        consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<super::own_publisher_v2::OwnOfferOutcomeV2, ArenaError> {
+        use super::own_publisher_v2::OwnOfferOutcomeV2;
+        if self.worker_thread.is_some() || self.worker_exit.is_none()
+            || self.worker_thread_panicked || self.worker_custody_poisoned
+            || matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::Panicked(_)))
+        { return Ok(OwnOfferOutcomeV2::Pending); }
+        let worker = match self.worker.try_lock() {
+            Ok(worker) => worker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 worker poisoned")),
+        };
+        let Some(handoff) = worker.original_handoff() else { return Ok(OwnOfferOutcomeV2::Pending); };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 handoff poisoned")),
+        };
+        let admission = handoff.parts_mut().0.clone();
+        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(OwnOfferOutcomeV2::Pending); };
+        consumer.try_offer_front(&self.owner, assembly, &gate, &mut handoff)
+    }
     /// Advance a caller-owned assembly with this run's original root gate and
     /// handoff. The assembly keeps the original row on busy/error; success is
     /// only in-memory assembly, not corpus publication or teacher retirement.
@@ -268,6 +385,16 @@ impl RoventNnuecCollectionRunV2 {
                 self.escrow_recovery_error = Some(error);
             }
         }
+        if self.worker_exit.is_some() || self.worker_thread_panicked || self.worker_not_started {
+            self.publisher_stop.store(true, Ordering::Release);
+        }
+        if self.publisher_thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            let handle = self.publisher_thread.take().expect("finished publisher retained");
+            match handle.join() {
+                Ok(result) => self.publisher_exit = Some(result),
+                Err(payload) => { self.publisher_unknown = true; std::mem::forget(payload); }
+            }
+        }
         self.worker_exit.is_some() || self.worker_thread_panicked || self.worker_not_started
             || (self.worker_custody_poisoned && self.worker_thread.is_none())
     }
@@ -362,6 +489,12 @@ impl RoventNnuecCollectionRunV2 {
                 else if self.escrow_recovery_error.is_some() { "failed" }
                 else if self.bridge.installed_admission_for_recovery().is_some() { "pending" }
                 else { "no_installed_admission_observed" },
+            "publisher_status":self.publisher_status,
+            "publisher_joined":self.publisher_exit.is_some(),
+            "publisher_worker_error":self.publisher_exit.as_ref().and_then(|result| result.as_ref().err()).map(|error| error.to_string()),
+            "publisher_unknown":self.publisher_unknown,
+            "publisher_error":self.publisher_error.as_ref().map(|error| error.to_string()),
+            "publisher_receipt":self.publisher_receipt,
             "teacher_worker_observation":worker_observation,
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
@@ -402,7 +535,7 @@ impl RoventNnuecCollectionRunV2 {
             "uci_handoff_custody":if self.transferred_handoff.is_some() { "leased_to_run" } else if self.recovered_handoff.is_some() { "recovered_from_escrow" } else { "unknown" },
             "uci_handoff_registry_released":false,
             "uci_handoff_transfer_error":self.handoff_transfer_error.map(|error|format!("{error:?}")),
-            "physical_completion_claimed":false,"corpus_published":false,"training_executed":false})
+            "physical_completion_claimed":false,"corpus_published":self.publisher_status == "published","training_executed":false})
     }
 
     /// Move the original native failure to a caller that will retain/recover
@@ -464,6 +597,12 @@ impl RoventNnuecCollectionRunV2 {
     /// worker observed the same fenced handoff and teacher retirement. This
     /// authorizes inspection/partial assembly, not final publication.
     pub fn closed_owner(&self) -> Result<RoventCollectionOwnerLockV2, ArenaError> {
+        check(self.bridge.try_has_deferred_observations()? == Some(false),
+            "Collection /2 deferred observations retained or busy")?;
+        let pending = self.bridge.try_pending_stopped_observation()?
+            .ok_or_else(|| invalid("Collection /2 pending observation busy"))?;
+        check(pending.first.is_none() && pending.summarized == 0 && pending.other == 0,
+            "Collection /2 retained pending collection observations")?;
         let worker = self.worker.try_lock().map_err(|_| invalid("Collection /2 worker busy or poisoned"))?;
         let delivered = worker.try_handoff_observation(|handoff| matches!(handoff.handoff_delivery(), Some(Ok(()))))
             .map_err(|error| invalid(format!("Collection /2 handoff delivery observation: {error:?}")))?;
@@ -491,6 +630,9 @@ impl RoventNnuecCollectionRunV2 {
             status.admitted
                 && status.settled
                 && status.pending_count == 0
+                && status.pending_retired_count == 0
+                && status.collection_disabled_first_ticket.is_none()
+                && status.prior_disabled_first_tickets.is_empty()
                 && status.incomplete_capture_count == 0
                 && status.retained_failed_captures == 0
                 && status.retained_failed_staged == 0
@@ -533,12 +675,16 @@ impl Drop for RoventNnuecCollectionRunV2 {
         // UCI's independent retained handoff slot remains unknown.
         let arena_worker_resolved = owner_resolved
             && self.bridge.try_has_deferred_observations().is_ok_and(|observation| observation == Some(false))
+            && self.bridge.try_pending_stopped_observation().is_ok_and(|observation|
+                observation.is_some_and(|summary| summary.first.is_none() && summary.summarized == 0 && summary.other == 0))
             && self.native_failure.is_none()
             && !self.native_failure_taken
             && self.resource_error.is_none()
             && !self.worker_custody_poisoned
             && self.commit_failure.is_none()
             && self.escrow_recovery_error.is_none()
+            && self.publisher_status == "published"
+            && self.publisher_panic.is_none()
             && self
                 .collection_failures()
                 .is_ok_and(|failures| failures.is_empty())
@@ -559,6 +705,12 @@ impl Drop for RoventNnuecCollectionRunV2 {
             std::mem::forget(self.owner.clone());
             std::mem::forget(Arc::clone(&self.bridge));
             std::mem::forget(Arc::clone(&self.worker));
+            std::mem::forget(Arc::clone(&self.publisher));
+            if let Some(assembly) = self.publisher_assembly.take() { std::mem::forget(assembly); }
+            if let Some(directory) = self.publisher_directory.take() { std::mem::forget(directory); }
+            if let Some(parent) = self.publisher_output_parent.take() { std::mem::forget(parent); }
+            if let Some(payload) = self.publisher_panic.take() { std::mem::forget(payload); }
+            if let Some(handle) = self.publisher_thread.take() { std::mem::forget(handle); }
             if let Some(original) = self.commit_failure.take() {
                 std::mem::forget(original);
             }
@@ -606,10 +758,20 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
             collection_owner: entry.collection_owner,
         })
         .collect();
-    let (bridge, worker) =
+    let (bridge, mut worker) =
         RoventNnuecCollectionBridgeV2::new(owner.clone(), Arc::clone(&manifest), roster)?;
-    // The consumer is not yet wired to offer, flush, and publish all original
-    // rows. Keep the teacher row pump disabled until the bounded publisher is live.
+    let (publisher, pump_sender) = OwnPumpConsumerV2::new(plan.maximum_records as usize);
+    worker.configure_pump_sender(pump_sender.clone())?;
+    worker.configure_row_pump(plan.teacher_constraint, Duration::from_nanos(plan.teacher_soft_quantum_ns))?;
+    let publisher_stop = Arc::new(AtomicBool::new(false));
+    let publisher_slot = Arc::new(Mutex::new(None));
+    let admission_publisher_slot = Arc::clone(&publisher_slot);
+    let thread_publisher = Arc::clone(&publisher);
+    let thread_publisher_stop = Arc::clone(&publisher_stop);
+    let publisher_manifest = Arc::clone(&manifest);
+    let publisher_output = plan.output_directory.clone();
+    let publisher_max_records = plan.maximum_records;
+    let publisher_timeout = Duration::from_millis(plan.publication_timeout_ms);
     let worker = Arc::new(Mutex::new(worker));
     let resource = Arc::new(Mutex::new(resources::CollectionResourceCustody::prepare(
         input_directory,
@@ -652,6 +814,14 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
                     detail: error.to_string(),
                 })?;
             }
+            let mut publisher_handle = admission_publisher_slot.lock().map_err(|_| RoventLaunchError {
+                stage: "publisher_worker_start", detail: "publisher handle custody poisoned".into(),
+            })?;
+            let handle = std::thread::Builder::new().name("rovent-own-publisher-v2".into())
+                .spawn(move || thread_publisher.run(&thread_publisher_stop, cleanup_deadline))
+                .map_err(|error| RoventLaunchError { stage: "publisher_worker_start", detail: error.to_string() })?;
+            *publisher_handle = Some(handle);
+            drop(publisher_handle);
             let mut slot = admission_worker_slot.lock().map_err(|_| RoventLaunchError {
                 stage: "teacher_worker_start",
                 detail: "Collection /2 worker handle custody poisoned".into(),
@@ -676,6 +846,11 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         Err(poison) => (poison.into_inner().take(), true),
     };
     let worker_not_started = worker_thread.is_none() && !slot_poisoned;
+    let (publisher_thread, publisher_unknown) = match publisher_slot.lock() {
+        Ok(mut slot) => (slot.take(), false),
+        Err(poison) => (poison.into_inner().take(), true),
+    };
+    if worker_not_started { publisher_stop.store(true, Ordering::Release); }
     let mut run = RoventNnuecCollectionRunV2 {
         resource,
         original_lock,
@@ -692,6 +867,23 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         escrow_recovery_error: None,
         handoff_transfer_error: None,
         commit_failure: None,
+        publisher,
+        publisher_sender: pump_sender,
+        publisher_stop,
+        publisher_thread,
+        publisher_exit: None,
+        publisher_unknown,
+        publisher_assembly: None,
+        publisher_directory: None,
+        publisher_output_parent: None,
+        publisher_manifest,
+        publisher_output,
+        publisher_max_records,
+        publisher_timeout,
+        publisher_status: "pending",
+        publisher_error: None,
+        publisher_panic: None,
+        publisher_receipt: None,
         native_failure: native.err(),
         native_failure_taken: false,
         pre_admission_failure_transferred: false,
@@ -719,6 +911,19 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
     }
     while !run.poll_worker() && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(2));
+    }
+    while run.publisher_thread.is_some() && Instant::now() < cleanup_deadline {
+        run.poll_worker();
+        if run.publisher_thread.is_some() { std::thread::sleep(Duration::from_millis(2)); }
+    }
+    if run.publisher_exit.as_ref().is_some_and(Result::is_ok) && run.worker_exit.is_some() {
+        let until = Instant::now().checked_add(run.publisher_timeout).unwrap_or(cleanup_deadline);
+        match run.finish_publisher(until) {
+            Ok(()) => run.publisher_status = "published",
+            Err(error) => { run.publisher_status = "partial"; run.publisher_error = Some(error); }
+        }
+    } else {
+        run.publisher_status = "unknown_or_not_started";
     }
     Ok(run)
 }

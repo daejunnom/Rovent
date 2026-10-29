@@ -26,6 +26,42 @@ pub struct RoventCorpusAssemblyLockV2 {
 }
 
 impl RoventCorpusAssemblyLockV2 {
+    /// Distinguish a full current chunk from validation, quota or duplicate
+    /// errors while keeping the sealed original row in this assembly.
+    pub(crate) fn chunk_flush_required(&self) -> Result<bool, ArenaError> {
+        match (self.writer.as_ref(), self.sealed.as_ref()) {
+            (Some(writer), Some(row)) => writer.chunk_flush_required(row),
+            _ => Ok(false),
+        }
+    }
+    /// P-C equivalent of the fenced Own advance, tied to the original
+    /// RoleOnly handoff. No row is removed on a busy or failed transition.
+    pub(crate) fn try_advance_fenced_pc(
+        &mut self,
+        gate: &super::collection_hooks_core_v2::RoventCollectionCommitGateV2<
+            '_, rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
+        >,
+        handoff: &mut rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
+    ) -> Result<bool, ArenaError> {
+        check(self.finished.is_none() && self.chunk.is_none(), "lock-v2 assembly closed or chunk pending")?;
+        if let Some(row) = self.pending.as_mut() {
+            match self.owner.try_with_fenced_pc_producer_mut(row, gate, handoff, |producer, row| producer.seal_retired(row))? {
+                None => return Ok(false),
+                Some(result) => result?,
+            }
+            let row = self.pending.take().expect("fenced row retained");
+            self.sealed = Some(PublishedRoventLockV2Record {
+                record: row.record, manifest_sha256: row.manifest_sha256, admission: row.admission,
+            });
+        }
+        if let Some(row) = self.sealed.as_ref() {
+            let next = self.records.checked_add(1).ok_or_else(|| invalid("lock-v2 record count overflow"))?;
+            self.writer.as_mut().ok_or_else(|| invalid("lock-v2 writer missing"))?.append(row)?;
+            self.sealed = None;
+            self.records = next;
+        }
+        Ok(true)
+    }
     /// Advance an Own row only while the original root's commit gate and
     /// native handoff fence exclude concurrent observer callbacks. Busy
     /// leaves the same row and writer in this assembly.

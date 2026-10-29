@@ -30,6 +30,14 @@ pub struct RoventCorpusWriterLockV2 {
 }
 
 impl RoventCorpusWriterLockV2 {
+    /// Whether this exact row requires flushing the existing chunk first.
+    /// Other validation, duplicate and total quota errors remain append errors.
+    pub(crate) fn chunk_flush_required(&self, row: &PublishedRoventLockV2Record) -> Result<bool, ArenaError> {
+        let bytes = serde_json::to_vec(row.record()).map_err(|error| invalid(error.to_string()))?;
+        let row_bytes = bytes.len().checked_add(1).ok_or_else(|| invalid("writer /2 row byte count overflow"))?;
+        Ok(!self.buffer.is_empty() && row_bytes <= MAX_CHUNK_BYTES
+            && self.buffer.len().checked_add(row_bytes).is_some_and(|n| n > MAX_CHUNK_BYTES))
+    }
     /// The manifest is checked against the original admitted lock. An
     /// admission is not a physical-completion or a teacher-result proof.
     pub fn new(

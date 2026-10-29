@@ -25,6 +25,19 @@ pub struct RoventPcCollectionRunV2 {
     owner: RoventCollectionOwnerLockV2,
     bridge: Arc<RoventPcCollectionBridgeV2>,
     worker: Arc<Mutex<RoventPcCollectionWorkerV2>>,
+    pump_consumer: Arc<super::own_publisher_v2::OwnPumpConsumerV2>,
+    pump_thread: Option<std::thread::JoinHandle<Result<(), ArenaError>>>,
+    pump_thread_failure: Option<String>,
+    pump_thread_panic: Option<Box<dyn std::any::Any + Send>>,
+    pump_thread_joined: bool,
+    pump_published: bool,
+    publication_manifest: Arc<RoventCorpusManifestLockV2>,
+    publication_directory: std::path::PathBuf,
+    publication_maximum_records: u64,
+    publication_assembly: Option<RoventCorpusAssemblyLockV2>,
+    publication_dir: Option<Dir>,
+    publication_attempted: bool,
+    publication: Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
     worker_start: Arc<AtomicU8>,
     worker_exit: Option<PcWorkerExitKindV2>,
     worker_thread_panicked: bool,
@@ -34,6 +47,123 @@ pub struct RoventPcCollectionRunV2 {
 }
 
 impl RoventPcCollectionRunV2 {
+    /// Complete a single-root publication using only the original joined
+    /// worker, settled handoff and received rows. Failures retain the owner,
+    /// consumer and any assembly; they never imply physical completion.
+    pub fn publish_single_root(&mut self, until: Instant) -> Result<bool, ArenaError> {
+        use super::own_publisher_v2::{OwnOfferOutcomeV2, OwnPumpPollV2};
+        if self.pump_published { return Ok(true); }
+        check(!self.publication_attempted, "P/C previous publication attempt requires explicit recovery")?;
+        check(self.pump_thread_joined && self.pump_thread_failure.is_none()
+            && self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
+            && self.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C handoff: {e:?}")))?
+            && self.closed_owner().is_ok(), "P/C original worker, native fence or teacher aggregate unavailable")?;
+        check(self.worker.try_lock().is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
+            "P/C worker has pending or failed original rows")?;
+        check(self.owner.try_status()?.is_some_and(|status| status.pending_retired_count == 0),
+            "P/C owner still retains or queues retired original rows")?;
+        check(Instant::now() < until, "P/C publication deadline expired")?;
+        let admission = self.bridge.installed_admission_for_recovery()
+            .ok_or_else(|| invalid("P/C original publication admission unavailable"))?.clone();
+        // Mark before filesystem mutation; a partial create/write must not be
+        // silently retried as a fresh publication.
+        self.publication_attempted = true;
+        let parent = self.publication_directory.parent().ok_or_else(|| invalid("P/C output parent"))?;
+        let leaf = self.publication_directory.file_name().ok_or_else(|| invalid("P/C output leaf"))?;
+        let root = Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?;
+        root.create_dir(leaf).map_err(io)?;
+        let directory = root.open_dir_nofollow(leaf).map_err(io)?;
+        directory.create_dir("chunks").map_err(io)?;
+        self.publication_dir = Some(directory);
+        self.publication_assembly = Some(RoventCorpusAssemblyLockV2::new(
+            &self.owner, self.publication_dir.as_ref().expect("original output owner"),
+            &self.publication_manifest, &admission, self.publication_maximum_records)?);
+        let mut assembly = self.publication_assembly.take().expect("original assembly");
+        let result = (|| -> Result<bool, ArenaError> {
+            loop {
+                check(Instant::now() < until, "P/C publication deadline expired")?;
+                let polled = self.pump_consumer.poll()?;
+                match self.try_offer_consumer_item(&self.pump_consumer, &mut assembly)? {
+                    OwnOfferOutcomeV2::Offered => {
+                        let advanced = match self.try_advance_consumer_assembly(&mut assembly) {
+                            Err(error) if assembly.chunk_flush_required()? => {
+                                assembly.flush()?;
+                                self.try_advance_consumer_assembly(&mut assembly).map_err(|retry| invalid(format!("P/C append before flush: {error}; retry: {retry}")))?
+                            }
+                            other => other?,
+                        };
+                        if !advanced {
+                            return Err(invalid("P/C original commit gate remained busy"));
+                        }
+                    }
+                    OwnOfferOutcomeV2::FailedRetained => return Err(invalid("P/C teacher row failed; original retained")),
+                    OwnOfferOutcomeV2::Pending => match polled {
+                        OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("P/C pump item remained pending")),
+                        OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
+                    },
+                }
+            }
+            check(assembly.records() > 0 && matches!(self.pump_consumer.try_has_failures()?, Some(false)),
+                "P/C publication has no valid rows or retains a teacher failure")?;
+            check(self.owner.try_status()?.is_some_and(|status| status.pending_retired_count == 0)
+                && self.worker.try_lock().is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
+                "P/C original rows remain outside the assembled corpus")?;
+            assembly.flush()?;
+            let directory = self.publication_dir.as_ref().expect("original output owner");
+            let finished = assembly.finish()?;
+            let publication = finished.publish_atomic(directory, until, &AtomicBool::new(false))?;
+            self.publication = Some(publication);
+            Ok(true)
+        })();
+        self.publication_assembly = Some(assembly);
+        if matches!(&result, Ok(true)) { self.pump_published = true; }
+        result
+    }
+    /// Offer an original pump item only under this root's real joined worker,
+    /// handoff and commit gate. It is not a publication receipt.
+    pub(super) fn try_offer_consumer_item(
+        &self,
+        consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<super::own_publisher_v2::OwnOfferOutcomeV2, ArenaError> {
+        use super::own_publisher_v2::OwnOfferOutcomeV2;
+        if self.worker_exit.is_none() || self.worker_thread_panicked { return Ok(OwnOfferOutcomeV2::Pending); }
+        let worker = match self.worker.try_lock() {
+            Ok(worker) => worker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original collection worker poisoned")),
+        };
+        let Some(handoff) = worker.original_handoff() else { return Ok(OwnOfferOutcomeV2::Pending); };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original handoff poisoned")),
+        };
+        let admission = handoff.parts_mut().0.clone();
+        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(OwnOfferOutcomeV2::Pending); };
+        consumer.try_offer_front_pc(&self.owner, assembly, &gate, &mut handoff)
+    }
+
+    pub(super) fn try_advance_consumer_assembly(
+        &self,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<bool, ArenaError> {
+        if self.worker_exit.is_none() || self.worker_thread_panicked { return Ok(false); }
+        let worker = match self.worker.try_lock() {
+            Ok(worker) => worker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original collection worker poisoned")),
+        };
+        let Some(handoff) = worker.original_handoff() else { return Ok(false); };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original handoff poisoned")),
+        };
+        let admission = handoff.parts_mut().0.clone();
+        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(false); };
+        assembly.try_advance_fenced_pc(&gate, &mut handoff)
+    }
     /// Collect only a thread that has already exited; never wait indefinitely
     /// or infer that a still-running worker has physically stopped.
     pub fn poll_worker(&mut self) -> bool {
@@ -83,9 +213,13 @@ impl RoventPcCollectionRunV2 {
             "teacher_worker_exit":worker_exit,
             "teacher_worker_running_or_unknown": match start {
                 WORKER_NOT_STARTED | WORKER_START_FAILED => false,
-                _ => self.worker_thread_panicked || self.worker_exit != Some(PcWorkerExitKindV2::Retirement),
+                _ => self.worker_exit.is_none() && !self.worker_thread_panicked,
             },
             "teacher_worker_thread_panicked":self.worker_thread_panicked,
+            "pump_consumer_joined":self.pump_thread_joined,
+            "pump_consumer_failure":self.pump_thread_failure,
+            "corpus_published":self.pump_published,
+            "publication_attempted":self.publication_attempted,
             "teacher_worker_observation":worker_observation,
             "deferred_collection":deferred_observation,
             "collection_owner_observation":owner_observation,
@@ -102,7 +236,7 @@ impl RoventPcCollectionRunV2 {
                 "failed_staged_inputs":status.retained_failed_staged,
                 "failure":status.failure.map(|error|format!("{error:?}")),
                 "callback_lock_failure":status.callback_lock_failure})),
-            "physical_completion_claimed":false,"corpus_published":false,"training_executed":false})
+            "physical_completion_claimed":false,"training_executed":false})
     }
 
     /// Move the original native failure to a caller that will retain/recover
@@ -120,6 +254,10 @@ impl RoventPcCollectionRunV2 {
     /// physical state or turns the run into a successful completion.
     pub fn take_worker_panic_payload(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
         self.bridge.take_outer_panic()
+    }
+
+    pub fn take_pump_panic_payload(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        self.pump_thread_panic.take()
     }
 
     /// Transfer actual teacher diagnostic bytes only after the worker thread
@@ -231,6 +369,13 @@ impl Drop for RoventPcCollectionRunV2 {
             std::mem::forget(Arc::clone(&self.bridge));
             std::mem::forget(Arc::clone(&self.worker));
         }
+        if !self.pump_thread_joined || self.pump_thread_failure.is_some() || !self.pump_published {
+            std::mem::forget(Arc::clone(&self.pump_consumer));
+            if let Some(thread) = self.pump_thread.take() { std::mem::forget(thread); }
+            if let Some(payload) = self.pump_thread_panic.take() { std::mem::forget(payload); }
+            if let Some(assembly) = self.publication_assembly.take() { std::mem::forget(assembly); }
+            if let Some(directory) = self.publication_dir.take() { std::mem::forget(directory); }
+        }
     }
 }
 
@@ -307,8 +452,11 @@ fn run_rovent_pc_collection_lock_v2_inner(
             collection_owner: entry.collection_owner,
         })
         .collect();
-    let (bridge, worker) =
+    let (bridge, mut worker) =
         RoventPcCollectionBridgeV2::new(owner.clone(), Arc::clone(&manifest), roster)?;
+    let (pump_consumer, pump_sender) = super::own_publisher_v2::OwnPumpConsumerV2::new(plan.maximum_records as usize);
+    worker.configure_row_pump(plan.teacher_constraint, Duration::from_nanos(plan.teacher_soft_quantum_ns))?;
+    worker.configure_pump_sender(pump_sender)?;
     let worker = Arc::new(Mutex::new(worker));
     let resource = Arc::new(Mutex::new(resources::CollectionResourceCustody::prepare(
         input_directory,
@@ -324,6 +472,13 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let admission_owner = owner.clone();
     let admission_stop = Arc::clone(&stop);
     let admission_worker_start = Arc::clone(&worker_start);
+    let pump_thread = Arc::new(Mutex::new(None));
+    let admission_pump_thread = Arc::clone(&pump_thread);
+    let admission_pump_consumer = Arc::clone(&pump_consumer);
+    let admission_pump_stop = Arc::clone(&stop);
+    let publication_manifest = Arc::clone(&manifest);
+    let publication_directory = plan.output_directory.clone();
+    let publication_maximum_records = plan.maximum_records;
     let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> =
         bridge.clone();
     let native = run_pc_collection_v2_with_resource_admission(
@@ -358,6 +513,14 @@ fn run_rovent_pc_collection_lock_v2_inner(
             on_owner(&admission_owner).map_err(|error| RoventLaunchError {
                 stage: "collection_owner_callback", detail: error.to_string(),
             })?;
+            let mut pump_slot = admission_pump_thread.lock().map_err(|_| RoventLaunchError {
+                stage: "collection_pump_start", detail: "pump thread custody poisoned".into(),
+            })?;
+            let thread = std::thread::Builder::new().name("rovent-pc-pump-consumer-v2".into())
+                .spawn(move || admission_pump_consumer.run(&admission_pump_stop, worker_deadline))
+                .map_err(|error| RoventLaunchError { stage: "collection_pump_start", detail: error.to_string() })?;
+            *pump_slot = Some(thread);
+            drop(pump_slot);
             admission_worker_start.store(WORKER_STARTING, Ordering::Release);
             match admission_bridge.start_worker(&admission_worker, admission_stop, worker_deadline) {
                 Ok(()) => admission_worker_start.store(WORKER_STARTED, Ordering::Release),
@@ -376,12 +539,26 @@ fn run_rovent_pc_collection_lock_v2_inner(
         },
     );
     stop.store(true, Ordering::Release);
+    let pump_thread = pump_thread.lock().map_err(|_| invalid("P/C pump thread custody poisoned"))?.take();
     let mut run = RoventPcCollectionRunV2 {
         resource,
         original_lock,
         owner,
         bridge,
         worker,
+        pump_consumer,
+        pump_thread,
+        pump_thread_failure: None,
+        pump_thread_panic: None,
+        pump_thread_joined: false,
+        pump_published: false,
+        publication_manifest,
+        publication_directory,
+        publication_maximum_records,
+        publication_assembly: None,
+        publication_dir: None,
+        publication_attempted: false,
+        publication: None,
         worker_start,
         worker_exit: None,
         worker_thread_panicked: false,
@@ -411,6 +588,24 @@ fn run_rovent_pc_collection_lock_v2_inner(
     }
     while !run.poll_worker() && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(2));
+    }
+    while run.pump_thread.as_ref().is_some_and(|thread| !thread.is_finished()) && Instant::now() < cleanup_deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    match run.pump_thread.take() {
+        Some(thread) if thread.is_finished() => {
+            run.pump_thread_joined = true;
+            match thread.join() {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => run.pump_thread_failure = Some(error.to_string()),
+                Err(payload) => {
+                    run.pump_thread_panic = Some(payload);
+                    run.pump_thread_failure = Some("P/C pump consumer panicked".into());
+                }
+            }
+        }
+        Some(thread) => run.pump_thread = Some(thread),
+        None => run.pump_thread_joined = true,
     }
     Ok(run)
 }

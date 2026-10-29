@@ -208,6 +208,28 @@ pub enum RoventPcCustodyReturnV2 {
     Busy,
 }
 
+/// Failed marker cleanup after the same root's native fence. This owns the
+/// original capability and diagnostic; it never claims collection completion.
+pub struct RoventPcDeferredCleanupV2 {
+    capability: crate::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+    reason: AdaptiveCollectionError,
+    fence: RoleOnlyShutdownReceipt,
+    cleanup_failure: RoventPcDeferredCleanupFailureV2,
+    retention_failure: Option<AdaptiveManagerError>,
+}
+pub enum RoventPcDeferredCleanupFailureV2 {
+    Busy,
+    Error(AdaptiveManagerError),
+    Panic(Box<dyn Any + Send>),
+}
+impl RoventPcDeferredCleanupV2 {
+    pub fn capability(&self) -> &crate::pals_adaptive::RoventNoCaptureRootCapabilityV2 { &self.capability }
+    pub fn reason(&self) -> &AdaptiveCollectionError { &self.reason }
+    pub fn fence(&self) -> &RoleOnlyShutdownReceipt { &self.fence }
+    pub fn failure(&self) -> &RoventPcDeferredCleanupFailureV2 { &self.cleanup_failure }
+    pub fn retention_failure(&self) -> Option<&AdaptiveManagerError> { self.retention_failure.as_ref() }
+}
+
 impl RoventPcCollectionRootCustodyV2 {
     /// The adapter constructs this only after joining the original worker.
     pub fn from_joined_worker(
@@ -262,6 +284,14 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
         _fence: &RoleOnlyShutdownReceipt,
     ) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
         Err(AdaptiveManagerError::Invalid("P/C no-capture cleanup unsupported"))
+    }
+    /// Keep the exact unresolved cleanup and its original diagnostic. Success
+    /// means custody only, not marker removal or collection publication.
+    fn retain_deferred_cleanup(
+        &self,
+        _cleanup: Arc<Mutex<RoventPcDeferredCleanupV2>>,
+    ) -> Result<RoventPcCustodyReturnV2, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("P/C deferred cleanup custody unsupported"))
     }
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
@@ -780,6 +810,7 @@ pub struct RoventPcSessionDriver {
     retained_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionHandoffV2>>>>,
     retained_collection_custody_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionRootCustodyV2>>>>,
     retained_no_capture_v2: Mutex<Option<(crate::pals_adaptive::RoventNoCaptureRootCapabilityV2, AdaptiveCollectionError)>>,
+    retained_deferred_cleanup_v2: Mutex<Option<Arc<Mutex<RoventPcDeferredCleanupV2>>>>,
     retained_collection_failure_v2: Mutex<Option<RoventPcCollectionAdmissionFailureV2>>,
     retained_collection_panic_v2: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
     selective_policy: Digest,
@@ -1111,6 +1142,7 @@ impl RoventPcSessionDriver {
             retained_collection_handoff_v2: Mutex::new(None),
             retained_collection_custody_v2: Mutex::new(None),
             retained_no_capture_v2: Mutex::new(None),
+            retained_deferred_cleanup_v2: Mutex::new(None),
             retained_collection_failure_v2: Mutex::new(None),
             retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
@@ -1421,6 +1453,7 @@ impl RoventPcSessionDriver {
             retained_collection_handoff_v2: Mutex::new(None),
             retained_collection_custody_v2: Mutex::new(None),
             retained_no_capture_v2: Mutex::new(None),
+            retained_deferred_cleanup_v2: Mutex::new(None),
             retained_collection_failure_v2: Mutex::new(None),
             retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
@@ -2434,32 +2467,58 @@ impl RoventPcSessionDriver {
                 return Err(physical_unknown_at("RoventPcNoCaptureOwner", "original collection hook unavailable"));
             };
             let signal = manager.activity_signal();
-            loop {
+            let cleanup_failure = loop {
                 let observed = signal.version();
                 match catch_unwind(AssertUnwindSafe(|| hook.finish_deferred(&capability, &physical))) {
-                    Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready)) => break,
+                    Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready)) => break None,
                     Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) if Instant::now() < context.shutdown_deadline => {
                         signal.wait_changed(observed, context.shutdown_deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
                     }
                     Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) => {
-                        *state = State::Manager(manager);
-                        self.closed.store(true, Ordering::Release);
-                        return Err(physical_unknown_at("RoventPcNoCaptureBusy", "marker remained busy until original deadline"));
+                        break Some(RoventPcDeferredCleanupFailureV2::Busy);
                     }
                     Ok(Err(error)) => {
-                        *state = State::Manager(manager);
-                        self.closed.store(true, Ordering::Release);
-                        return Err(physical_unknown_at("RoventPcNoCaptureCleanup", error));
+                        break Some(RoventPcDeferredCleanupFailureV2::Error(error));
                     }
                     Err(payload) => {
-                        self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
-                        *state = State::Manager(manager);
-                        self.closed.store(true, Ordering::Release);
-                        return Err(physical_unknown_at("RoventPcNoCaptureCleanupPanic", "original marker owner retained"));
+                        break Some(RoventPcDeferredCleanupFailureV2::Panic(payload));
                     }
                 }
+            };
+            if let Some(cleanup_failure) = cleanup_failure {
+                let (capability, reason) = self.retained_no_capture_v2.lock().unwrap_or_else(|p| p.into_inner()).take()
+                    .expect("original no-capture owner remains with this root");
+                let cleanup = Arc::new(Mutex::new(RoventPcDeferredCleanupV2 {
+                    capability, reason, fence: physical.clone(), cleanup_failure, retention_failure: None,
+                }));
+                *self.retained_deferred_cleanup_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&cleanup));
+                let transferred = loop {
+                    let observed = signal.version();
+                    match catch_unwind(AssertUnwindSafe(|| hook.retain_deferred_cleanup(Arc::clone(&cleanup)))) {
+                        Ok(Ok(RoventPcCustodyReturnV2::Accepted)) => break true,
+                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) if Instant::now() < context.shutdown_deadline => {
+                            signal.wait_changed(observed, context.shutdown_deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                        }
+                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) => break false,
+                        Ok(Err(error)) => {
+                            cleanup.lock().unwrap_or_else(|p| p.into_inner()).retention_failure = Some(error);
+                            break false;
+                        }
+                        Err(payload) => {
+                            self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                            break false;
+                        }
+                    }
+                };
+                if !transferred {
+                    *state = State::Manager(manager);
+                    self.closed.store(true, Ordering::Release);
+                    return Err(failure("RoventPcNoCaptureCustody", "native fence confirmed; original marker cleanup and failure retained"));
+                }
+                self.retained_deferred_cleanup_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
+            } else {
+                self.retained_no_capture_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
             }
-            self.retained_no_capture_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
             self.collection_v2_outstanding.store(false, Ordering::Release);
         }
         if v2_hook_started {
@@ -3229,6 +3288,9 @@ impl Drop for RoventPcSessionDriver {
             }
             if let Some(capability) = self.retained_no_capture_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
                 std::mem::forget(capability);
+            }
+            if let Some(cleanup) = self.retained_deferred_cleanup_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+                std::mem::forget(cleanup);
             }
             if let Some(failure) = self
                 .retained_collection_failure_v2

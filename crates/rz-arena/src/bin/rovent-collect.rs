@@ -98,7 +98,8 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
     if plan.maximum_roots != 1 {
         return Err("V2 runner supports exactly one root".into());
     }
-    let (observation, accepted) = match cli.mode.as_str() {
+    let publication_timeout_ms = plan.publication_timeout_ms;
+    let (observation, accepted, publication, publication_error) = match cli.mode.as_str() {
         "pc" => {
             let mut run = run_rovent_pc_collection_lock_v2(
                 cli.original,
@@ -114,6 +115,14 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                         .min(Duration::from_millis(10)),
                 );
             }
+            let until = Instant::now().checked_add(Duration::from_millis(publication_timeout_ms))
+                .ok_or("publication deadline overflow")?.min(cleanup_until);
+            let result = run.publish_single_root(until);
+            let (publication, publication_error) = match result {
+                Ok(true) => ("published", None),
+                Ok(false) => ("partial", None),
+                Err(error) => ("partial", Some(error.to_string())),
+            };
             let observation = run.observation();
             let accepted = run.closed_owner().is_ok()
                 && observation
@@ -122,7 +131,7 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                 && observation
                     .get("resource_error")
                     .is_some_and(serde_json::Value::is_null);
-            (observation, accepted)
+            (observation, accepted, publication, publication_error)
         }
         "own-nnuec" => {
             let mut run = run_rovent_own_nnuec_collection_lock_v2(
@@ -147,7 +156,13 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                 && observation
                     .get("resource_error")
                     .is_some_and(serde_json::Value::is_null);
-            (observation, accepted)
+            let publication = observation.get("publisher_status").and_then(serde_json::Value::as_str)
+                .map(|value| match value {
+                    "published" if observation.get("corpus_published").and_then(serde_json::Value::as_bool) == Some(true) => "published",
+                    "published" | "partial" => "partial", _ => "unknown_or_not_started" })
+                .unwrap_or("unknown_or_not_started");
+            let error = observation.get("publisher_error").and_then(serde_json::Value::as_str).map(str::to_owned);
+            (observation, accepted, publication, error)
         }
         _ => return Err("unsupported V2 collection mode".into()),
     };
@@ -155,7 +170,7 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
         "input_directory":cli.input, "output_directory":cli.output, "worker_timeout_ms":cli.worker_ms,
         "cleanup_timeout_ms":cli.cleanup_ms, "runner_observation":observation,
-        "owner_inspection_available":accepted, "publication":"not_attempted", "training_executed":false,
+        "owner_inspection_available":accepted, "publication":publication, "publication_error":publication_error, "training_executed":false,
         "owner_custody":"process_lifetime_only", "durable_recovery":"unavailable",
         "native_execution_deadline":"external_supervisor_required", "cli_acceptance":"incomplete"}),
         false,
