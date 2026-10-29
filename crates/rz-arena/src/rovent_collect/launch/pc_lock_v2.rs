@@ -55,13 +55,17 @@ impl RoventPcCollectionRunV2 {
         if self.pump_published { return Ok(true); }
         check(!self.publication_attempted, "P/C previous publication attempt requires explicit recovery")?;
         check(self.pump_thread_joined && self.pump_thread_failure.is_none()
-            && self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
+            && matches!(self.worker_exit, Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement))
             && self.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C handoff: {e:?}")))?
             && self.closed_owner().is_ok(), "P/C original worker, native fence or teacher aggregate unavailable")?;
         check(self.worker.try_lock().is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
             "P/C worker has pending or failed original rows")?;
         check(self.owner.try_status()?.is_some_and(|status| status.pending_retired_count == 0),
             "P/C owner still retains or queues retired original rows")?;
+        check(matches!(self.bridge.try_has_deferred()?, Some(false))
+            && self.owner.try_status()?.is_some_and(|status|
+                status.collection_disabled_first_ticket.is_none() && status.prior_disabled_first_tickets.is_empty()),
+            "P/C collection was deferred or capture was disabled")?;
         check(Instant::now() < until, "P/C publication deadline expired")?;
         let admission = self.bridge.installed_admission_for_recovery()
             .ok_or_else(|| invalid("P/C original publication admission unavailable"))?.clone();
@@ -219,6 +223,7 @@ impl RoventPcCollectionRunV2 {
             "pump_consumer_joined":self.pump_thread_joined,
             "pump_consumer_failure":self.pump_thread_failure,
             "corpus_published":self.pump_published,
+            "publisher_receipt":self.publication,
             "publication_attempted":self.publication_attempted,
             "teacher_worker_observation":worker_observation,
             "deferred_collection":deferred_observation,
@@ -466,6 +471,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let admission_resource = Arc::clone(&resource);
     let admission_lock = Arc::clone(&original_lock);
     let stop = Arc::new(AtomicBool::new(false));
+    let pump_stop = Arc::new(AtomicBool::new(false));
     let worker_start = Arc::new(AtomicU8::new(WORKER_NOT_STARTED));
     let admission_bridge = Arc::clone(&bridge);
     let admission_worker = Arc::clone(&worker);
@@ -475,7 +481,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let pump_thread = Arc::new(Mutex::new(None));
     let admission_pump_thread = Arc::clone(&pump_thread);
     let admission_pump_consumer = Arc::clone(&pump_consumer);
-    let admission_pump_stop = Arc::clone(&stop);
+    let admission_pump_stop = Arc::clone(&pump_stop);
     let publication_manifest = Arc::clone(&manifest);
     let publication_directory = plan.output_directory.clone();
     let publication_maximum_records = plan.maximum_records;
@@ -589,6 +595,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
     while !run.poll_worker() && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
+    pump_stop.store(true, Ordering::Release);
     while run.pump_thread.as_ref().is_some_and(|thread| !thread.is_finished()) && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
