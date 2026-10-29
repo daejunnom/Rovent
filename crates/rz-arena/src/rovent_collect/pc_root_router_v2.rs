@@ -10,7 +10,7 @@ use rz_uci::rovent_bootstrap::{RoventStartupControl, pc_session::{
     RoventPcCollectionAdmissionFailureV2, RoventPcCollectionAdmissionOutcomeV2,
     RoventPcCollectionAdmissionPortV2, RoventPcCollectionHandoffV2,
     RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2, RoventPcCustodyReturnV2,
-    RoventPcDeferredCleanupV2,
+    RoventPcDeferredCleanupV2, RoventPcRevokeObservationV2,
 }};
 use std::sync::{Arc, Mutex, OnceLock, mpsc, atomic::{AtomicU8, Ordering}};
 
@@ -264,7 +264,9 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                 }
                 Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }) => {
                     state.store(SLOT_READY, Ordering::Release);
-                    self.defer_if_closed(port, admission)
+                    // The bridge may be waiting on the original attempt lock;
+                    // Pending does not establish that installation did not start.
+                    Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission })
                 }
                 Ok(other @ RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { .. }) => {
                     state.store(SLOT_UNAVAILABLE_BEFORE_INSTALL, Ordering::Release);
@@ -323,6 +325,10 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
     }
     fn revoke_root(&self, root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
         self.original_slot(root)?.revoke_root(root)
+    }
+    fn revoke_root_observed(&self, root: &RoventCollectionRootAdmissionV2, observation: RoventPcRevokeObservationV2)
+        -> Result<(), AdaptiveManagerError> {
+        self.original_slot(root)?.revoke_root_observed(root, observation)
     }
     fn handoff_sender_root(&self, root: &RoventCollectionRootAdmissionV2)
         -> Result<mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>, AdaptiveManagerError> {

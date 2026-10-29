@@ -5,7 +5,7 @@
 //! a prepared root is not corpus publication or physical completion.
 use super::{invalid, ArenaError, RoventCollectionOwnerLockV2};
 use super::launch::own_publisher_v2::{OwnPumpConsumerV2, OwnPumpPollV2};
-use super::pc_hooks_lock_v2::{PcRootSeparationV2, PcWorkerStartErrorV2, RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2};
+use super::pc_hooks_lock_v2::{PcRootSeparationV2, PcWorkerExitKindV2, PcWorkerStartErrorV2, RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2};
 use super::pc_root_router_v2::{PcPreparedSlotOutcomeV2, RoventPcRootRouterV2};
 use super::teacher::v2_session::RoventTeacherRosterEntryV2;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
@@ -24,7 +24,15 @@ pub(crate) struct PcSecondarySlotV2 {
     pub(crate) consumer: Arc<OwnPumpConsumerV2>,
     pub(crate) retained_previous_rows: usize,
     pub(crate) published_to_router: bool,
+    pub(crate) worker_start: PcSecondaryWorkerStartV2,
+    pub(crate) worker_join_observed: bool,
+    pub(crate) worker_exit_kind: Option<PcWorkerExitKindV2>,
+    pub(crate) consumer_drained_after_join: bool,
+    pub(crate) consumer_empty_before_worker_start: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PcSecondaryWorkerStartV2 { StartingUnknown, Started, FailedBeforeStart }
 
 struct SupervisorState {
     slots: Vec<PcSecondarySlotV2>,
@@ -57,8 +65,10 @@ impl PcWorkerSupervisorV2 {
         maximum_roots: usize,
         maximum_records: usize,
         worker_deadline: Instant,
+        cleanup_deadline: Instant,
     ) -> Result<Self, ArenaError> {
-        if !(2..=64).contains(&maximum_roots) || maximum_records == 0 || Instant::now() >= worker_deadline {
+        if !(2..=64).contains(&maximum_roots) || maximum_records == 0 || Instant::now() >= worker_deadline
+            || worker_deadline > cleanup_deadline {
             return Err(invalid("P/C worker supervisor bounds or deadline"));
         }
         let startup = router.original_startup().ok_or_else(|| invalid("P/C original startup control unavailable"))?.clone();
@@ -94,6 +104,49 @@ impl PcWorkerSupervisorV2 {
                 drop(guard);
                 thread::sleep(Duration::from_millis(2));
             }
+            // Once the original stop/deadline is reached, stop the secondary
+            // workers and drain only until the already registered cleanup
+            // ceiling. Empty is final only after that same worker joined.
+            thread_stop.store(true, Ordering::Release);
+            while Instant::now() < cleanup_deadline {
+                let mut guard = match thread_state.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => break,
+                };
+                let mut failure = None;
+                let mut all_done = true;
+                let SupervisorState { slots, pending, .. } = &mut *guard;
+                for slot in slots.iter_mut().chain(pending.iter_mut()) {
+                    if slot.worker_start != PcSecondaryWorkerStartV2::FailedBeforeStart {
+                        match slot.bridge.poll_worker() {
+                            Ok(Some(kind)) => { slot.worker_join_observed = true; slot.worker_exit_kind = Some(kind); }
+                            Ok(None) => {},
+                            Err(error) => { failure = Some(invalid(format!("P/C secondary worker join: {error:?}"))); }
+                        }
+                    }
+                    match slot.consumer.poll() {
+                        Ok(OwnPumpPollV2::Received) => slot.consumer_drained_after_join = false,
+                        Ok(OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected) if slot.worker_join_observed => {
+                            slot.consumer_drained_after_join = true;
+                        }
+                        Ok(OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected)
+                            if slot.worker_start == PcSecondaryWorkerStartV2::FailedBeforeStart => {
+                            slot.consumer_empty_before_worker_start = true;
+                        }
+                        Ok(OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected) => {},
+                        Ok(OwnPumpPollV2::Full) => { failure = Some(invalid("P/C secondary consumer capacity reached during drain")); }
+                        Err(error) => { failure = Some(error); }
+                    }
+                    if !(slot.worker_join_observed && slot.consumer_drained_after_join)
+                        && !(slot.worker_start == PcSecondaryWorkerStartV2::FailedBeforeStart && slot.consumer_empty_before_worker_start) {
+                        all_done = false;
+                    }
+                }
+                if let Some(error) = failure { guard.error.get_or_insert(error); }
+                drop(guard);
+                if all_done { break; }
+                thread::sleep(Duration::from_millis(2));
+            }
         }).map_err(|error| ArenaError::Io(error.to_string()))?;
         Ok(Self { state, stop, thread: Some(thread), joined: false, panic: None, transferred: false })
     }
@@ -113,13 +166,30 @@ impl PcWorkerSupervisorV2 {
         true
     }
 
-    /// Transfer the exact retained slots only after the supervisor has joined.
-    /// The caller assumes their complete lifetime, publication and recovery
-    /// obligations.  A pending slot is included even on failure.
+    /// Transfer exact slots only once their worker joins and terminal custody
+    /// are observed as well. A child that remains unknown stays in this
+    /// supervisor; supervisor join alone never establishes child completion.
     pub(crate) fn take_joined_slots(&mut self) -> Result<Option<(Vec<PcSecondarySlotV2>, Option<ArenaError>)>, ArenaError> {
         if !self.joined || self.panic.is_some() { return Ok(None); }
         if self.transferred { return Err(invalid("P/C supervisor slots already transferred")); }
         let mut state = self.state.try_lock().map_err(|_| invalid("P/C supervisor state busy or poisoned"))?;
+        for slot in state.slots.iter().chain(state.pending.iter()) {
+            if slot.worker_start == PcSecondaryWorkerStartV2::FailedBeforeStart
+                && slot.consumer_empty_before_worker_start { continue; }
+            if !slot.worker_join_observed || !slot.consumer_drained_after_join { return Ok(None); }
+            match slot.worker_exit_kind {
+                Some(PcWorkerExitKindV2::NoAdmission) => {},
+                Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement) => {
+                    if !slot.bridge.returned_handoff_settled()
+                        .map_err(|error| invalid(format!("P/C secondary handoff: {error:?}")))? {
+                        return Ok(None);
+                    }
+                }
+                // A thread join does not resolve a child/process panic,
+                // timeout, cancellation or physical-only observation.
+                _ => return Ok(None),
+            }
+        }
         if let Some(pending) = state.pending.take() { state.slots.push(pending); }
         let slots = std::mem::take(&mut state.slots);
         let error = state.error.take();
@@ -170,6 +240,9 @@ fn supervisor_step(
         }
     } else {
         let Some(status) = owner.try_status()? else { return Ok(()); };
+        if status.game_record_limit != maximum_records {
+            return Err(invalid("P/C supervisor and original owner record limits differ"));
+        }
         let Some(reserved) = status.game_reserved_slots else { return Err(invalid("P/C game record budget unknown")); };
         if status.game_retired_total.checked_add(reserved).is_none_or(|used| used >= status.game_record_limit) {
             return Ok(());
@@ -188,10 +261,17 @@ fn supervisor_step(
         let worker = Arc::new(Mutex::new(worker));
         state.pending = Some(PcSecondarySlotV2 { previous, previous_admission: admission,
             bridge: Arc::clone(&next), worker: Arc::clone(&worker), consumer,
-            retained_previous_rows: 0, published_to_router: false });
+            retained_previous_rows: 0, published_to_router: false,
+            worker_start: PcSecondaryWorkerStartV2::StartingUnknown,
+            worker_join_observed: false, worker_exit_kind: None,
+            consumer_drained_after_join: false, consumer_empty_before_worker_start: false });
         match next.start_worker(&worker, Arc::clone(stop), deadline) {
-            Ok(()) => {},
-            Err(PcWorkerStartErrorV2::BeforeStart(error) | PcWorkerStartErrorV2::Unknown(error)) => return Err(error),
+            Ok(()) => state.pending.as_mut().expect("original secondary slot retained").worker_start = PcSecondaryWorkerStartV2::Started,
+            Err(PcWorkerStartErrorV2::BeforeStart(error)) => {
+                state.pending.as_mut().expect("original secondary slot retained").worker_start = PcSecondaryWorkerStartV2::FailedBeforeStart;
+                return Err(error);
+            }
+            Err(PcWorkerStartErrorV2::Unknown(error)) => return Err(error),
         }
     }
     let pending = state.pending.as_ref().expect("prepared original secondary slot");

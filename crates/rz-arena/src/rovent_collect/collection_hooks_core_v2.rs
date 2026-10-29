@@ -48,6 +48,9 @@ const GAME_ACTIVE: u64 = 2;
 const GAME_COMMITTING: u64 = 3;
 const GAME_UNKNOWN: u64 = 4;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreUnstartedSealV2 { Sealed, Busy, Unknown }
+
 struct GameInstallGuard<'a> {
     gate: &'a AtomicU64,
     generation: u64,
@@ -116,6 +119,8 @@ pub(crate) struct CollectionBridgeCoreV2<H> {
     owner: RoventCollectionOwnerLockV2,
     game_gate: Arc<AtomicU64>,
     game_generation: AtomicU64,
+    original_attempt: Mutex<Option<RoventCollectionRootAdmissionV2>>,
+    unstarted_sealed: AtomicBool,
     admissions: mpsc::SyncSender<Arc<AdmissionSlot>>,
     handoffs: mpsc::SyncSender<Arc<Mutex<H>>>,
     admission_phase: Arc<AtomicU8>,
@@ -163,6 +168,39 @@ impl<H> Drop for RoventCollectionCommitGateV2<'_, H> {
 }
 
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
+    /// Called only by this admission before invoking the install callback.
+    /// A competing cancellation never becomes proof of an unstarted root.
+    fn close_reserved_before_install(&self) {
+        if self.admission_phase.compare_exchange(
+            ADMISSION_RESERVED, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire,
+        ).is_ok() {
+            self.unstarted_sealed.store(true, Ordering::Release);
+        }
+    }
+    /// Fence only the same original attempt before observer installation.
+    /// RESERVED/installed or an unbound root cannot be called unstarted.
+    pub(crate) fn try_seal_unstarted(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<CoreUnstartedSealV2, ArenaError> {
+        let attempt = match self.original_attempt.try_lock() {
+            Ok(attempt) => attempt,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(CoreUnstartedSealV2::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Collection original attempt poisoned".into())),
+        };
+        let Some(original) = attempt.as_ref() else { return Ok(CoreUnstartedSealV2::Unknown); };
+        if !original.same_original_admission(admission) {
+            return Err(ArenaError::Invalid("Collection unstarted root differs from original attempt".into()));
+        }
+        match self.admission_phase.compare_exchange(ADMISSION_OPEN, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                self.unstarted_sealed.store(true, Ordering::Release);
+                Ok(CoreUnstartedSealV2::Sealed)
+            }
+            Err(ADMISSION_CLOSED) if self.unstarted_sealed.load(Ordering::Acquire) => Ok(CoreUnstartedSealV2::Sealed),
+            Err(_) => Ok(CoreUnstartedSealV2::Unknown),
+        }
+    }
     /// The supervisor reuses the same original cancellation owner and
     /// deadlines; an absent registration is not a ready startup control.
     pub(crate) fn startup_control_for_supervisor(&self) -> Option<RoventStartupControl> {
@@ -323,6 +361,8 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             owner,
             game_gate,
             game_generation: AtomicU64::new(0),
+            original_attempt: Mutex::new(None),
+            unstarted_sealed: AtomicBool::new(false),
             admissions,
             handoffs,
             admission_phase: Arc::clone(&admission_phase),
@@ -401,7 +441,7 @@ pub(crate) type HandoffRecovery<H> = fn(
 pub(crate) type HandoffIdentity<H> = fn(&mut H, &RoventCollectionRootAdmissionV2) -> bool;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoreGameGateStatus { NotApplicable, Busy, Unknown }
+pub(crate) enum CoreGameGateStatus { NotApplicable, Busy, OwnerBlocked, Unknown }
 
 pub(crate) struct CoreAdmissionFailure {
     pub(crate) error: AdaptiveManagerError,
@@ -449,6 +489,28 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             error, admission, owners: Box::new(()), before_start: false,
             game_gate_status: CoreGameGateStatus::NotApplicable,
         };
+        {
+            let mut attempt = match self.original_attempt.try_lock() {
+                Ok(attempt) => attempt,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let mut failure = reject_started(AdaptiveManagerError::AuxiliaryPending, admission);
+                    failure.game_gate_status = CoreGameGateStatus::Busy;
+                    return Err(failure);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    let mut failure = reject_started(AdaptiveManagerError::Invalid("Collection original attempt poisoned"), admission);
+                    failure.game_gate_status = CoreGameGateStatus::Unknown;
+                    return Err(failure);
+                }
+            };
+            if let Some(original) = attempt.as_ref() {
+                if !original.same_original_admission(&admission) {
+                    return Err(reject_started(AdaptiveManagerError::Invalid("Collection original attempt mismatch"), admission));
+                }
+            } else {
+                *attempt = Some(admission.clone());
+            }
+        }
         if self.startup.get().is_none()
             || self.revoked.load(Ordering::Acquire)
             || self.failed.load(Ordering::Acquire)
@@ -477,20 +539,42 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                 return Err(failure);
             }
             Ok(GameInstallAttempt::Unknown) => {
-                let _ = self.admission_phase.compare_exchange(
-                    ADMISSION_RESERVED, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire,
-                );
+                self.close_reserved_before_install();
                 let mut failure = reject(AdaptiveManagerError::Invalid("Collection game owner state unknown"), admission);
                 failure.game_gate_status = CoreGameGateStatus::Unknown;
                 return Err(failure);
             }
             Err(error) => {
-                let _ = self.admission_phase.compare_exchange(
-                    ADMISSION_RESERVED, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire,
-                );
+                self.close_reserved_before_install();
                 return Err(reject(error, admission));
             }
         };
+        match self.owner.try_install_readiness(&admission) {
+            Ok(Some(super::observer_lock_v2::OwnerInstallReadinessV2::Ready)) => {},
+            Ok(None) => {
+                let _ = self.admission_phase.compare_exchange(
+                    ADMISSION_RESERVED, ADMISSION_OPEN, Ordering::AcqRel, Ordering::Acquire,
+                );
+                let mut failure = reject(AdaptiveManagerError::AuxiliaryPending, admission);
+                failure.game_gate_status = CoreGameGateStatus::Busy;
+                return Err(failure);
+            }
+            Ok(Some(super::observer_lock_v2::OwnerInstallReadinessV2::Blocked(original))) => {
+                let _ = self.admission_phase.compare_exchange(
+                    ADMISSION_RESERVED, ADMISSION_OPEN, Ordering::AcqRel, Ordering::Acquire,
+                );
+                let mut failure = reject(AdaptiveManagerError::Collection(original), admission);
+                failure.game_gate_status = CoreGameGateStatus::OwnerBlocked;
+                return Err(failure);
+            }
+            Err(error) => {
+                self.close_reserved_before_install();
+                let mut failure = reject(AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Dispatch, "CollectionOwnerUnavailable", error.to_string())), admission);
+                failure.game_gate_status = CoreGameGateStatus::Unknown;
+                return Err(failure);
+            }
+        }
         // Reserve the bounded outbox before installing the observer. The
         // consumer cannot use the root until the release-store of INSTALLED.
         let slot = Arc::new(AdmissionSlot {
@@ -498,12 +582,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             state: AtomicU8::new(RESERVING),
         });
         if self.admissions.try_send(Arc::clone(&slot)).is_err() {
-            let _ = self.admission_phase.compare_exchange(
-                ADMISSION_RESERVED,
-                ADMISSION_CLOSED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            self.close_reserved_before_install();
             return Err(reject(
                 AdaptiveManagerError::Capacity("Collection V2 admission outbox"),
                 admission,
@@ -620,6 +699,12 @@ impl WorkerFailure {
     /// Diagnostic projection only; original errors and recovery owners remain
     /// in the worker. Limit the emitted text without changing failure state.
     pub(crate) fn diagnostic(&self) -> String {
+        self.diagnostic_projection().0
+    }
+
+    /// Return the bounded detail, its original character count and whether
+    /// it was truncated. This projection does not consume the original error.
+    pub(crate) fn diagnostic_projection(&self) -> (String, usize, bool) {
         let detail = match self {
             Self::Preparation(error) | Self::Retirement(error) | Self::RowPump(error) => format!("{error:?}"),
             Self::ActorStart(TeacherSessionStartErrorV2::Admission(error)) => format!("{error:?}"),
@@ -632,7 +717,10 @@ impl WorkerFailure {
             Self::HandoffRecovery(detail) | Self::AggregateRejected(detail) => (*detail).to_owned(),
             _ => String::new(),
         };
-        detail.chars().take(4096).collect()
+        let mut chars = detail.chars();
+        let bounded: String = chars.by_ref().take(4096).collect();
+        let original_characters = bounded.chars().count().saturating_add(chars.count());
+        (bounded, original_characters, original_characters > 4096)
     }
     pub(crate) fn kind(&self) -> &'static str {
         match self {

@@ -1,7 +1,7 @@
 //! Typed adapter around the shared bounded single-root Collection /2 worker.
 //! This layer does not combine P-C and Own manager or handoff authority.
 use super::collection_hooks_core_v2::{
-    CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure, CoreGameGateStatus,
+    CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure, CoreGameGateStatus, CoreUnstartedSealV2,
 };
 use super::teacher::v2_session::{RoventTeacherRosterEntryV2, TeacherSessionRetirementSealV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2};
@@ -13,6 +13,7 @@ use rz_uci::rovent_bootstrap::pc_session::{
     RoventPcCollectionHandoffV2, RoventPcCollectionHooksV2, RoventPcCollectionRootCustodyV2, RoventPcCustodyReturnV2,
     RoventPcCollectionAdmissionOutcomeV2,
     RoventPcDeferredCleanupV2,
+    RoventPcRevokeObservationV2,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -27,6 +28,8 @@ pub(crate) struct RoventPcCollectionBridgeV2 {
     roster_identity: Vec<(String, usize, u32)>,
     worker: Mutex<Option<PcWorkerCustodianV2>>,
     deferred: Mutex<PcDeferredRootsV2>,
+    revoke_observations: Mutex<Vec<RoventPcRevokeObservationV2>>,
+    revoke_observations_omitted: std::sync::atomic::AtomicUsize,
 }
 
 struct PcDeferredRootsV2 {
@@ -123,6 +126,29 @@ fn handoff_submit(
 }
 
 impl RoventPcCollectionBridgeV2 {
+    fn defer_proven_unstarted(
+        &self,
+        port: &mut RoventPcCollectionAdmissionPortV2<'_>,
+        failure: CoreAdmissionFailure,
+        code: &'static str,
+    ) -> Result<RoventPcCollectionAdmissionOutcomeV2, RoventPcCollectionAdmissionFailureV2> {
+        match self.core.try_seal_unstarted(&failure.admission) {
+            Ok(CoreUnstartedSealV2::Sealed) => {
+                let reason = AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,
+                    code, format!("{:?}", failure.error));
+                self.defer_before_start(port, failure.admission, reason)
+            }
+            Ok(CoreUnstartedSealV2::Busy) => Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission: failure.admission }),
+            Ok(CoreUnstartedSealV2::Unknown) => Err(RoventPcCollectionAdmissionFailureV2 {
+                error: failure.error, admission: failure.admission, owners: failure.owners,
+            }),
+            Err(error) => Err(RoventPcCollectionAdmissionFailureV2 {
+                error: AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Dispatch, "PcUnstartedSeal", error.to_string())),
+                admission: failure.admission.clone(), owners: Box::new(failure),
+            }),
+        }
+    }
     pub(crate) fn closed_before_next_admission(&self, next: &RoventCollectionRootAdmissionV2) -> bool {
         self.core.closed_before_next_admission(next)
     }
@@ -166,7 +192,7 @@ impl RoventPcCollectionBridgeV2 {
             CollectionBridgeCoreV2::new(owner.clone(), Arc::clone(&manifest), roster, handoff_matches, handoff_submit)?;
         Ok((Arc::new(Self { core, owner, manifest, roster_identity, worker: Mutex::new(None), deferred: Mutex::new(PcDeferredRootsV2 {
             originals: Vec::with_capacity(256), active: Vec::new(), cleanup_failures: Vec::new(), overflow: 0, first_overflow: None,
-        }) }), worker))
+        }), revoke_observations: Mutex::new(Vec::with_capacity(64)), revoke_observations_omitted: std::sync::atomic::AtomicUsize::new(0) }), worker))
     }
 
     pub(crate) fn defer_before_start(
@@ -232,6 +258,21 @@ impl RoventPcCollectionBridgeV2 {
             Err(std::sync::TryLockError::WouldBlock) => Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => Err(super::invalid("P/C deferred root custody poisoned")),
         }
+    }
+
+    pub(crate) fn try_revoke_observations(&self) -> Result<Option<serde_json::Value>, ArenaError> {
+        use std::sync::atomic::Ordering;
+        let events = match self.revoke_observations.try_lock() {
+            Ok(events) => events,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("P/C revoke observations poisoned")),
+        };
+        Ok(Some(serde_json::json!({"events":events.iter().map(|event| serde_json::json!({
+            "origin":format!("{:?}",event.origin),
+            "elapsed_ns":event.elapsed_from_start.and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
+            "context_acceptance":format!("{:?}",event.context_acceptance), "soft_expired":event.soft_expired,
+            "manager_phase":format!("{:?}",event.manager_phase), "goal":format!("{:?}",event.goal)
+        })).collect::<Vec<_>>(), "omitted":self.revoke_observations_omitted.load(Ordering::Acquire)})))
     }
 
     pub(crate) fn try_owns_deferred(
@@ -385,6 +426,28 @@ impl RoventPcCollectionBridgeV2 {
         if worker.separation_failed { return Err(super::invalid("P/C row separation failed; original retained")); }
         Ok(Some(worker.separated_rows.pop_front()))
     }
+
+    /// Copy bounded serializable row projections for a failure report. The
+    /// original row and authority stay in this bridge; JSON is not authority.
+    pub(crate) fn try_snapshot_separated_rows(&self, maximum_bytes: usize)
+        -> Result<Option<Vec<Vec<u8>>>, ArenaError> {
+        let slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("P/C separated row custody poisoned")),
+        };
+        let worker = slot.as_ref().ok_or_else(|| super::invalid("P/C separated row owner missing"))?;
+        let mut projections = Vec::new();
+        let mut total = 0usize;
+        for row in &worker.separated_rows {
+            let bytes = serde_json::to_vec(&row.record).map_err(|error| super::invalid(error.to_string()))?;
+            total = total.checked_add(bytes.len()).ok_or_else(|| super::invalid("P/C separated row projection size overflow"))?;
+            if total > maximum_bytes { return Err(super::invalid("P/C separated row projections exceed report capacity")); }
+            projections.try_reserve(1).map_err(|_| super::invalid("P/C separated row projection allocation"))?;
+            projections.push(bytes);
+        }
+        Ok(Some(projections))
+    }
 }
 
 impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
@@ -417,14 +480,18 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
                     })
             }) {
             Ok(()) => Ok(RoventPcCollectionAdmissionOutcomeV2::Installed),
-            Err(failure) if failure.before_start && failure.game_gate_status == CoreGameGateStatus::Busy =>
+            Err(failure) if failure.game_gate_status == CoreGameGateStatus::Busy =>
                 Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission: failure.admission }),
+            Err(failure) if failure.before_start && failure.game_gate_status == CoreGameGateStatus::Unknown => {
+                self.defer_proven_unstarted(port, failure, "PcGameOwnerUnknown")
+            }
+            Err(failure) if failure.before_start && failure.game_gate_status == CoreGameGateStatus::OwnerBlocked => {
+                self.defer_proven_unstarted(port, failure, "PcGameOwnerBlocked")
+            }
             Err(failure) if failure.before_start
                 && failure.game_gate_status == CoreGameGateStatus::NotApplicable
                 && matches!(&failure.error, AdaptiveManagerError::Capacity(_)) => {
-                let reason = AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,
-                    "PcAdmissionCapacity", format!("{:?}", failure.error));
-                self.defer_before_start(port, failure.admission, reason)
+                self.defer_proven_unstarted(port, failure, "PcAdmissionCapacity")
             }
             Err(failure) => Err(RoventPcCollectionAdmissionFailureV2 {
                 error: failure.error, admission: failure.admission, owners: failure.owners,
@@ -496,6 +563,24 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
             return Err(AdaptiveManagerError::Invalid("P/C root-scoped revoke admission mismatch"));
         }
         self.core.revoke();
+        Ok(())
+    }
+    fn revoke_root_observed(&self, root: &RoventCollectionRootAdmissionV2, observation: RoventPcRevokeObservationV2)
+        -> Result<(), AdaptiveManagerError> {
+        use std::sync::atomic::Ordering;
+        if !self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(root)) {
+            return Err(AdaptiveManagerError::Invalid("P/C observed revoke admission mismatch"));
+        }
+        // Revocation must not depend on diagnostics lock or allocation.
+        self.core.revoke();
+        let recorded = match self.revoke_observations.try_lock() {
+            Ok(mut events) if events.len() < 64 => { events.push(observation); true }
+            _ => false,
+        };
+        if !recorded {
+            let _ = self.revoke_observations_omitted.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                |value| Some(value.saturating_add(1)));
+        }
         Ok(())
     }
     fn handoff_sender(&self) -> mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>> {

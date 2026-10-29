@@ -52,6 +52,13 @@ pub enum RoventCollectionDisableReasonV2 {
     ObserverFailure,
 }
 
+/// Observer installation has not started. A blocked owner is distinct from
+/// a transient lock collision and retains the original collection state.
+pub(crate) enum OwnerInstallReadinessV2 {
+    Ready,
+    Blocked(AdaptiveCollectionError),
+}
+
 struct State {
     game_record_limit: usize,
     game_retired_total: usize,
@@ -99,6 +106,60 @@ pub struct RoventCollectionOwnerLockV2 {
 }
 
 impl RoventCollectionOwnerLockV2 {
+    /// Called with the shared game install guard held, before `port.install`.
+    /// The owner and capture registration use only nonblocking lock attempts.
+    pub(crate) fn try_install_readiness(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Option<OwnerInstallReadinessV2>, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+        };
+        let blocked = |detail: &'static str| OwnerInstallReadinessV2::Blocked(
+            AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch, "CollectionOwnerNotReady", detail));
+        if let Some(error) = &state.failure {
+            return Ok(Some(OwnerInstallReadinessV2::Blocked(error.clone())));
+        }
+        if self.callback_lock_failure.load(Ordering::Acquire) {
+            return Ok(Some(blocked("original collection callback lock failure is retained")));
+        }
+        check(state.admitted == state.current_admission.is_some()
+            && state.admitted == state.producer.is_some(),
+            "lock-v2 original owner admission/producer state is inconsistent")?;
+        if (state.admitted && !state.settled) || !state.pending.is_empty() || !state.staged.is_empty()
+            || !state.disabled_prior.is_empty() || !state.retired.is_empty()
+            || self.retired_queued.load(Ordering::Acquire) != 0 {
+            return Ok(Some(blocked("previous root still has unsettled or undrained original work")));
+        }
+        if state.disabled.is_some() || !state.prior_disabled.is_empty()
+            || !state.failed_staged.is_empty() || !state.failed_captures.is_empty()
+            || state.producer.as_ref().is_some_and(|producer| producer.incomplete_capture_count() != 0) {
+            return Ok(Some(blocked("previous root has retained disabled, failed or incomplete capture")));
+        }
+        if state.producer.is_some() && state.prior_producers.len() >= RETAINED_ROOT_CAPACITY {
+            return Ok(Some(blocked("original producer retention capacity reached")));
+        }
+        if state.game_used_and_reserved()? >= state.game_record_limit {
+            return Ok(Some(blocked("game record limit or retained reservations exhausted")));
+        }
+        match self.registration.try_disabled_root_count()? {
+            Some(0) => {},
+            Some(_) => return Ok(Some(blocked("original no-capture marker has not been settled"))),
+            None => return Ok(None),
+        }
+        if let Some(previous) = &state.current_admission {
+            let old = previous.root_admission().authority();
+            let next = admission.root_admission().authority();
+            check(!previous.same_original_admission(admission)
+                && previous.native_origin().same_original_origin(admission.native_origin())
+                && old.epoch == next.epoch && old.implementation == next.implementation
+                && (next.game > old.game || (next.game == old.game && next.root > old.root)),
+                "lock-v2 next root does not follow the original collection owner")?;
+        }
+        Ok(Some(OwnerInstallReadinessV2::Ready))
+    }
     pub(crate) fn same_original_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
             && Arc::ptr_eq(&self.game_gate, &other.game_gate)

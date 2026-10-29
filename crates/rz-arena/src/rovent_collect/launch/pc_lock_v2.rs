@@ -5,6 +5,7 @@ use crate::rovent_collect::pc_hooks_lock_v2::{
     RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2, PcWorkerExitKindV2, PcWorkerStartErrorV2,
 };
 use crate::rovent_collect::teacher::v2_session::RoventTeacherRosterEntryV2;
+use crate::rovent_collect::pc_worker_supervisor_v2::{PcSecondarySlotV2, PcWorkerSupervisorV2};
 use rz_experiments::RoventInputLockV2;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::rovent_bootstrap::launch::{
@@ -39,6 +40,9 @@ pub struct RoventPcCollectionRunV2 {
     publication_attempted: bool,
     publication: Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
     late_rows: std::collections::VecDeque<RoventRetiredLockV2Record>,
+    supervisor: Option<PcWorkerSupervisorV2>,
+    secondary_slots: Vec<PcSecondarySlotV2>,
+    supervisor_error: Option<ArenaError>,
     worker_start: Arc<AtomicU8>,
     worker_exit: Option<PcWorkerExitKindV2>,
     worker_thread_panicked: bool,
@@ -48,6 +52,47 @@ pub struct RoventPcCollectionRunV2 {
 }
 
 impl RoventPcCollectionRunV2 {
+    fn failure_projection(failure: &crate::rovent_collect::collection_hooks_core_v2::WorkerFailure)
+        -> (serde_json::Value, bool) {
+        let (detail, original_chars, truncated) = failure.diagnostic_projection();
+        (json!({"kind":failure.kind(), "detail":detail, "original_chars":original_chars,
+            "detail_truncated":truncated}), truncated)
+    }
+    /// Drain only an already stopped sender into its original bounded
+    /// consumer. Empty counts alone do not prove its receiver was drained.
+    fn failure_consumer_observation(
+        &self,
+        consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
+        sender_stopped: bool,
+    ) -> (serde_json::Value, bool) {
+        use super::own_publisher_v2::OwnPumpPollV2;
+        if !sender_stopped { return (json!({"status":"sender_not_joined"}), false); }
+        let mut drained = false;
+        let mut problem = None;
+        for _ in 0..self.publication_maximum_records.saturating_add(17) {
+            match consumer.poll() {
+                Ok(OwnPumpPollV2::Received) => continue,
+                Ok(OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected) => { drained = true; break; }
+                Ok(OwnPumpPollV2::Full) => { problem = Some("consumer_capacity".to_owned()); break; }
+                Err(error) => { problem = Some(error.to_string()); break; }
+            }
+        }
+        let counts = match consumer.try_counts() {
+            Ok(Some(counts)) => counts,
+            Ok(None) => return (json!({"status":"busy", "receiver_drained":drained}), false),
+            Err(error) => return (json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}), false),
+        };
+        let failures = match consumer.try_has_failures() {
+            Ok(Some(value)) => value,
+            Ok(None) => return (json!({"status":"busy", "receiver_drained":drained}), false),
+            Err(error) => return (json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}), false),
+        };
+        let complete = drained && problem.is_none() && counts.0 == 0 && counts.1 == 0 && !failures;
+        (json!({"status":if complete { "drained_empty" } else { "retained_or_unknown" },
+            "receiver_drained":drained, "items":counts.0, "failed_items":counts.1,
+            "teacher_evidence":counts.2, "disconnected":counts.3,
+            "failure_or_overflow":failures, "detail":problem}), complete)
+    }
     /// Write serializable failure observations and original recovered teacher
     /// byte streams without consuming their owners. A partial write is left
     /// in place and a later attempt cannot silently replace it.
@@ -76,15 +121,20 @@ impl RoventPcCollectionRunV2 {
                             raw.push((stderr, value.stderr().to_vec()));
                         }
                         let failure = worker.failure_observation();
+                        let primary = failure.primary.map(Self::failure_projection);
+                        let additional: Vec<_> = failure.additional.iter().map(Self::failure_projection).collect();
+                        let truncated = primary.as_ref().is_some_and(|(_, truncated)| *truncated)
+                            || additional.iter().any(|(_, truncated)| *truncated);
                         let retirement = format!("{:?}", worker.teacher_observations());
                         if retirement.len() > 256 * 1024 {
                             raw.clear();
                             (json!({"status":"retirement_observation_over_limit"}), false)
                         } else {
-                            (json!({"status":"observed", "primary_failure":failure.primary.map(|f| json!({"kind":f.kind(),"detail":f.diagnostic()})),
-                                "additional_failures":failure.additional.iter().map(|f| json!({"kind":f.kind(),"detail":f.diagnostic()})).collect::<Vec<_>>(),
+                            (json!({"status":"observed", "primary_failure":primary.map(|(value, _)| value),
+                                "additional_failures":additional.into_iter().map(|(value, _)| value).collect::<Vec<_>>(),
                                 "omitted_failures":failure.omitted, "teacher_retirement_observation_debug":retirement,
-                                "teacher_diagnostics":entries}), failure.omitted == 0)
+                                "pending_pump_rows":worker.pending_pump_rows(), "teacher_diagnostics":entries}),
+                                failure.omitted == 0 && worker.pending_pump_rows() == 0 && !truncated)
                         }
                     }
                 }
@@ -106,11 +156,164 @@ impl RoventPcCollectionRunV2 {
                 "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
             raw.push((name, bytes));
         }
+        let mut assembly_evidence = json!({"status":"not_created"});
+        if let Some(assembly) = &self.publication_assembly {
+            let pending = assembly.pending_row().map(|row| &row.record);
+            let sealed = assembly.sealed_row().map(|row| row.record());
+            let mut records = Vec::new();
+            for (name, record) in [("assembly-pending.json", pending), ("assembly-sealed.json", sealed)] {
+                let Some(record) = record else { continue; };
+                let bytes = serde_json::to_vec(record).map_err(|error| invalid(error.to_string()))?;
+                if late_bytes.checked_add(bytes.len()).is_none_or(|next| next > 4 * 1024 * 1024) {
+                    complete = false; continue;
+                }
+                late_bytes += bytes.len();
+                records.push(json!({"path":name, "bytes":bytes.len(),
+                    "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
+                raw.push((name.to_owned(), bytes));
+            }
+            let chunk = assembly.pending_chunk().map(|packet| {
+                let bytes = &packet.bytes;
+                if late_bytes.checked_add(bytes.len()).is_some_and(|next| next <= 4 * 1024 * 1024) {
+                    late_bytes += bytes.len();
+                    raw.push(("assembly-pending-chunk.bin".to_owned(), bytes.clone()));
+                    json!({"status":"projected","path":"assembly-pending-chunk.bin",
+                        "bytes":bytes.len(), "sha256":format!("{:x}", Sha256::digest(bytes))})
+                } else { complete = false; json!({"status":"over_limit","bytes":bytes.len()}) }
+            });
+            if !self.pump_published && (assembly.records() != 0 || pending.is_some() || sealed.is_some() || chunk.is_some()) {
+                complete = false;
+            }
+            assembly_evidence = json!({"status":"retained", "records":assembly.records(),
+                "pending_row":pending.is_some(), "sealed_row":sealed.is_some(), "record_projections":records,
+                "pending_chunk":chunk, "chunk_write_attempted":assembly.chunk_write_attempted(),
+                "writer_buffer":"not_exported"});
+        }
+        let (primary_consumer, primary_consumer_complete) = self.failure_consumer_observation(
+            &self.pump_consumer, self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked,
+        );
+        complete &= primary_consumer_complete;
+        match self.bridge.try_revoke_observations() {
+            Ok(Some(value)) if value.get("omitted").and_then(serde_json::Value::as_u64) == Some(0) => {},
+            _ => complete = false,
+        }
+        let mut secondary_evidence = Vec::new();
+        let mut teacher_bytes = raw.iter().filter(|(name, _)| name.starts_with("teacher-"))
+            .map(|(_, bytes)| bytes.len()).sum::<usize>();
+        let mut bridges = Vec::with_capacity(self.secondary_slots.len() + 1);
+        bridges.push(Arc::clone(&self.bridge));
+        bridges.extend(self.secondary_slots.iter().map(|slot| Arc::clone(&slot.bridge)));
+        for (slot_index, bridge) in bridges.iter().enumerate() {
+            let admission = bridge.installed_admission_for_recovery().map(|root| root.raw_sha256().to_owned());
+            if slot_index > 0 {
+                let slot = &self.secondary_slots[slot_index - 1];
+                if admission.is_none() && slot.worker_start == crate::rovent_collect::pc_worker_supervisor_v2::PcSecondaryWorkerStartV2::FailedBeforeStart
+                    && slot.consumer_empty_before_worker_start {
+                    let deferred = match bridge.try_deferred_observation() {
+                        Ok(Some(value)) => json!({"status":"observed","detail":value}),
+                        Ok(None) => { complete = false; json!({"status":"busy"}) },
+                        Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
+                    };
+                    secondary_evidence.push(json!({"slot":slot_index,"admission":null,"worker":{"status":"failed_before_start"},"separated":[],"deferred":deferred}));
+                    continue;
+                }
+            }
+            let (projections, separated_status) = match bridge.try_snapshot_separated_rows(4 * 1024 * 1024 - late_bytes) {
+                Ok(Some(rows)) => (Some(rows), json!({"status":"observed"})),
+                Ok(None) => { complete = false; (None, json!({"status":"busy"})) },
+                Err(error) => { complete = false; (None, json!({"status":"error","detail":error.to_string()})) }
+            };
+            let mut separated = Vec::new();
+            if let Some(projections) = projections {
+                for (row_index, bytes) in projections.into_iter().enumerate() {
+                    late_bytes += bytes.len();
+                    let name = format!("root-{slot_index}-separated-{row_index}.json");
+                    separated.push(json!({"path":&name,"bytes":bytes.len(),
+                        "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
+                    raw.push((name, bytes));
+                }
+            }
+            if slot_index == 0 {
+                secondary_evidence.push(json!({"slot":slot_index,"admission":admission,"separated":separated,"separated_status":separated_status}));
+                continue;
+            }
+            let slot = &self.secondary_slots[slot_index - 1];
+            let revokes = match bridge.try_revoke_observations() {
+                Ok(Some(value)) => {
+                    if value.get("omitted").and_then(serde_json::Value::as_u64) != Some(0) { complete = false; }
+                    json!({"status":"observed","detail":value})
+                },
+                Ok(None) => { complete = false; json!({"status":"busy"}) },
+                Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
+            };
+            let (consumer, consumer_complete) = self.failure_consumer_observation(&slot.consumer,
+                slot.worker_join_observed && slot.consumer_drained_after_join);
+            complete &= consumer_complete;
+            let deferred = match bridge.try_deferred_observation() {
+                Ok(Some(value)) => json!({"status":"observed","detail":value}),
+                Ok(None) => { complete = false; json!({"status":"busy"}) },
+                Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
+            };
+            if !slot.consumer_drained_after_join || !matches!(slot.worker_exit_kind,
+                Some(PcWorkerExitKindV2::NoAdmission | PcWorkerExitKindV2::Retirement | PcWorkerExitKindV2::Aggregate)) {
+                complete = false;
+            }
+            let detail = if !slot.worker_join_observed {
+                complete = false;
+                json!({"status":"worker_not_joined", "start":format!("{:?}", slot.worker_start)})
+            } else {
+                match slot.worker.try_lock() {
+                    Ok(worker) => {
+                        let failure = worker.failure_observation();
+                        let primary = failure.primary.map(Self::failure_projection);
+                        let additional: Vec<_> = failure.additional.iter().map(Self::failure_projection).collect();
+                        if primary.as_ref().is_some_and(|(_, truncated)| *truncated)
+                            || additional.iter().any(|(_, truncated)| *truncated) { complete = false; }
+                        if failure.omitted != 0 || worker.pending_pump_rows() != 0 { complete = false; }
+                        let mut diagnostics = Vec::new();
+                        for (index, (actor, value)) in worker.diagnostics().iter().enumerate() {
+                            let size = value.stdout().len().saturating_add(value.stderr().len());
+                            if teacher_bytes.checked_add(size).is_none_or(|total| total > 4 * 1024 * 1024) {
+                                complete = false; diagnostics.push(json!({"actor":actor,"status":"diagnostic_over_limit"})); continue;
+                            }
+                            teacher_bytes += size;
+                            let stdout = format!("root-{slot_index}-teacher-{index}-stdout.bin");
+                            let stderr = format!("root-{slot_index}-teacher-{index}-stderr.bin");
+                            diagnostics.push(json!({"actor":actor,
+                                "stdout":{"path":&stdout,"bytes":value.stdout().len(),"sha256":format!("{:x}",Sha256::digest(value.stdout()))},
+                                "stderr":{"path":&stderr,"bytes":value.stderr().len(),"sha256":format!("{:x}",Sha256::digest(value.stderr()))}}));
+                            raw.push((stdout, value.stdout().to_vec())); raw.push((stderr, value.stderr().to_vec()));
+                        }
+                        let retirement = format!("{:?}", worker.teacher_observations());
+                        if retirement.len() > 256 * 1024 { complete = false; }
+                        json!({"status":"observed", "exit":slot.worker_exit_kind.map(PcWorkerExitKindV2::label),
+                            "consumer_drained_after_join":slot.consumer_drained_after_join,
+                            "pending_pump_rows":worker.pending_pump_rows(),
+                            "primary_failure":primary.map(|(value, _)| value),
+                            "additional_failures":additional.into_iter().map(|(value, _)| value).collect::<Vec<_>>(),
+                            "omitted_failures":failure.omitted,
+                            "teacher_retirement_observation_debug":if retirement.len() <= 256 * 1024 { Some(retirement) } else { None },
+                            "teacher_diagnostics":diagnostics})
+                    }
+                    Err(_) => { complete = false; json!({"status":"worker_busy_or_poisoned"}) }
+                }
+            };
+            secondary_evidence.push(json!({"slot":slot_index,"admission":admission,"separated":separated,
+                "separated_status":separated_status,"deferred":deferred,"revokes":revokes,"consumer":consumer,"worker":detail}));
+        }
+        if self.supervisor.is_some() { complete = false; }
+        let publication_failure_chars = publication_failure.map(|s| s.chars().count());
+        let publication_failure_truncated = publication_failure_chars.is_some_and(|count| count > 4096);
+        if publication_failure_truncated { complete = false; }
         let mut evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
             "raw_files_complete_only_when_receipt_exists":true,
             "publication_failure":publication_failure.map(|s| s.chars().take(4096).collect::<String>()),
-            "run_observation":observation, "worker_evidence":worker_evidence,
-            "late_rows_total":self.late_rows.len(), "late_rows_serialized":late_entries}))
+            "publication_failure_original_chars":publication_failure_chars,
+            "publication_failure_truncated":publication_failure_truncated,
+            "run_observation":observation, "worker_evidence":worker_evidence, "primary_consumer":primary_consumer,
+            "assembly_evidence":assembly_evidence,
+            "late_rows_total":self.late_rows.len(), "late_rows_serialized":late_entries,
+            "secondary_slot_evidence":secondary_evidence, "supervisor_unresolved":self.supervisor.is_some()}))
             .map_err(|e| invalid(e.to_string()))?;
         if evidence.len() > 1024 * 1024 {
             raw.clear();
@@ -120,6 +323,8 @@ impl RoventPcCollectionRunV2 {
                 "worker_thread_panicked":self.worker_thread_panicked,
                 "physical_completion":"not_recorded",
                 "publication_failure":publication_failure.map(|s| s.chars().take(4096).collect::<String>()),
+                "publication_failure_original_chars":publication_failure_chars,
+                "publication_failure_truncated":publication_failure_truncated,
                 "native_failure_present":self.native_failure.is_some(), "resource_failure_present":self.resource_error.is_some(),
                 "detail":"Original owner remains in custody; detailed metadata exceeded 1 MiB"}))
                 .map_err(|e| invalid(e.to_string()))?;
@@ -156,6 +361,11 @@ impl RoventPcCollectionRunV2 {
     /// consumer and any assembly; they never imply physical completion.
     pub fn publish_single_root(&mut self, until: Instant) -> Result<bool, ArenaError> {
         use super::own_publisher_v2::{OwnOfferOutcomeV2, OwnPumpPollV2};
+        check(self.supervisor.is_none() && self.supervisor_error.is_none(),
+            "P/C game supervisor or secondary custody remains unresolved")?;
+        if !self.secondary_slots.is_empty() {
+            return self.publish_collected_game(until);
+        }
         if self.pump_published { return Ok(true); }
         check(!self.publication_attempted, "P/C previous publication attempt requires explicit recovery")?;
         check(self.pump_thread_joined && self.pump_thread_failure.is_none()
@@ -233,10 +443,17 @@ impl RoventPcCollectionRunV2 {
                         }
                     }
                     OwnOfferOutcomeV2::FailedRetained => return Err(invalid("P/C teacher row failed; original retained")),
-                    OwnOfferOutcomeV2::Pending => match polled {
-                        OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("P/C pump item remained pending")),
-                        OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
-                    },
+                    OwnOfferOutcomeV2::Pending => {
+                        let Some((items, failed, _, _)) = self.pump_consumer.try_counts()? else {
+                            std::thread::sleep(Duration::from_millis(1)); continue;
+                        };
+                        check(failed == 0, "P/C consumer retains failed rows")?;
+                        if items != 0 { std::thread::sleep(Duration::from_millis(1)); continue; }
+                        match polled {
+                            OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("P/C pump item remained pending")),
+                            OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
+                        }
+                    }
                 }
             }
             while !self.late_rows.is_empty() {
@@ -275,6 +492,140 @@ impl RoventPcCollectionRunV2 {
         if matches!(&result, Ok(true)) { self.pump_published = true; }
         result
     }
+
+    /// Process original per-root consumers and separated rows through one
+    /// game writer. A joined supervisor and every root's own handoff are
+    /// checked independently; pending rows remain in their original owners.
+    fn publish_collected_game(&mut self, until: Instant) -> Result<bool, ArenaError> {
+        use super::own_publisher_v2::{OwnOfferOutcomeV2, OwnPumpPollV2};
+        use crate::rovent_collect::pc_hooks_lock_v2::PcRootSeparationV2;
+        check(!self.publication_attempted && self.supervisor.is_none() && self.supervisor_error.is_none(),
+            "P/C game supervisor or prior publication remains unresolved")?;
+        check(self.pump_thread_joined && self.pump_thread_failure.is_none() && self.closed_owner().is_ok(),
+            "P/C primary root worker or original handoff is unresolved")?;
+        let mut roots = vec![(Arc::clone(&self.bridge), Arc::clone(&self.worker), Arc::clone(&self.pump_consumer))];
+        roots.try_reserve(self.secondary_slots.len()).map_err(|_| invalid("P/C game publisher slot allocation"))?;
+        for slot in &self.secondary_slots {
+            check(matches!(slot.bridge.try_has_deferred()?, Some(false)),
+                "P/C secondary slot retains deferred collection")?;
+            if slot.bridge.installed_admission_for_recovery().is_none() {
+                let proven_unstarted = (slot.worker_join_observed && slot.consumer_drained_after_join
+                    && slot.worker_exit_kind == Some(PcWorkerExitKindV2::NoAdmission))
+                    || (slot.worker_start == crate::rovent_collect::pc_worker_supervisor_v2::PcSecondaryWorkerStartV2::FailedBeforeStart
+                        && slot.consumer_empty_before_worker_start);
+                check(proven_unstarted, "P/C unused secondary slot start or installation is unknown")?;
+                continue;
+            }
+            check(slot.worker_join_observed && slot.consumer_drained_after_join
+                && matches!(slot.worker_exit_kind, Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement))
+                && slot.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C secondary handoff: {e:?}")))?,
+                "P/C secondary original worker, consumer or handoff is unresolved")?;
+            roots.push((Arc::clone(&slot.bridge), Arc::clone(&slot.worker), Arc::clone(&slot.consumer)));
+        }
+        for (bridge, worker, _) in &roots {
+            check(matches!(bridge.try_has_deferred()?, Some(false)), "P/C game contains deferred collection")?;
+            let worker = worker.try_lock().map_err(|_| invalid("P/C game worker busy or poisoned"))?;
+            check(!worker.has_failure() && !worker.has_unpublished_pump_rows(),
+                "P/C game worker retains failure or pending original rows")?;
+        }
+        check(self.owner.try_status()?.is_some_and(|status|
+            status.collection_disabled_first_ticket.is_none() && status.prior_disabled_first_tickets.is_empty()
+                && status.incomplete_capture_count == 0 && status.failure.is_none() && !status.callback_lock_failure),
+            "P/C game owner retains disabled, incomplete or failed collection")?;
+        let (last, _, _) = roots.last().expect("primary root retained");
+        let last_admission = last.installed_admission_for_recovery()
+            .ok_or_else(|| invalid("P/C last root admission missing"))?.clone();
+        loop {
+            check(Instant::now() < until, "P/C game root separation deadline reached")?;
+            match last.try_separate_root_for_next(&last_admission, self.publication_maximum_records as usize)? {
+                PcRootSeparationV2::Pending => std::thread::sleep(Duration::from_millis(1)),
+                PcRootSeparationV2::Released { .. } => break,
+            }
+        }
+        let first_admission = self.bridge.installed_admission_for_recovery()
+            .ok_or_else(|| invalid("P/C first root admission missing"))?.clone();
+        self.publication_attempted = true;
+        let parent = self.publication_directory.parent().ok_or_else(|| invalid("P/C output parent"))?;
+        let leaf = self.publication_directory.file_name().ok_or_else(|| invalid("P/C output leaf"))?;
+        let root = Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?;
+        root.create_dir(leaf).map_err(io)?;
+        let directory = root.open_dir_nofollow(leaf).map_err(io)?;
+        directory.create_dir("chunks").map_err(io)?;
+        self.publication_dir = Some(directory);
+        self.publication_assembly = Some(RoventCorpusAssemblyLockV2::new(
+            &self.owner, self.publication_dir.as_ref().expect("original output owner"),
+            &self.publication_manifest, &first_admission, self.publication_maximum_records)?);
+        let mut assembly = self.publication_assembly.take().expect("original assembly");
+        let result = (|| -> Result<bool, ArenaError> {
+            for (bridge, worker, consumer) in &roots {
+                loop {
+                    check(Instant::now() < until, "P/C game consumer deadline reached")?;
+                    let polled = consumer.poll()?;
+                    match self.try_offer_consumer_item_for(bridge, worker, consumer, &mut assembly)? {
+                        OwnOfferOutcomeV2::Offered => self.advance_game_row(bridge, worker, &mut assembly)?,
+                        OwnOfferOutcomeV2::FailedRetained => return Err(invalid("P/C game teacher row failed; original retained")),
+                        OwnOfferOutcomeV2::Pending => {
+                            let Some((items, failed, _, _)) = consumer.try_counts()? else {
+                                std::thread::sleep(Duration::from_millis(1)); continue;
+                            };
+                            check(failed == 0, "P/C game consumer retains failed rows")?;
+                            if items != 0 { std::thread::sleep(Duration::from_millis(1)); continue; }
+                            match polled {
+                                OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("P/C game consumer item remains pending")),
+                                OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
+                            }
+                        }
+                    }
+                }
+                let admission = bridge.installed_admission_for_recovery()
+                    .ok_or_else(|| invalid("P/C game original root admission missing"))?;
+                loop {
+                    check(Instant::now() < until, "P/C separated row deadline reached")?;
+                    self.late_rows.try_reserve(1).map_err(|_| invalid("P/C separated row custody capacity"))?;
+                    let row = match bridge.try_take_separated_row(admission)? {
+                        None => { std::thread::sleep(Duration::from_millis(1)); continue; }
+                        Some(None) => break,
+                        Some(Some(row)) => row,
+                    };
+                    self.late_rows.push_back(row);
+                    let row = self.late_rows.front().expect("original separated row retained");
+                    check(row.submitted_input_seal().teacher_actor_id.is_none() || row.record.0.input.legal_moves.is_empty(),
+                        "P/C separated row requires unobserved teacher evidence; original retained")?;
+                    let row = self.late_rows.pop_front().expect("original separated row retained");
+                    if let Err(original) = assembly.offer(row) {
+                        let (error, row) = *original; self.late_rows.push_front(row); return Err(error);
+                    }
+                    self.advance_game_row(bridge, worker, &mut assembly)?;
+                }
+                check(matches!(consumer.try_has_failures()?, Some(false)), "P/C game consumer retains failure")?;
+            }
+            check(assembly.records() > 0 && self.owner.try_status()?.is_some_and(|status|
+                status.pending_retired_count == 0 && status.game_reserved_slots == Some(0)
+                    && u64::try_from(status.game_retired_total) == Ok(assembly.records())),
+                "P/C game owner and assembled records differ")?;
+            assembly.flush()?;
+            let directory = self.publication_dir.as_ref().expect("original output owner");
+            self.publication = Some(assembly.finish()?.publish_atomic(directory, until, &AtomicBool::new(false))?);
+            Ok(true)
+        })();
+        self.publication_assembly = Some(assembly);
+        if matches!(&result, Ok(true)) { self.pump_published = true; }
+        result
+    }
+
+    fn advance_game_row(&self, bridge: &RoventPcCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>, assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<(), ArenaError> {
+        let advanced = match self.try_advance_consumer_assembly_for(bridge, worker, assembly) {
+            Err(error) if assembly.chunk_flush_required()? => {
+                assembly.flush()?;
+                self.try_advance_consumer_assembly_for(bridge, worker, assembly)
+                    .map_err(|retry| invalid(format!("P/C game append before flush: {error}; retry: {retry}")))?
+            }
+            other => other?,
+        };
+        check(advanced, "P/C game original root commit gate remained busy")
+    }
     /// Offer an original pump item only under this root's real joined worker,
     /// handoff and commit gate. It is not a publication receipt.
     pub(super) fn try_offer_consumer_item(
@@ -282,9 +633,21 @@ impl RoventPcCollectionRunV2 {
         consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
         assembly: &mut RoventCorpusAssemblyLockV2,
     ) -> Result<super::own_publisher_v2::OwnOfferOutcomeV2, ArenaError> {
+        if self.worker_exit.is_none() || self.worker_thread_panicked {
+            return Ok(super::own_publisher_v2::OwnOfferOutcomeV2::Pending);
+        }
+        self.try_offer_consumer_item_for(&self.bridge, &self.worker, consumer, assembly)
+    }
+
+    fn try_offer_consumer_item_for(
+        &self,
+        bridge: &RoventPcCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>,
+        consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<super::own_publisher_v2::OwnOfferOutcomeV2, ArenaError> {
         use super::own_publisher_v2::OwnOfferOutcomeV2;
-        if self.worker_exit.is_none() || self.worker_thread_panicked { return Ok(OwnOfferOutcomeV2::Pending); }
-        let worker = match self.worker.try_lock() {
+        let worker = match worker.try_lock() {
             Ok(worker) => worker,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original collection worker poisoned")),
@@ -296,7 +659,7 @@ impl RoventPcCollectionRunV2 {
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original handoff poisoned")),
         };
         let admission = handoff.parts_mut().0.clone();
-        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(OwnOfferOutcomeV2::Pending); };
+        let Some(gate) = bridge.try_begin_commit(&admission)? else { return Ok(OwnOfferOutcomeV2::Pending); };
         consumer.try_offer_front_pc(&self.owner, assembly, &gate, &mut handoff)
     }
 
@@ -305,7 +668,16 @@ impl RoventPcCollectionRunV2 {
         assembly: &mut RoventCorpusAssemblyLockV2,
     ) -> Result<bool, ArenaError> {
         if self.worker_exit.is_none() || self.worker_thread_panicked { return Ok(false); }
-        let worker = match self.worker.try_lock() {
+        self.try_advance_consumer_assembly_for(&self.bridge, &self.worker, assembly)
+    }
+
+    fn try_advance_consumer_assembly_for(
+        &self,
+        bridge: &RoventPcCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<bool, ArenaError> {
+        let worker = match worker.try_lock() {
             Ok(worker) => worker,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original collection worker poisoned")),
@@ -317,7 +689,7 @@ impl RoventPcCollectionRunV2 {
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original handoff poisoned")),
         };
         let admission = handoff.parts_mut().0.clone();
-        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(false); };
+        let Some(gate) = bridge.try_begin_commit(&admission)? else { return Ok(false); };
         assembly.try_advance_fenced_pc(&gate, &mut handoff)
     }
     /// Collect only a thread that has already exited; never wait indefinitely
@@ -371,6 +743,18 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => json!({"status":"busy"}),
             Err(error) => json!({"status":"failed", "error":error.to_string()}),
         };
+        let revoke_observation = match self.bridge.try_revoke_observations() {
+            Ok(Some(value)) => json!({"status":"available", "detail":value}),
+            Ok(None) => json!({"status":"busy"}),
+            Err(error) => json!({"status":"error", "detail":error.to_string()}),
+        };
+        let secondary_revokes: Vec<_> = self.secondary_slots.iter().map(|slot| {
+            match slot.bridge.try_revoke_observations() {
+                Ok(Some(value)) => json!({"status":"available", "detail":value}),
+                Ok(None) => json!({"status":"busy"}),
+                Err(error) => json!({"status":"error", "detail":error.to_string()}),
+            }
+        }).collect();
         json!({"schema":"rz-rovent-pc-lock-v2-run-observation/1",
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
             "native_failure_transferred":self.native_failure_taken,
@@ -388,11 +772,15 @@ impl RoventPcCollectionRunV2 {
             "corpus_published":self.pump_published,
             "publisher_receipt":self.publication,
             "publication_attempted":self.publication_attempted,
+            "secondary_supervisor_present":self.supervisor.is_some(),
+            "secondary_slots_recovered":self.secondary_slots.len(),
+            "secondary_supervisor_error":self.supervisor_error.as_ref().map(|error| error.to_string()),
             "assembly_records":self.publication_assembly.as_ref().map(|assembly| assembly.records()),
             "published_records":self.publication.as_ref().map(|receipt| receipt.record_count),
             "late_retired_rows_retained":self.late_rows.len(),
             "teacher_worker_observation":worker_observation,
             "deferred_collection":deferred_observation,
+            "revoke_observation":revoke_observation, "secondary_revoke_observations":secondary_revokes,
             "collection_owner_observation":owner_observation,
             "collection_owner":owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
@@ -544,6 +932,7 @@ impl Drop for RoventPcCollectionRunV2 {
             std::mem::forget(self.owner.clone());
             std::mem::forget(Arc::clone(&self.bridge));
             std::mem::forget(Arc::clone(&self.worker));
+            if !self.secondary_slots.is_empty() { std::mem::forget(std::mem::take(&mut self.secondary_slots)); }
         }
         if !self.pump_thread_joined || self.pump_thread_failure.is_some() || !self.pump_published {
             std::mem::forget(Arc::clone(&self.pump_consumer));
@@ -622,6 +1011,8 @@ fn run_rovent_pc_collection_lock_v2_inner(
         RoventCollectionOwnerLockV2::new_shared_with_record_limit(
             Arc::clone(&manifest), plan.metadata.clone(), plan.maximum_records,
         )?;
+    let roster_identity: Vec<_> = plan.teacher_slots.iter().map(|entry|
+        (entry.actor_id.clone(), entry.source_index, entry.collection_owner)).collect();
     let roster = plan
         .teacher_slots
         .iter()
@@ -662,10 +1053,19 @@ fn run_rovent_pc_collection_lock_v2_inner(
     // Route by the original admission even for the current one-root
     // profile. Additional router slots remain unavailable until the
     // supervisor proves the preceding root has released shared custody.
-    let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> =
-        Arc::new(crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
-            Arc::clone(&bridge), plan.maximum_roots as usize,
-        )?);
+    let router = Arc::new(crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
+        Arc::clone(&bridge), plan.maximum_roots as usize,
+    )?);
+    let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> = router.clone();
+    let supervisor_custody = Arc::new(Mutex::new(None));
+    let admission_supervisor = Arc::clone(&supervisor_custody);
+    let supervisor_router = Arc::clone(&router);
+    let supervisor_owner = owner.clone();
+    let supervisor_manifest = Arc::clone(&manifest);
+    let supervisor_roots = plan.maximum_roots as usize;
+    let supervisor_records = plan.maximum_records as usize;
+    let supervisor_constraint = plan.teacher_constraint;
+    let supervisor_quantum = Duration::from_nanos(plan.teacher_soft_quantum_ns);
     let native = run_pc_collection_v2_with_resource_admission(
         arguments,
         plan.teacher_sources,
@@ -720,6 +1120,16 @@ fn run_rovent_pc_collection_lock_v2_inner(
                     return Err(RoventLaunchError { stage: "collection_worker_start", detail: error.to_string() });
                 }
             }
+            if supervisor_roots > 1 {
+                let mut custody = admission_supervisor.lock().map_err(|_| RoventLaunchError {
+                    stage: "collection_supervisor_start", detail: "supervisor custody poisoned".into(),
+                })?;
+                *custody = Some(PcWorkerSupervisorV2::start(
+                    supervisor_router, supervisor_owner, supervisor_manifest, roster_identity,
+                    supervisor_constraint, supervisor_quantum, supervisor_roots, supervisor_records,
+                    worker_deadline, cleanup_deadline,
+                ).map_err(|error| RoventLaunchError { stage: "collection_supervisor_start", detail: error.to_string() })?);
+            }
             Ok(())
         },
     );
@@ -745,6 +1155,9 @@ fn run_rovent_pc_collection_lock_v2_inner(
         publication_attempted: false,
         publication: None,
         late_rows: std::collections::VecDeque::new(),
+        supervisor: supervisor_custody.lock().map_err(|_| invalid("P/C supervisor custody poisoned"))?.take(),
+        secondary_slots: Vec::new(),
+        supervisor_error: None,
         worker_start,
         worker_exit: None,
         worker_thread_panicked: false,
@@ -752,6 +1165,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
         native_failure_taken: false,
         resource_error: None,
     };
+    if let Some(supervisor) = &run.supervisor { supervisor.request_stop(); }
     if let Ok(mut resource) = run.resource.lock() {
         if let Err(error) = resource.finish_live() {
             run.resource_error = Some(error.to_string());
@@ -793,6 +1207,22 @@ fn run_rovent_pc_collection_lock_v2_inner(
         }
         Some(thread) => run.pump_thread = Some(thread),
         None => run.pump_thread_joined = true,
+    }
+    if let Some(supervisor) = &mut run.supervisor {
+        while !supervisor.poll_join() && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if supervisor.poll_join() {
+            match supervisor.take_joined_slots() {
+                Ok(Some((slots, error))) => {
+                    run.secondary_slots = slots;
+                    run.supervisor_error = error;
+                    run.supervisor = None;
+                }
+                Ok(None) => {}
+                Err(error) => run.supervisor_error = Some(error),
+            }
+        }
     }
     Ok(run)
 }

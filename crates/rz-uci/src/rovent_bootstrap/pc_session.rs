@@ -208,6 +208,22 @@ pub enum RoventPcCustodyReturnV2 {
     Busy,
 }
 
+/// Read-only timing and state observed at a root-scoped revoke call. These
+/// fields confer no authority to cancel, complete, or publish work.
+#[derive(Clone, Copy, Debug)]
+pub struct RoventPcRevokeObservationV2 {
+    pub origin: RoventPcRevokeOriginV2,
+    pub elapsed_from_start: Option<Duration>,
+    pub context_acceptance: RoventPcContextAcceptanceV2,
+    pub soft_expired: bool,
+    pub manager_phase: ManagerPhase,
+    pub goal: Option<FrontierGoalStatus>,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum RoventPcRevokeOriginV2 { LoopCondition, RunEnded }
+#[derive(Clone, Copy, Debug)]
+pub enum RoventPcContextAcceptanceV2 { Accepted, Rejected, Unavailable }
+
 /// Failed marker cleanup after the same root's native fence. This owns the
 /// original capability and diagnostic; it never claims collection completion.
 pub struct RoventPcDeferredCleanupV2 {
@@ -302,6 +318,14 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
     }
     fn revoke_root(&self, _root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
         Err(AdaptiveManagerError::Invalid("P/C root-scoped revoke unsupported"))
+    }
+    /// This callback must be bounded and nonblocking like `revoke_root`.
+    fn revoke_root_observed(
+        &self,
+        root: &RoventCollectionRootAdmissionV2,
+        _observation: RoventPcRevokeObservationV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.revoke_root(root)
     }
     /// Return a bounded channel reserved for this original root. The session
     /// sends directly with `try_send` and retains another Arc whether delivery
@@ -2316,18 +2340,33 @@ impl RoventPcSessionDriver {
                             }
                         }
                     }
-                    if v2_hook_started
-                        && !v2_hook_revoked
-                        && (!context.accepts().unwrap_or(false)
-                            || context.soft_expired(Instant::now())
-                            || manager.phase() != ManagerPhase::Running)
-                    {
+                    if v2_hook_started && !v2_hook_revoked {
+                        let revoke_now = Instant::now();
+                        let revoke_acceptance = context.accepts();
+                        let revoke_soft_expired = context.soft_expired(revoke_now);
+                        if !revoke_acceptance.as_ref().copied().unwrap_or(false)
+                            || revoke_soft_expired || manager.phase() != ManagerPhase::Running {
                         if let Some(hook) = &self.collection_hooks_v2 {
-                            hook.revoke_root(v2_current_admission.as_ref().ok_or(
+                            let observation = RoventPcRevokeObservationV2 {
+                                origin: RoventPcRevokeOriginV2::LoopCondition,
+                                elapsed_from_start: context.original_time_budget
+                                    .and_then(|budget| revoke_now.checked_duration_since(budget.start)),
+                                context_acceptance: match revoke_acceptance {
+                                    Ok(true) => RoventPcContextAcceptanceV2::Accepted,
+                                    Ok(false) => RoventPcContextAcceptanceV2::Rejected,
+                                    Err(_) => RoventPcContextAcceptanceV2::Unavailable,
+                                },
+                                soft_expired: revoke_soft_expired,
+                                manager_phase: manager.phase(),
+                                goal: manager.driver().port().rovent_frontier_receipt()
+                                    .map(|receipt| receipt.snapshot.goal),
+                            };
+                            hook.revoke_root_observed(v2_current_admission.as_ref().ok_or(
                                 AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
-                            )?)?;
+                            )?, observation)?;
                         }
                         v2_hook_revoked = true;
+                        }
                     }
                     if v2_hook_started {
                         if let Some(hook) = &self.collection_hooks_v2 {
@@ -2407,7 +2446,22 @@ impl RoventPcSessionDriver {
                     let root = v2_current_admission.as_ref().ok_or(
                         AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
                     )?;
-                    hook.revoke_root(root)
+                    let now = Instant::now();
+                    let observation = RoventPcRevokeObservationV2 {
+                        origin: RoventPcRevokeOriginV2::RunEnded,
+                        elapsed_from_start: context.original_time_budget
+                            .and_then(|budget| now.checked_duration_since(budget.start)),
+                        context_acceptance: match context.accepts() {
+                            Ok(true) => RoventPcContextAcceptanceV2::Accepted,
+                            Ok(false) => RoventPcContextAcceptanceV2::Rejected,
+                            Err(_) => RoventPcContextAcceptanceV2::Unavailable,
+                        },
+                        soft_expired: context.soft_expired(now),
+                        manager_phase: manager.phase(),
+                        goal: manager.driver().port().rovent_frontier_receipt()
+                            .map(|receipt| receipt.snapshot.goal),
+                    };
+                    hook.revoke_root_observed(root, observation)
                 }));
                 match result {
                     Ok(Ok(())) => {}
