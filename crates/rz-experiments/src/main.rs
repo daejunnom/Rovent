@@ -1,7 +1,11 @@
 use rz_experiments::{
     LockedManifest, MAX_MANIFEST_BYTES, RoventExecutionManifest, RoventExecutionReceipt,
-    RoventExecutionManifestV2, RoventInputLock, RunManifest,
+    RoventExecutionManifestV2, RoventInputLock, RoventInputLockV2, RunManifest,
 };
+use rz_experiments::rovent_corpus_lock_v2::record::{
+    ROVENT_CORPUS_MANIFEST_LOCK_V2_DOMAIN, RoventCorpusManifestLockV2,
+};
+use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -13,7 +17,7 @@ use std::process::ExitCode;
 mod numerical_scope_cli;
 
 const MAX_JSON_BYTES: u64 = MAX_MANIFEST_BYTES as u64;
-const USAGE: &str = "Usage:\n  rz-experiments validate MANIFEST\n  rz-experiments lock MANIFEST OUTPUT\n  rz-experiments verify LOCKED [--artifact-root ROOT --max-artifact-bytes N]\n  rz-experiments rovent-validate MANIFEST\n  rz-experiments rovent-lock MANIFEST OUTPUT\n  rz-experiments rovent-lock-v2 MANIFEST OUTPUT\n  rz-experiments rovent-verify-receipt LOCKED RECEIPT\n  rz-experiments pals-verify-numerical-scope SCOPE --scope-sha256 SHA256 --artifact-root ROOT --max-artifact-bytes N --timeout-ms N\n\nAll successful results retain execution_ready=false. Rovent receipt validation checks saved structure and lock binding, not the truth of owner observations. Numerical-scope verification requires pals-content-admission and only rechecks saved evidence through retained read-only descriptors; it does not execute a model or issue current process/device authority. Its explicit wall-clock guard checks read boundaries and validator entry/return, not hard preemption of an existing hashing/validation call.";
+const USAGE: &str = "Usage:\n  rz-experiments validate MANIFEST\n  rz-experiments lock MANIFEST OUTPUT\n  rz-experiments verify LOCKED [--artifact-root ROOT --max-artifact-bytes N]\n  rz-experiments rovent-validate MANIFEST\n  rz-experiments rovent-lock MANIFEST OUTPUT\n  rz-experiments rovent-lock-v2 MANIFEST OUTPUT\n  rz-experiments rovent-corpus-lock-v2 INPUT_LOCK REGISTRATION OUTPUT\n  rz-experiments rovent-verify-receipt LOCKED RECEIPT\n  rz-experiments pals-verify-numerical-scope SCOPE --scope-sha256 SHA256 --artifact-root ROOT --max-artifact-bytes N --timeout-ms N\n\nAll successful results retain execution_ready=false. Rovent receipt validation checks saved structure and lock binding, not the truth of owner observations. Numerical-scope verification requires pals-content-admission and only rechecks saved evidence through retained read-only descriptors; it does not execute a model or issue current process/device authority. Its explicit wall-clock guard checks read boundaries and validator entry/return, not hard preemption of an existing hashing/validation call.";
 
 enum Command {
     Help,
@@ -33,6 +37,11 @@ enum Command {
     },
     RoventLockV2 {
         input: PathBuf,
+        output: PathBuf,
+    },
+    RoventCorpusLockV2 {
+        input_lock: PathBuf,
+        registration: PathBuf,
         output: PathBuf,
     },
     RoventVerifyReceipt {
@@ -75,6 +84,11 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
         Some("rovent-lock-v2") if args.len() == 3 => Ok(Command::RoventLockV2 {
             input: PathBuf::from(&args[1]),
             output: PathBuf::from(&args[2]),
+        }),
+        Some("rovent-corpus-lock-v2") if args.len() == 4 => Ok(Command::RoventCorpusLockV2 {
+            input_lock: PathBuf::from(&args[1]),
+            registration: PathBuf::from(&args[2]),
+            output: PathBuf::from(&args[3]),
         }),
         Some("rovent-verify-receipt") if args.len() == 3 => Ok(Command::RoventVerifyReceipt {
             input_lock: PathBuf::from(&args[1]),
@@ -188,6 +202,24 @@ fn execute(command: Command) -> Result<String, String> {
             }
             write_new_file(&output, &json)?;
             Ok("Rovent /2 input locked; execution_ready=false".into())
+        }
+        Command::RoventCorpusLockV2 { input_lock, registration, output } => {
+            let lock = RoventInputLockV2::from_json(&read_json(&input_lock)?)
+                .map_err(|error| error.to_string())?;
+            let registration: RoventCorpusManifestV2 = rz_experiments::decode_json(&read_json(&registration)?)
+                .map_err(|error| error.to_string())?;
+            let corpus = RoventCorpusManifestLockV2 {
+                schema: ROVENT_CORPUS_MANIFEST_LOCK_V2_DOMAIN.into(),
+                registration,
+                startup_lock_sha256: lock.canonical_sha256.clone(),
+            };
+            corpus.validate(&lock).map_err(|error| error.to_string())?;
+            let json = serde_json::to_vec_pretty(&corpus).map_err(|error| error.to_string())?;
+            if json.len() as u64 > MAX_JSON_BYTES {
+                return Err("corpus manifest JSON exceeds the 4 MiB input limit".into());
+            }
+            write_new_file(&output, &json)?;
+            Ok("Rovent /2 corpus registration bound to input lock; execution_ready=false".into())
         }
         Command::RoventVerifyReceipt {
             input_lock,
