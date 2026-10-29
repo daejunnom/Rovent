@@ -161,7 +161,7 @@ impl RoventCorpusProducer {
         )?;
         let scope = job.scope();
         let process = startup.process_identity();
-        let raw = json!({"question_sequence":job.question.id.sequence,"question_digest":hex(job.question.question_digest),
+        let raw = json!({"input_sha256":input.input_sha256,"question_sequence":job.question.id.sequence,"question_digest":hex(job.question.question_digest),
             "root_budget":hex(job.question.root_budget),"root_restriction":hex(root_restriction),
             "execution_epoch":job.execution.epoch.0,"execution_sequence":job.execution.sequence,
             "owner":job.owner.0,"process":process_json(process),"requested":job.constraint,"question":question_json(job.question),

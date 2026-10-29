@@ -883,6 +883,42 @@ impl RoventCorpusIndexV2 {
     }
 }
 
+fn validate_teacher_input_binding(binding: &serde_json::Value, input_sha256: &str) -> bool {
+    if binding["schema"] == "rz-rovent-collection-teacher-binding/1" {
+        binding["input_scope"]["input_sha256"] == input_sha256
+    } else {
+        binding["input_sha256"] == input_sha256
+    }
+}
+
+#[cfg(test)]
+mod teacher_input_binding_tests {
+    use super::validate_teacher_input_binding;
+    use serde_json::json;
+
+    #[test]
+    fn collection_scope_is_bound_to_original_input_not_an_unrelated_field() {
+        let input = "a".repeat(64);
+        let other = "b".repeat(64);
+        let mut binding = json!({
+            "schema": "rz-rovent-collection-teacher-binding/1",
+            "input_scope": { "input_sha256": input },
+        });
+        assert!(validate_teacher_input_binding(&binding, &input));
+        binding["input_sha256"] = json!(input);
+        binding["input_scope"]["input_sha256"] = json!(other);
+        assert!(!validate_teacher_input_binding(&binding, &input));
+        binding["input_scope"] = json!({});
+        assert!(!validate_teacher_input_binding(&binding, &input));
+
+        // Preserve the pre-existing top-level binding validator contract.
+        // This fixture does not attest any real profiled teacher execution.
+        let top_level = json!({"input_sha256": input});
+        assert!(validate_teacher_input_binding(&top_level, &input));
+        assert!(!validate_teacher_input_binding(&top_level, &other));
+    }
+}
+
 fn validate_head_sources(
     row: &RoventTrainingRecordV2,
     manifest: &RoventCorpusManifestV2,
@@ -926,15 +962,9 @@ fn validate_head_sources(
             .ok_or_else(|| ManifestError::Integrity("unknown frozen teacher actor".into()))?;
         let raw = &head.raw_receipt;
         // The collection teacher uses the actual submitted input scope; the
-        // profiled external teacher uses a top-level input digest. Keep both
-        // existing binding families distinct instead of rejecting a genuine
-        // Collection receipt because its digest is nested in the scope.
-        let binding = &raw["binding"];
-        let binding_input = if binding["schema"] == "rz-rovent-collection-teacher-binding/1" {
-            &binding["input_scope"]["input_sha256"]
-        } else {
-            &binding["input_sha256"]
-        };
+        // pre-existing validator also accepts a top-level input digest. Keep
+        // the two shapes distinct instead of rejecting a genuine Collection
+        // receipt because its digest is nested in the scope.
         ensure(
             row.lineage.teacher_actor_id.as_ref() == Some(&head.actor_id)
                 && head.source == policy.source
@@ -948,7 +978,7 @@ fn validate_head_sources(
                 && raw["teacher_pin"]
                     == serde_json::to_value(pin)
                         .map_err(|e| ManifestError::Integrity(e.to_string()))?
-                && *binding_input == row.input_sha256,
+                && validate_teacher_input_binding(&raw["binding"], &row.input_sha256),
             "new teacher policy frozen actor/profile/binary/original binding",
         )?;
     }
