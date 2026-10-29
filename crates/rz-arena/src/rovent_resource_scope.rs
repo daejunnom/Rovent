@@ -68,16 +68,31 @@ pub struct RoventNativeResourceScopeV2 {
 }
 
 pub enum RoventNativeResourceFailureV2 {
-    BeforePreparation { error: ArenaError, lock: Arc<RoventInputLockV2>, delegated: File },
-    Preparation { failure: Box<RoventTrainingResourceFailure>, lock: Arc<RoventInputLockV2> },
-    Entry { error: ArenaError, lock: Arc<RoventInputLockV2>, resources: Arc<RoventTrainingResources> },
+    BeforePreparation {
+        error: ArenaError,
+        lock: Arc<RoventInputLockV2>,
+        delegated: File,
+    },
+    Preparation {
+        failure: Box<RoventTrainingResourceFailure>,
+        lock: Arc<RoventInputLockV2>,
+    },
+    Entry {
+        error: ArenaError,
+        lock: Arc<RoventInputLockV2>,
+        resources: Arc<RoventTrainingResources>,
+    },
 }
 
 impl std::fmt::Debug for RoventNativeResourceFailureV2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BeforePreparation { error, .. } => f.debug_tuple("BeforePreparation").field(error).finish(),
-            Self::Preparation { failure, .. } => f.debug_tuple("Preparation").field(failure).finish(),
+            Self::BeforePreparation { error, .. } => {
+                f.debug_tuple("BeforePreparation").field(error).finish()
+            }
+            Self::Preparation { failure, .. } => {
+                f.debug_tuple("Preparation").field(failure).finish()
+            }
             Self::Entry { error, .. } => f.debug_tuple("Entry").field(error).finish(),
         }
     }
@@ -94,11 +109,19 @@ impl std::error::Error for RoventNativeResourceFailureV2 {}
 impl RoventNativeResourceFailureV2 {
     pub fn observation(&self) -> Value {
         match self {
-            Self::BeforePreparation { error, lock, .. } => json!({"schema":"rz-rovent-native-resource-failure/2",
-                "stage":"before_preparation","input_lock_sha256":lock.canonical_sha256,"error":error.to_string(),"delegated_descriptor_retained":true,"automatic_cleanup":false}),
-            Self::Preparation { failure, lock } => json!({"schema":"rz-rovent-native-resource-failure/2",
-                "stage":"preparation","input_lock_sha256":lock.canonical_sha256,"resource_failure":failure.observation(),"automatic_cleanup":false}),
-            Self::Entry { error, lock, resources } => json!({"schema":"rz-rovent-native-resource-failure/2",
+            Self::BeforePreparation { error, lock, .. } => {
+                json!({"schema":"rz-rovent-native-resource-failure/2",
+                "stage":"before_preparation","input_lock_sha256":lock.canonical_sha256,"error":error.to_string(),"delegated_descriptor_retained":true,"automatic_cleanup":false})
+            }
+            Self::Preparation { failure, lock } => {
+                json!({"schema":"rz-rovent-native-resource-failure/2",
+                "stage":"preparation","input_lock_sha256":lock.canonical_sha256,"resource_failure":failure.observation(),"automatic_cleanup":false})
+            }
+            Self::Entry {
+                error,
+                lock,
+                resources,
+            } => json!({"schema":"rz-rovent-native-resource-failure/2",
                 "stage":"self_entry_or_readback","input_lock_sha256":lock.canonical_sha256,"error":error.to_string(),
                 "resource_policy":resources.policy(),"actual_partial_migration_must_be_preserved":true,"automatic_cleanup":false}),
         }
@@ -107,26 +130,55 @@ impl RoventNativeResourceFailureV2 {
 
 impl RoventNativeResourceScopeV2 {
     pub fn prepare(
-        lock: Arc<RoventInputLockV2>, delegated: File, delegated_path: &Path,
-        leaf_name: &str, options: RoventNativeResourceOptions,
+        lock: Arc<RoventInputLockV2>,
+        delegated: File,
+        delegated_path: &Path,
+        leaf_name: &str,
+        options: RoventNativeResourceOptions,
     ) -> Result<Self, Box<RoventNativeResourceFailureV2>> {
         let plan = (|| -> Result<_, ArenaError> {
             lock.validate()?;
-            resource_policy(&lock.manifest.engine.pc.device, &lock.manifest.resources, options)
+            resource_policy(
+                &lock.manifest.engine.pc.device,
+                &lock.manifest.resources,
+                options,
+            )
         })();
         let policy = match plan {
             Ok(policy) => policy,
-            Err(error) => return Err(Box::new(RoventNativeResourceFailureV2::BeforePreparation { error, lock, delegated })),
+            Err(error) => {
+                return Err(Box::new(RoventNativeResourceFailureV2::BeforePreparation {
+                    error,
+                    lock,
+                    delegated,
+                }));
+            }
         };
-        let resources = match RoventTrainingResources::prepare(delegated, delegated_path, leaf_name, policy) {
-            Ok(resources) => Arc::new(resources),
-            Err(failure) => return Err(Box::new(RoventNativeResourceFailureV2::Preparation { failure, lock })),
-        };
+        let resources =
+            match RoventTrainingResources::prepare(delegated, delegated_path, leaf_name, policy) {
+                Ok(resources) => Arc::new(resources),
+                Err(failure) => {
+                    return Err(Box::new(RoventNativeResourceFailureV2::Preparation {
+                        failure,
+                        lock,
+                    }));
+                }
+            };
         let entry = match resources.enter_current_native_process() {
             Ok(entry) => entry,
-            Err(error) => return Err(Box::new(RoventNativeResourceFailureV2::Entry { error, lock, resources })),
+            Err(error) => {
+                return Err(Box::new(RoventNativeResourceFailureV2::Entry {
+                    error,
+                    lock,
+                    resources,
+                }));
+            }
         };
-        Ok(Self { lock, resources, entry })
+        Ok(Self {
+            lock,
+            resources,
+            entry,
+        })
     }
 
     pub fn matches_input_lock(&self, lock: &Arc<RoventInputLockV2>) -> bool {
@@ -134,7 +186,12 @@ impl RoventNativeResourceScopeV2 {
     }
 
     pub fn observe(&self) -> RoventNativeResourceSnapshot {
-        observe_native(&self.resources, &self.entry, &self.lock.canonical_sha256, &self.lock.manifest.resources)
+        observe_native(
+            &self.resources,
+            &self.entry,
+            &self.lock.canonical_sha256,
+            &self.lock.manifest.resources,
+        )
     }
 }
 
@@ -258,7 +315,12 @@ impl RoventNativeResourceScope {
     /// Failed/racing probes remain explicit Unknown in the returned snapshot;
     /// the actual FD/process owner is always retained for subsequent cleanup.
     pub fn observe(&self) -> RoventNativeResourceSnapshot {
-        observe_native(&self.resources, &self.entry, &self.lock.canonical_sha256, &self.lock.manifest.resources)
+        observe_native(
+            &self.resources,
+            &self.entry,
+            &self.lock.canonical_sha256,
+            &self.lock.manifest.resources,
+        )
     }
 }
 
@@ -268,40 +330,40 @@ fn observe_native(
     lock_sha256: &str,
     declared: &RoventResourcePlan,
 ) -> RoventNativeResourceSnapshot {
-        let tree = resources.observe_native_process_tree(entry);
-        let total = resources.observe_total_parent_scope();
-        let startup = resources.native_startup_json();
-        // A failed probe does not establish that controls were unapplied.
-        // A leaf file alone also cannot establish application to this tree.
-        let applied = (startup.is_ok() && tree.is_ok()).then_some(true);
-        let threads = tree.as_ref().ok().map(|tree| tree.kernel_threads);
-        let limits = tree.as_ref().ok().map(|tree| {
-            (
-                tree.readback.memory_high_bytes,
-                tree.readback.memory_max_bytes,
-            )
-        });
-        let inventory_complete = tree.is_ok();
-        let raw = json!({
-            "schema":ROVENT_NATIVE_RESOURCE_EVIDENCE,
-            "input_lock_sha256":lock_sha256,
-            "declared_resource_plan":declared,
-            "actual_leaf_policy":resources.policy(),
-            "leaf_readback":startup.as_ref().ok(),"leaf_readback_error":startup.err().map(|error|error.to_string()),
-            "native_tree":tree.as_ref().ok(),"native_tree_error":tree.err().map(|error|error.to_string()),
-            "held_common_ancestor":total.as_ref().ok(),"ancestor_probe_error":total.err().map(|error|error.to_string()),
-            "full_quota_ancestry":"unknown","physical_topology":"unknown","actual_ort_thread_role_inventory":"unknown",
-            "final_host_peak":"unknown","vram_peak":"unknown","pre_entry_memory_charge_migration":"unknown",
-            "scope":"actual_configured_leaf_and_bounded_live_tree_only_not_controlled_comparison_or_final_peak",
-            "automatic_cleanup":false
-        });
-        RoventNativeResourceSnapshot {
-            raw,
-            applied,
-            threads,
-            limits,
-            inventory_complete,
-        }
+    let tree = resources.observe_native_process_tree(entry);
+    let total = resources.observe_total_parent_scope();
+    let startup = resources.native_startup_json();
+    // A failed probe does not establish that controls were unapplied.
+    // A leaf file alone also cannot establish application to this tree.
+    let applied = (startup.is_ok() && tree.is_ok()).then_some(true);
+    let threads = tree.as_ref().ok().map(|tree| tree.kernel_threads);
+    let limits = tree.as_ref().ok().map(|tree| {
+        (
+            tree.readback.memory_high_bytes,
+            tree.readback.memory_max_bytes,
+        )
+    });
+    let inventory_complete = tree.is_ok();
+    let raw = json!({
+        "schema":ROVENT_NATIVE_RESOURCE_EVIDENCE,
+        "input_lock_sha256":lock_sha256,
+        "declared_resource_plan":declared,
+        "actual_leaf_policy":resources.policy(),
+        "leaf_readback":startup.as_ref().ok(),"leaf_readback_error":startup.err().map(|error|error.to_string()),
+        "native_tree":tree.as_ref().ok(),"native_tree_error":tree.err().map(|error|error.to_string()),
+        "held_common_ancestor":total.as_ref().ok(),"ancestor_probe_error":total.err().map(|error|error.to_string()),
+        "full_quota_ancestry":"unknown","physical_topology":"unknown","actual_ort_thread_role_inventory":"unknown",
+        "final_host_peak":"unknown","vram_peak":"unknown","pre_entry_memory_charge_migration":"unknown",
+        "scope":"actual_configured_leaf_and_bounded_live_tree_only_not_controlled_comparison_or_final_peak",
+        "automatic_cleanup":false
+    });
+    RoventNativeResourceSnapshot {
+        raw,
+        applied,
+        threads,
+        limits,
+        inventory_complete,
+    }
 }
 
 fn policy(
@@ -309,7 +371,11 @@ fn policy(
     options: RoventNativeResourceOptions,
 ) -> Result<RoventTrainingResourcePolicy, ArenaError> {
     lock.validate()?;
-    resource_policy(&lock.manifest.engine.pc.device, &lock.manifest.resources, options)
+    resource_policy(
+        &lock.manifest.engine.pc.device,
+        &lock.manifest.resources,
+        options,
+    )
 }
 
 fn resource_policy(

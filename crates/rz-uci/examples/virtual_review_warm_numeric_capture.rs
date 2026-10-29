@@ -844,7 +844,9 @@ fn run_cases(
                         evidence,
                         observation_failures,
                         ..
-                    } if completion.ticket == ticket && started => break (completion, evidence, observation_failures),
+                    } if completion.ticket == ticket && started => {
+                        break (completion, evidence, observation_failures);
+                    }
                     event => return Err(unexpected(&event).into()),
                 }
             };
@@ -974,7 +976,10 @@ fn run_cases(
                     observation_failures,
                 } if t == ticket => {
                     if !observation_failures.is_empty() {
-                        let error = format!("native retirement observation failure: {:?}", observation_failures);
+                        let error = format!(
+                            "native retirement observation failure: {:?}",
+                            observation_failures
+                        );
                         // Preserve the exact receipt and registry until the
                         // process is gone; do not promote it to logical accept.
                         if let Some(receipt) = native_receipt {

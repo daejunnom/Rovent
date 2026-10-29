@@ -24,7 +24,13 @@ struct Facts {
     quiesced: AtomicUsize,
     fixture_evidence_produced: Mutex<Vec<(RequestId, TicketExecutionEvidence)>>,
     fixture_evidence_taken: Mutex<Vec<RequestId>>,
-    expected_dispatch: Mutex<Option<(NativeAcceptanceVerifier, NativeAcceptanceVerifier, Arc<View>)>>,
+    expected_dispatch: Mutex<
+        Option<(
+            NativeAcceptanceVerifier,
+            NativeAcceptanceVerifier,
+            Arc<View>,
+        )>,
+    >,
     owned_dispatch: Mutex<Vec<(RoleTicketEnvelope, u64, u64, bool, bool, bool)>>,
     run_observation: Mutex<Option<(TicketNativeObservationDisposition, RoleFailure)>>,
     accept_observation: Mutex<Option<(TicketNativeObservationDisposition, RoleFailure)>>,
@@ -75,12 +81,14 @@ impl TicketNativeBackend<View, u64> for Fake {
         // actual ORT/NN execution. Only this fixture's run produces them.
         let evidence = fixture_execution_evidence(ticket, *prepared);
         if let Some((disposition, cause)) = self.facts.run_observation.lock().unwrap().take() {
-            self.facts.pending_observations.lock().unwrap().push_back(TicketNativeObservationFailure {
-                ticket: *ticket,
-                stage: TicketNativeObservationStage::Completed,
-                disposition,
-                cause,
-            });
+            self.facts.pending_observations.lock().unwrap().push_back(
+                TicketNativeObservationFailure {
+                    ticket: *ticket,
+                    stage: TicketNativeObservationStage::Completed,
+                    disposition,
+                    cause,
+                },
+            );
         }
         self.fixture_evidence = Some((ticket.id, evidence));
         self.facts
@@ -102,7 +110,8 @@ impl TicketNativeBackend<View, u64> for Fake {
         context: TicketOwnerDispatchContext<'_, View, u64, u64>,
         canceled: &AtomicBool,
     ) -> TicketPhysicalResult<(u64, u64)> {
-        if let Some((expected, other, view)) = self.facts.expected_dispatch.lock().unwrap().as_ref() {
+        if let Some((expected, other, view)) = self.facts.expected_dispatch.lock().unwrap().as_ref()
+        {
             self.facts.owned_dispatch.lock().unwrap().push((
                 *context.ticket(),
                 context.question().query,
@@ -112,7 +121,12 @@ impl TicketNativeBackend<View, u64> for Fake {
                 Arc::ptr_eq(&context.question().view, view),
             ));
         }
-        self.run(context.ticket(), context.question(), context.prepared(), canceled)
+        self.run(
+            context.ticket(),
+            context.question(),
+            context.prepared(),
+            canceled,
+        )
     }
     fn output_host_bytes(&self, _: &(u64, u64)) -> u64 {
         16
@@ -150,12 +164,14 @@ impl TicketNativeBackend<View, u64> for Fake {
     ) -> Result<(), RoleFailure> {
         self.facts.accepted.lock().unwrap().push(ticket.id.sequence);
         if let Some((disposition, cause)) = self.facts.accept_observation.lock().unwrap().take() {
-            self.facts.pending_observations.lock().unwrap().push_back(TicketNativeObservationFailure {
-                ticket: *ticket,
-                stage: TicketNativeObservationStage::Retired,
-                disposition,
-                cause,
-            });
+            self.facts.pending_observations.lock().unwrap().push_back(
+                TicketNativeObservationFailure {
+                    ticket: *ticket,
+                    stage: TicketNativeObservationStage::Retired,
+                    disposition,
+                    cause,
+                },
+            );
         }
         if let Some(failure) = self.facts.accept_failure.lock().unwrap().take() {
             return Err(failure);
@@ -419,7 +435,14 @@ fn required_retirement_observation_does_not_rewrite_original_owner_acceptance() 
     ));
     service.accept_with_permit(id, original, permit).unwrap();
     let receipt = match next(&service) {
-        TicketNativeEvent::Retired { ticket, accepted, result, native_receipt, rejected_permit, observation_failures } => {
+        TicketNativeEvent::Retired {
+            ticket,
+            accepted,
+            result,
+            native_receipt,
+            rejected_permit,
+            observation_failures,
+        } => {
             assert_eq!(ticket, original);
             assert!(accepted);
             assert_eq!(result, Ok(()));
@@ -428,13 +451,18 @@ fn required_retirement_observation_does_not_rewrite_original_owner_acceptance() 
             assert_eq!(reports.len(), 1);
             assert_eq!(reports[0].ticket, original);
             assert_eq!(reports[0].stage, TicketNativeObservationStage::Retired);
-            assert_eq!(reports[0].disposition, TicketNativeObservationDisposition::RequiredAfterPhysical);
+            assert_eq!(
+                reports[0].disposition,
+                TicketNativeObservationDisposition::RequiredAfterPhysical
+            );
             assert_eq!(reports[0].cause, cause);
             native_receipt.expect("actual successful acceptance retains original receipt")
         }
         _ => panic!("expected original retirement with observation"),
     };
-    registry.confirm_native_acceptance(receipt, clock.domain(), clock.now()).unwrap();
+    registry
+        .confirm_native_acceptance(receipt, clock.domain(), clock.now())
+        .unwrap();
     service.accept(id, original).unwrap();
     assert!(matches!(next(&service), TicketNativeEvent::Rejected {
         preparation, error: TicketServiceError::UnknownPreparation
@@ -455,7 +483,14 @@ fn unknown_acceptance_preserves_failure_and_original_permit_without_replay() {
     ));
     service.accept_with_permit(id, original, permit).unwrap();
     let permit = match next(&service) {
-        TicketNativeEvent::Retired { ticket, accepted, result, native_receipt, rejected_permit, observation_failures } => {
+        TicketNativeEvent::Retired {
+            ticket,
+            accepted,
+            result,
+            native_receipt,
+            rejected_permit,
+            observation_failures,
+        } => {
             assert_eq!(ticket, original);
             assert!(!accepted);
             assert_eq!(result, Err(RoleFailure::PhysicalUnknown));
@@ -473,7 +508,12 @@ fn unknown_acceptance_preserves_failure_and_original_permit_without_replay() {
     };
     service.accept_with_permit(id, original, permit).unwrap();
     match next(&service) {
-        TicketNativeEvent::AcceptanceRejected { preparation, ticket, error, permit } => {
+        TicketNativeEvent::AcceptanceRejected {
+            preparation,
+            ticket,
+            error,
+            permit,
+        } => {
             assert_eq!(preparation, id);
             assert_eq!(ticket, original);
             assert_eq!(error, TicketServiceError::Duplicate);
@@ -485,7 +525,10 @@ fn unknown_acceptance_preserves_failure_and_original_permit_without_replay() {
     // This fake has no device-backed resources. Real PhysicalUnknown is not
     // resolved by this fixture's explicit discard or fake finish callback.
     service.discard(id, original).unwrap();
-    assert!(matches!(next(&service), TicketNativeEvent::Retired { result: Ok(()), .. }));
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::Retired { result: Ok(()), .. }
+    ));
     finish(service);
 }
 
@@ -494,7 +537,13 @@ fn completed_observation_is_one_terminal_and_preserves_actual_physical_result() 
     for physical_unknown in [false, true] {
         let (mut service, facts, clock) = spawn(true);
         let value = if physical_unknown { 99 } else { 2 };
-        let seal = prepare(&mut service, value, 4, &clock, Arc::new(AtomicUsize::new(0)));
+        let seal = prepare(
+            &mut service,
+            value,
+            4,
+            &clock,
+            Arc::new(AtomicUsize::new(0)),
+        );
         let original = ticket(seal, 1);
         let cause = RoleFailure::Backend("completed observation failed".into());
         *facts.run_observation.lock().unwrap() = Some((
@@ -503,7 +552,12 @@ fn completed_observation_is_one_terminal_and_preserves_actual_physical_result() 
         ));
         service.execute(seal.preparation, original).unwrap();
         let (completion, reports) = loop {
-            if let TicketNativeEvent::Completed { completion, observation_failures, .. } = next(&service) {
+            if let TicketNativeEvent::Completed {
+                completion,
+                observation_failures,
+                ..
+            } = next(&service)
+            {
                 break (completion, observation_failures);
             }
         };
@@ -512,19 +566,33 @@ fn completed_observation_is_one_terminal_and_preserves_actual_physical_result() 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].ticket, original);
         assert_eq!(entries[0].stage, TicketNativeObservationStage::Completed);
-        assert_eq!(entries[0].disposition, TicketNativeObservationDisposition::RequiredAfterPhysical);
+        assert_eq!(
+            entries[0].disposition,
+            TicketNativeObservationDisposition::RequiredAfterPhysical
+        );
         assert_eq!(entries[0].cause, cause);
         if physical_unknown {
             assert_eq!(completion.physical, PhysicalRoleCompletion::Unknown);
-            assert!(matches!(completion.result, Err(RoleFailure::PhysicalUnknown)));
-            assert!(matches!(next(&service), TicketNativeEvent::Finished { physical_shutdown_confirmed: false }));
+            assert!(matches!(
+                completion.result,
+                Err(RoleFailure::PhysicalUnknown)
+            ));
+            assert!(matches!(
+                next(&service),
+                TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed: false
+                }
+            ));
             assert!(service.is_quarantined());
             drop(service);
         } else {
             assert_eq!(completion.physical, PhysicalRoleCompletion::Confirmed);
             assert_eq!(*completion.result.unwrap(), (2, 102));
             service.discard(seal.preparation, original).unwrap();
-            assert!(matches!(next(&service), TicketNativeEvent::Retired { result: Ok(()), .. }));
+            assert!(matches!(
+                next(&service),
+                TicketNativeEvent::Retired { result: Ok(()), .. }
+            ));
             finish(service);
         }
     }
@@ -818,7 +886,10 @@ fn real_worker_dispatch_preserves_original_owner_ticket_and_prepared_input() {
         &[(original, 23, 23, true, false, true)]
     );
     service.discard(preparation, original).unwrap();
-    assert!(matches!(next(&service), TicketNativeEvent::Retired { result: Ok(()), .. }));
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::Retired { result: Ok(()), .. }
+    ));
     finish(service);
 }
 
@@ -864,19 +935,37 @@ fn owner_context_projection_requires_the_original_view_and_question_contract() {
 
     let mut changed = projected();
     changed.question = Digest([42; 32]);
-    assert!(matches!(context().project(&changed, &projected_prepared), Err(RoleFailure::InvalidOutput)));
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
     let mut changed = projected();
     changed.seal.view_sequence += 1;
-    assert!(matches!(context().project(&changed, &projected_prepared), Err(RoleFailure::InvalidOutput)));
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
     let mut changed = projected();
     changed.role = Role::Critic;
-    assert!(matches!(context().project(&changed, &projected_prepared), Err(RoleFailure::InvalidOutput)));
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
     let mut changed = projected();
     changed.deadline.at = MonotonicTick(changed.deadline.at.0 + 1);
-    assert!(matches!(context().project(&changed, &projected_prepared), Err(RoleFailure::InvalidOutput)));
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
     let mut changed = projected();
-    changed.view = Arc::new(View { value: source.view.value, drops: Arc::clone(&source.view.drops) });
-    assert!(matches!(context().project(&changed, &projected_prepared), Err(RoleFailure::InvalidOutput)));
+    changed.view = Arc::new(View {
+        value: source.view.value,
+        drops: Arc::clone(&source.view.drops),
+    });
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
 }
 
 #[test]

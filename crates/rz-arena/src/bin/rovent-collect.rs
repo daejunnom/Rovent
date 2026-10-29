@@ -13,77 +13,153 @@ struct LockV2Cli {
 
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn std::error::Error>> {
-    if !arguments.iter().any(|arg| arg.starts_with("--v2-")) { return Ok(None); }
+    if !arguments.iter().any(|arg| arg.starts_with("--v2-")) {
+        return Ok(None);
+    }
     let mut fields = std::collections::BTreeMap::new();
     let mut original = Vec::new();
     for arg in arguments {
         if arg.starts_with("--v2-") {
             let (key, value) = arg.split_once('=').ok_or("V2 options require =value")?;
-            if !matches!(key, "--v2-mode" | "--v2-plan" | "--v2-plan-sha256" | "--v2-plan-bytes" | "--v2-input-dir" | "--v2-output-dir" | "--v2-worker-timeout-ms" | "--v2-cleanup-timeout-ms")
-                || value.is_empty() || fields.insert(key.to_owned(), value.to_owned()).is_some()
-            { return Err("unknown, empty or duplicate V2 option".into()); }
-        } else if arg.starts_with("--collection-plan") || arg.starts_with("--utility-cohort-plan")
-            || arg.starts_with("--utility-intervention-plan") || arg.starts_with("--prepare-utility-cohort-pins") {
+            if !matches!(
+                key,
+                "--v2-mode"
+                    | "--v2-plan"
+                    | "--v2-plan-sha256"
+                    | "--v2-plan-bytes"
+                    | "--v2-input-dir"
+                    | "--v2-output-dir"
+                    | "--v2-worker-timeout-ms"
+                    | "--v2-cleanup-timeout-ms"
+            ) || value.is_empty()
+                || fields.insert(key.to_owned(), value.to_owned()).is_some()
+            {
+                return Err("unknown, empty or duplicate V2 option".into());
+            }
+        } else if arg.starts_with("--collection-plan")
+            || arg.starts_with("--utility-cohort-plan")
+            || arg.starts_with("--utility-intervention-plan")
+            || arg.starts_with("--prepare-utility-cohort-pins")
+        {
             return Err("legacy and V2 collection selectors cannot be mixed".into());
-        } else { original.push(arg); }
+        } else {
+            original.push(arg);
+        }
     }
     let mut take = |key: &str| fields.remove(key).ok_or_else(|| format!("missing {key}"));
     let mode = take("--v2-mode")?;
-    if !matches!(mode.as_str(), "pc" | "own-nnuec") { return Err("unsupported V2 collection mode".into()); }
+    if !matches!(mode.as_str(), "pc" | "own-nnuec") {
+        return Err("unsupported V2 collection mode".into());
+    }
     let plan = rz_arena::rovent_collect::RoventPublicationFile {
-        path: take("--v2-plan")?, sha256: take("--v2-plan-sha256")?, bytes: take("--v2-plan-bytes")?.parse()?,
+        path: take("--v2-plan")?,
+        sha256: take("--v2-plan-sha256")?,
+        bytes: take("--v2-plan-bytes")?.parse()?,
     };
     let input = std::path::PathBuf::from(take("--v2-input-dir")?);
     let output = std::path::PathBuf::from(take("--v2-output-dir")?);
     let worker_ms = take("--v2-worker-timeout-ms")?.parse::<u64>()?;
     let cleanup_ms = take("--v2-cleanup-timeout-ms")?.parse::<u64>()?;
     if !input.is_absolute() || !output.is_absolute() || worker_ms == 0 || cleanup_ms < worker_ms {
-        return Err("absolute input/output and finite ordered worker/cleanup timeouts required".into());
+        return Err(
+            "absolute input/output and finite ordered worker/cleanup timeouts required".into(),
+        );
     }
-    Ok(Some(LockV2Cli { mode, plan, input, output, worker_ms, cleanup_ms, original }))
+    Ok(Some(LockV2Cli {
+        mode,
+        plan,
+        input,
+        output,
+        worker_ms,
+        cleanup_ms,
+        original,
+    }))
 }
 
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std::error::Error>> {
-    use rz_arena::rovent_collect::launch::{load_rovent_collection_lock_v2_plan,
-        run_rovent_pc_collection_lock_v2, run_rovent_own_nnuec_collection_lock_v2};
+    use rz_arena::rovent_collect::launch::{
+        load_rovent_collection_lock_v2_plan, run_rovent_own_nnuec_collection_lock_v2,
+        run_rovent_pc_collection_lock_v2,
+    };
     use std::time::{Duration, Instant};
     let start = Instant::now();
-    let worker_until = start.checked_add(Duration::from_millis(cli.worker_ms)).ok_or("worker deadline overflow")?;
-    let cleanup_until = start.checked_add(Duration::from_millis(cli.cleanup_ms)).ok_or("cleanup deadline overflow")?;
+    let worker_until = start
+        .checked_add(Duration::from_millis(cli.worker_ms))
+        .ok_or("worker deadline overflow")?;
+    let cleanup_until = start
+        .checked_add(Duration::from_millis(cli.cleanup_ms))
+        .ok_or("cleanup deadline overflow")?;
     let directory = cap_std::fs::Dir::open_ambient_dir(&cli.input, cap_std::ambient_authority())?;
     let plan = load_rovent_collection_lock_v2_plan(&directory, &cli.plan)?;
-    if plan.output_directory != cli.output { return Err("V2 output directory differs from pinned plan".into()); }
-    if plan.maximum_roots != 1 { return Err("V2 runner supports exactly one root".into()); }
+    if plan.output_directory != cli.output {
+        return Err("V2 output directory differs from pinned plan".into());
+    }
+    if plan.maximum_roots != 1 {
+        return Err("V2 runner supports exactly one root".into());
+    }
     let (observation, accepted) = match cli.mode.as_str() {
         "pc" => {
-            let mut run = run_rovent_pc_collection_lock_v2(cli.original, plan, &directory, worker_until, cleanup_until)?;
+            let mut run = run_rovent_pc_collection_lock_v2(
+                cli.original,
+                plan,
+                &directory,
+                worker_until,
+                cleanup_until,
+            )?;
             while !run.poll_worker() && Instant::now() < cleanup_until {
-                std::thread::sleep(cleanup_until.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                std::thread::sleep(
+                    cleanup_until
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
             }
             let observation = run.observation();
-            let accepted = run.closed_owner().is_ok() && observation.get("native_error").is_some_and(serde_json::Value::is_null)
-                && observation.get("resource_error").is_some_and(serde_json::Value::is_null);
+            let accepted = run.closed_owner().is_ok()
+                && observation
+                    .get("native_error")
+                    .is_some_and(serde_json::Value::is_null)
+                && observation
+                    .get("resource_error")
+                    .is_some_and(serde_json::Value::is_null);
             (observation, accepted)
         }
         "own-nnuec" => {
-            let mut run = run_rovent_own_nnuec_collection_lock_v2(cli.original, plan, &directory, worker_until, cleanup_until)?;
+            let mut run = run_rovent_own_nnuec_collection_lock_v2(
+                cli.original,
+                plan,
+                &directory,
+                worker_until,
+                cleanup_until,
+            )?;
             while !run.poll_worker() && Instant::now() < cleanup_until {
-                std::thread::sleep(cleanup_until.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                std::thread::sleep(
+                    cleanup_until
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
             }
             let observation = run.observation();
-            let accepted = run.closed_owner().is_ok() && observation.get("native_error").is_some_and(serde_json::Value::is_null)
-                && observation.get("resource_error").is_some_and(serde_json::Value::is_null);
+            let accepted = run.closed_owner().is_ok()
+                && observation
+                    .get("native_error")
+                    .is_some_and(serde_json::Value::is_null)
+                && observation
+                    .get("resource_error")
+                    .is_some_and(serde_json::Value::is_null);
             (observation, accepted)
         }
         _ => return Err("unsupported V2 collection mode".into()),
     };
-    Ok((serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
+    Ok((
+        serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
         "input_directory":cli.input, "output_directory":cli.output, "worker_timeout_ms":cli.worker_ms,
         "cleanup_timeout_ms":cli.cleanup_ms, "runner_observation":observation,
         "owner_inspection_available":accepted, "publication":"not_attempted", "training_executed":false,
         "owner_custody":"process_lifetime_only", "durable_recovery":"unavailable",
-        "native_execution_deadline":"external_supervisor_required", "cli_acceptance":"incomplete"}), false))
+        "native_execution_deadline":"external_supervisor_required", "cli_acceptance":"incomplete"}),
+        false,
+    ))
 }
 
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
@@ -97,23 +173,38 @@ fn main() -> std::process::ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match parse_lock_v2(arguments.clone()) {
         Ok(Some(cli)) => {
-            let _ = writeln!(std::io::stderr().lock(), "V2 worker/cleanup timeouts do not limit the native UCI loop; an external finite process supervisor is required");
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "V2 worker/cleanup timeouts do not limit the native UCI loop; an external finite process supervisor is required"
+            );
             return match run_lock_v2(cli) {
                 Ok((observation, accepted)) => {
                     if writeln!(std::io::stderr().lock(), "{observation}").is_err() || !accepted {
                         std::process::ExitCode::FAILURE
-                    } else { std::process::ExitCode::SUCCESS }
+                    } else {
+                        std::process::ExitCode::SUCCESS
+                    }
                 }
                 Err(error) => {
-                    let detail: String = error.to_string().chars().take(2048)
-                        .map(|c| if c.is_control() { ' ' } else { c }).collect();
-                    let _ = writeln!(std::io::stderr().lock(), "rovent-collect V2 halted: {detail}");
+                    let detail: String = error
+                        .to_string()
+                        .chars()
+                        .take(2048)
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .collect();
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "rovent-collect V2 halted: {detail}"
+                    );
                     std::process::ExitCode::FAILURE
                 }
             };
         }
         Err(error) => {
-            let _ = writeln!(std::io::stderr().lock(), "rovent-collect V2 configuration: {error}");
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "rovent-collect V2 configuration: {error}"
+            );
             return std::process::ExitCode::FAILURE;
         }
         Ok(None) => {}
@@ -122,7 +213,10 @@ fn main() -> std::process::ExitCode {
         match parse_rovent_collection_cli(arguments)? {
             RoventCollectionCliParse::Help => {
                 writeln!(std::io::stdout().lock(), "{ROVENT_COLLECTION_USAGE}")?;
-                writeln!(std::io::stdout().lock(), "V2: --v2-mode=pc|own-nnuec --v2-plan=inputs/<plan.json> --v2-plan-sha256=<sha256> --v2-plan-bytes=<bytes> --v2-input-dir=<absolute> --v2-output-dir=<absolute> --v2-worker-timeout-ms=<ms> --v2-cleanup-timeout-ms=<ms> <original source/config/FD arguments>")?;
+                writeln!(
+                    std::io::stdout().lock(),
+                    "V2: --v2-mode=pc|own-nnuec --v2-plan=inputs/<plan.json> --v2-plan-sha256=<sha256> --v2-plan-bytes=<bytes> --v2-input-dir=<absolute> --v2-output-dir=<absolute> --v2-worker-timeout-ms=<ms> --v2-cleanup-timeout-ms=<ms> <original source/config/FD arguments>"
+                )?;
                 writeln!(
                     std::io::stdout().lock(),
                     "선택형 cohort: --utility-cohort-plan=inputs/<plan.json> --utility-cohort-plan-sha256=<SHA> --utility-cohort-plan-bytes=<bytes> <원 source/config 인수>"
@@ -210,10 +304,20 @@ mod v2_cli_tests {
     use super::parse_lock_v2;
 
     fn arguments() -> Vec<String> {
-        ["--v2-mode=pc", "--v2-plan=inputs/plan.json", "--v2-plan-sha256=unused-at-parse",
-         "--v2-plan-bytes=42", "--v2-input-dir=/tmp/input", "--v2-output-dir=/tmp/output",
-         "--v2-worker-timeout-ms=100", "--v2-cleanup-timeout-ms=200", "--process-epoch=1"]
-            .into_iter().map(str::to_owned).collect()
+        [
+            "--v2-mode=pc",
+            "--v2-plan=inputs/plan.json",
+            "--v2-plan-sha256=unused-at-parse",
+            "--v2-plan-bytes=42",
+            "--v2-input-dir=/tmp/input",
+            "--v2-output-dir=/tmp/output",
+            "--v2-worker-timeout-ms=100",
+            "--v2-cleanup-timeout-ms=200",
+            "--process-epoch=1",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     }
 
     #[test]
@@ -230,7 +334,11 @@ mod v2_cli_tests {
         let mut duplicate = arguments();
         duplicate.push("--v2-mode=own-nnuec".into());
         assert!(parse_lock_v2(duplicate).is_err());
-        assert!(parse_lock_v2(vec!["--collection-plan=inputs/old.json".into()]).unwrap().is_none());
+        assert!(
+            parse_lock_v2(vec!["--collection-plan=inputs/old.json".into()])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

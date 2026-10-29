@@ -86,10 +86,14 @@ impl DriverStartSource {
     /// All root-admission materializations of this same actual UCI Start
     /// share one teacher scope claim; later Starts own different cells.
     pub(crate) fn claim_teacher_scope_once(&self) -> bool {
-        self.teacher_scope_claimed.compare_exchange(
-            false, true, std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ).is_ok()
+        self.teacher_scope_claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Validation does not require a live deadline: an original stopped Start

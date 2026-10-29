@@ -252,7 +252,8 @@ pub struct RoventCorpusProducer {
     reserved: BTreeSet<u64>,
     pending: BTreeMap<(u64, u64), Pending>,
     retired: BTreeSet<(u64, u64)>,
-    native_observation_failures: BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
+    native_observation_failures:
+        BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
 }
 impl RoventCorpusProducer {
     fn validate_admission(
@@ -292,8 +293,10 @@ impl RoventCorpusProducer {
     pub fn incomplete_capture_count(&self) -> usize {
         self.reserved.len() + self.pending.len()
     }
-    pub fn native_observation_failures(&self, id: RequestId)
-        -> Option<&[rz_uci::pals_native::ticketed::TicketNativeObservationFailure]> {
+    pub fn native_observation_failures(
+        &self,
+        id: RequestId,
+    ) -> Option<&[rz_uci::pals_native::ticketed::TicketNativeObservationFailure]> {
         self.native_observation_failures.get(&id).map(Vec::as_slice)
     }
     pub fn submitted_input_seal(
@@ -400,20 +403,33 @@ impl RoventCorpusProducer {
         event: &TicketNativeEvent<O>,
     ) -> Result<(), ArenaError> {
         let terminal = match event {
-            TicketNativeEvent::Completed { completion, observation_failures, .. } =>
-                Some((completion.ticket, observation_failures)),
-            TicketNativeEvent::Retired { ticket, observation_failures, .. } =>
-                Some((*ticket, observation_failures)),
+            TicketNativeEvent::Completed {
+                completion,
+                observation_failures,
+                ..
+            } => Some((completion.ticket, observation_failures)),
+            TicketNativeEvent::Retired {
+                ticket,
+                observation_failures,
+                ..
+            } => Some((*ticket, observation_failures)),
             _ => None,
         };
         if let Some((ticket, failures)) = terminal {
             if !failures.is_empty() {
-                check(self.native_observation_failures.len() < MAX_CORPUS_ROWS
-                    || self.native_observation_failures.contains_key(&ticket.id),
-                    "native observation failure evidence cap")?;
-                let retained = self.native_observation_failures.entry(ticket.id).or_default();
+                check(
+                    self.native_observation_failures.len() < MAX_CORPUS_ROWS
+                        || self.native_observation_failures.contains_key(&ticket.id),
+                    "native observation failure evidence cap",
+                )?;
+                let retained = self
+                    .native_observation_failures
+                    .entry(ticket.id)
+                    .or_default();
                 retained.extend(failures.iter().cloned());
-                return Err(invalid(format!("original native observation failed: {retained:?}")));
+                return Err(invalid(format!(
+                    "original native observation failed: {retained:?}"
+                )));
             }
         }
         if let TicketNativeEvent::Retired {
@@ -578,8 +594,10 @@ impl RoventCorpusProducer {
         acceptance_kind: &str,
     ) -> Result<RoventRetiredRecord, ArenaError> {
         self.validate_admission(admission)?;
-        check(!self.native_observation_failures.contains_key(&t.id),
-            "native observation failed for original retirement")?;
+        check(
+            !self.native_observation_failures.contains_key(&t.id),
+            "native observation failed for original retirement",
+        )?;
         let key = (t.id.epoch.0, t.id.sequence);
         let pending = self
             .pending
@@ -1075,26 +1093,26 @@ pub use teacher::{
 mod native_capture;
 #[cfg(feature = "pals-collection-onnx")]
 pub use native_capture::*;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod collection_hooks_core_v2;
 #[cfg(feature = "pals-collection-onnx")]
 mod observer;
 #[cfg(feature = "pals-collection-onnx")]
 mod observer_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-mod collection_hooks_core_v2;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-mod pc_hooks_lock_v2;
-#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code, unused_imports)]
 mod own_hooks_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod pc_hooks_lock_v2;
+#[cfg(feature = "pals-collection-onnx")]
+pub use observer::*;
+#[cfg(feature = "pals-collection-onnx")]
+pub use observer_lock_v2::*;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(unused_imports)]
 pub(super) use pc_hooks_lock_v2::{
     RoventPcCollectionBridgeV2, RoventPcCollectionWorkerExitV2, RoventPcCollectionWorkerV2,
 };
-#[cfg(feature = "pals-collection-onnx")]
-pub use observer::*;
-#[cfg(feature = "pals-collection-onnx")]
-pub use observer_lock_v2::*;
 mod rules_replay;
 pub use rules_replay::*;
 mod external_scope;
@@ -1121,8 +1139,8 @@ mod publication_v2;
 pub use publication_v2::{ROVENT_CORPUS_PUBLICATION_V2, RoventCorpusPublicationV2};
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod publication_lock_v2;
-mod submitted_v3;
 mod submitted_lock_v2;
+mod submitted_v3;
 pub use submitted_lock_v2::{PublishedRoventLockV2Record, RoventRetiredLockV2Record};
 pub use submitted_v3::{
     PublishedRoventRecordV2, RoventRetiredRecordV2, RoventSubmittedRecordMetadata,

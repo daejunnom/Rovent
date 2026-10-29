@@ -330,9 +330,7 @@ impl<L: SessionExternalLock> RoventExternalSessionSource<L> {
             owner
                 .worker()
                 .request_root_change(root.authority(), root.original_context().control.deadline)
-                .map_err(|error| {
-                    SearchSessionFailure::debug("RoventExternalRootChange", &error)
-                })?;
+                .map_err(|error| SearchSessionFailure::debug("RoventExternalRootChange", &error))?;
             loop {
                 if let Some(result) = owner.worker().root_change_result() {
                     result.map_err(|error| {

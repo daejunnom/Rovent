@@ -32,13 +32,12 @@ use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::AdaptiveSearchDriver as _;
 use crate::pals_adaptive::{
-    AdaptiveExecutionLimits, AdaptiveExecutionManager, AdaptiveManagerCounters,
-    AdaptiveManagerError, AdaptiveManagerRegistration, AdaptiveManagerSources,
-    AdaptiveNnuecRetiredOwner, AdaptivePortDriver, AdaptiveRegisteredLedgerSources,
-    AdaptiveSessionCollectionHooks, AdaptiveShutdownReceipt, ManagerPhase,
-    AdaptiveCollectionObserverBoxV2,
-    RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin,
-    RoventNativeCollectionOriginV2,
+    AdaptiveCollectionObserverBoxV2, AdaptiveExecutionLimits, AdaptiveExecutionManager,
+    AdaptiveManagerCounters, AdaptiveManagerError, AdaptiveManagerRegistration,
+    AdaptiveManagerSources, AdaptiveNnuecRetiredOwner, AdaptivePortDriver,
+    AdaptiveRegisteredLedgerSources, AdaptiveSessionCollectionHooks, AdaptiveShutdownReceipt,
+    ManagerPhase, RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2,
+    RoventNativeCollectionOrigin, RoventNativeCollectionOriginV2,
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
@@ -131,7 +130,9 @@ impl RoventNnuecCollectionHandoffV2 {
         Ok(())
     }
 
-    pub fn teacher_aggregate_ack(&self) -> Option<&crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2> {
+    pub fn teacher_aggregate_ack(
+        &self,
+    ) -> Option<&crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2> {
         self.teacher_aggregate_ack.as_ref()
     }
 
@@ -148,20 +149,31 @@ impl RoventNnuecCollectionHandoffV2 {
         Ok(())
     }
 
-    pub fn teacher_physical_ack(&self) -> Option<&crate::pals_adaptive::RoventTeacherScopePhysicalAckV2> {
+    pub fn teacher_physical_ack(
+        &self,
+    ) -> Option<&crate::pals_adaptive::RoventTeacherScopePhysicalAckV2> {
         self.teacher_physical_ack.as_ref()
     }
 
-    pub fn parts_mut(&mut self) -> (
+    pub fn parts_mut(
+        &mut self,
+    ) -> (
         &RoventCollectionRootAdmissionV2,
         &mut AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
         &Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
         &AdaptiveShutdownReceipt,
     ) {
-        (&self.admission, &mut self.observer, &self.settlement, &self.native_fence)
+        (
+            &self.admission,
+            &mut self.observer,
+            &self.settlement,
+            &self.native_fence,
+        )
     }
 
-    pub fn into_parts(self) -> (
+    pub fn into_parts(
+        self,
+    ) -> (
         RoventCollectionRootAdmissionV2,
         AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
         Result<(), crate::pals_adaptive::AdaptiveCollectionError>,
@@ -170,7 +182,15 @@ impl RoventNnuecCollectionHandoffV2 {
         Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
         Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
     ) {
-        (self.admission, self.observer, self.settlement, self.native_fence, self.collection_failures, self.teacher_physical_ack, self.teacher_aggregate_ack)
+        (
+            self.admission,
+            self.observer,
+            self.settlement,
+            self.native_fence,
+            self.collection_failures,
+            self.teacher_physical_ack,
+            self.teacher_aggregate_ack,
+        )
     }
 }
 
@@ -181,7 +201,10 @@ impl RoventNnuecCollectionHandoffV2 {
 /// lifecycle consumers can retain and drain the same owners.
 pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     /// Register the actual startup control before work can be spawned.
-    fn register_startup_control(&self, control: &super::RoventStartupControl) -> Result<(), AdaptiveManagerError>;
+    fn register_startup_control(
+        &self,
+        control: &super::RoventStartupControl,
+    ) -> Result<(), AdaptiveManagerError>;
     fn admit(
         &self,
         port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
@@ -190,8 +213,9 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
     /// A bounded nonblocking handoff; delivery is not teacher retirement.
-    fn handoff_sender(&self) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>;
-
+    fn handoff_sender(
+        &self,
+    ) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>;
 }
 
 /// Failure custody returned by the /2 hook. This must contain the original
@@ -223,7 +247,8 @@ impl RoventNnuecCollectionAdmissionPortV2<'_> {
         admission: RoventCollectionRootAdmissionV2,
         observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, VirtualReviewTicketOutput>,
     ) -> Result<(), RoventNnuecCollectionObserverRejectionV2> {
-        self.manager.install_collection_observer_v2(admission, observer)
+        self.manager
+            .install_collection_observer_v2(admission, observer)
             .map_err(|failure| RoventNnuecCollectionObserverRejectionV2 {
                 error: failure.error,
                 admission: failure.admission,
@@ -2410,8 +2435,12 @@ impl Drop for RoventNnuecSessionDriver {
     fn drop(&mut self) {
         // Outer delivery alone does not prove that the receiver retained the
         // original observer/data. Unclaimed evidence is quarantined on drop.
-        if let Some(handoff) = self.v2_handoff_custody.get_mut()
-            .unwrap_or_else(|poison| poison.into_inner()).take() {
+        if let Some(handoff) = self
+            .v2_handoff_custody
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
             std::mem::forget(handoff);
         }
         let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());

@@ -4,16 +4,17 @@
 //! 경계를 확인한 뒤에만 이 payload를 만든다. 이 모듈은 질문이나 authority를
 //! 만들지 않으며, 동일한 prepared owner와 원 FD의 소유권만 callback에 넘긴다.
 
+use super::collection_v2_observer::{V2ObserverCustody, V2ObserverReclaimError};
 use super::{LaunchRetirementEvidence, RoventLaunchError};
 use crate::EngineIdentity;
 use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
-use crate::pals_native::ticketed::VirtualReviewCollectionObserver;
-use crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
-use crate::rovent_bootstrap::product::{RoventNativeProductDriver, RoventProductStartupRejection};
-use crate::rovent_bootstrap::product::RoventOwnPcrV2StartupRejection;
-use crate::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2;
-use crate::rovent_bootstrap::nnuec_session::RoventNnuecCollectionHooksV2;
 use crate::pals_adaptive::RoventBoardCollectionHooksV2;
+use crate::pals_native::ticketed::VirtualReviewCollectionObserver;
+use crate::rovent_bootstrap::nnuec_session::RoventNnuecCollectionHooksV2;
+use crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
+use crate::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2;
+use crate::rovent_bootstrap::product::RoventOwnPcrV2StartupRejection;
+use crate::rovent_bootstrap::product::{RoventNativeProductDriver, RoventProductStartupRejection};
 use crate::rovent_bootstrap::{
     PreparedRoventNative, RoventCollectionPreloadSources, RoventPinnedExternalRSource,
     RoventStartupControl, RoventTeacherSourceSelection,
@@ -21,9 +22,8 @@ use crate::rovent_bootstrap::{
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use rz_experiments::{RoventInputLock, RoventInputLockV2};
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use super::collection_v2_observer::{V2ObserverCustody, V2ObserverReclaimError};
+use std::sync::{Arc, Mutex};
 
 /// Explicit V2 P/C collection inputs. These owners are selected before the
 /// original lock is opened; they never project a V2 input lock into V1.
@@ -41,7 +41,8 @@ pub(super) struct CollectionLaunchV2<'a> {
     pub(super) teacher_selections: Vec<RoventTeacherSourceSelection>,
     pub(super) observer: Box<dyn VirtualReviewCollectionObserver>,
     pub(super) hooks: CollectionHooksV2,
-    pub(super) admit_resource: Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>,
+    pub(super) admit_resource:
+        Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>,
     pub(super) startup_attempt: Arc<AtomicBool>,
     pub(super) native_settled: Arc<AtomicBool>,
     pub(super) board_product_custody: Arc<Mutex<Option<RoventOwnPcrV2StartupRejection>>>,
@@ -61,9 +62,12 @@ pub struct RoventCollectionLaunchFailureV2<H: ?Sized> {
     physical_unknown: bool,
 }
 
-pub type RoventPcCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<dyn RoventPcCollectionHooksV2>;
-pub type RoventOwnNnuecCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<dyn RoventNnuecCollectionHooksV2>;
-pub type RoventOwnBoardCollectionLaunchFailureV2 = RoventCollectionLaunchFailureV2<RoventOwnBoardCollectionHooksV2>;
+pub type RoventPcCollectionLaunchFailureV2 =
+    RoventCollectionLaunchFailureV2<dyn RoventPcCollectionHooksV2>;
+pub type RoventOwnNnuecCollectionLaunchFailureV2 =
+    RoventCollectionLaunchFailureV2<dyn RoventNnuecCollectionHooksV2>;
+pub type RoventOwnBoardCollectionLaunchFailureV2 =
+    RoventCollectionLaunchFailureV2<RoventOwnBoardCollectionHooksV2>;
 
 /// Retains an actual Board product rejection while its physical owners are
 /// unresolved. Borrowing permits inspection without releasing ownership.
@@ -73,7 +77,9 @@ pub struct RoventBoardProductCustody {
 
 impl RoventBoardProductCustody {
     pub fn original(&self) -> &RoventOwnPcrV2StartupRejection {
-        self.original.as_ref().expect("original Board product custody")
+        self.original
+            .as_ref()
+            .expect("original Board product custody")
     }
 }
 
@@ -88,7 +94,9 @@ impl Drop for RoventBoardProductCustody {
 
 impl<H: ?Sized> RoventCollectionLaunchFailureV2<H> {
     pub fn hooks(&self) -> &Arc<H> {
-        self.hooks.as_ref().expect("original collection hooks retained")
+        self.hooks
+            .as_ref()
+            .expect("original collection hooks retained")
     }
 
     /// Transfer the original hook custody to a caller that will retain it
@@ -117,14 +125,18 @@ impl<H: ?Sized> RoventCollectionLaunchFailureV2<H> {
         })
     }
 
-    pub fn physical_completion_unknown(&self) -> bool { self.physical_unknown }
+    pub fn physical_completion_unknown(&self) -> bool {
+        self.physical_unknown
+    }
 
     /// Transfer the exact Board product rejection; this transfers custody but
     /// does not establish that its native or teacher owners have finished.
     pub fn take_board_product_custody(&mut self) -> Option<RoventBoardProductCustody> {
-        self.board_product_custody.take().map(|original| RoventBoardProductCustody {
-            original: Some(original),
-        })
+        self.board_product_custody
+            .take()
+            .map(|original| RoventBoardProductCustody {
+                original: Some(original),
+            })
     }
 }
 
@@ -153,7 +165,14 @@ pub fn run_pc_collection_v2_with_resource_admission<'a>(
     hooks: Arc<dyn RoventPcCollectionHooksV2>,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventPcCollectionLaunchFailureV2> {
-    run_collection_v2(arguments, teacher_selections, observer, Arc::clone(&hooks), CollectionHooksV2::Pc(hooks), admit_resource)
+    run_collection_v2(
+        arguments,
+        teacher_selections,
+        observer,
+        Arc::clone(&hooks),
+        CollectionHooksV2::Pc(hooks),
+        admit_resource,
+    )
 }
 
 pub fn run_own_nnuec_collection_v2_with_resource_admission<'a>(
@@ -163,7 +182,14 @@ pub fn run_own_nnuec_collection_v2_with_resource_admission<'a>(
     hooks: Arc<dyn RoventNnuecCollectionHooksV2>,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventOwnNnuecCollectionLaunchFailureV2> {
-    run_collection_v2(arguments, teacher_selections, observer, Arc::clone(&hooks), CollectionHooksV2::OwnNnuec(hooks), admit_resource)
+    run_collection_v2(
+        arguments,
+        teacher_selections,
+        observer,
+        Arc::clone(&hooks),
+        CollectionHooksV2::OwnNnuec(hooks),
+        admit_resource,
+    )
 }
 
 pub fn run_own_board_collection_v2_with_resource_admission<'a>(
@@ -173,7 +199,14 @@ pub fn run_own_board_collection_v2_with_resource_admission<'a>(
     hooks: Arc<RoventOwnBoardCollectionHooksV2>,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventOwnBoardCollectionLaunchFailureV2> {
-    run_collection_v2(arguments, teacher_selections, observer, Arc::clone(&hooks), CollectionHooksV2::OwnBoard(hooks), admit_resource)
+    run_collection_v2(
+        arguments,
+        teacher_selections,
+        observer,
+        Arc::clone(&hooks),
+        CollectionHooksV2::OwnBoard(hooks),
+        admit_resource,
+    )
 }
 
 fn run_collection_v2<'a, H: ?Sized>(
@@ -190,19 +223,30 @@ fn run_collection_v2<'a, H: ?Sized>(
     let mut observer_custody = V2ObserverCustody::new(observer);
     let proxy = observer_custody.proxy().expect("new observer custody");
     let inner_startup_attempt = Arc::clone(&startup_attempt);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::run_pc_collection_v2_inner(arguments, CollectionLaunchV2 {
-        teacher_selections,
-        observer: proxy,
-        hooks,
-        admit_resource: Box::new(admit_resource),
-        startup_attempt: inner_startup_attempt,
-        native_settled: Arc::clone(&native_settled),
-        board_product_custody: Arc::clone(&board_product_slot),
-    })));
-    let board_product_custody = board_product_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::run_pc_collection_v2_inner(
+            arguments,
+            CollectionLaunchV2 {
+                teacher_selections,
+                observer: proxy,
+                hooks,
+                admit_resource: Box::new(admit_resource),
+                startup_attempt: inner_startup_attempt,
+                native_settled: Arc::clone(&native_settled),
+                board_product_custody: Arc::clone(&board_product_slot),
+            },
+        )
+    }));
+    let board_product_custody = board_product_slot
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
     match result {
         Ok(Ok(())) if board_product_custody.is_some() => Err(RoventCollectionLaunchFailureV2 {
-            error: super::error("PhysicalCompletionUnknown", "a Board product rejection remained after apparent success"),
+            error: super::error(
+                "PhysicalCompletionUnknown",
+                "a Board product rejection remained after apparent success",
+            ),
             hooks: Some(original_hooks),
             panic_payload: None,
             observer_before_start: None,
@@ -212,9 +256,15 @@ fn run_collection_v2<'a, H: ?Sized>(
             physical_unknown: true,
         }),
         Ok(Ok(())) => match observer_custody.try_reclaim_after_verified_boundary() {
-            Ok(original) => { drop(original); Ok(()) }
+            Ok(original) => {
+                drop(original);
+                Ok(())
+            }
             Err(reclaim_error) => Err(RoventCollectionLaunchFailureV2 {
-                error: super::error("PhysicalCompletionUnknown", "V2 collection observer custody remained active after session closure"),
+                error: super::error(
+                    "PhysicalCompletionUnknown",
+                    "V2 collection observer custody remained active after session closure",
+                ),
                 hooks: Some(original_hooks),
                 panic_payload: None,
                 observer_before_start: None,
@@ -225,16 +275,23 @@ fn run_collection_v2<'a, H: ?Sized>(
             }),
         },
         Ok(Err(error)) => {
-            let safe_native = !startup_attempt.load(Ordering::Acquire)
-                || native_settled.load(Ordering::Acquire);
-            let (original, reclaim_error) = if safe_native && error.stage != "PhysicalCompletionUnknown" {
-                match observer_custody.try_reclaim_after_verified_boundary() {
-                    Ok(original) => (Some(original), None),
-                    Err(reclaim_error) => (None, Some(reclaim_error)),
-                }
-            } else { (None, None) };
+            let safe_native =
+                !startup_attempt.load(Ordering::Acquire) || native_settled.load(Ordering::Acquire);
+            let (original, reclaim_error) =
+                if safe_native && error.stage != "PhysicalCompletionUnknown" {
+                    match observer_custody.try_reclaim_after_verified_boundary() {
+                        Ok(original) => (Some(original), None),
+                        Err(reclaim_error) => (None, Some(reclaim_error)),
+                    }
+                } else {
+                    (None, None)
+                };
             let physical_unknown = !safe_native || error.stage == "PhysicalCompletionUnknown";
-            let retained_observer = if original.is_none() { Some(observer_custody) } else { None };
+            let retained_observer = if original.is_none() {
+                Some(observer_custody)
+            } else {
+                None
+            };
             Err(RoventCollectionLaunchFailureV2 {
                 error,
                 hooks: Some(original_hooks),

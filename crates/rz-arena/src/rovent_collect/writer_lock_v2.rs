@@ -5,11 +5,10 @@
 use super::*;
 use publication::PublicationSourceBytes;
 use publication_lock_v2::{LockV2PublicationSource, publish_lock_v2_payloads};
-use rz_experiments::rovent_corpus_lock_v2::record::{
-    ROVENT_CORPUS_INDEX_LOCK_V2_DOMAIN, RoventCorpusIndexLockV2,
-    RoventCorpusManifestLockV2,
-};
 use rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication;
+use rz_experiments::rovent_corpus_lock_v2::record::{
+    ROVENT_CORPUS_INDEX_LOCK_V2_DOMAIN, RoventCorpusIndexLockV2, RoventCorpusManifestLockV2,
+};
 use std::sync::Arc;
 
 /// Owns bounded JSONL buffers and the source snapshots of the real rows it
@@ -43,9 +42,13 @@ impl RoventCorpusWriterLockV2 {
             .map_err(|error| invalid(error.to_string()))?
             .len() as u64;
         let output_bytes_max = lock.manifest.output_bytes_max.min(MAX_CORPUS_BYTES);
-        let total_bytes = manifest_bytes.checked_add(4096)
+        let total_bytes = manifest_bytes
+            .checked_add(4096)
             .ok_or_else(|| invalid("writer /2 manifest byte count overflow"))?;
-        check(total_bytes <= output_bytes_max, "writer /2 initial output cap")?;
+        check(
+            total_bytes <= output_bytes_max,
+            "writer /2 initial output cap",
+        )?;
         Ok(Self {
             manifest: manifest.clone(),
             index: RoventCorpusIndexLockV2 {
@@ -72,7 +75,10 @@ impl RoventCorpusWriterLockV2 {
         let admission = row.admission();
         let lock = admission.native_origin().original_input_lock();
         check(lock == &self.lock, "writer /2 input lock differs")?;
-        check(row.manifest_sha256() == self.index.manifest_sha256, "writer /2 manifest differs")?;
+        check(
+            row.manifest_sha256() == self.index.manifest_sha256,
+            "writer /2 manifest differs",
+        )?;
         let record = row.record();
         record.validate(&self.manifest, lock)?;
         let value = &record.0;
@@ -98,14 +104,22 @@ impl RoventCorpusWriterLockV2 {
         };
         let admission_sha = admission.raw_sha256().to_owned();
         if let Some(original) = self.original_admissions.get(&admission_sha) {
-            check(original.same_original_admission(admission), "writer /2 original admission owner changed")?;
+            check(
+                original.same_original_admission(admission),
+                "writer /2 original admission owner changed",
+            )?;
         }
         let (snapshot, source_bytes) = if let Some(original) = self.admissions.get(&admission_sha) {
-            check(self.original_admissions.contains_key(&admission_sha), "writer /2 admission custody missing")?;
+            check(
+                self.original_admissions.contains_key(&admission_sha),
+                "writer /2 admission custody missing",
+            )?;
             (Arc::clone(original), 0)
         } else {
             let snapshot = Arc::new(LockV2PublicationSource::capture(admission)?);
-            let bundle_bytes = snapshot.runtime_bundle().map_or(0, |(_, raw)| raw.len() as u64);
+            let bundle_bytes = snapshot
+                .runtime_bundle()
+                .map_or(0, |(_, raw)| raw.len() as u64);
             let source_bytes = (snapshot.lock_bytes().len() as u64)
                 .checked_add(bundle_bytes)
                 .and_then(|n| n.checked_add(1024))
@@ -114,7 +128,8 @@ impl RoventCorpusWriterLockV2 {
         };
         let origin_bytes = serde_json::to_vec(&origin)
             .map_err(|error| invalid(error.to_string()))?
-            .len() as u64 + 1;
+            .len() as u64
+            + 1;
         let added = (bytes.len() as u64)
             .checked_add(origin_bytes)
             .and_then(|n| n.checked_add(source_bytes))
@@ -122,14 +137,22 @@ impl RoventCorpusWriterLockV2 {
         check(
             self.index.origins.len() < MAX_CORPUS_ROWS
                 && bytes.len() <= GENERATION_MAX_ROW_BYTES + 1
-                && self.buffer.len().checked_add(bytes.len()).is_some_and(|n| n <= MAX_CHUNK_BYTES)
-                && self.total_bytes.checked_add(added).is_some_and(|n| n <= self.output_bytes_max)
+                && self
+                    .buffer
+                    .len()
+                    .checked_add(bytes.len())
+                    .is_some_and(|n| n <= MAX_CHUNK_BYTES)
+                && self
+                    .total_bytes
+                    .checked_add(added)
+                    .is_some_and(|n| n <= self.output_bytes_max)
                 && !self.record_seals.contains(&value.record_sha256),
             "writer /2 output cap or duplicate; flush explicitly",
         )?;
         self.record_seals.insert(value.record_sha256.clone());
         self.admissions.entry(admission_sha).or_insert(snapshot);
-        self.original_admissions.entry(admission.raw_sha256().to_owned())
+        self.original_admissions
+            .entry(admission.raw_sha256().to_owned())
             .or_insert_with(|| admission.clone());
         self.index.origins.push(origin);
         self.index.record_count += 1;
@@ -140,9 +163,14 @@ impl RoventCorpusWriterLockV2 {
     }
 
     pub fn flush(&mut self) -> Result<Option<RoventChunkPacket>, ArenaError> {
-        if self.buffer.is_empty() { return Ok(None); }
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
         check(self.index.chunks.len() < 8192, "writer /2 chunk count cap")?;
-        let total = self.total_bytes.checked_add(512).ok_or_else(|| invalid("writer /2 byte count overflow"))?;
+        let total = self
+            .total_bytes
+            .checked_add(512)
+            .ok_or_else(|| invalid("writer /2 byte count overflow"))?;
         check(total <= self.output_bytes_max, "writer /2 chunk/index cap")?;
         let bytes = std::mem::take(&mut self.buffer);
         let declaration = RoventCorpusChunk {
@@ -165,15 +193,24 @@ impl RoventCorpusWriterLockV2 {
     /// available to the caller.
     pub fn finish(self) -> Result<FinishedRoventCorpusLockV2, Box<(ArenaError, Self)>> {
         let result = (|| {
-            check(self.buffer.is_empty() && self.index.record_count > 0
-                && !self.admissions.is_empty()
-                && self.index.record_count as usize == self.record_seals.len(),
-                "writer /2 finish requires flushed original rows")?;
+            check(
+                self.buffer.is_empty()
+                    && self.index.record_count > 0
+                    && !self.admissions.is_empty()
+                    && self.index.record_count as usize == self.record_seals.len(),
+                "writer /2 finish requires flushed original rows",
+            )?;
             self.index.validate(&self.manifest, &self.lock)?;
             Ok::<(), ArenaError>(())
         })();
-        if let Err(error) = result { return Err(Box::new((error, self))); }
-        Ok(FinishedRoventCorpusLockV2 { manifest: self.manifest, index: self.index, admissions: self.admissions })
+        if let Err(error) = result {
+            return Err(Box::new((error, self)));
+        }
+        Ok(FinishedRoventCorpusLockV2 {
+            manifest: self.manifest,
+            index: self.index,
+            admissions: self.admissions,
+        })
     }
 }
 
@@ -187,8 +224,12 @@ pub struct FinishedRoventCorpusLockV2 {
 }
 
 impl FinishedRoventCorpusLockV2 {
-    pub fn manifest(&self) -> &RoventCorpusManifestLockV2 { &self.manifest }
-    pub fn index(&self) -> &RoventCorpusIndexLockV2 { &self.index }
+    pub fn manifest(&self) -> &RoventCorpusManifestLockV2 {
+        &self.manifest
+    }
+    pub fn index(&self) -> &RoventCorpusIndexLockV2 {
+        &self.index
+    }
 
     // The original session owner has not yet supplied an unforgeable actor
     // fence and teacher-terminal completion capability. Keep this internal
@@ -201,6 +242,13 @@ impl FinishedRoventCorpusLockV2 {
         until: std::time::Instant,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<RoventLockV2Publication, ArenaError> {
-        publish_lock_v2_payloads(directory, until, cancel, &self.manifest, &self.index, &self.admissions)
+        publish_lock_v2_payloads(
+            directory,
+            until,
+            cancel,
+            &self.manifest,
+            &self.index,
+            &self.admissions,
+        )
     }
 }

@@ -246,11 +246,22 @@ impl RoventCorpusProducer {
         // Preserve the legacy path's ordering: an invalid opinion is reported
         // before sequence overflow, and later serialization failure consumes
         // the sequence exactly as it did before the shared calculation.
-        let (ranked, depth) = validate_completed_teacher_opinions(&row.record.input, &pin, outcome)?;
+        let (ranked, depth) =
+            validate_completed_teacher_opinions(&row.record.input, &pin, outcome)?;
         let sequence = self.next()?;
         let (target, source) = prepare_completed_teacher_policy(
-            &row.record.input, &row.record.input_sha256, sequence, actor_id, pin,
-            binding_raw, startup, outcome, attempt, timing, ranked, depth,
+            &row.record.input,
+            &row.record.input_sha256,
+            sequence,
+            actor_id,
+            pin,
+            binding_raw,
+            startup,
+            outcome,
+            attempt,
+            timing,
+            ranked,
+            depth,
         )?;
         row.record.targets.policy = Some(target);
         row.record.head_sources.insert("policy".into(), source);
@@ -263,45 +274,45 @@ impl RoventCorpusProducer {
 /// not advance a producer; callers commit the returned values atomically.
 #[allow(clippy::too_many_arguments)]
 fn prepare_completed_teacher_policy(
-        input: &GenerationInputV3,
-        input_sha256: &str,
-        sequence: u64,
-        actor_id: String,
-        pin: RoventTeacherPin,
-        binding_raw: Value,
-        startup: &rz_uci::rovent_external_launch::VerifiedRoventExternalStartup,
-        outcome: &rz_search::external_cpu::ProfiledExternalOutcome,
-        attempt: &rz_search::cpu_checker::CheckerAttempt,
-        timing: rz_search::external_cpu::ProfiledExternalTiming,
-        ranked: Vec<u16>,
-        depth: u16,
+    input: &GenerationInputV3,
+    input_sha256: &str,
+    sequence: u64,
+    actor_id: String,
+    pin: RoventTeacherPin,
+    binding_raw: Value,
+    startup: &rz_uci::rovent_external_launch::VerifiedRoventExternalStartup,
+    outcome: &rz_search::external_cpu::ProfiledExternalOutcome,
+    attempt: &rz_search::cpu_checker::CheckerAttempt,
+    timing: rz_search::external_cpu::ProfiledExternalTiming,
+    ranked: Vec<u16>,
+    depth: u16,
 ) -> Result<(GenerationPolicyTargetV3, RoventHeadSource), ArenaError> {
-        let r = &outcome.report;
-        let raw = &r.raw;
-        let mut opinions = outcome.opinions.iter().collect::<Vec<_>>();
-        opinions.sort_by_key(|o| o.rank);
-        let raw_report = json!({"identity":raw.identity,"observed_uci":{"name":raw.observed_uci.name,"author":raw.observed_uci.author},
+    let r = &outcome.report;
+    let raw = &r.raw;
+    let mut opinions = outcome.opinions.iter().collect::<Vec<_>>();
+    opinions.sort_by_key(|o| o.rank);
+    let raw_report = json!({"identity":raw.identity,"observed_uci":{"name":raw.observed_uci.name,"author":raw.observed_uci.author},
             "request_id":raw.request_id,"best_move":raw.best_move.map(|m|Move16::pack(m).map(|v|v.bits())).transpose().map_err(|e|invalid(e.to_string()))?,
             "pv":packed(&raw.pv)?,"score":score_json(raw.score),"bound":format!("{:?}",raw.bound),"wdl_per_mille":raw.wdl_per_mille,
             "perspective":format!("{:?}",raw.perspective),"requested_depth":raw.requested_depth,"reported_depth":raw.reported_depth,
             "seldepth":raw.seldepth,"root_restricted":raw.root_restricted,"completion":format!("{:?}",raw.completion),
             "work":{"nodes":raw.work.nodes,"qnodes":raw.work.qnodes,"tt_hits":raw.work.tt_hits},
             "elapsed_ns":raw.elapsed.as_nanos().min(u128::from(u64::MAX)) as u64});
-        let opinions_json=opinions.iter().map(|o|Ok(json!({"rank":o.rank,"depth":o.depth,"seldepth":o.seldepth,
+    let opinions_json=opinions.iter().map(|o|Ok(json!({"rank":o.rank,"depth":o.depth,"seldepth":o.seldepth,
             "pv":packed(&o.pv)?,"score":score_json(o.score),"bound":format!("{:?}",o.bound),"reported_wdl":o.reported_wdl}))).collect::<Result<Vec<_>,ArenaError>>()?;
-        let physical = attempt
-            .external
-            .as_ref()
-            .ok_or_else(|| invalid("teacher physical process receipt missing"))?;
-        let p = physical.process;
-        let attempt_json = json!({"elapsed_ns":attempt.elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+    let physical = attempt
+        .external
+        .as_ref()
+        .ok_or_else(|| invalid("teacher physical process receipt missing"))?;
+    let p = physical.process;
+    let attempt_json = json!({"elapsed_ns":attempt.elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
             "work":{"nodes":attempt.work.nodes,"qnodes":attempt.work.qnodes,"tt_hits":attempt.work.tt_hits},
             "request_id":physical.request_id,"partial_report_matches":physical.partial_report.as_ref()==Some(raw),
             "process":{"identity":p.process_identity.map(process_json),"stop_sent":p.stop_sent,"quit_sent":p.quit_sent,
                 "exit_observed":p.exit_observed,"stdout_drained":p.stdout_drained,"stderr_drained":p.stderr_drained,
                 "exit_code":p.exit_code,"exit_signal":p.exit_signal,"cleanup_complete":p.cleanup_complete,
                 "quarantined":p.quarantined,"ownership_lost":p.ownership_lost,"stdout_bytes":p.stdout_bytes,"stderr_bytes":p.stderr_bytes}});
-        let body = json!({"schema":HEAD_DOMAIN,"kind":"teacher_policy","actor_id":actor_id,
+    let body = json!({"schema":HEAD_DOMAIN,"kind":"teacher_policy","actor_id":actor_id,
             "input_sha256":input_sha256,"anchor":input.rules_anchor,"teacher_pin":pin,"binding":binding_raw,
             "completion":{"profile":r.profile,"purpose":r.purpose,"issued_go":r.issued_go,"requested":r.requested,"issued":r.issued,
                 "readiness_barrier_completed":r.readiness_barrier_completed,"go_issued":true,"raw":raw_report,"opinions":opinions_json,
@@ -310,33 +321,33 @@ fn prepare_completed_teacher_policy(
                 "stop_control":outcome.stop_control.map(|c|json!({"sequence":c.sequence,"action":format!("{:?}",c.action)})),
                 "timing":{"go_issued":timing.go_issued_at.is_some(),"stop_sent":timing.stop_sent_at.is_some(),
                     "bestmove_drained":timing.bestmove_drained_at.is_some(),"ready_completed":timing.ready_completed_at.is_some()}}});
-        let seal = generation_digest(HEAD_DOMAIN, &body)?;
-        let target = GenerationPolicyTargetV3 {
-            observed_sequence: sequence,
-            question_id: input.question_id.clone(),
-            view_sha256: input.view_sha256.clone(),
-            raw_evidence_sha256: seal.clone(),
-            source: "rovent_completed_teacher_multipv".into(),
-            completed: true,
-            stale: false,
-            anchor: input.rules_anchor.clone(),
-            ranked_moves: ranked,
-            teacher_binary_sha256: pin.binary_sha256.clone(),
-            teacher_profile_sha256: pin.profile_sha256.clone(),
-            go_sequence: raw.request_id,
-            completed_depth: u32::from(depth),
-        };
-        let source = RoventHeadSource {
-                actor_id,
-                source: "rovent_completed_teacher_multipv".into(),
-                binary_sha256: Some(pin.binary_sha256),
-                profile_sha256: Some(pin.profile_sha256),
-                raw_receipt: body,
-                raw_receipt_sha256: seal,
-                observed_sequence: sequence,
-                anchor: input.rules_anchor.clone(),
-        };
-        Ok((target, source))
+    let seal = generation_digest(HEAD_DOMAIN, &body)?;
+    let target = GenerationPolicyTargetV3 {
+        observed_sequence: sequence,
+        question_id: input.question_id.clone(),
+        view_sha256: input.view_sha256.clone(),
+        raw_evidence_sha256: seal.clone(),
+        source: "rovent_completed_teacher_multipv".into(),
+        completed: true,
+        stale: false,
+        anchor: input.rules_anchor.clone(),
+        ranked_moves: ranked,
+        teacher_binary_sha256: pin.binary_sha256.clone(),
+        teacher_profile_sha256: pin.profile_sha256.clone(),
+        go_sequence: raw.request_id,
+        completed_depth: u32::from(depth),
+    };
+    let source = RoventHeadSource {
+        actor_id,
+        source: "rovent_completed_teacher_multipv".into(),
+        binary_sha256: Some(pin.binary_sha256),
+        profile_sha256: Some(pin.profile_sha256),
+        raw_receipt: body,
+        raw_receipt_sha256: seal,
+        observed_sequence: sequence,
+        anchor: input.rules_anchor.clone(),
+    };
+    Ok((target, source))
 }
 
 fn validate_completed_teacher_opinions(
@@ -344,40 +355,40 @@ fn validate_completed_teacher_opinions(
     pin: &RoventTeacherPin,
     outcome: &rz_search::external_cpu::ProfiledExternalOutcome,
 ) -> Result<(Vec<u16>, u16), ArenaError> {
-        let r = &outcome.report;
-        let raw = &r.raw;
+    let r = &outcome.report;
+    let raw = &r.raw;
+    check(
+        r.purpose == ExternalEnginePurpose::Teacher
+            && r.profile.source_commit() == pin.source_commit
+            && raw.identity.binary_sha256 == pin.binary_sha256
+            && raw.identity.options == pin.options
+            && outcome.conditional_policy_target_known
+            && r.readiness_barrier_completed
+            && !outcome.opinions.is_empty()
+            && outcome.opinions.len() <= 4,
+        "failed/partial/stale teacher report has no conditional policy target",
+    )?;
+    let mut opinions = outcome.opinions.iter().collect::<Vec<_>>();
+    opinions.sort_by_key(|o| o.rank);
+    let mut ranked = Vec::new();
+    let mut depth = u16::MAX;
+    for (slot, o) in opinions.iter().enumerate() {
         check(
-            r.purpose == ExternalEnginePurpose::Teacher
-                && r.profile.source_commit() == pin.source_commit
-                && raw.identity.binary_sha256 == pin.binary_sha256
-                && raw.identity.options == pin.options
-                && outcome.conditional_policy_target_known
-                && r.readiness_barrier_completed
-                && !outcome.opinions.is_empty()
-                && outcome.opinions.len() <= 4,
-            "failed/partial/stale teacher report has no conditional policy target",
+            o.rank as usize == slot + 1 && o.depth > 0 && !o.pv.is_empty(),
+            "incomplete teacher rank/depth/PV",
         )?;
-        let mut opinions = outcome.opinions.iter().collect::<Vec<_>>();
-        opinions.sort_by_key(|o| o.rank);
-        let mut ranked = Vec::new();
-        let mut depth = u16::MAX;
-        for (slot, o) in opinions.iter().enumerate() {
-            check(
-                o.rank as usize == slot + 1 && o.depth > 0 && !o.pv.is_empty(),
-                "incomplete teacher rank/depth/PV",
-            )?;
-            let first = Move16::pack(o.pv[0])
-                .map_err(|e| invalid(e.to_string()))?
-                .bits();
-            check(
-                input.legal_moves.contains(&first) && !ranked.contains(&first),
-                "teacher first move is illegal/duplicated",
-            )?;
-            // The original worker validates every PV suffix from its retained
-            // exact job position. owner.validate_completion above joins that
-            // private worker completion and its unchanged raw report.
-            ranked.push(first);
-            depth = depth.min(o.depth);
-        }
-        Ok((ranked, depth))
+        let first = Move16::pack(o.pv[0])
+            .map_err(|e| invalid(e.to_string()))?
+            .bits();
+        check(
+            input.legal_moves.contains(&first) && !ranked.contains(&first),
+            "teacher first move is illegal/duplicated",
+        )?;
+        // The original worker validates every PV suffix from its retained
+        // exact job position. owner.validate_completion above joins that
+        // private worker completion and its unchanged raw report.
+        ranked.push(first);
+        depth = depth.min(o.depth);
+    }
+    Ok((ranked, depth))
 }

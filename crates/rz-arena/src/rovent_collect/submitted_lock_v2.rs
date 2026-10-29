@@ -4,16 +4,17 @@
 //! producer must join an actually accepted and retired request with the same
 //! live admission before constructing it; a wire record is not that authority.
 
+use rz_contracts::pals_adaptive::RoleTicketEnvelope;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2;
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2;
-use rz_contracts::pals_adaptive::RoleTicketEnvelope;
 
 /// Original accepted and search-consumed row, before target attachment and
 /// publication. It is issued only by the owning producer, never by decoding.
 pub struct RoventRetiredLockV2Record {
     pub(super) record: RoventTrainingRecordLockV2,
     pub(super) manifest_sha256: String,
-    pub(super) manifest_owner: std::sync::Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
+    pub(super) manifest_owner:
+        std::sync::Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
     // Private in-process identity of the exact producer that retired the row.
     // No serialized digest can reconstruct this ownership.
     pub(super) producer_owner: std::sync::Arc<()>,
@@ -24,7 +25,9 @@ pub struct RoventRetiredLockV2Record {
 impl RoventRetiredLockV2Record {
     pub(crate) fn matches_manifest_owner(
         &self,
-        manifest: &std::sync::Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
+        manifest: &std::sync::Arc<
+            rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
+        >,
     ) -> bool {
         std::sync::Arc::ptr_eq(&self.manifest_owner, manifest)
     }
@@ -51,7 +54,9 @@ impl RoventRetiredLockV2Record {
 
     /// Reconstruct the actual query position from this row's original Rules
     /// replay. This supplies no live root or teacher execution authority.
-    pub fn original_teacher_query_position(&self) -> Result<rz_position::Position, super::ArenaError> {
+    pub fn original_teacher_query_position(
+        &self,
+    ) -> Result<rz_position::Position, super::ArenaError> {
         let input = &self.record.0.input;
         input.validate()?;
         let replay: super::rules_replay::RoventSubmittedRulesReplay =
@@ -59,12 +64,23 @@ impl RoventRetiredLockV2Record {
                 .map_err(|error| super::invalid(error.to_string()))?;
         let position = replay.original_query_position(&input.common_validation_projection())?;
         let legal = super::packed(&position.legal_moves())?;
-        if matches!(input.selected_view.query.purpose.as_str(), "divergence_policy" | "task_policy") {
-            super::check(input.legal_moves.is_empty(), "scalar-only query has policy candidates")?;
+        if matches!(
+            input.selected_view.query.purpose.as_str(),
+            "divergence_policy" | "task_policy"
+        ) {
+            super::check(
+                input.legal_moves.is_empty(),
+                "scalar-only query has policy candidates",
+            )?;
         } else {
-            super::check(legal.len() == input.legal_moves.len()
-                && input.legal_moves.iter().all(|movement| legal.contains(movement)),
-                "input candidates are not the complete query Rules legal set")?;
+            super::check(
+                legal.len() == input.legal_moves.len()
+                    && input
+                        .legal_moves
+                        .iter()
+                        .all(|movement| legal.contains(movement)),
+                "input candidates are not the complete query Rules legal set",
+            )?;
         }
         Ok(position)
     }

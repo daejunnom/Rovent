@@ -69,13 +69,13 @@ pub use cohort_prepare::{
 };
 use collection::{CollectionHooksV2, CollectionLaunch, CollectionLaunchV2};
 pub use collection::{
-    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, RoventCollectionLaunchFailureV2,
-    RoventPcCollectionLaunchFailureV2, RoventOwnNnuecCollectionLaunchFailureV2,
-    RoventOwnBoardCollectionHooksV2, RoventOwnBoardCollectionLaunchFailureV2,
-    RoventBoardProductCustody, run_collection,
-    run_collection_with_driver, run_collection_with_resource_admission,
-    run_pc_collection_v2_with_resource_admission, run_own_nnuec_collection_v2_with_resource_admission,
-    run_own_board_collection_v2_with_resource_admission,
+    RoventBoardProductCustody, RoventCollectionLaunchFailureV2, RoventCollectionPreparedLaunch,
+    RoventCollectionPreparedNative, RoventOwnBoardCollectionHooksV2,
+    RoventOwnBoardCollectionLaunchFailureV2, RoventOwnNnuecCollectionLaunchFailureV2,
+    RoventPcCollectionLaunchFailureV2, run_collection, run_collection_with_driver,
+    run_collection_with_resource_admission, run_own_board_collection_v2_with_resource_admission,
+    run_own_nnuec_collection_v2_with_resource_admission,
+    run_pc_collection_v2_with_resource_admission,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
@@ -1186,13 +1186,21 @@ fn run_pc_collection_v2_inner<'a>(
     let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
     let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
         .map_err(|failure| error("Cwd", failure))?;
-    let lock_file = root.open_with(
-        &arguments.input_lock,
-        cap_std::fs::OpenOptions::new().read(true),
-    ).map_err(|failure| error("InputLock", failure))?.into_std();
+    let lock_file = root
+        .open_with(
+            &arguments.input_lock,
+            cap_std::fs::OpenOptions::new().read(true),
+        )
+        .map_err(|failure| error("InputLock", failure))?
+        .into_std();
     let lock = match parse_launch_lock(&read_bounded(&lock_file, MAX_LOCK_BYTES)?)? {
         LaunchInputLock::V2(lock) => lock,
-        LaunchInputLock::V1(_) => return Err(error("InputLockUnsupportedV1", "V2 collection requires an original /2 lock")),
+        LaunchInputLock::V1(_) => {
+            return Err(error(
+                "InputLockUnsupportedV1",
+                "V2 collection requires an original /2 lock",
+            ));
+        }
     };
     run_v2_native(arguments, lock, root, cwd, lock_file, Some(collection))
 }
@@ -1211,9 +1219,14 @@ fn run_v2_native<'a>(
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
         || arguments.initial_stop_source_diagnostics
-        || !matches!((lock.manifest.purpose, collection.is_some()),
-            (rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment, false)
-            | (rz_experiments::RoventPurpose::Collection, true))
+        || !matches!(
+            (lock.manifest.purpose, collection.is_some()),
+            (
+                rz_experiments::RoventPurpose::Validation
+                    | rz_experiments::RoventPurpose::Deployment,
+                false
+            ) | (rz_experiments::RoventPurpose::Collection, true)
+        )
     {
         return Err(error(
             "InputLockUnsupportedV2",
@@ -1224,13 +1237,26 @@ fn run_v2_native<'a>(
         super::admitted_collection_topology_v2(&lock)
     } else {
         super::admitted_topology_v2(&lock)
-    }.map_err(|failure| error("InputLockUnsupportedV2", failure))?;
+    }
+    .map_err(|failure| error("InputLockUnsupportedV2", failure))?;
     if let Some(request) = &collection {
-        if !matches!((&request.hooks, topology),
-            (CollectionHooksV2::Pc(_), super::RoventStartupTopology::RolesOnly)
-            | (CollectionHooksV2::OwnNnuec(_), super::RoventStartupTopology::OwnResearcher)
-            | (CollectionHooksV2::OwnBoard(_), super::RoventStartupTopology::OwnResearcher)) {
-            return Err(error("InputLockUnsupportedV2", "typed V2 collection hook and engine topology differ"));
+        if !matches!(
+            (&request.hooks, topology),
+            (
+                CollectionHooksV2::Pc(_),
+                super::RoventStartupTopology::RolesOnly
+            ) | (
+                CollectionHooksV2::OwnNnuec(_),
+                super::RoventStartupTopology::OwnResearcher
+            ) | (
+                CollectionHooksV2::OwnBoard(_),
+                super::RoventStartupTopology::OwnResearcher
+            )
+        ) {
+            return Err(error(
+                "InputLockUnsupportedV2",
+                "typed V2 collection hook and engine topology differ",
+            ));
         }
     }
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
@@ -1280,15 +1306,29 @@ fn run_v2_native<'a>(
     let view = boundary
         .startup_view()
         .map_err(|failure| error("ProcessBoundary", failure))?;
-    let board_product_custody = collection.as_ref().map(|request| Arc::clone(&request.board_product_custody));
-    let (teacher_selections, observer, hooks, resource, startup_attempt, native_settled) = match collection {
-        Some(request) => (Some(request.teacher_selections), Some(request.observer), Some(request.hooks), Some(request.admit_resource), Some(request.startup_attempt), Some(request.native_settled)),
-        None => (None, None, None, None, None, None),
-    };
+    let board_product_custody = collection
+        .as_ref()
+        .map(|request| Arc::clone(&request.board_product_custody));
+    let (teacher_selections, observer, hooks, resource, startup_attempt, native_settled) =
+        match collection {
+            Some(request) => (
+                Some(request.teacher_selections),
+                Some(request.observer),
+                Some(request.hooks),
+                Some(request.admit_resource),
+                Some(request.startup_attempt),
+                Some(request.native_settled),
+            ),
+            None => (None, None, None, None, None, None),
+        };
     if let Some(resource) = resource {
-        control.check().map_err(|failure| error("ResourceAdmission", failure))?;
+        control
+            .check()
+            .map_err(|failure| error("ResourceAdmission", failure))?;
         resource(&lock)?;
-        control.check().map_err(|failure| error("ResourceAdmission", failure))?;
+        control
+            .check()
+            .map_err(|failure| error("ResourceAdmission", failure))?;
     }
     let selected: Vec<_> = lock
         .manifest
@@ -1307,27 +1347,38 @@ fn run_v2_native<'a>(
         .map_err(|failure| error("Assets", failure))?;
     let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
     let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
-    let sources = Arc::new(match teacher_selections {
-        Some(selections) => {
-            let preload = Arc::new(RoventCollectionPreloadSources::open_v2(
+    let sources = Arc::new(
+        match teacher_selections {
+            Some(selections) => {
+                let preload = Arc::new(
+                    RoventCollectionPreloadSources::open_v2(
+                        Arc::clone(&lock),
+                        root.try_clone().map_err(|failure| error("Cwd", failure))?,
+                        &cwd,
+                        selections,
+                        &control,
+                    )
+                    .map_err(|failure| error("CollectionSources", failure))?,
+                );
+                RoventPinnedNativeSources::<RoventInputLockV2>::open_v2_with_collection(
+                    Arc::clone(&lock),
+                    source_root,
+                    cwd,
+                    selection,
+                    &control,
+                    preload,
+                )
+            }
+            None => RoventPinnedNativeSources::<RoventInputLockV2>::open_v2(
                 Arc::clone(&lock),
-                root.try_clone().map_err(|failure| error("Cwd", failure))?,
-                &cwd,
-                selections,
+                source_root,
+                cwd,
+                selection,
                 &control,
-            ).map_err(|failure| error("CollectionSources", failure))?);
-            RoventPinnedNativeSources::<RoventInputLockV2>::open_v2_with_collection(
-                Arc::clone(&lock), source_root, cwd, selection, &control, preload,
-            )
+            ),
         }
-        None => RoventPinnedNativeSources::<RoventInputLockV2>::open_v2(
-            Arc::clone(&lock),
-            source_root,
-            cwd,
-            selection,
-            &control,
-        ),
-    }.map_err(|failure| error("Assets", failure))?);
+        .map_err(|failure| error("Assets", failure))?,
+    );
     sources
         .configuration()
         .require_supported_native_capabilities()
@@ -1471,10 +1522,16 @@ fn run_v2_native<'a>(
     let assembled = (|| -> Result<_, RoventLaunchError> {
         if let (Some(observer), Some(hooks)) = (observer, hooks) {
             if matches!(&hooks, CollectionHooksV2::OwnNnuec(_)) && loaded_nnuec.is_none() {
-                return Err(error("InputLockUnsupportedV2", "Own NNUEC Collection requires its original loaded model"));
+                return Err(error(
+                    "InputLockUnsupportedV2",
+                    "Own NNUEC Collection requires its original loaded model",
+                ));
             }
             if matches!(&hooks, CollectionHooksV2::OwnBoard(_)) && loaded_nnuec.is_some() {
-                return Err(error("InputLockUnsupportedV2", "Own board Collection cannot discard a loaded NNUEC owner"));
+                return Err(error(
+                    "InputLockUnsupportedV2",
+                    "Own board Collection cannot discard a loaded NNUEC owner",
+                ));
             }
             if let Some(attempt) = &startup_attempt {
                 attempt.store(true, std::sync::atomic::Ordering::Release);
@@ -1482,8 +1539,13 @@ fn run_v2_native<'a>(
             macro_rules! collection_native {
                 ($question:ty) => {
                     super::prepare_native_v2_collection::<$question>(
-                        Arc::clone(&sources), resources, clock.runtime_clock(), control.clone(), observer,
-                    ).map_err(|rejection| {
+                        Arc::clone(&sources),
+                        resources,
+                        clock.runtime_clock(),
+                        control.clone(),
+                        observer,
+                    )
+                    .map_err(|rejection| {
                         let failure = reject_factory(rejection, cleanup_until, &diagnostic);
                         if failure.stage != "PhysicalCompletionUnknown" {
                             if let Some(settled) = &native_settled {
@@ -1506,8 +1568,12 @@ fn run_v2_native<'a>(
                         failure
                     })?;
                     let completion = driver.physical_close_observation();
-                    let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2 {
-                        Arc::new(super::product::diagnostics_v2::ObservedV2::new(driver, lock.canonical_sha256.clone()))
+                    let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2
+                    {
+                        Arc::new(super::product::diagnostics_v2::ObservedV2::new(
+                            driver,
+                            lock.canonical_sha256.clone(),
+                        ))
                     } else {
                         Arc::new(driver)
                     };
@@ -1517,10 +1583,19 @@ fn run_v2_native<'a>(
             return Ok(match hooks {
                 CollectionHooksV2::Pc(hooks) => {
                     let prepared = collection_native!(PcPortQuestion);
-                    collection_driver!(super::product::RoventNativeProductDriverV2::pc_with_collection_hooks_v2(
-                        prepared, loaded_nnuec, Arc::clone(&boundary), clock.clone(),
-                        Arc::clone(&owners), identity, arguments.root_policy, hooks,
-                    ), reject_pc_collection_product_v2)
+                    collection_driver!(
+                        super::product::RoventNativeProductDriverV2::pc_with_collection_hooks_v2(
+                            prepared,
+                            loaded_nnuec,
+                            Arc::clone(&boundary),
+                            clock.clone(),
+                            Arc::clone(&owners),
+                            identity,
+                            arguments.root_policy,
+                            hooks,
+                        ),
+                        reject_pc_collection_product_v2
+                    )
                 }
                 CollectionHooksV2::OwnNnuec(hooks) => {
                     let prepared = collection_native!(AdaptivePortQuestion);
@@ -1804,13 +1879,19 @@ fn reject_pc_collection_product_v2(
     diagnostic: &NativeStartupDiagnostic,
 ) -> RoventLaunchError {
     let detail = error("ProductAssembly", &failure.failure);
-    diagnostic.emit(NativeStartupDiagnosticStage::ProductDrain, NativeStartupDiagnosticPhase::Entry);
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        NativeStartupDiagnosticPhase::Entry,
+    );
     let confirmed = drain_native(&mut failure.prepared.service, until);
-    diagnostic.emit(NativeStartupDiagnosticStage::ProductDrain, if confirmed {
-        NativeStartupDiagnosticPhase::Exit
-    } else {
-        NativeStartupDiagnosticPhase::Error
-    });
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        if confirmed {
+            NativeStartupDiagnosticPhase::Exit
+        } else {
+            NativeStartupDiagnosticPhase::Error
+        },
+    );
     if !confirmed {
         let _quarantine = Box::leak(Box::new(failure));
         return error("PhysicalCompletionUnknown", detail);
@@ -1873,14 +1954,22 @@ fn reject_own_board_collection_product_v2(
     if slot.is_some() {
         // An impossible second rejection cannot displace the first owner.
         let _quarantine = Box::leak(Box::new(failure));
-        return error("PhysicalCompletionUnknown", "duplicate Board rejection retained");
+        return error(
+            "PhysicalCompletionUnknown",
+            "duplicate Board rejection retained",
+        );
     }
     *slot = Some(failure);
-    let detail = error("ProductAssembly", &slot.as_ref().expect("original rejection retained").failure);
+    let detail = error(
+        "ProductAssembly",
+        &slot.as_ref().expect("original rejection retained").failure,
+    );
     // The original rejection is already in caller-owned custody even if
     // drain or diagnostics panic. The wrapper recovers poisoned slots.
     let _native_confirmed = drain_own_pcr_product_v2(
-        slot.as_mut().expect("original rejection retained"), until, diagnostic,
+        slot.as_mut().expect("original rejection retained"),
+        until,
+        diagnostic,
     );
     // The caller gets the actual rejection separately. Even a successful
     // native drain says nothing about the separate teacher's completion.

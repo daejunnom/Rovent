@@ -14,10 +14,11 @@ use super::{
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
-    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV2, AdaptiveManagerError, ManagerPhase, PcPortDriver,
-    RoleOnlyCollectionV2Rejection, RoleOnlyExecutionManager, RoleOnlyManagerRegistration,
-    RoleOnlyManagerSources, RoleOnlyShutdownReceipt, RoventCollectionRootAdmission,
-    RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin, RoventNativeCollectionOriginV2,
+    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV2, AdaptiveManagerError, ManagerPhase,
+    PcPortDriver, RoleOnlyCollectionV2Rejection, RoleOnlyExecutionManager,
+    RoleOnlyManagerRegistration, RoleOnlyManagerSources, RoleOnlyShutdownReceipt,
+    RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin,
+    RoventNativeCollectionOriginV2,
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
@@ -163,7 +164,12 @@ impl RoventPcCollectionHandoffV2 {
         &Result<(), AdaptiveCollectionError>,
         &RoleOnlyShutdownReceipt,
     ) {
-        (&self.admission, &mut self.observer, &self.settlement, &self.native_fence)
+        (
+            &self.admission,
+            &mut self.observer,
+            &self.settlement,
+            &self.native_fence,
+        )
     }
 
     /// Transfer the original objects to their collection owner without
@@ -178,7 +184,14 @@ impl RoventPcCollectionHandoffV2 {
         Option<crate::pals_adaptive::RoventTeacherScopePhysicalAckV2>,
         Option<crate::rovent_external_launch::RoventTeacherScopeAggregateAckV2>,
     ) {
-        (self.admission, self.observer, self.settlement, self.native_fence, self.teacher_physical_ack, self.teacher_aggregate_ack)
+        (
+            self.admission,
+            self.observer,
+            self.settlement,
+            self.native_fence,
+            self.teacher_physical_ack,
+            self.teacher_aggregate_ack,
+        )
     }
 }
 
@@ -195,7 +208,10 @@ impl RoventPcCollectionRootCustodyV2 {
         handoff: Arc<Mutex<RoventPcCollectionHandoffV2>>,
         original_worker: Box<dyn Any + Send>,
     ) -> Self {
-        Self { handoff, original_worker }
+        Self {
+            handoff,
+            original_worker,
+        }
     }
 
     pub fn matches_handoff(&self, handoff: &Arc<Mutex<RoventPcCollectionHandoffV2>>) -> bool {
@@ -216,7 +232,10 @@ impl RoventPcCollectionRootCustodyV2 {
 pub trait RoventPcCollectionHooksV2: Send + Sync {
     /// Bind the original startup control once, before native preparation.
     /// This only registers the identity; it must not spawn or wait for work.
-    fn register_startup_control(&self, control: &super::RoventStartupControl) -> Result<(), AdaptiveManagerError>;
+    fn register_startup_control(
+        &self,
+        control: &super::RoventStartupControl,
+    ) -> Result<(), AdaptiveManagerError>;
     fn admit(
         &self,
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
@@ -227,7 +246,9 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
     /// Return a bounded channel reserved for this original root. The session
     /// sends directly with `try_send` and retains another Arc whether delivery
     /// fails, the receiver is dropped, or teacher completion is unresolved.
-    fn handoff_sender(&self) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>;
+    fn handoff_sender(
+        &self,
+    ) -> std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>;
     /// Nonblocking; `None` preserves the still-running original worker.
     fn try_take_root_custody(
         &self,
@@ -257,7 +278,8 @@ impl RoventPcCollectionAdmissionPortV2<'_> {
         admission: RoventCollectionRootAdmissionV2,
         observer: AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
     ) -> Result<(), RoleOnlyCollectionV2Rejection<PcPortQuestion, VirtualReviewTicketOutput>> {
-        self.manager.install_collection_observer_v2(admission, observer)
+        self.manager
+            .install_collection_observer_v2(admission, observer)
     }
 }
 
@@ -2077,12 +2099,18 @@ impl RoventPcSessionDriver {
                         self.selective_policy,
                     )?;
                     let expected = admission.clone();
-                    let hook = self.collection_hooks_v2.as_ref().ok_or(
-                        AdaptiveManagerError::Invalid("P/C V2 collection hook owner absent"),
-                    )?;
+                    let hook =
+                        self.collection_hooks_v2
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "P/C V2 collection hook owner absent",
+                            ))?;
                     v2_hook_started = true;
-                    self.collection_v2_outstanding.store(true, Ordering::Release);
-                    let mut port = RoventPcCollectionAdmissionPortV2 { manager: &mut manager };
+                    self.collection_v2_outstanding
+                        .store(true, Ordering::Release);
+                    let mut port = RoventPcCollectionAdmissionPortV2 {
+                        manager: &mut manager,
+                    };
                     if let Err(rejected) = hook.admit(&mut port, admission) {
                         let error = if rejected.admission.same_original_admission(&expected) {
                             rejected.error.clone()
@@ -2096,7 +2124,9 @@ impl RoventPcSessionDriver {
                         AdaptiveManagerError::Invalid("P/C V2 observer was not installed"),
                     )?;
                     if !actual.same_original_admission(&expected) {
-                        return Err(AdaptiveManagerError::Invalid("P/C installed V2 admission owner differs"));
+                        return Err(AdaptiveManagerError::Invalid(
+                            "P/C installed V2 admission owner differs",
+                        ));
                     }
                 }
                 let scanned = manager.driver_mut().port_mut().prepare_rovent_root_rules();
@@ -2156,7 +2186,8 @@ impl RoventPcSessionDriver {
                             }
                         }
                     }
-                    if v2_hook_started && !v2_hook_revoked
+                    if v2_hook_started
+                        && !v2_hook_revoked
                         && (!context.accepts().unwrap_or(false)
                             || context.soft_expired(Instant::now())
                             || manager.phase() != ManagerPhase::Running)
@@ -2224,7 +2255,10 @@ impl RoventPcSessionDriver {
             },
         ));
         if let Some(rejected) = v2_admission_failure {
-            *self.retained_collection_failure_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(rejected);
+            *self
+                .retained_collection_failure_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(rejected);
         }
         let (run_result, mut original_panic) = match run {
             Ok(result) => (Some(result), None),
@@ -2233,18 +2267,27 @@ impl RoventPcSessionDriver {
         if v2_hook_started && !v2_hook_revoked {
             if let Some(hook) = &self.collection_hooks_v2 {
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hook.revoke())) {
-                    let mut retained = self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut retained = self
+                        .retained_collection_panic_v2
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
                     retained.0 = original_panic.take();
                     retained.1 = Some(payload);
                     *state = State::Manager(manager);
                     self.closed.store(true, Ordering::Release);
-                    return Err(physical_unknown_at("RoventPcV2CollectionRevokePanic", "original hook and manager retained"));
+                    return Err(physical_unknown_at(
+                        "RoventPcV2CollectionRevokePanic",
+                        "original hook and manager retained",
+                    ));
                 }
             }
         }
         if let Some(payload) = original_panic {
             if v2_hook_started {
-                self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                self.retained_collection_panic_v2
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0 = Some(payload);
             } else {
                 // Keep the legacy no-collection path unchanged.
                 drop(payload);
@@ -2297,14 +2340,23 @@ impl RoventPcSessionDriver {
             // Acquire the channel before removing any owner from the manager.
             // A hook panic therefore leaves the actual observer in place.
             let sender = match catch_unwind(AssertUnwindSafe(|| {
-                self.collection_hooks_v2.as_ref().expect("started hook").handoff_sender()
+                self.collection_hooks_v2
+                    .as_ref()
+                    .expect("started hook")
+                    .handoff_sender()
             })) {
                 Ok(sender) => sender,
                 Err(payload) => {
-                    self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                    self.retained_collection_panic_v2
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0 = Some(payload);
                     *state = State::Manager(manager);
                     self.closed.store(true, Ordering::Release);
-                    return Err(physical_unknown_at("RoventPcV2HandoffSenderPanic", "original observer and manager retained"));
+                    return Err(physical_unknown_at(
+                        "RoventPcV2HandoffSenderPanic",
+                        "original observer and manager retained",
+                    ));
                 }
             };
             let (admission, observer, settlement) = match manager.take_collection_observer_v2() {
@@ -2312,7 +2364,10 @@ impl RoventPcSessionDriver {
                 _ => {
                     *state = State::Manager(manager);
                     self.closed.store(true, Ordering::Release);
-                    return Err(physical_unknown_at("RoventPcV2HandoffUnavailable", "original observer and manager retained"));
+                    return Err(physical_unknown_at(
+                        "RoventPcV2HandoffUnavailable",
+                        "original observer and manager retained",
+                    ));
                 }
             };
             let handoff = Arc::new(Mutex::new(RoventPcCollectionHandoffV2 {
@@ -2323,11 +2378,17 @@ impl RoventPcSessionDriver {
                 teacher_physical_ack: None,
                 teacher_aggregate_ack: None,
             }));
-            *self.retained_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
+            *self
+                .retained_collection_handoff_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
             if sender.try_send(Arc::clone(&handoff)).is_err() {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
-                return Err(physical_unknown_at("RoventPcV2HandoffUndelivered", "original handoff and manager retained"));
+                return Err(physical_unknown_at(
+                    "RoventPcV2HandoffUndelivered",
+                    "original handoff and manager retained",
+                ));
             }
             // Reclaim only the same joined root worker, without blocking the
             // collection worker on this manager. A scope ACK by itself does
@@ -2337,11 +2398,15 @@ impl RoventPcSessionDriver {
             let mut custody_state = String::from("worker join not yet observed");
             loop {
                 let observed = signal.version();
-                let result = catch_unwind(AssertUnwindSafe(|| hook.try_take_root_custody(&handoff)));
+                let result =
+                    catch_unwind(AssertUnwindSafe(|| hook.try_take_root_custody(&handoff)));
                 match result {
                     Ok(Ok(Some(custody))) => {
                         let matches = custody.matches_handoff(&handoff);
-                        *self.retained_collection_custody_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(custody);
+                        *self
+                            .retained_collection_custody_v2
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(custody);
                         custody_state = if matches {
                             "same root worker joined; publication custody retained but not yet transferred"
                         } else {
@@ -2350,17 +2415,28 @@ impl RoventPcSessionDriver {
                         break;
                     }
                     Ok(Ok(None)) if Instant::now() < context.shutdown_deadline => {
-                        signal.wait_changed(observed, context.shutdown_deadline
-                            .saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                        signal.wait_changed(
+                            observed,
+                            context
+                                .shutdown_deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10)),
+                        );
                     }
                     Ok(Ok(None)) => break,
                     Ok(Err(error)) => {
-                        custody_state = format!("original worker custody request failed; owner retained by hook: {error:?}");
+                        custody_state = format!(
+                            "original worker custody request failed; owner retained by hook: {error:?}"
+                        );
                         break;
                     }
                     Err(payload) => {
-                        self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
-                        custody_state = "worker custody callback panicked; original owners retained".into();
+                        self.retained_collection_panic_v2
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .0 = Some(payload);
+                        custody_state =
+                            "worker custody callback panicked; original owners retained".into();
                         break;
                     }
                 }
@@ -2369,7 +2445,10 @@ impl RoventPcSessionDriver {
             // worker, observer and manager instead of fabricating completion.
             *state = State::Manager(manager);
             self.closed.store(true, Ordering::Release);
-            return Err(physical_unknown_at("RoventPcV2CollectionCustodyPending", custody_state));
+            return Err(physical_unknown_at(
+                "RoventPcV2CollectionCustodyPending",
+                custody_state,
+            ));
         }
         if let Some(observer) = &self.collection_hooks.root_closure {
             if let Err(error) = observer(&mut manager) {
@@ -2962,18 +3041,40 @@ impl Drop for RoventPcSessionDriver {
             if let Some(hooks) = self.collection_hooks_v2.take() {
                 std::mem::forget(hooks);
             }
-            if let Some(handoff) = self.retained_collection_handoff_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+            if let Some(handoff) = self
+                .retained_collection_handoff_v2
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
                 std::mem::forget(handoff);
             }
-            if let Some(custody) = self.retained_collection_custody_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+            if let Some(custody) = self
+                .retained_collection_custody_v2
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
                 std::mem::forget(custody);
             }
-            if let Some(failure) = self.retained_collection_failure_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+            if let Some(failure) = self
+                .retained_collection_failure_v2
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
                 std::mem::forget(failure);
             }
-            let panics = self.retained_collection_panic_v2.get_mut().unwrap_or_else(|p| p.into_inner());
-            if let Some(payload) = panics.0.take() { std::mem::forget(payload); }
-            if let Some(payload) = panics.1.take() { std::mem::forget(payload); }
+            let panics = self
+                .retained_collection_panic_v2
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(payload) = panics.0.take() {
+                std::mem::forget(payload);
+            }
+            if let Some(payload) = panics.1.take() {
+                std::mem::forget(payload);
+            }
             if let Some(owner) = self.shared_nnuec.take() {
                 // Do not run PreparationActor's joining Drop on an unknown
                 // manager/root. Its original cache/terminal/model owners stay

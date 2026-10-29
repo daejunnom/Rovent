@@ -968,7 +968,9 @@ impl RoventNnuecSessionDriver {
                         // retains the original hook along with all root owners.
                         v2_hook_started = true;
                         let expected_cap = cap.clone();
-                        let mut port = RoventNnuecCollectionAdmissionPortV2 { manager: &mut *manager };
+                        let mut port = RoventNnuecCollectionAdmissionPortV2 {
+                            manager: &mut *manager,
+                        };
                         if let Err(rejected) = hooks.admit(&mut port, cap) {
                             let error = if rejected.admission.same_original_admission(&expected_cap)
                             {
@@ -1048,8 +1050,11 @@ impl RoventNnuecSessionDriver {
                                     Err(error) => return Err(error),
                                 }
                             }
-                            if let Some(hooks) = self.collection_hooks_v2.as_ref()
-                                .filter(|_| collection_failure.is_none()) {
+                            if let Some(hooks) = self
+                                .collection_hooks_v2
+                                .as_ref()
+                                .filter(|_| collection_failure.is_none())
+                            {
                                 match hooks.pump() {
                                     Ok(()) => {}
                                     Err(AdaptiveManagerError::Collection(error)) => {
@@ -1153,8 +1158,14 @@ impl RoventNnuecSessionDriver {
         };
         let manager = run.manager.as_ref().expect("same fenced manager");
         let mut semantic_failures: Vec<_> = manager.failures().cloned().collect();
-        for original in [run.collection_failure.as_ref(), manager.first_v2_collection_failure()]
-            .into_iter().flatten().rev() {
+        for original in [
+            run.collection_failure.as_ref(),
+            manager.first_v2_collection_failure(),
+        ]
+        .into_iter()
+        .flatten()
+        .rev()
+        {
             // The manager's existing bounded history may have rolled over
             // while draining. Keep this exact first caller cause primary
             // without changing that history's capacity or error semantics.
@@ -1224,23 +1235,33 @@ impl RoventNnuecSessionDriver {
                 // Obtain the bounded sender before removing the original
                 // observer from the fenced manager. A panic leaves it there.
                 let sender = match catch_unwind(AssertUnwindSafe(|| {
-                    self.collection_hooks_v2.as_ref().expect("started hook").handoff_sender()
+                    self.collection_hooks_v2
+                        .as_ref()
+                        .expect("started hook")
+                        .handoff_sender()
                 })) {
                     Ok(sender) => sender,
-                    Err(payload) => return Err(run.retain_panic(
-                        "RoventNnuecV2HandoffSenderPanic",
-                        "original observer and manager retained",
-                        payload,
-                    )),
+                    Err(payload) => {
+                        return Err(run.retain_panic(
+                            "RoventNnuecV2HandoffSenderPanic",
+                            "original observer and manager retained",
+                            payload,
+                        ));
+                    }
                 };
-                let (admission, observer, settlement) = match run.manager.as_mut()
-                    .expect("same fenced manager").take_collection_observer_v2()
+                let (admission, observer, settlement) = match run
+                    .manager
+                    .as_mut()
+                    .expect("same fenced manager")
+                    .take_collection_observer_v2()
                 {
                     Ok(Some(original)) => original,
-                    _ => return Err(run.fail(
-                        "RoventNnuecV2HandoffUnavailable",
-                        "original observer and manager retained",
-                    )),
+                    _ => {
+                        return Err(run.fail(
+                            "RoventNnuecV2HandoffUnavailable",
+                            "original observer and manager retained",
+                        ));
+                    }
                 };
                 // Preserve collection diagnostics with the original handoff.
                 // They make the corpus incomplete, but are not a native NN
@@ -1250,7 +1271,9 @@ impl RoventNnuecSessionDriver {
                 if let Some(failures) = run.semantic_failures.take() {
                     for failure in Vec::from(failures) {
                         match failure {
-                            AdaptiveManagerError::Collection(error) => collection_failures.push(error),
+                            AdaptiveManagerError::Collection(error) => {
+                                collection_failures.push(error)
+                            }
                             other => other_failures.push(other),
                         }
                     }
@@ -1259,7 +1282,10 @@ impl RoventNnuecSessionDriver {
                     run.semantic_failures = Some(other_failures.into_boxed_slice());
                 }
                 let handoff = Arc::new(Mutex::new(RoventNnuecCollectionHandoffV2 {
-                    admission, observer, settlement, native_fence: physical.clone(),
+                    admission,
+                    observer,
+                    settlement,
+                    native_fence: physical.clone(),
                     collection_failures: collection_failures.into_boxed_slice(),
                     teacher_physical_ack: None,
                     teacher_aggregate_ack: None,
@@ -1269,11 +1295,33 @@ impl RoventNnuecSessionDriver {
                 // alone does not prove the receiver actually kept the data.
                 loop {
                     match self.v2_handoff_custody.try_lock() {
-                        Ok(mut slot) if slot.is_none() => { *slot = Some(Arc::clone(&handoff)); break; }
-                        Ok(_) => return Err(run.fail("RoventNnuecV2HandoffCapacity", "prior root handoff is still retained")),
-                        Err(TryLockError::WouldBlock) if Instant::now() < context.shutdown_deadline => std::thread::sleep(Duration::from_millis(1)),
-                        Err(TryLockError::WouldBlock) => return Err(run.fail("RoventNnuecV2HandoffCustodyBusy", "session handoff custody remained busy until the shutdown deadline")),
-                        Err(TryLockError::Poisoned(_)) => return Err(run.fail("RoventNnuecV2HandoffCustodyPoisoned", "session handoff custody is poisoned")),
+                        Ok(mut slot) if slot.is_none() => {
+                            *slot = Some(Arc::clone(&handoff));
+                            break;
+                        }
+                        Ok(_) => {
+                            return Err(run.fail(
+                                "RoventNnuecV2HandoffCapacity",
+                                "prior root handoff is still retained",
+                            ));
+                        }
+                        Err(TryLockError::WouldBlock)
+                            if Instant::now() < context.shutdown_deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(TryLockError::WouldBlock) => {
+                            return Err(run.fail(
+                                "RoventNnuecV2HandoffCustodyBusy",
+                                "session handoff custody remained busy until the shutdown deadline",
+                            ));
+                        }
+                        Err(TryLockError::Poisoned(_)) => {
+                            return Err(run.fail(
+                                "RoventNnuecV2HandoffCustodyPoisoned",
+                                "session handoff custody is poisoned",
+                            ));
+                        }
                     }
                 }
                 if sender.try_send(Arc::clone(&handoff)).is_err() {

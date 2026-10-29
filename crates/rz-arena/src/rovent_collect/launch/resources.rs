@@ -37,7 +37,10 @@ impl CollectionResourceCustody {
     pub(super) fn finish_live(&mut self) -> Result<(), ArenaError> {
         self.original.finish_live()
     }
-    pub(super) fn validate_success_v2(&self, lock: &Arc<RoventInputLockV2>) -> Result<(), ArenaError> {
+    pub(super) fn validate_success_v2(
+        &self,
+        lock: &Arc<RoventInputLockV2>,
+    ) -> Result<(), ArenaError> {
         self.original.validate_success_v2(lock)
     }
     pub(super) fn observation(&self) -> Value {

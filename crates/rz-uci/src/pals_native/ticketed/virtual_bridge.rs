@@ -90,11 +90,15 @@ pub enum VirtualReviewCaptureFailure {
 }
 impl VirtualReviewCaptureFailure {
     pub fn into_cause(self) -> RoleFailure {
-        match self { Self::Required(cause) | Self::Observation(cause) => cause }
+        match self {
+            Self::Required(cause) | Self::Observation(cause) => cause,
+        }
     }
 }
 impl From<RoleFailure> for VirtualReviewCaptureFailure {
-    fn from(value: RoleFailure) -> Self { Self::Required(value) }
+    fn from(value: RoleFailure) -> Self {
+        Self::Required(value)
+    }
 }
 
 /// Collection is opt-in. Callbacks run on the native ticket owner and may only
@@ -116,9 +120,15 @@ pub trait VirtualReviewCollectionObserver: Send + 'static {
     ) -> Result<(), RoleFailure>;
     fn submitted_classified(
         &mut self,
-        context: &TicketOwnerDispatchContext<'_, ReviewView, NativeTicketQuestion, VirtualReviewPreparedTicket>,
+        context: &TicketOwnerDispatchContext<
+            '_,
+            ReviewView,
+            NativeTicketQuestion,
+            VirtualReviewPreparedTicket,
+        >,
     ) -> Result<(), VirtualReviewCaptureFailure> {
-        self.submitted(context.ticket(), context.question(), context.prepared()).map_err(VirtualReviewCaptureFailure::Required)
+        self.submitted(context.ticket(), context.question(), context.prepared())
+            .map_err(VirtualReviewCaptureFailure::Required)
     }
     /// A capture-only failure may be isolated only when the observer has
     /// retained the original failure and revoked publication for this
@@ -148,11 +158,17 @@ pub trait VirtualReviewCollectionObserver: Send + 'static {
         evidence: Option<TicketExecutionEvidence>,
         invocation: Option<VirtualReviewPhysicalInvocationEvidence>,
     ) -> Result<(), VirtualReviewCaptureFailure> {
-        self.completed(ticket, physical, output, evidence, invocation).map_err(VirtualReviewCaptureFailure::Required)
+        self.completed(ticket, physical, output, evidence, invocation)
+            .map_err(VirtualReviewCaptureFailure::Required)
     }
     fn retired(&mut self, ticket: &RoleTicketEnvelope, accepted: bool) -> Result<(), RoleFailure>;
-    fn retired_classified(&mut self, ticket: &RoleTicketEnvelope, accepted: bool) -> Result<(), VirtualReviewCaptureFailure> {
-        self.retired(ticket, accepted).map_err(VirtualReviewCaptureFailure::Required)
+    fn retired_classified(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        accepted: bool,
+    ) -> Result<(), VirtualReviewCaptureFailure> {
+        self.retired(ticket, accepted)
+            .map_err(VirtualReviewCaptureFailure::Required)
     }
     /// Post-Run, backend-issued V3 placement proof. Consumers may seal/enqueue
     /// this exact scope; a legacy P/C witness never certifies V or seeded Warm.
@@ -175,7 +191,9 @@ fn isolate_capture_failure(
         VirtualReviewCaptureFailure::Observation(cause) => cause,
     };
     if failure == RoleFailure::PhysicalUnknown
-        || !observer.as_mut().is_some_and(|o| o.preserve_observation_failure(stage, ticket, &failure))
+        || !observer
+            .as_mut()
+            .is_some_and(|o| o.preserve_observation_failure(stage, ticket, &failure))
     {
         return Err(failure);
     }
@@ -248,9 +266,13 @@ impl NativeVirtualReviewTicketBackend {
         if self.observation_failures.len() >= 2 {
             return Err(RoleFailure::PhysicalUnknown);
         }
-        self.observation_failures.push_back(TicketNativeObservationFailure {
-            ticket: *ticket, stage, disposition, cause,
-        });
+        self.observation_failures
+            .push_back(TicketNativeObservationFailure {
+                ticket: *ticket,
+                stage,
+                disposition,
+                cause,
+            });
         Ok(())
     }
 
@@ -392,13 +414,19 @@ impl NativeVirtualReviewTicketBackend {
         } else if Instant::now() >= until {
             Err(RoleFailure::Expired)
         } else {
-            self.execute_command(VirtualReviewNativeCommand::VerifyVirtualCudaPlacement, until)
-                .and_then(|result| match result {
-                    VirtualReviewNativeResult::VirtualCudaPlacementVerified(_) => Ok(()),
-                    _ => Err(RoleFailure::InvalidOutput),
-                })
+            self.execute_command(
+                VirtualReviewNativeCommand::VerifyVirtualCudaPlacement,
+                until,
+            )
+            .and_then(|result| match result {
+                VirtualReviewNativeResult::VirtualCudaPlacementVerified(_) => Ok(()),
+                _ => Err(RoleFailure::InvalidOutput),
+            })
         };
-        let window = self.accepted_warm_profile_window.as_mut().expect("opt-in profile window retained");
+        let window = self
+            .accepted_warm_profile_window
+            .as_mut()
+            .expect("opt-in profile window retained");
         match &result {
             Ok(()) => window.sealed = true,
             Err(failure) => window.failure = Some(failure.clone()),
@@ -565,7 +593,9 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
     ) -> TicketPhysicalResult<Self::Output> {
         TicketPhysicalResult {
             physical: PhysicalRoleCompletion::Confirmed,
-            output: Err(RoleFailure::Unsupported("original ticket service owner required")),
+            output: Err(RoleFailure::Unsupported(
+                "original ticket service owner required",
+            )),
         }
     }
     fn run_owned(
@@ -605,8 +635,18 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                     Ok(()) => observer_submitted = true,
                     Err(failure) => {
                         let cause = failure.clone().into_cause();
-                        isolate_capture_failure(&mut self.observer, VirtualReviewCaptureFailureStage::Submitted, ticket, failure)?;
-                        self.record_observation_failure(ticket, TicketNativeObservationStage::Submitted, TicketNativeObservationDisposition::Observation, cause)?;
+                        isolate_capture_failure(
+                            &mut self.observer,
+                            VirtualReviewCaptureFailureStage::Submitted,
+                            ticket,
+                            failure,
+                        )?;
+                        self.record_observation_failure(
+                            ticket,
+                            TicketNativeObservationStage::Submitted,
+                            TicketNativeObservationDisposition::Observation,
+                            cause,
+                        )?;
                     }
                 }
             }
@@ -734,7 +774,10 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
             ) {
                 let cause = failure.clone().into_cause();
                 let classification = isolate_capture_failure(
-                    &mut self.observer, VirtualReviewCaptureFailureStage::Completed, ticket, failure,
+                    &mut self.observer,
+                    VirtualReviewCaptureFailureStage::Completed,
+                    ticket,
+                    failure,
                 );
                 let disposition = if classification.is_ok() {
                     TicketNativeObservationDisposition::Observation
@@ -742,11 +785,16 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                     TicketNativeObservationDisposition::RequiredAfterPhysical
                 };
                 if let Err(report_error) = self.record_observation_failure(
-                    ticket, TicketNativeObservationStage::Completed, disposition, cause,
+                    ticket,
+                    TicketNativeObservationStage::Completed,
+                    disposition,
+                    cause,
                 ) {
                     result = Err(report_error);
                 } else if let Err(failure) = classification
-                    && physical == PhysicalRoleCompletion::Confirmed && result.is_ok() {
+                    && physical == PhysicalRoleCompletion::Confirmed
+                    && result.is_ok()
+                {
                     result = Err(failure);
                 }
             }
@@ -834,17 +882,34 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 if let Some(observer) = &mut self.observer {
                     if let Err(failure) = observer.retired_classified(ticket, true) {
                         let cause = failure.clone().into_cause();
-                        let disposition = if isolate_capture_failure(&mut self.observer, VirtualReviewCaptureFailureStage::Retired, ticket, failure).is_ok() {
+                        let disposition = if isolate_capture_failure(
+                            &mut self.observer,
+                            VirtualReviewCaptureFailureStage::Retired,
+                            ticket,
+                            failure,
+                        )
+                        .is_ok()
+                        {
                             TicketNativeObservationDisposition::Observation
                         } else {
                             TicketNativeObservationDisposition::RequiredAfterPhysical
                         };
-                        self.record_observation_failure(ticket, TicketNativeObservationStage::Retired, disposition, cause)?;
+                        self.record_observation_failure(
+                            ticket,
+                            TicketNativeObservationStage::Retired,
+                            disposition,
+                            cause,
+                        )?;
                     }
                 }
                 // TicketAccepted already happened. The audit outcome is
                 // carried beside its original receipt, never as failed accept.
-                self.report_post_accept_audit(ticket, ticket.role, !output.completion.warm_started, until)?;
+                self.report_post_accept_audit(
+                    ticket,
+                    ticket.role,
+                    !output.completion.warm_started,
+                    until,
+                )?;
                 Ok(())
             }
             _ => Err(RoleFailure::InvalidOutput),
@@ -861,8 +926,18 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
             if let Some(observer) = &mut self.observer {
                 if let Err(failure) = observer.retired_classified(ticket, false) {
                     let cause = failure.clone().into_cause();
-                    isolate_capture_failure(&mut self.observer, VirtualReviewCaptureFailureStage::Retired, ticket, failure)?;
-                    self.record_observation_failure(ticket, TicketNativeObservationStage::Retired, TicketNativeObservationDisposition::Observation, cause)?;
+                    isolate_capture_failure(
+                        &mut self.observer,
+                        VirtualReviewCaptureFailureStage::Retired,
+                        ticket,
+                        failure,
+                    )?;
+                    self.record_observation_failure(
+                        ticket,
+                        TicketNativeObservationStage::Retired,
+                        TicketNativeObservationDisposition::Observation,
+                        cause,
+                    )?;
                 }
             }
             return Ok(());
@@ -885,7 +960,10 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 if let Err(failure) = observer.retired_classified(ticket, false) {
                     let cause = failure.clone().into_cause();
                     let observation = isolate_capture_failure(
-                        &mut self.observer, VirtualReviewCaptureFailureStage::Retired, ticket, failure,
+                        &mut self.observer,
+                        VirtualReviewCaptureFailureStage::Retired,
+                        ticket,
+                        failure,
                     );
                     // A failed native discard remains the primary physical
                     // result. Capture observers that support isolation retain
@@ -895,7 +973,12 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                     } else {
                         TicketNativeObservationDisposition::RequiredAfterPhysical
                     };
-                    self.record_observation_failure(ticket, TicketNativeObservationStage::Retired, disposition, cause)?;
+                    self.record_observation_failure(
+                        ticket,
+                        TicketNativeObservationStage::Retired,
+                        disposition,
+                        cause,
+                    )?;
                 }
             }
         }
@@ -1268,11 +1351,36 @@ mod tests {
         seen: Arc<std::sync::Mutex<Vec<(VirtualReviewCaptureFailureStage, RoleFailure)>>>,
     }
     impl VirtualReviewCollectionObserver for FailureObserver {
-        fn submitted(&mut self, _: &RoleTicketEnvelope, _: &TicketPreparation<ReviewView, NativeTicketQuestion>, _: &VirtualReviewPreparedTicket) -> Result<(), RoleFailure> { unreachable!() }
-        fn completed(&mut self, _: &RoleTicketEnvelope, _: PhysicalRoleCompletion, _: Option<&RoleOutput>, _: Option<TicketExecutionEvidence>, _: Option<VirtualReviewPhysicalInvocationEvidence>) -> Result<(), RoleFailure> { unreachable!() }
-        fn retired(&mut self, _: &RoleTicketEnvelope, _: bool) -> Result<(), RoleFailure> { unreachable!() }
-        fn preserve_observation_failure(&mut self, stage: VirtualReviewCaptureFailureStage, _: &RoleTicketEnvelope, failure: &RoleFailure) -> bool {
-            if self.preserve { self.seen.lock().unwrap().push((stage, failure.clone())); }
+        fn submitted(
+            &mut self,
+            _: &RoleTicketEnvelope,
+            _: &TicketPreparation<ReviewView, NativeTicketQuestion>,
+            _: &VirtualReviewPreparedTicket,
+        ) -> Result<(), RoleFailure> {
+            unreachable!()
+        }
+        fn completed(
+            &mut self,
+            _: &RoleTicketEnvelope,
+            _: PhysicalRoleCompletion,
+            _: Option<&RoleOutput>,
+            _: Option<TicketExecutionEvidence>,
+            _: Option<VirtualReviewPhysicalInvocationEvidence>,
+        ) -> Result<(), RoleFailure> {
+            unreachable!()
+        }
+        fn retired(&mut self, _: &RoleTicketEnvelope, _: bool) -> Result<(), RoleFailure> {
+            unreachable!()
+        }
+        fn preserve_observation_failure(
+            &mut self,
+            stage: VirtualReviewCaptureFailureStage,
+            _: &RoleTicketEnvelope,
+            failure: &RoleFailure,
+        ) -> bool {
+            if self.preserve {
+                self.seen.lock().unwrap().push((stage, failure.clone()));
+            }
             self.preserve
         }
     }
@@ -1282,25 +1390,76 @@ mod tests {
         let (_store, question) = question(Position::startpos(), &[], &[]);
         let (input, identity) = encode_view(&question, [1; 32], [2; 32]).unwrap();
         let ticket = RoleTicketEnvelope {
-            id: RequestId::new(question.seal.authority.epoch, 1), authority: question.seal.authority,
-            question: question.question, view: question.seal,
+            id: RequestId::new(question.seal.authority.epoch, 1),
+            authority: question.seal.authority,
+            question: question.question,
+            view: question.seal,
             representation: representation(&input, &identity, identity.rules_history, 0).unwrap(),
-            role: question.role, original_deadline: question.deadline,
+            role: question.role,
+            original_deadline: question.deadline,
         };
-        for stage in [VirtualReviewCaptureFailureStage::Submitted, VirtualReviewCaptureFailureStage::Completed, VirtualReviewCaptureFailureStage::Retired] {
+        for stage in [
+            VirtualReviewCaptureFailureStage::Submitted,
+            VirtualReviewCaptureFailureStage::Completed,
+            VirtualReviewCaptureFailureStage::Retired,
+        ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let cause = RoleFailure::Backend("capture queue unavailable".into());
-            let mut observer: Option<Box<dyn VirtualReviewCollectionObserver>> = Some(Box::new(FailureObserver { preserve: true, seen: Arc::clone(&seen) }));
-            assert_eq!(isolate_capture_failure(&mut observer, stage, &ticket, VirtualReviewCaptureFailure::Observation(cause.clone())), Ok(()));
+            let mut observer: Option<Box<dyn VirtualReviewCollectionObserver>> =
+                Some(Box::new(FailureObserver {
+                    preserve: true,
+                    seen: Arc::clone(&seen),
+                }));
+            assert_eq!(
+                isolate_capture_failure(
+                    &mut observer,
+                    stage,
+                    &ticket,
+                    VirtualReviewCaptureFailure::Observation(cause.clone())
+                ),
+                Ok(())
+            );
             assert!(observer.is_none());
             assert_eq!(*seen.lock().unwrap(), vec![(stage, cause)]);
-            let mut unpreserved: Option<Box<dyn VirtualReviewCollectionObserver>> = Some(Box::new(FailureObserver { preserve: false, seen: Arc::clone(&seen) }));
-            assert_eq!(isolate_capture_failure(&mut unpreserved, stage, &ticket, VirtualReviewCaptureFailure::Observation(RoleFailure::InvalidOutput)), Err(RoleFailure::InvalidOutput));
+            let mut unpreserved: Option<Box<dyn VirtualReviewCollectionObserver>> =
+                Some(Box::new(FailureObserver {
+                    preserve: false,
+                    seen: Arc::clone(&seen),
+                }));
+            assert_eq!(
+                isolate_capture_failure(
+                    &mut unpreserved,
+                    stage,
+                    &ticket,
+                    VirtualReviewCaptureFailure::Observation(RoleFailure::InvalidOutput)
+                ),
+                Err(RoleFailure::InvalidOutput)
+            );
             assert!(unpreserved.is_some());
-            assert_eq!(isolate_capture_failure(&mut unpreserved, stage, &ticket, VirtualReviewCaptureFailure::Observation(RoleFailure::PhysicalUnknown)), Err(RoleFailure::PhysicalUnknown));
+            assert_eq!(
+                isolate_capture_failure(
+                    &mut unpreserved,
+                    stage,
+                    &ticket,
+                    VirtualReviewCaptureFailure::Observation(RoleFailure::PhysicalUnknown)
+                ),
+                Err(RoleFailure::PhysicalUnknown)
+            );
             assert!(unpreserved.is_some());
-            let mut optional: Option<Box<dyn VirtualReviewCollectionObserver>> = Some(Box::new(FailureObserver { preserve: true, seen: Arc::clone(&seen) }));
-            assert_eq!(isolate_capture_failure(&mut optional, stage, &ticket, VirtualReviewCaptureFailure::Required(RoleFailure::InvalidOutput)), Err(RoleFailure::InvalidOutput));
+            let mut optional: Option<Box<dyn VirtualReviewCollectionObserver>> =
+                Some(Box::new(FailureObserver {
+                    preserve: true,
+                    seen: Arc::clone(&seen),
+                }));
+            assert_eq!(
+                isolate_capture_failure(
+                    &mut optional,
+                    stage,
+                    &ticket,
+                    VirtualReviewCaptureFailure::Required(RoleFailure::InvalidOutput)
+                ),
+                Err(RoleFailure::InvalidOutput)
+            );
             assert!(optional.is_some());
         }
     }
@@ -1393,10 +1552,13 @@ mod tests {
         let (_store, question) = question(Position::startpos(), &[], &[]);
         let (input, identity) = encode_view(&question, [1; 32], [2; 32]).unwrap();
         let ticket = RoleTicketEnvelope {
-            id: RequestId::new(question.seal.authority.epoch, 1), authority: question.seal.authority,
-            question: question.question, view: question.seal,
+            id: RequestId::new(question.seal.authority.epoch, 1),
+            authority: question.seal.authority,
+            question: question.question,
+            view: question.seal,
             representation: representation(&input, &identity, identity.rules_history, 0).unwrap(),
-            role: question.role, original_deadline: question.deadline,
+            role: question.role,
+            original_deadline: question.deadline,
         };
         for scenario in 0..3 {
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1404,28 +1566,53 @@ mod tests {
             let worker = SingleWorker::spawn(move |_: &VirtualReviewNativeCommand| {
                 observed.fetch_add(1, Ordering::AcqRel);
                 Err(mock_audit_failure())
-            }).unwrap();
+            })
+            .unwrap();
             let mut backend = mock_finish_backend(worker, true);
             backend.accepted_warm_profile_window = Some(AcceptedWarmProfileWindow {
-                combinations: 7, sealed: false, failure: None,
+                combinations: 7,
+                sealed: false,
+                failure: None,
             });
             backend.physical_unknown = scenario == 2;
-            let until = if scenario == 1 { Instant::now() } else { Instant::now() + Duration::from_secs(2) };
+            let until = if scenario == 1 {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(2)
+            };
             if scenario == 0 {
-                backend.record_observation_failure(&ticket, TicketNativeObservationStage::Retired,
-                    TicketNativeObservationDisposition::Observation,
-                    RoleFailure::Backend("mock collector unavailable".into())).unwrap();
+                backend
+                    .record_observation_failure(
+                        &ticket,
+                        TicketNativeObservationStage::Retired,
+                        TicketNativeObservationDisposition::Observation,
+                        RoleFailure::Backend("mock collector unavailable".into()),
+                    )
+                    .unwrap();
             }
-            assert!(backend.report_post_accept_audit(&ticket, Role::Critic, false, until).is_ok());
+            assert!(
+                backend
+                    .report_post_accept_audit(&ticket, Role::Critic, false, until)
+                    .is_ok()
+            );
             if scenario == 0 {
                 let observation = backend.take_observation_failure().unwrap();
-                assert_eq!(observation.disposition, TicketNativeObservationDisposition::Observation);
-                assert_eq!(observation.cause, RoleFailure::Backend("mock collector unavailable".into()));
+                assert_eq!(
+                    observation.disposition,
+                    TicketNativeObservationDisposition::Observation
+                );
+                assert_eq!(
+                    observation.cause,
+                    RoleFailure::Backend("mock collector unavailable".into())
+                );
             }
             let report = backend.take_observation_failure().unwrap();
             assert_eq!(report.ticket, ticket);
             assert_eq!(report.stage, TicketNativeObservationStage::Retired);
-            assert_eq!(report.disposition, TicketNativeObservationDisposition::RequiredAfterPhysical);
+            assert_eq!(
+                report.disposition,
+                TicketNativeObservationDisposition::RequiredAfterPhysical
+            );
             let expected = match scenario {
                 0 => RoleFailure::Backend(mock_audit_failure().to_string()),
                 1 => RoleFailure::Expired,
@@ -1433,7 +1620,10 @@ mod tests {
             };
             assert_eq!(report.cause, expected);
             assert!(backend.take_observation_failure().is_none());
-            assert_eq!(backend.seal_warm_profile_after_accept(Role::Critic, false, until), Err(expected));
+            assert_eq!(
+                backend.seal_warm_profile_after_accept(Role::Critic, false, until),
+                Err(expected)
+            );
             assert_eq!(calls.load(Ordering::Acquire), usize::from(scenario == 0));
             assert_eq!(backend.physical_unknown, scenario == 2);
         }

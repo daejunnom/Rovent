@@ -9,8 +9,8 @@ use super::external_session::{
 };
 use super::launch::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use super::nnuec_session::{
-    RoventNnuecCollectionHooks, RoventNnuecCollectionHooksV2, RoventNnuecSessionDriver, RoventNnuecSessionRejection,
-    RoventNnuecSessionV2Rejection,
+    RoventNnuecCollectionHooks, RoventNnuecCollectionHooksV2, RoventNnuecSessionDriver,
+    RoventNnuecSessionRejection, RoventNnuecSessionV2Rejection,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::pc_session::{
@@ -27,7 +27,8 @@ use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
     AdaptiveCheckerMetadata, AdaptiveSessionAdmissionRejection, AdaptiveSessionCollectionHooks,
     AdaptiveSessionDriver, AdaptiveSessionOptions, AdaptiveSessionSources, PersistentCpuOwner,
-    RoventPcrSessionProfile, RoventBoardCollectionHooksV2, RoventBoardCollectionRegistrationRejectionV2,
+    RoventBoardCollectionHooksV2, RoventBoardCollectionRegistrationRejectionV2,
+    RoventPcrSessionProfile,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::{
@@ -1189,9 +1190,14 @@ pub struct RoventOwnPcrV2StartupRejection {
     pub sources: Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV2>>,
     pub process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
     /// Original collection hook remains recoverable on any startup failure.
-    pub collection_hooks: Option<Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>>,
+    pub collection_hooks:
+        Option<Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>>,
     /// A failed registration may itself own state acquired by the callback.
-    pub collection_rejection: Option<Box<RoventBoardCollectionRegistrationRejectionV2<RoventNativeBackend<AdaptivePortQuestion>>>>,
+    pub collection_rejection: Option<
+        Box<
+            RoventBoardCollectionRegistrationRejectionV2<RoventNativeBackend<AdaptivePortQuestion>>,
+        >,
+    >,
 }
 
 impl RoventOwnPcrProductDriverV2 {
@@ -1204,7 +1210,15 @@ impl RoventOwnPcrProductDriverV2 {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventOwnPcrV2StartupRejection> {
-        Self::admit_own_board_pcr_v2(prepared, process, clock, owners, identity, root_policy, None)
+        Self::admit_own_board_pcr_v2(
+            prepared,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            None,
+        )
     }
 
     /// Collection path retains the exact loaded native origin and hook owner.
@@ -1218,7 +1232,15 @@ impl RoventOwnPcrProductDriverV2 {
         root_policy: RoventRootAdmissionPolicy,
         hooks: Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>,
     ) -> Result<Self, RoventOwnPcrV2StartupRejection> {
-        Self::admit_own_board_pcr_v2(prepared, process, clock, owners, identity, root_policy, Some(hooks))
+        Self::admit_own_board_pcr_v2(
+            prepared,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            Some(hooks),
+        )
     }
 
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
@@ -1229,7 +1251,9 @@ impl RoventOwnPcrProductDriverV2 {
         owners: Arc<OwnerRegistry>,
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
-        collection_hooks: Option<Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>>,
+        collection_hooks: Option<
+            Arc<dyn RoventBoardCollectionHooksV2<RoventNativeBackend<AdaptivePortQuestion>>>,
+        >,
     ) -> Result<Self, RoventOwnPcrV2StartupRejection> {
         let pins = Arc::clone(prepared.sources());
         let same_owner = Arc::ptr_eq(pins.lock_owner(), process.input_lock())
@@ -1264,7 +1288,8 @@ impl RoventOwnPcrProductDriverV2 {
                 collection_rejection: None,
             });
         }
-        let is_collection = pins.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection;
+        let is_collection =
+            pins.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection;
         if is_collection != collection_hooks.is_some()
             || is_collection != pins.collection_preload_sources().is_some()
         {
@@ -1321,7 +1346,8 @@ impl RoventOwnPcrProductDriverV2 {
             match prepared.collection_identity() {
                 Ok(origin) => Some(origin),
                 Err(error) => {
-                    let mut failure = SearchSessionFailure::debug("RoventPcrV2CollectionOrigin", &error);
+                    let mut failure =
+                        SearchSessionFailure::debug("RoventPcrV2CollectionOrigin", &error);
                     failure.physical_completion = DriverPhysicalCompletion::Unknown;
                     return Err(RoventOwnPcrV2StartupRejection {
                         failure,
@@ -1411,7 +1437,9 @@ impl RoventOwnPcrProductDriverV2 {
         }
         if let Some(origin) = collection_origin {
             let hooks = Arc::clone(collection_hooks.as_ref().expect("checked collection hooks"));
-            if let Err(rejected) = driver.register_rovent_collection_v2(origin, hooks, &original_control) {
+            if let Err(rejected) =
+                driver.register_rovent_collection_v2(origin, hooks, &original_control)
+            {
                 let mut failure = rejected.error.clone();
                 failure.physical_completion = DriverPhysicalCompletion::Unknown;
                 return Err(RoventOwnPcrV2StartupRejection {
@@ -1731,7 +1759,14 @@ impl RoventOwnNnuecProductDriverV2 {
     ) -> Result<Self, RoventOwnNnuecV2StartupRejection> {
         let sources = Arc::clone(prepared.sources());
         let driver = RoventNnuecSessionDriver::new_v2_with_collection_hooks(
-            prepared, loaded, Arc::clone(&process), clock, owners, identity, root_policy, hooks,
+            prepared,
+            loaded,
+            Arc::clone(&process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+            hooks,
         )
         .map_err(|rejected| {
             let mut failure = rejected.failure.clone();

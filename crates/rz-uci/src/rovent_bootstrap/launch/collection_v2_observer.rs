@@ -5,14 +5,13 @@
 //! panics, or physical completion is unknown. No root/manager lock may be held
 //! while a callback or reclamation acquires this mutex.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::pals_native::ticketed::{
-    NativeTicketQuestion, TicketExecutionEvidence, TicketOwnerDispatchContext,
-    TicketPreparation, VirtualReviewCaptureFailure, VirtualReviewCaptureFailureStage,
-    VirtualReviewCollectionObserver, VirtualReviewPhysicalInvocationEvidence,
-    VirtualReviewPreparedTicket,
+    NativeTicketQuestion, TicketExecutionEvidence, TicketOwnerDispatchContext, TicketPreparation,
+    VirtualReviewCaptureFailure, VirtualReviewCaptureFailureStage, VirtualReviewCollectionObserver,
+    VirtualReviewPhysicalInvocationEvidence, VirtualReviewPreparedTicket,
 };
 use rz_contracts::pals::RoleOutput;
 use rz_contracts::pals_adaptive::RoleTicketEnvelope;
@@ -45,18 +44,22 @@ pub(super) enum V2ObserverReclaimError {
 
 impl V2ObserverCustody {
     pub(super) fn new(observer: Box<dyn VirtualReviewCollectionObserver>) -> Self {
-        Self { shared: Some(Arc::new(SharedObserver {
-            observer: Mutex::new(Some(observer)),
-            poison_observed: AtomicBool::new(false),
-        })) }
+        Self {
+            shared: Some(Arc::new(SharedObserver {
+                observer: Mutex::new(Some(observer)),
+                poison_observed: AtomicBool::new(false),
+            })),
+        }
     }
 
     /// Create a proxy before moving it to the native startup factory. The
     /// custody must outlive the proxy and all physical work it might observe.
     pub(super) fn proxy(&self) -> Option<Box<dyn VirtualReviewCollectionObserver>> {
-        self.shared.as_ref().map(|shared| Box::new(V2ObserverProxy {
-            shared: Arc::clone(shared),
-        }) as Box<dyn VirtualReviewCollectionObserver>)
+        self.shared.as_ref().map(|shared| {
+            Box::new(V2ObserverProxy {
+                shared: Arc::clone(shared),
+            }) as Box<dyn VirtualReviewCollectionObserver>
+        })
     }
 
     pub(super) fn poison_observed(&self) -> bool {
@@ -73,7 +76,10 @@ impl V2ObserverCustody {
     pub(super) fn try_reclaim_after_verified_boundary(
         &mut self,
     ) -> Result<Box<dyn VirtualReviewCollectionObserver>, V2ObserverReclaimError> {
-        let shared = self.shared.as_ref().ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
         if Arc::strong_count(shared) != 1 {
             return Err(V2ObserverReclaimError::ProxyStillOwned);
         }
@@ -81,7 +87,9 @@ impl V2ObserverCustody {
             shared.poison_observed.store(true, Ordering::Release);
             V2ObserverReclaimError::Poisoned
         })?;
-        let observer = guard.take().ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
+        let observer = guard
+            .take()
+            .ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
         drop(guard);
         self.shared = None;
         Ok(observer)
@@ -93,8 +101,17 @@ impl V2ObserverCustody {
     /// verified physical boundary required by the ordinary method applies.
     pub(super) fn reclaim_poisoned_after_verified_boundary(
         &mut self,
-    ) -> Result<(Box<dyn VirtualReviewCollectionObserver>, V2ObserverReclaimError), V2ObserverReclaimError> {
-        let shared = self.shared.as_ref().ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
+    ) -> Result<
+        (
+            Box<dyn VirtualReviewCollectionObserver>,
+            V2ObserverReclaimError,
+        ),
+        V2ObserverReclaimError,
+    > {
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
         if Arc::strong_count(shared) != 1 {
             return Err(V2ObserverReclaimError::ProxyStillOwned);
         }
@@ -103,7 +120,9 @@ impl V2ObserverCustody {
             Ok(_) => return Err(V2ObserverReclaimError::NotPoisoned),
         };
         shared.poison_observed.store(true, Ordering::Release);
-        let observer = guard.take().ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
+        let observer = guard
+            .take()
+            .ok_or(V2ObserverReclaimError::AlreadyReclaimed)?;
         drop(guard);
         self.shared = None;
         Ok((observer, V2ObserverReclaimError::Poisoned))
@@ -139,36 +158,84 @@ impl V2ObserverProxy {
 }
 
 impl VirtualReviewCollectionObserver for V2ObserverProxy {
-    fn prepared(&mut self, question: &TicketPreparation<ReviewView, NativeTicketQuestion>, prepared: &VirtualReviewPreparedTicket) -> Result<(), RoleFailure> {
+    fn prepared(
+        &mut self,
+        question: &TicketPreparation<ReviewView, NativeTicketQuestion>,
+        prepared: &VirtualReviewPreparedTicket,
+    ) -> Result<(), RoleFailure> {
         self.with_observer(|observer| observer.prepared(question, prepared))?
     }
-    fn submitted(&mut self, ticket: &RoleTicketEnvelope, question: &TicketPreparation<ReviewView, NativeTicketQuestion>, prepared: &VirtualReviewPreparedTicket) -> Result<(), RoleFailure> {
+    fn submitted(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        question: &TicketPreparation<ReviewView, NativeTicketQuestion>,
+        prepared: &VirtualReviewPreparedTicket,
+    ) -> Result<(), RoleFailure> {
         self.with_observer(|observer| observer.submitted(ticket, question, prepared))?
     }
-    fn submitted_classified(&mut self, context: &TicketOwnerDispatchContext<'_, ReviewView, NativeTicketQuestion, VirtualReviewPreparedTicket>) -> Result<(), VirtualReviewCaptureFailure> {
+    fn submitted_classified(
+        &mut self,
+        context: &TicketOwnerDispatchContext<
+            '_,
+            ReviewView,
+            NativeTicketQuestion,
+            VirtualReviewPreparedTicket,
+        >,
+    ) -> Result<(), VirtualReviewCaptureFailure> {
         self.with_observer(|observer| observer.submitted_classified(context))
             .map_err(VirtualReviewCaptureFailure::Required)?
     }
-    fn preserve_observation_failure(&mut self, stage: VirtualReviewCaptureFailureStage, ticket: &RoleTicketEnvelope, failure: &RoleFailure) -> bool {
+    fn preserve_observation_failure(
+        &mut self,
+        stage: VirtualReviewCaptureFailureStage,
+        ticket: &RoleTicketEnvelope,
+        failure: &RoleFailure,
+    ) -> bool {
         // This trait method cannot return an error. Refuse isolation on poison;
         // the flag exposes the failure and the original observer stays held.
-        self.with_observer(|observer| observer.preserve_observation_failure(stage, ticket, failure)).unwrap_or(false)
+        self.with_observer(|observer| observer.preserve_observation_failure(stage, ticket, failure))
+            .unwrap_or(false)
     }
-    fn completed(&mut self, ticket: &RoleTicketEnvelope, physical: PhysicalRoleCompletion, output: Option<&RoleOutput>, evidence: Option<TicketExecutionEvidence>, invocation: Option<VirtualReviewPhysicalInvocationEvidence>) -> Result<(), RoleFailure> {
-        self.with_observer(|observer| observer.completed(ticket, physical, output, evidence, invocation))?
+    fn completed(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        physical: PhysicalRoleCompletion,
+        output: Option<&RoleOutput>,
+        evidence: Option<TicketExecutionEvidence>,
+        invocation: Option<VirtualReviewPhysicalInvocationEvidence>,
+    ) -> Result<(), RoleFailure> {
+        self.with_observer(|observer| {
+            observer.completed(ticket, physical, output, evidence, invocation)
+        })?
     }
-    fn completed_classified(&mut self, ticket: &RoleTicketEnvelope, physical: PhysicalRoleCompletion, output: Option<&RoleOutput>, evidence: Option<TicketExecutionEvidence>, invocation: Option<VirtualReviewPhysicalInvocationEvidence>) -> Result<(), VirtualReviewCaptureFailure> {
-        self.with_observer(|observer| observer.completed_classified(ticket, physical, output, evidence, invocation))
-            .map_err(VirtualReviewCaptureFailure::Required)?
+    fn completed_classified(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        physical: PhysicalRoleCompletion,
+        output: Option<&RoleOutput>,
+        evidence: Option<TicketExecutionEvidence>,
+        invocation: Option<VirtualReviewPhysicalInvocationEvidence>,
+    ) -> Result<(), VirtualReviewCaptureFailure> {
+        self.with_observer(|observer| {
+            observer.completed_classified(ticket, physical, output, evidence, invocation)
+        })
+        .map_err(VirtualReviewCaptureFailure::Required)?
     }
     fn retired(&mut self, ticket: &RoleTicketEnvelope, accepted: bool) -> Result<(), RoleFailure> {
         self.with_observer(|observer| observer.retired(ticket, accepted))?
     }
-    fn retired_classified(&mut self, ticket: &RoleTicketEnvelope, accepted: bool) -> Result<(), VirtualReviewCaptureFailure> {
+    fn retired_classified(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        accepted: bool,
+    ) -> Result<(), VirtualReviewCaptureFailure> {
         self.with_observer(|observer| observer.retired_classified(ticket, accepted))
             .map_err(VirtualReviewCaptureFailure::Required)?
     }
-    fn runtime_audited(&mut self, witness: &VirtualReviewCudaPlacementWitness) -> Result<(), RoleFailure> {
+    fn runtime_audited(
+        &mut self,
+        witness: &VirtualReviewCudaPlacementWitness,
+    ) -> Result<(), RoleFailure> {
         self.with_observer(|observer| observer.runtime_audited(witness))?
     }
 }

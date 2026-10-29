@@ -1149,7 +1149,8 @@ pub(crate) fn admitted_collection_topology_v2(
     lock.validate()
         .map_err(|_| fail(K::IdentityMismatch, "Rovent lock validation failed"))?;
     let engine = &lock.manifest.engine;
-    let explicit = lock.manifest.purpose == RoventPurpose::Collection && !engine.teachers.is_empty();
+    let explicit =
+        lock.manifest.purpose == RoventPurpose::Collection && !engine.teachers.is_empty();
     admitted_native_topology_fields(engine, &lock.manifest.coordinator, explicit)
 }
 

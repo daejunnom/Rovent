@@ -5,30 +5,36 @@
 //! a process permit or matching digest alone does not authorize a teacher go,
 //! completion, label, or publication.
 
+use super::super::{RoventRetiredLockV2Record, RoventSubmittedInputSeal, exact_rules_anchor};
 use super::v2_actor_preflight::{TeacherActorSourcePreflightV2, preflight_teacher_actor_source_v2};
 use super::{ArenaError, check, invalid};
-use super::super::{RoventRetiredLockV2Record, RoventSubmittedInputSeal, exact_rules_anchor};
 use rz_contracts::Digest;
 use rz_contracts::pals::Role;
 use rz_experiments::pals_data_v3::GenerationRoleV3;
-use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_experiments::rovent_corpus::MAX_CORPUS_ROWS;
+use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
-use rz_search::external_cpu::collection_teacher::{TeacherCompletion, TeacherDispatch, TeacherInputScope, TeacherJob, TeacherJobId, TeacherWorkerRegistration};
 use rz_search::external_cpu::ExternalGoConstraint;
+use rz_search::external_cpu::collection_teacher::{
+    TeacherCompletion, TeacherDispatch, TeacherInputScope, TeacherJob, TeacherJobId,
+    TeacherWorkerRegistration,
+};
 use rz_search::external_cpu::process_scope::{CollectionProcessPermit, CollectionProcessScope};
-use rz_uci::pals_adaptive::{AdaptiveCollectionError, RoventCollectionRootAdmissionV2, RoventTeacherScopeCapabilityV2, RoventTeacherScopeClaimFailureV2, RoventTeacherScopePhysicalAckV2, RoventTeacherScopeWorkerAckV2};
+use rz_uci::pals_adaptive::{
+    AdaptiveCollectionError, RoventCollectionRootAdmissionV2, RoventTeacherScopeCapabilityV2,
+    RoventTeacherScopeClaimFailureV2, RoventTeacherScopePhysicalAckV2,
+    RoventTeacherScopeWorkerAckV2,
+};
 use rz_uci::rovent_bootstrap::RoventStartupControl;
 use rz_uci::rovent_external_launch::{
     BoundCollectionTeacherActorV2, BoundTeacherSpawnCauseV2, BoundTeacherSpawnFailureV2,
     RoventCollectionTeacherLifecycleV2, RoventCollectionTeacherOwnerV2,
-    RoventTeacherRetirementObservationV2, RoventTeacherRetirementTokenV2,
-    RoventTeacherWorkerTerminalTokenV2,
-    RoventTeacherScopeAggregateAckV2,
-    RoventTeacherPolicyCustodyV2, RoventTeacherPolicyEvidenceV2,
-    RoventTeacherPolicySealErrorV2, RoventTeacherPolicySealFailureKindV2, VerifiedRoventExternalStartup,
-    TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2, TeacherRecoveryKeyV2,
-    bind_collection_teacher_actor_v2, spawn_bound_collection_teacher_v2,
+    RoventTeacherPolicyCustodyV2, RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealErrorV2,
+    RoventTeacherPolicySealFailureKindV2, RoventTeacherRetirementObservationV2,
+    RoventTeacherRetirementTokenV2, RoventTeacherScopeAggregateAckV2,
+    RoventTeacherWorkerTerminalTokenV2, TeacherActorBindingErrorV2, TeacherRecoveryCustodianV2,
+    TeacherRecoveryKeyV2, VerifiedRoventExternalStartup, bind_collection_teacher_actor_v2,
+    spawn_bound_collection_teacher_v2,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -135,7 +141,10 @@ pub(crate) struct TeacherPolicyQuarantineV2 {
 }
 
 pub(crate) enum TeacherPolicySealRejectionV2 {
-    Rejected { cause: TeacherPolicySealFailureV2, completed: CompletedTeacherV2 },
+    Rejected {
+        cause: TeacherPolicySealFailureV2,
+        completed: CompletedTeacherV2,
+    },
     Quarantined(TeacherPolicyQuarantineV2),
 }
 
@@ -155,13 +164,20 @@ pub(crate) struct TeacherSessionRetirementSealV2 {
 
 #[allow(dead_code)]
 impl TeacherSessionRetirementSealV2 {
-    pub(crate) fn try_physical_retirement(&self) -> Result<Option<RoventTeacherScopePhysicalAckV2>, AdaptiveCollectionError> {
+    pub(crate) fn try_physical_retirement(
+        &self,
+    ) -> Result<Option<RoventTeacherScopePhysicalAckV2>, AdaptiveCollectionError> {
         self.session.try_physical_retirement()
     }
-    pub(crate) fn try_worker_retirement(&self) -> Result<Option<RoventTeacherScopeWorkerAckV2>, AdaptiveCollectionError> {
+    pub(crate) fn try_worker_retirement(
+        &self,
+    ) -> Result<Option<RoventTeacherScopeWorkerAckV2>, AdaptiveCollectionError> {
         self.session.try_worker_retirement()
     }
-    pub(crate) fn release_retired_permits(&mut self, aggregate: &RoventTeacherScopeAggregateAckV2) -> Result<(), ArenaError> {
+    pub(crate) fn release_retired_permits(
+        &mut self,
+        aggregate: &RoventTeacherScopeAggregateAckV2,
+    ) -> Result<(), ArenaError> {
         self.session.release_retired_permits(aggregate)
     }
     pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
@@ -207,13 +223,19 @@ pub(crate) struct TeacherSessionPrepareFailureV2 {
 }
 
 impl From<ArenaError> for TeacherSessionPrepareFailureV2 {
-    fn from(error: ArenaError) -> Self { Self { error, owner: None } }
+    fn from(error: ArenaError) -> Self {
+        Self { error, owner: None }
+    }
 }
 impl From<rz_contracts::ContractError> for TeacherSessionPrepareFailureV2 {
-    fn from(error: rz_contracts::ContractError) -> Self { ArenaError::from(error).into() }
+    fn from(error: rz_contracts::ContractError) -> Self {
+        ArenaError::from(error).into()
+    }
 }
 impl From<rz_experiments::ManifestError> for TeacherSessionPrepareFailureV2 {
-    fn from(error: rz_experiments::ManifestError) -> Self { ArenaError::from(error).into() }
+    fn from(error: rz_experiments::ManifestError) -> Self {
+        ArenaError::from(error).into()
+    }
 }
 
 /// One prospective session owns the original root, manifest and preflight
@@ -259,7 +281,10 @@ impl RoventCollectionTeacherSessionV2 {
                     })
             });
         if complete {
-            Ok(TeacherSessionRetirementSealV2 { session: self, actors })
+            Ok(TeacherSessionRetirementSealV2 {
+                session: self,
+                actors,
+            })
         } else {
             Err(Box::new(TeacherSessionRetirementSealRejectionV2 {
                 session: self,
@@ -347,20 +372,20 @@ impl RoventCollectionTeacherSessionV2 {
         )?;
         // Claim only after all reversible roster/source/scope preparation has
         // succeeded. A claim is never reissued after failure or unknown work.
-        let root_scope = admission
-            .claim_teacher_scope(scope)
-            .map_err(|failure| {
-                let (error, owner) = match failure {
-                    RoventTeacherScopeClaimFailureV2::BeforeClaim { error, scope } =>
-                        (error, TeacherSessionPrepareOwnerV2::Unclaimed(scope)),
-                    RoventTeacherScopeClaimFailureV2::AfterClaim { error, capability } =>
-                        (error, TeacherSessionPrepareOwnerV2::Claimed(capability)),
-                };
-                TeacherSessionPrepareFailureV2 {
-                    error: invalid(error.to_string()),
-                    owner: Some(Box::new(owner)),
+        let root_scope = admission.claim_teacher_scope(scope).map_err(|failure| {
+            let (error, owner) = match failure {
+                RoventTeacherScopeClaimFailureV2::BeforeClaim { error, scope } => {
+                    (error, TeacherSessionPrepareOwnerV2::Unclaimed(scope))
                 }
-            })?;
+                RoventTeacherScopeClaimFailureV2::AfterClaim { error, capability } => {
+                    (error, TeacherSessionPrepareOwnerV2::Claimed(capability))
+                }
+            };
+            TeacherSessionPrepareFailureV2 {
+                error: invalid(error.to_string()),
+                owner: Some(Box::new(owner)),
+            }
+        })?;
         Ok(Self {
             admission: admission.clone(),
             startup_control: startup_control.clone(),
@@ -496,11 +521,15 @@ impl RoventCollectionTeacherSessionV2 {
             .map(|run| &mut run.lifecycle)
     }
 
-    pub(crate) fn try_physical_retirement(&self) -> Result<Option<RoventTeacherScopePhysicalAckV2>, AdaptiveCollectionError> {
+    pub(crate) fn try_physical_retirement(
+        &self,
+    ) -> Result<Option<RoventTeacherScopePhysicalAckV2>, AdaptiveCollectionError> {
         self.root_scope.try_physical_retirement()
     }
 
-    pub(crate) fn try_worker_retirement(&self) -> Result<Option<RoventTeacherScopeWorkerAckV2>, AdaptiveCollectionError> {
+    pub(crate) fn try_worker_retirement(
+        &self,
+    ) -> Result<Option<RoventTeacherScopeWorkerAckV2>, AdaptiveCollectionError> {
         self.root_scope.try_worker_retirement()
     }
 
@@ -512,53 +541,95 @@ impl RoventCollectionTeacherSessionV2 {
         &mut self,
         aggregate: &RoventTeacherScopeAggregateAckV2,
     ) -> Result<(), ArenaError> {
-        use rz_search::external_cpu::process_scope::{CollectionMemberPhysicalState as P, CollectionMemberWorkerState as W};
-        check(aggregate.matches_admission(&self.admission) && self.root_scope_closed,
-            "V2 retired permit aggregate admission/scope mismatch")?;
-        let physical = aggregate.physical().scope_outcome()
+        use rz_search::external_cpu::process_scope::{
+            CollectionMemberPhysicalState as P, CollectionMemberWorkerState as W,
+        };
+        check(
+            aggregate.matches_admission(&self.admission) && self.root_scope_closed,
+            "V2 retired permit aggregate admission/scope mismatch",
+        )?;
+        let physical = aggregate
+            .physical()
+            .scope_outcome()
             .ok_or_else(|| invalid("V2 session cannot retire using no-scope proof"))?;
-        let workers = aggregate.workers()
+        let workers = aggregate
+            .workers()
             .filter(|value| value.matches_admission(&self.admission))
-            .ok_or_else(|| invalid("V2 retired worker roster absent"))?.outcome();
-        check(physical.same_issuer_as_worker(workers)
+            .ok_or_else(|| invalid("V2 retired worker roster absent"))?
+            .outcome();
+        check(
+            physical.same_issuer_as_worker(workers)
                 && physical.members().len() == self.actors.len()
                 && workers.members().len() == self.actors.len(),
-            "V2 retired permit issuer or roster mismatch")?;
+            "V2 retired permit issuer or roster mismatch",
+        )?;
         for actor in self.actors.values() {
-            let matches: Vec<_> = physical.members().iter().enumerate()
-                .filter_map(|(index, (registration, _))|
-                    (*registration == actor.registration).then_some(index)).collect();
-            check(matches.len() == 1 && actor.running.is_none() && actor.pending.is_none(),
-                "V2 retired actor roster or pending work mismatch")?;
+            let matches: Vec<_> = physical
+                .members()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (registration, _))| {
+                    (*registration == actor.registration).then_some(index)
+                })
+                .collect();
+            check(
+                matches.len() == 1 && actor.running.is_none() && actor.pending.is_none(),
+                "V2 retired actor roster or pending work mismatch",
+            )?;
             let index = matches[0];
             let (_, p) = physical.members()[index];
             let (worker_registration, w) = workers.members()[index];
-            check(worker_registration == actor.registration, "V2 retired worker registration mismatch")?;
-            check(match actor.worker_state {
-                ActorWorkerStateV2::NotAttempted | ActorWorkerStateV2::BeforeSpawn => w == W::NoThread,
-                ActorWorkerStateV2::Joined | ActorWorkerStateV2::Retired => w == W::Joined,
-                ActorWorkerStateV2::SpawnInProgress | ActorWorkerStateV2::Started => false,
-            }, "V2 retired actor worker state mismatch")?;
-            check(matches!(p, P::NeverIssuedNoChild | P::IssuedNoChild | P::AcquiredNoChild | P::PhysicallyConfirmed),
-                "V2 retired actor physical state unresolved")?;
+            check(
+                worker_registration == actor.registration,
+                "V2 retired worker registration mismatch",
+            )?;
+            check(
+                match actor.worker_state {
+                    ActorWorkerStateV2::NotAttempted | ActorWorkerStateV2::BeforeSpawn => {
+                        w == W::NoThread
+                    }
+                    ActorWorkerStateV2::Joined | ActorWorkerStateV2::Retired => w == W::Joined,
+                    ActorWorkerStateV2::SpawnInProgress | ActorWorkerStateV2::Started => false,
+                },
+                "V2 retired actor worker state mismatch",
+            )?;
+            check(
+                matches!(
+                    p,
+                    P::NeverIssuedNoChild
+                        | P::IssuedNoChild
+                        | P::AcquiredNoChild
+                        | P::PhysicallyConfirmed
+                ),
+                "V2 retired actor physical state unresolved",
+            )?;
             if let Some(permit) = &actor.permit {
-                check(physical.state_for_permit(permit) == Some(p)
-                    && workers.matches_member_at(index, &permit.member_witness()),
-                    "V2 retired actor permit belongs to another issuer/member")?;
+                check(
+                    physical.state_for_permit(permit) == Some(p)
+                        && workers.matches_member_at(index, &permit.member_witness()),
+                    "V2 retired actor permit belongs to another issuer/member",
+                )?;
             } else {
                 // An issued-without-returned-permit race is safe only when
                 // the actual worker roster proves this member has no thread.
-                check(w == W::NoThread, "V2 retired joined actor lacks original permit")?;
+                check(
+                    w == W::NoThread,
+                    "V2 retired joined actor lacks original permit",
+                )?;
             }
         }
-        for actor in self.actors.values_mut() { actor.permit = None; }
+        for actor in self.actors.values_mut() {
+            actor.permit = None;
+        }
         Ok(())
     }
 
     /// Original preflight registration for this roster entry. Callers must
     /// still bind the actual worker, dispatch and completion before labeling.
     pub(crate) fn registered(&self, actor_id: &str) -> Option<&super::RoventRegisteredTeacher> {
-        self.actors.get(actor_id).map(|actor| actor.original.registered())
+        self.actors
+            .get(actor_id)
+            .map(|actor| actor.original.registered())
     }
 
     /// Start one real teacher job from the original retired row. This runs on
@@ -582,25 +653,40 @@ impl RoventCollectionTeacherSessionV2 {
         )?;
         self.require_live_root()?;
         let input = row.submitted_input_seal();
-        self.admission.validate_ticket(&input.ticket)
+        self.admission
+            .validate_ticket(&input.ticket)
             .map_err(|error| invalid(error.to_string()))?;
-        let actor_id = input.teacher_actor_id.as_deref()
+        let actor_id = input
+            .teacher_actor_id
+            .as_deref()
             .ok_or_else(|| invalid("V2 row has no frozen teacher actor"))?;
         let position = row.original_teacher_query_position()?;
         let root = self.admission.root_admission();
-        let actor = self.actors.get_mut(actor_id)
+        let actor = self
+            .actors
+            .get_mut(actor_id)
             .ok_or_else(|| invalid("V2 teacher actor absent"))?;
         if actor.pending.is_some() {
-            return Ok(TeacherSubmitOutcomeV2::Pending(TeacherSubmitPendingV2::ActorBusy));
+            return Ok(TeacherSubmitOutcomeV2::Pending(
+                TeacherSubmitPendingV2::ActorBusy,
+            ));
         }
         let registered = actor.original.registered();
-        let run = actor.running.as_mut()
+        let run = actor
+            .running
+            .as_mut()
             .ok_or_else(|| invalid("V2 teacher actor was not started"))?;
         let owner = run.lifecycle.owner();
-        let startup = match owner.verified_startup()
-            .map_err(|error| invalid(error.to_string()))? {
+        let startup = match owner
+            .verified_startup()
+            .map_err(|error| invalid(error.to_string()))?
+        {
             Some(startup) => startup,
-            None => return Ok(TeacherSubmitOutcomeV2::Pending(TeacherSubmitPendingV2::Startup)),
+            None => {
+                return Ok(TeacherSubmitOutcomeV2::Pending(
+                    TeacherSubmitPendingV2::Startup,
+                ));
+            }
         };
         check(
             owner.admission().same_original_admission(&self.admission)
@@ -622,9 +708,15 @@ impl RoventCollectionTeacherSessionV2 {
             GenerationRoleV3::Critic => Role::Critic,
             GenerationRoleV3::Validator => return Err(invalid("V2 teacher policy is P/C only")),
         };
-        check(input.ticket.role == role, "V2 teacher input and ticket role differ")?;
-        let parse = |value: &str| rz_eval::asset::parse_sha256(value)
-            .map(Digest).map_err(|error| invalid(error.to_string()));
+        check(
+            input.ticket.role == role,
+            "V2 teacher input and ticket role differ",
+        )?;
+        let parse = |value: &str| {
+            rz_eval::asset::parse_sha256(value)
+                .map(Digest)
+                .map_err(|error| invalid(error.to_string()))
+        };
         let scope = TeacherInputScope {
             authority: input.ticket.authority,
             input_sha256: parse(&input.input_sha256)?,
@@ -641,14 +733,22 @@ impl RoventCollectionTeacherSessionV2 {
             collection_owner: actor.registration.collection_owner,
             sequence: actor.next_sequence,
         };
-        let next = actor.next_sequence.checked_add(1)
+        let next = actor
+            .next_sequence
+            .checked_add(1)
             .ok_or_else(|| invalid("V2 teacher sequence exhausted"))?;
         // Allocate/copy all receipt metadata before the real worker admission.
         let pending_actor = actor_id.to_owned();
         let pending_registered = registered.clone();
         let input_key = (id.collection_owner, input.ticket.id);
-        check(self.issued_inputs.len() < MAX_CORPUS_ROWS, "V2 teacher input ledger full")?;
-        check(self.issued_inputs.insert(input_key), "V2 teacher input already submitted")?;
+        check(
+            self.issued_inputs.len() < MAX_CORPUS_ROWS,
+            "V2 teacher input ledger full",
+        )?;
+        check(
+            self.issued_inputs.insert(input_key),
+            "V2 teacher input already submitted",
+        )?;
         let job = TeacherJob {
             id,
             input_scope: scope,
@@ -668,8 +768,12 @@ impl RoventCollectionTeacherSessionV2 {
         };
         actor.next_sequence = next;
         actor.pending = Some(PendingTeacherV2 {
-            actor_id: pending_actor, input, registered: pending_registered,
-            startup, soft_quantum, dispatch,
+            actor_id: pending_actor,
+            input,
+            registered: pending_registered,
+            startup,
+            soft_quantum,
+            dispatch,
         });
         Ok(TeacherSubmitOutcomeV2::Submitted(id))
     }
@@ -681,14 +785,20 @@ impl RoventCollectionTeacherSessionV2 {
         &mut self,
         actor_id: &str,
     ) -> Result<Option<CompletedTeacherV2>, ArenaError> {
-        let actor = self.actors.get_mut(actor_id)
+        let actor = self
+            .actors
+            .get_mut(actor_id)
             .ok_or_else(|| invalid("V2 teacher actor absent"))?;
         if actor.pending.is_none() {
             return Ok(None);
         }
-        let run = actor.running.as_mut()
+        let run = actor
+            .running
+            .as_mut()
             .ok_or_else(|| invalid("V2 pending teacher owner absent"))?;
-        let Some(completion) = run.lifecycle.take_completion() else { return Ok(None); };
+        let Some(completion) = run.lifecycle.take_completion() else {
+            return Ok(None);
+        };
         let pending = actor.pending.take().expect("checked pending teacher job");
         Ok(Some(CompletedTeacherV2 {
             actor_id: pending.actor_id,
@@ -709,78 +819,143 @@ impl RoventCollectionTeacherSessionV2 {
         row: &RoventRetiredLockV2Record,
         completed: CompletedTeacherV2,
     ) -> Result<SealedTeacherPolicyV2, Box<TeacherPolicySealRejectionV2>> {
-        let validation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, ArenaError> {
-            let original = row.submitted_input_seal();
-            check(
-                row.admission.same_original_admission(&self.admission)
-                    && row.matches_manifest_owner(&self.lock_manifest)
-                    && row.manifest_sha256 == self.lock_manifest_sha256
-                    && original.ticket == completed.input.ticket
-                    && original.manifest_sha256 == completed.input.manifest_sha256
-                    && original.input_sha256 == completed.input.input_sha256
-                    && original.selected_view_sha256 == completed.input.selected_view_sha256
-                    && original.anchor == completed.input.anchor
-                    && original.role == completed.input.role
-                    && original.teacher_actor_id.as_deref() == Some(completed.actor_id.as_str()),
-                "V2 teacher completed input differs from original retired row",
-            )?;
-            let actor = self.actors.get(&completed.actor_id)
-                .ok_or_else(|| invalid("V2 completed teacher actor absent"))?;
-            check(
-                actor.original.registered().frozen_actor_digest()?
-                    == completed.registered.frozen_actor_digest()?
-                    && actor.registration.frozen_actor == completed.registered.frozen_actor_digest()?,
-                "V2 completed teacher registration differs from original actor",
-            )?;
-            let run = actor.running.as_ref()
-                .ok_or_else(|| invalid("V2 completed teacher owner absent"))?;
-            let owner = run.lifecycle.owner();
-            let startup = owner.verified_startup().map_err(|error| invalid(error.to_string()))?
-                .ok_or_else(|| invalid("V2 completed teacher startup absent"))?;
-            check(
-                owner.admission().same_original_admission(&self.admission)
-                    && owner.worker().registration() == actor.registration
-                    && startup.process_identity() == completed.startup.process_identity()
-                    && startup.canonical_sha256() == completed.startup.canonical_sha256()
-                    && startup.capability_sha256() == completed.startup.capability_sha256()
-                    && startup.input_lock_sha256() == completed.startup.input_lock_sha256(),
-                "V2 completed teacher owner/startup differs from original",
-            )?;
-            Ok(row.original_teacher_query_position()?.snapshot())
-        }));
+        let validation =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, ArenaError> {
+                let original = row.submitted_input_seal();
+                check(
+                    row.admission.same_original_admission(&self.admission)
+                        && row.matches_manifest_owner(&self.lock_manifest)
+                        && row.manifest_sha256 == self.lock_manifest_sha256
+                        && original.ticket == completed.input.ticket
+                        && original.manifest_sha256 == completed.input.manifest_sha256
+                        && original.input_sha256 == completed.input.input_sha256
+                        && original.selected_view_sha256 == completed.input.selected_view_sha256
+                        && original.anchor == completed.input.anchor
+                        && original.role == completed.input.role
+                        && original.teacher_actor_id.as_deref()
+                            == Some(completed.actor_id.as_str()),
+                    "V2 teacher completed input differs from original retired row",
+                )?;
+                let actor = self
+                    .actors
+                    .get(&completed.actor_id)
+                    .ok_or_else(|| invalid("V2 completed teacher actor absent"))?;
+                check(
+                    actor.original.registered().frozen_actor_digest()?
+                        == completed.registered.frozen_actor_digest()?
+                        && actor.registration.frozen_actor
+                            == completed.registered.frozen_actor_digest()?,
+                    "V2 completed teacher registration differs from original actor",
+                )?;
+                let run = actor
+                    .running
+                    .as_ref()
+                    .ok_or_else(|| invalid("V2 completed teacher owner absent"))?;
+                let owner = run.lifecycle.owner();
+                let startup = owner
+                    .verified_startup()
+                    .map_err(|error| invalid(error.to_string()))?
+                    .ok_or_else(|| invalid("V2 completed teacher startup absent"))?;
+                check(
+                    owner.admission().same_original_admission(&self.admission)
+                        && owner.worker().registration() == actor.registration
+                        && startup.process_identity() == completed.startup.process_identity()
+                        && startup.canonical_sha256() == completed.startup.canonical_sha256()
+                        && startup.capability_sha256() == completed.startup.capability_sha256()
+                        && startup.input_lock_sha256() == completed.startup.input_lock_sha256(),
+                    "V2 completed teacher owner/startup differs from original",
+                )?;
+                Ok(row.original_teacher_query_position()?.snapshot())
+            }));
         let query = match validation {
             Ok(Ok(query)) => query,
-            Ok(Err(error)) => return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
-                cause: TeacherPolicySealFailureV2::Validation(error), completed,
-            })),
-            Err(payload) => return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
-                cause: TeacherPolicySealFailureV2::Panicked(payload), completed,
-            })),
+            Ok(Err(error)) => {
+                return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                    cause: TeacherPolicySealFailureV2::Validation(error),
+                    completed,
+                }));
+            }
+            Err(payload) => {
+                return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                    cause: TeacherPolicySealFailureV2::Panicked(payload),
+                    completed,
+                }));
+            }
         };
-        let actor = self.actors.get_mut(&completed.actor_id).expect("validated actor");
+        let actor = self
+            .actors
+            .get_mut(&completed.actor_id)
+            .expect("validated actor");
         let run = actor.running.as_mut().expect("validated running actor");
         let manifest_owner = Arc::clone(&self.lock_manifest);
-        let CompletedTeacherV2 { actor_id, input, registered, startup, soft_quantum, dispatch, completion } = completed;
+        let CompletedTeacherV2 {
+            actor_id,
+            input,
+            registered,
+            startup,
+            soft_quantum,
+            dispatch,
+            completion,
+        } = completed;
         let mut custody = RoventTeacherPolicyCustodyV2::new(dispatch, completion);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run.lifecycle.seal_policy_custody(&mut custody, &query, None)
+            run.lifecycle
+                .seal_policy_custody(&mut custody, &query, None)
         }));
         match result {
             Ok(Ok(evidence)) => Ok(SealedTeacherPolicyV2 {
                 manifest_owner,
-                actor_id, input, registered, startup, soft_quantum, evidence,
+                actor_id,
+                input,
+                registered,
+                startup,
+                soft_quantum,
+                evidence,
             }),
             Ok(Err(rejected)) => match custody.into_originals() {
-                Ok((dispatch, completion)) => Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
-                    cause: TeacherPolicySealFailureV2::Native { kind: rejected.kind, error: rejected.error },
-                    completed: CompletedTeacherV2 { actor_id, input, registered, startup, soft_quantum, dispatch, completion },
-                })),
+                Ok((dispatch, completion)) => {
+                    Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                        cause: TeacherPolicySealFailureV2::Native {
+                            kind: rejected.kind,
+                            error: rejected.error,
+                        },
+                        completed: CompletedTeacherV2 {
+                            actor_id,
+                            input,
+                            registered,
+                            startup,
+                            soft_quantum,
+                            dispatch,
+                            completion,
+                        },
+                    }))
+                }
                 Err(custody) => Err(Box::new(TeacherPolicySealRejectionV2::Quarantined(
-                    TeacherPolicyQuarantineV2 { manifest_owner, actor_id, input, registered, startup, soft_quantum, custody, panic: None, native_failure: Some(rejected) },
+                    TeacherPolicyQuarantineV2 {
+                        manifest_owner,
+                        actor_id,
+                        input,
+                        registered,
+                        startup,
+                        soft_quantum,
+                        custody,
+                        panic: None,
+                        native_failure: Some(rejected),
+                    },
                 ))),
             },
             Err(payload) => Err(Box::new(TeacherPolicySealRejectionV2::Quarantined(
-                TeacherPolicyQuarantineV2 { manifest_owner, actor_id, input, registered, startup, soft_quantum, custody, panic: Some(payload), native_failure: None },
+                TeacherPolicyQuarantineV2 {
+                    manifest_owner,
+                    actor_id,
+                    input,
+                    registered,
+                    startup,
+                    soft_quantum,
+                    custody,
+                    panic: Some(payload),
+                    native_failure: None,
+                },
             ))),
         }
     }
@@ -796,7 +971,10 @@ impl RoventCollectionTeacherSessionV2 {
 
     /// Close the process scope before requesting each original worker's
     /// bounded shutdown. Requests are not physical-completion evidence.
-    pub(crate) fn request_shutdown(&mut self, until: Instant) -> Result<(), AdaptiveCollectionError> {
+    pub(crate) fn request_shutdown(
+        &mut self,
+        until: Instant,
+    ) -> Result<(), AdaptiveCollectionError> {
         let close_result = self.close_admission();
         for actor in self.actors.values_mut() {
             if let Some(run) = actor.running.as_mut() {
@@ -824,8 +1002,13 @@ impl RoventCollectionTeacherSessionV2 {
     pub(crate) fn try_finish_actor(
         &mut self,
         actor_id: &str,
-    ) -> Result<Option<(RoventCollectionTeacherOwnerV2, RoventTeacherRetirementObservationV2)>, ArenaError>
-    {
+    ) -> Result<
+        Option<(
+            RoventCollectionTeacherOwnerV2,
+            RoventTeacherRetirementObservationV2,
+        )>,
+        ArenaError,
+    > {
         let actor = self
             .actors
             .get_mut(actor_id)
@@ -893,17 +1076,26 @@ impl RoventCollectionTeacherSessionV2 {
         &mut self,
         actor_id: &str,
     ) -> Result<Option<RoventTeacherWorkerTerminalTokenV2>, ArenaError> {
-        let actor = self.actors.get_mut(actor_id)
+        let actor = self
+            .actors
+            .get_mut(actor_id)
             .ok_or_else(|| invalid("V2 teacher actor absent"))?;
-        if actor.pending.is_some() { return Ok(None); }
-        let Some(run) = actor.running.take() else { return Ok(None); };
+        if actor.pending.is_some() {
+            return Ok(None);
+        }
+        let Some(run) = actor.running.take() else {
+            return Ok(None);
+        };
         match run.lifecycle.try_finish_worker() {
             Ok(token) => {
                 actor.worker_state = ActorWorkerStateV2::Joined;
                 Ok(Some(token))
             }
             Err(lifecycle) => {
-                actor.running = Some(RunningTeacherV2 { lifecycle, recovery_key: run.recovery_key });
+                actor.running = Some(RunningTeacherV2 {
+                    lifecycle,
+                    recovery_key: run.recovery_key,
+                });
                 Ok(None)
             }
         }

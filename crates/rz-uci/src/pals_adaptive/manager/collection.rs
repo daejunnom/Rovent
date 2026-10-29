@@ -176,9 +176,11 @@ impl<'a> RoventCollectionDispatchWitnessV2<'a> {
         verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
         ticket: &'a RoleTicketEnvelope,
     ) -> Result<Self, RoventDispatchWitnessFailureV2> {
-        admission.validate_native_identity(verifier)
+        admission
+            .validate_native_identity(verifier)
             .map_err(RoventDispatchWitnessFailureV2::NativeIdentity)?;
-        admission.try_validate_ticket(ticket)
+        admission
+            .try_validate_ticket(ticket)
             .map_err(RoventDispatchWitnessFailureV2::Ticket)?;
         Ok(Self { admission, ticket })
     }
@@ -191,8 +193,12 @@ impl<'a> RoventCollectionDispatchWitnessV2<'a> {
         admission.validate_ticket(ticket)?;
         Ok(Self { admission, ticket })
     }
-    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 { self.admission }
-    pub fn ticket(&self) -> &RoleTicketEnvelope { self.ticket }
+    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 {
+        self.admission
+    }
+    pub fn ticket(&self) -> &RoleTicketEnvelope {
+        self.ticket
+    }
 }
 
 /// A single callback's original native acceptance, tied to the same live /2
@@ -221,7 +227,10 @@ impl<'a> RoventCollectionAcceptedWitnessV2<'a> {
                 "original accepted output differs",
             ));
         }
-        Ok(Self { admission, accepted })
+        Ok(Self {
+            admission,
+            accepted,
+        })
     }
 
     pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 {
@@ -258,8 +267,12 @@ impl<'a, O> RoventCollectionNativeEventWitnessV2<'a, O> {
         admission.validate_native_identity(verifier)?;
         Ok(Self { admission, event })
     }
-    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 { self.admission }
-    pub fn event(&self) -> &TicketNativeEvent<O> { self.event }
+    pub fn admission(&self) -> &RoventCollectionRootAdmissionV2 {
+        self.admission
+    }
+    pub fn event(&self) -> &TicketNativeEvent<O> {
+        self.event
+    }
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -344,8 +357,10 @@ pub trait AdaptiveCollectionObserverV2<Q, O>: Send {
             "original collection owner cannot register the earlier ticket",
         ))
     }
-    fn native_event(&mut self, event: RoventCollectionNativeEventWitnessV2<'_, O>)
-    -> Result<(), AdaptiveCollectionError>;
+    fn native_event(
+        &mut self,
+        event: RoventCollectionNativeEventWitnessV2<'_, O>,
+    ) -> Result<(), AdaptiveCollectionError>;
     fn accepted(
         &mut self,
         accepted: RoventCollectionAcceptedWitnessV2<'_>,
@@ -405,11 +420,13 @@ pub(super) fn notify_adaptive_consumed_v2<Q, O>(
     let Some(observer) = observer.as_mut() else {
         return Ok(());
     };
-    let missing = || AdaptiveCollectionError::new(
-        AdaptiveCollectionStage::Accepted,
-        "OriginalOwnerUnavailable",
-        "V2 consumption has no original admission or native verifier",
-    );
+    let missing = || {
+        AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Accepted,
+            "OriginalOwnerUnavailable",
+            "V2 consumption has no original admission or native verifier",
+        )
+    };
     let witness = RoventCollectionAcceptedWitnessV2::new(
         admission.ok_or_else(missing)?,
         verifier.ok_or_else(missing)?,

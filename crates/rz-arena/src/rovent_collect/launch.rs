@@ -60,10 +60,10 @@ pub use intervention::{
     RoventUtilityInterventionLaunchReceipt, run_rovent_utility_intervention,
     run_rovent_utility_intervention_from_cli,
 };
-pub use pc_lock_v2::{RoventPcCollectionRunV2, run_rovent_pc_collection_lock_v2};
+pub use own_nnuec_lock_v2::{RoventNnuecCollectionRunV2, run_rovent_own_nnuec_collection_lock_v2};
 #[cfg(feature = "test-fixtures")]
 pub use pc_lock_v2::run_rovent_pc_collection_lock_v2_with_test_owner;
-pub use own_nnuec_lock_v2::{RoventNnuecCollectionRunV2, run_rovent_own_nnuec_collection_lock_v2};
+pub use pc_lock_v2::{RoventPcCollectionRunV2, run_rovent_pc_collection_lock_v2};
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
@@ -310,7 +310,10 @@ impl RoventCollectionLockV2LaunchPlan {
         let mut owners = BTreeSet::new();
         for binding in &self.teacher_slots {
             check(
-                manifest.registration.teachers.contains_key(&binding.actor_id)
+                manifest
+                    .registration
+                    .teachers
+                    .contains_key(&binding.actor_id)
                     && actors.insert(binding.actor_id.clone())
                     && slots.insert(binding.source_index)
                     && binding.collection_owner > 0
@@ -322,9 +325,16 @@ impl RoventCollectionLockV2LaunchPlan {
         }
         match self.teacher_constraint {
             ExternalGoConstraint::Depth { depth } => check(depth > 0, "teacher depth")?,
-            ExternalGoConstraint::Nodes { reported_nodes } => check(reported_nodes > 0, "teacher nodes")?,
-            ExternalGoConstraint::Combined { depth, reported_nodes } => check(depth > 0 && reported_nodes > 0, "teacher combined limit")?,
-            ExternalGoConstraint::MoveTime { milliseconds } => check(milliseconds > 0, "teacher time")?,
+            ExternalGoConstraint::Nodes { reported_nodes } => {
+                check(reported_nodes > 0, "teacher nodes")?
+            }
+            ExternalGoConstraint::Combined {
+                depth,
+                reported_nodes,
+            } => check(depth > 0 && reported_nodes > 0, "teacher combined limit")?,
+            ExternalGoConstraint::MoveTime { milliseconds } => {
+                check(milliseconds > 0, "teacher time")?
+            }
         }
         Ok(())
     }

@@ -104,9 +104,11 @@ fn cases(
                         checked(registry.physical_started(&t))?
                     }
                     TicketNativeEvent::OwnerRunStarted { ticket: t, .. } if t == ticket => {}
-                    TicketNativeEvent::Completed { completion, observation_failures, .. }
-                        if completion.ticket == ticket =>
-                    {
+                    TicketNativeEvent::Completed {
+                        completion,
+                        observation_failures,
+                        ..
+                    } if completion.ticket == ticket => {
                         break (completion, observation_failures);
                     }
                     e => return Err(unexpected(&e).into()),

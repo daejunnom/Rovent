@@ -13,9 +13,9 @@ use super::{
 };
 use crate::pals_native::ticketed::{
     NativeRootFence, PreparationId, TicketExecutionEvidence, TicketNativeBackend,
-    TicketNativeEvent, TicketNativeObservationFailure, TicketNativeObservationFailures,
-    TicketNativeObservationDisposition, TicketNativeObservationStage, TicketOwnerRunWitness, TicketPreparation, TicketServiceError,
-    TicketedNativeService,
+    TicketNativeEvent, TicketNativeObservationDisposition, TicketNativeObservationFailure,
+    TicketNativeObservationFailures, TicketNativeObservationStage, TicketOwnerRunWitness,
+    TicketPreparation, TicketServiceError, TicketedNativeService,
 };
 use rz_contracts::pals::{Move16, Role, RoleOutput, RolePayload, SearchAuthority};
 use rz_contracts::pals_adaptive::{
@@ -3136,7 +3136,8 @@ where
     }
     fn has_collection_failure(&self) -> bool {
         !self.collection_failure_is_independent()
-            && self.failures
+            && self
+                .failures
                 .iter()
                 .any(|error| matches!(error, AdaptiveManagerError::Collection(_)))
     }
@@ -3429,7 +3430,8 @@ where
                 Some(AdaptiveManagerError::PhysicalUnknown)
             } else if failure.ticket != *ticket
                 || match failure.stage {
-                    TicketNativeObservationStage::Submitted | TicketNativeObservationStage::Completed => retired,
+                    TicketNativeObservationStage::Submitted
+                    | TicketNativeObservationStage::Completed => retired,
                     TicketNativeObservationStage::Retired => !retired,
                     TicketNativeObservationStage::Retrieval => false,
                 }
@@ -3439,7 +3441,9 @@ where
             } else {
                 None
             };
-            if self.native_observation_failures.len() < self.limits.role_tickets_max.saturating_mul(2) {
+            if self.native_observation_failures.len()
+                < self.limits.role_tickets_max.saturating_mul(2)
+            {
                 self.native_observation_failures.push(failure.clone());
             } else if gate.is_none() {
                 gate = Some(AdaptiveManagerError::NativeObservation(failure.clone()));
@@ -4193,7 +4197,8 @@ where
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if independent_collection {
             if let AdaptiveManagerError::Collection(original) = &error {
-                self.collection_v2_first_failure.get_or_insert_with(|| original.clone());
+                self.collection_v2_first_failure
+                    .get_or_insert_with(|| original.clone());
             }
         }
         // A utility experiment depends on its collection evidence even when
@@ -4218,15 +4223,23 @@ where
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if let Some(observer) = &mut self.collection_observer_v2 {
             let verifier = self.native.native_acceptance_verifier();
-            let result = self.collection_admission_v2.as_ref().zip(
-                verifier.as_ref(),
-            ).ok_or_else(|| AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::NativeEvent,
-                "NativeOwnerUnavailable",
-                "original admission or native verifier unavailable",
-            )).and_then(|(admission, verifier)| {
-                collection::RoventCollectionNativeEventWitnessV2::new(admission, verifier, &event)
-            }).and_then(|witness| observer.native_event(witness));
+            let result = self
+                .collection_admission_v2
+                .as_ref()
+                .zip(verifier.as_ref())
+                .ok_or_else(|| {
+                    AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::NativeEvent,
+                        "NativeOwnerUnavailable",
+                        "original admission or native verifier unavailable",
+                    )
+                })
+                .and_then(|(admission, verifier)| {
+                    collection::RoventCollectionNativeEventWitnessV2::new(
+                        admission, verifier, &event,
+                    )
+                })
+                .and_then(|witness| observer.native_event(witness));
             if let Err(error) = result {
                 collection_failures.push(error);
             }
@@ -4396,7 +4409,11 @@ where
                         owner_run,
                         owner_service_elapsed,
                     };
-                    if let Some(error) = self.observe_native_failures(&completion.ticket, &observation_failures, false) {
+                    if let Some(error) = self.observe_native_failures(
+                        &completion.ticket,
+                        &observation_failures,
+                        false,
+                    ) {
                         self.retained_native_completions.push(retained);
                         return Err(error);
                     }
@@ -4636,7 +4653,9 @@ where
                     rejected_permit,
                     observation_failures,
                 } => {
-                    if let Some(error) = self.observe_native_failures(&ticket, &observation_failures, true) {
+                    if let Some(error) =
+                        self.observe_native_failures(&ticket, &observation_failures, true)
+                    {
                         if let Some(receipt) = native_receipt {
                             self.retained_native_receipts.push(receipt);
                         }
@@ -4727,8 +4746,12 @@ where
                                 ),
                             };
                             Ok::<_, AdaptiveManagerError>((
-                                inputs.ok_or(AdaptiveManagerError::Capacity("native accepted NN count"))?,
-                                unknown.ok_or(AdaptiveManagerError::Capacity("native accepted unknown count"))?,
+                                inputs.ok_or(AdaptiveManagerError::Capacity(
+                                    "native accepted NN count",
+                                ))?,
+                                unknown.ok_or(AdaptiveManagerError::Capacity(
+                                    "native accepted unknown count",
+                                ))?,
                             ))
                         })();
                         let (inputs, unknown) = match accounting_result {
@@ -4800,19 +4823,25 @@ where
                                             let raw = output.proposer_ranking_output();
                                             let result = collection_verifier
                                                 .as_ref()
-                                                .ok_or_else(|| AdaptiveCollectionError::new(
-                                                    AdaptiveCollectionStage::Accepted,
-                                                    "NativeVerifierUnavailable",
-                                                    "V2 original native verifier unavailable",
-                                                ))
+                                                .ok_or_else(|| {
+                                                    AdaptiveCollectionError::new(
+                                                        AdaptiveCollectionStage::Accepted,
+                                                        "NativeVerifierUnavailable",
+                                                        "V2 original native verifier unavailable",
+                                                    )
+                                                })
                                                 .and_then(|verifier| {
                                                     RoventCollectionAcceptedWitnessV2::new(
                                                         admission, verifier, proof, raw,
                                                     )
                                                 })
-                                                .and_then(|witness| observer.accepted(
-                                                    witness, &binding.input, output.as_ref(),
-                                                ));
+                                                .and_then(|witness| {
+                                                    observer.accepted(
+                                                        witness,
+                                                        &binding.input,
+                                                        output.as_ref(),
+                                                    )
+                                                });
                                             if let Err(error) = result {
                                                 collection_failures.push(error);
                                             }
@@ -5341,9 +5370,11 @@ where
         // Driver confirmed consumption before this method. Preserve that fact
         // even if the separate accounting or observer path fails.
         self.roles[index].consumption_recorded = true;
-        let ticket = self.roles[index].ticket.ok_or(AdaptiveManagerError::Invalid(
-            "original consumed role ticket missing",
-        ))?;
+        let ticket = self.roles[index]
+            .ticket
+            .ok_or(AdaptiveManagerError::Invalid(
+                "original consumed role ticket missing",
+            ))?;
         let physical = self.roles[index].physical;
         self.record_role_consumption(ticket, physical)?;
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -5366,11 +5397,14 @@ where
         } else if self.collection_observer_v2.is_some()
             && self.roles[index].reciprocal_acceptance.is_some()
         {
-            self.record_failure(AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Accepted,
-                "MissingOriginalOutput",
-                "V2 consumed proof has no retained output",
-            ).into());
+            self.record_failure(
+                AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Accepted,
+                    "MissingOriginalOutput",
+                    "V2 consumed proof has no retained output",
+                )
+                .into(),
+            );
         }
         #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
         let _ = after_error_readback;
@@ -5569,8 +5603,14 @@ where
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if let Some(busy) = self.collection_v2_busy_ticket {
-            if !self.roles.iter().any(|role| role.dispatch_pending && role.ticket == Some(busy)) {
-                return Err(AdaptiveManagerError::Invalid("original busy collection ticket lost"));
+            if !self
+                .roles
+                .iter()
+                .any(|role| role.dispatch_pending && role.ticket == Some(busy))
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "original busy collection ticket lost",
+                ));
             }
         }
         let mut changed = false;
@@ -5582,7 +5622,10 @@ where
                 continue;
             };
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            if self.collection_v2_busy_ticket.is_some_and(|busy| busy != ticket) {
+            if self
+                .collection_v2_busy_ticket
+                .is_some_and(|busy| busy != ticket)
+            {
                 continue;
             }
             if self.registration.endpoints.execution_use == CpuExecutionUse::Collection

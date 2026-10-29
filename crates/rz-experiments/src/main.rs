@@ -1,11 +1,11 @@
-use rz_experiments::{
-    LockedManifest, MAX_MANIFEST_BYTES, RoventExecutionManifest, RoventExecutionReceipt,
-    RoventExecutionManifestV2, RoventInputLock, RoventInputLockV2, RunManifest,
-};
 use rz_experiments::rovent_corpus_lock_v2::record::{
     ROVENT_CORPUS_MANIFEST_LOCK_V2_DOMAIN, RoventCorpusManifestLockV2,
 };
 use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
+use rz_experiments::{
+    LockedManifest, MAX_MANIFEST_BYTES, RoventExecutionManifest, RoventExecutionManifestV2,
+    RoventExecutionReceipt, RoventInputLock, RoventInputLockV2, RunManifest,
+};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -203,11 +203,16 @@ fn execute(command: Command) -> Result<String, String> {
             write_new_file(&output, &json)?;
             Ok("Rovent /2 input locked; execution_ready=false".into())
         }
-        Command::RoventCorpusLockV2 { input_lock, registration, output } => {
+        Command::RoventCorpusLockV2 {
+            input_lock,
+            registration,
+            output,
+        } => {
             let lock = RoventInputLockV2::from_json(&read_json(&input_lock)?)
                 .map_err(|error| error.to_string())?;
-            let registration: RoventCorpusManifestV2 = rz_experiments::decode_json(&read_json(&registration)?)
-                .map_err(|error| error.to_string())?;
+            let registration: RoventCorpusManifestV2 =
+                rz_experiments::decode_json(&read_json(&registration)?)
+                    .map_err(|error| error.to_string())?;
             let corpus = RoventCorpusManifestLockV2 {
                 schema: ROVENT_CORPUS_MANIFEST_LOCK_V2_DOMAIN.into(),
                 registration,

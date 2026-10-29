@@ -504,8 +504,14 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
             // unavailable. The original native event is still processed by the
             // manager independently of this collection-only failure.
             let failed_observation = match event {
-                TicketNativeEvent::Completed { observation_failures, .. }
-                | TicketNativeEvent::Retired { observation_failures, .. } => !observation_failures.is_empty(),
+                TicketNativeEvent::Completed {
+                    observation_failures,
+                    ..
+                }
+                | TicketNativeEvent::Retired {
+                    observation_failures,
+                    ..
+                } => !observation_failures.is_empty(),
                 _ => false,
             };
             if failed_observation {
@@ -585,7 +591,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
                 if let Some(input) = state.receiver.take_failed_input_for_cleanup()? {
                     state.failed_captures.push(input);
                 }
-                state.failed_captures.extend(state.receiver.take_queued_inputs_for_cleanup());
+                state
+                    .failed_captures
+                    .extend(state.receiver.take_queued_inputs_for_cleanup());
             } else {
                 state.drain_captures()?;
             }
@@ -602,7 +610,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
             state.actual_history.clear();
             // 원 완료·퇴역 row와 최초 오류는 caller가 회수할 때까지 보존한다.
             if let Some(failure) = capture_failure {
-                return Err(invalid(format!("native input capture failed before fenced cleanup: {failure:?}")));
+                return Err(invalid(format!(
+                    "native input capture failed before fenced cleanup: {failure:?}"
+                )));
             }
             Ok(())
         })

@@ -6,7 +6,9 @@
 //! Rules 결과, native node credit 또는 exact resume 권한을 발급하지 않는다.
 //! 기존 profiled R worker의 mode/recipient guard는 이 경로에서 변경하지 않는다.
 
-use super::process_scope::{CollectionProcessPermit, CollectionWorkerJoinedWitness, CollectionWorkerLease};
+use super::process_scope::{
+    CollectionProcessPermit, CollectionWorkerJoinedWitness, CollectionWorkerLease,
+};
 use super::profiled_worker::{ProfiledExternalOutcome, ProfiledExternalTiming};
 use super::worker::{
     ExternalWorkerClock, ExternalWorkerStartup, external_evaluation_namespace,
@@ -177,7 +179,10 @@ impl TeacherCompletion {
         Arc::ptr_eq(&self.dispatch.admission, &submitted.admission)
             && self.dispatch.id == submitted.id
             && self.dispatch.input_scope == submitted.input_scope
-            && self.dispatch.original_position.same_state(&submitted.original_position)
+            && self
+                .dispatch
+                .original_position
+                .same_state(&submitted.original_position)
             && self.dispatch.original_root_moves == submitted.original_root_moves
             && self.dispatch.requested == submitted.requested
             && self.dispatch.original_deadline == submitted.original_deadline
@@ -198,9 +203,11 @@ impl TeacherCompletion {
     /// alone is not an acceptance or a publication capability.
     pub fn try_claim_policy_once(&self, submitted: &TeacherDispatch) -> bool {
         self.matches_submission(submitted)
-            && self.dispatch.admission.compare_exchange(
-                false, true, Ordering::AcqRel, Ordering::Acquire,
-            ).is_ok()
+            && self
+                .dispatch
+                .admission
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 }
 
@@ -407,34 +414,45 @@ impl CollectionTeacherWorker {
         // Reserve the unique same-issuer worker before the thread can exist.
         // A concurrent scope close either prevents this reservation or leaves
         // it pending until the exact spawn attempt reaches a terminal outcome.
-        let mut worker_reservation = process_permit.as_ref()
-            .map(CollectionProcessPermit::reserve_worker).transpose()?;
+        let mut worker_reservation = process_permit
+            .as_ref()
+            .map(CollectionProcessPermit::reserve_worker)
+            .transpose()?;
         let launch_pin = match process_permit {
             Some(permit) => launch_pin.with_collection_permit(permit),
             None => launch_pin,
         };
-        if worker_reservation.as_ref().is_some_and(|reservation| !reservation.spawn_allowed()) {
-            worker_reservation.take().expect("checked reservation").cancel_before_spawn();
-            return Err(error("teacher_worker", "collection_scope_closed_before_thread"));
+        if worker_reservation
+            .as_ref()
+            .is_some_and(|reservation| !reservation.spawn_allowed())
+        {
+            worker_reservation
+                .take()
+                .expect("checked reservation")
+                .cancel_before_spawn();
+            return Err(error(
+                "teacher_worker",
+                "collection_scope_closed_before_thread",
+            ));
         }
         let spawned = builder.spawn(move || {
-                run_worker(
-                    worker_config,
-                    profile,
-                    registration,
-                    clock,
-                    startup_deadline,
-                    cleanup_ceiling,
-                    launch_pin,
-                    worker_mailbox,
-                    worker_shutdown,
-                    worker_deadline,
-                    worker_startup,
-                    worker_diagnostics,
-                    worker_process,
-                    create_checker,
-                )
-            });
+            run_worker(
+                worker_config,
+                profile,
+                registration,
+                clock,
+                startup_deadline,
+                cleanup_ceiling,
+                launch_pin,
+                worker_mailbox,
+                worker_shutdown,
+                worker_deadline,
+                worker_startup,
+                worker_diagnostics,
+                worker_process,
+                create_checker,
+            )
+        });
         let thread = match spawned {
             Ok(thread) => thread,
             Err(_) => {
@@ -446,7 +464,9 @@ impl CollectionTeacherWorker {
         };
         // Even a quarantined/inconsistent reservation returns its actual
         // lease; the JoinHandle and lease therefore keep the same owner.
-        let scope_worker_lease = worker_reservation.take().map(|reservation| reservation.spawn_succeeded());
+        let scope_worker_lease = worker_reservation
+            .take()
+            .map(|reservation| reservation.spawn_succeeded());
         Ok(Self {
             registration,
             config,
@@ -1390,13 +1410,14 @@ mod tests {
         assert!(!completion.try_claim_policy_once(&substituted));
         let mut different_position = dispatch.clone();
         let mut moved = Position::startpos();
-        moved.make_move(BoardMove::from_uci("e2e4").unwrap()).unwrap();
+        moved
+            .make_move(BoardMove::from_uci("e2e4").unwrap())
+            .unwrap();
         different_position.original_position = moved.snapshot();
         assert!(!completion.try_claim_policy_once(&different_position));
         let mut different_restriction = dispatch.clone();
-        different_restriction.original_root_moves = Some(Arc::from(
-            [BoardMove::from_uci("e2e4").unwrap()].as_slice(),
-        ));
+        different_restriction.original_root_moves =
+            Some(Arc::from([BoardMove::from_uci("e2e4").unwrap()].as_slice()));
         assert!(!completion.try_claim_policy_once(&different_restriction));
         let mut contenders = Vec::new();
         for _ in 0..8 {
@@ -1404,7 +1425,14 @@ mod tests {
             let c = completion.clone();
             contenders.push(std::thread::spawn(move || c.try_claim_policy_once(&d)));
         }
-        assert_eq!(contenders.into_iter().map(|t| t.join().unwrap()).filter(|won| *won).count(), 1);
+        assert_eq!(
+            contenders
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
         assert!(!completion.try_claim_policy_once(&dispatch));
     }
 
@@ -1733,17 +1761,20 @@ mod tests {
         .unwrap();
         // A cloned permit cannot create a second worker for the same seat,
         // whether the first thread is still starting or already owns a child.
-        assert!(CollectionTeacherWorker::spawn_checked(
-            config.clone(),
-            profile,
-            first_registration,
-            clock,
-            startup,
-            cleanup,
-            pin.clone(),
-            Some(first_permit.clone()),
-            create_fixture_checker,
-        ).is_err());
+        assert!(
+            CollectionTeacherWorker::spawn_checked(
+                config.clone(),
+                profile,
+                first_registration,
+                clock,
+                startup,
+                cleanup,
+                pin.clone(),
+                Some(first_permit.clone()),
+                create_fixture_checker,
+            )
+            .is_err()
+        );
         let mut second = CollectionTeacherWorker::spawn_checked(
             config.clone(),
             profile,
@@ -1797,7 +1828,9 @@ mod tests {
         let second_closed = close_fixture(&mut second, cleanup);
         assert_eq!(first_closed.process_identity, Some(first_process));
         assert_eq!(second_closed.process_identity, Some(second_process));
-        let first_join = first.take_scope_join_witness().expect("actual original worker join");
+        let first_join = first
+            .take_scope_join_witness()
+            .expect("actual original worker join");
         assert!(first_join.same_member(&first_permit));
         assert!(first.take_scope_join_witness().is_none());
         drop(first_permit);
@@ -1889,10 +1922,12 @@ mod tests {
         missing_process.process = None;
         assert!(missing_process.matches_dispatch_identity(&first));
         assert!(!missing_process.matches_submission(&first));
-        assert!(!missing_process.matches_dispatch_identity(&TeacherDispatch {
-            admission: Arc::new(AtomicBool::new(false)),
-            ..first.clone()
-        }));
+        assert!(
+            !missing_process.matches_dispatch_identity(&TeacherDispatch {
+                admission: Arc::new(AtomicBool::new(false)),
+                ..first.clone()
+            })
+        );
         assert!(!completion.matches_submission(&TeacherDispatch {
             admission: Arc::new(AtomicBool::new(false)),
             ..first.clone()

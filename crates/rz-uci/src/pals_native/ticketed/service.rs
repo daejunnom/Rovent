@@ -48,9 +48,15 @@ pub struct TicketOwnerDispatchContext<'a, V, Q, P> {
 }
 
 impl<'a, V, Q, P> TicketOwnerDispatchContext<'a, V, Q, P> {
-    pub fn ticket(&self) -> &'a RoleTicketEnvelope { self.ticket }
-    pub fn question(&self) -> &'a TicketPreparation<V, Q> { self.question }
-    pub fn prepared(&self) -> &'a P { self.prepared }
+    pub fn ticket(&self) -> &'a RoleTicketEnvelope {
+        self.ticket
+    }
+    pub fn question(&self) -> &'a TicketPreparation<V, Q> {
+        self.question
+    }
+    pub fn prepared(&self) -> &'a P {
+        self.prepared
+    }
     pub fn same_owner(&self, verifier: &NativeAcceptanceVerifier) -> bool {
         self.verifier.same_owner(verifier)
     }
@@ -291,7 +297,8 @@ fn take_observation_failures<V, Q, B: TicketNativeBackend<V, Q>>(
                     stage: TicketNativeObservationStage::Retrieval,
                     disposition: TicketNativeObservationDisposition::RequiredAfterPhysical,
                     cause: RoleFailure::Backend(
-                        "observation failure retrieval panicked; original report unavailable".into(),
+                        "observation failure retrieval panicked; original report unavailable"
+                            .into(),
                     ),
                 });
                 break;

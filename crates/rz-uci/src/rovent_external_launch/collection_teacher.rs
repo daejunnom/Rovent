@@ -7,9 +7,9 @@ use rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration;
 use rz_search::external_cpu::collection_teacher::{
     CollectionTeacherWorker, TeacherCompletion, TeacherDiagnostics, TeacherDispatch, TeacherJob,
 };
-use rz_search::external_cpu::process_scope::CollectionProcessPermit;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use rz_search::external_cpu::process_scope::CollectionProcessMemberWitness;
+use rz_search::external_cpu::process_scope::CollectionProcessPermit;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use rz_search::external_cpu::process_scope::{
     CollectionMemberPhysicalState, CollectionMemberWorkerState, CollectionScopePhysicalOutcome,
@@ -37,9 +37,15 @@ mod policy_seal_v2;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod scope_aggregate_v2;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-pub use scope_aggregate_v2::{RoventTeacherScopeAggregateAckV2, RoventTeacherScopeAggregateFailureV2, RoventTeacherRetiredActorV2};
+pub use policy_seal_v2::{
+    RoventTeacherPolicyCustodyV2, RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealErrorV2,
+    RoventTeacherPolicySealFailureKindV2, RoventTeacherPolicySealFailureV2,
+};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-pub use policy_seal_v2::{RoventTeacherPolicyCustodyV2, RoventTeacherPolicySealErrorV2, RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealFailureV2, RoventTeacherPolicySealFailureKindV2};
+pub use scope_aggregate_v2::{
+    RoventTeacherRetiredActorV2, RoventTeacherScopeAggregateAckV2,
+    RoventTeacherScopeAggregateFailureV2,
+};
 
 pub struct RoventCollectionTeacherOwner {
     launch: PreparedRoventExternalLaunch,
@@ -407,10 +413,12 @@ impl RoventCollectionTeacherOwnerV2 {
     ) -> Result<Self, RoventCollectionTeacherSpawnRejectionV2> {
         let _scope_guard = match scope.begin_spawn(&admission, permit) {
             Ok(guard) => guard,
-            Err(_) => return Err(RoventCollectionTeacherSpawnRejectionV2::BeforeSpawn {
-                cause: invalid("teacher /2 scope invalid, closed, or contended"),
-                admission,
-            }),
+            Err(_) => {
+                return Err(RoventCollectionTeacherSpawnRejectionV2::BeforeSpawn {
+                    cause: invalid("teacher /2 scope invalid, closed, or contended"),
+                    admission,
+                });
+            }
         };
         let created: Result<Self, CheckerError> = (|| {
             let root = admission.root_admission();
@@ -678,7 +686,9 @@ impl RoventCollectionTeacherOwnerV2 {
             .accepts()
             .map_err(|_| invalid("teacher /2 root revoked"))?
         {
-            return Err(invalid("collection teacher completion lacks original private dispatch"));
+            return Err(invalid(
+                "collection teacher completion lacks original private dispatch",
+            ));
         }
         self.validate_completion_provenance(completion, dispatch)
     }
@@ -825,7 +835,10 @@ impl SpawnedTeacherGuardV2 {
             .reservation
             .take()
             .expect("spawn guard retains recovery reservation");
-        let member_witness = self.member_witness.take().expect("spawn guard retains member witness");
+        let member_witness = self
+            .member_witness
+            .take()
+            .expect("spawn guard retains member witness");
         let owner = owner_from_spawned_actor_v2(actor, worker, member_witness);
         RoventCollectionTeacherLifecycleV2::new(owner, reservation, self.cleanup_deadline)
     }
@@ -834,10 +847,18 @@ impl SpawnedTeacherGuardV2 {
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl Drop for SpawnedTeacherGuardV2 {
     fn drop(&mut self) {
-        if self.actor.is_none() && self.worker.is_none() && self.reservation.is_none() && self.member_witness.is_none() {
+        if self.actor.is_none()
+            && self.worker.is_none()
+            && self.reservation.is_none()
+            && self.member_witness.is_none()
+        {
             return;
         }
-        if self.actor.is_none() || self.worker.is_none() || self.reservation.is_none() || self.member_witness.is_none() {
+        if self.actor.is_none()
+            || self.worker.is_none()
+            || self.reservation.is_none()
+            || self.member_witness.is_none()
+        {
             // An impossible partial handoff must not silently destroy a
             // remaining worker or release a possibly occupied reservation.
             quarantine_v2::mark_custody_violation();
@@ -888,10 +909,12 @@ pub fn spawn_bound_collection_teacher_v2(
     // fabricated process permit. This guard is released only on return.
     let _scope_guard = match scope.begin_spawn(actor.admission(), permit) {
         Ok(guard) => guard,
-        Err(error) => return Err(BoundTeacherSpawnFailureV2::BeforeSpawn {
-            cause: BoundTeacherSpawnCauseV2::Scope(error),
-            actor,
-        }),
+        Err(error) => {
+            return Err(BoundTeacherSpawnFailureV2::BeforeSpawn {
+                cause: BoundTeacherSpawnCauseV2::Scope(error),
+                actor,
+            });
+        }
     };
     let (reservation, recovery_key) = match TeacherRecoveryReservationV2::reserve() {
         Ok(value) => value,
@@ -908,7 +931,11 @@ pub fn spawn_bound_collection_teacher_v2(
             actor,
         });
     }
-    let cleanup_deadline = actor.admission().root_admission().original_context().shutdown_deadline;
+    let cleanup_deadline = actor
+        .admission()
+        .root_admission()
+        .original_context()
+        .shutdown_deadline;
     let created = (|| -> Result<CollectionTeacherWorker, BoundTeacherSpawnCauseV2> {
         reservation
             .validate_before_spawn()
@@ -1154,9 +1181,16 @@ pub struct RoventTeacherNoChildRetirementTokenV2 {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventTeacherNoChildRetirementTokenV2 {
-    pub fn owner(&self) -> &RoventCollectionTeacherOwnerV2 { &self.owner }
-    pub fn observation(&self) -> &RoventTeacherRetirementObservationV2 { &self.observation }
-    pub fn matches_admission(&self, admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2) -> bool {
+    pub fn owner(&self) -> &RoventCollectionTeacherOwnerV2 {
+        &self.owner
+    }
+    pub fn observation(&self) -> &RoventTeacherRetirementObservationV2 {
+        &self.observation
+    }
+    pub fn matches_admission(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> bool {
         self.owner.admission().same_original_admission(admission)
     }
 }
@@ -1174,7 +1208,10 @@ impl RoventTeacherWorkerTerminalTokenV2 {
     }
 
     fn has_original_join_witness(&self) -> bool {
-        self.lifecycle.owner().worker.scope_join_witness()
+        self.lifecycle
+            .owner()
+            .worker
+            .scope_join_witness()
             .is_some_and(|joined| self.member_witness().same_joined_member(joined))
     }
 
@@ -1182,7 +1219,10 @@ impl RoventTeacherWorkerTerminalTokenV2 {
         &self,
         admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
     ) -> bool {
-        self.lifecycle.owner().admission().same_original_admission(admission)
+        self.lifecycle
+            .owner()
+            .admission()
+            .same_original_admission(admission)
     }
 
     pub fn owner(&self) -> &RoventCollectionTeacherOwnerV2 {
@@ -1196,10 +1236,16 @@ impl RoventTeacherWorkerTerminalTokenV2 {
     /// Physical retirement uses the existing independent checks. On failure
     /// the original token, owner and reservation remain with the caller.
     pub fn try_into_physical_retirement(self) -> Result<RoventTeacherRetirementTokenV2, Self> {
-        let Self { lifecycle, observation } = self;
+        let Self {
+            lifecycle,
+            observation,
+        } = self;
         match lifecycle.try_retire() {
             Ok(token) => Ok(token),
-            Err(lifecycle) => Err(Self { lifecycle, observation }),
+            Err(lifecycle) => Err(Self {
+                lifecycle,
+                observation,
+            }),
         }
     }
 
@@ -1212,14 +1258,24 @@ impl RoventTeacherWorkerTerminalTokenV2 {
         workers: &CollectionScopeWorkerOutcome,
     ) -> Result<RoventTeacherNoChildRetirementTokenV2, Self> {
         let witness = self.member_witness();
-        if !self.has_original_join_witness() || !matches!(witness.physical_state_in(physical),
-            Some(CollectionMemberPhysicalState::IssuedNoChild | CollectionMemberPhysicalState::AcquiredNoChild))
+        if !self.has_original_join_witness()
+            || !matches!(
+                witness.physical_state_in(physical),
+                Some(
+                    CollectionMemberPhysicalState::IssuedNoChild
+                        | CollectionMemberPhysicalState::AcquiredNoChild
+                )
+            )
             || witness.state_in(workers) != Some(CollectionMemberWorkerState::Joined)
         {
             return Err(self);
         }
-        let poisoned = match self.lifecycle.reservation.as_mut()
-            .and_then(|reservation| reservation.release().ok()) {
+        let poisoned = match self
+            .lifecycle
+            .reservation
+            .as_mut()
+            .and_then(|reservation| reservation.release().ok())
+        {
             Some(poisoned) => poisoned,
             None => return Err(self),
         };
@@ -1416,7 +1472,8 @@ impl RoventCollectionTeacherLifecycleV2 {
         if self.terminal_ledger.unmatched.is_some() {
             return None;
         }
-        let completion = self.owner
+        let completion = self
+            .owner
             .as_ref()
             .expect("retained teacher owner")
             .worker
@@ -1590,7 +1647,10 @@ impl RoventCollectionTeacherLifecycleV2 {
     pub fn try_finish_worker(mut self) -> Result<RoventTeacherWorkerTerminalTokenV2, Self> {
         let observation = self.poll();
         if observation.worker_join.is_none()
-            || !self.owner().worker.scope_join_witness()
+            || !self
+                .owner()
+                .worker
+                .scope_join_witness()
                 .is_some_and(|joined| self.owner().member_witness.same_joined_member(joined))
             || observation.commands != 0
             || observation.reliable_queued != 0
@@ -1603,15 +1663,17 @@ impl RoventCollectionTeacherLifecycleV2 {
         {
             return Err(self);
         }
-        Ok(RoventTeacherWorkerTerminalTokenV2 { lifecycle: self, observation })
+        Ok(RoventTeacherWorkerTerminalTokenV2 {
+            lifecycle: self,
+            observation,
+        })
     }
 
     /// Issue an opaque token only through the same physical retirement path.
     /// A failure returns the original lifecycle and retains recovery custody.
     pub fn try_retire(self) -> Result<RoventTeacherRetirementTokenV2, Self> {
-        self.try_finish().map(|(owner, observation)| {
-            RoventTeacherRetirementTokenV2 { owner, observation }
-        })
+        self.try_finish()
+            .map(|(owner, observation)| RoventTeacherRetirementTokenV2 { owner, observation })
     }
 }
 

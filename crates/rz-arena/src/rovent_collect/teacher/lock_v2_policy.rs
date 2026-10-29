@@ -1,7 +1,7 @@
 //! Move-only V2 teacher evidence is checked and transformed outside the
 //! producer lock. A later short producer commit only transfers the prepared
 //! target to the same original retired row.
-use super::collection::{scope_json, ROVENT_COLLECTION_TEACHER_BINDING};
+use super::collection::{ROVENT_COLLECTION_TEACHER_BINDING, scope_json};
 use super::v2_session::SealedTeacherPolicyV2;
 use super::*;
 
@@ -200,7 +200,7 @@ impl RoventCorpusProducerLockV2 {
                     error: invalid("V2 teacher policy commit preparation panicked"),
                     prepared,
                     panic: Some(panic),
-                }))
+                }));
             }
         };
         prepared.target.observed_sequence = sequence;

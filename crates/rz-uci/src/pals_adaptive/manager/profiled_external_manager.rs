@@ -153,9 +153,7 @@ where
 
     /// Return the original V2 source only after the same physical root fence.
     #[allow(clippy::result_large_err)]
-    pub fn into_profiled_v2_persistent_parts(
-        self,
-    ) -> V2FacadePartsResult<Q, B, D> {
+    pub fn into_profiled_v2_persistent_parts(self) -> V2FacadePartsResult<Q, B, D> {
         self.inner
             .into_profiled_v2_persistent_parts()
             .map_err(|rejected| ProfiledExternalPersistentRejection {
@@ -168,9 +166,7 @@ where
 
     /// Return the original V2 source only after the process-close proof.
     #[allow(clippy::result_large_err)]
-    pub fn into_profiled_v2_process_parts(
-        self,
-    ) -> V2FacadePartsResult<Q, B, D> {
+    pub fn into_profiled_v2_process_parts(self) -> V2FacadePartsResult<Q, B, D> {
         self.inner
             .into_profiled_v2_process_parts()
             .map_err(|rejected| ProfiledExternalPersistentRejection {
@@ -395,15 +391,11 @@ where
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn into_profiled_v2_persistent_parts(
-        self,
-    ) -> V2ManagerPartsResult<Q, B, D> {
+    pub fn into_profiled_v2_persistent_parts(self) -> V2ManagerPartsResult<Q, B, D> {
         self.into_profiled_v2_settled_parts(AdaptiveCloseMode::RootQuiesce)
     }
     #[allow(clippy::result_large_err)]
-    pub fn into_profiled_v2_process_parts(
-        self,
-    ) -> V2ManagerPartsResult<Q, B, D> {
+    pub fn into_profiled_v2_process_parts(self) -> V2ManagerPartsResult<Q, B, D> {
         self.into_profiled_v2_settled_parts(AdaptiveCloseMode::ProcessShutdown)
     }
     #[allow(clippy::result_large_err)]

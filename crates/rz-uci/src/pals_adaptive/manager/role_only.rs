@@ -1,14 +1,14 @@
 //! Actual P/C-only ticket manager. There is no CPU worker, native-node ledger,
 //! adaptive CPU controller, R frame machine, evaluator or stack in this owner.
 //! Encoding and inference stay on the existing single native service worker.
-use super::collection::{AdaptiveCollectionObserver, RoventCollectionRootAdmission};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use super::collection::{
     AdaptiveCollectionBoundaryV2, AdaptiveCollectionDispatchV2, AdaptiveCollectionObserverBoxV2,
-    RoleOnlySearchConsumptionV2, RoventDispatchWitnessFailureV2, RoventTicketValidationKindV2,
-    RoventCollectionAcceptedWitnessV2, RoventCollectionConsumedWitnessV2,
-    RoventCollectionRootAdmissionV2,
+    RoleOnlySearchConsumptionV2, RoventCollectionAcceptedWitnessV2,
+    RoventCollectionConsumedWitnessV2, RoventCollectionRootAdmissionV2,
+    RoventDispatchWitnessFailureV2, RoventTicketValidationKindV2,
 };
+use super::collection::{AdaptiveCollectionObserver, RoventCollectionRootAdmission};
 use super::*;
 use crate::pals_native::ticketed::{
     TicketNativeObservationDisposition, TicketNativeObservationFailure,
@@ -1037,7 +1037,9 @@ where
                 .take()
                 .expect("checked admission"),
             self.collection_v2.take().expect("checked observer"),
-            self.collection_v2_settlement.take().expect("checked settlement"),
+            self.collection_v2_settlement
+                .take()
+                .expect("checked settlement"),
         )))
     }
 
@@ -1098,7 +1100,8 @@ where
         for failure in failures.iter() {
             self.observation_failures.push(failure.clone());
             let stage_matches = match failure.stage {
-                TicketNativeObservationStage::Submitted | TicketNativeObservationStage::Completed => !retired,
+                TicketNativeObservationStage::Submitted
+                | TicketNativeObservationStage::Completed => !retired,
                 TicketNativeObservationStage::Retired => retired,
                 TicketNativeObservationStage::Retrieval => true,
             };
@@ -1114,7 +1117,9 @@ where
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }
         if mismatch || (self.observation_failures.len() as u64) > maximum {
-            return Err(AdaptiveManagerError::Invalid("P/C native observation identity or bound"));
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C native observation identity or bound",
+            ));
         }
         if let Some(cause) = required {
             return Err(AdaptiveManagerError::Semantic(format!(
@@ -1271,13 +1276,18 @@ where
         }
         let mut changed = false;
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        let priority = self.collection_v2_busy_ticket.and_then(|ticket|
-            self.bindings.iter().position(|binding| binding.ticket == Some(ticket) && binding.dispatch_pending));
+        let priority = self.collection_v2_busy_ticket.and_then(|ticket| {
+            self.bindings
+                .iter()
+                .position(|binding| binding.ticket == Some(ticket) && binding.dispatch_pending)
+        });
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if self.collection_v2_busy_ticket.is_some() && priority.is_none() {
             // A staged capture cannot be silently replaced by another ticket.
             // Close through the normal owner fence and settlement path.
-            return Err(AdaptiveManagerError::Invalid("P/C V2 busy ticket owner unavailable"));
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V2 busy ticket owner unavailable",
+            ));
         }
         #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
         let priority: Option<usize> = None;
@@ -1301,25 +1311,37 @@ where
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 if let Some(observer) = &mut self.collection_v2 {
                     let verifier = self.native.native_acceptance_verifier();
-                    let (admission, verifier) = self.collection_admission_v2.as_ref()
+                    let (admission, verifier) = self
+                        .collection_admission_v2
+                        .as_ref()
                         .zip(verifier.as_ref())
                         .ok_or(AdaptiveManagerError::Invalid(
                             "P/C V2 collection admission or verifier absent",
                         ))?;
-                    let witness = match super::collection::RoventCollectionDispatchWitnessV2::try_new(
-                        admission, verifier, &ticket,
-                    ) {
-                        Ok(witness) => witness,
-                        Err(RoventDispatchWitnessFailureV2::Ticket(error)) if error.kind == RoventTicketValidationKindV2::Busy => {
-                            self.collection_v2_busy_ticket = Some(ticket);
-                            break;
-                        }
-                        Err(RoventDispatchWitnessFailureV2::Ticket(error)) => return Err(error.error.into()),
-                        Err(RoventDispatchWitnessFailureV2::NativeIdentity(error)) => return Err(error.into()),
-                    };
+                    let witness =
+                        match super::collection::RoventCollectionDispatchWitnessV2::try_new(
+                            admission, verifier, &ticket,
+                        ) {
+                            Ok(witness) => witness,
+                            Err(RoventDispatchWitnessFailureV2::Ticket(error))
+                                if error.kind == RoventTicketValidationKindV2::Busy =>
+                            {
+                                self.collection_v2_busy_ticket = Some(ticket);
+                                break;
+                            }
+                            Err(RoventDispatchWitnessFailureV2::Ticket(error)) => {
+                                return Err(error.error.into());
+                            }
+                            Err(RoventDispatchWitnessFailureV2::NativeIdentity(error)) => {
+                                return Err(error.into());
+                            }
+                        };
                     if let Some(first) = self.collection_v2_disabled_first_ticket {
-                        if ticket.id.epoch != first.id.epoch || ticket.authority != first.authority {
-                            return Err(AdaptiveManagerError::Invalid("P/C V2 disabled boundary mismatch"));
+                        if ticket.id.epoch != first.id.epoch || ticket.authority != first.authority
+                        {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "P/C V2 disabled boundary mismatch",
+                            ));
                         }
                         if ticket.id.sequence < first.id.sequence {
                             match observer.allow_disabled_prior_ticket(witness)? {
@@ -1334,7 +1356,9 @@ where
                         }
                     } else if let Some(original) = self.collection_v2_first_failure.as_ref() {
                         match observer.disable_after_failure(witness, original)? {
-                            AdaptiveCollectionBoundaryV2::Ready => self.collection_v2_disabled_first_ticket = Some(ticket),
+                            AdaptiveCollectionBoundaryV2::Ready => {
+                                self.collection_v2_disabled_first_ticket = Some(ticket)
+                            }
                             AdaptiveCollectionBoundaryV2::Busy => {
                                 self.collection_v2_busy_ticket = Some(ticket);
                                 break;
@@ -1364,7 +1388,9 @@ where
                                     Err(RoventDispatchWitnessFailureV2::NativeIdentity(error)) => return Err(error.into()),
                                 };
                                 match observer.disable_after_failure(witness, &original)? {
-                                    AdaptiveCollectionBoundaryV2::Ready => self.collection_v2_disabled_first_ticket = Some(ticket),
+                                    AdaptiveCollectionBoundaryV2::Ready => {
+                                        self.collection_v2_disabled_first_ticket = Some(ticket)
+                                    }
                                     AdaptiveCollectionBoundaryV2::Busy => {
                                         self.collection_v2_busy_ticket = Some(ticket);
                                         break;
@@ -1565,7 +1591,10 @@ where
                                 AdaptiveManagerError::Invalid("P/C V2 native verifier absent"),
                             )?;
                             let witness = RoventCollectionAcceptedWitnessV2::new(
-                                admission, &verifier, accepted, output.proposer_ranking_output(),
+                                admission,
+                                &verifier,
+                                accepted,
+                                output.proposer_ranking_output(),
                             )?;
                             let observation = if returned.is_ok() {
                                 RoleOnlySearchConsumptionV2::DriverReturnedSuccess
@@ -1573,7 +1602,8 @@ where
                                 RoleOnlySearchConsumptionV2::DriverReadbackAfterError
                             };
                             if let Err(error) = observer.consumed(
-                                RoventCollectionConsumedWitnessV2::new(witness), observation,
+                                RoventCollectionConsumedWitnessV2::new(witness),
+                                observation,
                             ) {
                                 // Consumption already happened. Keep both that
                                 // fact and the observer error without replay.
@@ -1801,9 +1831,9 @@ where
                     owner_run,
                     owner_service_elapsed,
                 };
-                if let Err(error) = self.retain_native_observations(
-                    completion.ticket, &observation_failures, false,
-                ) {
+                if let Err(error) =
+                    self.retain_native_observations(completion.ticket, &observation_failures, false)
+                {
                     self.retained_completions.push(retained);
                     return Err(error);
                 }
@@ -1899,9 +1929,9 @@ where
                 rejected_permit,
                 observation_failures,
             } => {
-                if let Err(error) = self.retain_native_observations(
-                    ticket, &observation_failures, true,
-                ) {
+                if let Err(error) =
+                    self.retain_native_observations(ticket, &observation_failures, true)
+                {
                     if let Some(receipt) = native_receipt {
                         self.retained_receipts.push(receipt);
                     }
@@ -1977,7 +2007,8 @@ where
                     ))?;
                     let mut accounting = self.accounting;
                     let accounting_result = (|| {
-                        accounting.observe_owner_acceptance(ticket.role, self.bindings[index].physical)?;
+                        accounting
+                            .observe_owner_acceptance(ticket.role, self.bindings[index].physical)?;
                         let count = self.bindings[index]
                             .physical
                             .filter(|e| e.measurement_complete)
@@ -1993,8 +2024,12 @@ where
                             ),
                         };
                         Ok::<_, AdaptiveManagerError>((
-                            inputs.ok_or(AdaptiveManagerError::Capacity("P/C native accepted NN count"))?,
-                            unknown.ok_or(AdaptiveManagerError::Capacity("P/C native accepted unknown count"))?,
+                            inputs.ok_or(AdaptiveManagerError::Capacity(
+                                "P/C native accepted NN count",
+                            ))?,
+                            unknown.ok_or(AdaptiveManagerError::Capacity(
+                                "P/C native accepted unknown count",
+                            ))?,
                         ))
                     })();
                     let (inputs, unknown) = match accounting_result {
@@ -2049,18 +2084,25 @@ where
                                         ),
                                     )?;
                                     let role_output = output.proposer_ranking_output();
-                                    let admission = self.collection_admission_v2
-                                        .as_ref()
-                                        .ok_or(AdaptiveManagerError::Invalid(
+                                    let admission = self.collection_admission_v2.as_ref().ok_or(
+                                        AdaptiveManagerError::Invalid(
                                             "P/C V2 collection admission absent",
-                                        ))?;
+                                        ),
+                                    )?;
                                     let verifier = self.native.native_acceptance_verifier().ok_or(
-                                        AdaptiveManagerError::Invalid("P/C V2 native verifier absent"),
+                                        AdaptiveManagerError::Invalid(
+                                            "P/C V2 native verifier absent",
+                                        ),
                                     )?;
                                     let witness = RoventCollectionAcceptedWitnessV2::new(
-                                        admission, &verifier, accepted, role_output,
+                                        admission,
+                                        &verifier,
+                                        accepted,
+                                        role_output,
                                     )?;
-                                    if let Err(error) = observer.accepted(witness, &binding.input, output.as_ref()) {
+                                    if let Err(error) =
+                                        observer.accepted(witness, &binding.input, output.as_ref())
+                                    {
                                         self.collection_v2_first_failure.get_or_insert(error);
                                     }
                                 }
@@ -2218,20 +2260,27 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             let collection_failure_v2 = self.collection_v2.as_mut().and_then(|observer| {
                 let verifier = self.native.native_acceptance_verifier();
-                let witness = self.collection_admission_v2.as_ref().zip(verifier.as_ref())
-                    .ok_or_else(|| AdaptiveCollectionError::new(
-                        AdaptiveCollectionStage::NativeEvent,
-                        "NativeOwnerUnavailable",
-                        "original admission or native verifier unavailable",
-                    ))
+                let witness = self
+                    .collection_admission_v2
+                    .as_ref()
+                    .zip(verifier.as_ref())
+                    .ok_or_else(|| {
+                        AdaptiveCollectionError::new(
+                            AdaptiveCollectionStage::NativeEvent,
+                            "NativeOwnerUnavailable",
+                            "original admission or native verifier unavailable",
+                        )
+                    })
                     .and_then(|(admission, verifier)| {
                         super::collection::RoventCollectionNativeEventWitnessV2::new(
                             admission, verifier, &event,
                         )
-                    })
-                    ;
+                    });
                 match witness {
-                    Ok(witness) => observer.native_event(witness).err().map(|error| (error, true)),
+                    Ok(witness) => observer
+                        .native_event(witness)
+                        .err()
+                        .map(|error| (error, true)),
                     Err(error) => Some((error, false)),
                 }
             });
@@ -2317,8 +2366,11 @@ where
                 && self.phase != ManagerPhase::Quarantined
             {
                 if !self.collection_settled {
-                    let remaining: Vec<_> = self.bindings.iter()
-                        .filter_map(|binding| binding.ticket).collect();
+                    let remaining: Vec<_> = self
+                        .bindings
+                        .iter()
+                        .filter_map(|binding| binding.ticket)
+                        .collect();
                     if let Some(observer) = &mut self.collection {
                         let result = observer.settled(&remaining);
                         if let Err(error) = result {
@@ -2331,10 +2383,11 @@ where
                         if let Err(error) = result {
                             self.collection_v2_first_failure.get_or_insert(error);
                         }
-                        self.collection_v2_settlement = Some(match self.collection_v2_first_failure.as_ref() {
-                            Some(error) => Err(error.clone()),
-                            None => Ok(()),
-                        });
+                        self.collection_v2_settlement =
+                            Some(match self.collection_v2_first_failure.as_ref() {
+                                Some(error) => Err(error.clone()),
+                                None => Ok(()),
+                            });
                     }
                     self.collection_settled = true;
                 }

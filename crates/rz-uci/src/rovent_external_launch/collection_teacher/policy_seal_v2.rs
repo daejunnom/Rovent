@@ -58,14 +58,23 @@ pub struct RoventTeacherPolicyCustodyV2 {
 }
 impl RoventTeacherPolicyCustodyV2 {
     pub fn new(dispatch: TeacherDispatch, completion: TeacherCompletion) -> Self {
-        Self { dispatch: Some(dispatch), completion: Some(completion), uncertain: false }
+        Self {
+            dispatch: Some(dispatch),
+            completion: Some(completion),
+            uncertain: false,
+        }
     }
-    pub fn is_uncertain(&self) -> bool { self.uncertain }
+    pub fn is_uncertain(&self) -> bool {
+        self.uncertain
+    }
     pub fn into_originals(mut self) -> Result<(TeacherDispatch, TeacherCompletion), Self> {
         if self.uncertain || self.dispatch.is_none() || self.completion.is_none() {
             return Err(self);
         }
-        Ok((self.dispatch.take().expect("checked dispatch"), self.completion.take().expect("checked completion")))
+        Ok((
+            self.dispatch.take().expect("checked dispatch"),
+            self.completion.take().expect("checked completion"),
+        ))
     }
 }
 impl Drop for RoventTeacherPolicyCustodyV2 {
@@ -75,8 +84,12 @@ impl Drop for RoventTeacherPolicyCustodyV2 {
             // Preserve any original objects rather than silently release an
             // unknown claim. The caller may instead retain the whole custody.
             quarantine_v2::mark_custody_violation();
-            if let Some(dispatch) = self.dispatch.take() { std::mem::forget(dispatch); }
-            if let Some(completion) = self.completion.take() { std::mem::forget(completion); }
+            if let Some(dispatch) = self.dispatch.take() {
+                std::mem::forget(dispatch);
+            }
+            if let Some(completion) = self.completion.take() {
+                std::mem::forget(completion);
+            }
         }
     }
 }
@@ -110,7 +123,12 @@ impl RoventCollectionTeacherLifecycleV2 {
                         panic!("failure lost teacher custody invariant");
                     }
                 };
-                Err(Box::new(RoventTeacherPolicySealFailureV2 { kind: failure.kind, error: failure.error, dispatch, completion }))
+                Err(Box::new(RoventTeacherPolicySealFailureV2 {
+                    kind: failure.kind,
+                    error: failure.error,
+                    dispatch,
+                    completion,
+                }))
             }
         }
     }
@@ -124,12 +142,18 @@ impl RoventCollectionTeacherLifecycleV2 {
         expected_root_moves: Option<&[rz_position::BoardMove]>,
     ) -> Result<RoventTeacherPolicyEvidenceV2, RoventTeacherPolicySealErrorV2> {
         if custody.uncertain {
-            return Err(RoventTeacherPolicySealErrorV2 { kind: RoventTeacherPolicySealFailureKindV2::Invalid, error: invalid("teacher /2 custody claim state unknown") });
+            return Err(RoventTeacherPolicySealErrorV2 {
+                kind: RoventTeacherPolicySealFailureKindV2::Invalid,
+                error: invalid("teacher /2 custody claim state unknown"),
+            });
         }
         custody.uncertain = true;
         let (Some(dispatch), Some(completion)) = (&custody.dispatch, &custody.completion) else {
             custody.uncertain = false;
-            return Err(RoventTeacherPolicySealErrorV2 { kind: RoventTeacherPolicySealFailureKindV2::Invalid, error: invalid("teacher /2 custody already consumed") });
+            return Err(RoventTeacherPolicySealErrorV2 {
+                kind: RoventTeacherPolicySealFailureKindV2::Invalid,
+                error: invalid("teacher /2 custody already consumed"),
+            });
         };
         let mut kind = RoventTeacherPolicySealFailureKindV2::Invalid;
         let validation = (|| -> Result<_, CheckerError> {
@@ -144,13 +168,19 @@ impl RoventCollectionTeacherLifecycleV2 {
             if !dispatch.original_position().same_state(expected_query)
                 || dispatch.original_root_moves() != expected_root_moves
             {
-                return Err(invalid("teacher /2 original Rules query or restriction differs"));
+                return Err(invalid(
+                    "teacher /2 original Rules query or restriction differs",
+                ));
             }
-            let owner = self.owner.as_ref().ok_or(invalid("teacher /2 owner absent"))?;
+            let owner = self
+                .owner
+                .as_ref()
+                .ok_or(invalid("teacher /2 owner absent"))?;
             // Startup is read before acquiring the UCI authority guard: the
             // worker owns its startup mutex and must not be waited on inside
             // the root's linearization boundary.
-            let startup = owner.verified_startup()?
+            let startup = owner
+                .verified_startup()?
                 .ok_or(invalid("teacher /2 original worker startup absent"))?;
             let registration = owner.worker.registration();
             let admission = owner.admission();
@@ -167,7 +197,9 @@ impl RoventCollectionTeacherLifecycleV2 {
                 }
             })?;
             let clock = root.runtime_clock();
-            let now = clock.try_now().map_err(|_| invalid("teacher /2 clock unavailable"))?;
+            let now = clock
+                .try_now()
+                .map_err(|_| invalid("teacher /2 clock unavailable"))?;
             if root.hard_deadline().clock != clock.domain()
                 || dispatch.original_deadline().clock != clock.domain()
             {
@@ -186,7 +218,10 @@ impl RoventCollectionTeacherLifecycleV2 {
             }
             if Instant::now() >= context.control.deadline
                 || root.hard_deadline().accepts(clock.domain(), now).is_err()
-                || dispatch.original_deadline().accepts(clock.domain(), now).is_err()
+                || dispatch
+                    .original_deadline()
+                    .accepts(clock.domain(), now)
+                    .is_err()
             {
                 kind = RoventTeacherPolicySealFailureKindV2::Expired;
                 return Err(invalid("teacher /2 policy deadline unavailable"));
@@ -203,12 +238,16 @@ impl RoventCollectionTeacherLifecycleV2 {
                 || dispatch.original_deadline().clock != registration.original_deadline.clock
                 || dispatch.original_deadline().at > registration.original_deadline.at
             {
-                return Err(invalid("teacher /2 policy authority unavailable or incomplete"));
+                return Err(invalid(
+                    "teacher /2 policy authority unavailable or incomplete",
+                ));
             }
             owner.validate_completion_provenance(completion, dispatch)?;
             // Re-check atomic cancellations and both deadlines immediately at
             // issuance; no fallible operation follows the original token CAS.
-            let now = clock.try_now().map_err(|_| invalid("teacher /2 clock unavailable"))?;
+            let now = clock
+                .try_now()
+                .map_err(|_| invalid("teacher /2 clock unavailable"))?;
             if context.cancellation.is_canceled()
                 || context.control.cancellation.load(Ordering::Acquire)
                 || completion.controls().is_cancelled()
@@ -218,10 +257,15 @@ impl RoventCollectionTeacherLifecycleV2 {
             }
             if Instant::now() >= context.control.deadline
                 || root.hard_deadline().accepts(clock.domain(), now).is_err()
-                || dispatch.original_deadline().accepts(clock.domain(), now).is_err()
+                || dispatch
+                    .original_deadline()
+                    .accepts(clock.domain(), now)
+                    .is_err()
             {
                 kind = RoventTeacherPolicySealFailureKindV2::Expired;
-                return Err(invalid("teacher /2 policy authority expired during validation"));
+                return Err(invalid(
+                    "teacher /2 policy authority expired during validation",
+                ));
             }
             let accepted_admission = admission.clone();
             if !completion.try_claim_policy_once(dispatch) {
@@ -235,14 +279,21 @@ impl RoventCollectionTeacherLifecycleV2 {
                 // mutated while borrowed. No callback runs between claim and
                 // these ownership transfers.
                 let dispatch = custody.dispatch.take().expect("validated dispatch custody");
-                let completion = custody.completion.take().expect("validated completion custody");
+                let completion = custody
+                    .completion
+                    .take()
+                    .expect("validated completion custody");
                 custody.uncertain = false;
-                Ok(RoventTeacherPolicyEvidenceV2 { admission, dispatch, completion })
+                Ok(RoventTeacherPolicyEvidenceV2 {
+                    admission,
+                    dispatch,
+                    completion,
+                })
             }
             Err(error) => {
                 custody.uncertain = false;
                 Err(RoventTeacherPolicySealErrorV2 { kind, error })
-            },
+            }
         }
     }
 }

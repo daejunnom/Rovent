@@ -1,6 +1,8 @@
 //! Typed adapter around the shared bounded single-root Collection /2 worker.
 //! This layer does not combine P-C and Own manager or handoff authority.
-use super::collection_hooks_core_v2::{CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure};
+use super::collection_hooks_core_v2::{
+    CollectionBridgeCoreV2, CollectionWorkerCoreV2, CoreAdmissionFailure,
+};
 use super::teacher::v2_session::{RoventTeacherRosterEntryV2, TeacherSessionRetirementSealV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2};
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
@@ -44,13 +46,17 @@ impl RoventPcCollectionBridgeV2 {
         manifest: Arc<RoventCorpusManifestLockV2>,
         roster: Vec<RoventTeacherRosterEntryV2>,
     ) -> Result<(Arc<Self>, RoventPcCollectionWorkerV2), ArenaError> {
-        let (core, worker) = CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
+        let (core, worker) =
+            CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
         Ok((Arc::new(Self { core }), worker))
     }
 }
 
 impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
-    fn register_startup_control(&self, control: &RoventStartupControl) -> Result<(), AdaptiveManagerError> {
+    fn register_startup_control(
+        &self,
+        control: &RoventStartupControl,
+    ) -> Result<(), AdaptiveManagerError> {
         self.core.register_startup_control(control)
     }
     fn admit(
@@ -58,18 +64,27 @@ impl RoventPcCollectionHooksV2 for RoventPcCollectionBridgeV2 {
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
     ) -> Result<(), RoventPcCollectionAdmissionFailureV2> {
-        self.core.admit(admission, |admission, owner| {
-            port.install(admission, owner.observer()).map_err(|original| CoreAdmissionFailure {
-                error: original.error.clone(),
-                admission: original.admission.clone(),
-                owners: Box::new(original),
+        self.core
+            .admit(admission, |admission, owner| {
+                port.install(admission, owner.observer())
+                    .map_err(|original| CoreAdmissionFailure {
+                        error: original.error.clone(),
+                        admission: original.admission.clone(),
+                        owners: Box::new(original),
+                    })
             })
-        }).map_err(|failure| RoventPcCollectionAdmissionFailureV2 {
-            error: failure.error, admission: failure.admission, owners: failure.owners,
-        })
+            .map_err(|failure| RoventPcCollectionAdmissionFailureV2 {
+                error: failure.error,
+                admission: failure.admission,
+                owners: failure.owners,
+            })
     }
-    fn pump(&self) -> Result<(), AdaptiveManagerError> { self.core.pump() }
-    fn revoke(&self) { self.core.revoke(); }
+    fn pump(&self) -> Result<(), AdaptiveManagerError> {
+        self.core.pump()
+    }
+    fn revoke(&self) {
+        self.core.revoke();
+    }
     fn handoff_sender(&self) -> mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>> {
         self.core.handoff_sender()
     }

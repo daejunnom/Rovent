@@ -2221,7 +2221,12 @@ fn failed_consumption_readback_retains_binding_after_real_owner_fence() {
         .find(|binding| binding.consumption_unknown)
         .expect("uncertain original binding must remain in custody");
     assert!(!original.consumption_recorded);
-    assert!(manager.driver().consumed.contains(&original.ticket.unwrap()));
+    assert!(
+        manager
+            .driver()
+            .consumed
+            .contains(&original.ticket.unwrap())
+    );
     assert!(manager.failures().any(|error| matches!(
         error,
         AdaptiveManagerError::Semantic(detail)

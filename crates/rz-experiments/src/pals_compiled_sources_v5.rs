@@ -613,9 +613,15 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/rovent_external_launch.rs"),
             source!("crates/rz-uci/src/rovent_external_launch/actual_root.rs"),
             source!("crates/rz-uci/src/rovent_external_launch/collection_teacher.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/scope_aggregate_v2.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/policy_seal_v2.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/actor_binding_v2.rs"),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/scope_aggregate_v2.rs"
+            ),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/policy_seal_v2.rs"
+            ),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/actor_binding_v2.rs"
+            ),
             source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/quarantine_v2.rs"),
             source!("crates/rz-search/src/external_cpu/collection_teacher.rs"),
             source!("crates/rz-uci/src/rovent_external_launch/frontier_source.rs"),
@@ -967,9 +973,15 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_checker_profile/rovent.rs"),
             source!("crates/rz-uci/src/rovent_external_launch.rs"),
             source!("crates/rz-uci/src/rovent_external_launch/collection_teacher.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/scope_aggregate_v2.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/policy_seal_v2.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/actor_binding_v2.rs"),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/scope_aggregate_v2.rs"
+            ),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/policy_seal_v2.rs"
+            ),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/actor_binding_v2.rs"
+            ),
             source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/quarantine_v2.rs"),
             source!("crates/rz-uci/src/rovent_external_launch/frontier_source.rs"),
         ],
@@ -1097,9 +1109,15 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/validator.rs"),
             source!("crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs"),
             source!("crates/rz-uci/src/rovent_external_launch/collection_teacher.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/scope_aggregate_v2.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/policy_seal_v2.rs"),
-            source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/actor_binding_v2.rs"),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/scope_aggregate_v2.rs"
+            ),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/policy_seal_v2.rs"
+            ),
+            source!(
+                "crates/rz-uci/src/rovent_external_launch/collection_teacher/actor_binding_v2.rs"
+            ),
             source!("crates/rz-uci/src/rovent_external_launch/collection_teacher/quarantine_v2.rs"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py"

@@ -108,7 +108,12 @@ impl HistoricalIndexMetadata {
         origins: Vec<RoventCorpusOrigin>,
         canonical_sha256: String,
     ) -> Self {
-        Self { record_count, chunks, origins, canonical_sha256 }
+        Self {
+            record_count,
+            chunks,
+            origins,
+            canonical_sha256,
+        }
     }
     /// Compatibility query of the already checked original family seal. This
     /// common metadata has no serializer and never computes a legacy digest.

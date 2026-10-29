@@ -10,13 +10,18 @@ fn same_original_start_two_v2_admissions_share_one_teacher_claim() {
     let clock = ProcessClock::new(ProcessEpoch(7711));
     let original = context(&clock, false);
     let owner = input_lock_v2(&position);
-    let materialize = || PreparedSourceV2::prepare(
-        &owner,
-        RoventRootAdmissionPolicy::DynamicGo,
-        &position,
-        &original,
-        &clock,
-    ).unwrap().try_into_live().unwrap();
+    let materialize = || {
+        PreparedSourceV2::prepare(
+            &owner,
+            RoventRootAdmissionPolicy::DynamicGo,
+            &position,
+            &original,
+            &clock,
+        )
+        .unwrap()
+        .try_into_live()
+        .unwrap()
+    };
 
     let first = materialize();
     let second = materialize();
@@ -34,13 +39,18 @@ fn distinct_original_start_has_an_independent_teacher_claim() {
     // even though this source-only fixture uses the same visible authority.
     let second_start = context(&clock, false);
     let owner = input_lock_v2(&position);
-    let materialize = |start: &SearchSessionContext| PreparedSourceV2::prepare(
-        &owner,
-        RoventRootAdmissionPolicy::DynamicGo,
-        &position,
-        start,
-        &clock,
-    ).unwrap().try_into_live().unwrap();
+    let materialize = |start: &SearchSessionContext| {
+        PreparedSourceV2::prepare(
+            &owner,
+            RoventRootAdmissionPolicy::DynamicGo,
+            &position,
+            start,
+            &clock,
+        )
+        .unwrap()
+        .try_into_live()
+        .unwrap()
+    };
 
     let first = materialize(&first_start);
     let second = materialize(&second_start);

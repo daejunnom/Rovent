@@ -132,8 +132,13 @@ impl CollectionScopeWorkerOutcome {
     pub fn belongs_to(&self, scope: &CollectionProcessScope) -> bool {
         Arc::ptr_eq(&self.identity, &scope.inner.identity)
     }
-    pub fn state_for_permit(&self, permit: &CollectionProcessPermit) -> Option<CollectionMemberWorkerState> {
-        if !Arc::ptr_eq(&self.identity, &permit.inner.identity) { return None; }
+    pub fn state_for_permit(
+        &self,
+        permit: &CollectionProcessPermit,
+    ) -> Option<CollectionMemberWorkerState> {
+        if !Arc::ptr_eq(&self.identity, &permit.inner.identity) {
+            return None;
+        }
         let (registration, state) = self.members.get(permit.index)?;
         (permit.inner.members.get(permit.index)?.registration == *registration).then_some(*state)
     }
@@ -161,12 +166,22 @@ impl CollectionProcessMemberWitness {
     pub fn same_joined_member(&self, joined: &CollectionWorkerJoinedWitness) -> bool {
         Arc::ptr_eq(&self.identity, &joined.identity) && self.index == joined.index
     }
-    pub fn state_in(&self, outcome: &CollectionScopeWorkerOutcome) -> Option<CollectionMemberWorkerState> {
-        if !Arc::ptr_eq(&self.identity, &outcome.identity) { return None; }
+    pub fn state_in(
+        &self,
+        outcome: &CollectionScopeWorkerOutcome,
+    ) -> Option<CollectionMemberWorkerState> {
+        if !Arc::ptr_eq(&self.identity, &outcome.identity) {
+            return None;
+        }
         outcome.members.get(self.index).map(|(_, state)| *state)
     }
-    pub fn physical_state_in(&self, outcome: &CollectionScopePhysicalOutcome) -> Option<CollectionMemberPhysicalState> {
-        if !Arc::ptr_eq(&self.identity, &outcome.identity) { return None; }
+    pub fn physical_state_in(
+        &self,
+        outcome: &CollectionScopePhysicalOutcome,
+    ) -> Option<CollectionMemberPhysicalState> {
+        if !Arc::ptr_eq(&self.identity, &outcome.identity) {
+            return None;
+        }
         outcome.members.get(self.index).map(|(_, state)| *state)
     }
 }
@@ -188,7 +203,9 @@ pub struct CollectionScopePhysicalOutcome {
 }
 
 impl CollectionScopePhysicalOutcome {
-    pub fn manifest(&self) -> Digest { self.manifest }
+    pub fn manifest(&self) -> Digest {
+        self.manifest
+    }
 
     /// Both outcomes must come from the same original, opaque scope issuer.
     pub fn same_issuer_as_worker(&self, worker: &CollectionScopeWorkerOutcome) -> bool {
@@ -204,8 +221,13 @@ impl CollectionScopePhysicalOutcome {
     }
 
     /// A copied registration alone is not proof of the original member.
-    pub fn state_for_permit(&self, permit: &CollectionProcessPermit) -> Option<CollectionMemberPhysicalState> {
-        if !Arc::ptr_eq(&self.identity, &permit.inner.identity) { return None; }
+    pub fn state_for_permit(
+        &self,
+        permit: &CollectionProcessPermit,
+    ) -> Option<CollectionMemberPhysicalState> {
+        if !Arc::ptr_eq(&self.identity, &permit.inner.identity) {
+            return None;
+        }
         let (registration, state) = self.members.get(permit.index)?;
         (permit.inner.members.get(permit.index)?.registration == *registration).then_some(*state)
     }
@@ -235,8 +257,10 @@ impl CollectionProcessScope {
             && !self.inner.members.is_empty()
             && self.inner.members.iter().all(|member| {
                 let r = member.registration;
-                r.authority == authority && r.original_deadline == deadline
-                    && r.input_lock == input_lock && r.root_admission == root_admission
+                r.authority == authority
+                    && r.original_deadline == deadline
+                    && r.input_lock == input_lock
+                    && r.root_admission == root_admission
                     && r.root_budget == root_budget
                     && member.state.load(Ordering::Acquire) == UNISSUED
             })
@@ -351,7 +375,10 @@ impl CollectionProcessScope {
         for member in &self.inner.members {
             // An in-flight spawn stays pending until its actual owner settles it.
             let _ = member.worker_state.compare_exchange(
-                WORKER_UNSTARTED, WORKER_NO_THREAD, Ordering::AcqRel, Ordering::Acquire,
+                WORKER_UNSTARTED,
+                WORKER_NO_THREAD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             );
             let mut observed = member.state.load(Ordering::Acquire);
             loop {
@@ -361,7 +388,10 @@ impl CollectionProcessScope {
                     _ => break,
                 };
                 match member.state.compare_exchange_weak(
-                    observed, no_child, Ordering::AcqRel, Ordering::Acquire,
+                    observed,
+                    no_child,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 ) {
                     Ok(_) => break,
                     Err(actual) => observed = actual,
@@ -371,63 +401,102 @@ impl CollectionProcessScope {
     }
 
     /// Read-only member states. They do not by themselves certify closure.
-    pub fn physical_states(&self) -> Vec<(TeacherWorkerRegistration, CollectionMemberPhysicalState)> {
-        self.inner.members.iter().map(|member| {
-            (member.registration, physical_state(member.state.load(Ordering::Acquire)))
-        }).collect()
+    pub fn physical_states(
+        &self,
+    ) -> Vec<(TeacherWorkerRegistration, CollectionMemberPhysicalState)> {
+        self.inner
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.registration,
+                    physical_state(member.state.load(Ordering::Acquire)),
+                )
+            })
+            .collect()
     }
 
     pub fn worker_states(&self) -> Vec<(TeacherWorkerRegistration, CollectionMemberWorkerState)> {
-        self.inner.members.iter().map(|member| {
-            let state = match member.worker_state.load(Ordering::Acquire) {
-                WORKER_UNSTARTED => CollectionMemberWorkerState::Unstarted,
-                WORKER_STARTING => CollectionMemberWorkerState::Starting,
-                WORKER_STARTED => CollectionMemberWorkerState::Started,
-                WORKER_JOINED => CollectionMemberWorkerState::Joined,
-                WORKER_NO_THREAD => CollectionMemberWorkerState::NoThread,
-                _ => CollectionMemberWorkerState::Unknown,
-            };
-            (member.registration, state)
-        }).collect()
+        self.inner
+            .members
+            .iter()
+            .map(|member| {
+                let state = match member.worker_state.load(Ordering::Acquire) {
+                    WORKER_UNSTARTED => CollectionMemberWorkerState::Unstarted,
+                    WORKER_STARTING => CollectionMemberWorkerState::Starting,
+                    WORKER_STARTED => CollectionMemberWorkerState::Started,
+                    WORKER_JOINED => CollectionMemberWorkerState::Joined,
+                    WORKER_NO_THREAD => CollectionMemberWorkerState::NoThread,
+                    _ => CollectionMemberWorkerState::Unknown,
+                };
+                (member.registration, state)
+            })
+            .collect()
     }
 
-    pub fn try_worker_retirement(&self) -> Result<Option<CollectionScopeWorkerOutcome>, CheckerError> {
-        if !self.inner.closed.load(Ordering::Acquire) { return Ok(None); }
-        let members = self.worker_states();
-        if members.iter().any(|(_, state)| *state == CollectionMemberWorkerState::Unknown) {
-            return Err(CheckerError::Invalid("Collection worker ownership unknown"));
-        }
-        if members.iter().any(|(_, state)| !matches!(state,
-            CollectionMemberWorkerState::Joined | CollectionMemberWorkerState::NoThread)) {
+    pub fn try_worker_retirement(
+        &self,
+    ) -> Result<Option<CollectionScopeWorkerOutcome>, CheckerError> {
+        if !self.inner.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
-        self.inner.worker_outcome_issued.compare_exchange(
-            false, true, Ordering::AcqRel, Ordering::Acquire,
-        ).map_err(|_| CheckerError::Invalid("Collection worker outcome already issued"))?;
-        Ok(Some(CollectionScopeWorkerOutcome { identity: Arc::clone(&self.inner.identity), members }))
+        let members = self.worker_states();
+        if members
+            .iter()
+            .any(|(_, state)| *state == CollectionMemberWorkerState::Unknown)
+        {
+            return Err(CheckerError::Invalid("Collection worker ownership unknown"));
+        }
+        if members.iter().any(|(_, state)| {
+            !matches!(
+                state,
+                CollectionMemberWorkerState::Joined | CollectionMemberWorkerState::NoThread
+            )
+        }) {
+            return Ok(None);
+        }
+        self.inner
+            .worker_outcome_issued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CheckerError::Invalid("Collection worker outcome already issued"))?;
+        Ok(Some(CollectionScopeWorkerOutcome {
+            identity: Arc::clone(&self.inner.identity),
+            members,
+        }))
     }
 
     /// Issue the original closed roster only after every member has a stable
     /// no-child or physical completion outcome. Pending or quarantined members
     /// never become a successful proof. At most one snapshot can be issued.
-    pub fn try_physical_retirement(&self) -> Result<Option<CollectionScopePhysicalOutcome>, CheckerError> {
+    pub fn try_physical_retirement(
+        &self,
+    ) -> Result<Option<CollectionScopePhysicalOutcome>, CheckerError> {
         if !self.inner.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
         let members = self.physical_states();
-        if members.iter().any(|(_, state)| *state == CollectionMemberPhysicalState::Quarantined) {
-            return Err(CheckerError::Invalid("Collection process member is quarantined"));
-        }
-        if members.iter().any(|(_, state)| matches!(state,
-            CollectionMemberPhysicalState::Unissued
-                | CollectionMemberPhysicalState::Issued
-                | CollectionMemberPhysicalState::AcquisitionPending))
+        if members
+            .iter()
+            .any(|(_, state)| *state == CollectionMemberPhysicalState::Quarantined)
         {
+            return Err(CheckerError::Invalid(
+                "Collection process member is quarantined",
+            ));
+        }
+        if members.iter().any(|(_, state)| {
+            matches!(
+                state,
+                CollectionMemberPhysicalState::Unissued
+                    | CollectionMemberPhysicalState::Issued
+                    | CollectionMemberPhysicalState::AcquisitionPending
+            )
+        }) {
             return Ok(None);
         }
-        self.inner.physical_outcome_issued.compare_exchange(
-            false, true, Ordering::AcqRel, Ordering::Acquire,
-        ).map_err(|_| CheckerError::Invalid("Collection physical outcome already issued"))?;
+        self.inner
+            .physical_outcome_issued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CheckerError::Invalid("Collection physical outcome already issued"))?;
         Ok(Some(CollectionScopePhysicalOutcome {
             identity: Arc::clone(&self.inner.identity),
             manifest: self.inner.manifest,
@@ -469,7 +538,10 @@ impl CollectionProcessPermit {
     }
 
     pub fn member_witness(&self) -> CollectionProcessMemberWitness {
-        CollectionProcessMemberWitness { identity: Arc::clone(&self.inner.identity), index: self.index }
+        CollectionProcessMemberWitness {
+            identity: Arc::clone(&self.inner.identity),
+            index: self.index,
+        }
     }
 
     /// The unique reservation precedes thread creation. Closing the scope and
@@ -479,10 +551,18 @@ impl CollectionProcessPermit {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(CheckerError::Invalid("Collection worker scope closed"));
         }
-        self.inner.members[self.index].worker_state.compare_exchange(
-            WORKER_UNSTARTED, WORKER_STARTING, Ordering::AcqRel, Ordering::Acquire,
-        ).map_err(|_| CheckerError::Invalid("Collection worker already reserved"))?;
-        let reservation = CollectionWorkerReservation { permit: Some(self.clone()) };
+        self.inner.members[self.index]
+            .worker_state
+            .compare_exchange(
+                WORKER_UNSTARTED,
+                WORKER_STARTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| CheckerError::Invalid("Collection worker already reserved"))?;
+        let reservation = CollectionWorkerReservation {
+            permit: Some(self.clone()),
+        };
         if self.inner.closed.load(Ordering::Acquire) {
             reservation.cancel_before_spawn();
             return Err(CheckerError::Invalid("Collection worker scope closed"));
@@ -518,7 +598,9 @@ pub(super) struct CollectionWorkerReservation {
 }
 impl CollectionWorkerReservation {
     pub(super) fn spawn_allowed(&self) -> bool {
-        self.permit.as_ref().is_some_and(|permit| !permit.inner.closed.load(Ordering::Acquire))
+        self.permit
+            .as_ref()
+            .is_some_and(|permit| !permit.inner.closed.load(Ordering::Acquire))
     }
     pub(super) fn cancel_before_spawn(mut self) {
         self.finish_no_thread();
@@ -528,9 +610,16 @@ impl CollectionWorkerReservation {
     }
     fn finish_no_thread(&mut self) {
         if let Some(permit) = self.permit.take() {
-            if permit.inner.members[permit.index].worker_state.compare_exchange(
-                WORKER_STARTING, WORKER_NO_THREAD, Ordering::AcqRel, Ordering::Acquire,
-            ).is_err() {
+            if permit.inner.members[permit.index]
+                .worker_state
+                .compare_exchange(
+                    WORKER_STARTING,
+                    WORKER_NO_THREAD,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
                 quarantine_worker(&permit);
             }
         }
@@ -539,17 +628,28 @@ impl CollectionWorkerReservation {
     /// An impossible state mismatch is quarantined and still retains the lease.
     pub(super) fn spawn_succeeded(mut self) -> CollectionWorkerLease {
         let permit = self.permit.take().expect("live worker reservation");
-        if permit.inner.members[permit.index].worker_state.compare_exchange(
-            WORKER_STARTING, WORKER_STARTED, Ordering::AcqRel, Ordering::Acquire,
-        ).is_err() {
+        if permit.inner.members[permit.index]
+            .worker_state
+            .compare_exchange(
+                WORKER_STARTING,
+                WORKER_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
             quarantine_worker(&permit);
         }
-        CollectionWorkerLease { permit: Some(permit) }
+        CollectionWorkerLease {
+            permit: Some(permit),
+        }
     }
 }
 impl Drop for CollectionWorkerReservation {
     fn drop(&mut self) {
-        if let Some(permit) = self.permit.take() { quarantine_worker(&permit); }
+        if let Some(permit) = self.permit.take() {
+            quarantine_worker(&permit);
+        }
     }
 }
 
@@ -561,25 +661,39 @@ pub(super) struct CollectionWorkerLease {
 impl CollectionWorkerLease {
     pub(super) fn joined(mut self) -> Result<CollectionWorkerJoinedWitness, CheckerError> {
         let permit = self.permit.take().expect("live worker lease");
-        if permit.inner.members[permit.index].worker_state.compare_exchange(
-            WORKER_STARTED, WORKER_JOINED, Ordering::AcqRel, Ordering::Acquire,
-        ).is_err() {
+        if permit.inner.members[permit.index]
+            .worker_state
+            .compare_exchange(
+                WORKER_STARTED,
+                WORKER_JOINED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
             quarantine_worker(&permit);
-            return Err(CheckerError::Invalid("Collection worker join state changed"));
+            return Err(CheckerError::Invalid(
+                "Collection worker join state changed",
+            ));
         }
         Ok(CollectionWorkerJoinedWitness {
-            identity: Arc::clone(&permit.inner.identity), index: permit.index,
+            identity: Arc::clone(&permit.inner.identity),
+            index: permit.index,
         })
     }
 }
 impl Drop for CollectionWorkerLease {
     fn drop(&mut self) {
-        if let Some(permit) = self.permit.take() { quarantine_worker(&permit); }
+        if let Some(permit) = self.permit.take() {
+            quarantine_worker(&permit);
+        }
     }
 }
 
 fn quarantine_worker(permit: &CollectionProcessPermit) {
-    permit.inner.members[permit.index].worker_state.store(WORKER_UNKNOWN, Ordering::Release);
+    permit.inner.members[permit.index]
+        .worker_state
+        .store(WORKER_UNKNOWN, Ordering::Release);
     permit.inner._global.quarantine();
 }
 
@@ -716,7 +830,9 @@ mod tests {
     fn worker_spawn_racing_close_remains_pending_until_join() {
         let gate = Arc::new(Gate::default());
         let member = registration(1);
-        let scope = CollectionProcessScope::in_gate(Digest([9; 32]), vec![member], Arc::clone(&gate)).unwrap();
+        let scope =
+            CollectionProcessScope::in_gate(Digest([9; 32]), vec![member], Arc::clone(&gate))
+                .unwrap();
         let permit = scope.permit(Digest([9; 32]), member).unwrap();
         let id = permit.member_witness();
         let reservation = permit.reserve_worker().unwrap();
@@ -730,7 +846,10 @@ mod tests {
         let joined = lease.joined().unwrap();
         let roster = scope.try_worker_retirement().unwrap().unwrap();
         assert!(id.same_joined_member(&joined));
-        assert_eq!(id.state_in(&roster), Some(CollectionMemberWorkerState::Joined));
+        assert_eq!(
+            id.state_in(&roster),
+            Some(CollectionMemberWorkerState::Joined)
+        );
         assert!(scope.try_worker_retirement().is_err());
     }
 
@@ -738,15 +857,25 @@ mod tests {
     fn worker_only_explicit_failure_is_no_thread_and_abandoned_spawn_is_unknown() {
         let gate = Arc::new(Gate::default());
         let member = registration(1);
-        let scope = CollectionProcessScope::in_gate(Digest([9; 32]), vec![member], Arc::clone(&gate)).unwrap();
+        let scope =
+            CollectionProcessScope::in_gate(Digest([9; 32]), vec![member], Arc::clone(&gate))
+                .unwrap();
         let permit = scope.permit(Digest([9; 32]), member).unwrap();
         permit.reserve_worker().unwrap().spawn_failed();
         scope.close_admission();
-        assert_eq!(scope.try_worker_retirement().unwrap().unwrap().state_for_permit(&permit),
-            Some(CollectionMemberWorkerState::NoThread));
+        assert_eq!(
+            scope
+                .try_worker_retirement()
+                .unwrap()
+                .unwrap()
+                .state_for_permit(&permit),
+            Some(CollectionMemberWorkerState::NoThread)
+        );
         drop(permit);
         drop(scope);
-        let next = CollectionProcessScope::in_gate(Digest([9; 32]), vec![member], Arc::clone(&gate)).unwrap();
+        let next =
+            CollectionProcessScope::in_gate(Digest([9; 32]), vec![member], Arc::clone(&gate))
+                .unwrap();
         let permit = next.permit(Digest([9; 32]), member).unwrap();
         drop(permit.reserve_worker().unwrap());
         next.close_admission();
@@ -795,24 +924,36 @@ mod tests {
         let second = scope(&Arc::new(Gate::default()));
         let registration = registration(5);
         assert!(first.is_unissued_for_root(
-            registration.authority, registration.original_deadline,
-            registration.input_lock, registration.root_admission, registration.root_budget,
+            registration.authority,
+            registration.original_deadline,
+            registration.input_lock,
+            registration.root_admission,
+            registration.root_budget,
         ));
         assert!(!first.is_unissued_for_root(
-            registration.authority, registration.original_deadline,
-            registration.input_lock, registration.root_admission, Digest([99; 32]),
+            registration.authority,
+            registration.original_deadline,
+            registration.input_lock,
+            registration.root_admission,
+            Digest([99; 32]),
         ));
         let permit = first.permit(Digest([9; 32]), registration).unwrap();
         assert!(permit.belongs_to(&first));
         assert!(!permit.belongs_to(&second));
         assert!(!first.is_unissued_for_root(
-            registration.authority, registration.original_deadline,
-            registration.input_lock, registration.root_admission, registration.root_budget,
+            registration.authority,
+            registration.original_deadline,
+            registration.input_lock,
+            registration.root_admission,
+            registration.root_budget,
         ));
         drop(permit);
         assert!(!first.is_unissued_for_root(
-            registration.authority, registration.original_deadline,
-            registration.input_lock, registration.root_admission, registration.root_budget,
+            registration.authority,
+            registration.original_deadline,
+            registration.input_lock,
+            registration.root_admission,
+            registration.root_budget,
         ));
     }
     #[test]
@@ -962,9 +1103,15 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let scope = CollectionProcessScope::in_gate(
             Digest([9; 32]),
-            vec![registration(5), registration(6), registration(7), registration(8)],
+            vec![
+                registration(5),
+                registration(6),
+                registration(7),
+                registration(8),
+            ],
             Arc::clone(&gate),
-        ).unwrap();
+        )
+        .unwrap();
         let issued = scope.permit(Digest([9; 32]), registration(5)).unwrap();
         let acquired = scope.permit(Digest([9; 32]), registration(6)).unwrap();
         let confirmed = scope.permit(Digest([9; 32]), registration(7)).unwrap();
@@ -977,12 +1124,27 @@ mod tests {
         assert!(scope.try_physical_retirement().unwrap().is_none());
         finished_owner.complete_physical();
         drop(finished_owner);
-        let outcome = scope.try_physical_retirement().unwrap().expect("closed roster");
+        let outcome = scope
+            .try_physical_retirement()
+            .unwrap()
+            .expect("closed roster");
         assert!(outcome.belongs_to(&scope));
-        assert_eq!(outcome.state_for_permit(&issued), Some(CollectionMemberPhysicalState::IssuedNoChild));
-        assert_eq!(outcome.state_for_permit(&acquired), Some(CollectionMemberPhysicalState::AcquiredNoChild));
-        assert_eq!(outcome.state_for_permit(&confirmed), Some(CollectionMemberPhysicalState::PhysicallyConfirmed));
-        assert_eq!(outcome.members()[3].1, CollectionMemberPhysicalState::NeverIssuedNoChild);
+        assert_eq!(
+            outcome.state_for_permit(&issued),
+            Some(CollectionMemberPhysicalState::IssuedNoChild)
+        );
+        assert_eq!(
+            outcome.state_for_permit(&acquired),
+            Some(CollectionMemberPhysicalState::AcquiredNoChild)
+        );
+        assert_eq!(
+            outcome.state_for_permit(&confirmed),
+            Some(CollectionMemberPhysicalState::PhysicallyConfirmed)
+        );
+        assert_eq!(
+            outcome.members()[3].1,
+            CollectionMemberPhysicalState::NeverIssuedNoChild
+        );
         assert!(scope.try_physical_retirement().is_err());
         drop(scope);
         drop(issued);
@@ -1006,7 +1168,10 @@ mod tests {
         assert!(scope.try_physical_retirement().unwrap().is_none());
         drop(owner);
         assert!(scope.try_physical_retirement().is_err());
-        assert_eq!(scope.physical_states()[0].1, CollectionMemberPhysicalState::Quarantined);
+        assert_eq!(
+            scope.physical_states()[0].1,
+            CollectionMemberPhysicalState::Quarantined
+        );
         drop(scope);
         drop(permit);
         assert!(acquire(None, &gate).is_err());
@@ -1019,7 +1184,8 @@ mod tests {
         let permit = scope.permit(Digest([9; 32]), registration(5)).unwrap();
         let mut owner = acquire(Some(&permit), &gate).unwrap();
         scope.close_admission();
-        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.complete_physical()));
+        let failure =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.complete_physical()));
         assert!(failure.is_err());
         assert!(scope.try_physical_retirement().is_err());
         drop(owner);
@@ -1049,27 +1215,36 @@ mod tests {
                     release_rx.recv().unwrap();
                     owner.complete_physical();
                 }
-                Err(_) => { started_tx.send(false).unwrap(); }
+                Err(_) => {
+                    started_tx.send(false).unwrap();
+                }
             }
         });
         barrier.wait();
         scope.close_admission();
         let started = started_rx.recv().unwrap();
         let early = scope.try_physical_retirement().unwrap();
-        if started { assert!(early.is_none()); }
+        if started {
+            assert!(early.is_none());
+        }
         release_tx.send(()).unwrap_or(());
         worker.join().unwrap();
         let outcome = match early {
             Some(outcome) => outcome,
-            None => scope.try_physical_retirement().unwrap().expect("finished member"),
+            None => scope
+                .try_physical_retirement()
+                .unwrap()
+                .expect("finished member"),
         };
         let state = outcome.state_for_permit(&permit).unwrap();
         if started {
             assert_eq!(state, CollectionMemberPhysicalState::PhysicallyConfirmed);
         } else {
-            assert!(matches!(state,
+            assert!(matches!(
+                state,
                 CollectionMemberPhysicalState::IssuedNoChild
-                | CollectionMemberPhysicalState::AcquiredNoChild));
+                    | CollectionMemberPhysicalState::AcquiredNoChild
+            ));
         }
         assert!(acquire(Some(&permit), &gate).is_err());
     }

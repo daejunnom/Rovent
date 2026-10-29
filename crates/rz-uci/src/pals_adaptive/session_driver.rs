@@ -2719,9 +2719,11 @@ where
                     board_collection_v2_started = true;
                     self.admit_board_collection_v2(
                         &mut manager,
-                        root_admission.as_ref().ok_or(AdaptiveManagerError::Invalid(
-                            "V2 board root admission absent",
-                        ))?,
+                        root_admission
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "V2 board root admission absent",
+                            ))?,
                         profile,
                     )?;
                 }
@@ -2783,7 +2785,10 @@ where
                         if board_collection_v2_started {
                             if manager.phase() != ManagerPhase::Running {
                                 if !board_collection_v2_revoked {
-                                    if !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
+                                    if !self
+                                        .rovent_collection_revoke_v2
+                                        .swap(true, Ordering::AcqRel)
+                                    {
                                         if let Some(hooks) = &self.rovent_collection_hooks_v2 {
                                             hooks.revoke();
                                         }
@@ -2830,13 +2835,23 @@ where
             Err(payload) => {
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 if board_collection_v2_started {
-                    self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
-                    if !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
+                    self.rovent_collection_panic_v2
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(payload);
+                    if !self
+                        .rovent_collection_revoke_v2
+                        .swap(true, Ordering::AcqRel)
+                    {
                         if let Some(hooks) = &self.rovent_collection_hooks_v2 {
-                            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
-                            // Both panic payloads can own resources. Retain a
-                            // second one independently if revocation panics.
-                                self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
+                            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke()))
+                            {
+                                // Both panic payloads can own resources. Retain a
+                                // second one independently if revocation panics.
+                                self.rovent_collection_panic_v2
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .push(payload);
                             }
                         }
                     }
@@ -2848,11 +2863,18 @@ where
             }
         };
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if board_collection_v2_started && !board_collection_v2_revoked
-            && !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
+        if board_collection_v2_started
+            && !board_collection_v2_revoked
+            && !self
+                .rovent_collection_revoke_v2
+                .swap(true, Ordering::AcqRel)
+        {
             if let Some(hooks) = &self.rovent_collection_hooks_v2 {
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
-                    self.rovent_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).push(payload);
+                    self.rovent_collection_panic_v2
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(payload);
                     *state = SessionState::Manager(manager);
                     return Err(SearchSessionFailure::physical_completion_unknown());
                 }
@@ -2906,12 +2928,17 @@ where
             // Get the nonblocking destination while the fenced manager still
             // owns the original observer. A panic retains both owners.
             let sender = match catch_unwind(AssertUnwindSafe(|| {
-                self.rovent_collection_hooks_v2.as_ref().expect("registered hook").handoff_sender()
+                self.rovent_collection_hooks_v2
+                    .as_ref()
+                    .expect("registered hook")
+                    .handoff_sender()
             })) {
                 Ok(sender) => sender,
                 Err(payload) => {
-                    self.rovent_collection_panic_v2.lock()
-                        .unwrap_or_else(|p| p.into_inner()).push(payload);
+                    self.rovent_collection_panic_v2
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(payload);
                     *state = SessionState::Manager(manager);
                     return Err(SearchSessionFailure::physical_completion_unknown());
                 }
@@ -2924,17 +2951,30 @@ where
                 }
             };
             let handoff = Arc::new(Mutex::new(RoventBoardCollectionHandoffV2 {
-                admission, observer, settlement, native_fence,
-                teacher_physical_ack: None, teacher_aggregate_ack: None,
+                admission,
+                observer,
+                settlement,
+                native_fence,
+                teacher_physical_ack: None,
+                teacher_aggregate_ack: None,
             }));
-            *self.rovent_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()) =
-                Some(Arc::clone(&handoff));
+            *self
+                .rovent_collection_handoff_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
             let delivery = match sender.try_send(handoff) {
                 Ok(()) => RoventBoardCollectionDeliveryV2::Delivered,
-                Err(std::sync::mpsc::TrySendError::Full(_)) => RoventBoardCollectionDeliveryV2::Full,
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => RoventBoardCollectionDeliveryV2::Disconnected,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    RoventBoardCollectionDeliveryV2::Full
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    RoventBoardCollectionDeliveryV2::Disconnected
+                }
             };
-            *self.rovent_collection_delivery_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(delivery);
+            *self
+                .rovent_collection_delivery_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(delivery);
             // Delivery or the native fence is not teacher retirement. The
             // same handoff remains retained even if the channel is full or
             // disconnected; neither condition permits a successful result.
@@ -3336,26 +3376,39 @@ where
             // A native process fence cannot attest the separately owned V2
             // teacher. Until a same-owner retirement handoff exists, do not
             // detach or discard the manager's original collection observer.
-            if !self.rovent_collection_revoke_v2.swap(true, Ordering::AcqRel) {
+            if !self
+                .rovent_collection_revoke_v2
+                .swap(true, Ordering::AcqRel)
+            {
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
-                    self.rovent_collection_panic_v2.lock()
-                        .unwrap_or_else(|poison| poison.into_inner()).push(payload);
+                    self.rovent_collection_panic_v2
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(payload);
                 }
             }
             // Only the complete scope aggregate can establish child and
             // worker retirement. A raw physical ACK stays in the original
             // handoff, so its owner can use it to form that aggregate.
-            let mut retained_ack = self.rovent_collection_teacher_aggregate_ack_v2.try_lock()
+            let mut retained_ack = self
+                .rovent_collection_teacher_aggregate_ack_v2
+                .try_lock()
                 .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
-            let transferred = self.rovent_collection_handoff_transferred_v2.try_lock()
+            let transferred = self
+                .rovent_collection_handoff_transferred_v2
+                .try_lock()
                 .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
-            let handoff = transferred.as_ref()
+            let handoff = transferred
+                .as_ref()
                 .and_then(std::sync::Weak::upgrade)
                 .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
             if retained_ack.is_none() {
-                let mut original = handoff.try_lock()
+                let mut original = handoff
+                    .try_lock()
                     .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
-                let ack = original.teacher_aggregate_ack.take()
+                let ack = original
+                    .teacher_aggregate_ack
+                    .take()
                     .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
                 if !ack.matches_admission(&original.admission) {
                     original.teacher_aggregate_ack = Some(ack);
@@ -3812,16 +3865,27 @@ where
             let collection_owners = (
                 self.rovent_collection_origin_v2.take(),
                 self.rovent_collection_hooks_v2.take(),
-                self.rovent_collection_failure_v2.get_mut()
-                    .unwrap_or_else(|poison| poison.into_inner()).take(),
-                self.rovent_collection_handoff_v2.get_mut()
-                    .unwrap_or_else(|poison| poison.into_inner()).take(),
-                self.rovent_collection_handoff_transferred_v2.get_mut()
-                    .unwrap_or_else(|poison| poison.into_inner()).take(),
-                self.rovent_collection_teacher_aggregate_ack_v2.get_mut()
-                    .unwrap_or_else(|poison| poison.into_inner()).take(),
-                std::mem::take(self.rovent_collection_panic_v2.get_mut()
-                    .unwrap_or_else(|poison| poison.into_inner())),
+                self.rovent_collection_failure_v2
+                    .get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+                self.rovent_collection_handoff_v2
+                    .get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+                self.rovent_collection_handoff_transferred_v2
+                    .get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+                self.rovent_collection_teacher_aggregate_ack_v2
+                    .get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+                std::mem::take(
+                    self.rovent_collection_panic_v2
+                        .get_mut()
+                        .unwrap_or_else(|poison| poison.into_inner()),
+                ),
             );
             std::mem::forget(collection_owners);
             let storage = self

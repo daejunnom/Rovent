@@ -5,8 +5,9 @@
 //! neither reads a newer Search question nor regenerates an input on the manager.
 
 use crate::pals_native::ticketed::{
-    NativeTicketQuestion, TicketExecutionEvidence, TicketNativeBackend, TicketPhysicalResult,
-    TicketPreparation, TicketOwnerDispatchContext, TicketNativeObservationFailure,
+    NativeTicketQuestion, TicketExecutionEvidence, TicketNativeBackend,
+    TicketNativeObservationFailure, TicketOwnerDispatchContext, TicketPhysicalResult,
+    TicketPreparation,
 };
 use rz_contracts::pals::RepresentationKey;
 use rz_contracts::pals_adaptive::RoleTicketEnvelope;
@@ -208,10 +209,12 @@ where
         }
         let projected = match context.project(&prepared.question, &prepared.prepared) {
             Ok(projected) => projected,
-            Err(error) => return TicketPhysicalResult {
-                physical: PhysicalRoleCompletion::Confirmed,
-                output: Err(error),
-            },
+            Err(error) => {
+                return TicketPhysicalResult {
+                    physical: PhysicalRoleCompletion::Confirmed,
+                    output: Err(error),
+                };
+            }
         };
         self.last_executed = Some(*ticket);
         self.backend.run_owned(projected, canceled)

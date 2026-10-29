@@ -205,7 +205,9 @@ impl RoventCorpusProducerLockV2 {
         if let Err(error) = self.admission.try_validate_ticket(ticket) {
             return if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV2::Busy {
                 Ok(None)
-            } else { Err(invalid(error.error.to_string())) };
+            } else {
+                Err(invalid(error.error.to_string()))
+            };
         }
         let mut reservation = self.original.reserve_input(context, lineage)?;
         reservation.producer_owner = Some(std::sync::Arc::clone(&self.producer_owner));
@@ -223,9 +225,10 @@ impl RoventCorpusProducerLockV2 {
             self.validate_admission(input.admission())?;
             let captured = input.captured();
             check(
-                captured.producer_owner.as_ref().is_some_and(|owner| {
-                    std::sync::Arc::ptr_eq(owner, &self.producer_owner)
-                }),
+                captured
+                    .producer_owner
+                    .as_ref()
+                    .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, &self.producer_owner)),
                 "lock-v2 captured input belongs to another original producer",
             )?;
             let key = (

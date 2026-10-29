@@ -315,7 +315,13 @@ pub struct RoventCollectionRootAdmissionV2 {
 /// a rejected, expired, malformed, or poisoned original authority.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoventTicketValidationKindV2 { Busy, Revoked, Poisoned, Invalid, Expired }
+pub enum RoventTicketValidationKindV2 {
+    Busy,
+    Revoked,
+    Poisoned,
+    Invalid,
+    Expired,
+}
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub struct RoventTicketValidationErrorV2 {
@@ -329,7 +335,9 @@ impl RoventCollectionRootAdmissionV2 {
     /// Consume the original one-shot claim without creating a teacher scope.
     /// No compliant teacher scope was issued for this Start; this says nothing
     /// about teacher success or any unrelated OS process.
-    pub fn seal_unclaimed_teacher_scope(&self) -> Result<RoventTeacherScopePhysicalAckV2, AdaptiveCollectionError> {
+    pub fn seal_unclaimed_teacher_scope(
+        &self,
+    ) -> Result<RoventTeacherScopePhysicalAckV2, AdaptiveCollectionError> {
         if !self.root_admission.claim_teacher_scope_once() {
             return Err(reject("teacher scope was already claimed or sealed"));
         }
@@ -342,25 +350,51 @@ impl RoventCollectionRootAdmissionV2 {
     /// Claim this exact live root's sole teacher process scope. A claim is
     /// never reissued, including after failed or physically unknown work.
     /// Do all reversible roster/source preflight before calling this method.
-    pub fn claim_teacher_scope(&self, scope: rz_search::external_cpu::process_scope::CollectionProcessScope)
-        -> Result<RoventTeacherScopeCapabilityV2, RoventTeacherScopeClaimFailureV2> {
+    pub fn claim_teacher_scope(
+        &self,
+        scope: rz_search::external_cpu::process_scope::CollectionProcessScope,
+    ) -> Result<RoventTeacherScopeCapabilityV2, RoventTeacherScopeClaimFailureV2> {
         match self.root_admission.original_context().accepts() {
             Ok(true) => {}
-            Ok(false) => return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim { error: reject("teacher scope root is revoked"), scope }),
-            Err(error) => return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim { error: reject(error.to_string()), scope }),
+            Ok(false) => {
+                return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim {
+                    error: reject("teacher scope root is revoked"),
+                    scope,
+                });
+            }
+            Err(error) => {
+                return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim {
+                    error: reject(error.to_string()),
+                    scope,
+                });
+            }
         }
         let root_digest = match self.root_admission.descriptor().digest() {
             Ok(digest) => digest,
-            Err(error) => return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim { error: reject(error.to_string()), scope }),
+            Err(error) => {
+                return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim {
+                    error: reject(error.to_string()),
+                    scope,
+                });
+            }
         };
         if !scope.is_unissued_for_root(
-            self.root_admission.authority(), self.root_admission.hard_deadline(),
-            self.root_admission.startup_lock_digest(), root_digest, self.root_budget,
+            self.root_admission.authority(),
+            self.root_admission.hard_deadline(),
+            self.root_admission.startup_lock_digest(),
+            root_digest,
+            self.root_budget,
         ) {
-            return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim { error: reject("teacher scope is shared, used, closed, or belongs to another root"), scope });
+            return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim {
+                error: reject("teacher scope is shared, used, closed, or belongs to another root"),
+                scope,
+            });
         }
         if !self.root_admission.claim_teacher_scope_once() {
-            return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim { error: reject("teacher scope already claimed for this original root"), scope });
+            return Err(RoventTeacherScopeClaimFailureV2::BeforeClaim {
+                error: reject("teacher scope already claimed for this original root"),
+                scope,
+            });
         }
         let capability = RoventTeacherScopeCapabilityV2 {
             admission: self.clone(),
@@ -370,8 +404,18 @@ impl RoventCollectionRootAdmissionV2 {
         };
         match self.root_admission.original_context().accepts() {
             Ok(true) => {}
-            Ok(false) => return Err(RoventTeacherScopeClaimFailureV2::AfterClaim { error: reject("teacher scope root revoked during claim"), capability }),
-            Err(error) => return Err(RoventTeacherScopeClaimFailureV2::AfterClaim { error: reject(error.to_string()), capability }),
+            Ok(false) => {
+                return Err(RoventTeacherScopeClaimFailureV2::AfterClaim {
+                    error: reject("teacher scope root revoked during claim"),
+                    capability,
+                });
+            }
+            Err(error) => {
+                return Err(RoventTeacherScopeClaimFailureV2::AfterClaim {
+                    error: reject(error.to_string()),
+                    capability,
+                });
+            }
         }
         Ok(capability)
     }
@@ -580,8 +624,15 @@ impl RoventCollectionRootAdmissionV2 {
         &self,
         verifier: &rz_search::pals::coordinator::NativeAcceptanceVerifier,
     ) -> Result<(), AdaptiveCollectionError> {
-        if !self.original.original._original_verifier.same_owner(verifier) {
-            return Err(reject("native verifier is not the original /2 worker verifier"));
+        if !self
+            .original
+            .original
+            ._original_verifier
+            .same_owner(verifier)
+        {
+            return Err(reject(
+                "native verifier is not the original /2 worker verifier",
+            ));
         }
         Ok(())
     }
@@ -614,7 +665,9 @@ impl RoventCollectionRootAdmissionV2 {
             || ticket.view.root_state != self.root_state
             || ticket.role == Role::Validator
         {
-            return Err(reject("discard ticket is outside the original /2 worker or root"));
+            return Err(reject(
+                "discard ticket is outside the original /2 worker or root",
+            ));
         }
         Ok(())
     }
@@ -643,32 +696,64 @@ impl RoventCollectionRootAdmissionV2 {
     /// Nonblocking equivalent of `validate_ticket`: the same original root,
     /// cancellation, control deadline and ticket checks remain mandatory.
     /// Busy means no claim was made and may be retried while the root lives.
-    pub fn try_validate_ticket(&self, ticket: &RoleTicketEnvelope) -> Result<(), RoventTicketValidationErrorV2> {
-        let fail = |kind, message| RoventTicketValidationErrorV2 { kind, error: reject(message), source: None };
+    pub fn try_validate_ticket(
+        &self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<(), RoventTicketValidationErrorV2> {
+        let fail = |kind, message| RoventTicketValidationErrorV2 {
+            kind,
+            error: reject(message),
+            source: None,
+        };
         let context = self.root_admission.original_context();
         let current = context.current.try_lock().map_err(|error| {
             let (kind, code, message) = match error {
-                std::sync::TryLockError::WouldBlock => (RoventTicketValidationKindV2::Busy, rz_contracts::ErrorCode::ResourceExhausted, "UCI search authority is busy"),
-                std::sync::TryLockError::Poisoned(_) => (RoventTicketValidationKindV2::Poisoned, rz_contracts::ErrorCode::BackendFailure, "UCI search authority poisoned"),
+                std::sync::TryLockError::WouldBlock => (
+                    RoventTicketValidationKindV2::Busy,
+                    rz_contracts::ErrorCode::ResourceExhausted,
+                    "UCI search authority is busy",
+                ),
+                std::sync::TryLockError::Poisoned(_) => (
+                    RoventTicketValidationKindV2::Poisoned,
+                    rz_contracts::ErrorCode::BackendFailure,
+                    "UCI search authority poisoned",
+                ),
             };
-            let source = rz_contracts::ContractError::new(code, rz_contracts::Stage::Admission, message);
-            RoventTicketValidationErrorV2 { kind, error: reject(source.to_string()), source: Some(source) }
+            let source =
+                rz_contracts::ContractError::new(code, rz_contracts::Stage::Admission, message);
+            RoventTicketValidationErrorV2 {
+                kind,
+                error: reject(source.to_string()),
+                source: Some(source),
+            }
         })?;
         if *current != crate::contracts::SessionScope::Search(context.authority)
             || context.cancellation.is_canceled()
-            || context.control.cancellation.load(std::sync::atomic::Ordering::Acquire)
+            || context
+                .control
+                .cancellation
+                .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(fail(RoventTicketValidationKindV2::Revoked, "native ticket original authority revoked"));
+            return Err(fail(
+                RoventTicketValidationKindV2::Revoked,
+                "native ticket original authority revoked",
+            ));
         }
         if std::time::Instant::now() >= context.control.deadline {
-            return Err(fail(RoventTicketValidationKindV2::Expired, "native ticket original authority expired"));
+            return Err(fail(
+                RoventTicketValidationKindV2::Expired,
+                "native ticket original authority expired",
+            ));
         }
         if ticket.authority != self.root_admission.authority()
             || ticket.original_deadline != self.root_admission.hard_deadline()
             || ticket.view.root_state != self.root_state
             || ticket.role == Role::Validator
         {
-            return Err(fail(RoventTicketValidationKindV2::Invalid, "native ticket is outside the original admitted /2 Collection root"));
+            return Err(fail(
+                RoventTicketValidationKindV2::Invalid,
+                "native ticket is outside the original admitted /2 Collection root",
+            ));
         }
         Ok(())
     }
@@ -747,7 +832,9 @@ impl RoventTeacherScopePhysicalAckV2 {
     }
 
     /// None is the sealed no-scope outcome, not a process-exit report.
-    pub fn scope_outcome(&self) -> Option<&rz_search::external_cpu::process_scope::CollectionScopePhysicalOutcome> {
+    pub fn scope_outcome(
+        &self,
+    ) -> Option<&rz_search::external_cpu::process_scope::CollectionScopePhysicalOutcome> {
         match &self.evidence {
             TeacherScopePhysicalEvidenceV2::NoScope => None,
             TeacherScopePhysicalEvidenceV2::Scope(outcome) => Some(outcome),
@@ -801,10 +888,14 @@ impl RoventTeacherScopeCapabilityV2 {
     pub fn close(&self) -> Result<(), AdaptiveCollectionError> {
         let slot = self.scope.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Settled, "TeacherScopeBusy", "teacher scope close is temporarily busy",
+                AdaptiveCollectionStage::Settled,
+                "TeacherScopeBusy",
+                "teacher scope close is temporarily busy",
             ),
             std::sync::TryLockError::Poisoned(_) => AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Settled, "TeacherScopePoisoned", "teacher scope close is poisoned",
+                AdaptiveCollectionStage::Settled,
+                "TeacherScopePoisoned",
+                "teacher scope close is poisoned",
             ),
         })?;
         if let Some(scope) = slot.as_ref() {
@@ -817,21 +908,36 @@ impl RoventTeacherScopeCapabilityV2 {
     /// actual member reaches no-child or physically confirmed status. Pending
     /// stays pending and quarantine remains an error. Releasing this scope
     /// does not release any still-retained permit or certify teacher success.
-    pub fn try_physical_retirement(&self) -> Result<Option<RoventTeacherScopePhysicalAckV2>, AdaptiveCollectionError> {
+    pub fn try_physical_retirement(
+        &self,
+    ) -> Result<Option<RoventTeacherScopePhysicalAckV2>, AdaptiveCollectionError> {
         let mut slot = self.scope.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Settled, "TeacherScopeBusy", "teacher scope retirement is temporarily busy",
+                AdaptiveCollectionStage::Settled,
+                "TeacherScopeBusy",
+                "teacher scope retirement is temporarily busy",
             ),
             std::sync::TryLockError::Poisoned(_) => AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Settled, "TeacherScopePoisoned", "teacher scope retirement is poisoned",
+                AdaptiveCollectionStage::Settled,
+                "TeacherScopePoisoned",
+                "teacher scope retirement is poisoned",
             ),
         })?;
-        let scope = slot.as_ref().ok_or_else(|| reject("teacher scope retirement already issued"))?;
-        let Some(outcome) = scope.try_physical_retirement().map_err(|error| reject(error.to_string()))? else {
+        let scope = slot
+            .as_ref()
+            .ok_or_else(|| reject("teacher scope retirement already issued"))?;
+        let Some(outcome) = scope
+            .try_physical_retirement()
+            .map_err(|error| reject(error.to_string()))?
+        else {
             return Ok(None);
         };
-        self.physical_issued.store(true, std::sync::atomic::Ordering::Release);
-        if self.worker_issued.load(std::sync::atomic::Ordering::Acquire) {
+        self.physical_issued
+            .store(true, std::sync::atomic::Ordering::Release);
+        if self
+            .worker_issued
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             drop(slot.take());
         }
         Ok(Some(RoventTeacherScopePhysicalAckV2 {
@@ -842,33 +948,60 @@ impl RoventTeacherScopeCapabilityV2 {
 
     /// Independently issue the same scope's worker roster after actual joins
     /// or confirmed no-thread outcomes. It is not terminal or physical proof.
-    pub fn try_worker_retirement(&self) -> Result<Option<RoventTeacherScopeWorkerAckV2>, AdaptiveCollectionError> {
+    pub fn try_worker_retirement(
+        &self,
+    ) -> Result<Option<RoventTeacherScopeWorkerAckV2>, AdaptiveCollectionError> {
         let mut slot = self.scope.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Settled, "TeacherScopeBusy", "teacher worker retirement is temporarily busy",
+                AdaptiveCollectionStage::Settled,
+                "TeacherScopeBusy",
+                "teacher worker retirement is temporarily busy",
             ),
             std::sync::TryLockError::Poisoned(_) => AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Settled, "TeacherScopePoisoned", "teacher worker retirement is poisoned",
+                AdaptiveCollectionStage::Settled,
+                "TeacherScopePoisoned",
+                "teacher worker retirement is poisoned",
             ),
         })?;
-        let scope = slot.as_ref().ok_or_else(|| reject("teacher scope retirement already issued"))?;
-        let Some(outcome) = scope.try_worker_retirement().map_err(|error| reject(error.to_string()))? else {
+        let scope = slot
+            .as_ref()
+            .ok_or_else(|| reject("teacher scope retirement already issued"))?;
+        let Some(outcome) = scope
+            .try_worker_retirement()
+            .map_err(|error| reject(error.to_string()))?
+        else {
             return Ok(None);
         };
-        self.worker_issued.store(true, std::sync::atomic::Ordering::Release);
-        if self.physical_issued.load(std::sync::atomic::Ordering::Acquire) {
+        self.worker_issued
+            .store(true, std::sync::atomic::Ordering::Release);
+        if self
+            .physical_issued
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             drop(slot.take());
         }
-        Ok(Some(RoventTeacherScopeWorkerAckV2 { admission: self.admission.clone(), outcome }))
+        Ok(Some(RoventTeacherScopeWorkerAckV2 {
+            admission: self.admission.clone(),
+            outcome,
+        }))
     }
 
     pub fn permit(
         &self,
         manifest: Digest,
         registration: rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration,
-    ) -> Result<rz_search::external_cpu::process_scope::CollectionProcessPermit, rz_search::cpu_checker::CheckerError> {
-        let slot = self.scope.try_lock().map_err(|_| rz_search::cpu_checker::CheckerError::Invalid("teacher scope permit unavailable"))?;
-        let scope = slot.as_ref().ok_or(rz_search::cpu_checker::CheckerError::Invalid("teacher scope closed"))?;
+    ) -> Result<
+        rz_search::external_cpu::process_scope::CollectionProcessPermit,
+        rz_search::cpu_checker::CheckerError,
+    > {
+        let slot = self.scope.try_lock().map_err(|_| {
+            rz_search::cpu_checker::CheckerError::Invalid("teacher scope permit unavailable")
+        })?;
+        let scope = slot
+            .as_ref()
+            .ok_or(rz_search::cpu_checker::CheckerError::Invalid(
+                "teacher scope closed",
+            ))?;
         scope.permit(manifest, registration)
     }
 
@@ -876,13 +1009,32 @@ impl RoventTeacherScopeCapabilityV2 {
         &'a self,
         admission: &RoventCollectionRootAdmissionV2,
         permit: &rz_search::external_cpu::process_scope::CollectionProcessPermit,
-    ) -> Result<std::sync::MutexGuard<'a, Option<rz_search::external_cpu::process_scope::CollectionProcessScope>>, AdaptiveCollectionError> {
-        let slot = self.scope.try_lock().map_err(|_| reject("teacher scope spawn unavailable"))?;
-        let scope = slot.as_ref().ok_or_else(|| reject("teacher scope closed"))?;
-        if !self.matches_admission(admission) || !permit.belongs_to(scope)
-            || !self.admission.root_admission.original_context().try_accepts().map_err(|e| reject(e.to_string()))?
+    ) -> Result<
+        std::sync::MutexGuard<
+            'a,
+            Option<rz_search::external_cpu::process_scope::CollectionProcessScope>,
+        >,
+        AdaptiveCollectionError,
+    > {
+        let slot = self
+            .scope
+            .try_lock()
+            .map_err(|_| reject("teacher scope spawn unavailable"))?;
+        let scope = slot
+            .as_ref()
+            .ok_or_else(|| reject("teacher scope closed"))?;
+        if !self.matches_admission(admission)
+            || !permit.belongs_to(scope)
+            || !self
+                .admission
+                .root_admission
+                .original_context()
+                .try_accepts()
+                .map_err(|e| reject(e.to_string()))?
         {
-            return Err(reject("teacher scope is closed, stale, or has a different root"));
+            return Err(reject(
+                "teacher scope is closed, stale, or has a different root",
+            ));
         }
         Ok(slot)
     }
