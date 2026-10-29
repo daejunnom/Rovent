@@ -686,6 +686,8 @@ where
     rovent_collection_failure_v2: Mutex<Option<RoventBoardCollectionAdmissionFailureV2>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     rovent_collection_panic_v2: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    rovent_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>>>,
     latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
     #[cfg(feature = "pals-adaptive")]
     latest_rovent_root_v2: Mutex<Option<Arc<RoventNativeRootReceiptV2>>>,
@@ -1478,6 +1480,8 @@ where
             rovent_collection_failure_v2: Mutex::new(None),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             rovent_collection_panic_v2: Mutex::new(Vec::new()),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            rovent_collection_handoff_v2: Mutex::new(None),
             latest_rovent_root: Mutex::new(None),
             #[cfg(feature = "pals-adaptive")]
             latest_rovent_root_v2: Mutex::new(None),
@@ -2869,9 +2873,35 @@ where
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if board_collection_v2_started {
-            // The native root fence does not attest the separate teacher's
-            // retirement. Keep the original manager and observer until the
-            // matching cross-owner handoff supplies that proof.
+            // Get the nonblocking destination while the fenced manager still
+            // owns the original observer. A panic retains both owners.
+            let sender = match catch_unwind(AssertUnwindSafe(|| {
+                self.rovent_collection_hooks_v2.as_ref().expect("registered hook").handoff_sender()
+            })) {
+                Ok(sender) => sender,
+                Err(payload) => {
+                    self.rovent_collection_panic_v2.lock()
+                        .unwrap_or_else(|p| p.into_inner()).push(payload);
+                    *state = SessionState::Manager(manager);
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+            };
+            let (admission, observer, settlement) = match manager.take_collection_observer_v2() {
+                Ok(Some(original)) => original,
+                _ => {
+                    *state = SessionState::Manager(manager);
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+            };
+            let handoff = Arc::new(Mutex::new(RoventBoardCollectionHandoffV2 {
+                admission, observer, settlement, native_fence: receipt.clone(),
+            }));
+            *self.rovent_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(Arc::clone(&handoff));
+            let _delivery = sender.try_send(handoff);
+            // Delivery or the native fence is not teacher retirement. The
+            // same handoff remains retained even if the channel is full or
+            // disconnected; neither condition permits a successful result.
             *state = SessionState::Manager(manager);
             return Err(SearchSessionFailure::physical_completion_unknown());
         }
@@ -3265,6 +3295,17 @@ where
         until: Instant,
     ) -> Result<AdaptiveSessionProcessReceipt, SearchSessionFailure> {
         self.closed.store(true, Ordering::Release);
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(hooks) = &self.rovent_collection_hooks_v2 {
+            // A native process fence cannot attest the separately owned V2
+            // teacher. Until a same-owner retirement handoff exists, do not
+            // detach or discard the manager's original collection observer.
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hooks.revoke())) {
+                self.rovent_collection_panic_v2.lock()
+                    .unwrap_or_else(|poison| poison.into_inner()).push(payload);
+            }
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
         let mut state = self
             .state
             .try_lock()
@@ -3710,6 +3751,8 @@ where
                 self.rovent_collection_origin_v2.take(),
                 self.rovent_collection_hooks_v2.take(),
                 self.rovent_collection_failure_v2.get_mut()
+                    .unwrap_or_else(|poison| poison.into_inner()).take(),
+                self.rovent_collection_handoff_v2.get_mut()
                     .unwrap_or_else(|poison| poison.into_inner()).take(),
                 std::mem::take(self.rovent_collection_panic_v2.get_mut()
                     .unwrap_or_else(|poison| poison.into_inner())),

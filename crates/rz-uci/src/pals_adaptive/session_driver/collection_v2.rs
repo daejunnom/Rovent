@@ -4,7 +4,7 @@
 use super::*;
 use crate::pals_adaptive::AdaptiveSearchDriver as _;
 use crate::pals_adaptive::{
-    AdaptiveCollectionObserverBoxV2, AdaptiveCollectionV2ObserverStatus,
+    AdaptiveCollectionError, AdaptiveCollectionObserverBoxV2, AdaptiveCollectionV2ObserverStatus,
     RoventCollectionRootAdmissionV2, RoventNativeCollectionOriginV2,
 };
 use std::any::Any;
@@ -16,6 +16,9 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// Bind the exact startup control without spawning or waiting.
+    fn register_startup_control(&self, control: &crate::rovent_bootstrap::RoventStartupControl)
+        -> Result<(), AdaptiveManagerError>;
     fn admit(
         &self,
         port: &mut RoventBoardCollectionAdmissionPortV2<'_, B>,
@@ -23,6 +26,38 @@ where
     ) -> Result<(), RoventBoardCollectionAdmissionFailureV2>;
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
+    fn handoff_sender(&self) -> std::sync::mpsc::SyncSender<
+        Arc<Mutex<RoventBoardCollectionHandoffV2<B::Output>>>,
+    >;
+}
+
+/// Native root completion and the original observer; this does not attest
+/// retirement of any separate teacher process.
+pub struct RoventBoardCollectionHandoffV2<O> {
+    pub(super) admission: RoventCollectionRootAdmissionV2,
+    pub(super) observer: AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
+    pub(super) settlement: Result<(), AdaptiveCollectionError>,
+    pub(super) native_fence: AdaptiveShutdownReceipt,
+}
+
+impl<O> RoventBoardCollectionHandoffV2<O> {
+    pub fn parts_mut(&mut self) -> (
+        &RoventCollectionRootAdmissionV2,
+        &mut AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
+        &Result<(), AdaptiveCollectionError>,
+        &AdaptiveShutdownReceipt,
+    ) {
+        (&self.admission, &mut self.observer, &self.settlement, &self.native_fence)
+    }
+
+    pub fn into_parts(self) -> (
+        RoventCollectionRootAdmissionV2,
+        AdaptiveCollectionObserverBoxV2<AdaptivePortQuestion, O>,
+        Result<(), AdaptiveCollectionError>,
+        AdaptiveShutdownReceipt,
+    ) {
+        (self.admission, self.observer, self.settlement, self.native_fence)
+    }
 }
 
 /// Preserve the original admission and every acquired owner on a failed hook.
