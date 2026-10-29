@@ -36,11 +36,15 @@ use std::{
 };
 
 pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
+/// Separate declaration for the original input-lock /2 Collection route.
+/// It cannot reconstruct a root admission or claim teacher completion.
+pub const ROVENT_COLLECTION_LOCK_V2_LAUNCH_PLAN: &str = "rz-rovent-collection-lock-v2-launch/1";
 mod cohort;
 mod cohort_audit;
 mod cohort_driver;
 mod cohort_prepare;
 mod intervention;
+mod pc_lock_v2;
 mod r_stream;
 mod resources;
 mod utility_stream;
@@ -55,6 +59,7 @@ pub use intervention::{
     RoventUtilityInterventionLaunchReceipt, run_rovent_utility_intervention,
     run_rovent_utility_intervention_from_cli,
 };
+pub use pc_lock_v2::{RoventPcCollectionRunV2, run_rovent_pc_collection_lock_v2};
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
@@ -249,6 +254,74 @@ pub struct RoventCollectionTeacherSlot {
     pub actor_id: String,
     pub source_index: usize,
     pub collection_owner: u32,
+}
+
+/// Explicit input-lock /2 caller configuration. The lock itself is checked
+/// against the manifest only inside the original UCI resource admission.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoventCollectionLockV2LaunchPlan {
+    pub schema: String,
+    pub manifest: RoventPublicationFile,
+    pub resource_plan: RoventPublicationFile,
+    pub metadata: RoventCollectionMetadata,
+    pub teacher_sources: Vec<RoventTeacherSourceSelection>,
+    pub teacher_slots: Vec<RoventCollectionTeacherSlot>,
+    pub teacher_constraint: ExternalGoConstraint,
+    pub teacher_soft_quantum_ns: u64,
+    pub maximum_roots: u16,
+    pub maximum_records: u64,
+    pub output_directory: PathBuf,
+    pub publication_timeout_ms: u64,
+}
+
+impl RoventCollectionLockV2LaunchPlan {
+    pub fn validate_registration(
+        &self,
+        manifest: &rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
+    ) -> Result<(), ArenaError> {
+        manifest.registration.validate()?;
+        self.manifest.validate()?;
+        self.resource_plan.validate()?;
+        check(
+            self.schema == ROVENT_COLLECTION_LOCK_V2_LAUNCH_PLAN
+                && manifest.schema == rz_experiments::rovent_corpus_lock_v2::record::ROVENT_CORPUS_MANIFEST_LOCK_V2_DOMAIN
+                && (1..=64).contains(&self.maximum_roots)
+                && (1..=8192).contains(&self.maximum_records)
+                && (1..=30_000).contains(&self.publication_timeout_ms)
+                && (1..=1_000_000_000).contains(&self.teacher_soft_quantum_ns)
+                && !self.teacher_slots.is_empty()
+                && self.teacher_slots.len() <= 16
+                && self.teacher_sources.len() == manifest.registration.teachers.len()
+                && self.teacher_slots.len() == manifest.registration.teachers.len()
+                && self.output_directory.is_absolute()
+                && self.output_directory.components().all(|part| matches!(part,
+                    Component::RootDir | Component::Prefix(_) | Component::Normal(_))),
+            "finite Collection /2 plan/teacher coverage/output path",
+        )?;
+        let mut actors = BTreeSet::new();
+        let mut slots = BTreeSet::new();
+        let mut owners = BTreeSet::new();
+        for binding in &self.teacher_slots {
+            check(
+                manifest.registration.teachers.contains_key(&binding.actor_id)
+                    && actors.insert(binding.actor_id.clone())
+                    && slots.insert(binding.source_index)
+                    && binding.collection_owner > 0
+                    && owners.insert(binding.collection_owner)
+                    && binding.source_index < self.teacher_sources.len()
+                    && self.teacher_sources[binding.source_index].index == binding.source_index,
+                "Collection /2 actor/source slot/worker owner coverage",
+            )?;
+        }
+        match self.teacher_constraint {
+            ExternalGoConstraint::Depth { depth } => check(depth > 0, "teacher depth")?,
+            ExternalGoConstraint::Nodes { reported_nodes } => check(reported_nodes > 0, "teacher nodes")?,
+            ExternalGoConstraint::Combined { depth, reported_nodes } => check(depth > 0 && reported_nodes > 0, "teacher combined limit")?,
+            ExternalGoConstraint::MoveTime { milliseconds } => check(milliseconds > 0, "teacher time")?,
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]

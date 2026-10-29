@@ -85,11 +85,32 @@ impl RoventCollectionOwnerLockV2 {
         let mut state = self.state.lock().map_err(|_| invalid("lock-v2 collection owner poisoned"))?;
         let root = row.admission.raw_sha256();
         if state.producer_root.as_deref() == Some(root) {
-            return action(state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?);
+            let producer = state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?;
+            producer.validate_admission(&row.admission)?;
+            return action(producer);
         }
         let (_, producer) = state.prior_producers.iter_mut().find(|(id, _)| id == root)
             .ok_or_else(|| invalid("lock-v2 retired row's original producer missing"))?;
+        producer.validate_admission(&row.admission)?;
         action(producer)
+    }
+
+    /// Mutate a row only through the producer that issued its original root.
+    /// On error the caller still owns the same row and all its evidence.
+    pub fn with_retired_producer_mut<T>(&self, row: &mut RoventRetiredLockV2Record,
+        action: impl FnOnce(&mut RoventCorpusProducerLockV2, &mut RoventRetiredLockV2Record)
+            -> Result<T, ArenaError>) -> Result<T, ArenaError> {
+        let mut state = self.state.lock().map_err(|_| invalid("lock-v2 collection owner poisoned"))?;
+        let root = row.admission.raw_sha256();
+        if state.producer_root.as_deref() == Some(root) {
+            let producer = state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?;
+            producer.validate_admission(&row.admission)?;
+            return action(producer, row);
+        }
+        let (_, producer) = state.prior_producers.iter_mut().find(|(id, _)| id == root)
+            .ok_or_else(|| invalid("lock-v2 retired row's original producer missing"))?;
+        producer.validate_admission(&row.admission)?;
+        action(producer, row)
     }
 
     pub fn take_retired(&self) -> Result<Option<RoventRetiredLockV2Record>, ArenaError> {
@@ -100,11 +121,36 @@ impl RoventCollectionOwnerLockV2 {
         Ok(self.state.lock().map_err(|_| invalid("lock-v2 collection owner poisoned"))?.failure.clone())
     }
 
+    /// Checked before launch while the original owner is idle. A busy or
+    /// poisoned observation does not create a collection failure or grant
+    /// authority to substitute another manifest.
+    pub(crate) fn matches_registration(
+        &self,
+        registration: &rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2,
+    ) -> Result<bool, ArenaError> {
+        let state = self.state.try_lock().map_err(|_| invalid("lock-v2 owner registration unavailable"))?;
+        Ok(&state.manifest.registration == registration)
+    }
+
     /// A local collection-status observation, never a teacher retirement,
     /// physical fence, corpus publication or trainer admission certificate.
     pub fn status(&self) -> Result<RoventCollectionOwnerStatusLockV2, ArenaError> {
         let state = self.state.lock().map_err(|_| invalid("lock-v2 collection owner poisoned"))?;
-        Ok(RoventCollectionOwnerStatusLockV2 {
+        Ok(self.status_from(&state))
+    }
+
+    /// Contention is an unavailable snapshot, not an observation failure.
+    /// Poison is an error and neither case creates physical-completion proof.
+    pub fn try_status(&self) -> Result<Option<RoventCollectionOwnerStatusLockV2>, ArenaError> {
+        match self.state.try_lock() {
+            Ok(state) => Ok(Some(self.status_from(&state))),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(invalid("lock-v2 collection owner poisoned")),
+        }
+    }
+
+    fn status_from(&self, state: &State) -> RoventCollectionOwnerStatusLockV2 {
+        RoventCollectionOwnerStatusLockV2 {
             admitted: state.admitted, settled: state.settled,
             pending_count: state.pending.len(), pending_retired_count: state.retired.len(),
             incomplete_capture_count: state.producer.as_ref().map_or(0, |producer| producer.incomplete_capture_count()),
@@ -113,7 +159,7 @@ impl RoventCollectionOwnerLockV2 {
             retained_failed_captures: state.failed_captures.len(),
             failure: state.failure.clone(),
             callback_lock_failure: self.callback_lock_failure.load(Ordering::Acquire),
-        })
+        }
     }
 }
 

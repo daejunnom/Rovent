@@ -1079,6 +1079,13 @@ pub use native_capture::*;
 mod observer;
 #[cfg(feature = "pals-collection-onnx")]
 mod observer_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod pc_hooks_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+#[allow(unused_imports)]
+pub(super) use pc_hooks_lock_v2::{
+    RoventPcCollectionBridgeV2, RoventPcCollectionWorkerExitV2, RoventPcCollectionWorkerV2,
+};
 #[cfg(feature = "pals-collection-onnx")]
 pub use observer::*;
 #[cfg(feature = "pals-collection-onnx")]
@@ -1127,6 +1134,10 @@ pub use writer_v2::{FinishedRoventCorpusV2, RoventCorpusWriterV2};
 mod writer_lock_v2;
 #[cfg(target_os = "linux")]
 pub use writer_lock_v2::{FinishedRoventCorpusLockV2, RoventCorpusWriterLockV2};
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod publication_caller_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub use publication_caller_lock_v2::RoventCorpusAssemblyLockV2;
 mod historical_v2;
 mod submitted_review_historical;
 pub use historical_v2::verify_historical_submitted_record_evidence;
