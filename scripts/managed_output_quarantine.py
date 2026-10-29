@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -106,13 +107,47 @@ def _pin_shape(value, expected, maximum):
 class _Held:
     def __init__(self, seconds):
         _need(sys.platform == "linux" and 0 < seconds <= 30, "Linux custody observation requires a finite <=30s window")
-        self.until, self.fds, self.blobs = time.monotonic() + seconds, [], []
+        started = time.monotonic()
+        self._initialize(started, started + seconds)
+
+    @classmethod
+    def _for_bounded_session(cls, seconds, hard_until):
+        """Create an observation bounded by its explicitly supplied caller deadline."""
+        _need(sys.platform == "linux" and type(seconds) in (int, float)
+              and math.isfinite(seconds) and seconds > 0
+              and type(hard_until) in (int, float) and math.isfinite(hard_until),
+              "bounded custody observation requires finite positive bounds")
+        started = time.monotonic()
+        _need(started < hard_until, "original custody observation deadline expired")
+        held = cls.__new__(cls)
+        held._initialize(started, min(started + seconds, hard_until))
+        return held
+
+    def _initialize(self, started, until):
+        self.started, self.until, self.fds, self.blobs = started, until, [], []
         self.directories = {}
+        self._stage = "observation"
+
+    def mark_stage(self, stage):
+        _need(stage in {"directory", "metadata_read", "metadata_recheck", "mount_observation",
+                        "tree_snapshot", "observation_check", "registry_inventory", "output_accounting"},
+              "invalid custody observation stage")
+        self._stage = stage
 
     def tick(self):
-        _need(time.monotonic() < self.until, "original custody observation deadline expired")
+        now = time.monotonic()
+        if now >= self.until:
+            error = StorageError("original custody observation deadline expired")
+            error.custody_deadline_observation = {
+                "schema": "rovezero.custody-deadline-observation.v1",
+                "stage": self._stage,
+                "elapsed_seconds": round(max(0.0, now - self.started), 3),
+                "window_seconds": round(max(0.0, self.until - self.started), 3),
+            }
+            raise error
 
     def directory(self, path):
+        self.mark_stage("directory")
         self.tick()
         path = checked(path)
         if path in self.directories:
@@ -125,6 +160,7 @@ class _Held:
         return fd
 
     def read(self, pin, path, maximum):
+        self.mark_stage("metadata_read")
         self.tick()
         _pin_shape(pin, path, maximum)
         fd = os.open(checked(path), os.O_RDONLY | os.O_NOFOLLOW)
@@ -140,6 +176,7 @@ class _Held:
 
     def _bytes(self, fd, size):
         result, remaining = [], size
+        self.mark_stage("metadata_read")
         while remaining:
             self.tick()
             block = os.read(fd, min(65536, remaining))
@@ -150,6 +187,7 @@ class _Held:
         return b"".join(result)
 
     def check(self):
+        self.mark_stage("metadata_recheck")
         for path, fd, before, pin in self.blobs:
             self.tick()
             _need(_stamp(os.fstat(fd)) == before == _stamp(checked(path).lstat()), "held custody metadata identity changed")
@@ -191,7 +229,16 @@ def _kernel(held, path, maximum):
         _close_fd(fd, sys.exc_info()[1])
 
 
+def _mark_stage(held, stage):
+    """Keep the existing tick() contract for observation implementations."""
+    marker = getattr(held, "mark_stage", None)
+    if marker is not None:
+        marker(stage)
+
+
 def _mounts(held, parent, target, device):
+    _mark_stage(held, "mount_observation")
+    held.tick()
     raw = _kernel(held, Path("/proc/self/mountinfo"), SNAPSHOT_LIMIT)
     namespace = os.stat("/proc/self/ns/mnt")  # A named kernel namespace link, never target data.
     rows = []
@@ -232,6 +279,8 @@ def _mounts(held, parent, target, device):
 
 
 def _snapshot(held, target, fd):
+    _mark_stage(held, "tree_snapshot")
+    held.tick()
     root = os.fstat(fd)
     device, seen, entries, regular_bytes = root.st_dev, set(), [], 0
     encoded_bound = 1024  # Conservative fixed header/numeric overhead.
@@ -307,6 +356,7 @@ class _Observed:
         self.check()
 
     def check(self):
+        _mark_stage(self.held, "observation_check")
         self.held.tick()
         _need(_did(os.fstat(self.parent_fd)) == _did(checked(self.target.parent).lstat()) == self.parent_identity, "custody parent FD/name changed")
         _need(_did(os.fstat(self.fd)) == _did(os.stat(self.target.name, dir_fd=self.parent_fd, follow_symlinks=False))
@@ -316,6 +366,8 @@ class _Observed:
 
 
 def _registry(held, catalog, complete=True):
+    _mark_stage(held, "registry_inventory")
+    held.tick()
     root = registry_path(catalog)
     try:
         info = root.lstat()
@@ -391,13 +443,17 @@ class QuarantineValidation:
         self.guard.assert_held()
 
     def usage(self, rows):
+        _mark_stage(self.held, "output_accounting")
+        self.held.tick()
         charges = {record.key: record.charge_bytes for record in self.records}
         _need(set(charges) <= {row["key"] for _, row, _ in rows}, "quarantined original row disappeared")
         total = self.registry_bytes
         for _, row, target in rows:
             amount = charges.get(row["key"])
             if amount is None:
+                self.held.tick()
                 amount = tree_size(target, allow_disappearing=True)
+                self.held.tick()
                 _need(amount <= row["reserved_bytes"], "managed output exceeds reservation")
             total += amount
         _need(total <= 18 * GiB, "custody charges and registry exceed 18GiB")

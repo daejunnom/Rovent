@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -41,6 +42,27 @@ def _emit_storage_cleanup_failure(error):
     except BaseException:
         # The operation already failed. Diagnostic encoding/writing cannot
         # replace its original exception, including KeyboardInterrupt.
+        pass
+
+
+def _emit_custody_deadline_observation(error):
+    """Report bounded timings without paths, content, or replacing the error."""
+    try:
+        observation = getattr(error, "custody_deadline_observation", None)
+        if (type(observation) is not dict
+                or set(observation) != {"schema", "stage", "elapsed_seconds", "window_seconds"}
+                or observation["schema"] != "rovezero.custody-deadline-observation.v1"
+                or observation["stage"] not in {"observation", "directory", "metadata_read",
+                    "metadata_recheck", "mount_observation", "tree_snapshot", "observation_check",
+                    "registry_inventory", "output_accounting"}
+                or any(type(observation[key]) not in (int, float) or not math.isfinite(observation[key])
+                       or observation[key] < 0
+                       for key in ("elapsed_seconds", "window_seconds"))):
+            return
+        print("custody_deadline_observation=" + json.dumps(
+            observation, sort_keys=True, separators=(",", ":"), allow_nan=False), file=sys.stderr)
+    except BaseException:
+        # Diagnostics must never alter process supervision or recovery.
         pass
 
 
@@ -106,6 +128,7 @@ def main(*, output_preservation=None) -> int:
         print("managed_storage=" + json.dumps(receipt, sort_keys=True), file=sys.stderr)
         if budget_failure is not None:
             _emit_storage_failure_observation(budget_failure)
+            _emit_custody_deadline_observation(budget_failure)
         return code
     except (StorageError, OSError, RuntimeError) as exc:
         try:
@@ -116,7 +139,9 @@ def main(*, output_preservation=None) -> int:
             pass
         if budget_failure is not None and budget_failure is not exc:
             _emit_storage_failure_observation(budget_failure)
+            _emit_custody_deadline_observation(budget_failure)
         _emit_storage_failure_observation(exc)
+        _emit_custody_deadline_observation(exc)
         return 125
 
 

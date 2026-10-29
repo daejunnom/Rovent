@@ -9,6 +9,9 @@ import json
 from pathlib import Path
 import os
 import sys
+import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -69,6 +72,43 @@ class PreservationPolicyShapeTests(unittest.TestCase):
         self.assertEqual(transitions.MAX_TRANSITIONS, 8)
         with self.assertRaisesRegex(StorageError, "bounded transition"):
             transitions._prefix("0" * 64 + "-" + "1" * 64, 9, "2" * 32)
+
+    def test_explicit_longer_session_requires_a_finite_future_caller_bound(self):
+        tips, pins = self.inputs()
+        deadline = time.monotonic() + 60
+        selection = session.PreservationSelection(
+            tips, pins, root_exclusive_writer=True, maximum_seconds=120,
+            observation_hard_until=deadline)
+        self.assertEqual(selection.maximum_seconds, 120)
+        self.assertEqual(selection.observation_hard_until, deadline)
+        for name, value in (("maximum_seconds", 240),
+                            ("observation_hard_until", deadline + 60),
+                            ("_window", (240, deadline + 60))):
+            with self.subTest(name=name), self.assertRaisesRegex(StorageError, "immutable"):
+                setattr(selection, name, value)
+        with self.assertRaisesRegex(StorageError, "immutable"):
+            del selection._window
+        for invalid in (True, float("nan"), float("inf"), time.monotonic() - 1):
+            with self.subTest(invalid=invalid), self.assertRaises(StorageError):
+                session.PreservationSelection(tips, pins, root_exclusive_writer=True,
+                    maximum_seconds=120, observation_hard_until=invalid)
+
+    def test_expired_selection_cannot_create_a_new_observation(self):
+        tips, pins = self.inputs()
+        deadline = time.monotonic() + 60
+        selection = session.PreservationSelection(
+            tips, pins, root_exclusive_writer=True, maximum_seconds=120,
+            observation_hard_until=deadline)
+        with tempfile.TemporaryDirectory() as name:
+            catalog = Path(name) / "catalog"
+            catalog.mkdir()
+            guard = SimpleNamespace(path=catalog / "catalog.lock", assert_held=lambda: None)
+            with patch.object(outputs, "canonical_catalog", return_value=catalog), \
+                    patch.object(session.sys, "platform", "linux"), \
+                    patch.object(session.time, "monotonic", return_value=deadline + 1):
+                with self.assertRaisesRegex(StorageError, "deadline expired"):
+                    session.observe_new_output(catalog, [], selection, guard,
+                                               output=Path(name) / "new-output", source=SCRIPTS)
 
     def test_optional_policy_cannot_open_a_separate_budget_ledger(self):
         tips, pins = self.inputs()

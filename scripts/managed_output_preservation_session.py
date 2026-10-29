@@ -42,11 +42,44 @@ def _source_paths():
 
 class PreservationSelection:
     """Copied raw input pins, never a current validation or admission token."""
+
+    __slots__ = ("_tips", "_sources", "_window")
+
+    def __setattr__(self, name, value):
+        if (name in ("maximum_seconds", "observation_hard_until")
+                or (name == "_window" and hasattr(self, "_window"))):
+            raise StorageError("original observation bounds are immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        if name in ("maximum_seconds", "observation_hard_until", "_window"):
+            raise StorageError("original observation bounds are immutable")
+        object.__delattr__(self, name)
+
+    @property
+    def maximum_seconds(self):
+        return self._window[0]
+
+    @property
+    def observation_hard_until(self):
+        return self._window[1]
+
     def __init__(self, historical_tips, current_source_pins, *,
-                 root_exclusive_writer=False, maximum_seconds=30):
+                 root_exclusive_writer=False, maximum_seconds=30,
+                 observation_hard_until=None):
         _need(root_exclusive_writer is True, "explicit exclusive Root preservation observation required")
         _need(type(maximum_seconds) in (int, float) and math.isfinite(maximum_seconds)
-              and 0 < maximum_seconds <= 30, "one finite preservation session <=30s required")
+              and 0 < maximum_seconds, "one finite positive preservation session required")
+        # A longer first observation is permitted only with an explicit
+        # caller-supplied monotonic bound. The default and all existing calls
+        # retain the 30-second limit; a live or expired view is never extended.
+        if observation_hard_until is None:
+            _need(maximum_seconds <= 30, "longer observation requires an explicit caller deadline")
+        else:
+            _need(type(observation_hard_until) in (int, float)
+                  and math.isfinite(observation_hard_until)
+                  and time.monotonic() < observation_hard_until,
+                  "future finite caller observation deadline required")
         _need(type(historical_tips) in (tuple, list)
               and 0 < len(historical_tips) <= custody.MAX_RUNS,
               "explicit bounded historical tip pins required")
@@ -54,7 +87,7 @@ class PreservationSelection:
               "explicit current source6 pins required")
         self._tips = tuple(copy.deepcopy(pin) for pin in historical_tips)
         self._sources = copy.deepcopy(current_source_pins)
-        self.maximum_seconds = maximum_seconds
+        self._window = (maximum_seconds, observation_hard_until)
         # Shape validation is not evidence that any pathname was inspected.
         for pin in self._tips:
             _need(type(pin) is dict and type(pin.get("path")) is str,
@@ -332,7 +365,10 @@ def observe_new_output(catalog, rows, selection, guard, *, output, source, produ
     _need(output.is_absolute() and source.is_absolute(), "exact new output/source required")
     if producer_record is None:
         _need(not output.exists(), "only a fresh output may start a preservation session")
-    held = custody._Held(selection.maximum_seconds)
+    held = (custody._Held(selection.maximum_seconds)
+            if selection.observation_hard_until is None
+            else custody._Held._for_bounded_session(selection.maximum_seconds,
+                                                     selection.observation_hard_until))
     try:
         # This is a historical parser, not validate_transitions and never a
         # current-tip capability. Its returned flag is not modified or handed
