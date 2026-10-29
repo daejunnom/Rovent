@@ -157,8 +157,12 @@ impl RoventCorpusWriterLockV2 {
         Ok(Some(RoventChunkPacket { declaration, bytes }))
     }
 
-    /// Retain the writer on failure so its original source snapshots and
-    /// pending data remain available to the caller.
+    /// Finalize only the accumulated row/index assembly. This is not proof
+    /// that the collection, actor fence, or teacher work completed; the
+    /// returned value is partial evidence until the original lifecycle owner
+    /// separately supplies a completion capability. Retain the writer on
+    /// failure so its original source snapshots and pending data remain
+    /// available to the caller.
     pub fn finish(self) -> Result<FinishedRoventCorpusLockV2, Box<(ArenaError, Self)>> {
         let result = (|| {
             check(self.buffer.is_empty() && self.index.record_count > 0
@@ -173,7 +177,8 @@ impl RoventCorpusWriterLockV2 {
     }
 }
 
-/// Issued only by the writer after consuming original opaque rows. It cannot
+/// Issued only by the writer after consuming original opaque rows. This is a
+/// partial assembled corpus, not evidence of whole-run completion; it cannot
 /// restore live admission, acceptance, or physical-completion authority.
 pub struct FinishedRoventCorpusLockV2 {
     manifest: RoventCorpusManifestLockV2,
@@ -185,7 +190,12 @@ impl FinishedRoventCorpusLockV2 {
     pub fn manifest(&self) -> &RoventCorpusManifestLockV2 { &self.manifest }
     pub fn index(&self) -> &RoventCorpusIndexLockV2 { &self.index }
 
-    pub fn publish_atomic(
+    // The original session owner has not yet supplied an unforgeable actor
+    // fence and teacher-terminal completion capability. Keep this internal
+    // until the lifecycle owner consumes and checks that capability; callers
+    // can still retain the writer, chunks, and individual retired rows.
+    #[allow(dead_code)]
+    pub(crate) fn publish_atomic(
         &self,
         directory: &cap_std::fs::Dir,
         until: std::time::Instant,

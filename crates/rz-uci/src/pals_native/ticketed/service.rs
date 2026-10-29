@@ -103,6 +103,46 @@ pub struct TicketPhysicalResult<O> {
     pub physical: PhysicalRoleCompletion,
     pub output: Result<O, RoleFailure>,
 }
+
+/// A collection/semantic report, separate from the owner's physical result.
+/// At most two reports can accompany a backend callback; neither is proof of
+/// acceptance, NN completion, or a physical fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketNativeObservationStage {
+    Submitted,
+    Completed,
+    Retired,
+    Retrieval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketNativeObservationDisposition {
+    Observation,
+    RequiredAfterPhysical,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketNativeObservationFailure {
+    pub ticket: RoleTicketEnvelope,
+    pub stage: TicketNativeObservationStage,
+    pub disposition: TicketNativeObservationDisposition,
+    pub cause: RoleFailure,
+}
+
+/// Bounded observations carried atomically with their original physical
+/// terminal. Empty is the compatibility default for existing backends.
+#[derive(Default, Debug)]
+pub struct TicketNativeObservationFailures {
+    entries: [Option<TicketNativeObservationFailure>; 2],
+}
+impl TicketNativeObservationFailures {
+    pub fn iter(&self) -> impl Iterator<Item = &TicketNativeObservationFailure> {
+        self.entries.iter().flatten()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+}
 /// Unknown measurement is neither completed-input zero nor logical consumption.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TicketExecutionEvidence {
@@ -208,6 +248,12 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
     fn execution_evidence(&mut self, _: &RoleTicketEnvelope) -> Option<TicketExecutionEvidence> {
         None
     }
+    /// At most two separately retained failures from the immediately preceding
+    /// run, accept or discard callback. Backends must retain its original cause
+    /// and must not use this to downgrade physical or pre-execution failures.
+    fn take_observation_failure(&mut self) -> Option<TicketNativeObservationFailure> {
+        None
+    }
     /// Only a manager acknowledgement reaches this callback. A backend may
     /// register a seed only in the namespace of this original ticket/query.
     fn accept(
@@ -226,6 +272,33 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
     }
     /// True requires the actual physical fence and worker join, not a timeout.
     fn finish(&mut self, until: Instant) -> bool;
+}
+
+fn take_observation_failures<V, Q, B: TicketNativeBackend<V, Q>>(
+    backend: &mut B,
+    ticket: RoleTicketEnvelope,
+) -> TicketNativeObservationFailures {
+    let mut failures = TicketNativeObservationFailures::default();
+    for entry in &mut failures.entries {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.take_observation_failure()
+        })) {
+            Ok(Some(failure)) => *entry = Some(failure),
+            Ok(None) => break,
+            Err(_) => {
+                *entry = Some(TicketNativeObservationFailure {
+                    ticket,
+                    stage: TicketNativeObservationStage::Retrieval,
+                    disposition: TicketNativeObservationDisposition::RequiredAfterPhysical,
+                    cause: RoleFailure::Backend(
+                        "observation failure retrieval panicked; original report unavailable".into(),
+                    ),
+                });
+                break;
+            }
+        }
+    }
+    failures
 }
 
 /// Produced only by the owner after root cancellation, physical completion and
@@ -316,6 +389,8 @@ pub enum TicketNativeEvent<O> {
         /// Actual owner run section, including admission/transfer/fence/decode;
         /// excludes preparation/queue wait and is not pure NN kernel time.
         owner_service_elapsed: Option<Duration>,
+        /// Recorded independently from, and inseparably with, this terminal.
+        observation_failures: TicketNativeObservationFailures,
     },
     Rejected {
         preparation: PreparationId,
@@ -327,6 +402,7 @@ pub enum TicketNativeEvent<O> {
         result: Result<(), RoleFailure>,
         native_receipt: Option<NativeAcceptanceReceipt>,
         rejected_permit: Option<NativeAcceptancePermit>,
+        observation_failures: TicketNativeObservationFailures,
     },
     AcceptanceRejected {
         preparation: PreparationId,
@@ -1495,6 +1571,11 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                     output = Err(RoleFailure::Expired);
                 }
                 value.completed = physical == PhysicalRoleCompletion::Confirmed;
+                let observation_failures = if service_started.is_some() {
+                    take_observation_failures::<V, Q, B>(&mut backend, ticket)
+                } else {
+                    TicketNativeObservationFailures::default()
+                };
                 let _ = events.send(TicketNativeEvent::Completed {
                     completion: RoleCompletion {
                         ticket,
@@ -1507,6 +1588,7 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                         invoked: service_started.is_some(),
                     },
                     owner_service_elapsed: service_started.map(|started| started.elapsed()),
+                    observation_failures,
                 });
                 if physical == PhysicalRoleCompletion::Unknown {
                     quarantine(backend, held, commands, &shared);
@@ -1566,6 +1648,7 @@ fn acknowledge<V, Q, B: TicketNativeBackend<V, Q>>(
     if accepted {
         value.ack_attempted = true;
     }
+    let mut backend_called = false;
     let result = if accepted {
         if value.canceled.load(Ordering::Acquire)
             || shared.closed.load(Ordering::Acquire)
@@ -1584,13 +1667,20 @@ fn acknowledge<V, Q, B: TicketNativeBackend<V, Q>>(
             }) {
                 Err(RoleFailure::InvalidOutput)
             } else {
+                backend_called = true;
                 backend.accept(&ticket, &value.question, &value.prepared, output)
             }
         } else {
             Err(RoleFailure::InvalidOutput)
         }
     } else {
+        backend_called = true;
         backend.discard(&ticket)
+    };
+    let observation_failures = if backend_called {
+        take_observation_failures::<V, Q, B>(backend, ticket)
+    } else {
+        TicketNativeObservationFailures::default()
     };
     if !accepted || result.is_ok() {
         held.remove(&id);
@@ -1608,6 +1698,7 @@ fn acknowledge<V, Q, B: TicketNativeBackend<V, Q>>(
         },
         rejected_permit: permit,
         result,
+        observation_failures,
     };
     // An acknowledgement can partially record telemetry before failing. It is
     // attempted once, preserving input/output until explicit discard or the

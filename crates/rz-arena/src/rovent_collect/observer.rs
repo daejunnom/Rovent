@@ -500,6 +500,17 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
         event: &TicketNativeEvent<O>,
     ) -> Result<(), AdaptiveCollectionError> {
         self.apply(AdaptiveCollectionStage::NativeEvent, |state| {
+            // Record terminal observation failures even if capture draining is
+            // unavailable. The original native event is still processed by the
+            // manager independently of this collection-only failure.
+            let failed_observation = match event {
+                TicketNativeEvent::Completed { observation_failures, .. }
+                | TicketNativeEvent::Retired { observation_failures, .. } => !observation_failures.is_empty(),
+                _ => false,
+            };
+            if failed_observation {
+                return state.producer.observe_native_event(event);
+            }
             state.drain_captures()?;
             state.producer.observe_native_event(event)?;
             if let TicketNativeEvent::Retired {

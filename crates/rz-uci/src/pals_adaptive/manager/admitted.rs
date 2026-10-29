@@ -129,6 +129,7 @@ where
             failures: VecDeque::with_capacity(64),
             quarantine_rejections: Vec::with_capacity(16),
             retained_native_completions: Vec::with_capacity(limits.role_tickets_max),
+            native_observation_failures: Vec::new(),
             quarantined_cpu_receipts: Vec::with_capacity(8),
             quarantined_foreign_receipts: Vec::with_capacity(1),
             ready_ids: Vec::with_capacity(limits.waiting_jobs_max),

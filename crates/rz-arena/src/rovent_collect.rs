@@ -252,6 +252,7 @@ pub struct RoventCorpusProducer {
     reserved: BTreeSet<u64>,
     pending: BTreeMap<(u64, u64), Pending>,
     retired: BTreeSet<(u64, u64)>,
+    native_observation_failures: BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
 }
 impl RoventCorpusProducer {
     fn validate_admission(
@@ -282,6 +283,7 @@ impl RoventCorpusProducer {
             reserved: BTreeSet::new(),
             pending: BTreeMap::new(),
             retired: BTreeSet::new(),
+            native_observation_failures: BTreeMap::new(),
         })
     }
     pub fn manifest(&self) -> &RoventCorpusManifest {
@@ -289,6 +291,10 @@ impl RoventCorpusProducer {
     }
     pub fn incomplete_capture_count(&self) -> usize {
         self.reserved.len() + self.pending.len()
+    }
+    pub fn native_observation_failures(&self, id: RequestId)
+        -> Option<&[rz_uci::pals_native::ticketed::TicketNativeObservationFailure]> {
+        self.native_observation_failures.get(&id).map(Vec::as_slice)
     }
     pub fn submitted_input_seal(
         &self,
@@ -393,6 +399,23 @@ impl RoventCorpusProducer {
         &mut self,
         event: &TicketNativeEvent<O>,
     ) -> Result<(), ArenaError> {
+        let terminal = match event {
+            TicketNativeEvent::Completed { completion, observation_failures, .. } =>
+                Some((completion.ticket, observation_failures)),
+            TicketNativeEvent::Retired { ticket, observation_failures, .. } =>
+                Some((*ticket, observation_failures)),
+            _ => None,
+        };
+        if let Some((ticket, failures)) = terminal {
+            if !failures.is_empty() {
+                check(self.native_observation_failures.len() < MAX_CORPUS_ROWS
+                    || self.native_observation_failures.contains_key(&ticket.id),
+                    "native observation failure evidence cap")?;
+                let retained = self.native_observation_failures.entry(ticket.id).or_default();
+                retained.extend(failures.iter().cloned());
+                return Err(invalid(format!("original native observation failed: {retained:?}")));
+            }
+        }
         if let TicketNativeEvent::Retired {
             ticket,
             accepted: false,
@@ -416,6 +439,7 @@ impl RoventCorpusProducer {
             evidence,
             owner_run,
             owner_service_elapsed,
+            ..
         } = event
         else {
             return Ok(());
@@ -554,6 +578,8 @@ impl RoventCorpusProducer {
         acceptance_kind: &str,
     ) -> Result<RoventRetiredRecord, ArenaError> {
         self.validate_admission(admission)?;
+        check(!self.native_observation_failures.contains_key(&t.id),
+            "native observation failed for original retirement")?;
         let key = (t.id.epoch.0, t.id.sequence);
         let pending = self
             .pending

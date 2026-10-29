@@ -86,7 +86,7 @@ impl HistoricalCollectionMetadata {
             ancestor_index_sha256: m.ancestor_index_sha256.clone(),
         }
     }
-    fn submitted(m: &RoventCorpusManifestV2) -> Self {
+    pub(super) fn submitted(m: &RoventCorpusManifestV2) -> Self {
         // E's explicitly named projection shares registration validation only.
         // Its temporary schema is never retained, encoded or hashed here.
         Self::legacy(&m.common_registration_projection())
@@ -100,6 +100,16 @@ pub(super) struct HistoricalIndexMetadata {
     canonical_sha256: String,
 }
 impl HistoricalIndexMetadata {
+    /// Projection of an already validated original index; never a new codec
+    /// or a replacement for that index's domain-specific canonical digest.
+    pub(super) fn from_validated_parts(
+        record_count: u64,
+        chunks: Vec<RoventCorpusChunk>,
+        origins: Vec<RoventCorpusOrigin>,
+        canonical_sha256: String,
+    ) -> Self {
+        Self { record_count, chunks, origins, canonical_sha256 }
+    }
     /// Compatibility query of the already checked original family seal. This
     /// common metadata has no serializer and never computes a legacy digest.
     pub(super) fn sha256(&self) -> Result<String, rz_experiments::ManifestError> {
@@ -376,7 +386,7 @@ pub(super) fn validate_original_ancestry(
 }
 /// Pure parent-admission audit. It does not modify either closed codec or
 /// rewrite a historical inherited-training declaration to make it pass.
-fn audit_original_ancestry(
+pub(super) fn audit_original_ancestry(
     manifest: &HistoricalCollectionMetadata,
     index: &HistoricalIndexMetadata,
     ancestors: &[(

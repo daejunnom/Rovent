@@ -323,6 +323,49 @@ class RecoveredChildContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cyclic, foreign, or incomplete"):
                 child._intake(startup, object())
 
+    def test_historical_intake_dispatches_original_families_without_retagging(self):
+        from rz_pals_model import rovent_corpus_codec as codecs
+        from rz_pals_model import rovent_historical_corpus as historical
+        from rz_pals_model.rovent_training_bootstrap import PinnedReadBudget
+        from test_rovent_historical_corpus import synthetic_submitted, write_publication, write_submitted_publication
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            old_registration, old_publication, _, _, _, _ = write_publication(root / "old")
+            old_owner = historical.HistoricalRoventCorpus.from_registration(old_registration,
+                read_budget=historical.HistoricalReadBudget(8 * 1024**2))
+            source = synthetic_submitted()
+            source[1]["ancestor_index_sha256"] = [old_owner.corpus.index_semantic_sha256]
+            new_registration, new_publication, _, _, _, _ = write_submitted_publication(root / "new", source=source)
+            startup = {"registration": {"current_dataset": new_registration,
+                                        "ancestor_datasets": [old_registration]}}
+            reads = PinnedReadBudget(16 * 1024**2, until_ns=2, clock=lambda: 1)
+            owner, ancestors, by_publication = child._intake(startup, reads)
+            self.assertIs(owner.corpus._codec, codecs.SUBMITTED_CODEC)
+            self.assertIs(ancestors[0].corpus._codec, codecs.LEGACY_CODEC)
+            self.assertEqual(owner.corpus.index_semantic_sha256, new_publication["canonical_index_sha256"])
+            self.assertEqual(ancestors[0].corpus.index_semantic_sha256, old_publication["canonical_index_sha256"])
+            self.assertEqual(set(by_publication), {old_registration["publication"]["sha256"],
+                                                   new_registration["publication"]["sha256"]})
+            self.assertFalse(owner.observation()["execution_authorized"])
+            self.assertFalse(owner.observation()["past_native_authority_reissued"])
+            self.assertFalse(owner.observation()["past_physical_completion_reissued"])
+
+    def test_publication_metadata_rejects_unknown_family_before_manifest_read(self):
+        from rz_pals_model.rovent_corpus import CorpusLimits
+        class Reads:
+            def __init__(self):
+                self.calls = 0
+            def json(self, _pin, *, maximum):
+                self.calls += 1
+                if self.calls > 1:
+                    raise AssertionError("unknown publication must not read its manifest")
+                return {"schema": "rz-rovent-corpus-publication-lock-v2/1"}
+        reads = Reads()
+        with self.assertRaisesRegex(ValueError, "unsupported.*publication"):
+            child._publication_metadata({"publication": {}, "root": "/unused"}, reads, CorpusLimits())
+        self.assertEqual(reads.calls, 1)
+
     def test_unrelated_registered_ancestor_is_not_silently_added_to_current_lineage(self):
         from rz_pals_model.rovent_historical_corpus import HistoricalRoventCorpus
         startup = recovered_fixture()

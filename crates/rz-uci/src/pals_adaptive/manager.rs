@@ -13,7 +13,8 @@ use super::{
 };
 use crate::pals_native::ticketed::{
     NativeRootFence, PreparationId, TicketExecutionEvidence, TicketNativeBackend,
-    TicketNativeEvent, TicketOwnerRunWitness, TicketPreparation, TicketServiceError,
+    TicketNativeEvent, TicketNativeObservationFailure, TicketNativeObservationFailures,
+    TicketNativeObservationDisposition, TicketNativeObservationStage, TicketOwnerRunWitness, TicketPreparation, TicketServiceError,
     TicketedNativeService,
 };
 use rz_contracts::pals::{Move16, Role, RoleOutput, RolePayload, SearchAuthority};
@@ -213,6 +214,7 @@ impl AdaptiveExecutionLimits {
 
 #[derive(Clone, Debug)]
 pub enum AdaptiveManagerError {
+    NativeObservation(TicketNativeObservationFailure),
     Collection(AdaptiveCollectionError),
     Coordinator(CoordinatorError),
     Contract(ContractError),
@@ -2262,6 +2264,7 @@ where
     failures: VecDeque<AdaptiveManagerError>,
     quarantine_rejections: Vec<RoleCompletion<Arc<B::Output>>>,
     retained_native_completions: Vec<RetainedNativeCompletion<B::Output>>,
+    native_observation_failures: Vec<TicketNativeObservationFailure>,
     quarantined_cpu_receipts: Vec<CpuWorkerEvent>,
     quarantined_foreign_receipts: Vec<ExternalWorkerReport>,
     ready_ids: Vec<FrameId>,
@@ -3306,6 +3309,45 @@ where
     pub fn retained_native_completions(&self) -> &[RetainedNativeCompletion<B::Output>] {
         &self.retained_native_completions
     }
+
+    /// Original non-physical capture failures. These are not NN failures.
+    pub fn native_observation_failures(&self) -> &[TicketNativeObservationFailure] {
+        &self.native_observation_failures
+    }
+
+    fn observe_native_failures(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        failures: &TicketNativeObservationFailures,
+        retired: bool,
+    ) -> Option<AdaptiveManagerError> {
+        let mut gate = None;
+        for failure in failures.iter() {
+            let error = if failure.cause == RoleFailure::PhysicalUnknown {
+                Some(AdaptiveManagerError::PhysicalUnknown)
+            } else if failure.ticket != *ticket
+                || match failure.stage {
+                    TicketNativeObservationStage::Submitted | TicketNativeObservationStage::Completed => retired,
+                    TicketNativeObservationStage::Retired => !retired,
+                    TicketNativeObservationStage::Retrieval => false,
+                }
+                || failure.disposition == TicketNativeObservationDisposition::RequiredAfterPhysical
+            {
+                Some(AdaptiveManagerError::NativeObservation(failure.clone()))
+            } else {
+                None
+            };
+            if self.native_observation_failures.len() < self.limits.role_tickets_max.saturating_mul(2) {
+                self.native_observation_failures.push(failure.clone());
+            } else if gate.is_none() {
+                gate = Some(AdaptiveManagerError::NativeObservation(failure.clone()));
+            }
+            if gate.is_none() || matches!(&error, Some(AdaptiveManagerError::PhysicalUnknown)) {
+                gate = error.or(gate);
+            }
+        }
+        gate
+    }
     pub fn native_cpu_usage(&self) -> Result<(u64, u64), AdaptiveManagerError> {
         Ok(self.native_ledger()?.global_usage()?)
     }
@@ -4232,6 +4274,7 @@ where
                     evidence,
                     owner_run,
                     owner_service_elapsed,
+                    observation_failures,
                 } => {
                     let retained = RetainedNativeCompletion {
                         completion: RoleCompletion {
@@ -4243,6 +4286,10 @@ where
                         owner_run,
                         owner_service_elapsed,
                     };
+                    if let Some(error) = self.observe_native_failures(&completion.ticket, &observation_failures, false) {
+                        self.retained_native_completions.push(retained);
+                        return Err(error);
+                    }
                     #[cfg(feature = "pals-adaptive-diagnostics")]
                     let diagnostic_completion_ticket = completion.ticket.id;
                     let outcome = (|| -> Result<(), AdaptiveManagerError> {
@@ -4477,7 +4524,17 @@ where
                     result,
                     native_receipt,
                     rejected_permit,
+                    observation_failures,
                 } => {
+                    if let Some(error) = self.observe_native_failures(&ticket, &observation_failures, true) {
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        if let Some(permit) = rejected_permit {
+                            self.retained_native_permits.push(permit);
+                        }
+                        return Err(error);
+                    }
                     let index = self
                         .roles
                         .iter()

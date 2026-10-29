@@ -107,6 +107,46 @@ pub type RoventPcAdmissionObserver = Arc<
 pub type RoventPcClosureObserver =
     Arc<dyn Fn(&mut RoventPcSessionManager) -> Result<(), AdaptiveManagerError> + Send + Sync>;
 
+/// An original V2 collection owner. The hook must retain its teacher and
+/// publication custody; these callbacks do not prove physical completion.
+/// `admit`, `pump`, and `revoke` run while the root's session owner is held:
+/// implementations must be bounded and nonblocking and must not synchronously
+/// acquire a root/teacher lock or wait for teacher I/O. They may instead pass
+/// work to an independently owned worker with bounded admission.
+pub trait RoventPcCollectionHooksV2: Send + Sync {
+    fn admit(
+        &self,
+        port: &mut RoventPcCollectionAdmissionPortV2<'_>,
+        admission: RoventCollectionRootAdmissionV2,
+    ) -> Result<(), RoventPcCollectionAdmissionFailureV2>;
+    fn pump(&self) -> Result<(), AdaptiveManagerError>;
+    fn revoke(&self);
+}
+
+/// The rejected admission and every acquired observer/teacher owner remain
+/// with this value until the caller explicitly recovers or quarantines it.
+pub struct RoventPcCollectionAdmissionFailureV2 {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub owners: Box<dyn Any + Send>,
+}
+
+/// Borrowed access to the actual manager for one root admission. This port
+/// cannot manufacture a root or issue an acceptance witness.
+pub struct RoventPcCollectionAdmissionPortV2<'a> {
+    manager: &'a mut RoventPcSessionManager,
+}
+
+impl RoventPcCollectionAdmissionPortV2<'_> {
+    pub fn install(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV2,
+        observer: AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
+    ) -> Result<(), RoleOnlyCollectionV2Rejection<PcPortQuestion, VirtualReviewTicketOutput>> {
+        self.manager.install_collection_observer_v2(admission, observer)
+    }
+}
+
 /// Failure keeps the original observer and root authority. The returned live
 /// objects are not completion evidence and may require separate quarantine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -457,6 +497,7 @@ pub struct RoventPcSessionV2Rejection {
     pub prepared: PreparedRoventNativeV2<PcPortQuestion>,
     pub process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
     pub loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>>,
+    pub collection_hooks: Option<Arc<dyn RoventPcCollectionHooksV2>>,
 }
 /// No preparation thread is started before this constructor has succeeded.
 /// Rejection therefore returns both original startup owners without a join.
@@ -550,6 +591,11 @@ pub struct RoventPcSessionDriver {
     root_policy: RoventRootAdmissionPolicy,
     collection_origin: Option<RoventNativeCollectionOrigin>,
     collection_hooks: RoventPcCollectionHooks,
+    collection_origin_v2: Option<RoventNativeCollectionOriginV2>,
+    collection_hooks_v2: Option<Arc<dyn RoventPcCollectionHooksV2>>,
+    collection_v2_outstanding: AtomicBool,
+    retained_collection_failure_v2: Mutex<Option<RoventPcCollectionAdmissionFailureV2>>,
+    retained_collection_panic_v2: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
     selective_policy: Digest,
     frontier_limits: FrontierLimits,
     closed: AtomicBool,
@@ -614,6 +660,7 @@ impl RoventPcSessionDriver {
             owners,
             identity,
             root_policy,
+            None,
         )
     }
 
@@ -635,6 +682,33 @@ impl RoventPcSessionDriver {
             owners,
             identity,
             root_policy,
+            None,
+        )
+    }
+
+    /// Prepare the same V2 P/C session with its original collection hook.
+    /// This is an integration seam, not proof of teacher retirement or corpus
+    /// publication. Startup rejection returns the hook alongside the worker.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn new_v2_collection(
+        prepared: PreparedRoventNativeV2<PcPortQuestion>,
+        loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV2>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: Arc<dyn RoventPcCollectionHooksV2>,
+    ) -> Result<Self, RoventPcSessionV2Rejection> {
+        Self::construct_v2(
+            prepared,
+            loaded,
+            process,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            Some(hooks),
         )
     }
 
@@ -647,6 +721,7 @@ impl RoventPcSessionDriver {
         owners: Arc<OwnerRegistry>,
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
+        collection_hooks_v2: Option<Arc<dyn RoventPcCollectionHooksV2>>,
     ) -> Result<Self, RoventPcSessionV2Rejection> {
         let build = (|| -> Result<_, SearchSessionFailure> {
             let sources = prepared.sources();
@@ -709,8 +784,25 @@ impl RoventPcSessionDriver {
                     ));
                 }
             }
-            if sources.collection_preload_sources().is_some()
-                || prepared.snapshot().mode.has_native_r()
+            let collection_origin_v2 = match (
+                sources.lock().manifest.purpose,
+                sources.collection_preload_sources().is_some(),
+                collection_hooks_v2.is_some(),
+            ) {
+                (rz_experiments::RoventPurpose::Collection, true, true) => {
+                    Some(prepared.collection_identity().map_err(|error| {
+                        SearchSessionFailure::debug("RoventPcV2CollectionOrigin", &error)
+                    })?)
+                }
+                (rz_experiments::RoventPurpose::Collection, _, _) | (_, true, _) | (_, _, true) => {
+                    return Err(failure(
+                        "RoventPcV2CollectionUnsupported",
+                        "V2 collection requires its original preload and explicit hook owner",
+                    ));
+                }
+                _ => None,
+            };
+            if prepared.snapshot().mode.has_native_r()
                 || prepared.snapshot().process_epoch != clock.epoch().0
                 || identity.name.is_empty()
                 || identity.author.is_empty()
@@ -784,6 +876,7 @@ impl RoventPcSessionDriver {
                 .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?;
             Ok((
                 configuration,
+                collection_origin_v2,
                 original_owner,
                 owner,
                 implementation,
@@ -793,6 +886,7 @@ impl RoventPcSessionDriver {
         })();
         let (
             configuration,
+            collection_origin_v2,
             original_owner,
             owner,
             implementation,
@@ -806,6 +900,7 @@ impl RoventPcSessionDriver {
                     prepared,
                     process,
                     loaded,
+                    collection_hooks: collection_hooks_v2,
                 });
             }
         };
@@ -824,6 +919,11 @@ impl RoventPcSessionDriver {
             root_policy,
             collection_origin: None,
             collection_hooks: RoventPcCollectionHooks::default(),
+            collection_origin_v2,
+            collection_hooks_v2,
+            collection_v2_outstanding: AtomicBool::new(false),
+            retained_collection_failure_v2: Mutex::new(None),
+            retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
             frontier_limits,
             closed: AtomicBool::new(false),
@@ -1126,6 +1226,11 @@ impl RoventPcSessionDriver {
             root_policy,
             collection_origin,
             collection_hooks,
+            collection_origin_v2: None,
+            collection_hooks_v2: None,
+            collection_v2_outstanding: AtomicBool::new(false),
+            retained_collection_failure_v2: Mutex::new(None),
+            retained_collection_panic_v2: Mutex::new((None, None)),
             selective_policy,
             frontier_limits,
             closed: AtomicBool::new(false),
@@ -1812,6 +1917,9 @@ impl RoventPcSessionDriver {
                     ));
                 }
             };
+        let mut v2_hook_started = false;
+        let mut v2_hook_revoked = false;
+        let mut v2_admission_failure = None;
         let run = catch_unwind(AssertUnwindSafe(
             || -> Result<(), crate::pals_adaptive::AdaptiveManagerError> {
                 manager.register_cleanup_deadline(context.shutdown_deadline)?;
@@ -1830,6 +1938,46 @@ impl RoventPcSessionDriver {
                     (&self.collection_hooks.root_admission, collection_admission)
                 {
                     observer(&mut manager, admission)?;
+                }
+                if let Some(origin) = &self.collection_origin_v2 {
+                    let original_root = match &root_admission {
+                        PcRootAdmission::V2(root) => Arc::clone(root),
+                        PcRootAdmission::V1(_) => {
+                            return Err(AdaptiveManagerError::Invalid("P/C V2 root owner absent"));
+                        }
+                    };
+                    let frontier = manager.driver().port().rovent_frontier().ok_or(
+                        AdaptiveManagerError::Invalid("P/C V2 actual frontier absent"),
+                    )?;
+                    let admission = RoventCollectionRootAdmissionV2::from_attached_frontier(
+                        origin,
+                        frontier,
+                        original_root,
+                        root_budget,
+                        self.selective_policy,
+                    )?;
+                    let expected = admission.clone();
+                    let hook = self.collection_hooks_v2.as_ref().ok_or(
+                        AdaptiveManagerError::Invalid("P/C V2 collection hook owner absent"),
+                    )?;
+                    v2_hook_started = true;
+                    self.collection_v2_outstanding.store(true, Ordering::Release);
+                    let mut port = RoventPcCollectionAdmissionPortV2 { manager: &mut manager };
+                    if let Err(rejected) = hook.admit(&mut port, admission) {
+                        let error = if rejected.admission.same_original_admission(&expected) {
+                            rejected.error.clone()
+                        } else {
+                            AdaptiveManagerError::Invalid("P/C rejected V2 admission owner differs")
+                        };
+                        v2_admission_failure = Some(rejected);
+                        return Err(error);
+                    }
+                    let actual = manager.collection_root_admission_v2().ok_or(
+                        AdaptiveManagerError::Invalid("P/C V2 observer was not installed"),
+                    )?;
+                    if !actual.same_original_admission(&expected) {
+                        return Err(AdaptiveManagerError::Invalid("P/C installed V2 admission owner differs"));
+                    }
                 }
                 let scanned = manager.driver_mut().port_mut().prepare_rovent_root_rules();
                 if let Err(error) = scanned {
@@ -1888,6 +2036,21 @@ impl RoventPcSessionDriver {
                             }
                         }
                     }
+                    if v2_hook_started && !v2_hook_revoked
+                        && (!context.accepts().unwrap_or(false)
+                            || context.soft_expired(Instant::now())
+                            || manager.phase() != ManagerPhase::Running)
+                    {
+                        if let Some(hook) = &self.collection_hooks_v2 {
+                            hook.revoke();
+                        }
+                        v2_hook_revoked = true;
+                    }
+                    if v2_hook_started {
+                        if let Some(hook) = &self.collection_hooks_v2 {
+                            hook.pump()?;
+                        }
+                    }
                     if let Some(pump) = &self.collection_hooks.cooperative {
                         pump()?;
                     }
@@ -1940,19 +2103,49 @@ impl RoventPcSessionDriver {
                 }
             },
         ));
-        if !matches!(run, Ok(Ok(()))) {
+        if let Some(rejected) = v2_admission_failure {
+            *self.retained_collection_failure_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(rejected);
+        }
+        let (run_result, mut original_panic) = match run {
+            Ok(result) => (Some(result), None),
+            Err(payload) => (None, Some(payload)),
+        };
+        if v2_hook_started && !v2_hook_revoked {
+            if let Some(hook) = &self.collection_hooks_v2 {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| hook.revoke())) {
+                    let mut retained = self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner());
+                    retained.0 = original_panic.take();
+                    retained.1 = Some(payload);
+                    *state = State::Manager(manager);
+                    self.closed.store(true, Ordering::Release);
+                    return Err(physical_unknown_at("RoventPcV2CollectionRevokePanic", "original hook and manager retained"));
+                }
+            }
+        }
+        if let Some(payload) = original_panic {
+            if v2_hook_started {
+                self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+            } else {
+                // Keep the legacy no-collection path unchanged.
+                drop(payload);
+            }
             *state = State::Manager(manager);
             self.closed.store(true, Ordering::Release);
-            return Err(match run {
-                Ok(Err(error)) => {
+            return Err(physical_unknown_at(
+                "RoventPcRootExecution",
+                "root closure panicked; original manager retained",
+            ));
+        }
+        if !matches!(&run_result, Some(Ok(()))) {
+            *state = State::Manager(manager);
+            self.closed.store(true, Ordering::Release);
+            return Err(match run_result {
+                Some(Err(error)) => {
                     let mut failure = SearchSessionFailure::debug("RoventPcRoot", &error);
                     failure.physical_completion = DriverPhysicalCompletion::Unknown;
                     failure
                 }
-                _ => physical_unknown_at(
-                    "RoventPcRootExecution",
-                    "root closure panicked; original manager retained",
-                ),
+                _ => unreachable!("original panic retained above"),
             });
         }
         let physical = match manager.shutdown_receipt() {
@@ -1980,6 +2173,14 @@ impl RoventPcSessionDriver {
                 return Err(physical_unknown_at("RoventPcShutdownReceipt", error));
             }
         };
+        if v2_hook_started {
+            // The native fence does not cover the teacher process. Until a
+            // same-owner retirement proof and observer handoff are wired,
+            // keep the actual manager, observer and hook together.
+            *state = State::Manager(manager);
+            self.closed.store(true, Ordering::Release);
+            return Err(physical_unknown_at("RoventPcV2TeacherRetirementUnsupported", "teacher retirement and observer handoff are not connected"));
+        }
         if let Some(observer) = &self.collection_hooks.root_closure {
             if let Err(error) = observer(&mut manager) {
                 *state = State::Manager(manager);
@@ -2398,6 +2599,13 @@ impl RoventPcSessionDriver {
                             return Err(SearchSessionFailure::physical_completion_unknown());
                         }
                     };
+                    if self.collection_v2_outstanding.load(Ordering::Acquire) {
+                        // Native root shutdown does not establish teacher
+                        // retirement or an observer handoff. Preserve all
+                        // owners until a same-owner proof is connected.
+                        *state = State::Manager(manager);
+                        return Err(SearchSessionFailure::physical_completion_unknown());
+                    }
                     let sources = match manager.into_sources() {
                         Ok(value) => value,
                         Err((manager, _)) => {
@@ -2564,6 +2772,15 @@ impl Drop for RoventPcSessionDriver {
             if let Some(process) = self.process_v2.take() {
                 std::mem::forget(process);
             }
+            if let Some(hooks) = self.collection_hooks_v2.take() {
+                std::mem::forget(hooks);
+            }
+            if let Some(failure) = self.retained_collection_failure_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+                std::mem::forget(failure);
+            }
+            let panics = self.retained_collection_panic_v2.get_mut().unwrap_or_else(|p| p.into_inner());
+            if let Some(payload) = panics.0.take() { std::mem::forget(payload); }
+            if let Some(payload) = panics.1.take() { std::mem::forget(payload); }
             if let Some(owner) = self.shared_nnuec.take() {
                 // Do not run PreparationActor's joining Drop on an unknown
                 // manager/root. Its original cache/terminal/model owners stay

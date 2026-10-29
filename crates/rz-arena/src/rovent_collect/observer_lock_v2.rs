@@ -147,8 +147,16 @@ impl State {
     }
     fn drain(&mut self) -> Result<(), ArenaError> {
         let producer = self.producer.as_mut().ok_or_else(|| invalid("lock-v2 root not yet admitted"))?;
-        self.receiver.admit_available_lock_v2(producer)?;
-        Ok(())
+        match self.receiver.admit_available_lock_v2(producer) {
+            Ok(_) => Ok(()),
+            Err(failure) => {
+                let (error, input) = *failure;
+                if let Some(input) = input {
+                    self.failed_captures.push(super::native_capture::RoventFailedCapturedInput::LockV2(input));
+                }
+                Err(error)
+            }
+        }
     }
     fn discard(&mut self, ticket: &RoleTicketEnvelope) -> Result<(), ArenaError> {
         if let Some(handled) = self.handled_tickets.get(&ticket.id) {
@@ -243,7 +251,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
             let lineage = state.metadata.lineage.clone();
             let reservation = state.producer_mut()?.reserve_input(ticket, context, lineage)?;
             let sequence = reservation.sequence();
-            if let Err(error) = state.registration.register_submitted_input_v1(ticket, reservation) {
+            if let Err(error) = state.registration.register_lock_v2(ticket, reservation, witness.admission()) {
                 state.producer_mut()?.discard_reserved_input(sequence);
                 return Err(error);
             }
@@ -256,6 +264,17 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
         -> Result<(), AdaptiveCollectionError> {
         self.apply(AdaptiveCollectionStage::NativeEvent, |state| {
             check(!state.settled, "lock-v2 native event after settled owner fence")?;
+            // Preserve the original terminal's typed observation failures even
+            // if the capture queue is already unhealthy. No input is admitted
+            // or published on this path; native completion remains independent.
+            let failed_observation = match event.event() {
+                TicketNativeEvent::Completed { observation_failures, .. }
+                | TicketNativeEvent::Retired { observation_failures, .. } => !observation_failures.is_empty(),
+                _ => false,
+            };
+            if failed_observation {
+                return state.producer_mut()?.observe_native_event(event);
+            }
             state.drain()?;
             let failed = match event.event() {
                 TicketNativeEvent::Retired { accepted: false, result: Err(error), .. } => {

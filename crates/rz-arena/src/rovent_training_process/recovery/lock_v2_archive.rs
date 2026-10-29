@@ -22,6 +22,15 @@ pub struct InspectedRoventLockV2Archive {
     semantic_lock_snapshots: usize,
 }
 
+/// Strictly checked historical data and original ancestor owners. This is
+/// deliberately not the live or recovered trainer admission type.
+pub struct CheckedRoventLockV2HistoricalDataset {
+    archive: InspectedRoventLockV2Archive,
+    registration: RoventHistoricalDatasetRegistration,
+    original_ancestors: Vec<Arc<VerifiedRoventDataset>>,
+    lock_v2_ancestors: Vec<Arc<CheckedRoventLockV2HistoricalDataset>>,
+}
+
 fn lock_v2_pin(root: &Path, pin: &RoventLockV2PublicationFile) -> Result<RoventTrainingFilePin, ArenaError> {
     pin.validate()?;
     let relative = Path::new(&pin.path);
@@ -47,6 +56,15 @@ impl InspectedRoventLockV2Archive {
         publication_pin: &RoventTrainingFilePin,
         budget: &RoventRecoveryReadBudget,
     ) -> Result<Self, ArenaError> {
+        Self::inspect_registered(root, publication_pin, budget, None)
+    }
+
+    fn inspect_registered(
+        root: &Path,
+        publication_pin: &RoventTrainingFilePin,
+        budget: &RoventRecoveryReadBudget,
+        registration: Option<&RoventHistoricalDatasetRegistration>,
+    ) -> Result<Self, ArenaError> {
         check(root.is_absolute() && publication_pin.path == root.join("publication.json"),
             "lock-v2 exact publication registration")?;
         let (file, raw) = budget.read(publication_pin, MAX_METADATA_BYTES, true)?;
@@ -55,6 +73,21 @@ impl InspectedRoventLockV2Archive {
         let (file, raw) = budget.read(&lock_v2_pin(root, &publication.manifest)?, MAX_METADATA_BYTES, true)?;
         held.push(file);
         let manifest = RoventCorpusManifestLockV2::from_json(text(&raw)?)?;
+        if let Some(registered) = registration {
+            let m = &manifest.registration;
+            check(publication.source_commit == registered.collection_source_commit
+                && publication.source_sha256 == registered.collection_source_sha256
+                && publication.runtime_sha256 == registered.collection_runtime_library_sha256
+                && m.source_commit == registered.collection_source_commit
+                && m.source_sha256 == registered.collection_source_sha256
+                && m.runtime_sha256 == registered.collection_runtime_library_sha256
+                && m.model_semantics_sha256 == registered.model_semantics_sha256
+                && m.model_epoch == registered.model_epoch
+                && m.context_epoch == registered.context_epoch
+                && m.recipe_sha256 == registered.recipe_sha256
+                && m.stage_id == registered.stage_id,
+                "lock-v2 historical registration source/model/epoch differs")?;
+        }
         let (file, raw) = budget.read(&lock_v2_pin(root, &publication.index)?, MAX_METADATA_BYTES, true)?;
         held.push(file);
         let index = RoventCorpusIndexLockV2::from_json(text(&raw)?)?;
@@ -110,6 +143,7 @@ impl InspectedRoventLockV2Archive {
         let admissions = publication.admissions.iter().map(|entry| (entry.native_admission_sha256.as_str(), entry)).collect::<BTreeMap<_, _>>();
         check(admissions.len() == publication.admissions.len(), "lock-v2 duplicate admission")?;
         let mut records = BTreeSet::new();
+        let mut origins = BTreeSet::new();
         let mut used = BTreeSet::new();
         for (declared, pin) in index.chunks.iter().zip(&publication.chunks) {
             check(declared.path == pin.path && declared.sha256 == pin.sha256 && declared.bytes == pin.bytes,
@@ -131,6 +165,32 @@ impl InspectedRoventLockV2Archive {
                 let evidence = crate::rovent_collect::verify_historical_lock_v2_record_evidence(&record, &manifest, lock)?;
                 check(evidence.root_sha256 == admission_sha && evidence.input_lock_sha256 == admission.canonical_input_lock_sha256,
                     "lock-v2 row root/lock does not join publication")?;
+                let origin = &row.native.raw_retirement["root_admission"]["native_origin"];
+                let pc = &lock.manifest.engine.pc;
+                let role_model = match row.input.role {
+                    GenerationRoleV3::Proposer => &pc.proposer,
+                    GenerationRoleV3::Critic => &pc.critic,
+                    GenerationRoleV3::Validator => pc.validator.as_ref()
+                        .ok_or_else(|| invalid("lock-v2 V row is absent from original lock"))?,
+                };
+                // The root metadata verifier checks the loaded proposer. The
+                // row's own role must also be joined to its distinct lock pin.
+                check(origin["startup_observation"]["weights_sha256"].as_str() == Some(role_model.weights.sha256.as_str())
+                    && origin["declaration"]["model_implementation_sha256"].as_str() == Some(role_model.implementation_sha256.as_str())
+                    && origin["declaration"]["model_semantics"].as_str() == Some(role_model.semantics.as_str())
+                    && origin["declaration"]["encoding"].as_str() == Some(role_model.encoding.as_str()),
+                    "lock-v2 row role model differs from original loaded lock")?;
+                if let Some(registered) = registration {
+                    let binding = registered.role_bindings.get(role_name(row.input.role))
+                        .ok_or_else(|| invalid("lock-v2 row role not registered"))?;
+                    // These raw fields have already been joined to the typed,
+                    // validated original lock/root by the call above.
+                    check(origin["declaration"]["model_semantics_sha256"].as_str() == Some(binding.model_semantics_sha256.as_str())
+                        && row.native.model_sha256 == binding.model_identity_sha256
+                        && origin["startup_observation"]["weights_sha256"].as_str() == Some(binding.weights_sha256.as_str())
+                        && origin["declaration"]["encoding_sha256"].as_str() == Some(binding.encoding_sha256.as_str()),
+                        "lock-v2 historical row role/model/weights/encoding differs")?;
+                }
                 let observed = &row.native.raw_retirement["root_admission"]["native_origin"]["startup_observation"];
                 let runtime = observed["runtime_library_sha256"].as_str().ok_or_else(|| invalid("lock-v2 runtime missing"))?;
                 check(runtime == publication.runtime_sha256 && lock.manifest.engine.pc.runtime_artifacts.iter().any(|v| v.sha256 == runtime),
@@ -157,7 +217,9 @@ impl InspectedRoventLockV2Archive {
                     opening_id: row.input.opening_id.clone(), line_genealogy_id: row.input.line_genealogy_id.clone(),
                     transposition_sha256: row.input.transposition_sha256.clone(), actor_id: row.lineage.actor_id.clone(),
                     teacher_actor_id: row.lineage.teacher_actor_id.clone(), ancestor_origin_sha256: row.lineage.ancestor_origin_sha256.clone() };
-                check(**expected == actual && records.insert(row.record_sha256.clone()), "lock-v2 index row mismatch or duplicate")?;
+                check(**expected == actual && records.insert(row.record_sha256.clone())
+                    && origins.insert(row.origin_sha256.clone()),
+                    "lock-v2 index row mismatch or duplicate record/origin")?;
                 used.insert(admission_sha.to_owned());
                 count += 1;
             }
@@ -183,6 +245,70 @@ impl InspectedRoventLockV2Archive {
             let (file, _) = budget.read(&retained.pin, retained.pin.bytes, false)?;
             check(file.identity == retained.identity, "lock-v2 historical file identity changed")?;
         }
+        Ok(())
+    }
+}
+
+impl CheckedRoventLockV2HistoricalDataset {
+    /// Reuses the original index seals and ancestor owners; no family is
+    /// re-encoded, and this check grants no learner or current-run authority.
+    pub fn inspect(
+        registration: RoventHistoricalDatasetRegistration,
+        original_ancestors: Vec<Arc<VerifiedRoventDataset>>,
+        lock_v2_ancestors: Vec<Arc<Self>>,
+        budget: &RoventRecoveryReadBudget,
+    ) -> Result<Self, ArenaError> {
+        check(original_ancestors.len().saturating_add(lock_v2_ancestors.len()) <= 256
+            && registration.publication.path == registration.root.join("publication.json")
+            && generation_identifier(&registration.stage_id)
+            && generation_sha(&registration.collection_source_sha256)
+            && generation_sha(&registration.collection_runtime_library_sha256)
+            && generation_sha(&registration.model_semantics_sha256)
+            && generation_sha(&registration.recipe_sha256)
+            && !registration.role_bindings.is_empty() && registration.role_bindings.len() <= 3,
+            "lock-v2 strict historical registration")?;
+        for (role, binding) in &registration.role_bindings {
+            check(ROLES.contains(&role.as_str())
+                && [&binding.model_semantics_sha256, &binding.model_identity_sha256,
+                    &binding.weights_sha256, &binding.encoding_sha256].iter().all(|sha| generation_sha(sha)),
+                "lock-v2 strict historical role binding")?;
+        }
+        let archive = InspectedRoventLockV2Archive::inspect_registered(
+            &registration.root, &registration.publication, budget, Some(&registration))?;
+        // A retained ancestor's metadata is not proof that its original files
+        // still have their pinned bytes and identity at this admission point.
+        for ancestor in &original_ancestors { ancestor.revalidate(budget)?; }
+        for ancestor in &lock_v2_ancestors { ancestor.archive.revalidate(budget)?; }
+        let manifest = HistoricalCollectionMetadata::submitted(&archive.manifest.registration);
+        let index = HistoricalIndexMetadata::from_validated_parts(archive.index.record_count,
+            archive.index.chunks.clone(), archive.index.origins.clone(), archive.publication.canonical_index_sha256.clone());
+        let lock_metadata = lock_v2_ancestors.iter().map(|a| (
+            HistoricalCollectionMetadata::submitted(&a.archive.manifest.registration),
+            HistoricalIndexMetadata::from_validated_parts(a.archive.index.record_count,
+                a.archive.index.chunks.clone(), a.archive.index.origins.clone(), a.archive.publication.canonical_index_sha256.clone()),
+        )).collect::<Vec<_>>();
+        let mut ancestors = original_ancestors.iter().map(|a| (a.index_sha256(), &a.manifest, &a.index)).collect::<Vec<_>>();
+        ancestors.extend(lock_v2_ancestors.iter().zip(&lock_metadata).map(|(owner, (m, i))|
+            (owner.archive.publication.canonical_index_sha256.as_str(), m, i)));
+        audit_original_ancestry(&manifest, &index, &ancestors)?;
+        Ok(Self { archive, registration, original_ancestors, lock_v2_ancestors })
+    }
+
+    pub fn observation(&self) -> Value {
+        let mut result = self.archive.observation();
+        result["cross_publication_ancestry_checked"] = json!(true);
+        result["learner_role_bindings_checked"] = json!(true);
+        result["registration_publication_sha256"] = json!(self.registration.publication.sha256);
+        result["ancestor_count"] = json!(self.original_ancestors.len() + self.lock_v2_ancestors.len());
+        // This does not cover P/C-to-R joins, current parent sample admission,
+        // Python intake, or trainer-process and physical execution authority.
+        result
+    }
+
+    pub fn revalidate(&self, budget: &RoventRecoveryReadBudget) -> Result<(), ArenaError> {
+        self.archive.revalidate(budget)?;
+        for ancestor in &self.original_ancestors { ancestor.revalidate(budget)?; }
+        for ancestor in &self.lock_v2_ancestors { ancestor.archive.revalidate(budget)?; }
         Ok(())
     }
 }

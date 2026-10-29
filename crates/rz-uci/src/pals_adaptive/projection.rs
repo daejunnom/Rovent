@@ -6,7 +6,7 @@
 
 use crate::pals_native::ticketed::{
     NativeTicketQuestion, TicketExecutionEvidence, TicketNativeBackend, TicketPhysicalResult,
-    TicketPreparation, TicketOwnerDispatchContext,
+    TicketPreparation, TicketOwnerDispatchContext, TicketNativeObservationFailure,
 };
 use rz_contracts::pals::RepresentationKey;
 use rz_contracts::pals_adaptive::RoleTicketEnvelope;
@@ -234,6 +234,10 @@ where
         } else {
             None
         }
+    }
+
+    fn take_observation_failure(&mut self) -> Option<TicketNativeObservationFailure> {
+        self.backend.take_observation_failure()
     }
 
     fn accept(

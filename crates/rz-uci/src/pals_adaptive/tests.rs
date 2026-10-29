@@ -1420,8 +1420,8 @@ fn pcr_keeps_actual_canceled_published_head_accept_until_original_fence() {
         assert!(facts.second_run_observed_cancel.load(Ordering::Acquire));
         assert!(matches!(&original, TicketNativeEvent::Retired {
             ticket: actual, accepted: false, result: Err(RoleFailure::Canceled),
-            rejected_permit: Some(_), native_receipt: None,
-        } if *actual == ticket));
+            rejected_permit: Some(_), native_receipt: None, observation_failures,
+        } if *actual == ticket && observation_failures.is_empty()));
         manager.native_event(original).unwrap();
         let binding = manager
             .roles

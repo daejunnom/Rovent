@@ -832,7 +832,7 @@ fn run_cases(
             }
             checked(service.execute(id, ticket))?;
             let mut started = false;
-            let (completion, evidence) = loop {
+            let (completion, evidence, observation_failures) = loop {
                 match next(service, until)? {
                     TicketNativeEvent::Started(t) if t == ticket => {
                         checked(registry.physical_started(&t))?;
@@ -842,8 +842,9 @@ fn run_cases(
                     TicketNativeEvent::Completed {
                         completion,
                         evidence,
+                        observation_failures,
                         ..
-                    } if completion.ticket == ticket && started => break (completion, evidence),
+                    } if completion.ticket == ticket && started => break (completion, evidence, observation_failures),
                     event => return Err(unexpected(&event).into()),
                 }
             };
@@ -853,6 +854,11 @@ fn run_cases(
                 }
                 std::mem::forget(registry);
                 return Err("physical completion unknown; original owners retained".into());
+            }
+            if !observation_failures.is_empty() {
+                let error = format!("native observation failure: {:?}", observation_failures);
+                std::mem::forget(registry);
+                return Err(error.into());
             }
             if ticket.role == Role::Proposer {
                 registry
@@ -965,7 +971,18 @@ fn run_cases(
                     result: Ok(()),
                     native_receipt,
                     rejected_permit: None,
+                    observation_failures,
                 } if t == ticket => {
+                    if !observation_failures.is_empty() {
+                        let error = format!("native retirement observation failure: {:?}", observation_failures);
+                        // Preserve the exact receipt and registry until the
+                        // process is gone; do not promote it to logical accept.
+                        if let Some(receipt) = native_receipt {
+                            std::mem::forget(receipt);
+                        }
+                        std::mem::forget(registry);
+                        return Err(error.into());
+                    }
                     if let Some(receipt) = native_receipt {
                         registry
                             .confirm_native_acceptance(receipt, clock.domain(), clock.now())

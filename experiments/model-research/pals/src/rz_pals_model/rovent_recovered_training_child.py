@@ -71,8 +71,13 @@ def _metadata_inputs(startup, reads):
 
 
 def _publication_metadata(files, reads, limits):
-    from .rovent_historical_corpus import _publication
-    publication = _publication(reads.json(files["publication"], maximum=16 * 1024**2), limits)
+    from .rovent_corpus_codec import codec_from_publication
+    from .rovent_historical_corpus import _publication_for_codec
+    body = reads.json(files["publication"], maximum=16 * 1024**2)
+    # Select the original wire family before reading its ancestry.  This is
+    # only a metadata probe: the historical owner and the new Rust parent
+    # still validate the full corpus and control actual sample admission.
+    publication = _publication_for_codec(body, limits, codec_from_publication(body))
     root = Path(files["root"])
     pin = publication["manifest"]
     manifest = reads.json({"path": str(root.joinpath(*pin["path"].split("/"))),

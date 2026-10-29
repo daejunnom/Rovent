@@ -1171,8 +1171,8 @@ fn prepare_launch_native<Q: NativeQuestionProjection>(
 }
 
 /// /2 native products retain their original process, selected files and lock
-/// through actual UCI drain. Collection, storage and diagnostic profiles
-/// remain separate unsupported startup profiles.
+/// through actual UCI drain. Collection, storage and V1 diagnostics remain
+/// unsupported here; the separate V2 lifecycle observer is opt-in.
 fn run_v2_native(
     arguments: Arguments,
     lock: Arc<RoventInputLockV2>,

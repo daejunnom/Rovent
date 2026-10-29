@@ -92,7 +92,7 @@ fn cases(
         }
         checked(service.execute(id, ticket))?;
         let mut canceled = false;
-        let completion = loop {
+        let (completion, observation_failures) = loop {
             // Observation only: never gate, sleep or suspend the native owner.
             if !canceled && trace.has_open_ort_run(&ticket) {
                 checked(service.cancel(id))?;
@@ -104,10 +104,10 @@ fn cases(
                         checked(registry.physical_started(&t))?
                     }
                     TicketNativeEvent::OwnerRunStarted { ticket: t, .. } if t == ticket => {}
-                    TicketNativeEvent::Completed { completion, .. }
+                    TicketNativeEvent::Completed { completion, observation_failures, .. }
                         if completion.ticket == ticket =>
                     {
-                        break completion;
+                        break (completion, observation_failures);
                     }
                     e => return Err(unexpected(&e).into()),
                 }
@@ -124,6 +124,11 @@ fn cases(
             std::mem::forget(registry);
             return Err("physical completion unknown; original owner retained".into());
         }
+        if !observation_failures.is_empty() {
+            let error = format!("native observation failure: {:?}", observation_failures);
+            std::mem::forget(registry);
+            return Err(error.into());
+        }
         checked(registry.complete(completion).map_err(|e| e.error))?;
         let ready = registry
             .take_ready(clock.domain(), clock.now())
@@ -139,8 +144,9 @@ fn cases(
                 accepted: false,
                 result: Ok(()),
                 rejected_permit: None,
+                observation_failures,
                 ..
-            } if t == ticket => {}
+            } if t == ticket && observation_failures.is_empty() => {}
             e => return Err(unexpected(&e).into()),
         }
         checked(registry.discard_delivered(&ticket))?;

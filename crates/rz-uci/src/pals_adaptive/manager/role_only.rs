@@ -9,6 +9,10 @@ use super::collection::{
     RoventCollectionRootAdmissionV2,
 };
 use super::*;
+use crate::pals_native::ticketed::{
+    TicketNativeObservationDisposition, TicketNativeObservationFailure,
+    TicketNativeObservationFailures, TicketNativeObservationStage,
+};
 use rz_search::cpu_value::nnuec::v2::Model as SharedNnuecModel;
 use rz_search::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
 use rz_search::cpu_value::nnuec::v2::review::{
@@ -338,6 +342,7 @@ where
     accounting: AdaptiveNativeAccountingSnapshot,
     review_leases: RoventReviewLeaseObservation,
     failures: VecDeque<AdaptiveManagerError>,
+    observation_failures: Vec<TicketNativeObservationFailure>,
     retained_completions: Vec<RetainedNativeCompletion<B::Output>>,
     retained_receipts: Vec<NativeAcceptanceReceipt>,
     retained_permits: Vec<NativeAcceptancePermit>,
@@ -446,6 +451,7 @@ where
             accounting: AdaptiveNativeAccountingSnapshot::default(),
             review_leases: RoventReviewLeaseObservation::new(registration.role_tickets_max),
             failures: VecDeque::with_capacity(64),
+            observation_failures: Vec::new(),
             retained_completions: Vec::with_capacity(16),
             retained_receipts: Vec::with_capacity(16),
             retained_permits: Vec::with_capacity(16),
@@ -799,6 +805,11 @@ where
     pub fn failures(&self) -> impl Iterator<Item = &AdaptiveManagerError> {
         self.failures.iter()
     }
+    /// Original native observation reports; these are distinct from search
+    /// failure and do not imply a physical fence or a successful publication.
+    pub fn native_observation_failures(&self) -> &[TicketNativeObservationFailure] {
+        &self.observation_failures
+    }
     pub fn pending_tickets(&self) -> usize {
         self.registry.occupancy()
     }
@@ -873,6 +884,11 @@ where
         {
             false
         }
+    }
+
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn collection_root_admission_v2(&self) -> Option<&RoventCollectionRootAdmissionV2> {
+        self.collection_admission_v2.as_ref()
     }
 
     /// Internal V2 admission preserves its original objects on every failure.
@@ -1053,6 +1069,46 @@ where
             self.failures.pop_front();
         }
         self.failures.push_back(error);
+    }
+    fn retain_native_observations(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+        failures: &TicketNativeObservationFailures,
+        retired: bool,
+    ) -> Result<(), AdaptiveManagerError> {
+        // Each admitted ticket has at most two reports on each of its two
+        // terminals. No allocation is made from the declared limit itself.
+        let maximum = self.registration.role_call_limit.saturating_mul(4);
+        let mut mismatch = false;
+        let mut required = None;
+        let mut physical_unknown = false;
+        for failure in failures.iter() {
+            self.observation_failures.push(failure.clone());
+            let stage_matches = match failure.stage {
+                TicketNativeObservationStage::Submitted | TicketNativeObservationStage::Completed => !retired,
+                TicketNativeObservationStage::Retired => retired,
+                TicketNativeObservationStage::Retrieval => true,
+            };
+            mismatch |= failure.ticket != ticket || !stage_matches;
+            if failure.cause == RoleFailure::PhysicalUnknown {
+                physical_unknown = true;
+            }
+            if failure.disposition == TicketNativeObservationDisposition::RequiredAfterPhysical {
+                required.get_or_insert_with(|| failure.cause.clone());
+            }
+        }
+        if physical_unknown {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        if mismatch || (self.observation_failures.len() as u64) > maximum {
+            return Err(AdaptiveManagerError::Invalid("P/C native observation identity or bound"));
+        }
+        if let Some(cause) = required {
+            return Err(AdaptiveManagerError::Semantic(format!(
+                "P/C required post-physical observation: {cause:?}"
+            )));
+        }
+        Ok(())
     }
     fn pending_limit(&self) -> Result<usize, AdaptiveManagerError> {
         let observed = self.driver.review_lease_admission()?;
@@ -1635,6 +1691,7 @@ where
                 evidence,
                 owner_run,
                 owner_service_elapsed,
+                observation_failures,
             } => {
                 let retained = RetainedNativeCompletion {
                     completion: RoleCompletion {
@@ -1646,6 +1703,12 @@ where
                     owner_run,
                     owner_service_elapsed,
                 };
+                if let Err(error) = self.retain_native_observations(
+                    completion.ticket, &observation_failures, false,
+                ) {
+                    self.retained_completions.push(retained);
+                    return Err(error);
+                }
                 let outcome = (|| {
                     let ticket = completion.ticket;
                     let index = self.index(ticket)?;
@@ -1736,7 +1799,19 @@ where
                 result,
                 native_receipt,
                 rejected_permit,
+                observation_failures,
             } => {
+                if let Err(error) = self.retain_native_observations(
+                    ticket, &observation_failures, true,
+                ) {
+                    if let Some(receipt) = native_receipt {
+                        self.retained_receipts.push(receipt);
+                    }
+                    if let Some(permit) = rejected_permit {
+                        self.retained_permits.push(permit);
+                    }
+                    return Err(error);
+                }
                 let index = match self.index(ticket) {
                     Ok(index) => index,
                     Err(error) => {

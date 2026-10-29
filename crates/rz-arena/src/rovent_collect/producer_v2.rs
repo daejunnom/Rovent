@@ -96,6 +96,8 @@ pub struct RoventCorpusProducerLockV2 {
     manifest: rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2,
     admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
     original: RoventCorpusProducerV2,
+    native_retirements: BTreeMap<RequestId, RoleTicketEnvelope>,
+    native_observation_failures: BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
 }
 
 impl RoventCorpusProducerLockV2 {
@@ -119,6 +121,8 @@ impl RoventCorpusProducerLockV2 {
             manifest,
             admission,
             original,
+            native_retirements: BTreeMap::new(),
+            native_observation_failures: BTreeMap::new(),
         })
     }
 
@@ -128,6 +132,15 @@ impl RoventCorpusProducerLockV2 {
 
     pub fn incomplete_capture_count(&self) -> usize {
         self.original.incomplete_capture_count()
+    }
+
+    /// Exact owner observations retained with the original ticket. These are
+    /// collection failure evidence and never replace a physical terminal.
+    pub fn native_observation_failures(
+        &self,
+        id: RequestId,
+    ) -> Option<&[rz_uci::pals_native::ticketed::TicketNativeObservationFailure]> {
+        self.native_observation_failures.get(&id).map(Vec::as_slice)
     }
 
     pub(super) fn validate_admission(
@@ -152,14 +165,40 @@ impl RoventCorpusProducerLockV2 {
         self.original.reserve_input(context, lineage)
     }
 
-    pub(super) fn admit_captured_input(
+    pub(super) fn admit_captured_lock_input(
         &mut self,
-        captured: RoventCapturedInputV2,
-    ) -> Result<(), ArenaError> {
+        input: super::native_capture::RoventCapturedLockInputV2,
+    ) -> Result<(), Box<(ArenaError, super::native_capture::RoventCapturedLockInputV2)>> {
         // The private receiver only admits the registered native callback.
         // Do not require a still-live root here: a late completion must remain
         // drainable after logical cancellation, without regaining authority.
-        self.original.admit_captured_input(captured)
+        let validation = (|| {
+            self.validate_admission(input.admission())?;
+            let captured = input.captured();
+            let key = (captured.original.pending.ticket.id.epoch.0,
+                captured.original.pending.ticket.id.sequence);
+            let original = &self.original.original;
+            check(!self.original.inputs.contains_key(&key) && self.original.inputs.len() < 16,
+                "lock-v2 original input duplicate/cap")?;
+            check(captured.original.manifest_sha256 == original.manifest_sha256
+                && original.reserved.contains(&captured.original.pending.submitted)
+                && original.pending.len() < 16 && !original.pending.contains_key(&key)
+                && !original.retired.contains(&key),
+                "lock-v2 revoked/different-owner/duplicate captured input")?;
+            Ok::<(), ArenaError>(())
+        })();
+        if let Err(error) = validation {
+            return Err(Box::new((error, input)));
+        }
+        // Validation happens before moving the input; commit has no fallible
+        // operations and preserves the original owner and reservation.
+        let (captured, _) = input.into_original();
+        let key = (captured.original.pending.ticket.id.epoch.0,
+            captured.original.pending.ticket.id.sequence);
+        self.original.original.reserved.remove(&captured.original.pending.submitted);
+        self.original.original.pending.insert(key, captured.original.pending);
+        self.original.inputs.insert(key, captured.input);
+        Ok(())
     }
 
     pub(super) fn discard_reserved_input(&mut self, sequence: u64) -> bool {
@@ -176,7 +215,33 @@ impl RoventCorpusProducerLockV2 {
             self.admission.same_original_admission(witness.admission()),
             "lock-v2 native event belongs to another original admission",
         )?;
-        self.original.observe_native_event(witness.event())
+        let event = witness.event();
+        let (ticket, failures) = match event {
+            TicketNativeEvent::Completed { completion, observation_failures, .. } =>
+                (Some(completion.ticket), Some(observation_failures)),
+            TicketNativeEvent::Retired { ticket, observation_failures, .. } =>
+                (Some(*ticket), Some(observation_failures)),
+            _ => (None, None),
+        };
+        if let (Some(ticket), Some(failures)) = (ticket, failures) {
+            if !failures.is_empty() {
+                check(self.native_observation_failures.len() < MAX_CORPUS_ROWS
+                    || self.native_observation_failures.contains_key(&ticket.id),
+                    "lock-v2 native failure evidence cap")?;
+                let records = self.native_observation_failures.entry(ticket.id).or_default();
+                records.extend(failures.iter().cloned());
+                return Err(invalid(format!("lock-v2 original native observation failed: {records:?}")));
+            }
+        }
+        self.original.observe_native_event(event)?;
+        if let TicketNativeEvent::Retired { ticket, accepted: true, result: Ok(()), .. } = event {
+            check(!self.native_observation_failures.contains_key(&ticket.id)
+                && self.native_retirements.len() < MAX_CORPUS_ROWS
+                && !self.native_retirements.contains_key(&ticket.id),
+                "lock-v2 duplicate or failed native retirement")?;
+            self.native_retirements.insert(ticket.id, *ticket);
+        }
+        Ok(())
     }
 
     pub fn discard_unpublished(&mut self, id: RequestId) -> bool {
@@ -226,6 +291,9 @@ impl RoventCorpusProducerLockV2 {
         output_digest: Digest,
         acceptance_kind: &str,
     ) -> Result<RoventRetiredLockV2Record, ArenaError> {
+        check(self.native_retirements.get(&ticket.id) == Some(&ticket)
+            && !self.native_observation_failures.contains_key(&ticket.id),
+            "lock-v2 original native retirement is missing or reported an observation failure")?;
         let key = (ticket.id.epoch.0, ticket.id.sequence);
         let producer = &mut self.original.original;
         let pending = producer.pending.get(&key)
