@@ -219,6 +219,9 @@ pub enum RoventOwnRActivityV2 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+// The observed form is part of the public receipt API and its serialized
+// domain; boxing it here would change construction for existing consumers.
+#[allow(clippy::large_enum_variant)]
 pub enum RoventRootTieObservationV2 {
     Unknown,
     NotApplicable {
@@ -437,9 +440,7 @@ impl RoventExecutionReceiptV2 {
                     || root_state_and_history_sha256
                         != &lock.manifest.engine.search.root_state_and_history_sha256
                     || plan == RoventPolicyRecordConsistencyV2::Mismatch
-                {
-                    RoventPolicyRecordConsistencyV2::Mismatch
-                } else if matches!(&self.own_r_activity, RoventOwnRActivityV2::Issued { owner_id: issued_owner, root_authority_sha256: issued_authority, .. } if issued_owner != owner_id || issued_authority != root_authority_sha256)
+                    || matches!(&self.own_r_activity, RoventOwnRActivityV2::Issued { owner_id: issued_owner, root_authority_sha256: issued_authority, .. } if issued_owner != owner_id || issued_authority != root_authority_sha256)
                 {
                     RoventPolicyRecordConsistencyV2::Mismatch
                 } else if matches!(self.own_r_activity, RoventOwnRActivityV2::Unknown)
