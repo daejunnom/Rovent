@@ -324,31 +324,31 @@ impl<L: SessionExternalLock> RoventExternalSessionSource<L> {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        if owner.actual_root_admission().is_some() || owner.actual_root_admission_v2().is_some() {
-            if !L::is_current(owner, &root) {
-                owner
-                    .worker()
-                    .request_root_change(root.authority(), root.original_context().control.deadline)
-                    .map_err(|error| {
+        if (owner.actual_root_admission().is_some() || owner.actual_root_admission_v2().is_some())
+            && !L::is_current(owner, &root)
+        {
+            owner
+                .worker()
+                .request_root_change(root.authority(), root.original_context().control.deadline)
+                .map_err(|error| {
+                    SearchSessionFailure::debug("RoventExternalRootChange", &error)
+                })?;
+            loop {
+                if let Some(result) = owner.worker().root_change_result() {
+                    result.map_err(|error| {
                         SearchSessionFailure::debug("RoventExternalRootChange", &error)
                     })?;
-                loop {
-                    if let Some(result) = owner.worker().root_change_result() {
-                        result.map_err(|error| {
-                            SearchSessionFailure::debug("RoventExternalRootChange", &error)
-                        })?;
-                        break;
-                    }
-                    if !root.original_context().accepts().unwrap_or(false)
-                        || Instant::now() >= root.original_context().control.deadline
-                    {
-                        return Err(failure(
-                            "RoventExternalRootChange",
-                            "root change canceled or expired",
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
+                    break;
                 }
+                if !root.original_context().accepts().unwrap_or(false)
+                    || Instant::now() >= root.original_context().control.deadline
+                {
+                    return Err(failure(
+                        "RoventExternalRootChange",
+                        "root change canceled or expired",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
         L::admit(owner, root)

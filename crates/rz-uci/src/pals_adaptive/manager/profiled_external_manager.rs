@@ -29,6 +29,17 @@ where
     pub manager: ProfiledExternalExecutionManager<Q, B, D>,
 }
 
+type V2ExternalParts<Q, B, D> =
+    ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>;
+type V2FacadePartsResult<Q, B, D> =
+    Result<V2ExternalParts<Q, B, D>, ProfiledExternalPersistentRejection<Q, B, D>>;
+type V2ManagerPartsResult<Q, B, D> =
+    Result<V2ExternalParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>>;
+type V2ExternalAdmissionResult<Q, B, D> = Result<
+    ProfiledExternalExecutionManager<Q, B, D>,
+    ProfiledExternalManagerAdmissionRejection<Q, B, D, rz_experiments::RoventInputLockV2>,
+>;
+
 impl<Q, B, D> ProfiledExternalExecutionManager<Q, B, D>
 where
     Q: Clone + Send + Sync + 'static,
@@ -144,10 +155,7 @@ where
     #[allow(clippy::result_large_err)]
     pub fn into_profiled_v2_persistent_parts(
         self,
-    ) -> Result<
-        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
-        ProfiledExternalPersistentRejection<Q, B, D>,
-    > {
+    ) -> V2FacadePartsResult<Q, B, D> {
         self.inner
             .into_profiled_v2_persistent_parts()
             .map_err(|rejected| ProfiledExternalPersistentRejection {
@@ -162,10 +170,7 @@ where
     #[allow(clippy::result_large_err)]
     pub fn into_profiled_v2_process_parts(
         self,
-    ) -> Result<
-        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
-        ProfiledExternalPersistentRejection<Q, B, D>,
-    > {
+    ) -> V2FacadePartsResult<Q, B, D> {
         self.inner
             .into_profiled_v2_process_parts()
             .map_err(|rejected| ProfiledExternalPersistentRejection {
@@ -392,29 +397,20 @@ where
     #[allow(clippy::result_large_err)]
     pub fn into_profiled_v2_persistent_parts(
         self,
-    ) -> Result<
-        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
-        AdaptivePersistentRejection<Q, B, D>,
-    > {
+    ) -> V2ManagerPartsResult<Q, B, D> {
         self.into_profiled_v2_settled_parts(AdaptiveCloseMode::RootQuiesce)
     }
     #[allow(clippy::result_large_err)]
     pub fn into_profiled_v2_process_parts(
         self,
-    ) -> Result<
-        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
-        AdaptivePersistentRejection<Q, B, D>,
-    > {
+    ) -> V2ManagerPartsResult<Q, B, D> {
         self.into_profiled_v2_settled_parts(AdaptiveCloseMode::ProcessShutdown)
     }
     #[allow(clippy::result_large_err)]
     fn into_profiled_v2_settled_parts(
         self,
         mode: AdaptiveCloseMode,
-    ) -> Result<
-        ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV2>,
-        AdaptivePersistentRejection<Q, B, D>,
-    > {
+    ) -> V2ManagerPartsResult<Q, B, D> {
         if !matches!(&self.researcher, ResearcherResources::ProfiledExternal(source) if matches!(source.as_ref(), researcher_resources::ProfiledExternalSource::V2(_)))
         {
             return Err(AdaptivePersistentRejection {
@@ -509,10 +505,7 @@ where
         sources: AdaptiveManagerSources<Q, B, D>,
         external: ProfiledExternalManagerSource<rz_experiments::RoventInputLockV2>,
         continuation: Option<AdaptiveSequenceContinuation>,
-    ) -> Result<
-        ProfiledExternalExecutionManager<Q, B, D>,
-        ProfiledExternalManagerAdmissionRejection<Q, B, D, rz_experiments::RoventInputLockV2>,
-    > {
+    ) -> V2ExternalAdmissionResult<Q, B, D> {
         Self::new_profiled_external_any_retaining(
             registration,
             clock,
