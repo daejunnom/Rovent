@@ -1,8 +1,10 @@
 """Finite custody deadlines and non-sensitive failure observations."""
 import io
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -72,6 +74,28 @@ class CustodyDeadlineDiagnosticTests(unittest.TestCase):
             with self.assertRaises(StorageError) as caught:
                 view.usage([(None, {"key": "row", "reserved_bytes": 10}, Path("unread"))])
         self.assertEqual(caught.exception.custody_deadline_observation["stage"], "output_accounting")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires real no-follow Linux descriptor")
+    def test_mismatched_source_owner_still_fails_with_bounded_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.py"
+            raw = b"fixture only\n"
+            path.write_bytes(raw)
+            pin = custody._pin(path, raw)
+            held = custody._Held(10)
+            try:
+                actual_uid = os.geteuid()
+                with patch.object(custody.os, "geteuid", return_value=actual_uid + 1):
+                    with self.assertRaisesRegex(StorageError, "FD/type/owner/length changed") as caught:
+                        held.read(pin, path, len(raw))
+                observation = caught.exception.custody_metadata_failure_observation
+                self.assertFalse(observation["owner_matches_euid"])
+                self.assertTrue(observation["regular_file"])
+                self.assertTrue(observation["single_link"])
+                self.assertTrue(observation["length_matches_pin"])
+                self.assertNotIn(str(path), json.dumps(observation))
+            finally:
+                held.close()
 
 
 if __name__ == "__main__":

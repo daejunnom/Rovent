@@ -1539,12 +1539,23 @@ class QuarantineMetadataBoundaryTests(unittest.TestCase):
                 self.q._mounts(self.held, self.target.parent, self.target, 7)
         self.mount_raw = original
         self.namespace.st_ino += 1
-        with self.assertRaisesRegex(StorageError, "namespace/mount"):
+        with self.assertRaisesRegex(StorageError, "namespace/mount") as changed_namespace:
             observed.check()
+        self.assertTrue(changed_namespace.exception.custody_mount_change_observation["namespace_changed"])
         self.namespace.st_ino -= 1
         self.mount_raw += b"3 1 0:8 / /unrelated rw - ext4 dev rw\n"
-        with self.assertRaisesRegex(StorageError, "namespace/mount"):
+        with self.assertRaisesRegex(StorageError, "namespace/mount") as unrelated_mount:
             observed.check()
+        diagnostic = unrelated_mount.exception.custody_mount_change_observation
+        self.assertTrue(diagnostic["mountinfo_changed"])
+        self.assertFalse(diagnostic["namespace_changed"])
+        self.assertFalse(diagnostic["readonly_aliases_changed"])
+        self.assertFalse(diagnostic["origin_changed"])
+        self.assertNotIn("/unrelated", json.dumps(diagnostic))
+        self.mount_raw = original.replace(b" / rw -", b" / rw,noexec -")
+        with self.assertRaisesRegex(StorageError, "namespace/mount") as changed_origin:
+            observed.check()
+        self.assertTrue(changed_origin.exception.custody_mount_change_observation["origin_changed"])
 
     def test_directory_fd_cache_name_recheck_and_first_fstat_failure_close(self):
         first = self.held.directory(self.target)

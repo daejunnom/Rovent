@@ -379,7 +379,14 @@ def observe_new_output(catalog, rows, selection, guard, *, output, source, produ
               "registered completed transition history required")
         anchor = HistoricalAnchor(_TOKEN, history)
         for role, path in _source_paths().items():
-            held.read(selection._sources[role], path, transitions.SOURCE_RAW_LIMIT)
+            try:
+                held.read(selection._sources[role], path, transitions.SOURCE_RAW_LIMIT)
+            except StorageError as error:
+                observation = getattr(error, "custody_metadata_failure_observation", None)
+                if type(observation) is dict:
+                    observation["domain"] = "current_management_source"
+                    observation["source_role"] = role
+                raise
         result = CurrentExclusionSession(_TOKEN, anchor, selection, catalog, guard, output, source, producer_record)
         result.check()
         return result

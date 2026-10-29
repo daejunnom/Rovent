@@ -166,8 +166,25 @@ class _Held:
         fd = os.open(checked(path), os.O_RDONLY | os.O_NOFOLLOW)
         self.fds.append(fd)
         before = _stamp(os.fstat(fd))
-        _need(stat.S_ISREG(before[2]) and before[3] == os.geteuid() and before[5] == 1
-              and before[6] == pin["bytes"], "custody metadata FD/type/owner/length changed")
+        regular = stat.S_ISREG(before[2])
+        owner_matches = before[3] == os.geteuid()
+        single_link = before[5] == 1
+        length_matches = before[6] == pin["bytes"]
+        if not (regular and owner_matches and single_link and length_matches):
+            error = StorageError("custody metadata FD/type/owner/length changed")
+            # No path, file contents, raw pin, or ownership override. The
+            # caller may add a known public source role before reporting.
+            error.custody_metadata_failure_observation = {
+                "schema": "rovezero.custody-metadata-failure-observation.v1",
+                "stage": "metadata_read",
+                "domain": "unknown",
+                "source_role": None,
+                "regular_file": regular,
+                "owner_matches_euid": owner_matches,
+                "single_link": single_link,
+                "length_matches_pin": length_matches,
+            }
+            raise error
         raw = self._bytes(fd, before[6])
         _need(_pin(path, raw) == pin and _stamp(os.fstat(fd)) == before
               == _stamp(Path(path).lstat()), "custody metadata raw pin/FD/name changed")
@@ -241,7 +258,7 @@ def _mounts(held, parent, target, device):
     held.tick()
     raw = _kernel(held, Path("/proc/self/mountinfo"), SNAPSHOT_LIMIT)
     namespace = os.stat("/proc/self/ns/mnt")  # A named kernel namespace link, never target data.
-    rows = []
+    rows, origin_lines = [], {}
     def unescape(text):
         return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), text)
     for line in raw.decode("utf-8", "strict").splitlines():
@@ -250,6 +267,7 @@ def _mounts(held, parent, target, device):
         # Per-mount options precede the separator; superblock options do not
         # establish whether this particular alias is writable.
         rows.append((fields[0], fields[2], Path(unescape(fields[3])), Path(unescape(fields[4])), fields[5]))
+        origin_lines[fields[0]] = line.encode("utf-8")
     def containing(path):
         options = [row for row in rows if path == row[3] or row[3] in path.parents]
         _need(bool(options), "custody mount origin unavailable")
@@ -259,6 +277,10 @@ def _mounts(held, parent, target, device):
         return options[0]
     origin, target_origin = containing(parent), containing(target)
     _need(origin == target_origin and origin[1] == f"{os.major(device)}:{os.minor(device)}", "cross-device or boundary custody mount")
+    # Keep only a digest for failure diagnostics. The full mountinfo remains
+    # part of the actual comparison and no path is disclosed in that record.
+    if isinstance(held, _Held):
+        held._last_mount_origin_sha256 = hashlib.sha256(origin_lines[origin[0]]).hexdigest()
     native_parent = origin[2] / parent.relative_to(origin[3])
     readonly_aliases = []
     for row in rows:
@@ -352,6 +374,7 @@ class _Observed:
         _need(parent.st_dev == root.st_dev, "cross-device custody root")
         self.parent_identity, self.identity = _did(parent), _did(root)
         self.mounts = _mounts(held, self.target.parent, self.target, root.st_dev)
+        self.mount_origin_sha256 = getattr(held, "_last_mount_origin_sha256", None)
         self.snapshot = _snapshot(held, self.target, self.fd)
         self.check()
 
@@ -361,7 +384,24 @@ class _Observed:
         _need(_did(os.fstat(self.parent_fd)) == _did(checked(self.target.parent).lstat()) == self.parent_identity, "custody parent FD/name changed")
         _need(_did(os.fstat(self.fd)) == _did(os.stat(self.target.name, dir_fd=self.parent_fd, follow_symlinks=False))
               == _did(checked(self.target).lstat()) == self.identity, "custody target FD/name changed")
-        _need(_mounts(self.held, self.target.parent, self.target, self.identity[0]) == self.mounts, "custody namespace/mount observation changed")
+        current_mounts = _mounts(self.held, self.target.parent, self.target, self.identity[0])
+        if current_mounts != self.mounts:
+            current_origin = getattr(self.held, "_last_mount_origin_sha256", None)
+            error = StorageError("custody namespace/mount observation changed")
+            error.custody_mount_change_observation = {
+                "schema": "rovezero.custody-mount-change-observation.v1",
+                "namespace_changed": self.mounts.get("namespace") != current_mounts.get("namespace"),
+                "mountinfo_changed": (self.mounts.get("mountinfo_bytes"), self.mounts.get("mountinfo_sha256"))
+                                     != (current_mounts.get("mountinfo_bytes"), current_mounts.get("mountinfo_sha256")),
+                "readonly_aliases_changed": self.mounts.get("readonly_aliases") != current_mounts.get("readonly_aliases"),
+                "origin_changed": None if self.mount_origin_sha256 is None or current_origin is None
+                                  else self.mount_origin_sha256 != current_origin,
+                "before_mountinfo_sha256": self.mounts.get("mountinfo_sha256"),
+                "after_mountinfo_sha256": current_mounts.get("mountinfo_sha256"),
+                "before_origin_sha256": self.mount_origin_sha256,
+                "after_origin_sha256": current_origin,
+            }
+            raise error
         _need(_snapshot(self.held, self.target, self.fd) == self.snapshot, "custody snapshot changed")
 
 
