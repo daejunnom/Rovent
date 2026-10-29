@@ -90,6 +90,15 @@ def main():
     retire.add_argument("--plan-bytes", type=int, required=True)
     retire.add_argument("--plan-sha256", required=True)
     retire.add_argument("--seconds", type=int, default=300)
+    legacy = commands.add_parser("register-legacy-observation", help="record a bounded legacy build observation; no deletion authority")
+    legacy.add_argument("--inputs-root", type=Path, required=True)
+    legacy.add_argument("--directory", type=Path, required=True)
+    legacy.add_argument("--output", type=Path, required=True)
+    legacy.add_argument("--max-bytes", type=int, required=True)
+    legacy.add_argument("--max-entries", type=int, default=4096)
+    legacy.add_argument("--seconds", type=int, default=60)
+    legacy_inspect = commands.add_parser("inspect-legacy-observation", help="read a registered legacy observation; no deletion authority")
+    legacy_inspect.add_argument("--observation", type=Path, required=True)
     args = parser.parse_args()
     if args.operation == "inventory":
         result = inventory(args.root)
@@ -108,6 +117,16 @@ def main():
         from storage_artifact_review import audit_code_cache
         result = audit_code_cache({"path": str(args.plan), "bytes": args.plan_bytes,
                                    "sha256": args.plan_sha256}, seconds=args.seconds)
+    elif args.operation == "register-legacy-observation":
+        from storage_legacy_inventory import observe
+        observed = observe(args.inputs_root, args.directory, args.output, max_bytes=args.max_bytes,
+                           max_entries=args.max_entries, seconds=args.seconds)
+        result = {"schema": observed["schema"], "source": observed["source"],
+                  "entry_count": observed["entry_count"], "total_file_bytes": observed["total_file_bytes"],
+                  "registration_only": True, "deletion_authorized": False}
+    elif args.operation == "inspect-legacy-observation":
+        from storage_legacy_inventory import inspect_observation
+        result = inspect_observation(args.observation)
     else:
         from storage_code_retirement import retire_code_cache
         result = retire_code_cache({"path": str(args.plan), "bytes": args.plan_bytes,
