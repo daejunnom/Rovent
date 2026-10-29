@@ -21,6 +21,66 @@ import ci_native_bundle as bundle
 
 
 class NativeBundleTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'closed-owner ELF cleanup is Linux-only')
+    def test_partial_failure_reclaims_only_verified_restorable_private_copies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private, artifact = root / 'private-elf', root / 'artifact'
+            private.mkdir()
+            artifact.mkdir()
+            binaries = {}
+            expected = {'engine': b'\x7fELFengine', 'metadata': b'\x7fELFmetadata'}
+            filename = 'partial-native-validation-binaries.tar.gz'
+            with tarfile.open(artifact / filename, 'w:gz') as archive:
+                for name, data in expected.items():
+                    (private / name).write_bytes(data)
+                    info = tarfile.TarInfo('bin/' + name)
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+                    binaries[name] = {'pin': {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}
+            (root / 'failure.log').write_bytes(b'failure evidence')
+            receipt = {'status': 'FAILED_NOT_ADMITTED', 'commands': [{'original_tree_cleanup_verified': True}],
+                       'partial_binary_bundle_file': filename,
+                       'partial_binary_bundle': bundle.file_pin(artifact / filename), 'binaries': binaries}
+            journal = bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            self.assertTrue(journal['complete'])
+            self.assertFalse(private.exists())
+            self.assertEqual((root / 'failure.log').read_bytes(), b'failure evidence')
+            self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+            with tarfile.open(artifact / filename, 'r:gz') as archive:
+                self.assertEqual({name: archive.extractfile('bin/' + name).read() for name in expected}, expected)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'closed-owner ELF cleanup is Linux-only')
+    def test_partial_failure_preserves_private_copies_on_unknown_or_bad_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private, artifact = root / 'private-elf', root / 'artifact'
+            private.mkdir()
+            artifact.mkdir()
+            data = b'\x7fELFgood'
+            (private / 'engine').write_bytes(data)
+            filename = 'partial-native-validation-binaries.tar.gz'
+            with tarfile.open(artifact / filename, 'w:gz') as archive:
+                info = tarfile.TarInfo('bin/engine')
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(b'\x7fELFevil'))
+            receipt = {'status': 'FAILED_NOT_ADMITTED', 'commands': [{'original_tree_cleanup_verified': False}],
+                       'partial_binary_bundle_file': filename,
+                       'partial_binary_bundle': bundle.file_pin(artifact / filename),
+                       'binaries': {'engine': {'pin': {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}}}
+            with self.assertRaisesRegex(RuntimeError, 'ClosedPartialProcessTreeRequired'):
+                bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            receipt['commands'][0]['original_tree_cleanup_verified'] = True
+            with self.assertRaisesRegex(RuntimeError, 'PartialBundleMemberDigest'):
+                bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            archive_path = artifact / filename
+            archive_path.write_bytes(archive_path.read_bytes()[:-8])
+            receipt['partial_binary_bundle'] = bundle.file_pin(archive_path)
+            with self.assertRaises((EOFError, OSError)):
+                bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            self.assertEqual((private / 'engine').read_bytes(), data)
+            self.assertFalse((artifact / 'partial-elf-cleanup.json').exists())
+
     def test_compressed_artifact_and_uncompressed_payload_have_separate_bounds(self):
         rows = {str(index): {'pin': {'bytes': size << 20}}
                 for index, size in enumerate((200, 200, 150))}

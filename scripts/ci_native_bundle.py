@@ -9,6 +9,7 @@ runtime DSO, weight, credential discovery, cache adoption, or retry is present.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -413,6 +414,86 @@ def cleanup_compiler_outputs(root, artifact, receipt, *,
     journal['complete'] = True
     write_record(artifact / 'compile-cleanup.json', journal)
     return journal
+
+
+def cleanup_closed_partial_elf_copies(root, artifact, receipt):
+    """Drop only private ELF copies restored byte-for-byte from a partial bundle.
+
+    This is not admission of the failed build.  It is deliberately limited to
+    this invocation's closed process tree and leaves logs, compiler targets,
+    the partial bundle and the original failure receipt intact.
+    """
+    from managed_storage import remove_tree, write_record
+
+    require(sys.platform == 'linux' and receipt.get('status') == 'FAILED_NOT_ADMITTED'
+            and receipt.get('commands')
+            and all(row.get('original_tree_cleanup_verified') is True for row in receipt['commands']),
+            'ClosedPartialProcessTreeRequired')
+    name = receipt.get('partial_binary_bundle_file')
+    allowed = {'partial-native-validation-binaries.tar.gz',
+               'partial-runtime-loader-diagnostic-binaries.tar.gz',
+               *('partial-' + item[2] for item in GPU_SELECTED_PROFILES.values())}
+    require(name in allowed, 'PartialBundleFilename')
+    binaries = receipt.get('binaries')
+    require(type(binaries) is dict and binaries, 'PartialBundleTargetsRequired')
+    private = checked(root / 'private-elf')
+    require(private.parent == checked(root) and private.is_dir(), 'OwnedPrivateElfDirectory')
+    require(all(type(key) is str and key and Path(key).name == key for key in binaries),
+            'PartialTargetNames')
+    require({entry.name for entry in private.iterdir()} == set(binaries), 'PartialPrivateContents')
+    archive_stream, archive_pin, archive_before, _ = pinned_file(artifact / name, ARTIFACT_CAP)
+    handles = []
+    try:
+        require(archive_pin == receipt.get('partial_binary_bundle'), 'PartialBundleChanged')
+        pins = {}
+        for target, info in binaries.items():
+            stream, pin, before, _ = pinned_file(private / target, ELF_CAP)
+            handles.append((target, stream, before))
+            require(pin == {key: info['pin'][key] for key in ('bytes', 'sha256')}, 'PrivateElfChanged')
+            require(stream.read(4) == b'\x7fELF', 'PrivateFileNotElf')
+            pins['bin/' + target] = pin
+
+        # Exhaust gzip, including its trailer, so a truncated or corrupted
+        # archive is never mistaken for a restorable backup.
+        total = 0
+        with gzip.GzipFile(fileobj=archive_stream, mode='rb') as compressed:
+            while chunk := compressed.read(65536):
+                total += len(chunk)
+                require(total <= ELF_PAYLOAD_CAP + (16 << 20), 'PartialBundleUncompressedBound')
+        archive_stream.seek(0)
+        seen = set()
+        with tarfile.open(fileobj=archive_stream, mode='r:gz') as archive:
+            for member in archive:
+                require(member.isfile() and member.name in pins and member.name not in seen,
+                        'PartialBundleUnexpectedMember')
+                expected = pins[member.name]
+                require(member.size == expected['bytes'], 'PartialBundleMemberSize')
+                digest = hashlib.sha256()
+                with archive.extractfile(member) as stream:
+                    while chunk := stream.read(65536):
+                        digest.update(chunk)
+                require(digest.hexdigest() == expected['sha256'], 'PartialBundleMemberDigest')
+                seen.add(member.name)
+        require(seen == set(pins), 'PartialBundleIncomplete')
+        require(same_file_identity(archive_before, os.fstat(archive_stream.fileno()), (artifact / name).lstat()),
+                'PartialBundleIdentityChanged')
+        for target, stream, before in handles:
+            require(same_file_identity(before, os.fstat(stream.fileno()), (private / target).lstat()),
+                    'PrivateElfIdentityChanged')
+
+        journal_path = artifact / 'partial-elf-cleanup.json'
+        journal = {'schema': 'rovezero.ci-partial-elf-cleanup.v1',
+                   'bundle_file': name, 'bundle_pin': archive_pin,
+                   'targets': sorted(binaries), 'complete': False}
+        write_record(journal_path, journal)
+        remove_tree(private, root)
+        journal['complete'] = True
+        write_record(journal_path, journal)
+        return journal
+    finally:
+        for _, stream, _ in handles:
+            stream.close()
+        archive_stream.close()
 
 
 class CommandExitFailure(RuntimeError):
@@ -1058,6 +1139,14 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
                 receipt['cleanup_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
                 write_json(artifact / 'cleanup-failure.json', {
                     'status': receipt['status'], 'cleanup_error': receipt['cleanup_error']})
+        elif receipt.get('partial_binary_bundle') is not None:
+            try:
+                cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            except (OSError, RuntimeError, tarfile.TarError, EOFError, KeyError, TypeError, ValueError) as error:
+                # Cleanup is optional: never replace the original build verdict.
+                # An incomplete journal records any partially removed copies.
+                print('Partial ELF cleanup skipped: ' + type(error).__name__ + ': ' + str(error)[:512],
+                      file=sys.stderr)
         if os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
                 output.write('artifact_ready=true\n')
