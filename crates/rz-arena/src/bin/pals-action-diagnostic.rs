@@ -45,10 +45,19 @@ fn run() -> Result<(), String> {
             DiagnosticGameFailureV1::Game(failure) => format!("game: {}", failure.error),
             DiagnosticGameFailureV1::RootSelection { error, .. } => format!("actual root selection: {error}"),
         })?;
-        let action = run_action_diagnostic_owned_v3(
+        let action = match run_action_diagnostic_owned_v3(
             Path::new(&args[5]), &args[7], Arc::clone(game.archive()), decision,
             Arc::clone(&cancel), Duration::from_millis(action_ms),
-        ).map_err(|error| error.to_string())?;
+        ) {
+            Ok(action) => action,
+            Err(original) => {
+                // Preserve the actual failed intake/process and partial
+                // owners until process exit, including any unresolved child.
+                let message = original.to_string();
+                let _retained_until_exit = Box::leak(original);
+                return Err(message);
+            }
+        };
         println!("{}", serde_json::json!({
             "schema":"rz-pals-actual-game-action-diagnostic/1",
             "source_game_count":1, "root_read_bytes":game.root_read_bytes(),
