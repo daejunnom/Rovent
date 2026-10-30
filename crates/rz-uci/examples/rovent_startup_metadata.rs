@@ -8,6 +8,8 @@
 //! lock and its configuration join are validated without admitting assets.
 //! Standalone: `--runtime-bundle-metadata=PATH.json` declares the original bundle
 //! JSON byte pin and its existing typed semantic digest, without opening libraries.
+//! Standalone: `--own-worker-metadata=PATH.json` declares the configured own-R
+//! search identity and conditions without starting a worker or loading a model.
 //! The existing startup codec owns validation, canonicalization and domain hashes.
 //! This example never opens referenced assets or creates a native/runtime owner.
 
@@ -188,6 +190,7 @@ mod metadata {
     enum Invocation {
         Startup(Arguments),
         RuntimeBundleMetadata(PathBuf),
+        OwnWorkerMetadata(PathBuf),
     }
     #[derive(Debug, PartialEq, Eq)]
     struct PositionCommand {
@@ -222,6 +225,7 @@ mod metadata {
         let mut session_implementation_root_policy = None;
         let mut input_lock_metadata = None;
         let mut runtime_bundle_metadata = None;
+        let mut own_worker_metadata = None;
         for argument in arguments {
             let text = argument.to_str().ok_or(Error::Arguments)?;
             if let Some(path) = text.strip_prefix("--config=") {
@@ -259,6 +263,11 @@ mod metadata {
                     return Err(Error::Arguments);
                 }
                 runtime_bundle_metadata = Some(json_path(path)?);
+            } else if let Some(path) = text.strip_prefix("--own-worker-metadata=") {
+                if own_worker_metadata.is_some() {
+                    return Err(Error::Arguments);
+                }
+                own_worker_metadata = Some(json_path(path)?);
             } else {
                 return Err(Error::Arguments);
             }
@@ -269,10 +278,23 @@ mod metadata {
                 && position_command.is_none()
                 && session_implementation_root_policy.is_none()
                 && input_lock_metadata.is_none()
+                && own_worker_metadata.is_none()
             {
                 Ok(Invocation::RuntimeBundleMetadata(bundle))
             } else {
                 Err(Error::Arguments)
+            };
+        }
+        if let Some(own_path) = own_worker_metadata {
+            return if configuration.is_some()
+                || backend_metadata.is_some()
+                || position_command.is_some()
+                || session_implementation_root_policy.is_some()
+                || input_lock_metadata.is_some()
+            {
+                Err(Error::Arguments)
+            } else {
+                Ok(Invocation::OwnWorkerMetadata(own_path))
             };
         }
         if input_lock_metadata.is_some() && session_implementation_root_policy.is_none() {
@@ -753,6 +775,78 @@ mod metadata {
     ) -> Result<Vec<u8>, Error> {
         prepare_metadata_with_options(bytes, backend_raw, position, None)
     }
+
+    // Declaration-only: reproduce the product worker's immutable CPU plan
+    // using the same Rust constructors, without loading NNUEC or starting a
+    // worker. Actual workers are checked again against the resulting lock.
+    fn prepare_own_worker_metadata(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        use rz_search::cpu::{CpuEngine, CpuResumePolicy};
+        use rz_search::cpu_value::BootstrapCpuValue;
+        use rz_search::cpu_worker::cpu_search_conditions_digest;
+        use std::sync::Arc;
+
+        check_input_budget(bytes)?;
+        serde_json::from_slice::<UniqueJson>(bytes).map_err(Error::Json)?;
+        let document =
+            StartupConfigurationDocument::from_json(bytes).map_err(configuration_error)?;
+        document.validate().map_err(configuration_error)?;
+        if !matches!(&document, StartupConfigurationDocument::V4(_)) {
+            return Err(Error::SessionImplementationLock(
+                "own worker metadata requires a /4 startup declaration",
+            ));
+        }
+        let ExecutionConfiguration::OwnResearcher { cpu_plan, .. } = document.fields().execution
+        else {
+            return Err(Error::SessionImplementationLock(
+                "own worker metadata requires own researcher",
+            ));
+        };
+        let tie = document
+            .own_r_root_tie_policy()
+            .map_err(configuration_error)?
+            .ok_or(Error::SessionImplementationLock(
+                "own root tie policy is required",
+            ))?;
+        let config = cpu_plan.actual().map_err(configuration_error)?;
+        let evaluator = Arc::new(BootstrapCpuValue::default());
+        let mut engine = if cpu_plan.preserve_paused_side_scope {
+            CpuEngine::with_paused_side_scope_and_tie_policy(
+                config,
+                evaluator,
+                cpu_plan.ordering(),
+                tie,
+            )
+        } else {
+            CpuEngine::with_evaluator_ordering_resume_and_tie_policy(
+                config,
+                evaluator,
+                cpu_plan.ordering(),
+                CpuResumePolicy::PausedStack,
+                tie,
+            )
+        }
+        .map_err(|_| Error::SessionImplementationLock("own worker CPU plan construction failed"))?;
+        engine
+            .set_paused_stack_max_bytes(cpu_plan.paused_bytes_limit)
+            .map_err(|_| {
+                Error::SessionImplementationLock("own worker paused stack limit failed")
+            })?;
+        let value = serde_json::json!({
+            "schema":"rz-rovent-own-worker-metadata/1",
+            "scope":"configured_cpu_search_declaration_only",
+            "source_configuration": byte_pin(bytes),
+            "compiled_bootstrap_source_sha256": hex(&rz_uci::rovent_bootstrap::compiled_bootstrap_source_digest()),
+            "expected_search_identity": engine.search_identity(),
+            "expected_worker_conditions_sha256": hex(&cpu_search_conditions_digest(&engine).0),
+            "actual_worker_started": false,
+            "nnuec_loaded": false,
+            "neural_execution_observed": false,
+            "native_authority": false,
+        });
+        let mut output = serde_json::to_vec(&value).map_err(Error::OutputEncoding)?;
+        output.push(b'\n');
+        Ok(output)
+    }
     fn prepare_metadata_with_options(
         bytes: &[u8],
         backend_raw: Option<&[u8]>,
@@ -958,6 +1052,9 @@ mod metadata {
             Invocation::RuntimeBundleMetadata(path) => {
                 prepare_runtime_bundle_metadata(&read_configuration(&path)?)?
             }
+            Invocation::OwnWorkerMetadata(path) => {
+                prepare_own_worker_metadata(&read_configuration(&path)?)?
+            }
         };
         let mut stdout = io::stdout().lock();
         stdout
@@ -1016,6 +1113,50 @@ mod metadata {
                 "peers":{"pc_peer":true,"researcher":true,"max_sources_per_root":1}
             });
             serde_json::to_vec(&value).unwrap()
+        }
+
+        #[test]
+        fn own_worker_metadata_is_opt_in_and_uses_the_declared_tie_policy() {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&own_nnuec_fixture()).unwrap();
+            value["domain"] = serde_json::json!(ROVENT_STARTUP_CONFIGURATION_V4_DOMAIN);
+            value["post_repair"] = serde_json::json!("disabled");
+            value["external"] = serde_json::json!({"kind":"absent"});
+            value["own_r_root_tie"] =
+                serde_json::json!({"kind":"own", "policy":"legacy_first_searched"});
+            let legacy: serde_json::Value = serde_json::from_slice(
+                &prepare_own_worker_metadata(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(legacy["actual_worker_started"], false);
+            assert_eq!(legacy["nnuec_loaded"], false);
+            value["own_r_root_tie"]["policy"] = serde_json::json!("rules_order_confirmed");
+            let confirmed: serde_json::Value = serde_json::from_slice(
+                &prepare_own_worker_metadata(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_ne!(
+                legacy["expected_search_identity"],
+                confirmed["expected_search_identity"]
+            );
+            assert_ne!(
+                legacy["expected_worker_conditions_sha256"],
+                confirmed["expected_worker_conditions_sha256"]
+            );
+            assert!(matches!(
+                parse_arguments([OsString::from("--own-worker-metadata=a.json")]).unwrap(),
+                Invocation::OwnWorkerMetadata(_)
+            ));
+            assert!(
+                parse_arguments(
+                    ["--config=a.json", "--own-worker-metadata=b.json"].map(OsString::from)
+                )
+                .is_err()
+            );
+            assert!(
+                prepare_own_worker_metadata(&fixture(ROVENT_STARTUP_CONFIGURATION_DOMAIN, ""))
+                    .is_err()
+            );
         }
 
         fn external_fixture() -> Vec<u8> {
