@@ -36,6 +36,21 @@ pub struct TicketPreparation<V, Q> {
     pub query: Q,
 }
 
+/// A read-only handle to the same native ticket cancellation word. It grants
+/// no right to cancel, accept, consume, or establish physical completion.
+#[derive(Clone)]
+pub struct NativeTicketCancelObservation {
+    original: Arc<AtomicBool>,
+}
+impl NativeTicketCancelObservation {
+    pub fn is_canceled(&self) -> bool { self.original.load(Ordering::Acquire) }
+    /// Establish the ordering of an optional submission against cancellation.
+    /// A successful claim does not dispatch, accept or complete any work.
+    pub fn try_claim_submission(&self) -> bool {
+        self.original.compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+}
+
 /// Borrowed context produced only on the native worker after it validates
 /// the original ticket against its held preparation. It conveys no acceptance
 /// or physical-completion authority and cannot be constructed or cloned by a
@@ -45,6 +60,7 @@ pub struct TicketOwnerDispatchContext<'a, V, Q, P> {
     ticket: &'a RoleTicketEnvelope,
     question: &'a TicketPreparation<V, Q>,
     prepared: &'a P,
+    canceled: &'a Arc<AtomicBool>,
 }
 
 impl<'a, V, Q, P> TicketOwnerDispatchContext<'a, V, Q, P> {
@@ -56,6 +72,11 @@ impl<'a, V, Q, P> TicketOwnerDispatchContext<'a, V, Q, P> {
     }
     pub fn prepared(&self) -> &'a P {
         self.prepared
+    }
+    /// Retain the same original native cancellation observation, not a new
+    /// cancel authority or evidence that the NN request was accepted.
+    pub fn original_cancellation(&self) -> NativeTicketCancelObservation {
+        NativeTicketCancelObservation { original: Arc::clone(self.canceled) }
     }
     pub fn same_owner(&self, verifier: &NativeAcceptanceVerifier) -> bool {
         self.verifier.same_owner(verifier)
@@ -82,6 +103,7 @@ impl<'a, V, Q, P> TicketOwnerDispatchContext<'a, V, Q, P> {
             ticket: self.ticket,
             question,
             prepared,
+            canceled: self.canceled,
         })
     }
 }
@@ -1524,6 +1546,7 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                                 ticket: &ticket,
                                 question: &value.question,
                                 prepared: &value.prepared,
+                                canceled: &value.canceled,
                             },
                             &value.canceled,
                         )

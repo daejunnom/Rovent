@@ -9,7 +9,7 @@ use rz_uci::pals_native::ticketed::{
 };
 use std::cell::Cell;
 use std::sync::{Arc, Mutex, mpsc, atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}};
-use super::producer_v2::SubmittedTeacherQueryV2;
+use super::producer_v2::{SubmittedTeacherQueryV2, SpeculativeTicketAuthorityV2};
 
 /// A ticket's independent speculative handoff state. It never proves NN
 /// dispatch, acceptance, physical completion, a teacher target or retirement.
@@ -26,7 +26,7 @@ struct SpeculativeTicketV2 {
     ticket: RoleTicketEnvelope,
     state: AtomicU8,
     error: Mutex<Option<ArenaError>>,
-    canceled: Arc<AtomicBool>,
+    authority: SpeculativeTicketAuthorityV2,
 }
 struct SpeculativeRouteV2 {
     registration_owner: Registrations,
@@ -37,6 +37,7 @@ struct SpeculativeRouteV2 {
     maximum_tickets: usize,
     unattributed: AtomicU64,
     cancel_all: Arc<AtomicBool>,
+    root_revoked: Arc<AtomicBool>,
     targets_revoked: Arc<AtomicBool>,
 }
 /// Retains each original ticket and its one callback outcome, including
@@ -63,7 +64,7 @@ impl SpeculativeRootV2 {
         if !self.matches_ticket_authority(ticket) { return false; }
         let found = match self.route.tickets.try_lock() {
             Ok(tickets) => tickets.get(&ticket.id).filter(|item| item.ticket == *ticket)
-                .map(|item| { item.canceled.store(true, Ordering::Release); }),
+                .map(|item| { item.authority.cancel(); }),
             Err(_) => None,
         };
         if found.is_none() {
@@ -267,6 +268,7 @@ impl RoventNativeCaptureRegistration {
     pub(crate) fn try_install_speculative_root(
         &self, admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
         channel_capacity: usize, maximum_tickets: usize,
+        root_revoked: Arc<AtomicBool>,
     ) -> Result<Option<(SpeculativeRootV2, mpsc::Receiver<SubmittedTeacherQueryV2>)>, ArenaError> {
         check((1..=16).contains(&channel_capacity) && (1..=65_536).contains(&maximum_tickets),
             "speculative root channel/ticket capacity")?;
@@ -295,7 +297,7 @@ impl RoventNativeCaptureRegistration {
         let route = Arc::new(SpeculativeRouteV2 { registration_owner: Arc::clone(&self.registered),
             installed: AtomicBool::new(true), admission: admission.clone(), sender,
             tickets: Mutex::new(std::collections::HashMap::new()), maximum_tickets,
-            unattributed: AtomicU64::new(0), cancel_all: Arc::new(AtomicBool::new(false)),
+            unattributed: AtomicU64::new(0), cancel_all: Arc::new(AtomicBool::new(false)), root_revoked,
             targets_revoked: Arc::new(AtomicBool::new(false)) });
         routes.push(Arc::clone(&route));
         self.speculative_active.fetch_add(1, Ordering::Release);
@@ -638,7 +640,7 @@ impl RoventNativeCaptureRegistration {
                     && !tickets.contains_key(&ticket.id) => {
                     if tickets.try_reserve(1).is_ok() {
                         let item = Arc::new(SpeculativeTicketV2 { ticket: *ticket, state: AtomicU8::new(0),
-                            error: Mutex::new(None), canceled: Arc::new(AtomicBool::new(false)) });
+                            error: Mutex::new(None), authority: SpeculativeTicketAuthorityV2::new() });
                         tickets.insert(ticket.id, Arc::clone(&item));
                         Some(item)
                     } else { None }
@@ -978,7 +980,8 @@ impl RoventNativeInputObserver {
                 let teacher_required = captured.speculative_teacher_required();
                 let prepared_speculative = speculative.as_ref().filter(|_| teacher_required).map(|(route, ticket)| {
                     captured.speculative_teacher_query(admission.clone(), &preparation.view, &prepared.input,
-                        Arc::clone(&ticket.canceled), Arc::clone(&route.cancel_all), Arc::clone(&route.targets_revoked))
+                        ticket.authority.clone(), context.original_cancellation(), Arc::clone(&route.root_revoked),
+                        Arc::clone(&route.cancel_all), Arc::clone(&route.targets_revoked))
                 });
                 let input = RoventCapturedLockInputV2 { captured, admission };
                 match self.lock_v2_sender.try_send(input) {

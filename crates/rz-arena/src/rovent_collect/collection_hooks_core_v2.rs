@@ -650,7 +650,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         let (speculative, speculative_install_issue) = if self.speculative_enabled.load(Ordering::Acquire) {
             match self.owner.try_status() {
                 Ok(Some(status)) => match self.owner.capture_registration().try_install_speculative_root(
-                    &admission, SPECULATIVE_QUERY_QUEUE_CAPACITY, status.game_record_limit.min(65_536)) {
+                    &admission, SPECULATIVE_QUERY_QUEUE_CAPACITY, status.game_record_limit.min(65_536), Arc::clone(&self.revoked)) {
                     Ok(Some(route)) => (Some(route), None),
                     Ok(None) => (None, Some("speculative root installation busy".into())),
                     Err(error) => (None, Some(error.to_string())),

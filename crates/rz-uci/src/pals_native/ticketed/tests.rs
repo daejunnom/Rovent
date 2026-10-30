@@ -910,6 +910,7 @@ fn owner_context_projection_requires_the_original_view_and_question_contract() {
     let (_other_issuer, other) = NativeAcceptanceIssuer::new_pair();
     let original_prepared = 5_u64;
     let projected_prepared = 9_u64;
+    let original_cancellation = Arc::new(AtomicBool::new(false));
     let projected = || TicketPreparation {
         question: source.question,
         seal: source.seal,
@@ -923,6 +924,7 @@ fn owner_context_projection_requires_the_original_view_and_question_contract() {
         ticket: &original,
         question: &source,
         prepared: &original_prepared,
+        canceled: &original_cancellation,
     };
 
     let matching = projected();
@@ -932,6 +934,14 @@ fn owner_context_projection_requires_the_original_view_and_question_contract() {
     assert_eq!(result.ticket(), &original);
     assert_eq!(*result.prepared(), projected_prepared);
     assert!(Arc::ptr_eq(&result.question().view, &source.view));
+    // Projection must retain the real preparation's cancellation word, not
+    // a new flag or acceptance/fence authority.
+    let original_cancel = context().original_cancellation();
+    let projected_cancel = result.original_cancellation();
+    assert!(original_cancel.try_claim_submission());
+    original_cancellation.store(true, Ordering::Release);
+    assert!(projected_cancel.is_canceled());
+    assert!(!projected_cancel.try_claim_submission());
 
     let mut changed = projected();
     changed.question = Digest([42; 32]);

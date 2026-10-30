@@ -84,6 +84,7 @@ struct PendingTeacherV2 {
     // the only control writer; its one cancel uses sequence 1.
     cancel_control: Box<dyn Fn() -> Result<(), String> + Send>,
     cancel_requested: bool,
+    cancel_failure: Option<String>,
 }
 
 /// This is a logical per-ticket signal only, never a physical completion.
@@ -757,7 +758,7 @@ impl RoventCollectionTeacherSessionV2 {
         )?;
         self.require_live_root()?;
         let input = row.submitted_input_seal();
-        self.submit_original_input(input, || row.original_teacher_query_position(), || false, constraint, soft_quantum)
+        self.submit_original_input(input, || row.original_teacher_query_position(), || false, || Ok(None), constraint, soft_quantum)
     }
 
     /// Submit only the actual native-captured input. The original capsule
@@ -783,7 +784,8 @@ impl RoventCollectionTeacherSessionV2 {
             "V2 captured query differs from original root/manifest or has no policy candidates",
         )?;
         self.require_live_root()?;
-        self.submit_original_input(input, || capsule.original_teacher_query_position(), || capsule.is_canceled(), constraint, soft_quantum)
+        self.submit_original_input(input, || capsule.original_teacher_query_position(), || capsule.is_canceled(),
+            || capsule.try_claim_teacher_issuance().map(Some), constraint, soft_quantum)
     }
 
     /// Common dispatch path for a validated original input. Calling this does
@@ -793,6 +795,7 @@ impl RoventCollectionTeacherSessionV2 {
         input: RoventSubmittedInputSeal,
         make_position: impl FnOnce() -> Result<rz_position::Position, ArenaError>,
         is_canceled: impl Fn() -> bool,
+        claim_issuance: impl FnOnce() -> Result<Option<super::super::producer_v2::SpeculativeIssuanceClaimV2>, ArenaError>,
         constraint: ExternalGoConstraint,
         soft_quantum: Duration,
     ) -> Result<TeacherSubmitOutcomeV2, ArenaError> {
@@ -907,14 +910,33 @@ impl RoventCollectionTeacherSessionV2 {
         };
         check(!is_canceled(), "V2 teacher input canceled before admission")?;
         check(self.issued_inputs.insert(input_key), "V2 teacher input already submitted")?;
+        // The ticket and both original root cancellation atomics claim the
+        // right to issue immediately before touching the physical mailbox.
+        // This never proves consumption or physical completion.
+        let claim = match claim_issuance() {
+            Ok(claim) => claim,
+            Err(error) => {
+                self.issued_inputs.remove(&input_key);
+                return Err(error);
+            }
+        };
+        if is_canceled() {
+            if let Some(claim) = claim { claim.rejected(); }
+            self.issued_inputs.remove(&input_key);
+            return Err(invalid("V2 teacher input canceled before mailbox submission"));
+        }
         let dispatch = match run.lifecycle.submit(job) {
             Ok(dispatch) => dispatch,
             Err(error) => {
+                if let Some(claim) = claim { claim.rejected(); }
                 self.issued_inputs.remove(&input_key);
                 return Err(invalid(error.to_string()));
             }
         };
+        if let Some(claim) = claim { claim.admitted(); }
         actor.next_sequence = next;
+        let cancel_requested = is_canceled();
+        let cancel_failure = if cancel_requested { cancel_control().err() } else { None };
         actor.pending = Some(PendingTeacherV2 {
             actor_id: pending_actor,
             input,
@@ -923,7 +945,8 @@ impl RoventCollectionTeacherSessionV2 {
             soft_quantum,
             dispatch,
             cancel_control,
-            cancel_requested: false,
+            cancel_requested,
+            cancel_failure,
         });
         Ok(TeacherSubmitOutcomeV2::Submitted(id))
     }
@@ -947,10 +970,18 @@ impl RoventCollectionTeacherSessionV2 {
             found = Some(pending);
         }
         let Some(pending) = found else { return Ok(TeacherTicketCancelOutcomeV2::NotPending); };
-        if pending.cancel_requested { return Ok(TeacherTicketCancelOutcomeV2::AlreadyRequested); }
+        if pending.cancel_requested {
+            if let Some(error) = &pending.cancel_failure {
+                return Err(invalid(format!("V2 teacher cancel request: {error}")));
+            }
+            return Ok(TeacherTicketCancelOutcomeV2::AlreadyRequested);
+        }
         // Mark before signaling: an error/terminal race never permits sealing.
         pending.cancel_requested = true;
-        (pending.cancel_control)().map_err(|error| invalid(format!("V2 teacher cancel request: {error}")))?;
+        if let Err(error) = (pending.cancel_control)() {
+            pending.cancel_failure = Some(error.clone());
+            return Err(invalid(format!("V2 teacher cancel request: {error}")));
+        }
         Ok(TeacherTicketCancelOutcomeV2::Requested)
     }
 

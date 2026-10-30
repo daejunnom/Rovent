@@ -85,6 +85,154 @@ impl RoventCapturedInputV2 {
     }
 }
 
+// The actual speculative-ticket cancel and issuance claim share this single
+// monotonic atomic. It is local authority only, not a process/fence witness.
+const TICKET_ISSUING: u8 = 1;
+const TICKET_CANCELED: u8 = 2;
+const TICKET_ADMITTED: u8 = 4;
+const TICKET_ISSUE_UNKNOWN: u8 = 8;
+
+#[derive(Clone)]
+pub(crate) struct SpeculativeTicketAuthorityV2(std::sync::Arc<std::sync::atomic::AtomicU8>);
+impl SpeculativeTicketAuthorityV2 {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+    /// Return whether an issuance claim was already acquired. This is not
+    /// proof of actual mailbox admission or physical completion.
+    pub(crate) fn cancel(&self) -> bool {
+        self.0.fetch_or(TICKET_CANCELED, std::sync::atomic::Ordering::AcqRel) & TICKET_ISSUING != 0
+    }
+    fn canceled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) & TICKET_CANCELED != 0
+    }
+    fn claim(&self) -> Result<SpeculativeIssuanceClaimV2, ArenaError> {
+        self.0.compare_exchange(0, TICKET_ISSUING, std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire).map_err(|_| invalid("speculative ticket issuance canceled, already claimed, or unknown"))?;
+        Ok(SpeculativeIssuanceClaimV2 { authority: self.clone(), resolved: false })
+    }
+}
+/// One claimed ticket immediately surrounding actual mailbox admission. The
+/// owner must mark the actual result. Unwind/unknown blocks retries.
+pub(crate) struct SpeculativeIssuanceClaimV2 {
+    authority: SpeculativeTicketAuthorityV2,
+    resolved: bool,
+}
+impl SpeculativeIssuanceClaimV2 {
+    /// Called only on the original mailbox's successful admission result.
+    pub(crate) fn admitted(mut self) {
+        self.authority.0.fetch_or(TICKET_ADMITTED, std::sync::atomic::Ordering::AcqRel);
+        self.resolved = true;
+    }
+    /// Called only when original mailbox admission is known not to have occurred.
+    pub(crate) fn rejected(mut self) {
+        self.authority.0.fetch_and(!TICKET_ISSUING, std::sync::atomic::Ordering::AcqRel);
+        self.resolved = true;
+    }
+}
+impl Drop for SpeculativeIssuanceClaimV2 {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.authority.0.fetch_or(TICKET_ISSUE_UNKNOWN, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+fn claim_speculative_issuance(
+    root_revoked: &std::sync::atomic::AtomicBool,
+    root_canceled: &std::sync::atomic::AtomicBool,
+    root_targets_revoked: &std::sync::atomic::AtomicBool,
+    ticket: &SpeculativeTicketAuthorityV2,
+) -> Result<SpeculativeIssuanceClaimV2, ArenaError> {
+    use std::sync::atomic::Ordering;
+    root_revoked.compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| invalid("speculative root is revoked"))?;
+    root_targets_revoked.compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| invalid("speculative root targets are revoked"))?;
+    root_canceled.compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| invalid("speculative root teacher admission is closed"))?;
+    ticket.claim()
+}
+
+#[cfg(test)]
+mod speculative_issuance_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, atomic::{AtomicBool, Ordering}};
+
+    #[test]
+    fn ticket_cancel_and_issue_claim_share_one_atomic_order() {
+        for _ in 0..128 {
+            let ticket = SpeculativeTicketAuthorityV2::new();
+            let barrier = Arc::new(Barrier::new(2));
+            let other = ticket.clone();
+            let other_barrier = Arc::clone(&barrier);
+            let cancel = std::thread::spawn(move || { other_barrier.wait(); other.cancel() });
+            barrier.wait();
+            let claimed = match ticket.claim() {
+                Ok(claim) => { claim.admitted(); true }
+                Err(_) => false,
+            };
+            let cancel_saw_claim = cancel.join().expect("cancel owner joined");
+            assert_eq!(claimed, cancel_saw_claim);
+            assert!(ticket.canceled());
+            assert!(ticket.claim().is_err());
+        }
+    }
+
+    #[test]
+    fn rejected_and_unknown_claims_preserve_cancel_and_never_fake_admission() {
+        let ticket = SpeculativeTicketAuthorityV2::new();
+        let claim = ticket.claim().unwrap();
+        assert!(ticket.cancel());
+        claim.rejected();
+        assert!(ticket.canceled());
+        assert!(ticket.claim().is_err());
+
+        let unknown = SpeculativeTicketAuthorityV2::new();
+        drop(unknown.claim().unwrap());
+        assert!(unknown.claim().is_err());
+        assert!(!unknown.canceled());
+    }
+
+    #[test]
+    fn cross_thread_root_revoke_before_claim_is_rejected() {
+        let root = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(2));
+        let other = Arc::clone(&root);
+        let other_barrier = Arc::clone(&barrier);
+        let cancel = std::thread::spawn(move || {
+            other.store(true, Ordering::Release);
+            other_barrier.wait();
+        });
+        barrier.wait();
+        let teacher_closed = AtomicBool::new(false);
+        let abort = AtomicBool::new(false);
+        let ticket = SpeculativeTicketAuthorityV2::new();
+        assert!(claim_speculative_issuance(&root, &teacher_closed, &abort, &ticket).is_err());
+        cancel.join().expect("root revoke owner joined");
+    }
+
+    #[test]
+    fn original_root_and_abort_flags_prevent_subsequent_claims() {
+        let root = AtomicBool::new(true);
+        let abort = AtomicBool::new(false);
+        let teacher_closed = AtomicBool::new(false);
+        let ticket = SpeculativeTicketAuthorityV2::new();
+        assert!(claim_speculative_issuance(&root, &teacher_closed, &abort, &ticket).is_err());
+        root.store(false, Ordering::Release);
+        abort.store(true, Ordering::Release);
+        assert!(claim_speculative_issuance(&root, &teacher_closed, &abort, &ticket).is_err());
+        abort.store(false, Ordering::Release);
+        teacher_closed.store(true, Ordering::Release);
+        assert!(claim_speculative_issuance(&root, &teacher_closed, &abort, &ticket).is_err());
+        teacher_closed.store(false, Ordering::Release);
+        let claim = claim_speculative_issuance(&root, &teacher_closed, &abort, &ticket).unwrap();
+        root.store(true, Ordering::Release);
+        claim.rejected();
+        assert!(claim_speculative_issuance(&root, &teacher_closed, &abort, &ticket).is_err());
+    }
+}
+
 /// Original native submission evidence for an optional speculative teacher.
 /// It is not NN acceptance, a retired record, a target, or a completion proof.
 /// Construction is restricted to the same private capture and root owner.
@@ -97,7 +245,9 @@ pub(crate) struct SubmittedTeacherQueryV2 {
     submitted_prefix: Vec<u16>,
     legal: Vec<u16>,
     scalar_only: bool,
-    canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ticket_authority: SpeculativeTicketAuthorityV2,
+    native_cancellation: rz_uci::pals_native::ticketed::NativeTicketCancelObservation,
+    root_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     root_canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     root_targets_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -126,11 +276,23 @@ impl SubmittedTeacherQueryV2 {
     /// Root closure stops new submissions, while an already sealed result may
     /// still join its valid original retirement if its ticket was not revoked.
     pub(crate) fn is_ticket_canceled(&self) -> bool {
-        self.canceled.load(std::sync::atomic::Ordering::Acquire)
+        self.ticket_authority.canceled()
             || self.root_targets_revoked.load(std::sync::atomic::Ordering::Acquire)
     }
     pub(crate) fn is_canceled(&self) -> bool {
-        self.is_ticket_canceled() || self.root_canceled.load(std::sync::atomic::Ordering::Acquire)
+        self.is_ticket_canceled()
+            || self.native_cancellation.is_canceled()
+            || self.root_revoked.load(std::sync::atomic::Ordering::Acquire)
+            || self.root_canceled.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Establish an ordering against root revoke, UCI abort and exact ticket
+    /// cancellation. Each compare_exchange uses the original shared atomic.
+    /// A later cancellation still requires actual cancel and physical drain.
+    pub(crate) fn try_claim_teacher_issuance(&self) -> Result<SpeculativeIssuanceClaimV2, ArenaError> {
+        // This CAS is against the exact native preparation cancellation
+        // word, not a later observer projection. It authorizes no NN result.
+        check(self.native_cancellation.try_claim_submission(), "original native ticket is canceled")?;
+        claim_speculative_issuance(&self.root_revoked, &self.root_canceled, &self.root_targets_revoked, &self.ticket_authority)
     }
 
     /// Reconstruct and verify outside the native callback. This does not
@@ -201,7 +363,9 @@ impl RoventCapturedInputV2 {
         admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
         view: &ReviewView,
         input: &PalsVirtualReviewInput,
-        canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ticket_authority: SpeculativeTicketAuthorityV2,
+        native_cancellation: rz_uci::pals_native::ticketed::NativeTicketCancelObservation,
+        root_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
         root_canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         root_targets_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<SubmittedTeacherQueryV2, ArenaError> {
@@ -223,7 +387,7 @@ impl RoventCapturedInputV2 {
         Ok(SubmittedTeacherQueryV2 {
             admission, producer_owner: std::sync::Arc::clone(owner),
             input: self.submitted_input_seal(), anchor, prefix, submitted_prefix, legal, scalar_only,
-            canceled, root_canceled, root_targets_revoked,
+            ticket_authority, native_cancellation, root_revoked, root_canceled, root_targets_revoked,
         })
     }
 }
