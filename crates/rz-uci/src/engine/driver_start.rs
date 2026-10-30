@@ -19,9 +19,28 @@ use std::{
 #[cfg(test)]
 pub(crate) mod fixture;
 
+struct CollectionAbortHook {
+    game_gate: Arc<std::sync::atomic::AtomicU64>,
+    root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+impl CollectionAbortHook {
+    fn abort(&self) {
+        self.game_gate.fetch_or(crate::search_driver::ROVENT_COLLECTION_ABORT_BIT, std::sync::atomic::Ordering::AcqRel);
+        self.root_targets_revoked.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+impl std::fmt::Debug for CollectionAbortHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CollectionAbortHook(original Start)")
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DriverStartSource {
     teacher_scope_claimed: std::sync::atomic::AtomicBool,
+    // 0 = unbound, 1 = bound, 2 = original Start canceled.
+    collection_abort_state: std::sync::atomic::AtomicU8,
+    collection_abort_hook: std::sync::OnceLock<CollectionAbortHook>,
     ticket: SearchTicket,
     authority: SearchAuthority,
     root: PositionSnapshot,
@@ -66,6 +85,8 @@ impl DriverStartSource {
         }
         Ok(Arc::new(Self {
             teacher_scope_claimed: std::sync::atomic::AtomicBool::new(false),
+            collection_abort_state: std::sync::atomic::AtomicU8::new(0),
+            collection_abort_hook: std::sync::OnceLock::new(),
             ticket: ticket.clone(),
             authority: context.authority,
             root: root.snapshot(),
@@ -81,6 +102,50 @@ impl DriverStartSource {
             cleanup: context.shutdown_deadline,
             effective_clock: context.effective_clock.clone(),
         }))
+    }
+
+    /// Bind only to this actual Start. The second cancellation check closes
+    /// the race between the owner's cancellation and a late optional install.
+    pub(crate) fn bind_collection_abort(
+        &self,
+        context: &SearchSessionContext,
+        game_gate: Arc<std::sync::atomic::AtomicU64>,
+        root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), ContractError> {
+        if self.authority != context.authority
+            || !Arc::ptr_eq(&self.control.cancellation, &context.control.cancellation)
+            || !self.cancellation.shares_cancellation_with(&context.cancellation)
+            || !Arc::ptr_eq(&self.current, &context.current)
+        {
+            return Err(invalid("collection abort hook differs from original Start"));
+        }
+        self.collection_abort_hook.set(CollectionAbortHook { game_gate, root_targets_revoked })
+            .map_err(|_| invalid("collection abort hook already installed"))?;
+        // One atomic word makes registration and actual owner cancellation
+        // mutually ordered: if cancel wins, this installer performs the abort;
+        // if install wins, the owner sees the already-initialized hook.
+        let aborted = match self.collection_abort_state.compare_exchange(
+            0, 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => false,
+            Err(2) => true,
+            Err(_) => return Err(invalid("collection abort registration state unknown")),
+        };
+        if aborted || self.control.cancellation.load(std::sync::atomic::Ordering::Acquire)
+            || self.cancellation.is_canceled()
+        {
+            self.collection_abort_hook.get().expect("hook just installed").abort();
+        }
+        Ok(())
+    }
+
+    /// Called by the actual UCI owner before its regular cancel. The hook is
+    /// optional and must perform only nonblocking atomic state transitions.
+    pub(super) fn abort_collection(&self) {
+        let previous = self.collection_abort_state.swap(2, std::sync::atomic::Ordering::AcqRel);
+        if previous == 1 {
+            if let Some(hook) = self.collection_abort_hook.get() { hook.abort(); }
+        }
     }
 
     /// All root-admission materializations of this same actual UCI Start

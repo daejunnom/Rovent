@@ -77,6 +77,11 @@ impl SpeculativeRootV2 {
         true
     }
     pub(crate) fn cancel_all(&self) { self.route.cancel_all.store(true, Ordering::Release); }
+    /// Shared original root flag for the session owner. Sharing this flag
+    /// does not grant authority, prove completion or linearize target commit.
+    pub(crate) fn target_revoke_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.route.targets_revoked)
+    }
     /// Used only for actual/unknown root abort; target authority is revoked.
     pub(crate) fn revoke_all_targets(&self) {
         self.route.targets_revoked.store(true, Ordering::Release);
@@ -327,6 +332,59 @@ impl RoventNativeCaptureRegistration {
             _ => false,
         }) { return Ok(Some(false)); }
         let Some(index) = routes.iter().position(|route| Arc::ptr_eq(route, &root.route)) else {
+            return Ok(Some(false));
+        };
+        root.route.installed.store(false, Ordering::Release);
+        routes.remove(index);
+        self.speculative_active.fetch_sub(1, Ordering::AcqRel);
+        Ok(Some(true))
+    }
+    /// Remove only the registration routing entry after the original PC
+    /// worker's joined handoff/fence proof. The worker retains the same Arc
+    /// and its observations; unlinking grants no collection success.
+    #[cfg(target_os = "linux")]
+    pub(super) fn try_unlink_finished_speculative_root(
+        &self,
+        root: &SpeculativeRootV2,
+        proof: &super::pc_hooks_lock_v2::PcSpeculativeRouteFenceV2,
+        received: usize,
+    ) -> Result<Option<bool>, ArenaError> {
+        check(proof.matches(&root.route.admission)
+            && Arc::ptr_eq(&self.registered, &root.route.registration_owner),
+            "speculative route fence or original registration differs")?;
+        let registered = match self.registered.try_lock() {
+            Ok(registered) => registered,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("capture registrations poisoned")),
+        };
+        let mut routes = match self.speculative_roots.try_lock() {
+            Ok(routes) => routes,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("speculative route custody poisoned")),
+        };
+        let tickets = match root.route.tickets.try_lock() {
+            Ok(tickets) => tickets,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("speculative ticket custody poisoned")),
+        };
+        if root.route.unattributed.load(Ordering::Acquire) != 0
+            || registered.values().any(|entry| match entry {
+                RegisteredInputCapture::LockV2 { admission, .. }
+                | RegisteredInputCapture::LockV2DisabledPrior { admission, .. } => admission.same_original_admission(&root.route.admission),
+                _ => false,
+            }) { return Ok(Some(false)); }
+        let mut sent = 0usize;
+        for ticket in tickets.values() {
+            match SpeculativeHandoffV2::decode(ticket.state.load(Ordering::Acquire)) {
+                SpeculativeHandoffV2::Reserved | SpeculativeHandoffV2::PreparationFailureDetailUnknown => return Ok(Some(false)),
+                SpeculativeHandoffV2::Sent => sent = sent.saturating_add(1),
+                _ => {}
+            }
+        }
+        if sent != received { return Ok(Some(false)); }
+        let Some(index) = routes.iter().position(|candidate| Arc::ptr_eq(candidate, &root.route)) else {
+            // The same root handle can be inspected after a successful unlink;
+            // no different route or synthetic proof may stand in for it.
             return Ok(Some(false));
         };
         root.route.installed.store(false, Ordering::Release);

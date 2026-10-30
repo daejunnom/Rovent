@@ -402,6 +402,8 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             speculative_install_issue: None,
             speculative_rejected: None,
             speculative_received: 0,
+            speculative_route_unlinked: false,
+            speculative_unlink_issue: None,
             pump_failed: false,
             pending_drain_failed: false,
             admission_receiver,
@@ -870,6 +872,8 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     speculative_install_issue: Option<String>,
     speculative_rejected: Option<Box<(ArenaError, super::producer_v2::SubmittedTeacherQueryV2)>>,
     speculative_received: usize,
+    speculative_route_unlinked: bool,
+    speculative_unlink_issue: Option<String>,
     pump_failed: bool,
     pending_drain_failed: bool,
     admission_receiver: mpsc::Receiver<Arc<AdmissionSlot>>,
@@ -994,6 +998,40 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             }
         }
         sent == self.speculative_received
+    }
+
+    /// Called only with the original PC joined-handoff/native-fence proof.
+    /// A late capsule is retained, never discarded, and cleanup is deferred.
+    /// The route Arc and its ledger remain owned by this worker after unlink.
+    pub(super) fn try_unlink_finished_speculative_route(
+        &mut self, proof: &super::pc_hooks_lock_v2::PcSpeculativeRouteFenceV2,
+    ) -> bool {
+        if self.speculative_route_unlinked { return true; }
+        let Some(route) = self.speculative_route.as_ref() else { return true; };
+        let Some(slot) = self.slot.as_ref() else { return false; };
+        if !proof.matches(&slot.admission) || !route.matches_admission(&slot.admission) { return false; }
+        if self.speculative_rejected.is_some() { return false; }
+        let Some(receiver) = self.speculative_receiver.as_ref() else { return false; };
+        match receiver.try_recv() {
+            Ok(capsule) => {
+                self.speculative_received = self.speculative_received.saturating_add(1);
+                self.speculative_rejected = Some(Box::new((invalid("speculative capsule arrived after joined worker"), capsule)));
+                return false;
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {},
+        }
+        match self.owner.capture_registration().try_unlink_finished_speculative_root(
+            route, proof, self.speculative_received) {
+            Ok(Some(true)) => { self.speculative_route_unlinked = true; true },
+            Ok(Some(false) | None) => false,
+            Err(error) => { self.speculative_unlink_issue = Some(error.to_string()); false },
+        }
+    }
+
+    /// Read-only outcome; unlink success is independent of collection or
+    /// native physical completion and does not represent publication.
+    pub(crate) fn speculative_route_unlink_observation(&self) -> (bool, Option<&str>) {
+        (self.speculative_route_unlinked, self.speculative_unlink_issue.as_deref())
     }
 
     pub(crate) fn pending_pump_rows(&self) -> usize {

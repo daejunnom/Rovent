@@ -33,6 +33,10 @@ pub(crate) fn prepare_teacher_policy_lock_v2(
     sealed: SealedTeacherPolicyV2,
 ) -> Result<PreparedTeacherPolicyLockV2, Box<PrepareTeacherPolicyFailureV2>> {
     let prepare = || -> Result<(GenerationPolicyTargetV3, RoventHeadSource), ArenaError> {
+        if let Some(guard) = &sealed.speculative_guard {
+            check(!guard.is_ticket_canceled(), "V2 speculative teacher input canceled before preparation")?;
+            guard.matches_original_row(row)?;
+        }
         let evidence = &sealed.evidence;
         let admission = evidence.admission();
         let dispatch = evidence.dispatch();
@@ -156,6 +160,12 @@ impl RoventCorpusProducerLockV2 {
                 .as_ref()
                 .ok_or_else(|| invalid("V2 prepared policy custody is empty"))?;
             self.validate_teacher_row(row)?;
+            // Preserve and inspect the same original guard through this owner
+            // boundary; a load alone does not linearize concurrent revoke.
+            if let Some(guard) = &prepared.sealed.speculative_guard {
+                check(!guard.is_ticket_canceled(), "V2 speculative teacher input canceled before commit")?;
+                guard.matches_original_row(row)?;
+            }
             check(
                 prepared.ticket == row.ticket
                     && row.matches_manifest_owner(&prepared.sealed.manifest_owner)

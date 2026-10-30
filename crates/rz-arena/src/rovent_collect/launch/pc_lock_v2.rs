@@ -756,6 +756,14 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => {}
             Err(error) => { self.resource_error.get_or_insert_with(|| format!("teacher worker custody: {error:?}")); }
         }
+        if self.worker_exit.is_some() && !self.worker_thread_panicked {
+            if let Some(admission) = self.bridge.installed_admission_for_recovery() {
+                // This best-effort path requires the same returned handoff,
+                // native fence, drained receiver and original route identity.
+                // Busy/unknown leaves custody in place without blocking NN.
+                self.bridge.try_unlink_finished_speculative_route(admission);
+            }
+        }
         self.worker_exit.is_some() || self.worker_thread_panicked
     }
 

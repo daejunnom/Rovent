@@ -73,6 +73,16 @@ pub(crate) enum PcRootSeparationV2 {
     Pending,
     Released { retained_rows: usize },
 }
+
+/// Created only by the original PC bridge after its joined-worker, teacher
+/// aggregate, native handoff and callback fence have all been verified. It
+/// licenses unlinking a route, not publication or a model result.
+pub(super) struct PcSpeculativeRouteFenceV2 { admission: RoventCollectionRootAdmissionV2 }
+impl PcSpeculativeRouteFenceV2 {
+    pub(super) fn matches(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+}
 impl PcWorkerExitKindV2 {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -365,6 +375,20 @@ impl RoventPcCollectionBridgeV2 {
         Ok(settlement.is_ok() && fence.permits_semantic_closure())
     }
 
+    /// Best-effort removal of the original root routing entry after exact
+    /// joined handoff evidence. Busy or unknown leaves custody untouched.
+    pub(crate) fn try_unlink_finished_speculative_route(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        if !self.core.installed_admission_for_recovery()
+            .is_some_and(|original| original.same_original_admission(admission))
+            || !matches!(self.returned_handoff_settled(), Ok(true)) { return false; }
+        let Ok(slot) = self.worker.try_lock() else { return false; };
+        let Some(worker) = slot.as_ref() else { return false; };
+        if worker.returned.is_none() || worker.handle.is_some() || worker.panic.is_some() { return false; }
+        let Ok(mut core) = worker.original.try_lock() else { return false; };
+        let proof = PcSpeculativeRouteFenceV2 { admission: admission.clone() };
+        core.try_unlink_finished_speculative_route(&proof)
+    }
+
     /// Move at most one original retired row into this original joined
     /// worker's bounded custody. Once the original outbox is empty, release
     /// only this root's game gate. The supervisor calls this outside manager
@@ -381,6 +405,9 @@ impl RoventPcCollectionBridgeV2 {
         if !self.returned_handoff_settled().map_err(|error| super::invalid(format!("P/C original handoff: {error:?}")))? {
             return Ok(PcRootSeparationV2::Pending);
         }
+        // Unlinking is optional maintenance; inability to prove it must not
+        // hold up root separation or a later native search.
+        let _route_unlinked = self.try_unlink_finished_speculative_route(admission);
         let mut slot = match self.worker.try_lock() {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(PcRootSeparationV2::Pending),

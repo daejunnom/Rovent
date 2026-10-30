@@ -62,7 +62,24 @@ pub struct SearchSessionContext {
     pub shutdown_deadline: Instant,
     pub(crate) current: Arc<Mutex<SessionScope>>,
 }
+/// Sticky marker in the original Collection game word, reserved by the
+/// opt-in collection owner. Normal search never installs or reads it.
+pub const ROVENT_COLLECTION_ABORT_BIT: u64 = 1u64 << 63;
+
 impl SearchSessionContext {
+    /// Bind the exact original Start to its optional Collection game word and
+    /// root target flag. UCI stop touches only these shared atomic owners.
+    #[cfg(feature = "pals-adaptive")]
+    pub fn bind_original_collection_abort(
+        &self,
+        game_gate: Arc<std::sync::atomic::AtomicU64>,
+        root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), ContractError> {
+        self.original_start.as_ref()
+            .ok_or_else(|| ContractError::new(ErrorCode::IdentityMismatch, Stage::Admission, "original UCI Start absent"))?
+            .bind_collection_abort(self, game_gate, root_targets_revoked)
+    }
+
     pub fn soft_expired(&self, now: Instant) -> bool {
         self.effective_clock
             .as_ref()

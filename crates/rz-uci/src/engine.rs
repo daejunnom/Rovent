@@ -1686,6 +1686,9 @@ impl Owner {
     }
     fn cancel(&self) {
         if let Some(active) = &self.active {
+            // The original Start's optional Collection gate closes before
+            // signaling its physical search cancellation; neither waits.
+            if let Some(start) = &active.driver_start { start.abort_collection(); }
             active.control.cancel();
             if let Some(clock) = &active.ponder_clock {
                 clock.close();

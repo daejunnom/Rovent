@@ -130,6 +130,9 @@ pub(crate) struct SealedTeacherPolicyV2 {
     pub(crate) startup: VerifiedRoventExternalStartup,
     pub(crate) soft_quantum: Duration,
     pub(crate) evidence: RoventTeacherPolicyEvidenceV2,
+    // Keep the same original speculative ticket/root cancellation owner even
+    // after preparation and producer commit. This is not a fence by itself.
+    pub(crate) speculative_guard: Option<super::super::producer_v2::SubmittedTeacherQueryV2>,
 }
 
 /// A live-root teacher observation tied to its actual submitted capture.
@@ -155,9 +158,16 @@ impl SpeculativeSealedTeacherPolicyV2 {
             // A valid live-root seal may join after ordinary root shutdown.
             // Only abandonment of this exact ticket invalidates that join.
             check(!self.capsule.is_ticket_canceled(), "V2 speculative teacher input was canceled")?;
+            check(self.sealed.speculative_guard.is_none(), "V2 teacher evidence already has speculative ownership")?;
             self.capsule.matches_original_row(row)
         })) {
-            Ok(Ok(())) => Ok(self.sealed),
+            Ok(Ok(())) => {
+                // Do not drop the capsule: it owns the exact producer/root
+                // identity and cancellation signals needed at final commit.
+                let mut sealed = self.sealed;
+                sealed.speculative_guard = Some(self.capsule);
+                Ok(sealed)
+            },
             Ok(Err(error)) => Err(Box::new((SpeculativeTeacherJoinFailureV2::Validation(error), self))),
             Err(panic) => Err(Box::new((SpeculativeTeacherJoinFailureV2::Panicked(panic), self))),
         }
@@ -1163,6 +1173,7 @@ impl RoventCollectionTeacherSessionV2 {
                 startup,
                 soft_quantum,
                 evidence,
+                speculative_guard: None,
             }),
             Ok(Err(rejected)) => match custody.into_originals() {
                 Ok((dispatch, completion)) => {
