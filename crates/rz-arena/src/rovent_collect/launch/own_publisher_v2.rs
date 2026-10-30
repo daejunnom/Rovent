@@ -89,6 +89,29 @@ impl OwnPumpConsumerV2 {
         Ok(Some(projections))
     }
 
+    /// Describe retained failures without moving their original rows or
+    /// completion evidence. The receipt reports truncation explicitly.
+    pub(crate) fn try_failure_observations(&self) -> Result<Option<serde_json::Value>, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Own publisher custody poisoned".into())),
+        };
+        let mut entries = Vec::new();
+        let mut total = 0usize;
+        for item in state.items.iter().chain(state.failed_items.iter()).chain(state.overflow_item.iter()) {
+            if let PumpItemV2::Failed { error, evidence, .. } = item {
+                total += 1;
+                if entries.len() < 32 {
+                    let error: String = error.to_string().chars().take(512).collect();
+                    let evidence: String = evidence.diagnostic().chars().take(512).collect();
+                    entries.push(serde_json::json!({"error": error, "evidence": evidence}));
+                }
+            }
+        }
+        Ok(Some(serde_json::json!({"count":total, "reported":entries, "omitted":total.saturating_sub(32)})))
+    }
+
     /// This is only a custody check; the caller still verifies both worker
     /// joins, a final channel drain, the root fence and teacher aggregate.
     pub(super) fn try_has_failures(&self) -> Result<Option<bool>, ArenaError> {

@@ -58,6 +58,28 @@ pub(crate) enum FailedEvidence {
     },
 }
 
+impl FailedEvidence {
+    /// Read-only description. The actual completion and authority remain
+    /// with this failure; this text is never a substitute for either.
+    pub(crate) fn diagnostic(&self) -> String {
+        match self {
+            Self::BeforeCompletion => "before_completion".into(),
+            Self::SubmitPending(_) => "submit_pending".into(),
+            Self::Pending { .. } => "pending_original_job".into(),
+            Self::PendingCompleted { .. } => "pending_completed".into(),
+            Self::Completion(_) => "completed_unsealed".into(),
+            Self::SealRejected { cause, .. } => match cause {
+                TeacherPolicySealFailureV2::Validation(error) => format!("seal_validation: {error}"),
+                TeacherPolicySealFailureV2::Native { kind, error } => format!("seal_native {kind:?}: {error:?}"),
+                TeacherPolicySealFailureV2::Panicked(_) => "seal_panicked".into(),
+            },
+            Self::Quarantined(_) => "seal_quarantined".into(),
+            Self::Sealed(_) => "prepared_seal_rejected".into(),
+            Self::PreparationPanicked { .. } => "preparation_panicked".into(),
+        }
+    }
+}
+
 struct Entry {
     row: RoventRetiredLockV2Record,
     deadline: Instant,

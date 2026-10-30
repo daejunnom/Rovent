@@ -106,11 +106,17 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => (json!({"status":"busy"}), false),
             Err(error) => (json!({"status":"error", "detail":error.to_string()}), false),
         };
+        let failure_observations = match consumer.try_failure_observations() {
+            Ok(Some(value)) => value,
+            Ok(None) => json!({"status":"busy"}),
+            Err(error) => json!({"status":"error", "detail":error.to_string()}),
+        };
         let complete = drained && problem.is_none() && counts.0 == 0 && counts.1 == 0 && !failures && projected;
         (json!({"status":if complete { "drained_empty" } else { "retained_or_unknown" },
             "receiver_drained":drained, "items":counts.0, "failed_items":counts.1,
             "teacher_evidence":counts.2, "disconnected":counts.3,
-            "failure_or_overflow":failures, "detail":problem, "record_projections":projections}), complete)
+            "failure_or_overflow":failures, "detail":problem, "record_projections":projections,
+            "failure_observations":failure_observations}), complete)
     }
     /// Write serializable failure observations and original recovered teacher
     /// byte streams without consuming their owners. A partial write is left
