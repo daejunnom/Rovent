@@ -97,19 +97,28 @@ impl OwnPumpConsumerV2 {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Own publisher custody poisoned".into())),
         };
+        let describe = |text: String| {
+            let chars = text.chars().count();
+            serde_json::json!({"text":text.chars().take(512).collect::<String>(),
+                "original_chars":chars, "truncated":chars > 512})
+        };
         let mut entries = Vec::new();
         let mut total = 0usize;
         for item in state.items.iter().chain(state.failed_items.iter()).chain(state.overflow_item.iter()) {
             if let PumpItemV2::Failed { error, evidence, .. } = item {
                 total += 1;
                 if entries.len() < 32 {
-                    let error: String = error.to_string().chars().take(512).collect();
-                    let evidence: String = evidence.diagnostic().chars().take(512).collect();
-                    entries.push(serde_json::json!({"error": error, "evidence": evidence}));
+                    entries.push(serde_json::json!({"error":describe(error.to_string()),
+                        "evidence":describe(evidence.diagnostic())}));
                 }
             }
         }
-        Ok(Some(serde_json::json!({"count":total, "reported":entries, "omitted":total.saturating_sub(32)})))
+        let commits = state.commit_failures.iter().take(32).map(|failure| serde_json::json!({
+            "error":describe(failure.error.to_string()), "panicked":failure.panic.is_some()
+        })).collect::<Vec<_>>();
+        Ok(Some(serde_json::json!({"count":total, "reported":entries, "omitted":total.saturating_sub(32),
+            "commit_failure_count":state.commit_failures.len(), "commit_failures":commits,
+            "commit_failures_omitted":state.commit_failures.len().saturating_sub(32)})))
     }
 
     /// This is only a custody check; the caller still verifies both worker

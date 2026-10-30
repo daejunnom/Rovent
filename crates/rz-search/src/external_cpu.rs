@@ -1572,15 +1572,27 @@ impl ExternalUciCpuChecker {
     /// Record exact, legal tuples as reported; a bounded or incomplete next
     /// depth never replaces the most recent complete equal-depth set.
     fn observe_exact_policy_iteration(&mut self, opinion: &ExternalPolicyOpinion, width: u16) {
-        if opinion.bound != ExternalBound::ExactReported || opinion.pv.is_empty()
-            || opinion.rank == 0 || opinion.rank > width { return; }
-        match self.cooperative_exact_candidates.iter_mut().find(|item| item.rank == opinion.rank) {
-            Some(prior) if prior.depth <= opinion.depth => *prior = opinion.clone(),
-            Some(_) => return,
-            None => self.cooperative_exact_candidates.push(opinion.clone()),
+        if opinion.rank == 0 || opinion.rank > width { return; }
+        if opinion.bound != ExternalBound::ExactReported || opinion.pv.is_empty() {
+            if self.cooperative_exact_candidates.first().is_some_and(|first| first.depth == opinion.depth) {
+                self.cooperative_exact_candidates.clear();
+            }
+            return;
+        }
+        // Only an observed consecutive rank-ordered group is a completed
+        // iteration; never splice a partial later MultiPV update into it.
+        if opinion.rank == 1 {
+            self.cooperative_exact_candidates.clear();
+            self.cooperative_exact_candidates.push(opinion.clone());
+        } else if self.cooperative_exact_candidates.last().is_some_and(|last|
+            last.rank + 1 == opinion.rank && last.depth == opinion.depth)
+        {
+            self.cooperative_exact_candidates.push(opinion.clone());
+        } else {
+            self.cooperative_exact_candidates.clear();
+            return;
         }
         if self.cooperative_exact_candidates.len() != usize::from(width) { return; }
-        self.cooperative_exact_candidates.sort_by_key(|item| item.rank);
         let depth = self.cooperative_exact_candidates[0].depth;
         if self.cooperative_exact_candidates.iter().enumerate().all(|(index, item)|
             item.rank == index as u16 + 1 && item.depth == depth
