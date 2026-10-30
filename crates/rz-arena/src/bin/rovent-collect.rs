@@ -278,6 +278,11 @@ fn main() -> std::process::ExitCode {
             }
             RoventCollectionCliParse::Intervention { plan, arguments } => {
                 let receipt = run_rovent_utility_intervention_from_cli(&plan, arguments)?;
+                if let Some(warning) = &receipt.diagnostic_warning {
+                    // Ancillary diagnostics are not cohort publication or ACK.
+                    // Preserve the warning without changing the /1 stdout schema.
+                    let _ = writeln!(std::io::stderr().lock(), "intervention diagnostic warning: {warning}");
+                }
                 let resources = receipt.resource_observations()?;
                 let collection = receipt.collection_observations()?;
                 Ok(Some(serde_json::json!({

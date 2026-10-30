@@ -95,6 +95,9 @@ pub struct RoventUtilityInterventionLaunchReceipt {
     pub trials: u64,
     pub pairs: u64,
     pub historical: RoventHistoricalUtilityInterventionEvidence,
+    /// Ancillary finite-diagnostic publication did not complete. The
+    /// original cohort publication, ACK, and resource checks are unaffected.
+    pub diagnostic_warning: Option<String>,
     original: Arc<Mutex<CohortCaller>>,
 }
 impl RoventUtilityInterventionLaunchReceipt {
@@ -858,6 +861,7 @@ pub fn run_rovent_utility_intervention(
             trials: owner.writer.original_trials().count() as u64,
             pairs: owner.pairs.len() as u64,
             historical,
+            diagnostic_warning: None,
             original: Arc::clone(&shared),
         })
     })();
@@ -880,18 +884,17 @@ pub fn run_rovent_utility_intervention(
         }
         Err(_) => Some("cohort owner busy or poisoned before diagnostic publication".into()),
     };
-    match (result, diagnostic_error) {
-        (Ok(receipt), None) => Ok(receipt),
-        (original, diagnostic_error) => {
-            let detail = match (original.err(), diagnostic_error) {
-                (Some(primary), Some(secondary)) => format!(
+    match result {
+        Ok(mut receipt) => {
+            receipt.diagnostic_warning = diagnostic_error;
+            Ok(receipt)
+        }
+        Err(primary) => {
+            let detail = match diagnostic_error {
+                Some(secondary) => format!(
                     "{primary}; original finite diagnostics publication failed: {secondary}"
                 ),
-                (Some(primary), None) => primary.to_string(),
-                (None, Some(secondary)) => {
-                    format!("original finite diagnostics publication failed: {secondary}")
-                }
-                (None, None) => unreachable!("successful result handled above"),
+                None => primary.to_string(),
             };
             Err(RoventUtilityInterventionLaunchFailure {
                 detail,
