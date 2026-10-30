@@ -57,6 +57,8 @@ const MAX_SELECTION_BYTES: u64 = 64 << 10;
 mod cohort_prepare;
 mod collection;
 mod collection_v2_observer;
+#[cfg(feature = "native-validation-diagnostics")]
+mod selected_view_observation;
 #[cfg(test)]
 mod collection_v2_tests;
 mod evidence;
@@ -722,6 +724,12 @@ fn run_inner<'a>(
             "V2 lifecycle observation requires an original /2 lock",
         ));
     }
+    // A diagnostic observer belongs to this launch and never replaces a
+    // collection observer. It keeps only a bounded projection and emits it
+    // after the product runner has finished its ordinary cleanup.
+    #[cfg(feature = "native-validation-diagnostics")]
+    let (collection_observer, selected_view_observation) =
+        selected_view_observation::attach(arguments.lifecycle_diagnostics, collection_observer);
     if arguments.startup_ms > lock.manifest.wall_time_max_ms {
         return Err(error(
             "StartupWindow",
@@ -1152,6 +1160,10 @@ fn run_inner<'a>(
             }
         },
     };
+    #[cfg(feature = "native-validation-diagnostics")]
+    if let Some(observation) = selected_view_observation {
+        observation.emit();
+    }
     drop(pending_storage);
     drop(boundary);
     drop((external_selection_file, selection_file, lock_file));
