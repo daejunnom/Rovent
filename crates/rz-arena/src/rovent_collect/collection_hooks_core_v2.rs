@@ -992,6 +992,29 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         }
     }
 
+    /// After revocation, transfer only already-ready original rows. This never
+    /// polls the teacher, submits a new job, or turns a queued/late item into
+    /// a completed one. Full keeps the same item in this worker's custody.
+    fn drain_ready_pump_after_revoke(&mut self) {
+        if self.pump_sender_failed { return; }
+        let Some(sender) = self.pump_sender.clone() else { return; };
+        for _ in 0..16 {
+            if self.pump_ready.is_empty() {
+                let Some(item) = self.pump.as_mut().and_then(RetiredRowPumpV2::take_ready) else { break; };
+                self.pump_ready.push_back(item);
+            }
+            match self.try_send_first_pump_item(&sender) {
+                Ok(PumpSendOutcomeV2::Sent) => {}
+                Ok(PumpSendOutcomeV2::Empty | PumpSendOutcomeV2::Full) => break,
+                Err(error) => {
+                    self.pump_sender_failed = true;
+                    self.record_failure(WorkerFailure::RowPump(error));
+                    break;
+                }
+            }
+        }
+    }
+
     /// Clone the actual handoff received by this worker.  This is solely an
     /// ownership reference; it does not prove worker join, teacher closure,
     /// settlement or publication.  Callers must first join the original
@@ -1643,6 +1666,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                     );
                 }
                 self.poll();
+                if self.revoked.load(Ordering::Acquire) {
+                    self.drain_ready_pump_after_revoke();
+                }
                 if self.retirement_matches_handoff() && self.physical_ack_delivered {
                     break CollectionWorkerExitV2::RetirementAndHandoffObserved;
                 }
