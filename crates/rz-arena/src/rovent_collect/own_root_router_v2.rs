@@ -506,16 +506,20 @@ impl RoventNnuecCollectionHooksV2 for RoventOwnRootRouterV2 {
         for bridge in self.slots.iter().filter_map(OnceLock::get) { bridge.revoke(); }
     }
     fn finish_physical(&self) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
-        // The narrow no-admission proof applies only to the primary worker.
-        // Installed, uncertain or prepared secondary owners need their own
-        // original handoff/physical completion and remain unknown here.
+        // Only the single original worker can be resolved here. Prepared or
+        // unpublished secondary owners require separate physical evidence.
         if self.slots.len() != 1
             || self.states.iter().any(|state| matches!(state.load(Ordering::Acquire),
-            RESERVING | INSTALLED | FAILED | PREPARING | PREINSTALL_FAILED | UNCERTAIN))
+            RESERVING | FAILED | PREPARING | PREINSTALL_FAILED | UNCERTAIN))
             || self.slots.iter().skip(1).any(|slot| slot.get().is_some()) {
             return Ok(AdaptiveCollectionBoundaryV2::Busy);
         }
-        if self.primary().try_finish_physical_no_admission()? {
+        let finished = if self.states[0].load(Ordering::Acquire) == INSTALLED {
+            self.primary().try_finish_physical_installed()?
+        } else {
+            self.primary().try_finish_physical_no_admission()?
+        };
+        if finished {
             Ok(AdaptiveCollectionBoundaryV2::Ready)
         } else {
             Ok(AdaptiveCollectionBoundaryV2::Busy)

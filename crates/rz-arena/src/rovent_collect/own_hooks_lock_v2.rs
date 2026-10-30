@@ -194,6 +194,48 @@ impl RoventNnuecCollectionBridgeV2 {
         Ok(matches!(self.poll_worker()?, Some(OwnWorkerExitKindV2::NoAdmission)))
     }
 
+    /// Observe only the original worker's physical completion. Collection
+    /// settlement and unpublished rows remain with their own owners and are
+    /// not turned into success by this physical-only observation.
+    pub(crate) fn try_finish_physical_installed(&self) -> Result<bool, AdaptiveManagerError> {
+        {
+            let slot = match self.worker.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own worker custody poisoned")),
+            };
+            let Some(worker) = slot.as_ref() else { return Ok(false); };
+            worker.stop.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if !matches!(self.poll_worker()?, Some(OwnWorkerExitKindV2::Retirement | OwnWorkerExitKindV2::Aggregate)) {
+            return Ok(false);
+        }
+        let slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own worker custody poisoned")),
+        };
+        let Some(worker) = slot.as_ref() else { return Ok(false); };
+        if worker.handle.is_some() || worker.panic.is_some() { return Ok(false); }
+        let core = match worker.original.try_lock() {
+            Ok(core) => core,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own original worker poisoned")),
+        };
+        let Some(handoff) = core.original_handoff() else { return Ok(false); };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own original handoff poisoned")),
+        };
+        let Some(original) = self.core.installed_admission_for_recovery() else { return Ok(false); };
+        if !handoff.teacher_aggregate_ack().is_some_and(|ack| ack.matches_admission(original)) {
+            return Ok(false);
+        }
+        let (admission, _, _, fence) = handoff.parts_mut();
+        Ok(original.same_original_admission(admission) && fence.permits_semantic_closure())
+    }
+
     pub(crate) fn try_prepared_for_same_owner(&self, previous: &Self) -> Result<Option<bool>, ArenaError> {
         if !self.owner.same_original_owner(&previous.owner) || !Arc::ptr_eq(&self.manifest, &previous.manifest)
             || self.roster_identity != previous.roster_identity || !self.core.same_original_startup(&previous.core)
