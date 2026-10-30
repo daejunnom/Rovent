@@ -217,7 +217,8 @@ mod speculative_publication_boundary_tests {
                 match std::fs::create_dir(&path) {
                     Ok(()) => {
                         std::fs::create_dir(path.join("chunks")).expect("owned chunks directory");
-                        std::fs::create_dir(path.join("input-locks")).expect("owned input lock directory");
+                        // The writer creates input-locks itself using create_dir.
+                        // Precreating it would fail before authorization.
                         return Self(path);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -245,10 +246,12 @@ mod speculative_publication_boundary_tests {
         let cancel = AtomicBool::new(false);
         let expected = (GAME_PHASE_MASK + 1) | GAME_IDLE;
         let gate = AtomicU64::new(expected);
+        let authorization_reached = AtomicBool::new(false);
         let result = publication::publish_original_payloads_authorized(
             &directory, Instant::now() + Duration::from_secs(30), &cancel, material,
             |_, _, _, _, _| Ok(serde_json::json!({"test":"publication boundary only"})),
             || {
+                authorization_reached.store(true, Ordering::Release);
                 // Real pending bytes are already durable before authorization;
                 // the visible success link must not exist yet.
                 assert!(directory.open("publication.pending.json").is_ok());
@@ -261,8 +264,10 @@ mod speculative_publication_boundary_tests {
                 Ok(())
             },
         );
+        assert!(authorization_reached.load(Ordering::Acquire),
+            "publisher did not reach final authorization: {result:?}");
         if abort_before_grant {
-            assert!(result.is_err());
+            assert!(result.is_err(), "abort before authorization must fail: {result:?}");
             assert!(directory.open("publication.pending.json").is_ok());
             assert!(directory.open("publication.json").is_err());
             assert_eq!(gate.load(Ordering::Acquire), expected | GAME_HAS_ABORT);
@@ -270,7 +275,7 @@ mod speculative_publication_boundary_tests {
             // Logical authorization preceded this simulated stop; the actual
             // link appears afterward. This is not a claim of physical pre-stop
             // file visibility or complete model/teacher execution.
-            assert!(result.is_ok());
+            assert!(result.is_ok(), "publication after authorization failed: {result:?}");
             assert!(directory.open("publication.pending.json").is_err());
             assert!(directory.open("publication.json").is_ok());
             assert_eq!(gate.load(Ordering::Acquire), expected | GAME_PUBLICATION_GRANTED | GAME_HAS_ABORT);
