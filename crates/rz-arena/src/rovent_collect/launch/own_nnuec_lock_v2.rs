@@ -796,6 +796,15 @@ impl RoventNnuecCollectionRunV2 {
             unreachable!("remaining observation is an object");
         };
         observation.as_object_mut().expect("observation is an object").extend(remaining);
+        // This bounded projection does not consume the original rows or prove
+        // that an unknown sender has drained. Preserve busy/error explicitly.
+        let publisher_failures = match self.publisher.try_failure_observations() {
+            Ok(Some(value)) => json!({"status":"observed", "failures":value}),
+            Ok(None) => json!({"status":"busy"}),
+            Err(error) => json!({"status":"error", "detail":error.to_string()}),
+        };
+        observation.as_object_mut().expect("observation is an object")
+            .insert("publisher_failure_observations".into(), publisher_failures);
         observation
     }
 
