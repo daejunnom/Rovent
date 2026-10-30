@@ -471,7 +471,7 @@ impl RoventNnuecCollectionRunV2 {
                 "pump_unpublished_rows":worker.pending_pump_rows(),
                 "pump_ready_unlabeled":pump_unlabeled,"pump_ready_prepared":pump_prepared,"pump_ready_committed":pump_committed,"pump_ready_failed":pump_failed})
         });
-        json!({"schema":"rz-rovent-own-nnuec-lock-v2-run-observation/1",
+        let mut observation = json!({"schema":"rz-rovent-own-nnuec-lock-v2-run-observation/1",
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
             "native_failure_transferred":self.native_failure_taken,
             "resource_error":self.resource_error,"resource_observation":resource_observation,"resource":resource,
@@ -512,7 +512,9 @@ impl RoventNnuecCollectionRunV2 {
                 "failed_staged_inputs":status.retained_failed_staged,
                 "pending_disabled_markers":status.pending_disabled_markers,
                 "failure":status.failure.map(|error|format!("{error:?}")),
-                "callback_lock_failure":status.callback_lock_failure})),
+                "callback_lock_failure":status.callback_lock_failure}))
+        });
+        let remaining = json!({
             "deferred_collection_roots_observation":deferred_observation,
             "pending_stopped_observation":pending_observation,
             "before_start_failure":self.bridge.before_start_failure().map(|error|format!("{error:?}")),
@@ -549,7 +551,12 @@ impl RoventNnuecCollectionRunV2 {
             "uci_handoff_custody":if self.transferred_handoff.is_some() { "leased_to_run" } else if self.recovered_handoff.is_some() { "recovered_from_escrow" } else { "unknown" },
             "uci_handoff_registry_released":false,
             "uci_handoff_transfer_error":self.handoff_transfer_error.map(|error|format!("{error:?}")),
-            "physical_completion_claimed":false,"corpus_published":self.publisher_status == "published","training_executed":false})
+            "physical_completion_claimed":false,"corpus_published":self.publisher_status == "published","training_executed":false});
+        let serde_json::Value::Object(remaining) = remaining else {
+            unreachable!("remaining observation is an object");
+        };
+        observation.as_object_mut().expect("observation is an object").extend(remaining);
+        observation
     }
 
     /// Move the original native failure to a caller that will retain/recover
