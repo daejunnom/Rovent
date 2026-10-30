@@ -522,6 +522,21 @@ where
             held.binding.consumption_recorded = true;
             self.record_role_consumption(source, held.binding.physical)?;
             if let Some(accepted) = &held.binding.reciprocal_acceptance {
+                // A parent may reach its final commit without admitting a
+                // peer (for example when the follow-up budget is exhausted).
+                // Record that actual consumption once, using the original
+                // accepted proof and retained output just as on the peer path.
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if let Err(error) = collection::notify_adaptive_consumed_v2(
+                    &mut self.collection_observer_v2,
+                    self.collection_admission_v2.as_ref(),
+                    self.native.native_acceptance_verifier().as_ref(),
+                    accepted,
+                    output,
+                    false,
+                ) {
+                    self.record_failure(error.into());
+                }
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }
         }
