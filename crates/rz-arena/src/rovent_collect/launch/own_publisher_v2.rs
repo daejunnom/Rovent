@@ -65,7 +65,24 @@ impl OwnPumpConsumerV2 {
     /// the caller after the sender stops.
     pub(crate) fn try_snapshot_retained_rows(
         &self, maximum_bytes: usize,
-    ) -> Result<Option<Vec<(&'static str, Vec<u8>)>>, ArenaError> {
+    ) -> Result<Option<(Vec<(&'static str, Vec<u8>)>, usize, Option<String>)>, ArenaError> {
+        use std::io::{self, Write};
+        struct BoundedProjection { bytes: Vec<u8>, limit: usize, limit_reached: bool }
+        impl Write for BoundedProjection {
+            fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+                let Some(next) = self.bytes.len().checked_add(input.len()) else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "projection size overflow"));
+                };
+                if next > self.limit {
+                    self.limit_reached = true;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "projection capacity reached"));
+                }
+                self.bytes.try_reserve(input.len()).map_err(|_| io::Error::other("projection allocation failed"))?;
+                self.bytes.extend_from_slice(input);
+                Ok(input.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -73,6 +90,9 @@ impl OwnPumpConsumerV2 {
         };
         let mut projections = Vec::new();
         let mut total = 0usize;
+        let mut projection_error = None;
+        let mut remaining = state.items.len().saturating_add(state.failed_items.len())
+            .saturating_add(usize::from(state.overflow_item.is_some()));
         for item in state.items.iter().chain(state.failed_items.iter()).chain(state.overflow_item.iter()) {
             let (stage, row) = match item {
                 PumpItemV2::Unlabeled { row } => ("unlabeled", row),
@@ -80,13 +100,20 @@ impl OwnPumpConsumerV2 {
                 PumpItemV2::Committed { row, .. } => ("committed", row),
                 PumpItemV2::Failed { row, .. } => ("failed", row),
             };
-            let bytes = serde_json::to_vec(&row.record).map_err(|error| ArenaError::Invalid(error.to_string()))?;
-            total = total.checked_add(bytes.len()).ok_or_else(|| ArenaError::Invalid("consumer projection size overflow".into()))?;
-            if total > maximum_bytes { return Err(ArenaError::Invalid("consumer projections exceed report capacity".into())); }
-            projections.try_reserve(1).map_err(|_| ArenaError::Invalid("consumer projection allocation".into()))?;
-            projections.push((stage, bytes));
+            let mut buffer = BoundedProjection { bytes: Vec::new(), limit: maximum_bytes - total, limit_reached: false };
+            if let Err(error) = serde_json::to_writer(&mut buffer, &row.record) {
+                if !buffer.limit_reached { projection_error = Some(error.to_string()); }
+                break;
+            }
+            if projections.try_reserve(1).is_err() {
+                projection_error = Some("consumer projection allocation failed".into());
+                break;
+            }
+            total += buffer.bytes.len();
+            projections.push((stage, buffer.bytes));
+            remaining -= 1;
         }
-        Ok(Some(projections))
+        Ok(Some((projections, remaining, projection_error)))
     }
 
     /// Describe retained failures without moving their original rows or

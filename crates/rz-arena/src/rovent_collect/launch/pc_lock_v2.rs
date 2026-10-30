@@ -92,7 +92,7 @@ impl RoventPcCollectionRunV2 {
             Err(error) => return (json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}), false),
         };
         let (projections, projected) = match consumer.try_snapshot_retained_rows(4 * 1024 * 1024 - *record_bytes) {
-            Ok(Some(rows)) => {
+            Ok(Some((rows, omitted, projection_error))) => {
                 let mut entries = Vec::new();
                 for (index, (stage, bytes)) in rows.into_iter().enumerate() {
                     *record_bytes += bytes.len();
@@ -101,7 +101,10 @@ impl RoventPcCollectionRunV2 {
                         "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
                     raw.push((name, bytes));
                 }
-                (json!({"status":"observed", "rows":entries}), true)
+                (json!({"status":if omitted == 0 { "observed" } else { "partial" },
+                    "omitted_rows":omitted, "count_scope":"consumer_custody_only",
+                    "projection_error":projection_error,
+                    "authority":"not_reconstructable", "rows":entries}), omitted == 0)
             },
             Ok(None) => (json!({"status":"busy"}), false),
             Err(error) => (json!({"status":"error", "detail":error.to_string()}), false),
@@ -152,8 +155,10 @@ impl RoventPcCollectionRunV2 {
                             || additional.iter().any(|(_, truncated)| *truncated);
                         let retirement = format!("{:?}", worker.teacher_observations());
                         if retirement.len() > 256 * 1024 {
-                            raw.clear();
-                            (json!({"status":"retirement_observation_over_limit"}), false)
+                            (json!({"status":"retirement_observation_over_limit", "teacher_diagnostics":entries,
+                                "primary_failure":primary.map(|(value, _)| value),
+                                "additional_failures":additional.into_iter().map(|(value, _)| value).collect::<Vec<_>>(),
+                                "omitted_failures":failure.omitted}), false)
                         } else {
                             (json!({"status":"observed", "primary_failure":primary.map(|(value, _)| value),
                                 "additional_failures":additional.into_iter().map(|(value, _)| value).collect::<Vec<_>>(),
@@ -343,8 +348,10 @@ impl RoventPcCollectionRunV2 {
             "secondary_slot_evidence":secondary_evidence, "supervisor_unresolved":self.supervisor.is_some()}))
             .map_err(|e| invalid(e.to_string()))?;
         if evidence.len() > 1024 * 1024 {
-            raw.clear();
             complete = false;
+            let raw_index: Vec<_> = raw.iter().map(|(name, bytes)| json!({
+                "path":name, "bytes":bytes.len(), "sha256":format!("{:x}", Sha256::digest(bytes))
+            })).collect();
             evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
                 "observation_complete":false,
                 "status":"metadata_over_limit", "worker_exit":self.worker_exit.map(PcWorkerExitKindV2::label),
@@ -354,7 +361,8 @@ impl RoventPcCollectionRunV2 {
                 "publication_failure_original_chars":publication_failure_chars,
                 "publication_failure_truncated":publication_failure_truncated,
                 "native_failure_present":self.native_failure.is_some(), "resource_failure_present":self.resource_error.is_some(),
-                "detail":"Original owner remains in custody; detailed metadata exceeded 1 MiB"}))
+                "raw_files":raw_index,
+                "detail":"Detailed metadata exceeded 1 MiB; original in-process authority cannot be reconstructed from these files"}))
                 .map_err(|e| invalid(e.to_string()))?;
         }
         let parent = self.publication_directory.parent().ok_or_else(|| invalid("P/C output parent"))?;
