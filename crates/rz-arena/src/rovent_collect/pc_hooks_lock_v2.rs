@@ -291,6 +291,12 @@ impl RoventPcCollectionBridgeV2 {
     pub(crate) fn start_worker(&self, worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>, stop: Arc<std::sync::atomic::AtomicBool>, deadline: std::time::Instant) -> Result<(), PcWorkerStartErrorV2> {
         let mut slot = self.worker.try_lock().map_err(|_| PcWorkerStartErrorV2::Unknown(super::invalid("PC V2 worker custodian busy or poisoned")))?;
         if slot.is_some() { return Err(PcWorkerStartErrorV2::Unknown(super::invalid("PC V2 worker already registered"))); }
+        {
+            let original = worker.try_lock().map_err(|_| PcWorkerStartErrorV2::Unknown(super::invalid("PC V2 original worker busy or poisoned")))?;
+            if !self.core.matches_original_worker(&original) {
+                return Err(PcWorkerStartErrorV2::Unknown(super::invalid("PC V2 worker belongs to a different original bridge")));
+            }
+        }
         let original = Arc::clone(worker);
         let handle = std::thread::Builder::new().name("rovent-pc-collection-v2".into()).spawn(move || {
             let exit = match original.lock() {

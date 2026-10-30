@@ -1024,8 +1024,8 @@ fn run_rovent_pc_collection_lock_v2_inner(
     on_owner: impl FnOnce(&RoventCollectionOwnerLockV2) -> Result<(), ArenaError>,
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
     check(
-        plan.maximum_roots == 1,
-        "P/C Collection /2 bridge currently accepts one root",
+        (1..=64).contains(&plan.maximum_roots),
+        "P/C Collection /2 root capacity must be between 1 and 64",
     )?;
     check(
         Instant::now() < worker_deadline && worker_deadline <= cleanup_deadline,
@@ -1079,8 +1079,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let publication_manifest = Arc::clone(&manifest);
     let publication_directory = plan.output_directory.clone();
     let publication_maximum_records = plan.maximum_records;
-    // Route by the original admission even for the current one-root
-    // profile. Additional router slots remain unavailable until the
+    // Route by the original admission. Additional slots remain unavailable until the
     // supervisor proves the preceding root has released shared custody.
     let router = Arc::new(crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
         Arc::clone(&bridge), plan.maximum_roots as usize,

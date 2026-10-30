@@ -95,8 +95,11 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
     if plan.output_directory != cli.output {
         return Err("V2 output directory differs from pinned plan".into());
     }
-    if plan.maximum_roots != 1 {
-        return Err("V2 runner supports exactly one root".into());
+    if cli.mode == "own-nnuec" && plan.maximum_roots != 1 {
+        return Err("V2 Own NNUEC runner supports exactly one root".into());
+    }
+    if cli.mode == "pc" && !(1..=64).contains(&plan.maximum_roots) {
+        return Err("V2 P/C root capacity must be between 1 and 64".into());
     }
     let publication_timeout_ms = plan.publication_timeout_ms;
     let (observation, accepted, publication, publication_error) = match cli.mode.as_str() {

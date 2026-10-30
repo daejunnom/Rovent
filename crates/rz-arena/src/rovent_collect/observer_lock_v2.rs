@@ -155,7 +155,7 @@ impl RoventCollectionOwnerLockV2 {
             check(!previous.same_original_admission(admission)
                 && previous.native_origin().same_original_origin(admission.native_origin())
                 && old.epoch == next.epoch && old.implementation == next.implementation
-                && (next.game > old.game || (next.game == old.game && next.root > old.root)),
+                && next.game == old.game && next.root > old.root,
                 "lock-v2 next root does not follow the original collection owner")?;
         }
         Ok(Some(OwnerInstallReadinessV2::Ready))

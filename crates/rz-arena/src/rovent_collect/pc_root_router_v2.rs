@@ -54,7 +54,19 @@ impl RoventPcRootRouterV2 {
         !original.same_original_admission(next)
             && original.native_origin().same_original_origin(next.native_origin())
             && old.epoch == new.epoch && old.implementation == new.implementation
-            && (new.game > old.game || (new.game == old.game && new.root > old.root))
+            && new.game == old.game && new.root > old.root
+    }
+
+    // A game-scoped owner may not publish rows from a later game. Preserve
+    // the new search by explicitly opting it out of this collection owner.
+    fn follows_later_game(previous: &RoventPcCollectionBridgeV2, next: &RoventCollectionRootAdmissionV2) -> bool {
+        let Some(original) = previous.installed_admission_for_recovery() else { return false; };
+        let old = original.root_admission().authority();
+        let new = next.root_admission().authority();
+        !original.same_original_admission(next)
+            && original.native_origin().same_original_origin(next.native_origin())
+            && old.epoch == new.epoch && old.implementation == new.implementation
+            && new.game > old.game
     }
     /// Call before entering the native manager. No worker is spawned here.
     pub(crate) fn new(primary: Arc<RoventPcCollectionBridgeV2>, maximum_roots: usize)
@@ -105,7 +117,8 @@ impl RoventPcRootRouterV2 {
         let previous = self.slots.iter().zip(&self.states).rev()
             .find_map(|(slot, state)| (state.load(Ordering::Acquire) == SLOT_INSTALLED).then(|| slot.get()).flatten());
         let Some(previous) = previous else { return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }); };
-        if !Self::follows(previous, &admission) {
+        let later_game = Self::follows_later_game(previous, &admission);
+        if !Self::follows(previous, &admission) && !later_game {
             return Err(RoventPcCollectionAdmissionFailureV2 {
                 error: AdaptiveManagerError::Invalid("P/C next root does not follow the original root"),
                 admission, owners: Box::new(()),
@@ -114,9 +127,13 @@ impl RoventPcRootRouterV2 {
         if !previous.closed_before_next_admission(&admission) {
             return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission });
         }
+        let (code, detail) = if later_game {
+            ("PcCollectionGameBoundary", "The collection owner belongs to the previous game; this root is not captured")
+        } else {
+            ("PcCollectionCapacity", "The next root worker or the shared game owner is not ready; this root is not captured")
+        };
         self.primary().defer_before_start(port, admission, AdaptiveCollectionError::new(
-            AdaptiveCollectionStage::Dispatch, "PcCollectionCapacity",
-            "The next root worker or the shared game owner is not ready; this root is not captured",
+            AdaptiveCollectionStage::Dispatch, code, detail,
         ))
     }
 
@@ -226,6 +243,10 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
                     state.store(SLOT_READY, Ordering::Release);
                     return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission });
                 };
+                if Self::follows_later_game(previous, &admission) {
+                    state.store(SLOT_READY, Ordering::Release);
+                    return self.defer_if_closed(port, admission);
+                }
                 if !Self::follows(previous, &admission) {
                     state.store(SLOT_READY, Ordering::Release);
                     return Err(RoventPcCollectionAdmissionFailureV2 {
