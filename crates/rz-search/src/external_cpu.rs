@@ -762,7 +762,9 @@ pub struct ExternalUciCpuChecker {
     // Keep only actual exact info tuples. A later aspiration bound must not
     // erase the last complete MultiPV iteration.
     cooperative_exact_candidates: Vec<ExternalPolicyOpinion>,
-    cooperative_exact_completed: Vec<ExternalPolicyOpinion>,
+    // At most one completed set per actually legal first move for this job.
+    cooperative_exact_completed: Vec<Vec<ExternalPolicyOpinion>>,
+    cooperative_exact_limit: usize,
     stop_control: Option<ExternalControlObservation>,
     go_issue: ExternalGoIssue,
     startup_multipv: Option<u16>,
@@ -845,6 +847,7 @@ impl ExternalUciCpuChecker {
             cooperative_opinions: Vec::new(),
             cooperative_exact_candidates: Vec::new(),
             cooperative_exact_completed: Vec::new(),
+            cooperative_exact_limit: 0,
             stop_control: None,
             go_issue: ExternalGoIssue::NotIssued,
             startup_multipv: None,
@@ -1342,6 +1345,11 @@ impl ExternalUciCpuChecker {
             return Err(CheckerError::Invalid("external requested depth/nodes"));
         }
         let legal_view = position.ordered_legal_moves();
+        // All retained policy PVs pass validate_pv against this very position.
+        // This bound is a workload fact, not a fixed chess-move guess.
+        if cooperative.is_some() {
+            self.cooperative_exact_limit = legal_view.moves().len();
+        }
         if position
             .play_status_from_view(&legal_view)
             .map_err(|_| error("analysis", "rules_classification"))?
@@ -1766,6 +1774,7 @@ impl ExternalUciCpuChecker {
         self.cooperative_opinions.clear();
         self.cooperative_exact_candidates.clear();
         self.cooperative_exact_completed.clear();
+        self.cooperative_exact_limit = 0;
     }
 
     /// Record exact, legal tuples as reported; a bounded or incomplete next
@@ -1796,9 +1805,15 @@ impl ExternalUciCpuChecker {
         if self.cooperative_exact_candidates.iter().enumerate().all(|(index, item)|
             item.rank == index as u16 + 1 && item.depth == depth
                 && !self.cooperative_exact_candidates[..index].iter().any(|prior| prior.pv.first() == item.pv.first()))
-            && self.cooperative_exact_completed.first().is_none_or(|old| old.depth < depth)
         {
-            self.cooperative_exact_completed.clone_from(&self.cooperative_exact_candidates);
+            let first = self.cooperative_exact_candidates[0].pv[0];
+            if let Some(old) = self.cooperative_exact_completed.iter_mut().find(|set|
+                set.first().and_then(|opinion| opinion.pv.first()).copied() == Some(first))
+            {
+                if old[0].depth < depth { old.clone_from(&self.cooperative_exact_candidates); }
+            } else if self.cooperative_exact_completed.len() < self.cooperative_exact_limit {
+                self.cooperative_exact_completed.push(self.cooperative_exact_candidates.clone());
+            }
         }
     }
 
@@ -1806,11 +1821,13 @@ impl ExternalUciCpuChecker {
     /// bestmove and readiness, and only when its first move agrees. Never turn
     /// a stopped/cancelled execution into a completed policy observation.
     fn select_completed_exact_policy(&mut self, report: &ExternalCheckerReport, width: u16) {
-        if report.completion == ExternalCompletion::BestMove
-            && self.cooperative_exact_completed.len() == usize::from(width)
-            && self.cooperative_exact_completed.first().and_then(|item| item.pv.first()).copied() == report.best_move
-        {
-            self.cooperative_opinions.clone_from(&self.cooperative_exact_completed);
+        if report.completion == ExternalCompletion::BestMove {
+            if let Some(exact) = self.cooperative_exact_completed.iter().find(|set|
+                set.len() == usize::from(width)
+                    && set.first().and_then(|item| item.pv.first()).copied() == report.best_move)
+            {
+                self.cooperative_opinions.clone_from(exact);
+            }
         }
     }
 
@@ -3146,6 +3163,25 @@ mod tests {
                 } else {
                     requested.min(10)
                 };
+                if mode == 10 {
+                    // A completed older set agrees with final bestmove even
+                    // though a newer exact set chose another first move.
+                    let mut moves = vec![best];
+                    moves.extend(position.legal_moves().into_iter().filter(|mv| *mv != best));
+                    let older = depth.parse::<u16>().unwrap().saturating_sub(1).max(1);
+                    for rank in 1..=multipv {
+                        println!("info depth {older} multipv {rank} nodes {nodes} score cp 21 pv {}", moves[usize::from(rank - 1)]);
+                    }
+                    moves.swap(0, 1);
+                    for rank in 1..=multipv {
+                        println!("info depth {depth} multipv {rank} nodes {nodes} score cp 22 pv {}", moves[usize::from(rank - 1)]);
+                    }
+                    let later = depth.parse::<u16>().unwrap() + 1;
+                    println!("info depth {later} multipv 1 nodes {nodes} score cp 23 lowerbound pv {best}");
+                    println!("bestmove {best}");
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                }
                 if mode == 2 {
                     println!("info depth {depth} nodes {nodes} score cp NaN pv {best}");
                 } else {
@@ -3264,6 +3300,12 @@ mod tests {
     #[test]
     fn fake_uci_final_bound_changed_best() {
         if fixture_mode("external_cpu::tests::fake_uci_final_bound_changed_best") { fixture_loop(9); }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_prior_exact_matching_best() {
+        if fixture_mode("external_cpu::tests::fake_uci_prior_exact_matching_best") { fixture_loop(10); }
     }
 
     #[cfg(target_os = "linux")]
@@ -3501,6 +3543,8 @@ mod tests {
             ("fake_uci_final_bound", 4, true),
             ("fake_uci_final_bound_changed_best", 1, false),
             ("fake_uci_final_bound_changed_best", 4, false),
+            ("fake_uci_prior_exact_matching_best", 1, true),
+            ("fake_uci_prior_exact_matching_best", 4, true),
             ("fake_uci_mixed_multipv", 4, false),
             ("fake_uci_waits_for_stop", 1, false),
         ] {
@@ -3517,6 +3561,11 @@ mod tests {
             if name == "fake_uci_final_bound" {
                 assert_eq!(report.report.bound, ExternalBound::Lower);
                 assert!(report.opinions.iter().all(|opinion| opinion.bound == ExternalBound::ExactReported && opinion.depth == 8));
+            }
+            if name == "fake_uci_prior_exact_matching_best" {
+                assert_eq!(report.report.bound, ExternalBound::Lower);
+                assert!(report.opinions.iter().all(|opinion| opinion.bound == ExternalBound::ExactReported && opinion.depth == 7));
+                assert_eq!(report.opinions[0].pv.first().copied(), report.report.best_move);
             }
             if name == "fake_uci_waits_for_stop" {
                 assert_ne!(report.report.completion, ExternalCompletion::BestMove);
