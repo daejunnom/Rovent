@@ -505,6 +505,22 @@ impl RoventNnuecCollectionHooksV2 for RoventOwnRootRouterV2 {
     fn revoke(&self) {
         for bridge in self.slots.iter().filter_map(OnceLock::get) { bridge.revoke(); }
     }
+    fn finish_physical(&self) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
+        // The narrow no-admission proof applies only to the primary worker.
+        // Installed, uncertain or prepared secondary owners need their own
+        // original handoff/physical completion and remain unknown here.
+        if self.slots.len() != 1
+            || self.states.iter().any(|state| matches!(state.load(Ordering::Acquire),
+            RESERVING | INSTALLED | FAILED | PREPARING | PREINSTALL_FAILED | UNCERTAIN))
+            || self.slots.iter().skip(1).any(|slot| slot.get().is_some()) {
+            return Ok(AdaptiveCollectionBoundaryV2::Busy);
+        }
+        if self.primary().try_finish_physical_no_admission()? {
+            Ok(AdaptiveCollectionBoundaryV2::Ready)
+        } else {
+            Ok(AdaptiveCollectionBoundaryV2::Busy)
+        }
+    }
     fn handoff_sender(&self) -> mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>> {
         self.primary().handoff_sender()
     }

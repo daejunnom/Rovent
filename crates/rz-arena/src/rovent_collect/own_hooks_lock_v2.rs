@@ -43,6 +43,7 @@ pub(crate) struct RoventNnuecCollectionBridgeV2 {
 
 pub(crate) struct OwnRootWorkerV2 {
     original: Arc<Mutex<RoventNnuecCollectionWorkerV2>>,
+    stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<RoventNnuecCollectionWorkerExitV2>>,
     exit: Option<RoventNnuecCollectionWorkerExitV2>,
     panic: Option<Box<dyn std::any::Any + Send>>,
@@ -166,14 +167,31 @@ impl RoventNnuecCollectionBridgeV2 {
         let mut slot = self.worker.try_lock().map_err(|_| OwnWorkerStartErrorV2::Unknown(super::invalid("Own worker custody busy or poisoned")))?;
         if slot.is_some() { return Err(OwnWorkerStartErrorV2::Unknown(super::invalid("Own worker already registered"))); }
         let original = Arc::clone(worker);
+        let thread_stop = Arc::clone(&stop);
         let handle = std::thread::Builder::new().name("rovent-own-root-worker-v2".into())
             .spawn(move || match original.lock() {
-                Ok(mut worker) => worker.run_until(stop, deadline),
+                Ok(mut worker) => worker.run_until(thread_stop, deadline),
                 Err(_) => panic!("Own original worker poisoned"),
             }).map_err(|error| OwnWorkerStartErrorV2::BeforeStart(ArenaError::Io(error.to_string())))?;
-        *slot = Some(OwnRootWorkerV2 { original: Arc::clone(worker), handle: Some(handle), exit: None,
+        *slot = Some(OwnRootWorkerV2 { original: Arc::clone(worker), stop, handle: Some(handle), exit: None,
             panic: None, separated_rows: std::collections::VecDeque::new(), separation_failed: false, separation_complete: false });
         Ok(())
+    }
+
+    /// Signal the exact worker started by this bridge, then join only its
+    /// original handle. This narrow path proves no collection admission ever
+    /// reached that worker; all admitted/unknown cases remain unresolved.
+    pub(crate) fn try_finish_physical_no_admission(&self) -> Result<bool, AdaptiveManagerError> {
+        {
+            let slot = match self.worker.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own worker custody poisoned")),
+            };
+            let Some(worker) = slot.as_ref() else { return Ok(false); };
+            worker.stop.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(matches!(self.poll_worker()?, Some(OwnWorkerExitKindV2::NoAdmission)))
     }
 
     pub(crate) fn try_prepared_for_same_owner(&self, previous: &Self) -> Result<Option<bool>, ArenaError> {

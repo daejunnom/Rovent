@@ -378,6 +378,12 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     }
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
+    /// Request and observe termination of this hook's original physical
+    /// collection workers.  Implementations must report Ready only with
+    /// evidence from the same owners; the default grants no completion.
+    fn finish_physical(&self) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("V2 physical completion observation unavailable"))
+    }
     /// A bounded nonblocking handoff; delivery is not teacher retirement.
     fn handoff_sender(
         &self,
@@ -2509,11 +2515,9 @@ impl RoventNnuecSessionDriver {
             .try_lock()
             .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
         if matches!(*state, State::Closed) {
-            return if v2_teacher_unproven {
-                Err(teacher_unknown())
-            } else {
-                Ok(())
-            };
+            // Closed is installed only after this same hook's physical
+            // completion (when present) and native cleanup have succeeded.
+            return if revoke_panicked { Err(teacher_unknown()) } else { Ok(()) };
         }
         let idle = match &mut *state {
             State::Idle(idle) => idle,
@@ -2561,9 +2565,24 @@ impl RoventNnuecSessionDriver {
                 }
             }
             if v2_teacher_unproven {
-                // Native/actor shutdown is known, but the hook and its actual
-                // teacher owner must remain quarantined rather than Closed.
-                return Err(teacher_unknown());
+                // Root/native/storage completion is independent of the
+                // collection worker. Only the original hook may establish
+                // that worker's completion, under this same cleanup deadline.
+                if revoke_panicked { return Err(teacher_unknown()); }
+                let hooks = self.collection_hooks_v2.as_ref().expect("original V2 hook");
+                loop {
+                    match catch_unwind(AssertUnwindSafe(|| hooks.finish_physical())) {
+                        Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready)) => break,
+                        Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy))
+                            if Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
+                        Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) => return Err(teacher_unknown()),
+                        Ok(Err(error)) => return Err(unknown("RoventNnuecV2PhysicalObservation", &format!("{error:?}"))),
+                        Err(payload) => {
+                            self.retain_v2_revoke_panic(payload);
+                            return Err(unknown("RoventNnuecV2PhysicalPanic", "original V2 physical observation panicked; payload and owners retained"));
+                        }
+                    }
+                }
             }
             *state = State::Closed;
             Ok(())
