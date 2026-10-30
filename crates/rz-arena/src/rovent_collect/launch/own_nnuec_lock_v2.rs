@@ -150,7 +150,7 @@ impl RoventNnuecCollectionRunV2 {
             &self.owner, directory, &self.publisher_manifest, &first, self.publisher_max_records,
         )?);
         let mut assembly = self.publisher_assembly.take().expect("assembly retained");
-        let result = (|| -> Result<(), ArenaError> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), ArenaError> {
             for (bridge, worker, consumer) in &roots {
                 loop {
                     check(Instant::now() < until, "Own game consumer deadline")?;
@@ -222,9 +222,15 @@ impl RoventNnuecCollectionRunV2 {
             let directory = self.publisher_directory.as_ref().expect("directory retained");
             self.publisher_receipt = Some(assembly.finish()?.publish_atomic(directory, until, &AtomicBool::new(false))?);
             Ok(())
-        })();
+        }));
         self.publisher_assembly = Some(assembly);
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => {
+                self.publisher_panic = Some(payload);
+                Err(invalid("Own game publisher panicked; original custody retained"))
+            }
+        }
     }
 
     fn advance_game_row(&self, bridge: &RoventNnuecCollectionBridgeV2,
