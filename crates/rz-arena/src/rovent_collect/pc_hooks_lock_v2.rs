@@ -271,7 +271,9 @@ impl RoventPcCollectionBridgeV2 {
             "origin":format!("{:?}",event.origin),
             "elapsed_ns":event.elapsed_from_start.and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
             "context_acceptance":format!("{:?}",event.context_acceptance), "soft_expired":event.soft_expired,
-            "manager_phase":format!("{:?}",event.manager_phase), "goal":format!("{:?}",event.goal)
+            "manager_phase":format!("{:?}",event.manager_phase), "goal":format!("{:?}",event.goal),
+            "role_calls_spent":event.role_calls_spent, "role_calls_reserved":event.role_calls_reserved,
+            "role_call_limit_reached":event.role_call_limit_reached, "manager_failures":event.manager_failures
         })).collect::<Vec<_>>(), "omitted":self.revoke_observations_omitted.load(Ordering::Acquire)})))
     }
 
