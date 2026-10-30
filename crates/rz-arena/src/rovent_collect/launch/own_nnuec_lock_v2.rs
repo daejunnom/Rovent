@@ -99,7 +99,7 @@ impl RoventNnuecCollectionRunV2 {
             "Own game primary worker or publisher not joined")?;
         check(self.bridge.returned_handoff_settled().map_err(|error| invalid(format!("Own primary handoff: {error:?}")))?,
             "Own game primary handoff unresolved")?;
-        let mut roots = vec![(Arc::clone(&self.bridge), Arc::clone(&self.worker), Arc::clone(&self.publisher))];
+        let mut roots = vec![(Arc::clone(&self.bridge), Arc::clone(&self.worker), Arc::clone(&self.publisher), self.publisher_sender.clone())];
         roots.try_reserve(self.secondary_slots.len()).map_err(|_| invalid("Own game root allocation"))?;
         for slot in &self.secondary_slots {
             check(matches!(slot.bridge.try_has_deferred_observations()?, Some(false)),
@@ -124,14 +124,14 @@ impl RoventNnuecCollectionRunV2 {
                 && matches!(slot.worker_exit_kind, Some(OwnWorkerExitKindV2::Aggregate | OwnWorkerExitKindV2::Retirement))
                 && slot.bridge.returned_handoff_settled().map_err(|error| invalid(format!("Own secondary handoff: {error:?}")))?,
                 "Own game secondary worker, consumer or handoff unresolved")?;
-            roots.push((Arc::clone(&slot.bridge), Arc::clone(&slot.worker), Arc::clone(&slot.consumer)));
+            roots.push((Arc::clone(&slot.bridge), Arc::clone(&slot.worker), Arc::clone(&slot.consumer), slot.sender.clone()));
         }
-        for (bridge, worker, _) in &roots {
+        for (bridge, worker, _, _) in &roots {
             check(matches!(bridge.try_has_deferred_observations()?, Some(false)), "Own game deferred collection retained")?;
             let worker = worker.try_lock().map_err(|_| invalid("Own game worker busy or poisoned"))?;
-            check(!worker.has_failure() && !worker.has_unpublished_pump_rows(), "Own game worker retains failure or rows")?;
+            check(!worker.has_failure(), "Own game worker retains failure")?;
         }
-        let (last, _, _) = roots.last().expect("primary root retained");
+        let (last, _, _, _) = roots.last().expect("primary root retained");
         let last_admission = last.installed_admission_for_recovery().ok_or_else(|| invalid("Own last root admission missing"))?.clone();
         loop {
             check(Instant::now() < until, "Own game root separation deadline")?;
@@ -140,7 +140,6 @@ impl RoventNnuecCollectionRunV2 {
                 OwnRootSeparationV2::Released { .. } => break,
             }
         }
-        self.closed_owner()?;
         check(self.native_failure.is_none() && !self.native_failure_taken && self.resource_error.is_none(),
             "Own native or resource failure retained")?;
         check(self.publisher_assembly.is_none() && self.publisher_directory.is_none(),
@@ -159,9 +158,11 @@ impl RoventNnuecCollectionRunV2 {
         )?);
         let mut assembly = self.publisher_assembly.take().expect("assembly retained");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), ArenaError> {
-            for (bridge, worker, consumer) in &roots {
+            for (bridge, worker, consumer, sender) in &roots {
                 loop {
                     check(Instant::now() < until, "Own game consumer deadline")?;
+                    let sent = worker.try_lock().map_err(|_| invalid("Own game worker busy or poisoned"))?
+                        .try_send_first_pump_item(sender)?;
                     let polled = consumer.poll()?;
                     match self.try_offer_consumer_item_for(bridge, worker, consumer, &mut assembly)? {
                         OwnOfferOutcomeV2::Offered => self.advance_game_row(bridge, worker, &mut assembly)?,
@@ -174,11 +175,15 @@ impl RoventNnuecCollectionRunV2 {
                             if items != 0 { std::thread::sleep(Duration::from_millis(1)); continue; }
                             match polled {
                                 OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("Own consumer item remains pending")),
-                                OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
+                                OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected
+                                    if matches!(sent, crate::rovent_collect::collection_hooks_core_v2::PumpSendOutcomeV2::Empty) => break,
+                                OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => continue,
                             }
                         }
                     }
                 }
+                check(worker.try_lock().is_ok_and(|original| !original.has_unpublished_pump_rows()),
+                    "Own original worker retains unpublished rows")?;
                 let admission = bridge.installed_admission_for_recovery().ok_or_else(|| invalid("Own root admission missing"))?;
                 loop {
                     check(Instant::now() < until, "Own separated row deadline")?;
@@ -200,12 +205,13 @@ impl RoventNnuecCollectionRunV2 {
                 }
                 check(matches!(consumer.try_has_failures()?, Some(false)), "Own consumer retains failure")?;
             }
+            self.closed_owner()?;
             check(assembly.records() > 0 && self.owner.try_status()?.is_some_and(|status|
                 status.pending_retired_count == 0 && status.game_reserved_slots == Some(0)
                     && u64::try_from(status.game_retired_total) == Ok(assembly.records())),
                 "Own game owner and assembled records differ")?;
             self.completed_workers.try_reserve(roots.len() + self.secondary_slots.len()).map_err(|_| invalid("Own worker custody capacity"))?;
-            for (bridge, _, _) in &roots {
+            for (bridge, _, _, _) in &roots {
                 let admission = bridge.installed_admission_for_recovery().ok_or_else(|| invalid("Own original admission missing"))?;
                 loop {
                     check(Instant::now() < until, "Own worker transfer deadline")?;

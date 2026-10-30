@@ -8,6 +8,7 @@ use super::launch::own_publisher_v2::{OwnPumpConsumerV2, OwnPumpPollV2};
 use super::own_hooks_lock_v2::{OwnRootSeparationV2, OwnWorkerExitKindV2, OwnWorkerStartErrorV2, RoventNnuecCollectionBridgeV2, RoventNnuecCollectionWorkerV2};
 use super::own_root_router_v2::{OwnPreparedSlotOutcomeV2, RoventOwnRootRouterV2};
 use super::teacher::v2_session::RoventTeacherRosterEntryV2;
+use super::teacher::lock_v2_row_pump::PumpItemV2;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_search::external_cpu::ExternalGoConstraint;
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2;
@@ -22,6 +23,9 @@ pub(crate) struct OwnSecondarySlotV2 {
     pub(crate) bridge: Arc<RoventNnuecCollectionBridgeV2>,
     pub(crate) worker: Arc<Mutex<RoventNnuecCollectionWorkerV2>>,
     pub(crate) consumer: Arc<OwnPumpConsumerV2>,
+    /// The original sender is retained to drain rows left with this worker
+    /// after it joins; a newly created channel cannot represent that custody.
+    pub(crate) sender: std::sync::mpsc::SyncSender<PumpItemV2>,
     pub(crate) retained_previous_rows: usize,
     pub(crate) published_to_router: bool,
     pub(crate) worker_start: OwnSecondaryWorkerStartV2,
@@ -264,10 +268,10 @@ fn supervisor_step(
         next.register_startup_control(startup).map_err(|error| invalid(format!("Own original startup registration: {error:?}")))?;
         let (consumer, sender) = OwnPumpConsumerV2::new(maximum_records);
         worker.configure_row_pump(constraint, quantum)?;
-        worker.configure_pump_sender(sender)?;
+        worker.configure_pump_sender(sender.clone())?;
         let worker = Arc::new(Mutex::new(worker));
         state.pending = Some(OwnSecondarySlotV2 { previous, previous_admission: admission,
-            bridge: Arc::clone(&next), worker: Arc::clone(&worker), consumer,
+            bridge: Arc::clone(&next), worker: Arc::clone(&worker), consumer, sender,
             retained_previous_rows: 0, published_to_router: false,
             worker_start: OwnSecondaryWorkerStartV2::StartingUnknown,
             worker_join_observed: false, worker_exit_kind: None,
