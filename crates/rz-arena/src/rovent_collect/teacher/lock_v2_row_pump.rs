@@ -35,6 +35,9 @@ enum Stage {
 /// Failures carry the real source object, never a reconstructed receipt.
 pub(crate) enum FailedEvidence {
     BeforeCompletion,
+    /// No teacher request was issued before the original root closed.
+    /// This is retained as a failure, never an unlabeled success or target.
+    UnissuedRootRevoked,
     Captured { capsule: super::super::producer_v2::SubmittedTeacherQueryV2, failure: Box<FailedEvidence> },
     SubmitPending(TeacherSubmitPendingV2),
     // The session may still own the pending worker job.
@@ -78,7 +81,7 @@ impl FailedEvidence {
                 TeacherPolicySealFailureV2::Native { kind, .. } => matches!(kind,
                     RoventTeacherPolicySealFailureKindV2::Poisoned | RoventTeacherPolicySealFailureKindV2::Invalid),
             },
-            Self::BeforeCompletion | Self::SubmitPending(_) | Self::PendingCompleted { .. }
+            Self::BeforeCompletion | Self::UnissuedRootRevoked | Self::SubmitPending(_) | Self::PendingCompleted { .. }
             | Self::Completion(_) | Self::Sealed(_) => false,
         }
     }
@@ -87,6 +90,7 @@ impl FailedEvidence {
     pub(crate) fn diagnostic(&self) -> String {
         match self {
             Self::BeforeCompletion => "before_completion".into(),
+            Self::UnissuedRootRevoked => "unissued_root_revoked_no_teacher_job".into(),
             Self::Captured { failure, .. } => format!("captured_{}", failure.diagnostic()),
             Self::SubmitPending(_) => "submit_pending".into(),
             Self::Pending { .. } => "pending_original_job".into(),
@@ -843,7 +847,7 @@ impl RetiredRowPumpV2 {
                     CapturedStage::Unlabeled
                 } else {
                     CapturedStage::Failed { error: invalid("captured teacher request unissued after root revoke"),
-                        evidence: FailedEvidence::BeforeCompletion }
+                        evidence: FailedEvidence::UnissuedRootRevoked }
                 };
             }
         }
@@ -855,7 +859,7 @@ impl RetiredRowPumpV2 {
                 } else {
                     Stage::Failed {
                         error: invalid("V2 teacher request unissued after root revoke"),
-                        evidence: FailedEvidence::BeforeCompletion,
+                        evidence: FailedEvidence::UnissuedRootRevoked,
                     }
                 };
             }

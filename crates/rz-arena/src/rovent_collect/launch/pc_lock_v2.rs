@@ -19,6 +19,55 @@ const WORKER_STARTING: u8 = 1;
 const WORKER_STARTED: u8 = 2;
 const WORKER_START_FAILED: u8 = 3;
 
+/// Small failure-only identity index survives the existing large-metadata
+/// fallback. It never reconstructs an original row or grants authority.
+fn compact_failure_identities(primary: &serde_json::Value, secondary: &[serde_json::Value]) -> serde_json::Value {
+    let mut entries = Vec::new();
+    let mut total = 0u64;
+    let mut sources_unknown = 0usize;
+    for (slot, consumer) in std::iter::once((0usize, primary))
+        .chain(secondary.iter().filter_map(|value| {
+            Some((usize::try_from(value.get("slot")?.as_u64()?).ok()?, value.get("consumer")?))
+        }))
+    {
+        let Some(failures) = consumer.get("failure_observations") else { sources_unknown += 1; continue; };
+        let Some(count) = failures.get("count").and_then(serde_json::Value::as_u64) else { sources_unknown += 1; continue; };
+        total = total.saturating_add(count);
+        if let Some(reported) = failures.get("reported").and_then(serde_json::Value::as_array) {
+            for item in reported {
+                if entries.len() >= 64 { break; }
+                let bounded = |key: &str| item.get(key).and_then(serde_json::Value::as_str)
+                    .map(|s| json!({"value":s.chars().take(256).collect::<String>(),"truncated":s.chars().count()>256}));
+                entries.push(json!({"slot":slot, "question_id":bounded("original_question_id"),
+                    "job_id":bounded("original_job_id"), "slice_id":bounded("original_slice_id")}));
+            }
+        } else { sources_unknown += 1; }
+    }
+    let omitted = total.saturating_sub(entries.len() as u64);
+    json!({"total":total,"reported":entries,"omitted":omitted,
+        "sources_unknown":sources_unknown,"scope":"failure_identity_projection_not_row_or_authority"})
+}
+
+#[cfg(test)]
+mod failure_identity_tests {
+    use super::*;
+
+    #[test]
+    fn compact_failure_identities_survive_row_projection_limit() {
+        let primary = json!({"record_projections":{"omitted_rows":150},"failure_observations":{
+            "count":1,"reported":[{"original_question_id":"q1","original_job_id":"j1","original_slice_id":"s1"}]
+        }});
+        let secondary = vec![json!({"slot":1,"consumer":{"record_projections":{"omitted_rows":59},
+            "failure_observations":{"count":2,"reported":[{"original_question_id":"q2","original_job_id":"j2","original_slice_id":"s2"}]}}})];
+        let result = compact_failure_identities(&primary, &secondary);
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["omitted"], 1);
+        assert_eq!(result["reported"][0]["question_id"]["value"], "q1");
+        assert_eq!(result["reported"][1]["job_id"]["value"], "j2");
+        assert_eq!(result["reported"][1]["slot"], 1);
+    }
+}
+
 /// Keeps the original resource, native failure and teacher worker together.
 /// Neither the live readback nor the thread exit establishes publication.
 pub struct RoventPcCollectionRunV2 {
@@ -347,6 +396,7 @@ impl RoventPcCollectionRunV2 {
         let publication_failure_chars = publication_failure.map(|s| s.chars().count());
         let publication_failure_truncated = publication_failure_chars.is_some_and(|count| count > 4096);
         if publication_failure_truncated { complete = false; }
+        let failure_identities = compact_failure_identities(&primary_consumer, &secondary_evidence);
         let mut evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
             "raw_files_complete_only_when_receipt_exists":true,
             "observation_complete":complete,
@@ -372,6 +422,7 @@ impl RoventPcCollectionRunV2 {
                 "publication_failure_original_chars":publication_failure_chars,
                 "publication_failure_truncated":publication_failure_truncated,
                 "native_failure_present":self.native_failure.is_some(), "resource_failure_present":self.resource_error.is_some(),
+                "failure_identities":failure_identities,
                 "raw_files":raw_index,
                 "detail":"Detailed metadata exceeded 1 MiB; original in-process authority cannot be reconstructed from these files"}))
                 .map_err(|e| invalid(e.to_string()))?;

@@ -132,11 +132,14 @@ impl OwnPumpConsumerV2 {
         let mut entries = Vec::new();
         let mut total = 0usize;
         for item in state.items.iter().chain(state.failed_items.iter()).chain(state.overflow_item.iter()) {
-            if let PumpItemV2::Failed { error, evidence, .. } = item {
+            if let PumpItemV2::Failed { row, error, evidence } = item {
                 total += 1;
                 if entries.len() < 32 {
                     entries.push(serde_json::json!({"error":describe(error.to_string()),
-                        "evidence":describe(evidence.diagnostic())}));
+                        "evidence":describe(evidence.diagnostic()),
+                        "original_question_id":row.record.0.input.question_id,
+                        "original_job_id":row.record.0.input.job_id,
+                        "original_slice_id":row.record.0.input.slice_id}));
                 }
             }
         }
