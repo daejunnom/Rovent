@@ -921,8 +921,9 @@ pub trait AdaptiveSearchDriver<Q> {
             "driver has no actual V2 collection frontier",
         ))
     }
-    /// A driver must not enable V2 observation until all acceptance and
-    /// consumption paths and the external teacher lifecycle are wired.
+    /// Report support for observing the exact original admission, including
+    /// its acceptance and consumption paths. This does not establish that the
+    /// separately owned teacher started, finished, or physically retired.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn collection_v2_observation_complete(&self, _admission: &RoventCollectionRootAdmissionV2) -> bool {
         false
