@@ -374,17 +374,24 @@ fn validate_completed_teacher_opinions(
 ) -> Result<(Vec<u16>, u16), ArenaError> {
     let r = &outcome.report;
     let raw = &r.raw;
-    check(
-        r.purpose == ExternalEnginePurpose::Teacher
-            && r.profile.source_commit() == pin.source_commit
-            && raw.identity.binary_sha256 == pin.binary_sha256
-            && raw.identity.options == pin.options
-            && outcome.conditional_policy_target_known
-            && r.readiness_barrier_completed
-            && !outcome.opinions.is_empty()
-            && outcome.opinions.len() <= 4,
-        "failed/partial/stale teacher report has no conditional policy target",
-    )?;
+    // Preserve the same short-circuit eligibility checks while recording the
+    // first failed condition. No failed or partial report becomes a target.
+    check(r.purpose == ExternalEnginePurpose::Teacher,
+        "teacher conditional policy target: purpose mismatch")?;
+    check(r.profile.source_commit() == pin.source_commit,
+        "teacher conditional policy target: source commit mismatch")?;
+    check(raw.identity.binary_sha256 == pin.binary_sha256,
+        "teacher conditional policy target: binary identity mismatch")?;
+    check(raw.identity.options == pin.options,
+        "teacher conditional policy target: options mismatch")?;
+    check(outcome.conditional_policy_target_known,
+        "teacher conditional policy target: completed opinions unknown")?;
+    check(r.readiness_barrier_completed,
+        "teacher conditional policy target: readiness barrier incomplete")?;
+    check(!outcome.opinions.is_empty(),
+        "teacher conditional policy target: no opinions")?;
+    check(outcome.opinions.len() <= 4,
+        "teacher conditional policy target: too many opinions")?;
     let mut opinions = outcome.opinions.iter().collect::<Vec<_>>();
     opinions.sort_by_key(|o| o.rank);
     let mut ranked = Vec::new();
