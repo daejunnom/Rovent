@@ -21,7 +21,7 @@ fn run() -> Result<(), String> {
     let action_ms = args[13].parse::<u64>().map_err(|_| "invalid action window")?;
     let read_bytes = args[15].parse::<u64>().map_err(|_| "invalid root read limit")?;
     if !(1..=7_200_000).contains(&game_ms) || !(1..=3_600_000).contains(&action_ms)
-        || read_bytes == 0 || read_bytes > 4 * 1024 * 1024
+        || read_bytes == 0
         || !Path::new(&args[1]).is_absolute() || !Path::new(&args[5]).is_absolute() {
         return Err("diagnostic paths or finite resource bounds are invalid".into());
     }
@@ -51,9 +51,16 @@ fn run() -> Result<(), String> {
             Arc::clone(&cancel), Duration::from_millis(action_ms),
         ) {
             Ok(action) => action,
-            Err(original) => {
-                // Preserve the actual failed intake/process and partial
-                // owners until process exit, including any unresolved child.
+            Err(mut original) => {
+                // Attempt each same-owner close under its original ceiling
+                // before retaining any unresolved process/partial custody.
+                let cleanup = original.attempt_original_cleanup(action_until);
+                eprintln!("{}", serde_json::json!({
+                    "schema":"rz-pals-action-diagnostic-cleanup/1",
+                    "original_cleanup":cleanup,
+                    "external_scope_cleanup":"not_observed_here",
+                    "native_physical_completion":"not_inferred",
+                }));
                 let message = original.to_string();
                 let _retained_until_exit = Box::leak(original);
                 return Err(message);

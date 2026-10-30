@@ -215,7 +215,101 @@ pub struct ActionCliFailureV3 {
     pub preservation_error: Option<ArenaError>,
     owner: Option<Box<ActionCliOwnerV3>>,
 }
+
+/// Results of bounded cleanup attempts on the retained original owners.
+/// These states are observations, not a GPU completion or training receipt.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionOriginalCleanupObservationV3 {
+    pub action_processes: &'static str,
+    pub action_receipts: usize,
+    pub intake_process: &'static str,
+    pub frozen_helper: &'static str,
+    pub errors: Vec<String>,
+}
+
 impl ActionCliFailureV3 {
+    /// Attempt original cleanup before retaining an unresolved failure owner.
+    /// Each owner additionally enforces its own original deadline. Failed or
+    /// still-pending child/process custody stays in `self`; an outer cgroup or
+    /// process-tree observation is never used as a native completion fence.
+    pub fn attempt_original_cleanup(
+        &mut self,
+        until: std::time::Instant,
+    ) -> ActionOriginalCleanupObservationV3 {
+        let mut observation = ActionOriginalCleanupObservationV3 {
+            action_processes: "not_present", action_receipts: 0,
+            intake_process: "not_present", frozen_helper: "not_present", errors: Vec::new(),
+        };
+        let Some(owner) = self.owner.as_mut() else {
+            observation.action_processes = "unknown";
+            observation.intake_process = "unknown";
+            observation.frozen_helper = "unknown";
+            observation.errors.push("original action owner absent".into());
+            return observation;
+        };
+        if let Some(factory) = owner.factory.as_mut() {
+            if std::time::Instant::now() >= until {
+                observation.action_processes = "unknown";
+                observation.errors.push("original cleanup deadline elapsed before action cleanup".into());
+            } else {
+                match factory.attempt_original_cleanup(until) {
+                    Ok(None) => observation.action_processes = "not_present",
+                    Ok(Some(receipts)) => {
+                        observation.action_processes = if receipts.is_empty() {
+                            "no_process_observed"
+                        } else {
+                            "closed_observed"
+                        };
+                        observation.action_receipts = receipts.len();
+                    }
+                    Err(error) => {
+                        observation.action_processes = "unknown";
+                        observation.errors.push(format!("original action cleanup: {error}"));
+                    }
+                }
+            }
+        }
+        if let Some(process) = owner.intake_process.as_ref() {
+            if std::time::Instant::now() >= until {
+                observation.intake_process = "unknown";
+                observation.errors.push("original cleanup deadline elapsed before intake cleanup".into());
+            } else {
+                match process.finish_process(until) {
+                    Ok(receipt) if receipt.permits_process_close() => observation.intake_process = "closed_observed",
+                    Ok(_) => {
+                        observation.intake_process = "unknown";
+                        observation.errors.push("original intake did not establish process close".into());
+                    }
+                    Err(error) => {
+                        observation.intake_process = "unknown";
+                        observation.errors.push(format!("original intake cleanup: {error}"));
+                    }
+                }
+            }
+        }
+        match owner.frozen.try_lock() {
+            Ok(frozen) => match frozen.as_ref() {
+                Some(Ok(verified)) if verified.process().transport_complete() => {
+                    observation.frozen_helper = "closed_transport_observed";
+                }
+                Some(Ok(_)) => observation.frozen_helper = "unknown_retained",
+                Some(Err(failure)) => {
+                    // The failed helper's process/child handle is retained by
+                    // its original failure. This is no new kill/reap right.
+                    observation.frozen_helper = "unknown_retained";
+                    if failure.process.as_ref().is_some_and(|process| process.process().pending_child.is_some()) {
+                        observation.errors.push("original frozen helper child remains in custody".into());
+                    }
+                }
+                None => {}
+            },
+            Err(_) => {
+                observation.frozen_helper = "unknown_retained";
+                observation.errors.push("original frozen helper custody busy or poisoned".into());
+            }
+        }
+        observation
+    }
     pub fn original_archives(&self) -> &[Arc<VerifiedGenerationGameArchiveV3>] {
         self.owner
             .as_ref()
