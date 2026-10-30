@@ -988,7 +988,18 @@ impl RoventNnuecSessionDriver {
                         v2_hook_admission = Some(expected_cap.clone());
                         // Reserve recovery capacity before this root can
                         // install an observer or start a teacher.
-                        let escrow_error = match handoff_escrow_v2::HandoffEscrowReservationV2::try_reserve(&cap) {
+                        // Collection is optional for the native search.  An
+                        // incomplete observer must not be installed or emit a
+                        // supposedly complete corpus, but it also must not
+                        // abort an otherwise valid NNUEC root before search.
+                        // The normal no-capture capability proves that no
+                        // observer or teacher was started for this admission.
+                        let escrow_error = if !manager.driver().collection_v2_observation_complete() {
+                            Some(crate::pals_adaptive::AdaptiveCollectionError::new(
+                                crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
+                                "RoventCollectionObservationIncomplete",
+                                "V2 adaptive collection observation is not fully connected"))
+                        } else { match handoff_escrow_v2::HandoffEscrowReservationV2::try_reserve(&cap) {
                             Ok(reservation) => { collection_escrow_v2 = Some(reservation); None }
                             Err(error @ (handoff_escrow_v2::HandoffEscrowErrorV2::Busy | handoff_escrow_v2::HandoffEscrowErrorV2::Capacity | handoff_escrow_v2::HandoffEscrowErrorV2::Poisoned)) => Some(crate::pals_adaptive::AdaptiveCollectionError::new(
                                 crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
@@ -1001,7 +1012,7 @@ impl RoventNnuecSessionDriver {
                                 });
                                 return Err(AdaptiveManagerError::Invalid("V2 escrow reservation failed"));
                             }
-                        };
+                        }};
                         // Preserve the actual Busy/Capacity/Poisoned source
                         // even if a later Pending ends at the root deadline.
                         deferred_preflight_cause = escrow_error.clone();
