@@ -45,6 +45,7 @@ fn run() -> Result<(), String> {
             DiagnosticGameFailureV1::Game(failure) => format!("game: {}", failure.error),
             DiagnosticGameFailureV1::RootSelection { error, .. } => format!("actual root selection: {error}"),
         })?;
+        let action_until = Instant::now().checked_add(Duration::from_millis(action_ms)).ok_or("action deadline overflow")?;
         let action = match run_action_diagnostic_owned_v3(
             Path::new(&args[5]), &args[7], Arc::clone(game.archive()), decision,
             Arc::clone(&cancel), Duration::from_millis(action_ms),
@@ -62,7 +63,7 @@ fn run() -> Result<(), String> {
             "schema":"rz-pals-actual-game-action-diagnostic/1",
             "source_game_count":1, "root_read_bytes":game.root_read_bytes(),
             "action":action.status(), "training_eligible":false, "optimizer_updates":0,
-            "diagnostic_identity": diagnostic_identity(),
+            "diagnostic_identity": diagnostic_identity(action_until, &cancel),
         }));
         Ok(())
     })();
@@ -73,16 +74,22 @@ fn run() -> Result<(), String> {
 /// Readback only; inability to observe it must not change a completed game or
 /// substitute for the independent production source inventory.
 #[cfg(target_os = "linux")]
-fn diagnostic_identity() -> serde_json::Value {
+fn diagnostic_identity(until: std::time::Instant, cancel: &std::sync::atomic::AtomicBool) -> serde_json::Value {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let binary = (|| -> std::io::Result<String> {
         let path = std::env::current_exe()?;
         let mut file = std::fs::File::open(path)?;
         let before = file.metadata()?;
+        if before.len() == 0 || before.len() > 512 * 1024 * 1024 {
+            return Err(std::io::Error::other("diagnostic executable outside read bound"));
+        }
         let mut hasher = Sha256::new();
         let mut bytes = [0u8; 64 * 1024];
         loop {
+            if std::time::Instant::now() >= until || cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::Error::other("diagnostic identity window ended"));
+            }
             let n = file.read(&mut bytes)?;
             if n == 0 { break; }
             hasher.update(&bytes[..n]);
@@ -94,7 +101,7 @@ fn diagnostic_identity() -> serde_json::Value {
         Ok(format!("{:x}", hasher.finalize()))
     })().ok();
     serde_json::json!({
-        "source_commit": option_env!("RZ_PALS_SOURCE_COMMIT"),
+        "declared_source_commit": option_env!("RZ_PALS_SOURCE_COMMIT"),
         "executable_sha256": binary,
         "observation_scope": "separate diagnostic readback; not the production source inventory",
     })
