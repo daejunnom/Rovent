@@ -1052,6 +1052,30 @@ impl RoventNnuecSessionDriver {
                                     v2_hook_started = false;
                                     break;
                                 }
+                                Ok(RoventNnuecCollectionAdmissionOutcomeV2::PendingUncertain { admission }) => {
+                                    if !admission.same_original_admission(&expected_cap) {
+                                        v2_admission_failure = Some(RoventNnuecCollectionAdmissionFailureV2 {
+                                            error: AdaptiveManagerError::Invalid("uncertain collection owner mismatch"),
+                                            admission, owners: Box::new(()),
+                                        });
+                                        return Err(AdaptiveManagerError::Invalid("uncertain collection owner mismatch"));
+                                    }
+                                    // Do not reclaim the escrow or claim a no-start
+                                    // boundary while this root's install is unknown.
+                                    v2_hook_started = true;
+                                    let accepts = context.accepts();
+                                    if !accepts.as_ref().copied().unwrap_or(false)
+                                        || context.soft_expired(Instant::now())
+                                        || manager.phase() != ManagerPhase::Running {
+                                        v2_admission_failure = Some(RoventNnuecCollectionAdmissionFailureV2 {
+                                            error: AdaptiveManagerError::Invalid("collection admission remained uncertain at its original boundary"),
+                                            admission, owners: Box::new(()),
+                                        });
+                                        return Err(AdaptiveManagerError::Invalid("collection admission remained uncertain at its original boundary"));
+                                    }
+                                    manager.tick()?;
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
                                 Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission }) => {
                                     if !admission.same_original_admission(&expected_cap)
                                         || manager.collection_root_admission_v2().is_some() {

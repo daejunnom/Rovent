@@ -413,6 +413,9 @@ pub enum RoventNnuecCollectionAdmissionOutcomeV2 {
     /// The original admission has not started a collector, teacher or
     /// marker. Retain and retry it only within its original deadline.
     Pending { admission: RoventCollectionRootAdmissionV2 },
+    /// The same root is busy but an in-flight install cannot yet be ruled
+    /// out. Its hook and escrow must remain in custody while retrying.
+    PendingUncertain { admission: RoventCollectionRootAdmissionV2 },
     DeferredNoCapture {
         capability: RoventNoCaptureRootCapabilityV2,
         reason: crate::pals_adaptive::AdaptiveCollectionError,

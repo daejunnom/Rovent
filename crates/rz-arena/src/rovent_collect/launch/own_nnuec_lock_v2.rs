@@ -2,8 +2,9 @@
 //! published corpus or a claim of native/teacher physical completion.
 use super::*;
 use crate::rovent_collect::own_hooks_lock_v2::{
-    RoventNnuecCollectionBridgeV2, RoventNnuecCollectionWorkerExitV2, RoventNnuecCollectionWorkerV2,
+    OwnRootSeparationV2, OwnRootWorkerV2, OwnWorkerExitKindV2, OwnWorkerStartErrorV2, RoventNnuecCollectionBridgeV2, RoventNnuecCollectionWorkerExitV2, RoventNnuecCollectionWorkerV2,
 };
+use crate::rovent_collect::own_worker_supervisor_v2::{OwnSecondarySlotV2, OwnWorkerSupervisorV2};
 use crate::rovent_collect::teacher::v2_session::RoventTeacherRosterEntryV2;
 use crate::rovent_collect::teacher::lock_v2_policy::CommitTeacherPolicyFailureV2;
 use crate::rovent_collect::teacher::lock_v2_row_pump::PumpItemV2;
@@ -19,9 +20,14 @@ use rz_uci::rovent_bootstrap::nnuec_session::{
 use rz_uci::rovent_bootstrap::nnuec_session::handoff_escrow_v2::{
     HandoffEscrowErrorV2, HandoffEscrowKeyV2, HandoffEscrowLeaseV2,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use super::own_publisher_v2::{OwnPumpConsumerV2, OwnOfferOutcomeV2, OwnPumpPollV2};
+
+const WORKER_NOT_STARTED: u8 = 0;
+const WORKER_STARTING: u8 = 1;
+const WORKER_STARTED: u8 = 2;
+const WORKER_START_FAILED: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnPumpCommitProgressV2 {
@@ -43,6 +49,7 @@ pub struct RoventNnuecCollectionRunV2 {
     worker_thread: Option<JoinHandle<RoventNnuecCollectionWorkerExitV2>>,
     worker_not_started: bool,
     worker_exit: Option<RoventNnuecCollectionWorkerExitV2>,
+    bridge_worker_exit: Option<OwnWorkerExitKindV2>,
     worker_thread_panicked: bool,
     worker_custody_poisoned: bool,
     transferred_handoff: Option<RoventNnuecTransferredHandoffV2>,
@@ -67,6 +74,11 @@ pub struct RoventNnuecCollectionRunV2 {
     publisher_error: Option<ArenaError>,
     publisher_panic: Option<Box<dyn std::any::Any + Send>>,
     publisher_receipt: Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
+    supervisor: Option<OwnWorkerSupervisorV2>,
+    secondary_slots: Vec<OwnSecondarySlotV2>,
+    supervisor_error: Option<ArenaError>,
+    retained_rows: std::collections::VecDeque<RoventRetiredLockV2Record>,
+    completed_workers: Vec<OwnRootWorkerV2>,
     native_failure: Option<RoventOwnNnuecCollectionLaunchFailureV2>,
     native_failure_taken: bool,
     pre_admission_failure_transferred: bool,
@@ -74,11 +86,179 @@ pub struct RoventNnuecCollectionRunV2 {
 }
 
 impl RoventNnuecCollectionRunV2 {
+    fn primary_join_observed(&self) -> bool {
+        self.worker_exit.is_some() || self.bridge_worker_exit.is_some()
+    }
+    /// Assemble each actual root with its own worker, handoff and commit gate.
+    /// A partial failure retains the row, worker and assembly in this run.
+    fn finish_game_publisher(&mut self, until: Instant) -> Result<(), ArenaError> {
+        use crate::rovent_collect::own_worker_supervisor_v2::OwnSecondaryWorkerStartV2;
+        check(self.primary_join_observed() && !self.primary_panic_observed()
+            && self.publisher_exit.as_ref().is_some_and(Result::is_ok)
+            && self.publisher_thread.is_none() && !self.publisher_unknown,
+            "Own game primary worker or publisher not joined")?;
+        check(self.bridge.returned_handoff_settled().map_err(|error| invalid(format!("Own primary handoff: {error:?}")))?,
+            "Own game primary handoff unresolved")?;
+        let mut roots = vec![(Arc::clone(&self.bridge), Arc::clone(&self.worker), Arc::clone(&self.publisher))];
+        roots.try_reserve(self.secondary_slots.len()).map_err(|_| invalid("Own game root allocation"))?;
+        for slot in &self.secondary_slots {
+            check(matches!(slot.bridge.try_has_deferred_observations()?, Some(false)),
+                "Own game secondary deferred collection retained")?;
+            if slot.bridge.installed_admission_for_recovery().is_none() {
+                let unstarted = (slot.worker_join_observed && slot.consumer_drained_after_join
+                    && slot.worker_exit_kind == Some(OwnWorkerExitKindV2::NoAdmission))
+                    || (slot.worker_start == OwnSecondaryWorkerStartV2::FailedBeforeStart
+                        && slot.consumer_empty_before_worker_start);
+                check(unstarted, "Own secondary start or admission unresolved")?;
+                continue;
+            }
+            check(slot.worker_join_observed && slot.consumer_drained_after_join
+                && matches!(slot.worker_exit_kind, Some(OwnWorkerExitKindV2::Aggregate | OwnWorkerExitKindV2::Retirement))
+                && slot.bridge.returned_handoff_settled().map_err(|error| invalid(format!("Own secondary handoff: {error:?}")))?,
+                "Own game secondary worker, consumer or handoff unresolved")?;
+            roots.push((Arc::clone(&slot.bridge), Arc::clone(&slot.worker), Arc::clone(&slot.consumer)));
+        }
+        for (bridge, worker, _) in &roots {
+            check(matches!(bridge.try_has_deferred_observations()?, Some(false)), "Own game deferred collection retained")?;
+            let worker = worker.try_lock().map_err(|_| invalid("Own game worker busy or poisoned"))?;
+            check(!worker.has_failure() && !worker.has_unpublished_pump_rows(), "Own game worker retains failure or rows")?;
+        }
+        let (last, _, _) = roots.last().expect("primary root retained");
+        let last_admission = last.installed_admission_for_recovery().ok_or_else(|| invalid("Own last root admission missing"))?.clone();
+        loop {
+            check(Instant::now() < until, "Own game root separation deadline")?;
+            match last.try_separate_root_for_next(&last_admission, self.publisher_max_records as usize)? {
+                OwnRootSeparationV2::Pending => std::thread::sleep(Duration::from_millis(1)),
+                OwnRootSeparationV2::Released { .. } => break,
+            }
+        }
+        self.closed_owner()?;
+        check(self.native_failure.is_none() && !self.native_failure_taken && self.resource_error.is_none(),
+            "Own native or resource failure retained")?;
+        check(self.publisher_assembly.is_none() && self.publisher_directory.is_none(),
+            "Own previous publication attempt retained")?;
+        let first = self.bridge.installed_admission_for_recovery().ok_or_else(|| invalid("Own first root admission missing"))?.clone();
+        let parent = self.publisher_output.parent().ok_or_else(|| invalid("Own output parent"))?;
+        let leaf = self.publisher_output.file_name().ok_or_else(|| invalid("Own output leaf"))?;
+        self.publisher_output_parent = Some(Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?);
+        let root = self.publisher_output_parent.as_ref().expect("parent retained");
+        root.create_dir(leaf).map_err(io)?;
+        self.publisher_directory = Some(root.open_dir_nofollow(leaf).map_err(io)?);
+        let directory = self.publisher_directory.as_ref().expect("directory retained");
+        directory.create_dir("chunks").map_err(io)?;
+        self.publisher_assembly = Some(RoventCorpusAssemblyLockV2::new(
+            &self.owner, directory, &self.publisher_manifest, &first, self.publisher_max_records,
+        )?);
+        let mut assembly = self.publisher_assembly.take().expect("assembly retained");
+        let result = (|| -> Result<(), ArenaError> {
+            for (bridge, worker, consumer) in &roots {
+                loop {
+                    check(Instant::now() < until, "Own game consumer deadline")?;
+                    let polled = consumer.poll()?;
+                    match self.try_offer_consumer_item_for(bridge, worker, consumer, &mut assembly)? {
+                        OwnOfferOutcomeV2::Offered => self.advance_game_row(bridge, worker, &mut assembly)?,
+                        OwnOfferOutcomeV2::FailedRetained => return Err(invalid("Own game teacher row failed; original retained")),
+                        OwnOfferOutcomeV2::Pending => {
+                            let Some((items, failed, _, _)) = consumer.try_counts()? else {
+                                std::thread::sleep(Duration::from_millis(1)); continue;
+                            };
+                            check(failed == 0, "Own consumer retains failed rows")?;
+                            if items != 0 { std::thread::sleep(Duration::from_millis(1)); continue; }
+                            match polled {
+                                OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("Own consumer item remains pending")),
+                                OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
+                            }
+                        }
+                    }
+                }
+                let admission = bridge.installed_admission_for_recovery().ok_or_else(|| invalid("Own root admission missing"))?;
+                loop {
+                    check(Instant::now() < until, "Own separated row deadline")?;
+                    self.retained_rows.try_reserve(1).map_err(|_| invalid("Own separated row custody"))?;
+                    let row = match bridge.try_take_separated_row(admission)? {
+                        None => { std::thread::sleep(Duration::from_millis(1)); continue; }
+                        Some(None) => break,
+                        Some(Some(row)) => row,
+                    };
+                    self.retained_rows.push_back(row);
+                    let row = self.retained_rows.front().expect("original separated row retained");
+                    check(row.submitted_input_seal().teacher_actor_id.is_none() || row.record.0.input.legal_moves.is_empty(),
+                        "Own separated row requires teacher evidence; original retained")?;
+                    let row = self.retained_rows.pop_front().expect("original separated row retained");
+                    if let Err(original) = assembly.offer(row) {
+                        let (error, row) = *original; self.retained_rows.push_front(row); return Err(error);
+                    }
+                    self.advance_game_row(bridge, worker, &mut assembly)?;
+                }
+                check(matches!(consumer.try_has_failures()?, Some(false)), "Own consumer retains failure")?;
+            }
+            check(assembly.records() > 0 && self.owner.try_status()?.is_some_and(|status|
+                status.pending_retired_count == 0 && status.game_reserved_slots == Some(0)
+                    && u64::try_from(status.game_retired_total) == Ok(assembly.records())),
+                "Own game owner and assembled records differ")?;
+            self.completed_workers.try_reserve(roots.len() + self.secondary_slots.len()).map_err(|_| invalid("Own worker custody capacity"))?;
+            for (bridge, _, _) in &roots {
+                let admission = bridge.installed_admission_for_recovery().ok_or_else(|| invalid("Own original admission missing"))?;
+                loop {
+                    check(Instant::now() < until, "Own worker transfer deadline")?;
+                    match bridge.try_take_separated_worker(admission)? {
+                        Some(original) => { self.completed_workers.push(original); break; }
+                        None => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                }
+            }
+            for slot in &self.secondary_slots {
+                if slot.bridge.installed_admission_for_recovery().is_some()
+                    || slot.worker_start == OwnSecondaryWorkerStartV2::FailedBeforeStart { continue; }
+                loop {
+                    check(Instant::now() < until, "Own unadmitted worker transfer deadline")?;
+                    match slot.bridge.try_take_unadmitted_worker()? {
+                        Some(original) => { self.completed_workers.push(original); break; }
+                        None => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                }
+            }
+            assembly.flush()?;
+            let directory = self.publisher_directory.as_ref().expect("directory retained");
+            self.publisher_receipt = Some(assembly.finish()?.publish_atomic(directory, until, &AtomicBool::new(false))?);
+            Ok(())
+        })();
+        self.publisher_assembly = Some(assembly);
+        result
+    }
+
+    fn advance_game_row(&self, bridge: &RoventNnuecCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventNnuecCollectionWorkerV2>>, assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<(), ArenaError> {
+        let advanced = match self.try_advance_assembly_for(bridge, worker, assembly) {
+            Err(error) if assembly.chunk_flush_required()? => {
+                assembly.flush()?;
+                self.try_advance_assembly_for(bridge, worker, assembly)
+                    .map_err(|retry| invalid(format!("Own append before flush: {error}; retry: {retry}")))?
+            }
+            other => other?,
+        };
+        check(advanced, "Own original root commit gate remained busy")
+    }
+
+    fn primary_retirement_observed(&self) -> bool {
+        matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved))
+            || matches!(self.bridge_worker_exit, Some(OwnWorkerExitKindV2::Retirement))
+    }
+
+    fn primary_panic_observed(&self) -> bool {
+        self.worker_thread_panicked
+            || matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::Panicked(_)))
+            || self.bridge_worker_exit == Some(OwnWorkerExitKindV2::Panicked)
+    }
     /// Drain and assemble this run's original rows after both worker joins.
     /// A failure retains the consumer, assembly and output directory in run.
     fn finish_publisher(&mut self, until: Instant) -> Result<(), ArenaError> {
+        check(self.supervisor.is_none() && self.supervisor_error.is_none(),
+            "Own supervisor custody is unresolved")?;
+        if !self.secondary_slots.is_empty() { return self.finish_game_publisher(until); }
         use crate::rovent_collect::collection_hooks_core_v2::PumpSendOutcomeV2;
-        check(self.worker_exit.is_some() && self.publisher_exit.as_ref().is_some_and(Result::is_ok)
+        check(self.primary_join_observed() && self.publisher_exit.as_ref().is_some_and(Result::is_ok)
             && self.worker_thread.is_none() && self.publisher_thread.is_none()
             && !self.worker_thread_panicked && !self.publisher_unknown && !self.worker_custody_poisoned,
             "Own publisher worker joins not confirmed")?;
@@ -154,11 +334,23 @@ impl RoventNnuecCollectionRunV2 {
         assembly: &mut RoventCorpusAssemblyLockV2,
     ) -> Result<super::own_publisher_v2::OwnOfferOutcomeV2, ArenaError> {
         use super::own_publisher_v2::OwnOfferOutcomeV2;
-        if self.worker_thread.is_some() || self.worker_exit.is_none()
+        if self.worker_thread.is_some() || !self.primary_join_observed()
             || self.worker_thread_panicked || self.worker_custody_poisoned
-            || matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::Panicked(_)))
+            || self.primary_panic_observed()
         { return Ok(OwnOfferOutcomeV2::Pending); }
-        let worker = match self.worker.try_lock() {
+        self.try_offer_consumer_item_for(&self.bridge, &self.worker, consumer, assembly)
+    }
+
+    /// The caller must first establish that this exact root's worker joined.
+    /// The gate and handoff are taken from that same root, not the newest root.
+    fn try_offer_consumer_item_for(
+        &self,
+        bridge: &RoventNnuecCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventNnuecCollectionWorkerV2>>,
+        consumer: &OwnPumpConsumerV2,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<OwnOfferOutcomeV2, ArenaError> {
+        let worker = match worker.try_lock() {
             Ok(worker) => worker,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 worker poisoned")),
@@ -170,18 +362,27 @@ impl RoventNnuecCollectionRunV2 {
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 handoff poisoned")),
         };
         let admission = handoff.parts_mut().0.clone();
-        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(OwnOfferOutcomeV2::Pending); };
+        let Some(gate) = bridge.try_begin_commit(&admission)? else { return Ok(OwnOfferOutcomeV2::Pending); };
         consumer.try_offer_front(&self.owner, assembly, &gate, &mut handoff)
     }
     /// Advance a caller-owned assembly with this run's original root gate and
     /// handoff. The assembly keeps the original row on busy/error; success is
     /// only in-memory assembly, not corpus publication or teacher retirement.
     pub fn try_advance_assembly(&self, assembly: &mut RoventCorpusAssemblyLockV2) -> Result<bool, ArenaError> {
-        if self.worker_thread.is_some() || self.worker_exit.is_none()
+        if self.worker_thread.is_some() || !self.primary_join_observed()
             || self.worker_thread_panicked || self.worker_custody_poisoned
-            || matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::Panicked(_)))
+            || self.primary_panic_observed()
         { return Ok(false); }
-        let worker = match self.worker.try_lock() {
+        self.try_advance_assembly_for(&self.bridge, &self.worker, assembly)
+    }
+
+    fn try_advance_assembly_for(
+        &self,
+        bridge: &RoventNnuecCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventNnuecCollectionWorkerV2>>,
+        assembly: &mut RoventCorpusAssemblyLockV2,
+    ) -> Result<bool, ArenaError> {
+        let worker = match worker.try_lock() {
             Ok(worker) => worker,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 worker poisoned")),
@@ -193,7 +394,7 @@ impl RoventNnuecCollectionRunV2 {
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("Collection /2 handoff poisoned")),
         };
         let admission = handoff.parts_mut().0.clone();
-        let Some(gate) = self.bridge.try_begin_commit(&admission)? else { return Ok(false); };
+        let Some(gate) = bridge.try_begin_commit(&admission)? else { return Ok(false); };
         assembly.try_advance_fenced_own(&gate, &mut handoff)
     }
     /// Recover only the original installed admission after the Arena worker
@@ -201,7 +402,7 @@ impl RoventNnuecCollectionRunV2 {
     pub fn try_recover_original_handoff(&mut self) -> Result<bool, ArenaError> {
         if self.recovered_handoff.is_some() { return Ok(true); }
         if self.worker_thread.is_some() || self.worker_custody_poisoned
-            || (self.worker_exit.is_none() && !self.worker_not_started && !self.worker_thread_panicked)
+            || (!self.primary_join_observed() && !self.worker_not_started && !self.worker_thread_panicked)
         {
             return Ok(false);
         }
@@ -279,13 +480,13 @@ impl RoventNnuecCollectionRunV2 {
     /// prepared evidence remain in the worker. Policy-commit failures are
     /// instead retained by this run, including any panic payload.
     pub fn try_commit_pump_head(&mut self) -> Result<OwnPumpCommitProgressV2, ArenaError> {
-        if matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::Panicked(_))) {
+        if self.primary_panic_observed() {
             return Err(invalid("original row worker panicked; exit payload remains retained"));
         }
         if self.worker_thread_panicked || self.worker_custody_poisoned {
             return Err(invalid("original row worker completion is unknown"));
         }
-        if self.worker_thread.is_some() || self.worker_exit.is_none() {
+        if self.worker_thread.is_some() || !self.primary_join_observed() {
             return Ok(OwnPumpCommitProgressV2::Pending);
         }
         if self.commit_failure.is_some() {
@@ -329,7 +530,7 @@ impl RoventNnuecCollectionRunV2 {
         if self.transferred_handoff.is_some() {
             return Ok(true);
         }
-        if self.worker_thread.is_some() || self.worker_exit.is_none() || self.worker_thread_panicked || self.worker_custody_poisoned {
+        if self.worker_thread.is_some() || !self.primary_join_observed() || self.primary_panic_observed() || self.worker_custody_poisoned {
             return Ok(false);
         }
         let handoff = {
@@ -356,6 +557,16 @@ impl RoventNnuecCollectionRunV2 {
     /// Collect only a thread that has already exited; never wait indefinitely
     /// or infer that a still-running worker has physically stopped.
     pub fn poll_worker(&mut self) -> bool {
+        if self.worker_thread.is_none() && !self.worker_not_started
+            && self.worker_exit.is_none() && self.bridge_worker_exit.is_none()
+            && !self.worker_custody_poisoned
+        {
+            match self.bridge.poll_worker() {
+                Ok(Some(kind)) => self.bridge_worker_exit = Some(kind),
+                Ok(None) => {},
+                Err(error) => { self.resource_error.get_or_insert_with(|| format!("teacher worker custody: {error:?}")); }
+            }
+        }
         if self
             .worker_thread
             .as_ref()
@@ -373,19 +584,19 @@ impl RoventNnuecCollectionRunV2 {
                 }
             }
         }
-        if self.worker_exit.is_some() && self.transferred_handoff.is_none() {
+        if self.primary_join_observed() && self.transferred_handoff.is_none() {
             if let Err(error) = self.try_transfer_joined_handoff() {
                 self.handoff_transfer_error = Some(error);
             }
         }
-        if (self.worker_exit.is_some() || self.worker_thread_panicked) && self.transferred_handoff.is_none()
+        if (self.primary_join_observed() || self.worker_thread_panicked) && self.transferred_handoff.is_none()
             && self.recovered_handoff.is_none() && self.escrow_recovery_error.is_none()
         {
             if let Err(error) = self.try_recover_original_handoff() {
                 self.escrow_recovery_error = Some(error);
             }
         }
-        if self.worker_exit.is_some() || self.worker_thread_panicked || self.worker_not_started {
+        if self.primary_join_observed() || self.worker_thread_panicked || self.worker_not_started {
             self.publisher_stop.store(true, Ordering::Release);
         }
         if self.publisher_thread.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -395,7 +606,7 @@ impl RoventNnuecCollectionRunV2 {
                 Err(payload) => { self.publisher_unknown = true; std::mem::forget(payload); }
             }
         }
-        self.worker_exit.is_some() || self.worker_thread_panicked || self.worker_not_started
+        self.primary_join_observed() || self.worker_thread_panicked || self.worker_not_started
             || (self.worker_custody_poisoned && self.worker_thread.is_none())
     }
 
@@ -445,6 +656,13 @@ impl RoventNnuecCollectionRunV2 {
                 "physical_aggregate_handoff_observed"
             }
             Some(RoventNnuecCollectionWorkerExitV2::Panicked(_)) => "caught_panic",
+            None if self.bridge_worker_exit == Some(OwnWorkerExitKindV2::NoAdmission) => "no_admission",
+            None if self.bridge_worker_exit == Some(OwnWorkerExitKindV2::Retirement) => "retirement_and_handoff_observed",
+            None if self.bridge_worker_exit == Some(OwnWorkerExitKindV2::Deadline) => "deadline",
+            None if self.bridge_worker_exit == Some(OwnWorkerExitKindV2::AdmissionCanceled) => "admission_canceled",
+            None if self.bridge_worker_exit == Some(OwnWorkerExitKindV2::PhysicalAck) => "physical_scope_ack_delivered",
+            None if self.bridge_worker_exit == Some(OwnWorkerExitKindV2::Aggregate) => "physical_aggregate_handoff_observed",
+            None if self.bridge_worker_exit == Some(OwnWorkerExitKindV2::Panicked) => "caught_panic",
             None if self.worker_not_started => "not_started",
             None if self.worker_custody_poisoned => "custody_poisoned",
             None if self.worker_thread_panicked => "outer_panic",
@@ -492,11 +710,11 @@ impl RoventNnuecCollectionRunV2 {
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
             "native_failure_transferred":self.native_failure_taken,
             "resource_error":self.resource_error,"resource_observation":resource_observation,"resource":resource,
-            "teacher_worker_returned":self.worker_exit.is_some(),
+            "teacher_worker_returned":self.primary_join_observed(),
             "teacher_worker_exit":worker_exit,
             "teacher_worker_running_or_unknown":!self.worker_not_started && (self.worker_thread.is_some() || self.worker_thread_panicked || self.worker_custody_poisoned
-                || !matches!(self.worker_exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved))),
-            "teacher_worker_thread_panicked":self.worker_thread_panicked,
+                || !self.primary_retirement_observed()),
+            "teacher_worker_thread_panicked":self.primary_panic_observed(),
             "teacher_worker_custody_poisoned":self.worker_custody_poisoned,
             "recovered_handoff_lease_retained":self.recovered_handoff.is_some(),
             "recovered_handoff_delivery":recovered_delivery,
@@ -580,7 +798,7 @@ impl RoventNnuecCollectionRunV2 {
         ArenaError,
     > {
         check(
-            self.worker_thread.is_none() && self.worker_exit.is_some()
+            self.worker_thread.is_none() && self.primary_join_observed()
                 && !self.worker_thread_panicked && !self.worker_custody_poisoned,
             "Collection /2 teacher worker has not exited cleanly",
         )?;
@@ -639,10 +857,7 @@ impl RoventNnuecCollectionRunV2 {
             "Collection /2 has incomplete handoff observations",
         )?;
         check(
-            matches!(
-                self.worker_exit.as_ref(),
-                Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved)
-            ) && self
+            self.primary_retirement_observed() && self
                 .worker
                 .try_lock()
                 .is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
@@ -721,10 +936,7 @@ impl Drop for RoventNnuecCollectionRunV2 {
                 .worker
                 .try_lock()
                 .is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows())
-            && matches!(
-                self.worker_exit.as_ref(),
-                Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved)
-            );
+            && self.primary_retirement_observed();
         if !arena_worker_resolved {
             // A dropped observation must not release a still-running or
             // unverified owner. Keep the exact objects for process lifetime;
@@ -735,6 +947,10 @@ impl Drop for RoventNnuecCollectionRunV2 {
             std::mem::forget(Arc::clone(&self.bridge));
             std::mem::forget(Arc::clone(&self.worker));
             std::mem::forget(Arc::clone(&self.publisher));
+            if let Some(supervisor) = self.supervisor.take() { std::mem::forget(supervisor); }
+            if !self.secondary_slots.is_empty() { std::mem::forget(std::mem::take(&mut self.secondary_slots)); }
+            if !self.completed_workers.is_empty() { std::mem::forget(std::mem::take(&mut self.completed_workers)); }
+            if !self.retained_rows.is_empty() { std::mem::forget(std::mem::take(&mut self.retained_rows)); }
             if let Some(assembly) = self.publisher_assembly.take() { std::mem::forget(assembly); }
             if let Some(directory) = self.publisher_directory.take() { std::mem::forget(directory); }
             if let Some(parent) = self.publisher_output_parent.take() { std::mem::forget(parent); }
@@ -763,10 +979,7 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
     worker_deadline: Instant,
     cleanup_deadline: Instant,
 ) -> Result<RoventNnuecCollectionRunV2, ArenaError> {
-    check(
-        plan.maximum_roots == 1,
-        "P/C Collection /2 bridge currently accepts one root",
-    )?;
+    check((1..=64).contains(&plan.maximum_roots), "Own Collection /2 root limit")?;
     check(
         Instant::now() < worker_deadline && worker_deadline <= cleanup_deadline,
         "P/C Collection /2 finite worker/cleanup deadline",
@@ -780,6 +993,8 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         RoventCollectionOwnerLockV2::new_shared_with_record_limit(
             Arc::clone(&manifest), plan.metadata.clone(), plan.maximum_records,
         )?;
+    let roster_identity: Vec<_> = plan.teacher_slots.iter().map(|entry|
+        (entry.actor_id.clone(), entry.source_index, entry.collection_owner)).collect();
     let roster = plan
         .teacher_slots
         .iter()
@@ -816,10 +1031,22 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
     let thread_worker = Arc::clone(&worker);
     // The output/cgroup resource gate can migrate only this startup thread.
     // Do not spawn any worker until that original gate has succeeded.
-    let worker_slot = Arc::new(Mutex::new(None));
-    let admission_worker_slot = Arc::clone(&worker_slot);
-    let hooks: Arc<dyn rz_uci::rovent_bootstrap::nnuec_session::RoventNnuecCollectionHooksV2> =
-        bridge.clone();
+    let worker_start = Arc::new(AtomicU8::new(WORKER_NOT_STARTED));
+    let admission_worker_start = Arc::clone(&worker_start);
+    let admission_bridge = Arc::clone(&bridge);
+    let router = Arc::new(crate::rovent_collect::own_root_router_v2::RoventOwnRootRouterV2::new(
+        Arc::clone(&bridge), plan.maximum_roots as usize,
+    )?);
+    let hooks: Arc<dyn rz_uci::rovent_bootstrap::nnuec_session::RoventNnuecCollectionHooksV2> = router.clone();
+    let supervisor_custody = Arc::new(Mutex::new(None));
+    let admission_supervisor = Arc::clone(&supervisor_custody);
+    let supervisor_router = Arc::clone(&router);
+    let supervisor_owner = owner.clone();
+    let supervisor_manifest = Arc::clone(&manifest);
+    let supervisor_roots = plan.maximum_roots as usize;
+    let supervisor_records = plan.maximum_records as usize;
+    let supervisor_constraint = plan.teacher_constraint;
+    let supervisor_quantum = Duration::from_nanos(plan.teacher_soft_quantum_ns);
     let native = run_own_nnuec_collection_v2_with_resource_admission(
         arguments,
         plan.teacher_sources,
@@ -853,30 +1080,37 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
                 .map_err(|error| RoventLaunchError { stage: "publisher_worker_start", detail: error.to_string() })?;
             *publisher_handle = Some(handle);
             drop(publisher_handle);
-            let mut slot = admission_worker_slot.lock().map_err(|_| RoventLaunchError {
-                stage: "teacher_worker_start",
-                detail: "Collection /2 worker handle custody poisoned".into(),
-            })?;
-            if slot.is_some() {
-                return Err(RoventLaunchError { stage: "teacher_worker_start", detail: "Collection /2 worker already started".into() });
+            admission_worker_start.store(WORKER_STARTING, Ordering::Release);
+            match admission_bridge.start_worker(&thread_worker, worker_stop, worker_deadline) {
+                Ok(()) => admission_worker_start.store(WORKER_STARTED, Ordering::Release),
+                Err(error) => {
+                    let error = match error {
+                        OwnWorkerStartErrorV2::BeforeStart(error) => {
+                            admission_worker_start.store(WORKER_START_FAILED, Ordering::Release);
+                            error
+                        }
+                        OwnWorkerStartErrorV2::Unknown(error) => error,
+                    };
+                    return Err(RoventLaunchError { stage: "teacher_worker_start", detail: error.to_string() });
+                }
             }
-            let handle = std::thread::Builder::new()
-                .name("rovent-own-nnuec-collection-v2".into())
-                .spawn(move || match thread_worker.lock() {
-                    Ok(mut owner) => owner.run_until(worker_stop, worker_deadline),
-                    Err(_) => panic!("teacher worker owner mutex poisoned before run"),
-                })
-                .map_err(|error| RoventLaunchError { stage: "teacher_worker_start", detail: error.to_string() })?;
-            *slot = Some(handle);
+            if supervisor_roots > 1 {
+                let mut custody = admission_supervisor.lock().map_err(|_| RoventLaunchError {
+                    stage: "collection_supervisor_start", detail: "supervisor custody poisoned".into(),
+                })?;
+                *custody = Some(crate::rovent_collect::own_worker_supervisor_v2::OwnWorkerSupervisorV2::start(
+                    supervisor_router, supervisor_owner, supervisor_manifest, roster_identity,
+                    supervisor_constraint, supervisor_quantum, supervisor_roots, supervisor_records,
+                    worker_deadline, cleanup_deadline,
+                ).map_err(|error| RoventLaunchError { stage: "collection_supervisor_start", detail: error.to_string() })?);
+            }
             Ok(())
         },
     );
     stop.store(true, Ordering::Release);
-    let (worker_thread, slot_poisoned) = match worker_slot.lock() {
-        Ok(mut slot) => (slot.take(), false),
-        Err(poison) => (poison.into_inner().take(), true),
-    };
-    let worker_not_started = worker_thread.is_none() && !slot_poisoned;
+    let worker_state = worker_start.load(Ordering::Acquire);
+    let worker_not_started = matches!(worker_state, WORKER_NOT_STARTED | WORKER_START_FAILED);
+    let slot_poisoned = worker_state == WORKER_STARTING;
     let (publisher_thread, publisher_unknown) = match publisher_slot.lock() {
         Ok(mut slot) => (slot.take(), false),
         Err(poison) => (poison.into_inner().take(), true),
@@ -888,9 +1122,15 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         owner,
         bridge,
         worker,
-        worker_thread,
+        worker_thread: None,
         worker_not_started,
         worker_exit: None,
+        bridge_worker_exit: None,
+        supervisor: supervisor_custody.lock().map_err(|_| invalid("Own supervisor custody poisoned"))?.take(),
+        secondary_slots: Vec::new(),
+        supervisor_error: None,
+        retained_rows: std::collections::VecDeque::new(),
+        completed_workers: Vec::new(),
         worker_thread_panicked: false,
         worker_custody_poisoned: slot_poisoned,
         transferred_handoff: None,
@@ -920,6 +1160,7 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         pre_admission_failure_transferred: false,
         resource_error: None,
     };
+    if let Some(supervisor) = &run.supervisor { supervisor.request_stop(); }
     if let Ok(mut resource) = run.resource.lock() {
         if let Err(error) = resource.finish_live() {
             run.resource_error = Some(error.to_string());
@@ -947,7 +1188,23 @@ pub fn run_rovent_own_nnuec_collection_lock_v2(
         run.poll_worker();
         if run.publisher_thread.is_some() { std::thread::sleep(Duration::from_millis(2)); }
     }
-    if run.publisher_exit.as_ref().is_some_and(Result::is_ok) && run.worker_exit.is_some() {
+    if let Some(supervisor) = &mut run.supervisor {
+        while !supervisor.poll_join() && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if supervisor.poll_join() {
+            match supervisor.take_joined_slots() {
+                Ok(Some((slots, error))) => {
+                    run.secondary_slots = slots;
+                    run.supervisor_error = error;
+                    run.supervisor = None;
+                }
+                Ok(None) => {}
+                Err(error) => run.supervisor_error = Some(error),
+            }
+        }
+    }
+    if run.publisher_exit.as_ref().is_some_and(Result::is_ok) && run.primary_join_observed() {
         let until = Instant::now().checked_add(run.publisher_timeout)
             .map_or(cleanup_deadline, |publication_until| publication_until.min(cleanup_deadline));
         match run.finish_publisher(until) {

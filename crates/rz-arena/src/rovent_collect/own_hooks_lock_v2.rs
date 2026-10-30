@@ -19,7 +19,9 @@ use rz_uci::rovent_bootstrap::nnuec_session::{
 use rz_uci::rovent_bootstrap::nnuec_session::handoff_escrow_v2::{
     HandoffEscrowErrorV2, HandoffEscrowKeyV2,
 };
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc, atomic::AtomicBool};
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 pub(crate) use super::collection_hooks_core_v2::CollectionWorkerExitV2 as RoventNnuecCollectionWorkerExitV2;
 pub(crate) type RoventNnuecCollectionWorkerV2 =
@@ -27,12 +29,50 @@ pub(crate) type RoventNnuecCollectionWorkerV2 =
 
 pub(crate) struct RoventNnuecCollectionBridgeV2 {
     core: Arc<CollectionBridgeCoreV2<RoventNnuecCollectionHandoffV2>>,
+    owner: RoventCollectionOwnerLockV2,
+    manifest: Arc<RoventCorpusManifestLockV2>,
+    roster_identity: Vec<(String, usize, u32)>,
+    worker: Mutex<Option<OwnRootWorkerV2>>,
     deferred: Mutex<DeferredCollectionHistoryV2>,
     pending_stopped: Mutex<PendingCollectionSummaryV2>,
     original_attempt: OnceLock<RoventCollectionRootAdmissionV2>,
     before_start_failure: OnceLock<AdaptiveManagerError>,
     unstarted_sealed: OnceLock<Arc<RoventNnuecPendingCollectionV2>>,
     first_pending_event: OnceLock<Arc<RoventNnuecPendingCollectionV2>>,
+}
+
+pub(crate) struct OwnRootWorkerV2 {
+    original: Arc<Mutex<RoventNnuecCollectionWorkerV2>>,
+    handle: Option<JoinHandle<RoventNnuecCollectionWorkerExitV2>>,
+    exit: Option<RoventNnuecCollectionWorkerExitV2>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+    separated_rows: std::collections::VecDeque<super::RoventRetiredLockV2Record>,
+    separation_failed: bool,
+    separation_complete: bool,
+}
+
+pub(crate) enum OwnRootSeparationV2 { Pending, Released { retained_rows: usize } }
+pub(crate) enum OwnWorkerStartErrorV2 { BeforeStart(ArenaError), Unknown(ArenaError) }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnWorkerExitKindV2 { NoAdmission, AdmissionCanceled, Retirement, PhysicalAck, Aggregate, Deadline, Panicked }
+
+impl OwnRootWorkerV2 {
+    pub(crate) fn original_worker(&self) -> &Arc<Mutex<RoventNnuecCollectionWorkerV2>> { &self.original }
+    pub(crate) fn take_separated_row(&mut self) -> Option<super::RoventRetiredLockV2Record> { self.separated_rows.pop_front() }
+    pub(crate) fn remaining_rows(&self) -> usize { self.separated_rows.len() }
+}
+
+impl Drop for RoventNnuecCollectionBridgeV2 {
+    fn drop(&mut self) {
+        // The outer supervisor must take separated custody explicitly. If it
+        // drops the bridge before doing so, the original worker, join handle,
+        // diagnostics and rows remain quarantined rather than detached/lost.
+        let slot = match self.worker.get_mut() {
+            Ok(slot) => slot,
+            Err(poison) => poison.into_inner(),
+        };
+        if let Some(original) = slot.take() { std::mem::forget(original); }
+    }
 }
 
 struct DeferredCollectionHistoryV2 {
@@ -113,6 +153,227 @@ fn recover_root_handoff(
 }
 
 impl RoventNnuecCollectionBridgeV2 {
+    /// The caller invokes this only after resource admission. It preserves the
+    /// original worker and handle, including every later join/panic outcome.
+    pub(crate) fn start_worker(&self, worker: &Arc<Mutex<RoventNnuecCollectionWorkerV2>>, stop: Arc<AtomicBool>, deadline: Instant)
+        -> Result<(), OwnWorkerStartErrorV2> {
+        {
+            let original = worker.try_lock().map_err(|_| OwnWorkerStartErrorV2::Unknown(super::invalid("Own original worker busy or poisoned")))?;
+            if !self.core.matches_original_worker(&original) {
+                return Err(OwnWorkerStartErrorV2::BeforeStart(super::invalid("Own worker differs from original bridge")));
+            }
+        }
+        let mut slot = self.worker.try_lock().map_err(|_| OwnWorkerStartErrorV2::Unknown(super::invalid("Own worker custody busy or poisoned")))?;
+        if slot.is_some() { return Err(OwnWorkerStartErrorV2::Unknown(super::invalid("Own worker already registered"))); }
+        let original = Arc::clone(worker);
+        let handle = std::thread::Builder::new().name("rovent-own-root-worker-v2".into())
+            .spawn(move || match original.lock() {
+                Ok(mut worker) => worker.run_until(stop, deadline),
+                Err(_) => panic!("Own original worker poisoned"),
+            }).map_err(|error| OwnWorkerStartErrorV2::BeforeStart(ArenaError::Io(error.to_string())))?;
+        *slot = Some(OwnRootWorkerV2 { original: Arc::clone(worker), handle: Some(handle), exit: None,
+            panic: None, separated_rows: std::collections::VecDeque::new(), separation_failed: false, separation_complete: false });
+        Ok(())
+    }
+
+    pub(crate) fn try_prepared_for_same_owner(&self, previous: &Self) -> Result<Option<bool>, ArenaError> {
+        if !self.owner.same_original_owner(&previous.owner) || !Arc::ptr_eq(&self.manifest, &previous.manifest)
+            || self.roster_identity != previous.roster_identity || !self.core.same_original_startup(&previous.core)
+            || self.core.installed_admission_for_recovery().is_some() {
+            return Err(super::invalid("Own prepared root owner, startup, roster or admission mismatch"));
+        }
+        let slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("Own prepared worker custody poisoned")),
+        };
+        Ok(Some(slot.as_ref().is_some_and(|worker| worker.handle.as_ref().is_some_and(|handle| !handle.is_finished())
+            && worker.exit.is_none() && worker.panic.is_none() && worker.separated_rows.is_empty() && !worker.separation_failed)))
+    }
+
+    /// Poll the original handle without detaching it; retain its complete
+    /// exit or panic payload for the outer owner and receipt.
+    pub(crate) fn poll_worker(&self) -> Result<Option<OwnWorkerExitKindV2>, AdaptiveManagerError> {
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own worker custody poisoned")),
+        };
+        let worker = slot.as_mut().ok_or(AdaptiveManagerError::Invalid("Own original worker missing"))?;
+        if worker.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            match worker.handle.take().expect("finished worker retained").join() {
+                Ok(exit) => worker.exit = Some(exit),
+                Err(payload) => worker.panic = Some(payload),
+            }
+        }
+        if worker.panic.is_some() { return Ok(Some(OwnWorkerExitKindV2::Panicked)); }
+        Ok(worker.exit.as_ref().map(|exit| match exit {
+            RoventNnuecCollectionWorkerExitV2::NoAdmission => OwnWorkerExitKindV2::NoAdmission,
+            RoventNnuecCollectionWorkerExitV2::AdmissionCanceled => OwnWorkerExitKindV2::AdmissionCanceled,
+            RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved => OwnWorkerExitKindV2::Retirement,
+            RoventNnuecCollectionWorkerExitV2::PhysicalAckDelivered => OwnWorkerExitKindV2::PhysicalAck,
+            RoventNnuecCollectionWorkerExitV2::AggregateHandoffObserved => OwnWorkerExitKindV2::Aggregate,
+            RoventNnuecCollectionWorkerExitV2::Deadline => OwnWorkerExitKindV2::Deadline,
+            RoventNnuecCollectionWorkerExitV2::Panicked(_) => OwnWorkerExitKindV2::Panicked,
+        }))
+    }
+
+    /// Observe only this joined worker's original handoff; neither this
+    /// observation nor a physical acknowledgement publishes the root rows.
+    pub(crate) fn returned_handoff_settled(&self) -> Result<bool, AdaptiveManagerError> {
+        let slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own worker custody poisoned")),
+        };
+        let Some(worker) = slot.as_ref() else { return Ok(false); };
+        if worker.handle.is_some() || worker.panic.is_some()
+            || !matches!(worker.exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved | RoventNnuecCollectionWorkerExitV2::AggregateHandoffObserved)) {
+            return Ok(false);
+        }
+        let core = match worker.original.try_lock() {
+            Ok(core) => core,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own original worker poisoned")),
+        };
+        if core.has_failure() { return Ok(false); }
+        let Some(handoff) = core.original_handoff() else { return Ok(false); };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own original handoff poisoned")),
+        };
+        if handoff.teacher_aggregate_ack().is_none() { return Ok(false); }
+        let (admission, _, settlement, fence) = handoff.parts_mut();
+        Ok(self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(admission))
+            && settlement.is_ok() && fence.permits_semantic_closure())
+    }
+
+    /// Join only the original worker and separate at most one same-root late
+    /// row. The shared game gate is released only after the actual handoff,
+    /// native fence and teacher aggregate have all been observed.
+    pub(crate) fn try_separate_root_for_next(&self, admission: &RoventCollectionRootAdmissionV2, retained_row_limit: usize)
+        -> Result<OwnRootSeparationV2, ArenaError> {
+        if !self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(admission)) {
+            return Err(super::invalid("Own separation original admission mismatch"));
+        }
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnRootSeparationV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("Own worker custody poisoned")),
+        };
+        let worker = slot.as_mut().ok_or_else(|| super::invalid("Own original worker missing"))?;
+        if worker.separation_failed { return Err(super::invalid("Own separation failed; originals retained")); }
+        if worker.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            match worker.handle.take().expect("finished worker retained").join() {
+                Ok(exit) => worker.exit = Some(exit),
+                Err(payload) => worker.panic = Some(payload),
+            }
+        }
+        if worker.handle.is_some() { return Ok(OwnRootSeparationV2::Pending); }
+        if worker.panic.is_some() { return Err(super::invalid("Own worker panic retained")); }
+        if !matches!(worker.exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved | RoventNnuecCollectionWorkerExitV2::AggregateHandoffObserved)) {
+            return Err(super::invalid("Own teacher/worker completion unknown"));
+        }
+        let core = match worker.original.try_lock() {
+            Ok(core) => core,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnRootSeparationV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("Own original worker poisoned")),
+        };
+        let Some(handoff) = core.original_handoff() else { return Ok(OwnRootSeparationV2::Pending); };
+        let mut handoff = match handoff.try_lock() {
+            Ok(handoff) => handoff,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnRootSeparationV2::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("Own original handoff poisoned")),
+        };
+        if handoff.teacher_aggregate_ack().is_none() { return Ok(OwnRootSeparationV2::Pending); }
+        let (original, _, settlement, fence) = handoff.parts_mut();
+        if !original.same_original_admission(admission) || settlement.is_err() || !fence.permits_semantic_closure() {
+            return Err(super::invalid("Own original handoff or native fence mismatch"));
+        }
+        drop(handoff);
+        drop(core);
+        let Some(status) = self.owner.try_status()? else { return Ok(OwnRootSeparationV2::Pending); };
+        if !status.admitted || !status.settled || status.pending_count != 0 { return Ok(OwnRootSeparationV2::Pending); }
+        if status.pending_retired_count != 0 {
+            if worker.separated_rows.len() >= retained_row_limit { return Err(super::invalid("Own separated row capacity")); }
+            worker.separated_rows.try_reserve(1).map_err(|_| super::invalid("Own separated row allocation"))?;
+            match self.owner.try_take_settled_retired()? {
+                Some(Some(row)) => {
+                    if !row.admission.same_original_admission(admission) {
+                        worker.separated_rows.push_back(row);
+                        worker.separation_failed = true;
+                        return Err(super::invalid("Own separated row belongs to another root"));
+                    }
+                    worker.separated_rows.push_back(row);
+                    return Ok(OwnRootSeparationV2::Pending);
+                }
+                Some(None) | None => return Ok(OwnRootSeparationV2::Pending),
+            }
+        }
+        if !self.core.try_release_game_root(admission)? { return Ok(OwnRootSeparationV2::Pending); }
+        worker.separation_complete = true;
+        Ok(OwnRootSeparationV2::Released { retained_rows: worker.separated_rows.len() })
+    }
+
+    /// Transfer the original joined worker and any separated rows together.
+    /// The caller must also retain that root's consumer and publication state.
+    pub(crate) fn try_take_separated_worker(&self, admission: &RoventCollectionRootAdmissionV2)
+        -> Result<Option<OwnRootWorkerV2>, ArenaError> {
+        if !self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(admission)) {
+            return Err(super::invalid("Own worker transfer original admission mismatch"));
+        }
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("Own worker custody poisoned")),
+        };
+        if !slot.as_ref().is_some_and(|worker| worker.separation_complete) { return Ok(None); }
+        Ok(slot.take())
+    }
+
+    /// Transfer only a joined worker whose original loop observed the closed
+    /// admission without taking a slot. This is custody, not physical or
+    /// publication success; its exit and any diagnostic state stay intact.
+    pub(crate) fn try_take_unadmitted_worker(&self) -> Result<Option<OwnRootWorkerV2>, ArenaError> {
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("Own worker custody poisoned")),
+        };
+        let Some(worker) = slot.as_ref() else { return Ok(None); };
+        if worker.handle.is_some() || worker.panic.is_some()
+            || !matches!(worker.exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::NoAdmission))
+            || self.core.installed_admission_for_recovery().is_some() {
+            return Ok(None);
+        }
+        Ok(slot.take())
+    }
+
+    pub(crate) fn try_take_separated_row(&self, admission: &RoventCollectionRootAdmissionV2)
+        -> Result<Option<Option<super::RoventRetiredLockV2Record>>, ArenaError> {
+        if !self.core.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(admission)) {
+            return Err(super::invalid("Own separated row original admission mismatch"));
+        }
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(super::invalid("Own worker custody poisoned")),
+        };
+        let worker = slot.as_mut().ok_or_else(|| super::invalid("Own original worker missing"))?;
+        if worker.separation_failed { return Err(super::invalid("Own separation failed; original rows retained")); }
+        Ok(Some(worker.separated_rows.pop_front()))
+    }
+    pub(crate) fn matches_original_attempt(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        self.original_attempt.get().is_some_and(|original| original.same_original_admission(admission))
+    }
+    pub(crate) fn closed_before_next_admission(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
+        self.core.closed_before_next_admission(admission)
+    }
+    pub(crate) fn try_seal_unstarted(&self, admission: &RoventCollectionRootAdmissionV2)
+        -> Result<super::collection_hooks_core_v2::CoreUnstartedSealV2, ArenaError> {
+        self.core.try_seal_unstarted(admission)
+    }
     /// Install no-capture only after the original attempt has been atomically
     /// sealed before observer installation. Pending retains this request.
     fn defer_after_unstarted_seal(
@@ -164,10 +425,12 @@ impl RoventNnuecCollectionBridgeV2 {
         manifest: Arc<RoventCorpusManifestLockV2>,
         roster: Vec<RoventTeacherRosterEntryV2>,
     ) -> Result<(Arc<Self>, RoventNnuecCollectionWorkerV2), ArenaError> {
+        let roster_identity = roster.iter().map(|entry|
+            (entry.actor_id.clone(), entry.source_index, entry.collection_owner)).collect();
         let (core, mut worker) =
-            CollectionBridgeCoreV2::new(owner, manifest, roster, handoff_matches, handoff_submit)?;
+            CollectionBridgeCoreV2::new(owner.clone(), Arc::clone(&manifest), roster, handoff_matches, handoff_submit)?;
         worker.configure_handoff_recovery(recover_root_handoff, handoff_identity);
-        Ok((Arc::new(Self { core, original_attempt: OnceLock::new(), before_start_failure: OnceLock::new(), unstarted_sealed: OnceLock::new(), first_pending_event: OnceLock::new(), pending_stopped: Mutex::new(PendingCollectionSummaryV2::new()), deferred: Mutex::new(DeferredCollectionHistoryV2 {
+        Ok((Arc::new(Self { core, owner, manifest, roster_identity, worker: Mutex::new(None), original_attempt: OnceLock::new(), before_start_failure: OnceLock::new(), unstarted_sealed: OnceLock::new(), first_pending_event: OnceLock::new(), pending_stopped: Mutex::new(PendingCollectionSummaryV2::new()), deferred: Mutex::new(DeferredCollectionHistoryV2 {
             retained: Vec::with_capacity(256), summarized: 0, first_summarized: None,
             summarized_reasons: Vec::with_capacity(16), other_summarized_reasons: 0,
         }) }), worker))
@@ -199,7 +462,7 @@ impl RoventNnuecCollectionBridgeV2 {
         }
     }
 
-    fn defer_before_start(
+    pub(crate) fn defer_before_start(
         &self,
         port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
@@ -370,7 +633,11 @@ impl RoventNnuecCollectionHooksV2 for RoventNnuecCollectionBridgeV2 {
             }) {
             Ok(()) => Ok(RoventNnuecCollectionAdmissionOutcomeV2::Installed),
             Err(failure) if failure.game_gate_status == super::collection_hooks_core_v2::CoreGameGateStatus::Busy => {
-                Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission: failure.admission })
+                if failure.before_start {
+                    Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission: failure.admission })
+                } else {
+                    Ok(RoventNnuecCollectionAdmissionOutcomeV2::PendingUncertain { admission: failure.admission })
+                }
             }
             Err(failure) if failure.before_start => {
                 let _ = self.before_start_failure.set(failure.error.clone());
