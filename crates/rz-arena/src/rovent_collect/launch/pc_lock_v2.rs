@@ -419,8 +419,9 @@ impl RoventPcCollectionRunV2 {
         check(!self.publication_attempted, "P/C previous publication attempt requires explicit recovery")?;
         check(self.pump_thread_joined && self.pump_thread_failure.is_none()
             && matches!(self.worker_exit, Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement))
-            && self.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C handoff: {e:?}")))?
-            && self.closed_owner().is_ok(), "P/C original worker, native fence or teacher aggregate unavailable")?;
+            && self.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C handoff: {e:?}")))?,
+            "P/C original worker, native fence or teacher aggregate unavailable")?;
+        self.closed_owner()?;
         // The original observer may retire rows just before its root fence.
         // Recover them after the original worker joined, outside the native
         // manager; never synthesize a teacher result for those late rows.
@@ -555,8 +556,11 @@ impl RoventPcCollectionRunV2 {
         use crate::rovent_collect::pc_hooks_lock_v2::PcRootSeparationV2;
         check(!self.publication_attempted && self.supervisor.is_none() && self.supervisor_error.is_none(),
             "P/C game supervisor or prior publication remains unresolved")?;
-        check(self.pump_thread_joined && self.pump_thread_failure.is_none() && self.closed_owner().is_ok(),
+        check(self.pump_thread_joined && self.pump_thread_failure.is_none(),
             "P/C primary root worker or original handoff is unresolved")?;
+        // Keep handoff and resource admission failures distinct. Both remain
+        // prerequisites for actual publication; neither is inferred from the other.
+        self.closed_owner()?;
         let mut roots = vec![(Arc::clone(&self.bridge), Arc::clone(&self.worker), Arc::clone(&self.pump_consumer))];
         roots.try_reserve(self.secondary_slots.len()).map_err(|_| invalid("P/C game publisher slot allocation"))?;
         for slot in &self.secondary_slots {
@@ -991,7 +995,7 @@ impl RoventPcCollectionRunV2 {
             || (self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
                 && self.bridge.returned_handoff_settled().map_err(|error| invalid(format!("P/C returned handoff: {error:?}")))?);
         check(
-            fenced && self.native_failure.is_none() && !self.native_failure_taken && self.resource_error.is_none() && self
+            fenced && self.native_failure.is_none() && !self.native_failure_taken && self
                 .worker
                 .try_lock()
                 .is_ok_and(|worker| !worker.has_failure()),
@@ -1013,6 +1017,10 @@ impl RoventPcCollectionRunV2 {
                 && !status.callback_lock_failure,
             "Collection /2 native observer is not settled",
         )?;
+        check(self.resource_error.is_none(), &format!(
+            "Collection /2 resource readback unavailable: {}",
+            self.resource_error.as_deref().unwrap_or("unknown"),
+        ))?;
         Ok(self.owner.clone())
     }
 }
@@ -1361,26 +1369,6 @@ fn run_rovent_pc_collection_lock_v2_inner(
         resource_error: None,
     };
     if let Some(supervisor) = &run.supervisor { supervisor.request_stop(); }
-    if let Ok(mut resource) = run.resource.lock() {
-        if let Err(error) = resource.finish_live() {
-            run.resource_error = Some(error.to_string());
-        } else if run.native_failure.is_none() {
-            let validated = run
-                .original_lock
-                .lock()
-                .map_err(|_| invalid("Collection /2 original lock custody poisoned"))
-                .and_then(|lock| {
-                    lock.as_ref()
-                        .ok_or_else(|| invalid("Collection /2 original lock missing"))
-                        .and_then(|lock| resource.validate_success_v2(lock))
-                });
-            if let Err(error) = validated {
-                run.resource_error = Some(error.to_string());
-            }
-        }
-    } else {
-        run.resource_error = Some("Collection /2 resource custody poisoned".into());
-    }
     while !run.poll_worker() && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1418,6 +1406,23 @@ fn run_rovent_pc_collection_lock_v2_inner(
                 Err(error) => run.supervisor_error = Some(error),
             }
         }
+    }
+    // Observe the live original scope after the existing bounded join attempts.
+    // If any worker is still unresolved its custody remains intact, and the
+    // resource snapshot is only the actual live state, not a physical fence.
+    if let Ok(mut resource) = run.resource.lock() {
+        if let Err(error) = resource.finish_live() {
+            run.resource_error = Some(error.to_string());
+        } else if run.native_failure.is_none() {
+            let validated = run.original_lock.lock()
+                .map_err(|_| invalid("Collection /2 original lock custody poisoned"))
+                .and_then(|lock| lock.as_ref()
+                    .ok_or_else(|| invalid("Collection /2 original lock missing"))
+                    .and_then(|lock| resource.validate_success_v2(lock)));
+            if let Err(error) = validated { run.resource_error = Some(error.to_string()); }
+        }
+    } else {
+        run.resource_error = Some("Collection /2 resource custody poisoned".into());
     }
     Ok(run)
 }
