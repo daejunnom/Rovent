@@ -185,16 +185,25 @@ impl RoventCollectionOwnerLockV2 {
         manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
         metadata: RoventCollectionMetadata,
     ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
-        Self::new_shared_with_record_limit(manifest, metadata, rz_experiments::rovent_corpus::MAX_CORPUS_ROWS as u64)
+        Self::new_shared_with_capacity(manifest, metadata,
+            rz_experiments::rovent_corpus::MAX_CORPUS_ROWS as u64, CAPACITY)
     }
 
-    /// The bounded value is owned once by the game Collection owner and is
-    /// shared by all of its root observers. Existing callers keep the legacy
-    /// corpus maximum through `new_shared`.
+    /// An explicitly registered game limit may also admit a larger finite
+    /// outbox. Existing unprofiled `new_shared` callers retain 16 slots.
     pub fn new_shared_with_record_limit(
         manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
         metadata: RoventCollectionMetadata,
         maximum_records: u64,
+    ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
+        Self::new_shared_with_capacity(manifest, metadata, maximum_records, MAX_RETIRED_OUTBOX_CAPACITY)
+    }
+
+    fn new_shared_with_capacity(
+        manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
+        metadata: RoventCollectionMetadata,
+        maximum_records: u64,
+        outbox_ceiling: usize,
     ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
         let game_record_limit = usize::try_from(maximum_records)
             .map_err(|_| invalid("lock-v2 game record limit exceeds platform capacity"))?;
@@ -214,7 +223,7 @@ impl RoventCollectionOwnerLockV2 {
         let registration_for_owner = registration.clone();
         // This is a finite custody allowance, not a claim about host memory
         // usage. It cannot exceed the user's registered game record quota.
-        let retired_outbox_capacity = game_record_limit.min(MAX_RETIRED_OUTBOX_CAPACITY);
+        let retired_outbox_capacity = game_record_limit.min(outbox_ceiling);
         let (retired_sender, retired_receiver) = mpsc::sync_channel(retired_outbox_capacity);
         let retired_queued = Arc::new(AtomicUsize::new(0));
         Ok((
