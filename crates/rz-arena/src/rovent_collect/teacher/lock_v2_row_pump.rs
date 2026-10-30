@@ -297,6 +297,15 @@ impl RetiredRowPumpV2 {
         self.entries.len()
     }
 
+    /// Observe transitions of the same original front item without moving it.
+    pub(crate) fn front_pending(&self) -> bool {
+        self.entries.front().is_some_and(|entry| matches!(entry.stage, Stage::Pending { .. }))
+    }
+
+    pub(crate) fn front_completed(&self) -> bool {
+        self.entries.front().is_some_and(|entry| matches!(entry.stage, Stage::Completed(_)))
+    }
+
     pub(crate) fn stage_counts(&self) -> PumpStageCountsV2 {
         let mut counts = PumpStageCountsV2::default();
         for entry in &self.entries {

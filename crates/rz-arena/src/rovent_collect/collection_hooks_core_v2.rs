@@ -997,9 +997,23 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         // does not linearize a simultaneous revoke against mailbox admission.
         let allow_submission = !self.revoked.load(Ordering::Acquire)
             && !self.shutdown_requested && self.failure.is_none();
+        let pending_before = pump.front_pending();
         if let Err(error) = pump.poll(session, allow_submission) {
             self.pump_failed = true;
             self.record_failure(WorkerFailure::RowPump(error));
+            return;
+        }
+        // If this exact poll collected a terminal, attempt its seal before
+        // the worker's shutdown step in the same tick. The original session
+        // rechecks authority and deadline; no new job is admitted here. A
+        // busy seal remains retained for a later tick and is not spun on.
+        if pending_before && pump.front_completed()
+            && !self.revoked.load(Ordering::Acquire)
+            && !self.shutdown_requested && self.failure.is_none() {
+            if let Err(error) = pump.poll(session, false) {
+                self.pump_failed = true;
+                self.record_failure(WorkerFailure::RowPump(error));
+            }
         }
     }
 
