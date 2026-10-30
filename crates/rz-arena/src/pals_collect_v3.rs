@@ -54,6 +54,10 @@ mod game_process;
 #[cfg(feature = "pals-collection-onnx")]
 pub use game_process::*;
 #[cfg(feature = "pals-collection-onnx")]
+mod diagnostic_game;
+#[cfg(feature = "pals-collection-onnx")]
+pub use diagnostic_game::*;
+#[cfg(feature = "pals-collection-onnx")]
 mod generation_series;
 #[cfg(feature = "pals-collection-onnx")]
 pub use generation_series::*;

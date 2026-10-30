@@ -54,6 +54,11 @@ path = "src/bin/pals-action-outcomes.rs"
 required-features = ["pals-collection-onnx"]
 
 [[bin]]
+name = "rz-pals-action-diagnostic"
+path = "src/bin/pals-action-diagnostic.rs"
+required-features = ["pals-collection-onnx"]
+
+[[bin]]
 name = "rz-pals-generation-pipeline"
 path = "src/bin/pals-generation-pipeline.rs"
 required-features = ["pals-collection-onnx"]
