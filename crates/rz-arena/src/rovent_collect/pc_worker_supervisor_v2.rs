@@ -239,6 +239,13 @@ fn supervisor_step(
             return Err(invalid("P/C prepared worker previous original root changed"));
         }
     } else {
+        // Do not contend with the live root's observer for the shared owner.
+        // Only inspect its budget after the original worker and handoff have
+        // settled; the game gate still prevents a later root installation.
+        if !previous.returned_handoff_settled()
+            .map_err(|error| invalid(format!("P/C previous handoff: {error:?}")))? {
+            return Ok(());
+        }
         let Some(status) = owner.try_status()? else { return Ok(()); };
         if status.game_record_limit != maximum_records {
             return Err(invalid("P/C supervisor and original owner record limits differ"));

@@ -59,6 +59,36 @@ impl OwnPumpConsumerV2 {
         Ok(Some((state.items.len(), state.failed_items.len(), state.teacher_evidence.len(), state.disconnected)))
     }
 
+    /// Copy diagnostic record projections without consuming the original rows,
+    /// teacher evidence or failure objects. The projection cannot restore
+    /// their in-process authority. Receiver contents must first be drained by
+    /// the caller after the sender stops.
+    pub(crate) fn try_snapshot_retained_rows(
+        &self, maximum_bytes: usize,
+    ) -> Result<Option<Vec<(&'static str, Vec<u8>)>>, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Own publisher custody poisoned".into())),
+        };
+        let mut projections = Vec::new();
+        let mut total = 0usize;
+        for item in state.items.iter().chain(state.failed_items.iter()).chain(state.overflow_item.iter()) {
+            let (stage, row) = match item {
+                PumpItemV2::Unlabeled { row } => ("unlabeled", row),
+                PumpItemV2::Prepared { row, .. } => ("prepared", row),
+                PumpItemV2::Committed { row, .. } => ("committed", row),
+                PumpItemV2::Failed { row, .. } => ("failed", row),
+            };
+            let bytes = serde_json::to_vec(&row.record).map_err(|error| ArenaError::Invalid(error.to_string()))?;
+            total = total.checked_add(bytes.len()).ok_or_else(|| ArenaError::Invalid("consumer projection size overflow".into()))?;
+            if total > maximum_bytes { return Err(ArenaError::Invalid("consumer projections exceed report capacity".into())); }
+            projections.try_reserve(1).map_err(|_| ArenaError::Invalid("consumer projection allocation".into()))?;
+            projections.push((stage, bytes));
+        }
+        Ok(Some(projections))
+    }
+
     /// This is only a custody check; the caller still verifies both worker
     /// joins, a final channel drain, the root fence and teacher aggregate.
     pub(super) fn try_has_failures(&self) -> Result<Option<bool>, ArenaError> {

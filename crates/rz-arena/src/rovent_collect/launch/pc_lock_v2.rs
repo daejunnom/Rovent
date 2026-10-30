@@ -64,8 +64,12 @@ impl RoventPcCollectionRunV2 {
         &self,
         consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
         sender_stopped: bool,
+        slot_index: usize,
+        raw: &mut Vec<(String, Vec<u8>)>,
+        record_bytes: &mut usize,
     ) -> (serde_json::Value, bool) {
         use super::own_publisher_v2::OwnPumpPollV2;
+        use sha2::{Digest as _, Sha256};
         if !sender_stopped { return (json!({"status":"sender_not_joined"}), false); }
         let mut drained = false;
         let mut problem = None;
@@ -87,11 +91,26 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => return (json!({"status":"busy", "receiver_drained":drained}), false),
             Err(error) => return (json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}), false),
         };
-        let complete = drained && problem.is_none() && counts.0 == 0 && counts.1 == 0 && !failures;
+        let (projections, projected) = match consumer.try_snapshot_retained_rows(4 * 1024 * 1024 - *record_bytes) {
+            Ok(Some(rows)) => {
+                let mut entries = Vec::new();
+                for (index, (stage, bytes)) in rows.into_iter().enumerate() {
+                    *record_bytes += bytes.len();
+                    let name = format!("root-{slot_index}-consumer-{index}.json");
+                    entries.push(json!({"path":&name, "stage":stage, "bytes":bytes.len(),
+                        "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
+                    raw.push((name, bytes));
+                }
+                (json!({"status":"observed", "rows":entries}), true)
+            },
+            Ok(None) => (json!({"status":"busy"}), false),
+            Err(error) => (json!({"status":"error", "detail":error.to_string()}), false),
+        };
+        let complete = drained && problem.is_none() && counts.0 == 0 && counts.1 == 0 && !failures && projected;
         (json!({"status":if complete { "drained_empty" } else { "retained_or_unknown" },
             "receiver_drained":drained, "items":counts.0, "failed_items":counts.1,
             "teacher_evidence":counts.2, "disconnected":counts.3,
-            "failure_or_overflow":failures, "detail":problem}), complete)
+            "failure_or_overflow":failures, "detail":problem, "record_projections":projections}), complete)
     }
     /// Write serializable failure observations and original recovered teacher
     /// byte streams without consuming their owners. A partial write is left
@@ -191,6 +210,7 @@ impl RoventPcCollectionRunV2 {
         }
         let (primary_consumer, primary_consumer_complete) = self.failure_consumer_observation(
             &self.pump_consumer, self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked,
+            0, &mut raw, &mut late_bytes,
         );
         complete &= primary_consumer_complete;
         match self.bridge.try_revoke_observations() {
@@ -247,7 +267,7 @@ impl RoventPcCollectionRunV2 {
                 Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
             };
             let (consumer, consumer_complete) = self.failure_consumer_observation(&slot.consumer,
-                slot.worker_join_observed && slot.consumer_drained_after_join);
+                slot.worker_join_observed && slot.consumer_drained_after_join, slot_index, &mut raw, &mut late_bytes);
             complete &= consumer_complete;
             let deferred = match bridge.try_deferred_observation() {
                 Ok(Some(value)) => json!({"status":"observed","detail":value}),
@@ -307,6 +327,7 @@ impl RoventPcCollectionRunV2 {
         if publication_failure_truncated { complete = false; }
         let mut evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
             "raw_files_complete_only_when_receipt_exists":true,
+            "observation_complete":complete,
             "publication_failure":publication_failure.map(|s| s.chars().take(4096).collect::<String>()),
             "publication_failure_original_chars":publication_failure_chars,
             "publication_failure_truncated":publication_failure_truncated,
@@ -319,6 +340,7 @@ impl RoventPcCollectionRunV2 {
             raw.clear();
             complete = false;
             evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
+                "observation_complete":false,
                 "status":"metadata_over_limit", "worker_exit":self.worker_exit.map(PcWorkerExitKindV2::label),
                 "worker_thread_panicked":self.worker_thread_panicked,
                 "physical_completion":"not_recorded",
