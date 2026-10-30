@@ -104,6 +104,14 @@ impl RoventNnuecCollectionRunV2 {
         for slot in &self.secondary_slots {
             check(matches!(slot.bridge.try_has_deferred_observations()?, Some(false)),
                 "Own game secondary deferred collection retained")?;
+            check(slot.bridge.first_pending_event().is_none()
+                && slot.bridge.sealed_pending_event().is_none()
+                && slot.bridge.before_start_failure().is_none(),
+                "Own game secondary pending or failed admission retained")?;
+            let pending = slot.bridge.try_pending_stopped_observation()?
+                .ok_or_else(|| invalid("Own secondary pending observation busy"))?;
+            check(pending.first.is_none() && pending.summarized == 0 && pending.other == 0,
+                "Own game secondary pending observations retained")?;
             if slot.bridge.installed_admission_for_recovery().is_none() {
                 let unstarted = (slot.worker_join_observed && slot.consumer_drained_after_join
                     && slot.worker_exit_kind == Some(OwnWorkerExitKindV2::NoAdmission))
