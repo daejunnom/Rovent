@@ -1016,7 +1016,7 @@ fn run_worker(
                         timing: timing.clone(),
                         progress_sequence: progress_sequence.clone(),
                     };
-                    checker.cooperative_opinions.clear();
+                    checker.clear_cooperative_opinions();
                     checker.stop_control = None;
                     let limits = CpuLimits {
                         max_depth: job.constraint.requested_depth().unwrap_or(0),
@@ -1051,6 +1051,7 @@ fn run_worker(
                     else {
                         return Err(error("teacher_analysis", "foreign_report_type"));
                     };
+                    checker.select_completed_exact_policy(&raw, multipv);
                     checker
                         .cooperative_opinions
                         .sort_by_key(|opinion| opinion.rank);

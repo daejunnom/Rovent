@@ -560,6 +560,10 @@ pub struct ExternalUciCpuChecker {
     failed_output: Option<(Vec<u8>, Vec<u8>)>,
     advertised_options: BTreeMap<String, OptionKind>,
     cooperative_opinions: Vec<ExternalPolicyOpinion>,
+    // Keep only actual exact info tuples. A later aspiration bound must not
+    // erase the last complete MultiPV iteration.
+    cooperative_exact_candidates: Vec<ExternalPolicyOpinion>,
+    cooperative_exact_completed: Vec<ExternalPolicyOpinion>,
     stop_control: Option<ExternalControlObservation>,
     go_issue: ExternalGoIssue,
     startup_multipv: Option<u16>,
@@ -640,6 +644,8 @@ impl ExternalUciCpuChecker {
             failed_output: None,
             advertised_options: BTreeMap::new(),
             cooperative_opinions: Vec::new(),
+            cooperative_exact_candidates: Vec::new(),
+            cooperative_exact_completed: Vec::new(),
             stop_control: None,
             go_issue: ExternalGoIssue::NotIssued,
             startup_multipv: None,
@@ -1050,7 +1056,7 @@ impl ExternalUciCpuChecker {
         }
         // Policy limits are requested foreign work, never CpuJob native credits.
         limits.max_nodes = policy.requested_reported_nodes;
-        self.cooperative_opinions.clear();
+        self.clear_cooperative_opinions();
         self.stop_control = None;
         self.go_issue = ExternalGoIssue::NotIssued;
         let CheckerReport::ExternalUci(report) = self.run_with_control(
@@ -1068,6 +1074,7 @@ impl ExternalUciCpuChecker {
         else {
             return Err(error("analysis", "foreign_report_type"));
         };
+        self.select_completed_exact_policy(&report, policy.multipv);
         self.cooperative_opinions
             .sort_by_key(|opinion| opinion.rank);
         let policy_target_known = report.completion == ExternalCompletion::BestMove
@@ -1450,6 +1457,9 @@ impl ExternalUciCpuChecker {
                                 control.publish_progress(&opinion, report.work.nodes);
                             }
                         }
+                        if let Some((_, policy)) = cooperative {
+                            self.observe_exact_policy_iteration(&opinion, policy.multipv);
+                        }
                         if let Some(prior) = self
                             .cooperative_opinions
                             .iter_mut()
@@ -1549,6 +1559,47 @@ impl ExternalUciCpuChecker {
             } else if matches!(line.as_str(), "uciok" | "readyok") {
                 return Err(error("analysis", "unexpected_barrier_response"));
             }
+        }
+    }
+
+    /// Begin a new physical query without reusing a previous query's data.
+    fn clear_cooperative_opinions(&mut self) {
+        self.cooperative_opinions.clear();
+        self.cooperative_exact_candidates.clear();
+        self.cooperative_exact_completed.clear();
+    }
+
+    /// Record exact, legal tuples as reported; a bounded or incomplete next
+    /// depth never replaces the most recent complete equal-depth set.
+    fn observe_exact_policy_iteration(&mut self, opinion: &ExternalPolicyOpinion, width: u16) {
+        if opinion.bound != ExternalBound::ExactReported || opinion.pv.is_empty()
+            || opinion.rank == 0 || opinion.rank > width { return; }
+        match self.cooperative_exact_candidates.iter_mut().find(|item| item.rank == opinion.rank) {
+            Some(prior) if prior.depth <= opinion.depth => *prior = opinion.clone(),
+            Some(_) => return,
+            None => self.cooperative_exact_candidates.push(opinion.clone()),
+        }
+        if self.cooperative_exact_candidates.len() != usize::from(width) { return; }
+        self.cooperative_exact_candidates.sort_by_key(|item| item.rank);
+        let depth = self.cooperative_exact_candidates[0].depth;
+        if self.cooperative_exact_candidates.iter().enumerate().all(|(index, item)|
+            item.rank == index as u16 + 1 && item.depth == depth
+                && !self.cooperative_exact_candidates[..index].iter().any(|prior| prior.pv.first() == item.pv.first()))
+            && self.cooperative_exact_completed.first().is_none_or(|old| old.depth < depth)
+        {
+            self.cooperative_exact_completed.clone_from(&self.cooperative_exact_candidates);
+        }
+    }
+
+    /// Use a completed iteration only after the same query naturally returned
+    /// bestmove and readiness, and only when its first move agrees. Never turn
+    /// a stopped/cancelled execution into a completed policy observation.
+    fn select_completed_exact_policy(&mut self, report: &ExternalCheckerReport, width: u16) {
+        if report.completion == ExternalCompletion::BestMove
+            && self.cooperative_exact_completed.len() == usize::from(width)
+            && self.cooperative_exact_completed.first().and_then(|item| item.pv.first()).copied() == report.best_move
+        {
+            self.cooperative_opinions.clone_from(&self.cooperative_exact_completed);
         }
     }
 
@@ -2771,7 +2822,7 @@ mod tests {
                     println!("info depth {depth} nodes {nodes} score cp NaN pv {best}");
                 } else {
                     println!("info depth {depth} seldepth 12 nodes {nodes} score cp 21 pv {best}");
-                    if mode == 6 || mode == 7 {
+                    if matches!(mode, 6 | 7 | 8 | 9) {
                         let legal = position.legal_moves();
                         for rank in 2..=multipv {
                             let other = legal
@@ -2785,9 +2836,16 @@ mod tests {
                             );
                         }
                     }
+                    if matches!(mode, 8 | 9) {
+                        let next_depth = depth.parse::<u16>().unwrap() + 1;
+                        println!("info depth {next_depth} multipv 1 nodes {nodes} score cp 32 lowerbound pv {best}");
+                    }
                 }
                 if mode == 4 || mode == 5 {
                     pending_best = Some(best);
+                } else if mode == 9 {
+                    let other = position.legal_moves().into_iter().find(|mv| *mv != best).unwrap();
+                    println!("bestmove {other}");
                 } else {
                     println!("bestmove {best}");
                 }
@@ -2866,6 +2924,18 @@ mod tests {
         if fixture_mode("external_cpu::tests::fake_uci_mixed_multipv") {
             fixture_loop(7);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_final_bound() {
+        if fixture_mode("external_cpu::tests::fake_uci_final_bound") { fixture_loop(8); }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_final_bound_changed_best() {
+        if fixture_mode("external_cpu::tests::fake_uci_final_bound_changed_best") { fixture_loop(9); }
     }
 
     #[cfg(target_os = "linux")]
@@ -3092,6 +3162,39 @@ mod tests {
                 .unwrap()
                 .cleanup_complete
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_exact_iteration_survives_final_bound_without_fabricating_completion() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        for (name, width, expected) in [
+            ("fake_uci_final_bound", 1, true),
+            ("fake_uci_final_bound", 4, true),
+            ("fake_uci_final_bound_changed_best", 1, false),
+            ("fake_uci_final_bound_changed_best", 4, false),
+            ("fake_uci_mixed_multipv", 4, false),
+            ("fake_uci_waits_for_stop", 1, false),
+        ] {
+            let mut checker = cooperative_fixture(name);
+            let control = FixtureControl(rz_runtime::adaptive::ControlMailbox::new(
+                1, rz_runtime::CompletionSignal::default()));
+            let report = checker.analyze_cooperative(
+                &Position::startpos(), None,
+                CpuLimits { max_depth: 8, max_nodes: 100, deadline: Some(Instant::now() + Duration::from_secs(2)) },
+                &AtomicBool::new(false), &control,
+                ExternalSlicePolicy { multipv: width, ..ExternalSlicePolicy::default() },
+            ).unwrap();
+            assert_eq!(report.policy_target_known, expected, "{name} width={width}");
+            if name == "fake_uci_final_bound" {
+                assert_eq!(report.report.bound, ExternalBound::Lower);
+                assert!(report.opinions.iter().all(|opinion| opinion.bound == ExternalBound::ExactReported && opinion.depth == 8));
+            }
+            if name == "fake_uci_waits_for_stop" {
+                assert_ne!(report.report.completion, ExternalCompletion::BestMove);
+            }
+            checker.shutdown(Instant::now() + Duration::from_secs(2)).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
