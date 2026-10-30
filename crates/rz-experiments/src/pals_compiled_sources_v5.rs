@@ -573,6 +573,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/rovent_bootstrap/configuration/v4.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/external_session.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch.rs"),
+            source!("crates/rz-uci/src/rovent_bootstrap/launch/selected_view_observation.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch/cohort_prepare.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch/collection.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch/collection_v2_observer.rs"),
@@ -734,6 +735,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/rovent_bootstrap/configuration/v4.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/external_session.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch.rs"),
+            source!("crates/rz-uci/src/rovent_bootstrap/launch/selected_view_observation.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch/cohort_prepare.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch/collection.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/launch/collection_v2_observer.rs"),
@@ -1918,6 +1920,28 @@ mod tests {
         let mut declared = compiled_source_components_v5().unwrap();
         declared.insert("unregistered".into(), "a".repeat(64));
         assert!(verify_compiled_source_components_v5(&declared).is_err());
+    }
+    #[test]
+    fn selected_view_observer_bytes_are_pinned_by_both_consumers() {
+        let inventory = compiled_source_inventory_v5().unwrap();
+        let path = "crates/rz-uci/src/rovent_bootstrap/launch/selected_view_observation.rs";
+        let bytes = include_bytes!("../../rz-uci/src/rovent_bootstrap/launch/selected_view_observation.rs");
+        let actual: [u8; 32] = Sha256::digest(bytes).into();
+        let mut changed_bytes = bytes.to_vec();
+        changed_bytes.push(0);
+        let changed: [u8; 32] = Sha256::digest(&changed_bytes).into();
+        for component in ["uci", "model_native"] {
+            let rows = &inventory[component];
+            let item = rows.iter().find(|row| row.0 == path).unwrap();
+            assert_eq!(item.1, bytes.len() as u64);
+            assert_eq!(item.2, actual);
+            let baseline = source_component_digest_v5(rows).unwrap();
+            let mut edited = rows.clone();
+            let item = edited.iter_mut().find(|row| row.0 == path).unwrap();
+            item.1 = changed_bytes.len() as u64;
+            item.2 = changed;
+            assert_ne!(source_component_digest_v5(&edited).unwrap(), baseline);
+        }
     }
     #[test]
     fn inventories_cover_required_components_and_unique_safe_paths() {

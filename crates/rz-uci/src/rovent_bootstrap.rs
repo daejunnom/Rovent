@@ -1201,9 +1201,20 @@ fn admitted_native_topology_fields(
 }
 
 pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
+    bootstrap_source_digest(BOOTSTRAP_SOURCES)
+}
+
+fn bootstrap_source_digest(sources: &[&str]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"rz-rovent-native-bootstrap-source/1\0");
-    for source in [
+    for source in sources {
+        hash.update((source.len() as u64).to_le_bytes());
+        hash.update(source.as_bytes());
+    }
+    hash.finalize().into()
+}
+
+const BOOTSTRAP_SOURCES: &[&str] = &[
         include_str!("rovent_bootstrap.rs"),
         include_str!("rovent_bootstrap/pinned.rs"),
         include_str!("rovent_bootstrap/configuration.rs"),
@@ -1226,6 +1237,7 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap/storage_lifecycle.rs"),
         include_str!("rovent_bootstrap/storage_lifecycle/observation.rs"),
         include_str!("rovent_bootstrap/launch.rs"),
+        include_str!("rovent_bootstrap/launch/selected_view_observation.rs"),
         include_str!("rovent_bootstrap/launch/collection.rs"),
         include_str!("rovent_bootstrap/launch/collection_v2_observer.rs"),
         include_str!("rovent_bootstrap/launch/evidence.rs"),
@@ -1243,11 +1255,15 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap/pinned/nnuec.rs"),
         include_str!("rovent_bootstrap/pinned/collection.rs"),
         include_str!("pals_adaptive_bootstrap/runtime_assets.rs"),
-    ] {
-        hash.update((source.len() as u64).to_le_bytes());
-        hash.update(source.as_bytes());
-    }
-    hash.finalize().into()
+    ];
+
+#[cfg(test)]
+#[test]
+fn bootstrap_source_identity_covers_selected_view_observer() {
+    let source = include_str!("rovent_bootstrap/launch/selected_view_observation.rs");
+    assert_eq!(BOOTSTRAP_SOURCES.iter().filter(|s| **s == source).count(), 1);
+    let without: Vec<_> = BOOTSTRAP_SOURCES.iter().copied().filter(|s| *s != source).collect();
+    assert_ne!(compiled_bootstrap_source_digest(), bootstrap_source_digest(&without));
 }
 pub(crate) fn fail(kind: K, message: &'static str) -> BackendError {
     BackendError::new(kind, S::Admission, message)
