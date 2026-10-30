@@ -140,6 +140,10 @@ impl OwnPumpConsumerV2 {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Own publisher custody poisoned".into())),
         };
+        // A drained queue requires no new evidence or failure custody. This
+        // remains a valid terminal observation even when the last row filled
+        // the configured record capacity exactly.
+        if state.items.is_empty() { return Ok(OwnOfferOutcomeV2::Pending); }
         if state.teacher_evidence.len() >= state.maximum { return Err(ArenaError::Invalid("Own teacher evidence capacity reached".into())); }
         if state.commit_failures.len() >= state.maximum { return Err(ArenaError::Invalid("Own teacher commit failure capacity reached".into())); }
         state.commit_failures.try_reserve(1).map_err(|_| ArenaError::Invalid("Own teacher commit failure capacity".into()))?;
