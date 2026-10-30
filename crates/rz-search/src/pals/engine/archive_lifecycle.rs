@@ -2987,6 +2987,83 @@ mod tests {
     }
 
     #[test]
+    fn cold_loaded_review_rebases_against_the_same_actual_game_history() {
+        use crate::pals::review_context::{
+            ReviewContextIndex, ReviewIndexLimits, ReviewQuerySequences, ReviewSelectionPolicy,
+        };
+
+        let mut engine = engine()
+            .with_selected_review_context(
+                ReviewSelectionPolicy::default(),
+                ReviewIndexLimits::default(),
+            )
+            .unwrap();
+        engine.enable_archive(archive_config("review-rebase")).unwrap();
+        let start = Position::startpos();
+        engine.search(&start, limits(), &AtomicBool::new(false)).unwrap();
+        let old_root = engine.semantic.stores.root().unwrap();
+        let old_state = engine.semantic.stores.situations.get(old_root).unwrap().state;
+        let old_node = engine.semantic.nodes.iter()
+            .find(|node| node.state == old_state).unwrap();
+        let first = old_node.edges.first().unwrap().movement;
+        let mut current = start.clone();
+        current.make_move(first).unwrap();
+        let reply = current.legal_moves()[0];
+        engine.semantic.revision += 1;
+        let revision = engine.semantic.revision;
+        let record = RoleRecord {
+            revision,
+            parent_revision: None,
+            supersedes_revision: None,
+            origin_state: old_state,
+            kind: RecordKind::Proposal,
+            line: vec![first, reply],
+            value: None,
+            completed_depth: 0,
+            score_scope: None,
+            cpu_observation: None,
+            perspective: start.side_to_move(),
+            critical: false,
+        };
+        // Model an evicted bounded review projection while preserving the
+        // original raw record for the real archive writer.
+        engine.semantic.review_index = Some(ReviewContextIndex::new(ReviewIndexLimits {
+            active_bundles: 1,
+            records_per_bundle: 64,
+        }).unwrap());
+        engine.semantic.review_index.as_mut().unwrap()
+            .publish(&engine.semantic.stores, &record, None).unwrap();
+        assert_eq!(engine.semantic.review_index.as_mut().unwrap().compact(), 1);
+        engine.semantic.review_index = Some(ReviewContextIndex::new(ReviewIndexLimits::default()).unwrap());
+        engine.semantic.records.push(record);
+        fill_hot(&mut engine);
+        engine.search(&current, limits(), &AtomicBool::new(false)).unwrap();
+        assert!(matches!(engine.semantic.stores.states.get(old_state), Err(StoreError::ColdRecord(_))));
+        engine.load_archived_root(&start, ArchiveIoBudget {
+            deadline: Instant::now() + Duration::from_secs(20),
+            max_bytes: SEARCH_ARCHIVE_IO_BYTES,
+        }).unwrap();
+        let index = engine.semantic.review_index.as_mut().unwrap();
+        let bundle = index.bundle_for_revision(revision).unwrap();
+        let root = engine.semantic.stores.root().unwrap();
+        let current_state = engine.semantic.stores.situations.get(root).unwrap().state;
+        assert!(engine.semantic.stores.states.get(current_state).unwrap().same_state(&current.snapshot()));
+        let view = index.select(&engine.semantic.stores, current_state, ReviewQuerySequences {
+            purpose: RoleQueryPurpose::ValueFresh,
+            prefix: &[], proposal: &[], counterexample: None, legal: &[], divergences: &[],
+        }, ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            ..ReviewSelectionPolicy::default()
+        }).unwrap();
+        let selected = view.records_metadata().iter()
+            .position(|metadata| metadata.source_revision == revision).unwrap();
+        assert_eq!(view.records()[selected].line, vec![reply]);
+        assert_eq!(view.records_metadata()[selected].source_line_offset, 1);
+        assert_eq!(view.records_metadata()[selected].original_first_move, Some(first));
+        assert!(view.anchors()[0].snapshot.same_state(&current.snapshot()));
+    }
+
+    #[test]
     fn actual_model_wdl_archive_restores_raw_context_revision_and_rejects_substitution() {
         let previous = engine();
         let mut engine = PalsEngine::new_with_boxed_checker_and_policies(
