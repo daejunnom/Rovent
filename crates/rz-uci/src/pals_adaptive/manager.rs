@@ -1898,6 +1898,10 @@ struct RoleBinding<Q, O> {
     dispatch_pending: bool,
     collection_registered: bool,
     rovent_collection_registered: bool,
+    /// The V2 observer may own this ticket's original capture or a staged
+    /// reservation. Disabled-only tickets must not consume capture custody.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    v2_capture_possible: bool,
     physical: Option<TicketExecutionEvidence>,
     prepared_at: Instant,
     preparation_elapsed: Option<Duration>,
@@ -3849,6 +3853,8 @@ where
             dispatch_pending: false,
             collection_registered: false,
             rovent_collection_registered: false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            v2_capture_possible: false,
             physical: None,
             prepared_at: Instant::now(),
             preparation_elapsed: None,
@@ -5397,7 +5403,7 @@ where
                 self.driver.discard_rovent_goal_input(original)?;
             }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            if !consumed {
+            if !consumed && self.roles[index].v2_capture_possible {
                 let result = self.collection_observer_v2.as_mut().map(|observer| observer.abandoned(&ticket));
                 if let Some(Err(error)) = result {
                     // Keep the same ticket even when observer cleanup fails;
@@ -5708,6 +5714,8 @@ where
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 let mut boundary_busy = false;
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let mut v2_capture_possible = self.roles[index].v2_capture_possible;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 let result = result.and_then(|()| {
                     match &mut self.collection_observer_v2 {
                         Some(observer) => {
@@ -5762,13 +5770,21 @@ where
                                 return Ok(());
                             }
                             match observer.dispatch(witness, &self.roles[index].input) {
-                                Ok(collection::AdaptiveCollectionDispatchV2::Captured) => {}
-                                Ok(collection::AdaptiveCollectionDispatchV2::Busy) => boundary_busy = true,
+                                Ok(collection::AdaptiveCollectionDispatchV2::Captured) => {
+                                    v2_capture_possible = true;
+                                }
+                                Ok(collection::AdaptiveCollectionDispatchV2::Busy) => {
+                                    // Busy can retain an original staged reservation.
+                                    v2_capture_possible = true;
+                                    boundary_busy = true;
+                                }
                                 Ok(collection::AdaptiveCollectionDispatchV2::DisabledBackpressure) => {
                                     self.collection_v2_disabled = true;
                                     self.collection_v2_disabled_first_ticket = Some(ticket);
                                 }
                                 Err(original) => {
+                                    // An error may retain a partial staged owner.
+                                    v2_capture_possible = true;
                                     self.collection_v2_first_failure = Some(original.clone());
                                     collection_errors.push(original.clone());
                                     let witness = match collection::RoventCollectionDispatchWitnessV2::try_new(
@@ -5803,6 +5819,7 @@ where
                 });
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 {
+                    self.roles[index].v2_capture_possible = v2_capture_possible;
                     if result.is_err() && self.collection_observer_v2.is_some() {
                         self.collection_v2_disable_failed = true;
                     }
