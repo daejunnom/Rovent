@@ -11,7 +11,7 @@ use super::{ArenaError, RoventCollectionOwnerLockV2, check, invalid};
 use rz_search::external_cpu::ExternalGoConstraint;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::pals_adaptive::{
-    AdaptiveManagerError, RoventCollectionRootAdmissionV2, RoventTeacherScopePhysicalAckV2,
+    AdaptiveCollectionError, AdaptiveCollectionStage, AdaptiveManagerError, RoventCollectionRootAdmissionV2, RoventTeacherScopePhysicalAckV2,
     RoventTeacherScopeWorkerAckV2,
 };
 use rz_uci::rovent_bootstrap::RoventStartupControl;
@@ -168,6 +168,15 @@ impl<H> Drop for RoventCollectionCommitGateV2<'_, H> {
 }
 
 impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
+    /// Check the actual bridge/worker pair created by `new`; no copied
+    /// metadata or identity digest can reconstruct this association.
+    pub(crate) fn matches_original_worker(&self, worker: &CollectionWorkerCoreV2<H>) -> bool {
+        self.owner.same_original_owner(&worker.owner)
+            && Arc::ptr_eq(&self.admission_phase, &worker.admission_phase)
+            && Arc::ptr_eq(&self.revoked, &worker.revoked)
+            && Arc::ptr_eq(&self.failed, &worker.failed)
+            && Arc::ptr_eq(&self.startup, &worker.startup)
+    }
     /// Called only by this admission before invoking the install callback.
     /// A competing cancellation never becomes proof of an unstarted root.
     fn close_reserved_before_install(&self) {
