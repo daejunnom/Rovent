@@ -386,6 +386,7 @@ mod v2_cli_tests {
         let result = parse_lock_v2(arguments()).unwrap().unwrap();
         assert_eq!(result.mode, "pc");
         assert_eq!(result.original, ["--process-epoch=1"]);
+        assert!(result.sealed_teacher_slots.is_empty());
         let mut mixed = arguments();
         mixed.push("--collection-plan=inputs/old.json".into());
         assert!(parse_lock_v2(mixed).is_err());
@@ -400,6 +401,18 @@ mod v2_cli_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn sealed_teacher_selection_is_explicit_and_keeps_native_arguments() {
+        let mut input = arguments();
+        input.push("--v2-sealed-teacher-slots=2,0,2".into());
+        let result = parse_lock_v2(input).unwrap().unwrap();
+        assert_eq!(result.sealed_teacher_slots, [0, 2]);
+        assert_eq!(result.original, ["--process-epoch=1"]);
+        let mut invalid = arguments();
+        invalid.push("--v2-sealed-teacher-slots=0,no".into());
+        assert!(parse_lock_v2(invalid).is_err());
     }
 
     #[test]
