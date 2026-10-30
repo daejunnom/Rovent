@@ -384,8 +384,12 @@ fn validate_completed_teacher_opinions(
         "teacher conditional policy target: binary identity mismatch")?;
     check(raw.identity.options == pin.options,
         "teacher conditional policy target: options mismatch")?;
-    check(outcome.conditional_policy_target_known,
-        "teacher conditional policy target: completed opinions unknown")?;
+    if !outcome.conditional_policy_target_known {
+        return Err(invalid(format!(
+            "teacher conditional policy target: completed opinions unknown (completion={:?}, requested_multipv={}, observed_opinions={})",
+            raw.completion, outcome.requested_multipv, outcome.opinions.len(),
+        )));
+    }
     check(r.readiness_barrier_completed,
         "teacher conditional policy target: readiness barrier incomplete")?;
     check(!outcome.opinions.is_empty(),
