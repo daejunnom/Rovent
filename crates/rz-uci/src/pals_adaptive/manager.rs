@@ -242,6 +242,29 @@ pub enum AdaptiveManagerError {
     AuxiliaryPending,
     RoleCallLimit,
 }
+impl AdaptiveManagerError {
+    /// Preserve the original semantic cause while identifying the manager
+    /// boundary that received it. Typed capacity, cancellation, and physical
+    /// errors must retain their original variants and handling.
+    fn at_semantic_stage(self, stage: &'static str) -> Self {
+        match self {
+            Self::Semantic(cause) => Self::Semantic(format!("{stage}: {cause}")),
+            other => other,
+        }
+    }
+}
+#[cfg(test)]
+#[test]
+fn semantic_stage_preserves_original_cause_and_typed_failures() {
+    let observed = AdaptiveManagerError::Semantic("PALS: Role(InvalidOutput)".into())
+        .at_semantic_stage("deliver_roles");
+    assert!(matches!(observed, AdaptiveManagerError::Semantic(cause)
+        if cause == "deliver_roles: PALS: Role(InvalidOutput)"));
+    assert!(matches!(AdaptiveManagerError::PhysicalUnknown.at_semantic_stage("deliver_roles"),
+        AdaptiveManagerError::PhysicalUnknown));
+    assert!(matches!(AdaptiveManagerError::AdmissionClosed.at_semantic_stage("schedule"),
+        AdaptiveManagerError::AdmissionClosed));
+}
 impl From<CoordinatorError> for AdaptiveManagerError {
     fn from(error: CoordinatorError) -> Self {
         Self::Coordinator(error)
@@ -3894,11 +3917,11 @@ where
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         match self.poll_profiled_events() {
             Ok(progress) => changed |= progress,
-            Err(error) => self.record_failure(error),
+            Err(error) => self.record_failure(error.at_semantic_stage("poll_profiled_events")),
         }
         match self.driver.poll_auxiliary() {
             Ok(progress) => changed |= progress,
-            Err(error) => self.record_failure(error),
+            Err(error) => self.record_failure(error.at_semantic_stage("poll_auxiliary")),
         }
         for _ in 0..MAX_EVENT_DRAIN {
             let Some(event) = self.native.poll() else {
@@ -3906,7 +3929,7 @@ where
             };
             changed = true;
             if let Err(error) = self.native_event(event) {
-                self.physical_event_error(error)?;
+                self.physical_event_error(error.at_semantic_stage("native_event"))?;
             }
         }
         for slot in 0..self.own.len() {
@@ -3919,7 +3942,7 @@ where
                     Ok(Some(event)) => {
                         changed = true;
                         if let Err(error) = self.own_event_observed(slot, event) {
-                            self.physical_event_error(error)?;
+                            self.physical_event_error(error.at_semantic_stage("own_event"))?;
                         }
                     }
                     Ok(None) => break,
@@ -3938,7 +3961,7 @@ where
             {
                 changed = true;
                 if let Err(error) = self.own_progress_observed(slot, progress) {
-                    self.record_failure(error);
+                    self.record_failure(error.at_semantic_stage("own_progress"));
                 }
             }
         }
@@ -3964,7 +3987,7 @@ where
         {
             changed = true;
             if let Err(error) = self.foreign_event(completion) {
-                self.physical_event_error(error)?;
+                self.physical_event_error(error.at_semantic_stage("foreign_event"))?;
             }
         }
         if let Some((sequence, progress)) = self
@@ -3974,11 +3997,11 @@ where
         {
             changed = true;
             if let Err(error) = self.foreign_progress_observed(sequence, progress) {
-                self.record_failure(error);
+                self.record_failure(error.at_semantic_stage("foreign_progress"));
             }
         }
         if let Err(error) = self.flush_acks() {
-            self.record_failure(error);
+            self.record_failure(error.at_semantic_stage("flush_acks"));
         }
         // Reliable physical owner events above are always processed before an
         // optional collector callback can fail. Its original capture remains
@@ -3991,12 +4014,15 @@ where
             if self.check_running().is_err() {
                 self.begin_selected_shutdown(self.cleanup_until()?)?;
             } else {
-                for action in [
-                    Self::flush_deferred,
-                    Self::dispatch_roles,
-                    Self::deliver_roles,
-                    Self::schedule,
-                    Self::schedule_root_round,
+                for (stage, action) in [
+                    (
+                        "flush_deferred",
+                        Self::flush_deferred as fn(&mut Self) -> Result<bool, AdaptiveManagerError>,
+                    ),
+                    ("dispatch_roles", Self::dispatch_roles),
+                    ("deliver_roles", Self::deliver_roles),
+                    ("schedule", Self::schedule),
+                    ("schedule_root_round", Self::schedule_root_round),
                 ] {
                     match action(self) {
                         Ok(progress) => changed |= progress,
@@ -4009,7 +4035,7 @@ where
                                 changed = true;
                                 break;
                             }
-                            self.frontier_boundary_or_failure(error)?;
+                            self.frontier_boundary_or_failure(error.at_semantic_stage(stage))?;
                             break;
                         }
                     }
@@ -4039,7 +4065,7 @@ where
                         let (spent, _) = self.role_call_budget_usage();
                         if let Err(error) = self.driver.close_rovent_role_call_budget(spent, limit)
                         {
-                            self.record_failure(error);
+                            self.record_failure(error.at_semantic_stage("close_role_budget"));
                         }
                         self.begin_selected_shutdown(until)?;
                     }
@@ -4051,15 +4077,15 @@ where
         } else {
             match self.deliver_roles() {
                 Ok(progress) => changed |= progress,
-                Err(error) => self.record_failure(error),
+                Err(error) => self.record_failure(error.at_semantic_stage("drain_deliver_roles")),
             }
             match self.flush_deferred() {
                 Ok(progress) => changed |= progress,
-                Err(error) => self.record_failure(error),
+                Err(error) => self.record_failure(error.at_semantic_stage("drain_flush_deferred")),
             }
             match self.poll_shutdown() {
                 Ok(progress) => changed |= progress,
-                Err(error) => self.record_failure(error),
+                Err(error) => self.record_failure(error.at_semantic_stage("poll_shutdown")),
             }
         }
         Ok(changed)
@@ -5368,7 +5394,9 @@ where
                 match consumed {
                     Ok(true) if !self.roles[index].consumption_recorded => {
                         if let Err(observation) = self.mark_role_consumed(index, true) {
-                            self.record_failure(observation);
+                            self.record_failure(
+                                observation.at_semantic_stage("mark_role_consumed_after_error"),
+                            );
                         }
                     }
                     Ok(_) => {}
@@ -5376,7 +5404,9 @@ where
                         if !self.roles[index].consumption_recorded {
                             self.roles[index].consumption_unknown = true;
                         }
-                        self.record_failure(readback);
+                        self.record_failure(
+                            readback.at_semantic_stage("role_consumption_readback"),
+                        );
                     }
                 }
                 if self.roles[index].consumption_recorded {
@@ -5384,7 +5414,7 @@ where
                         if let Err(observation) =
                             self.utility_role_at(index, work, output.proposer_ranking_output())
                         {
-                            self.record_failure(observation);
+                            self.record_failure(observation.at_semantic_stage("utility_role_after_error"));
                         }
                     }
                 }
@@ -6975,7 +7005,7 @@ where
                 .push(completion.into_report());
             self.phase = ManagerPhase::Quarantined;
             if let Err(error) = teacher_observed {
-                self.record_failure(error);
+                self.record_failure(error.at_semantic_stage("foreign_old_scope_observation"));
             }
             return Err(AdaptiveManagerError::Invalid(
                 "external old-go or unsupported exact resume",
@@ -9053,7 +9083,7 @@ where
         // and the exact owner close is retried before post-fence retirement.
         if self.driver.semantic_owner_available() {
             if let Err(error) = self.driver.close_rovent_goal_admission() {
-                self.record_failure(error);
+                self.record_failure(error.at_semantic_stage("close_goal_admission"));
             }
         }
         if let Some(preparation) = &self.nnuec {
@@ -9158,7 +9188,7 @@ where
             // the worker and before archive close; progress never settles them.
             for event in receipt.events {
                 if let Err(error) = self.own_event(index, event) {
-                    self.record_failure(error);
+                    self.record_failure(error.at_semantic_stage("shutdown_own_event"));
                 }
             }
             self.own[index].joined = receipt.thread_joined;

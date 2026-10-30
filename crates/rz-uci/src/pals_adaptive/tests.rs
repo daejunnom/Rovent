@@ -1184,7 +1184,7 @@ fn exhausted_root_role_budget_preserves_actual_commit_failure() {
     assert_eq!(manager.counters().consumed_role_outputs, 1);
     assert_eq!(manager.counters().unused_role_results, 1);
     assert!(manager.failures().any(|error| matches!(error,
-        AdaptiveManagerError::Semantic(message) if message == "authored role hot-commit failure")));
+        AdaptiveManagerError::Semantic(message) if message.contains("authored role hot-commit failure")));
     assert!(manager.roles.is_empty());
     assert_eq!(manager.native_cpu_usage().unwrap(), (0, 0));
 }
@@ -2104,7 +2104,7 @@ fn failed_role_hot_commit_retains_original_ticket_until_actual_owner_drain() {
     assert_eq!(receipt.native_cpu_reserved, 0);
     assert_eq!(receipt.counters.consumed_role_outputs, 1);
     assert!(manager.failures().any(|error| matches!(error,
-        AdaptiveManagerError::Semantic(message) if message == "authored role hot-commit failure")));
+        AdaptiveManagerError::Semantic(message) if message.contains("authored role hot-commit failure")));
     assert!(!manager.failures().any(|error| matches!(
         error,
         AdaptiveManagerError::Invalid("unknown semantic retirement")
