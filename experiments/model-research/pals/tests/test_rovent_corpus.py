@@ -356,6 +356,30 @@ class OriginalCorpusOwnerTests(unittest.TestCase):
             self.assertEqual(sample["head_sources"]["policy"]["raw_receipt"]["completion"]["raw"]["score"],
                              {"kind": "mate_moves", "value": 3})
 
+    def test_teacher_relative_timing_retains_strict_original_observations(self):
+        recipe, manifest, record = original_fixture()
+        add_teacher_policy(manifest, record)
+        timing = record["head_sources"]["policy"]["raw_receipt"]["completion"]["timing"]
+        timing["durations_ns"] = {name: None for name in (
+            "admitted_to_run_started", "run_started_to_go_issued", "go_issued_to_stop_sent",
+            "go_issued_to_bestmove_drained", "stop_sent_to_bestmove_drained",
+            "bestmove_drained_to_ready_completed", "ready_completed_to_returned", "admitted_to_returned")}
+        timing["durations_ns"]["go_issued_to_bestmove_drained"] = 10
+        reseal_head(record, "policy")
+        seal_record(manifest, record)
+        with tempfile.TemporaryDirectory() as directory:
+            owner = write_corpus(Path(directory), manifest, [record])
+            owner.admit_stage(recipe, "common", 1, 1, [], [])
+            self.assertIsNotNone(owner.training_sample(owner.rows("proposer")[0])["targets"]["policy"])
+        for name, value, error in (("go_issued_to_stop_sent", 1, "duration without observed stop"),
+                                   ("admitted_to_returned", -1, "invalid bounded unsigned integer")):
+            changed = copy.deepcopy(record)
+            changed["head_sources"]["policy"]["raw_receipt"]["completion"]["timing"]["durations_ns"][name] = value
+            reseal_head(changed, "policy")
+            seal_record(manifest, changed)
+            with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, error):
+                write_corpus(Path(directory), manifest, [changed])
+
     def test_native_bits_must_match_the_original_accepted_head_even_after_file_and_record_resealing(self):
         _, manifest, record = original_fixture()
         record["native"]["raw_completion"]["output"]["payload"]["candidate_logits_bits"][0] = 0x3F800000

@@ -480,11 +480,25 @@ def _teacher_head(manifest, record, source, label):
     for key in ("option_application_observed", "model_loading_observed"):
         if completed[key] is not None and type(completed[key]) is not bool:
             raise ValueError("teacher option/model loading observation must preserve known/unknown")
-    timing = fields(completed["timing"], ("go_issued", "stop_sent", "bestmove_drained", "ready_completed"),
+    timing_value = completed["timing"]
+    timing_keys = ("go_issued", "stop_sent", "bestmove_drained", "ready_completed")
+    has_durations = type(timing_value) is dict and "durations_ns" in timing_value
+    timing = fields(timing_value, (*timing_keys, *(("durations_ns",) if has_durations else ())),
                     "original teacher stop/drain/readiness observations")
-    if (any(type(value) is not bool for value in timing.values()) or timing["go_issued"] is not True
+    if (any(type(timing[key]) is not bool for key in timing_keys) or timing["go_issued"] is not True
             or timing["bestmove_drained"] is not True or timing["ready_completed"] is not True):
         raise ValueError("original teacher physical go/bestmove/readiness observations missing")
+    if has_durations:
+        duration_keys = ("admitted_to_run_started", "run_started_to_go_issued", "go_issued_to_stop_sent",
+                         "go_issued_to_bestmove_drained", "stop_sent_to_bestmove_drained",
+                         "bestmove_drained_to_ready_completed", "ready_completed_to_returned", "admitted_to_returned")
+        durations = fields(timing["durations_ns"], duration_keys, "original teacher relative durations")
+        for value in durations.values():
+            if value is not None:
+                uint(value)
+        if not timing["stop_sent"] and (durations["go_issued_to_stop_sent"] is not None
+                                        or durations["stop_sent_to_bestmove_drained"] is not None):
+            raise ValueError("teacher stop duration without observed stop")
     if completed["stop_control"] is not None:
         control = fields(completed["stop_control"], ("sequence", "action"), "original teacher stop control")
         uint(control["sequence"])
