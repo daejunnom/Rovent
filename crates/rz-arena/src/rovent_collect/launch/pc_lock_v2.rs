@@ -22,7 +22,9 @@ const WORKER_START_FAILED: u8 = 3;
 /// Keeps the original resource, native failure and teacher worker together.
 /// Neither the live readback nor the thread exit establishes publication.
 pub struct RoventPcCollectionRunV2 {
+    sealed_teacher_requested: Vec<usize>,
     sealed_teacher_indices: Vec<usize>,
+    sealed_teacher_ignored: Vec<(usize, &'static str)>,
     sealed_teacher_observations: Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>,
     resource: Arc<Mutex<resources::CollectionResourceCustody>>,
     original_lock: Arc<Mutex<Option<Arc<RoventInputLockV2>>>>,
@@ -848,7 +850,7 @@ impl RoventPcCollectionRunV2 {
             unreachable!("remaining observation is an object");
         };
         observation.as_object_mut().expect("observation is an object").extend(remaining);
-        if !self.sealed_teacher_indices.is_empty() {
+        if !self.sealed_teacher_requested.is_empty() {
             let preparation = match self.sealed_teacher_observations.try_lock() {
                 Ok(value) => value.as_ref().map_or_else(
                     || json!({"status":"unknown"}),
@@ -868,7 +870,10 @@ impl RoventPcCollectionRunV2 {
             };
             observation.as_object_mut().expect("observation is an object").insert(
                 "sealed_teacher_preparation".into(),
-                json!({"selected_sources":self.sealed_teacher_indices, "preparation":preparation,
+                json!({"requested_sources":self.sealed_teacher_requested,
+                    "selected_sources":self.sealed_teacher_indices,
+                    "ignored":self.sealed_teacher_ignored.iter().map(|(slot,reason)| json!({"source_index":slot,"reason":reason})).collect::<Vec<_>>(),
+                    "preparation":preparation,
                     "scope":"preparation_and_spawn_counts_not_physical_completion"}),
             );
         }
@@ -1159,6 +1164,19 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let supervisor_records = plan.maximum_records as usize;
     let supervisor_constraint = plan.teacher_constraint;
     let supervisor_quantum = Duration::from_nanos(plan.teacher_soft_quantum_ns);
+    let sealed_teacher_requested = sealed_teacher_indices;
+    let mut sealed_teacher_indices = Vec::new();
+    let mut sealed_teacher_ignored = Vec::new();
+    for &index in &sealed_teacher_requested {
+        if index >= plan.teacher_sources.len() {
+            sealed_teacher_ignored.push((index, "source_index_out_of_range"));
+        } else if sealed_teacher_indices.contains(&index) {
+            sealed_teacher_ignored.push((index, "duplicate_source_index"));
+        } else {
+            sealed_teacher_indices.push(index);
+        }
+    }
+    sealed_teacher_indices.sort_unstable();
     let sealed_teacher_observations = Arc::new(Mutex::new(None));
     let native = run_pc_collection_v2_with_sealed_policy(
         arguments,
@@ -1232,7 +1250,9 @@ fn run_rovent_pc_collection_lock_v2_inner(
     stop.store(true, Ordering::Release);
     let pump_thread = pump_thread.lock().map_err(|_| invalid("P/C pump thread custody poisoned"))?.take();
     let mut run = RoventPcCollectionRunV2 {
+        sealed_teacher_requested,
         sealed_teacher_indices,
+        sealed_teacher_ignored,
         sealed_teacher_observations,
         resource,
         original_lock,
