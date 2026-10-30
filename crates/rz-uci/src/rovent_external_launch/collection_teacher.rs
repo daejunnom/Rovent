@@ -487,6 +487,8 @@ impl RoventCollectionTeacherOwnerV2 {
             let sources = preload
                 .teacher_sources(source_index, control)
                 .map_err(|_| invalid("teacher /2 source custody"))?;
+            #[cfg(target_os = "linux")]
+            let sealed_executable = sources.sealed_executable().cloned();
             let (index, launch, _profile, executable, working_directory, custody) =
                 sources.into_parts();
             if index != source_index
@@ -537,7 +539,14 @@ impl RoventCollectionTeacherOwnerV2 {
                     .checked_add(config.shutdown_grace)
                     .ok_or(invalid("teacher /2 profile cleanup overflow"))?;
                 let cleanup_ceiling = cleanup_ceiling.min(root_cleanup).min(profile_cleanup);
-                let pin = ExternalLaunchPin::from_owned_descriptors(executable, working_directory)?;
+                let pin = match sealed_executable {
+                    Some(sealed) => {
+                        ExternalLaunchPin::from_verified_sealed(sealed, working_directory)?
+                    }
+                    None => {
+                        ExternalLaunchPin::from_owned_descriptors(executable, working_directory)?
+                    }
+                };
                 let registration = TeacherWorkerRegistration {
                     collection_owner,
                     authority: root.authority(),
@@ -1005,8 +1014,11 @@ pub fn spawn_bound_collection_teacher_v2(
                 .working_directory
                 .try_clone()
                 .map_err(BoundTeacherSpawnCauseV2::Io)?;
-            let pin = ExternalLaunchPin::from_owned_descriptors(executable, directory)
-                .map_err(BoundTeacherSpawnCauseV2::Checker)?;
+            let pin = match source.sealed_executable().cloned() {
+                Some(sealed) => ExternalLaunchPin::from_verified_sealed(sealed, directory),
+                None => ExternalLaunchPin::from_owned_descriptors(executable, directory),
+            }
+            .map_err(BoundTeacherSpawnCauseV2::Checker)?;
             let config = source
                 .prepared
                 .configuration()

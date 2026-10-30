@@ -9,7 +9,8 @@ use crate::rovent_collect::pc_worker_supervisor_v2::{PcSecondarySlotV2, PcWorker
 use rz_experiments::RoventInputLockV2;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::rovent_bootstrap::launch::{
-    RoventPcCollectionLaunchFailureV2, run_pc_collection_v2_with_resource_admission,
+    RoventPcCollectionLaunchFailureV2, SealedTeacherPreparationObservation,
+    run_pc_collection_v2_with_sealed_policy,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -21,6 +22,8 @@ const WORKER_START_FAILED: u8 = 3;
 /// Keeps the original resource, native failure and teacher worker together.
 /// Neither the live readback nor the thread exit establishes publication.
 pub struct RoventPcCollectionRunV2 {
+    sealed_teacher_indices: Vec<usize>,
+    sealed_teacher_observations: Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>,
     resource: Arc<Mutex<resources::CollectionResourceCustody>>,
     original_lock: Arc<Mutex<Option<Arc<RoventInputLockV2>>>>,
     owner: RoventCollectionOwnerLockV2,
@@ -845,6 +848,30 @@ impl RoventPcCollectionRunV2 {
             unreachable!("remaining observation is an object");
         };
         observation.as_object_mut().expect("observation is an object").extend(remaining);
+        if !self.sealed_teacher_indices.is_empty() {
+            let preparation = match self.sealed_teacher_observations.try_lock() {
+                Ok(value) => value.as_ref().map_or_else(
+                    || json!({"status":"unknown"}),
+                    |items| {
+                        let sources: Vec<_> = items.iter().map(|item| {
+                            let execution = item.actual_execution();
+                            json!({"source_index":item.source_index, "status":item.status,
+                                "failure":item.failure, "bytes":item.bytes, "elapsed_ms":item.elapsed_ms,
+                                "sealed_spawn_returned":execution.map(|value|value.0),
+                                "original_fallback_attempted":execution.map(|value|value.1)})
+                        }).collect();
+                        json!({"status":"observed", "sources":sources})
+                    },
+                ),
+                Err(std::sync::TryLockError::WouldBlock) => json!({"status":"busy"}),
+                Err(std::sync::TryLockError::Poisoned(_)) => json!({"status":"unknown"}),
+            };
+            observation.as_object_mut().expect("observation is an object").insert(
+                "sealed_teacher_preparation".into(),
+                json!({"selected_sources":self.sealed_teacher_indices, "preparation":preparation,
+                    "scope":"preparation_and_spawn_counts_not_physical_completion"}),
+            );
+        }
         observation
     }
 
@@ -1009,7 +1036,24 @@ pub fn run_rovent_pc_collection_lock_v2(
         input_directory,
         worker_deadline,
         cleanup_deadline,
+        Vec::new(),
         |_| Ok(()),
+    )
+}
+
+/// Explicitly select optional sealed copies for P-C teacher source slots.
+/// The /2 plan and its existing default entry point remain unchanged.
+pub fn run_rovent_pc_collection_lock_v2_with_sealed_policy(
+    arguments: Vec<String>,
+    plan: RoventCollectionLockV2LaunchPlan,
+    input_directory: &Dir,
+    worker_deadline: Instant,
+    cleanup_deadline: Instant,
+    sealed_teacher_indices: Vec<usize>,
+) -> Result<RoventPcCollectionRunV2, ArenaError> {
+    run_rovent_pc_collection_lock_v2_inner(
+        arguments, plan, input_directory, worker_deadline, cleanup_deadline,
+        sealed_teacher_indices, |_| Ok(()),
     )
 }
 
@@ -1030,6 +1074,7 @@ pub fn run_rovent_pc_collection_lock_v2_with_test_owner(
         input_directory,
         worker_deadline,
         cleanup_deadline,
+        Vec::new(),
         on_owner,
     )
 }
@@ -1040,6 +1085,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
     input_directory: &Dir,
     worker_deadline: Instant,
     cleanup_deadline: Instant,
+    sealed_teacher_indices: Vec<usize>,
     on_owner: impl FnOnce(&RoventCollectionOwnerLockV2) -> Result<(), ArenaError>,
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
     check(
@@ -1113,7 +1159,8 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let supervisor_records = plan.maximum_records as usize;
     let supervisor_constraint = plan.teacher_constraint;
     let supervisor_quantum = Duration::from_nanos(plan.teacher_soft_quantum_ns);
-    let native = run_pc_collection_v2_with_resource_admission(
+    let sealed_teacher_observations = Arc::new(Mutex::new(None));
+    let native = run_pc_collection_v2_with_sealed_policy(
         arguments,
         plan.teacher_sources,
         Box::new(observer),
@@ -1179,10 +1226,14 @@ fn run_rovent_pc_collection_lock_v2_inner(
             }
             Ok(())
         },
+        sealed_teacher_indices.clone(),
+        Arc::clone(&sealed_teacher_observations),
     );
     stop.store(true, Ordering::Release);
     let pump_thread = pump_thread.lock().map_err(|_| invalid("P/C pump thread custody poisoned"))?.take();
     let mut run = RoventPcCollectionRunV2 {
+        sealed_teacher_indices,
+        sealed_teacher_observations,
         resource,
         original_lock,
         owner,

@@ -40,6 +40,157 @@ pub(crate) use tests::FIXTURE_LOCK as EXTERNAL_FIXTURE_LOCK;
 pub const EXTERNAL_UCI_CHECKER_VERSION: &str = "rz-external-uci-checker/0.1";
 pub const EXTERNAL_UCI_SCORE_SEMANTICS: &str = "uci-native-cp-or-signed-mate-moves;root-side-to-move;reported-bounds;selectivity-unknown;no-cp-wdl-calibration;no-rules-proof";
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct SealedExecutionCounters {
+    sealed_spawn_returned: std::sync::atomic::AtomicU64,
+    original_fallback_attempted: std::sync::atomic::AtomicU64,
+}
+
+/// A byte-verified, immutable executable prepared before a search root starts.
+/// The private descriptor and hash remain coupled; constructing this token does
+/// not grant process, root, or completion authority.
+#[derive(Clone, Debug)]
+pub struct VerifiedSealedExecutable {
+    #[cfg(target_os = "linux")]
+    file: Arc<File>,
+    #[cfg(target_os = "linux")]
+    original: Arc<File>,
+    #[cfg(target_os = "linux")]
+    sha256: String,
+    #[cfg(target_os = "linux")]
+    counters: Arc<SealedExecutionCounters>,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedSealedExecutable {
+    /// Copy the already admitted original into a bounded anonymous file, verify
+    /// the copied bytes and seal writes/size changes before returning its owner.
+    /// `check` is the original preparation cancellation/deadline check.
+    pub fn prepare(
+        original: &File,
+        expected_sha256: &str,
+        mut check: impl FnMut() -> Result<(), CheckerError>,
+    ) -> Result<Self, CheckerError> {
+        use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+        use nix::sys::memfd::{MFdFlags, memfd_create};
+        use std::io::Write;
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        if expected_sha256.len() != 64
+            || !expected_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(error("sealed_prepare", "invalid_sha256"));
+        }
+        check()?;
+        let before = original
+            .metadata()
+            .map_err(|_| error("sealed_prepare", "original_metadata"))?;
+        if !before.is_file()
+            || before.len() < 4
+            || before.len() > 256 * 1024 * 1024
+            || before.mode() & 0o111 == 0
+        {
+            return Err(error("sealed_prepare", "original_kind_or_size"));
+        }
+        let fd = memfd_create(
+            "rovent-teacher",
+            MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+        )
+        .map_err(|_| error("sealed_prepare", "memfd_create"))?;
+        let mut file = File::from(fd);
+        if !file.metadata().is_ok_and(|metadata| metadata.mode() & 0o111 != 0) {
+            return Err(error("sealed_prepare", "memfd_not_executable"));
+        }
+        let mut total = 0u64;
+        let mut buffer = [0u8; 65_536];
+        loop {
+            check()?;
+            let count = original
+                .read_at(&mut buffer, total)
+                .map_err(|_| error("sealed_prepare", "original_read"))?;
+            if count == 0 {
+                break;
+            }
+            if total == 0 && (count < 4 || buffer[..4] != *b"\x7fELF") {
+                return Err(error("sealed_prepare", "native_elf_required"));
+            }
+            total = total
+                .checked_add(count as u64)
+                .ok_or_else(|| error("sealed_prepare", "length_overflow"))?;
+            if total > before.len() {
+                return Err(error("sealed_prepare", "original_changed"));
+            }
+            file.write_all(&buffer[..count])
+                .map_err(|_| error("sealed_prepare", "copy"))?;
+        }
+        let after = original
+            .metadata()
+            .map_err(|_| error("sealed_prepare", "original_recheck"))?;
+        if total != before.len()
+            || after.len() != before.len()
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+        {
+            return Err(error("sealed_prepare", "original_changed"));
+        }
+        check()?;
+        let seals = SealFlag::F_SEAL_WRITE
+            | SealFlag::F_SEAL_GROW
+            | SealFlag::F_SEAL_SHRINK
+            | SealFlag::F_SEAL_SEAL;
+        fcntl(&file, FcntlArg::F_ADD_SEALS(seals)).map_err(|_| error("sealed_prepare", "seal"))?;
+        let present = fcntl(&file, FcntlArg::F_GET_SEALS)
+            .map_err(|_| error("sealed_prepare", "seal_readback"))?;
+        if (present & seals.bits()) != seals.bits() {
+            return Err(error("sealed_prepare", "seal_incomplete"));
+        }
+        // Hash the sealed file itself, not the copy buffer: only this binds the
+        // proof to the immutable bytes that the process will actually execute.
+        let mut hash = Sha256::new();
+        let mut verified = 0u64;
+        while verified < total {
+            check()?;
+            let count = file
+                .read_at(&mut buffer, verified)
+                .map_err(|_| error("sealed_prepare", "sealed_read"))?;
+            if count == 0 {
+                return Err(error("sealed_prepare", "sealed_short_read"));
+            }
+            verified = verified
+                .checked_add(count as u64)
+                .ok_or_else(|| error("sealed_prepare", "length_overflow"))?;
+            if verified > total {
+                return Err(error("sealed_prepare", "sealed_length"));
+            }
+            hash.update(&buffer[..count]);
+        }
+        if format!("{:x}", hash.finalize()) != expected_sha256 {
+            return Err(error("sealed_prepare", "hash_mismatch"));
+        }
+        check()?;
+        let original = original.try_clone().map_err(|_| error("sealed_prepare", "original_clone"))?;
+        Ok(Self {
+            file: Arc::new(file),
+            original: Arc::new(original),
+            sha256: expected_sha256.to_owned(),
+            counters: Arc::new(SealedExecutionCounters::default()),
+        })
+    }
+
+    /// Cumulative source-slot observations, not process completion evidence.
+    pub fn execution_observations(&self) -> (u64, u64) {
+        (self.counters.sealed_spawn_returned.load(Ordering::Acquire),
+         self.counters.original_fallback_attempted.load(Ordering::Acquire))
+    }
+}
+
 /// Retained executable/cwd capabilities for a private V5 snapshot. Path names
 /// remain declarations in ExternalCpuConfig; an actual start uses these held
 /// objects and repeats byte/ELF verification before spawning. This pin is not a
@@ -48,6 +199,12 @@ pub const EXTERNAL_UCI_SCORE_SEMANTICS: &str = "uci-native-cp-or-signed-mate-mov
 pub struct ExternalLaunchPin {
     #[cfg(target_os = "linux")]
     executable: Arc<File>,
+    #[cfg(target_os = "linux")]
+    sealed_sha256: Option<String>,
+    #[cfg(target_os = "linux")]
+    fallback_executable: Option<Arc<File>>,
+    #[cfg(target_os = "linux")]
+    sealed_counters: Option<Arc<SealedExecutionCounters>>,
     #[cfg(target_os = "linux")]
     directory: Arc<File>,
     #[cfg(not(target_os = "linux"))]
@@ -76,6 +233,28 @@ impl ExternalLaunchPin {
         }
         Ok(Self {
             executable: Arc::new(executable),
+            sealed_sha256: None,
+            fallback_executable: None,
+            sealed_counters: None,
+            directory: Arc::new(directory),
+            collection_process_permit: None,
+        })
+    }
+    /// Bind the verified sealed file to the same retained working directory.
+    /// Process scope and root admission are still required at actual startup.
+    #[cfg(target_os = "linux")]
+    pub fn from_verified_sealed(
+        executable: VerifiedSealedExecutable,
+        directory: File,
+    ) -> Result<Self, CheckerError> {
+        if !directory.metadata().is_ok_and(|m| m.is_dir()) {
+            return Err(error("launch_pin", "directory_metadata"));
+        }
+        Ok(Self {
+            executable: executable.file,
+            sealed_sha256: Some(executable.sha256),
+            fallback_executable: Some(executable.original),
+            sealed_counters: Some(executable.counters),
             directory: Arc::new(directory),
             collection_process_permit: None,
         })
@@ -2039,54 +2218,69 @@ mod process {
             if header != *b"\x7fELF" {
                 return Err(error("spawn", "native_elf_required"));
             }
-            let mut hash = Sha256::new();
-            hash.update(header);
-            let mut buffer = [0u8; 65_536];
-            let mut total = 4u64;
-            loop {
-                // Report both conditions when both are observed at this check.
-                // They are independent observations, not an ordering claim:
-                // cancellation can race with the deadline and is read first.
-                let cancelled = cancel.load(Ordering::Acquire);
-                let expired = Instant::now() >= deadline;
-                match (cancelled, expired) {
-                    (false, false) => {}
-                    (true, false) => return Err(error("spawn", "hash_cancelled")),
-                    (false, true) => return Err(error("spawn", "hash_deadline_expired")),
-                    (true, true) => {
-                        return Err(error("spawn", "hash_cancelled_and_deadline_expired"));
+            if let Some(sealed_sha256) = launch_pin.and_then(|pin| pin.sealed_sha256.as_ref()) {
+                use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+                let required = SealFlag::F_SEAL_WRITE
+                    | SealFlag::F_SEAL_GROW
+                    | SealFlag::F_SEAL_SHRINK
+                    | SealFlag::F_SEAL_SEAL;
+                let actual = fcntl(&program, FcntlArg::F_GET_SEALS)
+                    .map_err(|_| error("spawn", "sealed_program_readback"))?;
+                if (actual & required.bits()) != required.bits()
+                    || sealed_sha256 != &config.identity.binary_sha256
+                {
+                    return Err(error("spawn", "sealed_program_identity"));
+                }
+            } else {
+                let mut hash = Sha256::new();
+                hash.update(header);
+                let mut buffer = [0u8; 65_536];
+                let mut total = 4u64;
+                loop {
+                    // Report both conditions when both are observed at this check.
+                    // They are independent observations, not an ordering claim:
+                    // cancellation can race with the deadline and is read first.
+                    let cancelled = cancel.load(Ordering::Acquire);
+                    let expired = Instant::now() >= deadline;
+                    match (cancelled, expired) {
+                        (false, false) => {}
+                        (true, false) => return Err(error("spawn", "hash_cancelled")),
+                        (false, true) => return Err(error("spawn", "hash_deadline_expired")),
+                        (true, true) => {
+                            return Err(error("spawn", "hash_cancelled_and_deadline_expired"));
+                        }
                     }
+                    let count = program
+                        .read_at(&mut buffer, total)
+                        .map_err(|_| error("spawn", "program_hash_read"))?;
+                    if count == 0 {
+                        break;
+                    }
+                    total = total
+                        .checked_add(count as u64)
+                        .ok_or_else(|| error("spawn", "program_hash_overflow"))?;
+                    if total > 256 * 1024 * 1024 {
+                        return Err(error("spawn", "program_hash_budget"));
+                    }
+                    hash.update(&buffer[..count]);
                 }
-                let count = program
-                    .read_at(&mut buffer, total)
-                    .map_err(|_| error("spawn", "program_hash_read"))?;
-                if count == 0 {
-                    break;
+                let after = program
+                    .metadata()
+                    .map_err(|_| error("spawn", "program_recheck"))?;
+                if total != metadata.len()
+                    || after.len() != metadata.len()
+                    || after.dev() != metadata.dev()
+                    || after.ino() != metadata.ino()
+                    || after.mtime() != metadata.mtime()
+                    || after.mtime_nsec() != metadata.mtime_nsec()
+                    || after.ctime() != metadata.ctime()
+                    || after.ctime_nsec() != metadata.ctime_nsec()
+                {
+                    return Err(error("spawn", "program_changed_during_hash"));
                 }
-                total = total
-                    .checked_add(count as u64)
-                    .ok_or_else(|| error("spawn", "program_hash_overflow"))?;
-                if total > 256 * 1024 * 1024 {
-                    return Err(error("spawn", "program_hash_budget"));
+                if format!("{:x}", hash.finalize()) != config.identity.binary_sha256 {
+                    return Err(error("spawn", "program_hash_mismatch"));
                 }
-                hash.update(&buffer[..count]);
-            }
-            let after = program
-                .metadata()
-                .map_err(|_| error("spawn", "program_recheck"))?;
-            if total != metadata.len()
-                || after.len() != metadata.len()
-                || after.dev() != metadata.dev()
-                || after.ino() != metadata.ino()
-                || after.mtime() != metadata.mtime()
-                || after.mtime_nsec() != metadata.mtime_nsec()
-                || after.ctime() != metadata.ctime()
-                || after.ctime_nsec() != metadata.ctime_nsec()
-            {
-                return Err(error("spawn", "program_changed_during_hash"));
-            }
-            if format!("{:x}", hash.finalize()) != config.identity.binary_sha256 {
-                return Err(error("spawn", "program_hash_mismatch"));
             }
             let directory = match launch_pin {
                 Some(pin) => pin
@@ -2122,14 +2316,46 @@ mod process {
                 .process_group(0);
             // Before spawn, dropping this reservation means NotStarted. After
             // spawn it is immediately installed in the original OS owner.
-            let mut process_slot = process_slot
+            let mut lease = process_slot
                 .take()
                 .expect("reserved process slot before spawn");
-            process_slot.ensure_spawn_allowed()?;
-            let mut child = command
-                .spawn()
-                .map_err(|_| error("spawn", "native_spawn"))?;
-            process_slot.mark_started();
+            lease.ensure_spawn_allowed()?;
+            let mut child = match command.spawn() {
+                Ok(child) => {
+                    if let Some(counters) = launch_pin.and_then(|pin| pin.sealed_counters.as_ref()) {
+                        if launch_pin.is_some_and(|pin| pin.sealed_sha256.is_some()) {
+                            let _ = counters.sealed_spawn_returned.fetch_update(
+                                Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
+                        }
+                    }
+                    child
+                }
+                Err(failure)
+                    if launch_pin.is_some_and(|pin| pin.sealed_sha256.is_some())
+                        && matches!(failure.raw_os_error(),
+                            Some(nix::libc::EACCES | nix::libc::EPERM | nix::libc::ETXTBSY)) =>
+                {
+                    let pin = launch_pin.expect("sealed pin checked above");
+                    let original = pin.fallback_executable.as_ref()
+                        .ok_or_else(|| error("spawn", "sealed_fallback_missing"))?;
+                    let mut fallback = pin.clone();
+                    fallback.executable = Arc::clone(original);
+                    fallback.sealed_sha256 = None;
+                    fallback.fallback_executable = None;
+                    if let Some(counters) = pin.sealed_counters.as_ref() {
+                        let _ = counters.original_fallback_attempted.fetch_update(
+                            Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
+                    }
+                    // No child was returned: transfer the *same* reservation to
+                    // the ordinary original-FD hash path, without extending its
+                    // deadline or reacquiring a one-shot collection permit.
+                    *process_slot = Some(lease);
+                    return Self::spawn_owned(config, deadline, cancel, Some(&fallback),
+                        failure_evidence, process_slot);
+                }
+                Err(_) => return Err(error("spawn", "native_spawn")),
+            };
+            lease.mark_started();
             // Linux kernel PIDs fit signed pid_t. Install the owned child before
             // any fallible setup and retain optional pipes even on setup error.
             let pid = Pid::from_raw(child.id() as i32);
@@ -2159,7 +2385,7 @@ mod process {
                 lines: VecDeque::new(),
                 state: empty_shutdown(),
                 shutdown_grace: config.shutdown_grace,
-                process_slot,
+                process_slot: lease,
             };
             let setup = (|| {
                 let identity = proc_identity(pid.as_raw())?
@@ -2768,6 +2994,69 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     pub(crate) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_teacher_pin_preserves_bytes_and_original_process_lifetime() {
+        use std::os::unix::fs::FileExt;
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let config = fixture_config("fake_uci_normal");
+        let original = File::open(&config.program).unwrap();
+        let expected = &config.identity.binary_sha256;
+        let mut checks = 0;
+        let token = VerifiedSealedExecutable::prepare(&original, expected, || {
+            checks += 1;
+            Ok(())
+        }).unwrap();
+        assert!(checks > 1);
+        assert!(token.file.write_at(b"changed", 0).is_err());
+        assert!(VerifiedSealedExecutable::prepare(&original, &"0".repeat(64), || Ok(())).is_err());
+        assert!(VerifiedSealedExecutable::prepare(&original, expected, || {
+            Err(CheckerError::Invalid("cancelled preparation"))
+        }).is_err());
+        let cwd = File::open(&config.working_directory).unwrap();
+        let pin = ExternalLaunchPin::from_verified_sealed(token.clone(), cwd).unwrap();
+        let mut wrong = config.clone();
+        wrong.identity.binary_sha256 = "0".repeat(64);
+        let mut denied = ExternalUciCpuChecker::create(wrong).unwrap();
+        denied.launch_pin = Some(pin.clone());
+        assert!(denied.start(Instant::now() + Duration::from_secs(10), &AtomicBool::new(false)).is_err());
+        let mut checker = ExternalUciCpuChecker::create(config).unwrap();
+        checker.launch_pin = Some(pin);
+        checker.start(Instant::now() + Duration::from_secs(10), &AtomicBool::new(false)).unwrap();
+        let closed = checker.shutdown(Instant::now() + Duration::from_secs(3)).unwrap();
+        assert!(closed.exit_observed && closed.stdout_drained && closed.stderr_drained);
+        assert!(closed.cleanup_complete);
+        assert_eq!(token.execution_observations(), (1, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_teacher_copy_does_not_follow_later_original_mutation() {
+        use std::io::Write;
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rz-sealed-mutation-{}-{nonce}", std::process::id()));
+        let _cleanup = Cleanup(path.clone());
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        out.write_all(&bytes).unwrap();
+        out.set_permissions(std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(out);
+        let original = File::open(&path).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        let token = VerifiedSealedExecutable::prepare(&original, &expected, || Ok(())).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_at(b"changed", 0).unwrap();
+        let mut sealed_header = [0u8; 4];
+        token.file.read_exact_at(&mut sealed_header, 0).unwrap();
+        assert_eq!(sealed_header, *b"\x7fELF");
+        assert!(VerifiedSealedExecutable::prepare(&original, &expected, || Ok(())).is_err());
+    }
 
     #[cfg(target_os = "linux")]
     fn fixture_mode(name: &str) -> bool {

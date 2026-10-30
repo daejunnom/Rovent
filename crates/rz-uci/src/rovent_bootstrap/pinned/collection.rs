@@ -14,6 +14,8 @@ use rz_experiments::{
     ArtifactRef, RoventEngineDeclaration, RoventInputLock, RoventInputLockV2, RoventPurpose,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -24,6 +26,24 @@ use std::{
 const PROFILE_MAX: usize = 256 << 10;
 const BINARY_MAX: u64 = 256 << 20;
 const ASSET_MAX: u64 = 1 << 30;
+#[cfg(target_os = "linux")]
+const SEALED_TEACHER_TOTAL_MAX: u64 = 256 << 20;
+#[cfg(target_os = "linux")]
+const SEALED_TEACHER_PREPARATION_MAX: Duration = Duration::from_secs(1);
+
+/// Source preparation evidence, not proof of teacher startup or completion.
+#[derive(Clone, Debug)]
+enum SealedTeacherPreparation {
+    Prepared {
+        bytes: u64,
+        elapsed_ms: u128,
+    },
+    Fallback {
+        reason: String,
+        elapsed_ms: Option<u128>,
+    },
+    NotRequested,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +64,9 @@ pub struct RoventTeacherSourceSelection {
 struct PinnedTeacherSource {
     profile: PinnedBlob,
     binary: PinnedBlob,
+    #[cfg(target_os = "linux")]
+    sealed_executable: Option<rz_search::external_cpu::VerifiedSealedExecutable>,
+    sealed_preparation: SealedTeacherPreparation,
     cwd: File,
     assets: Vec<(String, PinnedBlob)>,
 }
@@ -122,6 +145,9 @@ pub struct RoventCollectionTeacherSources {
     pub executable: File,
     pub working_directory: File,
     pub assets: Vec<(String, ArtifactRef, File)>,
+    #[cfg(target_os = "linux")]
+    sealed_executable: Option<rz_search::external_cpu::VerifiedSealedExecutable>,
+    sealed_preparation: SealedTeacherPreparation,
     original: Arc<RoventCollectionPreloadSources>,
 }
 /// Retain this after the worker consumes its executable/profile descriptors.
@@ -144,6 +170,38 @@ impl RoventCollectionTeacherSourceCustody {
     }
 }
 impl RoventCollectionTeacherSources {
+    pub fn sealed_preparation_status(&self) -> &'static str {
+        match &self.sealed_preparation {
+            SealedTeacherPreparation::Prepared { .. } => "prepared",
+            SealedTeacherPreparation::Fallback { .. } => "fallback",
+            SealedTeacherPreparation::NotRequested => "not_requested",
+        }
+    }
+    pub fn sealed_preparation_failure(&self) -> Option<&str> {
+        match &self.sealed_preparation {
+            SealedTeacherPreparation::Fallback { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+    pub fn sealed_preparation_bytes(&self) -> Option<u64> {
+        match &self.sealed_preparation {
+            SealedTeacherPreparation::Prepared { bytes, .. } => Some(*bytes),
+            _ => None,
+        }
+    }
+    pub fn sealed_preparation_elapsed_ms(&self) -> Option<u128> {
+        match &self.sealed_preparation {
+            SealedTeacherPreparation::Prepared { elapsed_ms, .. } => Some(*elapsed_ms),
+            SealedTeacherPreparation::Fallback { elapsed_ms, .. } => *elapsed_ms,
+            SealedTeacherPreparation::NotRequested => None,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sealed_executable(
+        &self,
+    ) -> Option<&rz_search::external_cpu::VerifiedSealedExecutable> {
+        self.sealed_executable.as_ref()
+    }
     pub fn original_input_lock_digest(&self) -> Digest {
         self.original.input_lock_digest()
     }
@@ -185,6 +243,7 @@ impl RoventCollectionPreloadSources {
             private_root_path,
             selections,
             control,
+            &[],
         )
     }
 
@@ -203,6 +262,27 @@ impl RoventCollectionPreloadSources {
             private_root_path,
             selections,
             control,
+            &[],
+        )
+    }
+
+    /// Explicit source-slot opt-in; does not grant process or root authority.
+    /// The caller must register this choice in its own execution policy.
+    pub fn open_v2_with_sealed_policy(
+        lock: Arc<RoventInputLockV2>,
+        root: Dir,
+        private_root_path: &Path,
+        selections: Vec<RoventTeacherSourceSelection>,
+        control: &RoventStartupControl,
+        sealed_teacher_indices: &[usize],
+    ) -> Result<Self, BackendError> {
+        Self::open_original(
+            CollectionInputLock::V2(lock),
+            root,
+            private_root_path,
+            selections,
+            control,
+            sealed_teacher_indices,
         )
     }
 
@@ -212,6 +292,7 @@ impl RoventCollectionPreloadSources {
         private_root_path: &Path,
         selections: Vec<RoventTeacherSourceSelection>,
         control: &RoventStartupControl,
+        sealed_teacher_indices: &[usize],
     ) -> Result<Self, BackendError> {
         control.check()?;
         lock.validate()?;
@@ -229,6 +310,20 @@ impl RoventCollectionPreloadSources {
                 "explicit Collection teacher source cardinality/purpose",
             ));
         }
+        if sealed_teacher_indices.len() > selections.len()
+            || sealed_teacher_indices
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != sealed_teacher_indices.len()
+            || sealed_teacher_indices
+                .iter()
+                .any(|&index| index >= selections.len())
+            || (!sealed_teacher_indices.is_empty() && !matches!(&lock, CollectionInputLock::V2(_)))
+        {
+            return Err(invalid("invalid sealed executable source slot selection"));
+        }
         let mut teachers = Vec::new();
         teachers.try_reserve_exact(selections.len()).map_err(|_| {
             fail(
@@ -236,6 +331,10 @@ impl RoventCollectionPreloadSources {
                 "teacher source roster allocation failed",
             )
         })?;
+        #[cfg(target_os = "linux")]
+        let mut sealed_total = 0u64;
+        #[cfg(target_os = "linux")]
+        let mut sealed_copy_deadline: Option<Instant> = None;
         for (index, selection) in selections.into_iter().enumerate() {
             let pin = &lock.engine().teachers[index];
             if selection.index != index
@@ -265,6 +364,101 @@ impl RoventCollectionPreloadSources {
             }
             let binary = open_blob(&root, pin.binary.clone(), BINARY_MAX)?;
             control.check()?;
+            // A sealed descriptor changes `/proc/self/exe`. Restrict this
+            // optional path to the declared embedded Stockfish profile without
+            // arguments or external assets; every other profile keeps its
+            // original executable descriptor and verified startup behavior.
+            #[cfg(target_os = "linux")]
+            let sealed_supported = matches!(&lock, CollectionInputLock::V2(_))
+                && declaration.engine
+                    == rz_search::external_cpu::ExternalEngineProfile::Stockfish19EmbeddedNnue
+                && declaration.arguments.is_empty()
+                && declaration.identity.assets.is_empty()
+                && selection.assets.is_empty();
+            let sealed_requested = sealed_teacher_indices.contains(&selection.index);
+            #[cfg(target_os = "linux")]
+            let sealed_eligible = sealed_requested && sealed_supported;
+            #[cfg(target_os = "linux")]
+            let sealed_preparation_started = Instant::now();
+            #[cfg(target_os = "linux")]
+            let (sealed_executable, sealed_preparation) = if sealed_eligible {
+                let next = sealed_total.checked_add(binary.declaration.bytes);
+                if next.is_none_or(|n| n > SEALED_TEACHER_TOTAL_MAX) {
+                    (
+                        None,
+                        SealedTeacherPreparation::Fallback {
+                            reason: "sealed teacher aggregate limit".into(),
+                            elapsed_ms: Some(sealed_preparation_started.elapsed().as_millis()),
+                        },
+                    )
+                } else {
+                    // All teachers share one optional copy window. It must
+                    // not consume the independent NN's startup budget.
+                    let copy_until = *sealed_copy_deadline.get_or_insert_with(|| {
+                        let now = Instant::now();
+                        let budget = (control.until.saturating_duration_since(now) / 4)
+                            .min(SEALED_TEACHER_PREPARATION_MAX);
+                        now.checked_add(budget).unwrap_or(now)
+                    });
+                    let prepared = rz_search::external_cpu::VerifiedSealedExecutable::prepare(
+                        &binary.file,
+                        &binary.declaration.sha256,
+                        || {
+                            control.check().map_err(|_| {
+                                rz_search::cpu_checker::CheckerError::Invalid(
+                                    "teacher source preload canceled or expired",
+                                )
+                            })?;
+                            if Instant::now() >= copy_until {
+                                return Err(rz_search::cpu_checker::CheckerError::Invalid(
+                                    "sealed teacher preparation budget expired",
+                                ));
+                            }
+                            Ok(())
+                        },
+                    );
+                    // Cancellation and startup expiry are not optional cache misses.
+                    control.check()?;
+                    match prepared {
+                        Ok(value) => {
+                            sealed_total = next.expect("bounded aggregate checked above");
+                            (
+                                Some(value),
+                                SealedTeacherPreparation::Prepared {
+                                    bytes: binary.declaration.bytes,
+                                    elapsed_ms: sealed_preparation_started.elapsed().as_millis(),
+                                },
+                            )
+                        }
+                        Err(error) => (
+                            None,
+                            SealedTeacherPreparation::Fallback {
+                                reason: error.to_string().chars().take(256).collect(),
+                                elapsed_ms: Some(sealed_preparation_started.elapsed().as_millis()),
+                            },
+                        ),
+                    }
+                }
+            } else if sealed_requested {
+                (
+                    None,
+                    SealedTeacherPreparation::Fallback {
+                        reason: "sealed executable unsupported for this teacher profile".into(),
+                        elapsed_ms: Some(sealed_preparation_started.elapsed().as_millis()),
+                    },
+                )
+            } else {
+                (None, SealedTeacherPreparation::NotRequested)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let sealed_preparation = if sealed_requested {
+                SealedTeacherPreparation::Fallback {
+                    reason: "sealed teacher unsupported on this platform".into(),
+                    elapsed_ms: None,
+                }
+            } else {
+                SealedTeacherPreparation::NotRequested
+            };
             let cwd = root
                 .open_dir(&selection.working_directory_snapshot_path)
                 .map_err(|_| invalid("original teacher working-directory descriptor"))?
@@ -300,6 +494,9 @@ impl RoventCollectionPreloadSources {
             teachers.push(PinnedTeacherSource {
                 profile,
                 binary,
+                #[cfg(target_os = "linux")]
+                sealed_executable,
+                sealed_preparation,
                 cwd,
                 assets,
             });
@@ -358,6 +555,34 @@ impl RoventCollectionPreloadSources {
         self.teachers.len()
     }
 
+    /// Borrow source-preparation status without opening a new root or file.
+    /// This is not evidence of a process, teacher result, or physical finish.
+    pub fn sealed_teacher_preparation(
+        &self,
+        index: usize,
+    ) -> Option<(&'static str, Option<&str>, Option<u64>, Option<u128>)> {
+        let status = &self.teachers.get(index)?.sealed_preparation;
+        Some(match status {
+            SealedTeacherPreparation::Prepared { bytes, elapsed_ms } => {
+                ("prepared", None, Some(*bytes), Some(*elapsed_ms))
+            }
+            SealedTeacherPreparation::Fallback { reason, elapsed_ms } => {
+                ("fallback", Some(reason), None, *elapsed_ms)
+            }
+            SealedTeacherPreparation::NotRequested => ("not_requested", None, None, None),
+        })
+    }
+
+    /// The clone shares immutable bytes and execution counters until the
+    /// receipt owner drops it. It does not grant process-start authority.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sealed_teacher_execution_probe(
+        &self,
+        index: usize,
+    ) -> Option<rz_search::external_cpu::VerifiedSealedExecutable> {
+        self.teachers.get(index)?.sealed_executable.clone()
+    }
+
     /// Duplicate only the original retained descriptors for a root's unique
     /// teacher owner. No pathname is reopened and no startup is represented.
     pub fn teacher_sources(
@@ -397,6 +622,9 @@ impl RoventCollectionPreloadSources {
             executable,
             working_directory,
             assets,
+            #[cfg(target_os = "linux")]
+            sealed_executable: source.sealed_executable.clone(),
+            sealed_preparation: source.sealed_preparation.clone(),
             original: Arc::clone(self),
         })
     }
@@ -415,6 +643,15 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn source_selection_keeps_legacy_wire_shape() {
+        let legacy =
+            json!({"index": 0, "working_directory_snapshot_path": "inputs/teacher", "assets": []});
+        let selection: RoventTeacherSourceSelection =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&selection).unwrap(), legacy);
+    }
 
     #[test]
     fn v2_original_lock_and_source_control_cannot_be_replaced_by_equal_values() {

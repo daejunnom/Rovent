@@ -8,6 +8,7 @@ struct LockV2Cli {
     output: std::path::PathBuf,
     worker_ms: u64,
     cleanup_ms: u64,
+    sealed_teacher_slots: Vec<usize>,
     original: Vec<String>,
 }
 
@@ -31,6 +32,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
                     | "--v2-output-dir"
                     | "--v2-worker-timeout-ms"
                     | "--v2-cleanup-timeout-ms"
+                    | "--v2-sealed-teacher-slots"
             ) || value.is_empty()
                 || fields.insert(key.to_owned(), value.to_owned()).is_some()
             {
@@ -60,6 +62,17 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
     let output = std::path::PathBuf::from(take("--v2-output-dir")?);
     let worker_ms = take("--v2-worker-timeout-ms")?.parse::<u64>()?;
     let cleanup_ms = take("--v2-cleanup-timeout-ms")?.parse::<u64>()?;
+    let sealed_teacher_slots = match fields.remove("--v2-sealed-teacher-slots") {
+        None => Vec::new(),
+        Some(value) => {
+            let mut slots = value.split(',').map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()?;
+            if slots.is_empty() || slots.len() > 16 { return Err("sealed teacher slot count exceeds limit".into()); }
+            slots.sort_unstable();
+            slots.dedup();
+            slots
+        }
+    };
     if !input.is_absolute() || !output.is_absolute() || worker_ms == 0 || cleanup_ms < worker_ms {
         return Err(
             "absolute input/output and finite ordered worker/cleanup timeouts required".into(),
@@ -72,6 +85,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
         output,
         worker_ms,
         cleanup_ms,
+        sealed_teacher_slots,
         original,
     }))
 }
@@ -80,7 +94,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
 fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std::error::Error>> {
     use rz_arena::rovent_collect::launch::{
         load_rovent_collection_lock_v2_plan, run_rovent_own_nnuec_collection_lock_v2,
-        run_rovent_pc_collection_lock_v2,
+        run_rovent_pc_collection_lock_v2_with_sealed_policy,
     };
     use std::time::{Duration, Instant};
     let start = Instant::now();
@@ -102,14 +116,20 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         return Err("V2 P/C root capacity must be between 1 and 64".into());
     }
     let publication_timeout_ms = plan.publication_timeout_ms;
+    let sealed_requested = cli.sealed_teacher_slots.clone();
+    let sealed_effective: Vec<_> = sealed_requested.iter().copied()
+        .filter(|&index| cli.mode == "pc" && index < plan.teacher_sources.len()).collect();
+    let sealed_fallback: Vec<_> = sealed_requested.iter().copied()
+        .filter(|index| !sealed_effective.contains(index)).collect();
     let (observation, accepted, publication, publication_error) = match cli.mode.as_str() {
         "pc" => {
-            let mut run = run_rovent_pc_collection_lock_v2(
+            let mut run = run_rovent_pc_collection_lock_v2_with_sealed_policy(
                 cli.original,
                 plan,
                 &directory,
                 worker_until,
                 cleanup_until,
+                sealed_effective.clone(),
             )?;
             while !run.poll_worker() && Instant::now() < cleanup_until {
                 std::thread::sleep(
@@ -181,16 +201,21 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
     // actual durable corpus result. Process-tree completion and enforcement
     // of the native wall deadline remain the external supervisor's evidence.
     let in_process_complete = accepted && publication == "published" && publication_error.is_none();
-    Ok((
-        serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
+    let mut result = serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
         "input_directory":cli.input, "output_directory":cli.output, "worker_timeout_ms":cli.worker_ms,
         "cleanup_timeout_ms":cli.cleanup_ms, "runner_observation":observation,
         "owner_inspection_available":accepted, "publication":publication, "publication_error":publication_error, "training_executed":false,
         "owner_custody":"process_lifetime_only", "durable_recovery":"unavailable",
         "native_execution_deadline":"external_supervisor_required",
-        "cli_acceptance":if in_process_complete { "complete_in_process" } else { "incomplete" }}),
-        in_process_complete,
-    ))
+        "cli_acceptance":if in_process_complete { "complete_in_process" } else { "incomplete" }});
+    if !sealed_requested.is_empty() {
+        result.as_object_mut().expect("CLI observation is an object").insert(
+            "sealed_teacher_selection".into(),
+            serde_json::json!({"requested":sealed_requested,"effective":sealed_effective,
+                "unsupported_or_invalid_fallback":sealed_fallback,"scope":"optional_preparation_only"}),
+        );
+    }
+    Ok((result, in_process_complete))
 }
 
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]

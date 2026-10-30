@@ -39,6 +39,9 @@ pub type RoventOwnBoardCollectionHooksV2 = dyn RoventBoardCollectionHooksV2<
 
 pub(super) struct CollectionLaunchV2<'a> {
     pub(super) teacher_selections: Vec<RoventTeacherSourceSelection>,
+    pub(super) sealed_teacher_indices: Vec<usize>,
+    pub(super) sealed_observations:
+        Option<Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>>,
     pub(super) observer: Box<dyn VirtualReviewCollectionObserver>,
     pub(super) hooks: CollectionHooksV2,
     pub(super) admit_resource:
@@ -47,6 +50,38 @@ pub(super) struct CollectionLaunchV2<'a> {
     pub(super) native_settled: Arc<AtomicBool>,
     pub(super) parsed_storage_selected: Arc<Mutex<Option<bool>>>,
     pub(super) board_product_custody: Arc<Mutex<Option<RoventOwnPcrV2StartupRejection>>>,
+}
+
+/// Immutable-source preparation only; it does not attest teacher execution.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SealedTeacherPreparationObservation {
+    pub source_index: usize,
+    pub status: &'static str,
+    pub failure: Option<String>,
+    pub bytes: Option<u64>,
+    pub elapsed_ms: Option<u64>,
+    /// Kept until the caller snapshots the final receipt. It retains the
+    /// sealed file and original FD but grants no process authority.
+    #[cfg(target_os = "linux")]
+    #[serde(skip)]
+    pub(crate) execution_probe: Option<rz_search::external_cpu::VerifiedSealedExecutable>,
+}
+
+impl SealedTeacherPreparationObservation {
+    /// Counts of sealed spawn-returned and original FD fallback-attempted.
+    /// Neither counter proves physical completion or a teacher result.
+    pub fn actual_execution(&self) -> Option<(u64, u64)> {
+        #[cfg(target_os = "linux")]
+        {
+            self.execution_probe
+                .as_ref()
+                .map(|probe| probe.execution_observations())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
 }
 
 /// Startup/session failure returns the same hook Arc to the caller. It does
@@ -184,6 +219,36 @@ pub fn run_pc_collection_v2_with_resource_admission<'a>(
         Arc::clone(&hooks),
         CollectionHooksV2::Pc(hooks),
         admit_resource,
+        Vec::new(),
+        None,
+    )
+}
+
+/// Opt-in source preparation, for a separately registered execution profile.
+/// Missing observation means unknown and never aborts unrelated NN startup.
+pub fn run_pc_collection_v2_with_sealed_policy<'a>(
+    arguments: Vec<String>,
+    teacher_selections: Vec<RoventTeacherSourceSelection>,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+    hooks: Arc<dyn RoventPcCollectionHooksV2>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
+    mut sealed_teacher_indices: Vec<usize>,
+    sealed_observations: Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>,
+) -> Result<(), RoventPcCollectionLaunchFailureV2> {
+    // Invalid optional slots must not block independent NN work. The caller's
+    // registered request remains separate from the actual source observations.
+    sealed_teacher_indices.retain(|index| *index < teacher_selections.len());
+    sealed_teacher_indices.sort_unstable();
+    sealed_teacher_indices.dedup();
+    run_collection_v2(
+        arguments,
+        teacher_selections,
+        observer,
+        Arc::clone(&hooks),
+        CollectionHooksV2::Pc(hooks),
+        admit_resource,
+        sealed_teacher_indices,
+        Some(sealed_observations),
     )
 }
 
@@ -201,6 +266,8 @@ pub fn run_own_nnuec_collection_v2_with_resource_admission<'a>(
         Arc::clone(&hooks),
         CollectionHooksV2::OwnNnuec(hooks),
         admit_resource,
+        Vec::new(),
+        None,
     )
 }
 
@@ -218,6 +285,8 @@ pub fn run_own_board_collection_v2_with_resource_admission<'a>(
         Arc::clone(&hooks),
         CollectionHooksV2::OwnBoard(hooks),
         admit_resource,
+        Vec::new(),
+        None,
     )
 }
 
@@ -228,6 +297,8 @@ fn run_collection_v2<'a, H: ?Sized>(
     original_hooks: Arc<H>,
     hooks: CollectionHooksV2,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
+    sealed_teacher_indices: Vec<usize>,
+    sealed_observations: Option<Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>>,
 ) -> Result<(), RoventCollectionLaunchFailureV2<H>> {
     let startup_attempt = Arc::new(AtomicBool::new(false));
     let native_settled = Arc::new(AtomicBool::new(false));
@@ -241,6 +312,8 @@ fn run_collection_v2<'a, H: ?Sized>(
             arguments,
             CollectionLaunchV2 {
                 teacher_selections,
+                sealed_teacher_indices,
+                sealed_observations,
                 observer: proxy,
                 hooks,
                 admit_resource: Box::new(admit_resource),

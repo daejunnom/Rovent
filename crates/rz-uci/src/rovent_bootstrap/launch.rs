@@ -72,10 +72,11 @@ pub use collection::{
     RoventBoardProductCustody, RoventCollectionLaunchFailureV2, RoventCollectionPreparedLaunch,
     RoventCollectionPreparedNative, RoventOwnBoardCollectionHooksV2,
     RoventOwnBoardCollectionLaunchFailureV2, RoventOwnNnuecCollectionLaunchFailureV2,
-    RoventPcCollectionLaunchFailureV2, run_collection, run_collection_with_driver,
-    run_collection_with_resource_admission, run_own_board_collection_v2_with_resource_admission,
+    RoventPcCollectionLaunchFailureV2, SealedTeacherPreparationObservation, run_collection,
+    run_collection_with_driver, run_collection_with_resource_admission,
+    run_own_board_collection_v2_with_resource_admission,
     run_own_nnuec_collection_v2_with_resource_admission,
-    run_pc_collection_v2_with_resource_admission,
+    run_pc_collection_v2_with_resource_admission, run_pc_collection_v2_with_sealed_policy,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
@@ -1183,9 +1184,11 @@ fn run_pc_collection_v2_inner<'a>(
     collection: CollectionLaunchV2<'a>,
 ) -> Result<(), RoventLaunchError> {
     let arguments = Arguments::parse(&arguments)?;
-    *collection.parsed_storage_selected.lock().map_err(|_| {
-        error("Arguments", "storage selection observation poisoned")
-    })? = Some(arguments.storage.is_some());
+    *collection
+        .parsed_storage_selected
+        .lock()
+        .map_err(|_| error("Arguments", "storage selection observation poisoned"))? =
+        Some(arguments.storage.is_some());
     let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
     let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
         .map_err(|failure| error("Cwd", failure))?;
@@ -1312,18 +1315,26 @@ fn run_v2_native<'a>(
     let board_product_custody = collection
         .as_ref()
         .map(|request| Arc::clone(&request.board_product_custody));
-    let (teacher_selections, observer, hooks, resource, startup_attempt, native_settled) =
-        match collection {
-            Some(request) => (
-                Some(request.teacher_selections),
-                Some(request.observer),
-                Some(request.hooks),
-                Some(request.admit_resource),
-                Some(request.startup_attempt),
-                Some(request.native_settled),
-            ),
-            None => (None, None, None, None, None, None),
-        };
+    let (
+        teacher_selections,
+        sealed_policy,
+        observer,
+        hooks,
+        resource,
+        startup_attempt,
+        native_settled,
+    ) = match collection {
+        Some(request) => (
+            Some(request.teacher_selections),
+            Some((request.sealed_teacher_indices, request.sealed_observations)),
+            Some(request.observer),
+            Some(request.hooks),
+            Some(request.admit_resource),
+            Some(request.startup_attempt),
+            Some(request.native_settled),
+        ),
+        None => (None, None, None, None, None, None, None),
+    };
     if let Some(resource) = resource {
         control
             .check()
@@ -1353,7 +1364,8 @@ fn run_v2_native<'a>(
     let sources = Arc::new(
         match teacher_selections {
             Some(selections) => {
-                let preload = Arc::new(
+                let (sealed_indices, sealed_observations) = sealed_policy.unwrap_or_default();
+                let preload = if sealed_indices.is_empty() {
                     RoventCollectionPreloadSources::open_v2(
                         Arc::clone(&lock),
                         root.try_clone().map_err(|failure| error("Cwd", failure))?,
@@ -1361,8 +1373,61 @@ fn run_v2_native<'a>(
                         selections,
                         &control,
                     )
-                    .map_err(|failure| error("CollectionSources", failure))?,
-                );
+                } else {
+                    RoventCollectionPreloadSources::open_v2_with_sealed_policy(
+                        Arc::clone(&lock),
+                        root.try_clone().map_err(|failure| error("Cwd", failure))?,
+                        &cwd,
+                        selections,
+                        &control,
+                        &sealed_indices,
+                    )
+                }
+                .map_err(|failure| error("CollectionSources", failure))?;
+                // Optional observability must neither wait on the caller nor
+                // turn an allocation/lock failure into an NN startup failure.
+                if let Some(observations) =
+                    sealed_observations.filter(|_| !sealed_indices.is_empty())
+                {
+                    let mut prepared = Vec::new();
+                    if prepared.try_reserve_exact(preload.teacher_count()).is_ok() {
+                        let mut observation_complete = true;
+                        for source_index in 0..preload.teacher_count() {
+                            if let Some((status, failure, bytes, elapsed_ms)) =
+                                preload.sealed_teacher_preparation(source_index)
+                            {
+                                let failure = if let Some(value) = failure {
+                                    let mut text = String::new();
+                                    if text.try_reserve_exact(value.len()).is_err() {
+                                        observation_complete = false;
+                                        break;
+                                    }
+                                    text.push_str(value);
+                                    Some(text)
+                                } else {
+                                    None
+                                };
+                                prepared.push(SealedTeacherPreparationObservation {
+                                    source_index,
+                                    status,
+                                    failure,
+                                    bytes,
+                                    elapsed_ms: elapsed_ms
+                                        .and_then(|value| u64::try_from(value).ok()),
+                                    #[cfg(target_os = "linux")]
+                                    execution_probe: preload
+                                        .sealed_teacher_execution_probe(source_index),
+                                });
+                            }
+                        }
+                        if observation_complete {
+                            if let Ok(mut target) = observations.try_lock() {
+                                *target = Some(prepared);
+                            }
+                        }
+                    }
+                }
+                let preload = Arc::new(preload);
                 RoventPinnedNativeSources::<RoventInputLockV2>::open_v2_with_collection(
                     Arc::clone(&lock),
                     source_root,
