@@ -89,6 +89,45 @@ pub(super) fn publish_lock_v2_payloads(
     index: &RoventCorpusIndexLockV2,
     admissions: &BTreeMap<String, Arc<LockV2PublicationSource>>,
 ) -> Result<RoventLockV2Publication, ArenaError> {
+    publish_lock_v2_payloads_authorized(directory, until, cancel, manifest, index, admissions, || Ok(()))
+}
+
+#[cfg(feature = "pals-collection-onnx")]
+pub(super) fn publish_lock_v2_payloads_speculative(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    manifest: &RoventCorpusManifestLockV2,
+    index: &RoventCorpusIndexLockV2,
+    admissions: &BTreeMap<String, Arc<LockV2PublicationSource>>,
+    game_gate: &std::sync::atomic::AtomicU64,
+) -> Result<RoventLockV2Publication, ArenaError> {
+    use std::sync::atomic::Ordering;
+    use super::collection_hooks_core_v2::{GAME_HAS_ABORT, GAME_IDLE, GAME_PHASE_MASK, GAME_PUBLICATION_GRANTED};
+    let expected = game_gate.load(Ordering::Acquire);
+    check(expected & (GAME_HAS_ABORT | GAME_PUBLICATION_GRANTED) == 0
+        && expected & GAME_PHASE_MASK == GAME_IDLE,
+        "speculative publication original game is aborted, busy, or already authorized")?;
+    publish_lock_v2_payloads_authorized(directory, until, cancel, manifest, index, admissions, || {
+        // This CAS is the logical publication authorization point. A UCI stop
+        // that sets abort first prevents the final hard-link; a later stop is
+        // ordered after authorization even if file visibility is later.
+        game_gate.compare_exchange(expected, expected | GAME_PUBLICATION_GRANTED,
+            Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| invalid("speculative publication game changed or was aborted"))?;
+        Ok(())
+    })
+}
+
+fn publish_lock_v2_payloads_authorized(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    manifest: &RoventCorpusManifestLockV2,
+    index: &RoventCorpusIndexLockV2,
+    admissions: &BTreeMap<String, Arc<LockV2PublicationSource>>,
+    authorize: impl FnOnce() -> Result<(), ArenaError>,
+) -> Result<RoventLockV2Publication, ArenaError> {
     check(
         !admissions.is_empty(),
         "/2 publication requires original admissions",
@@ -104,7 +143,7 @@ pub(super) fn publish_lock_v2_payloads(
     let manifest_bytes =
         serde_json::to_vec(manifest).map_err(|error| invalid(error.to_string()))?;
     let index_bytes = serde_json::to_vec(index).map_err(|error| invalid(error.to_string()))?;
-    publication::publish_original_payloads(
+    publication::publish_original_payloads_authorized(
         directory,
         until,
         cancel,
@@ -143,5 +182,108 @@ pub(super) fn publish_lock_v2_payloads(
             publication.validate()?;
             Ok(publication)
         },
+        authorize,
     )
+}
+
+
+#[cfg(all(test, target_os = "linux", feature = "pals-collection-onnx"))]
+mod speculative_publication_boundary_tests {
+    use super::*;
+    use super::super::collection_hooks_core_v2::{
+        GAME_HAS_ABORT, GAME_IDLE, GAME_PHASE_MASK, GAME_PUBLICATION_GRANTED,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+    use std::time::{Duration, Instant};
+
+    // This is only a source-byte fixture for the actual filesystem writer;
+    // it cannot construct /2 native admission or a training corpus.
+    struct Source { digest: String }
+    impl publication::PublicationSourceBytes for Source {
+        fn canonical_lock_sha256(&self) -> &str { &self.digest }
+        fn lock_bytes(&self) -> &[u8] { b"{}" }
+        fn runtime_bundle(&self) -> Option<(&rz_experiments::ArtifactRef, &[u8])> { None }
+    }
+
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let parent = std::env::temp_dir().canonicalize().expect("temp directory");
+            loop {
+                let id = NEXT.fetch_add(1, Ordering::Relaxed);
+                let path = parent.join(format!("rovent-publication-boundary-{}-{id}", std::process::id()));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {
+                        std::fs::create_dir(path.join("chunks")).expect("owned chunks directory");
+                        std::fs::create_dir(path.join("input-locks")).expect("owned input lock directory");
+                        return Self(path);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create owned scratch: {error}"),
+                }
+            }
+        }
+        fn directory(&self) -> cap_std::fs::Dir {
+            cap_std::fs::Dir::open_ambient_dir(&self.0, cap_std::ambient_authority()).expect("scratch capability")
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn exercise_boundary(abort_before_grant: bool) {
+        let scratch = Scratch::new();
+        let directory = scratch.directory();
+        let mut sources = BTreeMap::new();
+        sources.insert("original-root".to_owned(), Arc::new(Source { digest: "a".repeat(64) }));
+        let chunks: Vec<rz_experiments::rovent_corpus::RoventCorpusChunk> = Vec::new();
+        let material = publication::RoventPublicationMaterial {
+            manifest_bytes: b"{}", index_bytes: b"{}", chunks: &chunks, admissions: &sources,
+        };
+        let cancel = AtomicBool::new(false);
+        let expected = (GAME_PHASE_MASK + 1) | GAME_IDLE;
+        let gate = AtomicU64::new(expected);
+        let result = publication::publish_original_payloads_authorized(
+            &directory, Instant::now() + Duration::from_secs(30), &cancel, material,
+            |_, _, _, _, _| Ok(serde_json::json!({"test":"publication boundary only"})),
+            || {
+                // Real pending bytes are already durable before authorization;
+                // the visible success link must not exist yet.
+                assert!(directory.open("publication.pending.json").is_ok());
+                assert!(directory.open("publication.json").is_err());
+                if abort_before_grant { gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel); }
+                gate.compare_exchange(expected, expected | GAME_PUBLICATION_GRANTED,
+                    Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(|_| invalid("speculative publication game changed or was aborted"))?;
+                if !abort_before_grant { gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel); }
+                Ok(())
+            },
+        );
+        if abort_before_grant {
+            assert!(result.is_err());
+            assert!(directory.open("publication.pending.json").is_ok());
+            assert!(directory.open("publication.json").is_err());
+            assert_eq!(gate.load(Ordering::Acquire), expected | GAME_HAS_ABORT);
+        } else {
+            // Logical authorization preceded this simulated stop; the actual
+            // link appears afterward. This is not a claim of physical pre-stop
+            // file visibility or complete model/teacher execution.
+            assert!(result.is_ok());
+            assert!(directory.open("publication.pending.json").is_err());
+            assert!(directory.open("publication.json").is_ok());
+            assert_eq!(gate.load(Ordering::Acquire), expected | GAME_PUBLICATION_GRANTED | GAME_HAS_ABORT);
+        }
+    }
+
+    #[test]
+    fn abort_before_authorization_preserves_pending_without_publication() {
+        exercise_boundary(true);
+    }
+
+    #[test]
+    fn abort_after_authorization_does_not_rewrite_the_prior_order() {
+        exercise_boundary(false);
+    }
 }

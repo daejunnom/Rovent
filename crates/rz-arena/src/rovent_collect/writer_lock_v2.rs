@@ -239,6 +239,22 @@ impl FinishedRoventCorpusLockV2 {
         &self.index
     }
 
+    /// Publication authorization for the opt-in speculative collection path.
+    /// The supplied word must be the actual original game owner's gate. An
+    /// abort or root transition before the final CAS leaves pending files only.
+    #[cfg(feature = "pals-collection-onnx")]
+    pub(crate) fn publish_atomic_speculative(
+        &self,
+        directory: &cap_std::fs::Dir,
+        until: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+        game_gate: &std::sync::atomic::AtomicU64,
+    ) -> Result<RoventLockV2Publication, ArenaError> {
+        publication_lock_v2::publish_lock_v2_payloads_speculative(
+            directory, until, cancel, &self.manifest, &self.index, &self.admissions, game_gate,
+        )
+    }
+
     // The original session owner has not yet supplied an unforgeable actor
     // fence and teacher-terminal completion capability. Keep this internal
     // until the lifecycle owner consumes and checks that capability; callers

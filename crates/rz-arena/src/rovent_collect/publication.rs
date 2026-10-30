@@ -488,6 +488,27 @@ pub(super) fn publish_original_payloads<P: serde::Serialize, S: PublicationSourc
         u64,
     ) -> Result<P, ArenaError>,
 ) -> Result<P, ArenaError> {
+    publish_original_payloads_authorized(directory, until, cancel, material, build, || Ok(()))
+}
+
+/// Optional final authorization runs after all prepared bytes have been
+/// synced and immediately before the publication hard-link. Failure leaves
+/// the original pending files; it never creates a success receipt.
+#[cfg(target_os = "linux")]
+pub(super) fn publish_original_payloads_authorized<P: serde::Serialize, S: PublicationSourceBytes>(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    material: RoventPublicationMaterial<'_, S>,
+    build: impl FnOnce(
+        RoventPublicationFile,
+        RoventPublicationFile,
+        Vec<RoventPublicationFile>,
+        Vec<RoventPublicationAdmission>,
+        u64,
+    ) -> Result<P, ArenaError>,
+    authorize: impl FnOnce() -> Result<(), ArenaError>,
+) -> Result<P, ArenaError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use std::io::Read;
     fn io(error: std::io::Error) -> ArenaError {
@@ -664,6 +685,7 @@ pub(super) fn publish_original_payloads<P: serde::Serialize, S: PublicationSourc
     }
     original_directory.sync_all().map_err(io)?;
     active()?;
+    authorize()?;
     directory
         .hard_link(pending, directory, ROVENT_PUBLICATION_FILE)
         .map_err(io)?;

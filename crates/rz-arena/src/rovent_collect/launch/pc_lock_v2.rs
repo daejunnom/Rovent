@@ -533,7 +533,12 @@ impl RoventPcCollectionRunV2 {
             assembly.flush()?;
             let directory = self.publication_dir.as_ref().expect("original output owner");
             let finished = assembly.finish()?;
-            let publication = finished.publish_atomic(directory, until, &AtomicBool::new(false))?;
+            let publication = if self.speculative_teacher_enabled {
+                let gate = self.owner.game_gate();
+                finished.publish_atomic_speculative(directory, until, &AtomicBool::new(false), &gate)?
+            } else {
+                finished.publish_atomic(directory, until, &AtomicBool::new(false))?
+            };
             self.publication = Some(publication);
             Ok(true)
         })();
@@ -656,7 +661,13 @@ impl RoventPcCollectionRunV2 {
                 "P/C game owner and assembled records differ")?;
             assembly.flush()?;
             let directory = self.publication_dir.as_ref().expect("original output owner");
-            self.publication = Some(assembly.finish()?.publish_atomic(directory, until, &AtomicBool::new(false))?);
+            let finished = assembly.finish()?;
+            self.publication = Some(if self.speculative_teacher_enabled {
+                let gate = self.owner.game_gate();
+                finished.publish_atomic_speculative(directory, until, &AtomicBool::new(false), &gate)?
+            } else {
+                finished.publish_atomic(directory, until, &AtomicBool::new(false))?
+            });
             Ok(true)
         })();
         self.publication_assembly = Some(assembly);
@@ -761,7 +772,12 @@ impl RoventPcCollectionRunV2 {
                 // This best-effort path requires the same returned handoff,
                 // native fence, drained receiver and original route identity.
                 // Busy/unknown leaves custody in place without blocking NN.
-                self.bridge.try_unlink_finished_speculative_route(admission);
+                // At most the bounded receiver capacity plus one empty
+                // observation; each call remains nonblocking. Unresolved
+                // contention or custody remains visible in the receipt.
+                for _ in 0..=16 {
+                    if self.bridge.try_unlink_finished_speculative_route(admission) { break; }
+                }
             }
         }
         self.worker_exit.is_some() || self.worker_thread_panicked
@@ -781,6 +797,8 @@ impl RoventPcCollectionRunV2 {
         });
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
+            let (route_unlinked, route_unlink_error) = worker.speculative_route_unlink_observation();
+            let (late_capsules, late_exact_duplicates) = worker.speculative_late_observation();
             let (unlabeled, prepared, failed, committed) = worker.pump_ready_counts();
             let stages = worker.pump_stage_counts().map(|v| json!({
                 "queued":v.queued, "unlabeled":v.unlabeled, "transition_unknown":v.transition_unknown,
@@ -792,6 +810,10 @@ impl RoventPcCollectionRunV2 {
                 "additional_failures":failures.additional.iter().map(|failure|failure.kind()).collect::<Vec<_>>(),
                 "omitted_failures":failures.omitted,
                 "pending_pump_rows":worker.pending_pump_rows(),
+                "speculative_route_unlinked":route_unlinked,
+                "speculative_route_unlink_error":route_unlink_error,
+                "speculative_late_capsules_retained":late_capsules,
+                "speculative_late_exact_duplicates":late_exact_duplicates,
                 "pump_stages":stages,
                 "teacher_startup_observations_debug":format!("{:?}", worker.teacher_startups()),
                 "ready_unlabeled":unlabeled,"ready_prepared":prepared,"ready_failed":failed,"ready_committed":committed,
@@ -872,6 +894,7 @@ impl RoventPcCollectionRunV2 {
             observation.as_object_mut().expect("P/C observation object").insert(
                 "speculative_teacher".into(), json!({"requested":true,
                     "enabled":self.speculative_teacher_enabled,
+                    "publication_authorization":if self.pump_published { "game_gate_cas_before_hard_link" } else { "not_confirmed" },
                     "setup_error":self.speculative_teacher_setup_error,
                     "secondary_setup_errors":self.secondary_slots.iter().enumerate().filter_map(|(index, slot)|
                         slot.speculative_setup_error.as_ref().map(|error| json!({"slot":index+1,"error":error}))).collect::<Vec<_>>(),

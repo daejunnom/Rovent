@@ -345,12 +345,21 @@ impl RoventPcCollectionBridgeV2 {
     /// Inspect only the same joined/returned root. This confirms the native
     /// fence and observer settlement but does not publish any retained row.
     pub(crate) fn returned_handoff_settled(&self) -> Result<bool, AdaptiveManagerError> {
+        self.returned_handoff_fenced(true)
+    }
+
+    /// Cleanup-only proof; it does not relax the strict publication check.
+    fn returned_handoff_fenced(&self, require_semantic_success: bool) -> Result<bool, AdaptiveManagerError> {
         let slot = match self.worker.try_lock() {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 worker custodian poisoned; original retained")),
         };
         let Some(owner) = slot.as_ref() else { return Ok(false); };
+        if !require_semantic_success && (owner.panic.is_some()
+            || !matches!(owner.exit_kind, Some(PcWorkerExitKindV2::Retirement | PcWorkerExitKindV2::Aggregate))) {
+            return Ok(false);
+        }
         let Some(custody) = &owner.returned else { return Ok(false); };
         let custody = match custody.try_lock() {
             Ok(custody) => custody,
@@ -364,7 +373,9 @@ impl RoventPcCollectionBridgeV2 {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("PC V2 original worker poisoned; original retained")),
         };
-        if core.has_failure() || !core.original_handoff().is_some_and(|actual| Arc::ptr_eq(&actual, custody.handoff())) { return Ok(false); }
+        if (require_semantic_success && core.has_failure())
+            || (!require_semantic_success && !core.cleanup_failure_is_known())
+            || !core.original_handoff().is_some_and(|actual| Arc::ptr_eq(&actual, custody.handoff())) { return Ok(false); }
         let mut handoff = match custody.handoff().try_lock() {
             Ok(handoff) => handoff,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
@@ -380,7 +391,7 @@ impl RoventPcCollectionBridgeV2 {
     pub(crate) fn try_unlink_finished_speculative_route(&self, admission: &RoventCollectionRootAdmissionV2) -> bool {
         if !self.core.installed_admission_for_recovery()
             .is_some_and(|original| original.same_original_admission(admission))
-            || !matches!(self.returned_handoff_settled(), Ok(true)) { return false; }
+            || !matches!(self.returned_handoff_fenced(false), Ok(true)) { return false; }
         let Ok(slot) = self.worker.try_lock() else { return false; };
         let Some(worker) = slot.as_ref() else { return false; };
         if worker.returned.is_none() || worker.handle.is_some() || worker.panic.is_some() { return false; }
@@ -402,12 +413,12 @@ impl RoventPcCollectionBridgeV2 {
             .is_some_and(|original| original.same_original_admission(admission)) {
             return Err(super::invalid("P/C root separation original admission mismatch"));
         }
+        // Cleanup has its own physical proof and may succeed despite a known
+        // semantic failure. It never substitutes for strict root separation.
+        let _route_unlinked = self.try_unlink_finished_speculative_route(admission);
         if !self.returned_handoff_settled().map_err(|error| super::invalid(format!("P/C original handoff: {error:?}")))? {
             return Ok(PcRootSeparationV2::Pending);
         }
-        // Unlinking is optional maintenance; inability to prove it must not
-        // hold up root separation or a later native search.
-        let _route_unlinked = self.try_unlink_finished_speculative_route(admission);
         let mut slot = match self.worker.try_lock() {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(PcRootSeparationV2::Pending),

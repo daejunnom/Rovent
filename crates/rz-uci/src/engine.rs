@@ -1937,6 +1937,12 @@ impl Owner {
                         &self.clock,
                     )?;
                     context.original_start = Some(Arc::clone(&original_start));
+                    if let Err(error) = self.session_owner.bind_original_start(&ticket, Arc::clone(&original_start)) {
+                        // This optional Collection association is not part of
+                        // driver admission; retain the failure for its later
+                        // binding and leave the existing search path intact.
+                        original_start.mark_collection_owner_binding_failed(error);
+                    }
                     let driver_output = Arc::new(DriverOutputEnvelope::new(
                         original_start.ticket().clone(),
                         search_authority,

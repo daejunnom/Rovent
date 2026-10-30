@@ -66,6 +66,22 @@ pub(crate) enum FailedEvidence {
 }
 
 impl FailedEvidence {
+    /// Only explicit physical-unknown, poison, mismatch and panic evidence
+    /// blocks route cleanup; a known semantic failure is still retained.
+    pub(crate) fn has_uncertain_cleanup(&self) -> bool {
+        match self {
+            Self::Captured { failure, .. } => failure.has_uncertain_cleanup(),
+            Self::Pending { .. } | Self::PendingMismatched { .. } | Self::Quarantined(_) | Self::CapturedMismatch(_)
+            | Self::PreparationPanicked { .. } | Self::CapturedJoinPanicked { .. } => true,
+            Self::SealRejected { cause, .. } => match cause {
+                TeacherPolicySealFailureV2::Panicked(_) | TeacherPolicySealFailureV2::Validation(_) => true,
+                TeacherPolicySealFailureV2::Native { kind, .. } => matches!(kind,
+                    RoventTeacherPolicySealFailureKindV2::Poisoned | RoventTeacherPolicySealFailureKindV2::Invalid),
+            },
+            Self::BeforeCompletion | Self::SubmitPending(_) | Self::PendingCompleted { .. }
+            | Self::Completion(_) | Self::Sealed(_) => false,
+        }
+    }
     /// Read-only description. The actual completion and authority remain
     /// with this failure; this text is never a substitute for either.
     pub(crate) fn diagnostic(&self) -> String {
@@ -139,7 +155,7 @@ pub(crate) struct RetiredRowPumpV2 {
     entries: VecDeque<Entry>,
     captured: VecDeque<CapturedEntry>,
     seen_retired: BTreeMap<rz_contracts::RequestId, (rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
-        std::sync::Arc<()>, super::super::RoventSubmittedInputSeal)>,
+        std::sync::Arc<()>, super::super::RoventSubmittedInputSeal, bool)>,
     constraint: ExternalGoConstraint,
     soft_quantum: Duration,
     overflow_count: u64,
@@ -329,7 +345,7 @@ impl RetiredRowPumpV2 {
                 return Err(Box::new((invalid("captured teacher input and retired row differ or repeat"), row)));
             }
             self.seen_retired.insert(row.ticket().id,
-                (row.admission.clone(), std::sync::Arc::clone(&row.producer_owner), row.submitted_input_seal()));
+                (row.admission.clone(), std::sync::Arc::clone(&row.producer_owner), row.submitted_input_seal(), true));
             captured.row = Some(row);
             return Ok(());
         }
@@ -357,13 +373,24 @@ impl RetiredRowPumpV2 {
         };
         let deadline = deadline.min(self.observation_deadline);
         self.seen_retired.insert(row.ticket().id,
-            (row.admission.clone(), std::sync::Arc::clone(&row.producer_owner), row.submitted_input_seal()));
+            (row.admission.clone(), std::sync::Arc::clone(&row.producer_owner), row.submitted_input_seal(), false));
         self.entries.push_back(Entry {
             row,
             deadline,
             stage: Stage::Queued,
         });
         Ok(())
+    }
+
+    /// A late capsule may be discarded as a duplicate only when the real
+    /// retired path already retained the exact original producer identity.
+    /// This never dispatches a teacher or establishes completion.
+    pub(crate) fn is_exact_retired_duplicate(
+        &self, capsule: &super::super::producer_v2::SubmittedTeacherQueryV2,
+    ) -> bool {
+        let ticket = capsule.ticket();
+        self.seen_retired.get(&ticket.id).is_some_and(|(admission, producer, seal, via_captured)|
+            !*via_captured && capsule.matches_original_identity(admission, producer, seal).is_ok())
     }
 
     pub(crate) fn can_enqueue_row(&self, row: &RoventRetiredLockV2Record) -> bool {
@@ -384,9 +411,14 @@ impl RetiredRowPumpV2 {
         capsule: super::super::producer_v2::SubmittedTeacherQueryV2,
     ) -> Result<(), Box<(ArenaError, super::super::producer_v2::SubmittedTeacherQueryV2)>> {
         let seal = capsule.input_seal();
-        if let Some((admission, producer, original)) = self.seen_retired.get(&seal.ticket.id) {
-            // The real retired path already owns this exact input. Avoid a
-            // duplicate teacher job; no new target or completion is claimed.
+        if let Some((admission, producer, original, via_captured)) = self.seen_retired.get(&seal.ticket.id) {
+            // A captured-path job could be active: keep the duplicate as
+            // unknown rather than discarding possible physical evidence.
+            if *via_captured {
+                return Err(Box::new((invalid("captured-path duplicate remains in custody"), capsule)));
+            }
+            // The legacy retired path owns this exact input. Avoid a duplicate
+            // teacher job; no new target or completion is claimed.
             return match capsule.matches_original_identity(admission, producer, original) {
                 Ok(()) => Ok(()),
                 Err(error) => Err(Box::new((error, capsule))),
@@ -408,6 +440,18 @@ impl RetiredRowPumpV2 {
     }
 
     /// Observe transitions of the same original front item without moving it.
+    pub(crate) fn has_uncertain_failure(&self) -> bool {
+        self.pending_failure || self.entries.iter().any(|entry| match &entry.stage {
+            Stage::TransitionUnknown | Stage::Pending { .. } => true,
+            Stage::Failed { evidence, .. } => evidence.has_uncertain_cleanup(),
+            _ => false,
+        }) || self.captured.iter().any(|entry| match &entry.stage {
+            CapturedStage::TransitionUnknown | CapturedStage::Pending { .. } => true,
+            CapturedStage::Failed { evidence, .. } => evidence.has_uncertain_cleanup(),
+            _ => false,
+        })
+    }
+
     pub(crate) fn captured_len(&self) -> usize { self.captured.len() }
     pub(crate) fn retired_len(&self) -> usize { self.entries.len() }
 

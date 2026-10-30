@@ -29,6 +29,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+pub(super) const SPECULATIVE_QUERY_QUEUE_CAPACITY: usize = 16;
+
 const RESERVING: u8 = 0;
 const INSTALLED: u8 = 1;
 const REJECTED: u8 = 2;
@@ -41,12 +43,27 @@ const ADMISSION_COMMITTING: u8 = 5;
 
 // One shared word per actual game owner. The upper bits are a monotonic
 // generation, so a late root cannot release a newer root's state.
-const GAME_PHASE_MASK: u64 = 7;
-const GAME_IDLE: u64 = 0;
+pub(super) const GAME_PHASE_MASK: u64 = 7;
+// Sticky control bits do not count as root generation or change its phase.
+// They preserve partial collection without stopping later independent roots.
+pub(super) const GAME_HAS_ABORT: u64 = rz_uci::search_driver::ROVENT_COLLECTION_ABORT_BIT;
+pub(super) const GAME_PUBLICATION_GRANTED: u64 = 1u64 << 62;
+const GAME_CONTROL_BITS: u64 = GAME_HAS_ABORT | GAME_PUBLICATION_GRANTED;
+pub(super) const GAME_IDLE: u64 = 0;
 const GAME_INSTALLING: u64 = 1;
 const GAME_ACTIVE: u64 = 2;
 const GAME_COMMITTING: u64 = 3;
 const GAME_UNKNOWN: u64 = 4;
+
+// Only the original stop bit may change while this generation owns COMMIT.
+// Never clear it when returning the game to its preceding phase.
+fn release_game_commit(gate: &AtomicU64, commit: u64, restore: u64) {
+    if let Err(actual) = gate.compare_exchange(commit, restore, Ordering::AcqRel, Ordering::Acquire) {
+        if actual == (commit | GAME_HAS_ABORT) {
+            let _ = gate.compare_exchange(actual, restore | GAME_HAS_ABORT, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoreUnstartedSealV2 { Sealed, Busy, Unknown }
@@ -66,8 +83,16 @@ impl GameInstallGuard<'_> {
     fn enter(&mut self) { self.install_entered = true; }
     fn mark_installed(&mut self) -> Result<(), AdaptiveManagerError> {
         let expected = self.generation | GAME_INSTALLING;
-        self.gate.compare_exchange(expected, self.generation | GAME_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| AdaptiveManagerError::Invalid("Collection game installation state changed"))?;
+        match self.gate.compare_exchange(expected, self.generation | GAME_ACTIVE, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {},
+            // The optional UCI abort may race this completed installation.
+            // It changes no generation or phase, so preserve its sticky bit.
+            Err(actual) if actual == (expected | GAME_HAS_ABORT) => {
+                self.gate.compare_exchange(actual, self.generation | GAME_HAS_ABORT | GAME_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(|_| AdaptiveManagerError::Invalid("Collection game installation state changed"))?;
+            }
+            Err(_) => return Err(AdaptiveManagerError::Invalid("Collection game installation state changed")),
+        }
         self.installed = true;
         Ok(())
     }
@@ -76,7 +101,12 @@ impl Drop for GameInstallGuard<'_> {
     fn drop(&mut self) {
         if self.installed { return; }
         let replacement = self.generation | if self.install_entered { GAME_UNKNOWN } else { GAME_IDLE };
-        let _ = self.gate.compare_exchange(self.generation | GAME_INSTALLING, replacement, Ordering::AcqRel, Ordering::Acquire);
+        let expected = self.generation | GAME_INSTALLING;
+        if let Err(actual) = self.gate.compare_exchange(expected, replacement, Ordering::AcqRel, Ordering::Acquire) {
+            if actual == (expected | GAME_HAS_ABORT) {
+                let _ = self.gate.compare_exchange(actual, replacement | GAME_HAS_ABORT, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
     }
 }
 
@@ -87,8 +117,11 @@ fn try_game_install(gate: &AtomicU64) -> Result<GameInstallAttempt<'_>, Adaptive
         GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING => return Ok(GameInstallAttempt::Busy),
         _ => return Ok(GameInstallAttempt::Unknown),
     }
-    let generation = (previous & !GAME_PHASE_MASK).checked_add(GAME_PHASE_MASK + 1)
-        .ok_or(AdaptiveManagerError::Invalid("Collection game generation exhausted"))?;
+    let generation = (previous & !(GAME_PHASE_MASK | GAME_CONTROL_BITS))
+        .checked_add(GAME_PHASE_MASK + 1)
+        .filter(|generation| generation & GAME_CONTROL_BITS == 0)
+        .ok_or(AdaptiveManagerError::Invalid("Collection game generation exhausted"))?
+        | (previous & GAME_CONTROL_BITS);
     match gate.compare_exchange(previous, generation | GAME_INSTALLING, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Ok(GameInstallAttempt::Ready(GameInstallGuard { gate, generation, install_entered: false, installed: false })),
         Err(actual) => match actual & GAME_PHASE_MASK {
@@ -166,9 +199,7 @@ impl<H> Drop for RoventCollectionCommitGateV2<'_, H> {
         let _ = self.core.admission_phase.compare_exchange(
             ADMISSION_COMMITTING, ADMISSION_INSTALLED, Ordering::AcqRel, Ordering::Acquire,
         );
-        let _ = self.core.game_gate.compare_exchange(
-            self.game_commit, self.game_restore, Ordering::AcqRel, Ordering::Acquire,
-        );
+        release_game_commit(&self.core.game_gate, self.game_commit, self.game_restore);
     }
 }
 
@@ -256,16 +287,22 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         }
         let generation = self.game_generation.load(Ordering::Acquire);
         if generation == 0 { return Err(ArenaError::Invalid("Collection game release generation unavailable".into())); }
+        let same_generation = |word: u64| (word & !GAME_CONTROL_BITS) == (generation & !GAME_CONTROL_BITS);
         let current = self.game_gate.load(Ordering::Acquire);
-        if current == (generation | GAME_IDLE) { return Ok(true); }
-        if current == (generation | GAME_COMMITTING) { return Ok(false); }
-        if current != (generation | GAME_ACTIVE) {
+        if same_generation(current & !GAME_PHASE_MASK) && current & GAME_PHASE_MASK == GAME_IDLE { return Ok(true); }
+        if same_generation(current & !GAME_PHASE_MASK) && current & GAME_PHASE_MASK == GAME_COMMITTING { return Ok(false); }
+        if !same_generation(current & !GAME_PHASE_MASK) || current & GAME_PHASE_MASK != GAME_ACTIVE {
             return Err(ArenaError::Invalid("Collection game release generation or state mismatch".into()));
         }
-        match self.game_gate.compare_exchange(current, generation | GAME_IDLE, Ordering::AcqRel, Ordering::Acquire) {
+        let idle = (current & !GAME_PHASE_MASK) | GAME_IDLE;
+        match self.game_gate.compare_exchange(current, idle, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Ok(true),
-            Err(actual) if actual == (generation | GAME_COMMITTING) => Ok(false),
-            Err(actual) if actual == (generation | GAME_IDLE) => Ok(true),
+            // The original stop may have set the sticky bit while release was
+            // attempted. Retry on the caller's normal bounded polling path.
+            Err(actual) if same_generation(actual & !GAME_PHASE_MASK)
+                && matches!(actual & GAME_PHASE_MASK, GAME_ACTIVE | GAME_COMMITTING) => Ok(false),
+            Err(actual) if same_generation(actual & !GAME_PHASE_MASK)
+                && actual & GAME_PHASE_MASK == GAME_IDLE => Ok(true),
             Err(_) => Err(ArenaError::Invalid("Collection game release raced or state unknown".into())),
         }
     }
@@ -299,12 +336,16 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             return Err(ArenaError::Invalid("commit does not match the original closed collection root".into()));
         }
         let previous = self.game_gate.load(Ordering::Acquire);
+        if self.speculative_enabled.load(Ordering::Acquire) && previous & GAME_HAS_ABORT != 0 {
+            return Err(ArenaError::Invalid("original speculative Collection authority was canceled".into()));
+        }
         let phase = previous & GAME_PHASE_MASK;
         let generation = self.game_generation.load(Ordering::Acquire);
         if !matches!(phase, GAME_IDLE | GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING) {
             return Err(ArenaError::Invalid("Collection game owner state unknown".into()));
         }
-        if phase != GAME_IDLE && !(phase == GAME_ACTIVE && previous & !GAME_PHASE_MASK == generation) {
+        if phase != GAME_IDLE && !(phase == GAME_ACTIVE
+            && (previous & !(GAME_PHASE_MASK | GAME_CONTROL_BITS)) == (generation & !GAME_CONTROL_BITS)) {
             return Ok(None);
         }
         let commit = (previous & !GAME_PHASE_MASK) | GAME_COMMITTING;
@@ -314,11 +355,11 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         match self.admission_phase.compare_exchange(ADMISSION_INSTALLED, ADMISSION_COMMITTING, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Ok(Some(RoventCollectionCommitGateV2 { core: self, admission: admission.clone(), game_commit: commit, game_restore: previous })),
             Err(ADMISSION_COMMITTING) => {
-                let _ = self.game_gate.compare_exchange(commit, previous, Ordering::AcqRel, Ordering::Acquire);
+                release_game_commit(&self.game_gate, commit, previous);
                 Ok(None)
             }
             Err(_) => {
-                let _ = self.game_gate.compare_exchange(commit, previous, Ordering::AcqRel, Ordering::Acquire);
+                release_game_commit(&self.game_gate, commit, previous);
                 Err(ArenaError::Invalid("original collection admission is not commit-ready".into()))
             }
         }
@@ -401,9 +442,12 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             speculative_route: None,
             speculative_install_issue: None,
             speculative_rejected: None,
+            speculative_late: VecDeque::with_capacity(SPECULATIVE_QUERY_QUEUE_CAPACITY),
+            speculative_late_duplicates: 0,
             speculative_received: 0,
             speculative_route_unlinked: false,
             speculative_unlink_issue: None,
+            pump_uncertain_evidence_handed_off: false,
             pump_failed: false,
             pending_drain_failed: false,
             admission_receiver,
@@ -606,7 +650,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         let (speculative, speculative_install_issue) = if self.speculative_enabled.load(Ordering::Acquire) {
             match self.owner.try_status() {
                 Ok(Some(status)) => match self.owner.capture_registration().try_install_speculative_root(
-                    &admission, 16, status.game_record_limit.min(65_536)) {
+                    &admission, SPECULATIVE_QUERY_QUEUE_CAPACITY, status.game_record_limit.min(65_536)) {
                     Ok(Some(route)) => (Some(route), None),
                     Ok(None) => (None, Some("speculative root installation busy".into())),
                     Err(error) => (None, Some(error.to_string())),
@@ -640,6 +684,35 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                 AdaptiveManagerError::Capacity("Collection V2 admission outbox"),
                 admission,
             ));
+        }
+        // Connect only the opt-in route to this actual UCI Start. A failed or
+        // raced binding invalidates optional collection, never native search.
+        let abort_binding_issue = match slot.speculative.try_lock() {
+            Ok(speculative) => match speculative.as_ref() {
+                Some((route, _)) => {
+                    match admission.root_admission().original_context().bind_original_collection_abort(
+                        Arc::clone(&self.game_gate), route.target_revoke_flag(),
+                    ) {
+                        Ok(()) => None,
+                        Err(error) => {
+                            route.revoke_all_targets();
+                            self.game_gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel);
+                            Some(format!("original Start collection abort binding: {error}"))
+                        }
+                    }
+                }
+                None => None,
+            },
+            Err(_) => {
+                self.game_gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel);
+                Some("speculative abort binding owner unavailable".to_owned())
+            }
+        };
+        if let Some(issue) = abort_binding_issue {
+            match slot.speculative_install_issue.try_lock() {
+                Ok(mut stored) if stored.is_none() => *stored = Some(issue),
+                _ => slot.speculative_issue_unknown.store(true, Ordering::Release),
+            }
         }
         // Bind the exact route before observer installation; a failed optional
         // bind remains an observation and does not stop native execution.
@@ -871,9 +944,12 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     speculative_route: Option<super::native_capture::SpeculativeRootV2>,
     speculative_install_issue: Option<String>,
     speculative_rejected: Option<Box<(ArenaError, super::producer_v2::SubmittedTeacherQueryV2)>>,
+    speculative_late: VecDeque<super::producer_v2::SubmittedTeacherQueryV2>,
+    speculative_late_duplicates: usize,
     speculative_received: usize,
     speculative_route_unlinked: bool,
     speculative_unlink_issue: Option<String>,
+    pump_uncertain_evidence_handed_off: bool,
     pump_failed: bool,
     pending_drain_failed: bool,
     admission_receiver: mpsc::Receiver<Arc<AdmissionSlot>>,
@@ -978,7 +1054,7 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         self.pump.as_ref().is_some_and(|pump| pump.len() != 0)
             || !self.pump_ready.is_empty() || self.pump_rejected.is_some()
             || self.pump_waiting_row.is_some() || self.speculative_rejected.is_some()
-            || !self.speculative_capture_complete()
+            || !self.speculative_late.is_empty() || !self.speculative_capture_complete()
     }
 
     /// This is only a capture handoff observation. Sent is not teacher
@@ -1001,8 +1077,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     }
 
     /// Called only with the original PC joined-handoff/native-fence proof.
-    /// A late capsule is retained, never discarded, and cleanup is deferred.
-    /// The route Arc and its ledger remain owned by this worker after unlink.
+    /// Exact legacy-retired duplicates are counted without redispatch; every
+    /// other late capsule is retained and cleanup deferred. The route Arc and
+    /// its ledger remain owned by this worker after unlink.
     pub(super) fn try_unlink_finished_speculative_route(
         &mut self, proof: &super::pc_hooks_lock_v2::PcSpeculativeRouteFenceV2,
     ) -> bool {
@@ -1010,12 +1087,27 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         let Some(route) = self.speculative_route.as_ref() else { return true; };
         let Some(slot) = self.slot.as_ref() else { return false; };
         if !proof.matches(&slot.admission) || !route.matches_admission(&slot.admission) { return false; }
-        if self.speculative_rejected.is_some() { return false; }
+        // The source channel itself is bounded to 16. Preserve any late
+        // capsules in the original worker and advance at most one per call.
+        // A seventeenth unexpected item uses the existing overflow custody.
+        if self.speculative_late.len() >= SPECULATIVE_QUERY_QUEUE_CAPACITY && self.speculative_rejected.is_some() { return false; }
+        if self.speculative_late.len() < SPECULATIVE_QUERY_QUEUE_CAPACITY && self.speculative_late.try_reserve(1).is_err() {
+            self.speculative_unlink_issue = Some("late speculative custody allocation failed".into());
+            return false;
+        }
         let Some(receiver) = self.speculative_receiver.as_ref() else { return false; };
         match receiver.try_recv() {
             Ok(capsule) => {
                 self.speculative_received = self.speculative_received.saturating_add(1);
-                self.speculative_rejected = Some(Box::new((invalid("speculative capsule arrived after joined worker"), capsule)));
+                if self.pump.as_ref().is_some_and(|pump| pump.is_exact_retired_duplicate(&capsule)) {
+                    self.speculative_late_duplicates = self.speculative_late_duplicates.saturating_add(1);
+                    return false;
+                }
+                if self.speculative_late.len() < SPECULATIVE_QUERY_QUEUE_CAPACITY {
+                    self.speculative_late.push_back(capsule);
+                } else {
+                    self.speculative_rejected = Some(Box::new((invalid("speculative late channel exceeds original capacity"), capsule)));
+                }
                 return false;
             }
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {},
@@ -1033,11 +1125,15 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     pub(crate) fn speculative_route_unlink_observation(&self) -> (bool, Option<&str>) {
         (self.speculative_route_unlinked, self.speculative_unlink_issue.as_deref())
     }
+    pub(crate) fn speculative_late_observation(&self) -> (usize, usize) {
+        (self.speculative_late.len(), self.speculative_late_duplicates)
+    }
 
     pub(crate) fn pending_pump_rows(&self) -> usize {
         self.pump.as_ref().map_or(0, RetiredRowPumpV2::len)
             + self.pump_ready.len() + usize::from(self.pump_rejected.is_some())
             + usize::from(self.pump_waiting_row.is_some()) + usize::from(self.speculative_rejected.is_some())
+            + self.speculative_late.len()
     }
 
     pub(crate) fn pump_stage_counts(&self) -> Option<super::teacher::lock_v2_row_pump::PumpStageCountsV2> {
@@ -1064,6 +1160,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         sender: &mpsc::SyncSender<PumpItemV2>,
     ) -> Result<PumpSendOutcomeV2, ArenaError> {
         let Some(item) = self.pump_ready.front() else { return Ok(PumpSendOutcomeV2::Empty); };
+        if let PumpItemV2::Failed { evidence, .. } = item {
+            self.pump_uncertain_evidence_handed_off |= evidence.has_uncertain_cleanup();
+        }
         let row = match item {
             PumpItemV2::Unlabeled { row } | PumpItemV2::Prepared { row, .. }
             | PumpItemV2::Committed { row, .. } | PumpItemV2::Failed { row, .. } => row,
@@ -1835,6 +1934,22 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
 
     pub(crate) fn has_failure(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    /// Routing cleanup may outlive a known semantic collection failure, but
+    /// never treats missing failure detail or panic/poison as physical proof.
+    pub(super) fn cleanup_failure_is_known(&self) -> bool {
+        if self.omitted_failures != 0 || self.pump_uncertain_evidence_handed_off
+            || self.pump_rejected.is_some() || self.speculative_rejected.is_some()
+            || self.pump_ready.iter().any(|item| matches!(item,
+                PumpItemV2::Failed { evidence, .. } if evidence.has_uncertain_cleanup()))
+            || self.pump.as_ref().is_some_and(|pump| pump.has_uncertain_failure()) { return false; }
+        let known = |failure: &WorkerFailure| matches!(failure,
+            WorkerFailure::RootClosedBeforeStartup | WorkerFailure::RowPumpInputRejected);
+        match &self.failure {
+            Some(failure) => known(failure) && self.additional_failures.iter().all(known),
+            None => !self.failed.load(Ordering::Acquire) && self.additional_failures.is_empty(),
+        }
     }
 
     /// The proof only describes the original external-process scope. It is

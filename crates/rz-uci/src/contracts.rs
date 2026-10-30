@@ -2,7 +2,7 @@
 //! 실제 Rules/registry는 caller가 공급한다. 이 owner는 체스 상태나 digest를 만들지
 //! 않으며 Runtime의 raw-cache namespace 초기화와 물리 buffer drain을 대체하지 않는다.
 
-use std::{collections::VecDeque, time::Instant};
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use rz_contracts::{
     AcceptanceScope, Color, ContractError, ErrorCode, GameGeneration, ProcessEpoch, RootGeneration,
@@ -99,6 +99,8 @@ impl<S> From<SessionResult<S>> for ContractSessionOutcome<S> {
 }
 
 struct CurrentSearch {
+    // Same actual UCI Start used by the active driver; absent for legacy paths.
+    original_start: Option<Arc<crate::engine::DriverStartSource>>,
     binding: SearchBinding,
     cancellation: ContractCancellation,
     deadlines: ContractDeadlines,
@@ -223,6 +225,20 @@ impl ContractSessionOwner {
             mirror_cancel(c);
             &c.binding
         })
+    }
+    /// Bind only the original active ticket's concrete Start owner. This is
+    /// optional for legacy drivers and never constructs search authority.
+    pub(crate) fn bind_original_start(
+        &mut self,
+        ticket: &SearchTicket,
+        source: Arc<crate::engine::DriverStartSource>,
+    ) -> Result<(), ContractError> {
+        let current = self.current.as_mut().ok_or_else(|| error(ErrorCode::Stale, "original Start has no active owner"))?;
+        if current.binding.ticket() != ticket || source.ticket() != ticket || current.original_start.is_some() {
+            return Err(error(ErrorCode::IdentityMismatch, "original Start differs from active owner"));
+        }
+        current.original_start = Some(source);
+        Ok(())
     }
     pub fn control(&self) -> Option<&SearchControl> {
         self.active_binding().map(SearchBinding::control)
@@ -414,6 +430,16 @@ impl ContractSessionOwner {
         if !out.session.accepted {
             return out;
         }
+        // Session has already accepted the command and produced concrete
+        // effects. Close the exact original Start's optional Collection gate
+        // before its common cancel token, never for a rejected command or a
+        // natural completion lacking a matching Cancel effect.
+        if out.session.effects.iter().any(|effect| matches!(effect,
+            Effect::Cancel { ticket, .. } if previous_ticket.as_ref() == Some(ticket))) {
+            if let Some(start) = self.current.as_ref().and_then(|current| current.original_start.as_ref()) {
+                start.abort_collection();
+            }
+        }
         if let Some((game, root)) = next {
             self.close_current();
             self.scope.set_generations(game, root);
@@ -435,6 +461,7 @@ impl ContractSessionOwner {
                     let binding = binding.bind(ticket.clone());
                     let cancellation = ContractCancellation::from_control(binding.control());
                     Ok(CurrentSearch {
+                        original_start: None,
                         binding,
                         deadlines,
                         cancellation,
@@ -473,6 +500,7 @@ impl ContractSessionOwner {
                             ContractDeadlines::from_budget(&self.clock, binding.budget())?;
                         let cancellation = ContractCancellation::from_control(binding.control());
                         Ok(CurrentSearch {
+                            original_start: None,
                             binding,
                             deadlines,
                             cancellation,
@@ -570,6 +598,9 @@ impl ContractSessionOwner {
                 ));
             }
             Event::EndOfInput => {
+                if let Some(start) = self.current.as_ref().and_then(|current| current.original_start.as_ref()) {
+                    start.abort_collection();
+                }
                 self.close_current();
                 handle_event(session, Event::EndOfInput).into()
             }
@@ -675,6 +706,7 @@ impl ContractSessionOwner {
             Err(err) if err.code == ErrorCode::Expired && current.work_completed => {
                 // Only a reached timer may close passive infinite authority.
                 // Completed output waiting never becomes a new resource failure.
+                if let Some(start) = &current.original_start { start.abort_collection(); }
                 current.cancellation.cancel();
                 SessionResult::default().into()
             }
@@ -800,6 +832,11 @@ impl ContractSessionOwner {
 
 impl Drop for ContractSessionOwner {
     fn drop(&mut self) {
+        // An owner dropped with an active Start is an abort, not a natural
+        // synchronization close; preserve its optional Collection failure.
+        if let Some(start) = self.current.as_ref().and_then(|current| current.original_start.as_ref()) {
+            start.abort_collection();
+        }
         self.close_current();
     }
 }
@@ -922,6 +959,7 @@ fn expire_current<P: PositionPort>(
     current: &mut CurrentSearch,
     err: ContractError,
 ) -> ContractSessionOutcome<P::Snapshot> {
+    if let Some(start) = &current.original_start { start.abort_collection(); }
     current.cancellation.cancel();
     let mut out = if current.infinite && current.binding.budget_kind() == BudgetKind::ResourceWall {
         session.complete(

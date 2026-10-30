@@ -23,6 +23,8 @@ pub(crate) struct PcSecondarySlotV2 {
     pub(crate) worker: Arc<Mutex<RoventPcCollectionWorkerV2>>,
     pub(crate) consumer: Arc<OwnPumpConsumerV2>,
     pub(crate) speculative_setup_error: Option<String>,
+    // Maintenance status only; this does not assert collection publication.
+    speculative_route_unlinked: bool,
     pub(crate) retained_previous_rows: usize,
     pub(crate) published_to_router: bool,
     pub(crate) worker_start: PcSecondaryWorkerStartV2,
@@ -39,6 +41,9 @@ struct SupervisorState {
     slots: Vec<PcSecondarySlotV2>,
     pending: Option<PcSecondarySlotV2>,
     error: Option<ArenaError>,
+    initial_route_unlinked: bool,
+    route_retry_cursor: usize,
+    route_retry_at: Instant,
 }
 
 /// Owns the original supervisor thread and its exact slot state.  Callers
@@ -76,7 +81,8 @@ impl PcWorkerSupervisorV2 {
         let startup = router.original_startup().ok_or_else(|| invalid("P/C original startup control unavailable"))?.clone();
         let mut slots = Vec::new();
         slots.try_reserve_exact(maximum_roots - 1).map_err(|_| invalid("P/C supervisor slot capacity"))?;
-        let state = Arc::new(Mutex::new(SupervisorState { slots, pending: None, error: None }));
+        let state = Arc::new(Mutex::new(SupervisorState { slots, pending: None, error: None,
+            initial_route_unlinked: false, route_retry_cursor: 0, route_retry_at: Instant::now() }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_state = Arc::clone(&state);
         let thread_stop = Arc::clone(&stop);
@@ -97,11 +103,16 @@ impl PcWorkerSupervisorV2 {
                     }
                 }
                 if let Some(error) = poll_error { guard.error.get_or_insert(error); }
+                let mut separation_attempted = false;
                 if guard.error.is_none() {
                     if let Err(error) = supervisor_step(&mut guard, &router, &owner, &manifest, &roster,
-                        &startup, constraint, quantum, maximum_records, speculative_teacher, worker_deadline, &thread_stop) {
+                        &startup, constraint, quantum, maximum_records, speculative_teacher, worker_deadline, &thread_stop,
+                        &mut separation_attempted) {
                         guard.error = Some(error);
                     }
+                }
+                if speculative_teacher && !separation_attempted {
+                    retry_one_original_route(&mut guard, &router);
                 }
                 drop(guard);
                 thread::sleep(Duration::from_millis(2));
@@ -110,6 +121,11 @@ impl PcWorkerSupervisorV2 {
             // workers and drain only until the already registered cleanup
             // ceiling. Empty is final only after that same worker joined.
             thread_stop.store(true, Ordering::Release);
+            // Once all children settle, retry at most the bounded channel
+            // capacity plus one empty check per already-owned root. A
+            // permanently Busy/unknown route remains retained instead of
+            // extending the original cleanup ceiling.
+            let mut final_route_attempts: Option<usize> = None;
             while Instant::now() < cleanup_deadline {
                 let mut guard = match thread_state.lock() {
                     Ok(guard) => guard,
@@ -145,8 +161,26 @@ impl PcWorkerSupervisorV2 {
                     }
                 }
                 if let Some(error) = failure { guard.error.get_or_insert(error); }
+                if speculative_teacher && all_done {
+                    let remaining = final_route_attempts.get_or_insert_with(|| {
+                        let roots = 1 + guard.slots.len() + usize::from(guard.pending.is_some());
+                        roots * (super::collection_hooks_core_v2::SPECULATIVE_QUERY_QUEUE_CAPACITY + 1)
+                    });
+                    if *remaining > 0 {
+                        guard.route_retry_at = Instant::now();
+                        retry_one_original_route(&mut guard, &router);
+                        *remaining -= 1;
+                    }
+                } else if speculative_teacher {
+                    retry_one_original_route(&mut guard, &router);
+                }
+                let all_routes_unlinked = guard.initial_route_unlinked
+                    && guard.slots.iter().chain(guard.pending.iter()).all(|slot|
+                        slot.speculative_route_unlinked || slot.bridge.installed_admission_for_recovery().is_none());
+                let route_pass_complete = !speculative_teacher || all_routes_unlinked
+                    || final_route_attempts == Some(0);
                 drop(guard);
-                if all_done { break; }
+                if all_done && route_pass_complete { break; }
                 thread::sleep(Duration::from_millis(2));
             }
         }).map_err(|error| ArenaError::Io(error.to_string()))?;
@@ -213,6 +247,38 @@ impl Drop for PcWorkerSupervisorV2 {
     }
 }
 
+/// Retry at most one already-owned root per interval, with no extra queue or
+/// worker. All success/unknown decisions stay with the original bridge and
+/// its joined native handoff; a failed cleanup never prevents native search.
+fn retry_one_original_route(state: &mut SupervisorState, router: &RoventPcRootRouterV2) {
+    let now = Instant::now();
+    if now < state.route_retry_at { return; }
+    state.route_retry_at = now.checked_add(Duration::from_millis(100)).unwrap_or(now);
+    let total = 1 + state.slots.len() + usize::from(state.pending.is_some());
+    let index = state.route_retry_cursor % total;
+    state.route_retry_cursor = (index + 1) % total;
+    if index == 0 {
+        if state.initial_route_unlinked { return; }
+        let root = state.slots.first().map(|slot| (Arc::clone(&slot.previous), slot.previous_admission.clone()))
+            .or_else(|| state.pending.as_ref().map(|slot| (Arc::clone(&slot.previous), slot.previous_admission.clone())))
+            .or_else(|| router.latest_installed());
+        if let Some((bridge, admission)) = root {
+            state.initial_route_unlinked = bridge.try_unlink_finished_speculative_route(&admission);
+        }
+        return;
+    }
+    let slot_index = index - 1;
+    let slot = if slot_index < state.slots.len() {
+        state.slots.get_mut(slot_index)
+    } else {
+        state.pending.as_mut()
+    };
+    let Some(slot) = slot else { return; };
+    if slot.speculative_route_unlinked { return; }
+    let Some(admission) = slot.bridge.installed_admission_for_recovery() else { return; };
+    slot.speculative_route_unlinked = slot.bridge.try_unlink_finished_speculative_route(admission);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn supervisor_step(
     state: &mut SupervisorState,
@@ -227,6 +293,7 @@ fn supervisor_step(
     speculative_teacher: bool,
     deadline: Instant,
     stop: &Arc<AtomicBool>,
+    separation_attempted: &mut bool,
 ) -> Result<(), ArenaError> {
     if !router.next_slot_unprepared() { return Ok(()); }
     let Some((previous, admission)) = router.latest_installed() else { return Ok(()); };
@@ -257,6 +324,8 @@ fn supervisor_step(
         if status.game_retired_total.checked_add(reserved).is_none_or(|used| used >= status.game_record_limit) {
             return Ok(());
         }
+        // This path already makes one best-effort unlink attempt internally.
+        *separation_attempted = true;
         if !matches!(previous.try_separate_root_for_next(&admission, maximum_records)?, PcRootSeparationV2::Released { .. }) {
             return Ok(());
         }
@@ -276,7 +345,7 @@ fn supervisor_step(
         let worker = Arc::new(Mutex::new(worker));
         state.pending = Some(PcSecondarySlotV2 { previous, previous_admission: admission,
             bridge: Arc::clone(&next), worker: Arc::clone(&worker), consumer,
-            speculative_setup_error,
+            speculative_setup_error, speculative_route_unlinked: false,
             retained_previous_rows: 0, published_to_router: false,
             worker_start: PcSecondaryWorkerStartV2::StartingUnknown,
             worker_join_observed: false, worker_exit_kind: None,
@@ -290,7 +359,13 @@ fn supervisor_step(
             Err(PcWorkerStartErrorV2::Unknown(error)) => return Err(error),
         }
     }
+    // With optional route maintenance enabled, separation above already
+    // made this tick's unlink attempt. Defer router publication to the next
+    // existing supervisor tick rather than performing a second attempt here.
+    if speculative_teacher && *separation_attempted { return Ok(()); }
     let pending = state.pending.as_ref().expect("prepared original secondary slot");
+    // Router publication itself calls the previous root's separation path.
+    *separation_attempted = true;
     match router.publish_next_prepared(&pending.previous, &pending.previous_admission, &pending.bridge, maximum_records)? {
         PcPreparedSlotOutcomeV2::Pending => Ok(()),
         PcPreparedSlotOutcomeV2::Published { retained_rows } => {

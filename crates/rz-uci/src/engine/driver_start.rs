@@ -19,6 +19,9 @@ use std::{
 #[cfg(test)]
 pub(crate) mod fixture;
 
+#[cfg(all(test, feature = "pals-adaptive"))]
+mod collection_abort_tests;
+
 struct CollectionAbortHook {
     game_gate: Arc<std::sync::atomic::AtomicU64>,
     root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
@@ -38,9 +41,10 @@ impl std::fmt::Debug for CollectionAbortHook {
 #[derive(Debug)]
 pub(crate) struct DriverStartSource {
     teacher_scope_claimed: std::sync::atomic::AtomicBool,
-    // 0 = unbound, 1 = bound, 2 = original Start canceled.
+    // 0 = unbound, 1 = bound, 2 = canceled, 3 = optional owner binding failed.
     collection_abort_state: std::sync::atomic::AtomicU8,
     collection_abort_hook: std::sync::OnceLock<CollectionAbortHook>,
+    collection_owner_binding_error: std::sync::OnceLock<ContractError>,
     ticket: SearchTicket,
     authority: SearchAuthority,
     root: PositionSnapshot,
@@ -87,6 +91,7 @@ impl DriverStartSource {
             teacher_scope_claimed: std::sync::atomic::AtomicBool::new(false),
             collection_abort_state: std::sync::atomic::AtomicU8::new(0),
             collection_abort_hook: std::sync::OnceLock::new(),
+            collection_owner_binding_error: std::sync::OnceLock::new(),
             ticket: ticket.clone(),
             authority: context.authority,
             root: root.snapshot(),
@@ -106,6 +111,7 @@ impl DriverStartSource {
 
     /// Bind only to this actual Start. The second cancellation check closes
     /// the race between the owner's cancellation and a late optional install.
+    #[cfg(feature = "pals-adaptive")]
     pub(crate) fn bind_collection_abort(
         &self,
         context: &SearchSessionContext,
@@ -129,19 +135,33 @@ impl DriverStartSource {
         ) {
             Ok(_) => false,
             Err(2) => true,
+            Err(3) => {
+                self.collection_abort_hook.get().expect("hook just installed").abort();
+                return Err(self.collection_owner_binding_error.get().copied()
+                    .unwrap_or_else(|| invalid("original Start owner binding failure unavailable")));
+            }
             Err(_) => return Err(invalid("collection abort registration state unknown")),
         };
         if aborted || self.control.cancellation.load(std::sync::atomic::Ordering::Acquire)
             || self.cancellation.is_canceled()
         {
             self.collection_abort_hook.get().expect("hook just installed").abort();
+            return Err(self.collection_owner_binding_error.get().copied()
+                .unwrap_or_else(|| invalid("original Start already canceled before Collection binding")));
         }
         Ok(())
     }
 
+    /// A failure of the optional Collection association must not fail an
+    /// otherwise valid search. A later Collection binding is still rejected.
+    pub(crate) fn mark_collection_owner_binding_failed(&self, error: ContractError) {
+        let _ = self.collection_owner_binding_error.set(error);
+        self.collection_abort_state.store(3, std::sync::atomic::Ordering::Release);
+    }
+
     /// Called by the actual UCI owner before its regular cancel. The hook is
     /// optional and must perform only nonblocking atomic state transitions.
-    pub(super) fn abort_collection(&self) {
+    pub(crate) fn abort_collection(&self) {
         let previous = self.collection_abort_state.swap(2, std::sync::atomic::Ordering::AcqRel);
         if previous == 1 {
             if let Some(hook) = self.collection_abort_hook.get() { hook.abort(); }
