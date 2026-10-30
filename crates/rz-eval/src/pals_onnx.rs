@@ -2000,6 +2000,7 @@ fn load_session(
     // Default native copying; no direct-reference initializer option is enabled.
     // Serialized owned bytes are freed immediately after successful/failed load.
     let loaded = builder.commit_from_memory(&bytes);
+    drop(bytes);
     let placement = if let (Some((policy, _)), Some(log)) = (audit, &placement_log) {
         loaded
             .is_ok()

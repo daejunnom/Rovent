@@ -1045,6 +1045,12 @@ mod actual {
                     job: id,
                     execution: run,
                 } => json!({"kind":"ExternalCpu","job":job(id),"execution":execution(run)}),
+                StepExecution::ProfiledExternal {
+                    question,
+                    execution: run,
+                } => json!({"kind":"ProfiledExternal","question":{
+                    "domain":"reciprocal_question","authority":authority(&question.authority),
+                    "question_sequence":question.sequence.to_string()},"execution":execution(run)}),
             }
         }
         fn hot(value: &HotEvent) -> Value {

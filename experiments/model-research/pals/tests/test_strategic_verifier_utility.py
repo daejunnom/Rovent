@@ -17,6 +17,7 @@ from rz_pals_model import native_recheck_witness as native
 from rz_pals_model import verifier_producer as legacy
 from test_strategic_verifier_query import QueryFixture
 from test_native_recheck_witness import SyntheticWholeRecheckFixture
+from native_source_review_fixture import synthetic_custody_fixture_review_scope as fixture_review_scope
 
 
 class MaskedUtilityFixture:
@@ -321,7 +322,7 @@ class StrategicMaskedUtilityTests(unittest.TestCase):
             self.f.admit()
 
     def test_actual_whole_factory_observation_is_not_action_completion(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with fixture_review_scope("legacy_single_reply"), tempfile.TemporaryDirectory() as directory:
             whole_fixture = SyntheticWholeRecheckFixture(directory)
             whole = whole_fixture.admit()
             self.f.bind_witness(0, whole)
@@ -335,7 +336,7 @@ class StrategicMaskedUtilityTests(unittest.TestCase):
             self.assertIn("conditional_witness_parent_source_or_current_differs_from_query", value["additional_reasons"])
 
     def test_partial_whole_factory_is_preserved_unresolved(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with fixture_review_scope("legacy_single_reply"), tempfile.TemporaryDirectory() as directory:
             whole_fixture = SyntheticWholeRecheckFixture(directory)
             whole = whole_fixture.admit(rules_missing=True)
             self.f.bind_witness(0, whole)

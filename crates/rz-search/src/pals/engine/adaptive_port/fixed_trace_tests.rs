@@ -164,10 +164,10 @@ fn setup_model_value(position: Position, limits: PalsLimits) -> Port {
     )
     .unwrap();
     assert_eq!(
-        engine.model_registered_value.as_ref(),
-        engine.model.value_identity()
+        engine.semantic.model_registered_value.as_ref(),
+        engine.semantic.model.value_identity()
     );
-    assert!(engine.model_registered_value.is_some());
+    assert!(engine.semantic.model_registered_value.is_some());
     setup_port(engine, position, limits)
 }
 fn setup_port(engine: PalsEngine<RecordingMock>, position: Position, limits: PalsLimits) -> Port {
@@ -326,9 +326,9 @@ fn fixed_prepared_policy_queries_match_real_synchronous_callbacks() {
             input.question.counter, counter,
             "private branch continuation was lost"
         );
-        assert_eq!(baseline.engine.model.traces.len(), 1);
+        assert_eq!(baseline.engine.semantic.model.traces.len(), 1);
         assert_eq!(
-            baseline.engine.model.traces[0],
+            baseline.engine.semantic.model.traces[0],
             InputTrace::prepared(&input),
             "stage {stage:?}"
         );
@@ -386,9 +386,9 @@ fn fixed_fresh_endpoint_uses_endpoint_line_not_private_branch_metadata() {
             .unwrap();
         assert_eq!(input.view.query().proposal, endpoint);
         assert!(input.view.query().counterexample.is_none());
-        assert_eq!(baseline.engine.model.traces.len(), 1);
+        assert_eq!(baseline.engine.semantic.model.traces.len(), 1);
         assert_eq!(
-            baseline.engine.model.traces[0],
+            baseline.engine.semantic.model.traces[0],
             InputTrace::prepared(&input),
             "stage {stage:?}"
         );
@@ -502,7 +502,7 @@ fn actual_private_cpu_worker_preserves_verification_work_and_next_public_view() 
     };
     let clock = InstantClock::new(
         ClockDomain(fixed.authority.epoch),
-        fixed.engine.clock_origin,
+        fixed.engine.semantic.clock_origin,
     );
     let physical_job = worker
         .prepare_job(
@@ -546,8 +546,14 @@ fn actual_private_cpu_worker_preserves_verification_work_and_next_public_view() 
         shutdown.events.is_empty(),
         "CPU fixture left an unsettled receipt"
     );
-    let a = baseline.engine.nodes[old_node].evidence.as_ref().unwrap();
-    let b = fixed.engine.nodes[new_node].evidence.as_ref().unwrap();
+    let a = baseline.engine.semantic.nodes[old_node]
+        .evidence
+        .as_ref()
+        .unwrap();
+    let b = fixed.engine.semantic.nodes[new_node]
+        .evidence
+        .as_ref()
+        .unwrap();
     assert_eq!(
         (a.score, a.depth, a.scope, &a.value_identity),
         (b.score, b.depth, b.scope, &b.value_identity)
@@ -577,24 +583,29 @@ fn actual_private_cpu_worker_preserves_verification_work_and_next_public_view() 
         fixed.engine.value(new_node, 0)
     );
     assert_eq!(
-        baseline.engine.nodes[baseline.root].edges.len(),
-        fixed.engine.nodes[fixed.root].edges.len()
+        baseline.engine.semantic.nodes[baseline.root].edges.len(),
+        fixed.engine.semantic.nodes[fixed.root].edges.len()
     );
     assert_eq!(
         baseline
             .engine
+            .semantic
             .records
             .iter()
             .map(|r| format!("{r:?}"))
             .collect::<Vec<_>>(),
         fixed
             .engine
+            .semantic
             .records
             .iter()
             .map(|r| format!("{r:?}"))
             .collect::<Vec<_>>()
     );
-    assert_eq!(baseline.engine.revision, fixed.engine.revision);
+    assert_eq!(
+        baseline.engine.semantic.revision,
+        fixed.engine.semantic.revision
+    );
 
     // Inspect a subsequent real synchronous Reply callback against a fixed
     // prepared input after the same CPU publication. This one-ply frame has
@@ -629,7 +640,7 @@ fn actual_private_cpu_worker_preserves_verification_work_and_next_public_view() 
         )
         .unwrap();
     assert_eq!(
-        baseline.engine.model.traces.last().unwrap(),
+        baseline.engine.semantic.model.traces.last().unwrap(),
         &InputTrace::prepared(&next)
     );
 }

@@ -7,8 +7,11 @@
 use crate::contract_time::{ContractClock, InstantClock};
 use crate::cpu::{
     CpuCompletion, CpuControlMailbox, CpuControlledReport, CpuEngine, CpuError,
-    CpuIterationProgress, CpuLimits, CpuMailboxScope, CpuResumePolicy, CpuResumeToken,
-    CpuSliceControl, CpuWork,
+    CpuIterationProgress, CpuLimits, CpuMailboxScope, CpuReciprocalReply, CpuReciprocalRequest,
+    CpuReciprocalScope, CpuResumePolicy, CpuResumeToken, CpuSliceControl, CpuWork,
+};
+use crate::cpu_value::nnuec::v2::capture::{
+    CaptureError, NnuecActiveCapture, NnuecCaptureEnding, NnuecCaptureReservation,
 };
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::{CpuJobEnvelope, CpuJobId, CpuWorkerId, SliceGrant};
@@ -31,14 +34,109 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[path = "cpu_worker/prepared_value.rs"]
+mod prepared_value;
+pub use prepared_value::{
+    InstallId, InstallRejected, PreparedValueInstallation, ValueInstallReadback,
+    ValueInstallReceipt,
+};
+#[path = "cpu_worker/deferred_value.rs"]
+pub(crate) mod deferred_value;
+pub use deferred_value::{
+    DeferredNnuecCpuPlan, DeferredNnuecRSource, MaterializationCompletion, MaterializationHandoff,
+    MaterializationRequest, MaterializedNnuecEngine, NnuecMaterializationReleaseAck,
+    NnuecMaterializationReleaseCompletion, NnuecMaterializationReleaseId, NnuecReadyRegistration,
+    StartingNnuecWorker,
+};
+#[path = "cpu_worker/ledger_registration.rs"]
+mod ledger_registration;
+pub use ledger_registration::CpuLedgerRegistrationObservation;
+#[path = "cpu_worker/retired_value.rs"]
+mod retired_value;
+pub use retired_value::{
+    NnuecEngineReleaseAck, NnuecEngineRetirementCompletion, NnuecEngineRetirementId,
+    RecoveredNnuecEngine,
+};
+
 pub const CPU_WORKER_COMMAND_CAPACITY: usize = 8;
 pub const CPU_JOB_CAPACITY: usize = 64;
 pub const CPU_FIXED_SLICE_NODES: u64 = 4096;
 pub const CPU_FIXED_SOFT_LEASE: Duration = Duration::from_millis(8);
 
+/// A read-only observation of the original NNUEC Bound control. This is not
+/// proof of cleanup, nor permission to accept a failed root as a normal stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NnuecAuthorityRevocation {
+    Cancelled,
+    Expired,
+    ActorStopped,
+    Invalidated,
+}
+impl From<NnuecAuthorityRevocation> for crate::cpu_value::CpuValueAuthorityRevocation {
+    fn from(reason: NnuecAuthorityRevocation) -> Self {
+        match reason {
+            NnuecAuthorityRevocation::Cancelled => Self::Cancelled,
+            NnuecAuthorityRevocation::Expired => Self::Expired,
+            NnuecAuthorityRevocation::ActorStopped => Self::ActorStopped,
+            NnuecAuthorityRevocation::Invalidated => Self::Invalidated,
+        }
+    }
+}
+
+/// A typed soft error alone is not enough to recover a worker. Require the
+/// actual immutable V2 owner, the original installed binding, and the same
+/// original Bound's present control. Expiry may monotonically be followed
+/// by its cancellation, but the original Expired observation is not rewritten.
+/// Hard revocations and unknown work remain errors. This accepts no value.
+fn owned_soft_value_terminal(
+    engine: &CpuEngine,
+    binding: Option<Digest>,
+    error: &CpuError,
+    actual_work: Option<CpuWork>,
+) -> Option<CpuCompletion> {
+    actual_work?;
+    let completion = error.value_authority_stop()?;
+    let CpuError::Value(crate::cpu_value::CpuValueError::AuthorityRevoked(reason)) = error else {
+        return None;
+    };
+    let owner = engine.nnuec_retirement_owner().ok().flatten()?;
+    if binding != Some(owner.binding_digest())
+        || !original_soft_revocation_matches(
+            *reason,
+            owner.authority_revocation(),
+            owner.original_hard_deadline(),
+            Instant::now(),
+        )
+    {
+        return None;
+    }
+    Some(completion)
+}
+
+/// Pure control observation only. It cannot produce an owner or a terminal
+/// receipt. In particular a cancelled-but-not-expired Bound cannot attest a
+/// fabricated earlier Expired result merely because both are soft reasons.
+fn original_soft_revocation_matches(
+    observed: crate::cpu_value::CpuValueAuthorityRevocation,
+    current: Option<NnuecAuthorityRevocation>,
+    original_deadline: Instant,
+    observed_at: Instant,
+) -> bool {
+    use crate::cpu_value::CpuValueAuthorityRevocation;
+    match (observed, current) {
+        (CpuValueAuthorityRevocation::Cancelled, Some(NnuecAuthorityRevocation::Cancelled)) => true,
+        (
+            CpuValueAuthorityRevocation::Expired,
+            Some(NnuecAuthorityRevocation::Expired | NnuecAuthorityRevocation::Cancelled),
+        ) => observed_at >= original_deadline,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CpuWorkerError {
     Invalid(&'static str),
+    NnuecAuthorityRevoked(NnuecAuthorityRevocation),
     Capacity,
     UnknownJob,
     AlreadyReserved,
@@ -103,8 +201,14 @@ impl CpuSubmissionRejected {
     fn from_command(reason: CpuWorkerError, command: CpuCommand, verified_unqueued: bool) -> Self {
         let (grant, job) = match command {
             CpuCommand::Begin(job, grant) => (grant, Some(job)),
-            CpuCommand::Resume(grant) => (grant, None),
+            CpuCommand::Resume(grant) | CpuCommand::ResumeWithReply(grant, _) => (grant, None),
         };
+        // Only this owner's definite pre-enqueue rejection proves that the
+        // prepared original never executed. Duplicates/foreign/unknown
+        // submissions must leave any primary capture custody untouched.
+        if verified_unqueued && let Some(job) = &job {
+            let _ = job.retire_nnuec_capture(grant.owner, NnuecCaptureEnding::NotStarted);
+        }
         Self {
             reason,
             proof: Box::new(CpuAdmissionRejection {
@@ -155,6 +259,9 @@ pub fn compiled_cooperative_cpu_owner_sha256() -> [u8; 32] {
         include_bytes!("cpu.rs").as_slice(),
         include_bytes!("cpu/stack.rs").as_slice(),
         include_bytes!("cpu_worker.rs").as_slice(),
+        include_bytes!("cpu_worker/prepared_value.rs").as_slice(),
+        include_bytes!("cpu_worker/deferred_value.rs").as_slice(),
+        include_bytes!("cpu_worker/ledger_registration.rs").as_slice(),
     ] {
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
@@ -170,6 +277,8 @@ pub struct CpuJob {
     hard_deadline: Instant,
     clock: InstantClock,
     pub mailbox: Arc<CpuControlMailbox>,
+    reciprocal_scope: Option<CpuReciprocalScope>,
+    nnuec_capture: Option<NnuecCaptureReservation>,
 }
 
 impl CpuJob {
@@ -194,7 +303,7 @@ impl CpuJob {
             target_depth,
             clock,
             engine.config().max_depth,
-            cpu_evaluation_namespace_digest(engine)?,
+            prepared_value::registered_namespace(engine, None)?,
             cpu_search_conditions_digest(engine),
             owner,
             signal,
@@ -276,16 +385,97 @@ impl CpuJob {
             hard_deadline,
             clock: *clock,
             mailbox,
+            reciprocal_scope: None,
+            nnuec_capture: None,
         })
     }
     pub fn envelope(&self) -> CpuJobEnvelope {
         self.envelope
+    }
+    /// Optional collection custody is attached before Begin. This does not
+    /// activate a worker, evaluate a value or reserve additional node credit.
+    #[allow(clippy::result_large_err)]
+    pub fn enable_nnuec_capture(
+        &mut self,
+        capture: NnuecCaptureReservation,
+    ) -> Result<(), (CpuWorkerError, NnuecCaptureReservation)> {
+        if self.nnuec_capture.is_some() {
+            return Err((CpuWorkerError::Duplicate, capture));
+        }
+        if capture
+            .prepare_job(
+                self.envelope,
+                self.mailbox.scope().owner,
+                &self.position,
+                self.clock,
+            )
+            .is_err()
+        {
+            return Err((
+                CpuWorkerError::Invalid("NNUEC capture does not match prepared Job"),
+                capture,
+            ));
+        }
+        self.nnuec_capture = Some(capture);
+        Ok(())
+    }
+    pub fn nnuec_capture(&self) -> Option<&NnuecCaptureReservation> {
+        self.nnuec_capture.as_ref()
+    }
+    fn retire_nnuec_capture(
+        &self,
+        owner: CpuWorkerId,
+        ending: NnuecCaptureEnding,
+    ) -> Result<(), CaptureError> {
+        match &self.nnuec_capture {
+            Some(capture) => capture
+                .retire(self.envelope, owner, ending)
+                .inspect_err(|error| {
+                    capture.record_error(error.clone());
+                }),
+            None => Ok(()),
+        }
+    }
+
+    /// Configure before Begin. The original Job, owner and hard deadline stay
+    /// immutable; a question never creates a second engine or paused stack.
+    pub fn enable_reciprocal_questions(
+        &mut self,
+        scope: CpuReciprocalScope,
+    ) -> Result<(), CpuWorkerError> {
+        use rz_contracts::rovent::SearchRecipient;
+        if self.reciprocal_scope.is_some() {
+            return Err(CpuWorkerError::Duplicate);
+        }
+        if scope.job != self.envelope
+            || scope.owner != self.mailbox.scope().owner
+            || scope.parent.id.authority != self.envelope.id.authority
+            || scope.parent.anchor != self.envelope.state_identity
+            || scope.parent.question_digest != self.envelope.question
+            || scope.parent.original_deadline != self.envelope.hard_deadline
+            || scope.parent.recipient != SearchRecipient::Researcher
+            || !matches!(
+                scope.recipient,
+                SearchRecipient::Proposer | SearchRecipient::Critic
+            )
+            || !(1..=64).contains(&scope.max_questions)
+            || scope.node_interval == 0
+        {
+            return Err(CpuWorkerError::Invalid(
+                "CPU reciprocal scope differs from its original Job",
+            ));
+        }
+        self.reciprocal_scope = Some(scope);
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct CpuSliceReport {
     pub grant: SliceGrant,
+    /// A real owner-sealed waiting question, distinct from occupancy Yield.
+    /// The private continuation token remains exclusively on that CPU worker.
+    pub reciprocal_request: Option<CpuReciprocalRequest>,
     /// None is unknown and must quarantine the outstanding reservation.
     pub actual_work: Option<CpuWork>,
     pub result: Result<CpuControlledReport, CpuError>,
@@ -300,7 +490,7 @@ pub struct CpuSliceReport {
     pub controls: Option<ControlSnapshot>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CpuJobTermination {
     pub job: CpuJobId,
     pub owner: CpuWorkerId,
@@ -342,6 +532,10 @@ pub struct CpuWorkerShutdown {
     /// The actual engine may be taken only after this known joined exit. This
     /// does not replace settlement of the returned reliable event receipts.
     pub engine_recoverable: bool,
+    /// The independently bounded installation terminal is never discarded by
+    /// shutdown. A failed/absent channel acknowledgement remains an error.
+    pub value_installation_receipt: Option<ValueInstallReceipt>,
+    pub value_installation_error: Option<CpuWorkerError>,
 }
 
 struct CreditAccount {
@@ -354,11 +548,14 @@ struct CreditAccount {
     terminal: bool,
     quarantine: bool,
     owner: Option<CpuWorkerId>,
+    // Exact original owner terminal, retained only for the queued-Resume race.
+    terminated_owner: Option<Arc<CpuJobTermination>>,
 }
 
 /// Root-scoped single manager writer. Unknown failure retains reservation;
 /// snapshots do not settle credit. Completed receipts are externally retained.
 pub struct CpuCreditLedger {
+    identity: CpuLedgerIdentity,
     jobs: HashMap<CpuJobId, CreditAccount>,
     authority: SearchAuthority,
     clock: InstantClock,
@@ -366,6 +563,78 @@ pub struct CpuCreditLedger {
     global_spent: u64,
     highest_job_sequence: u64,
     highest_execution_sequence: u64,
+}
+
+/// In-process identity of the single writer, never a serializable authority.
+/// Retaining the Arc prevents a later ledger from reusing this identity even
+/// when it has the same root and credit settings.
+#[derive(Clone, Debug)]
+pub struct CpuLedgerIdentity(Arc<()>);
+impl PartialEq for CpuLedgerIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for CpuLedgerIdentity {}
+
+/// Issued only after this ledger has accepted and settled the supplied report.
+/// This attests accounting, not independent worker/physical completion. The
+/// actual worker report and its owner channel remain separate evidence.
+#[derive(Clone, Debug)]
+pub struct SettledCpuSlice {
+    ledger: CpuLedgerIdentity,
+    grant: SliceGrant,
+    actual_work: CpuWork,
+    admission_rejected: bool,
+    terminal: bool,
+    terminated_owner: Option<Arc<CpuJobTermination>>,
+}
+impl SettledCpuSlice {
+    pub fn ledger_identity(&self) -> &CpuLedgerIdentity {
+        &self.ledger
+    }
+    pub fn grant(&self) -> SliceGrant {
+        self.grant
+    }
+    pub fn actual_work(&self) -> CpuWork {
+        self.actual_work
+    }
+    pub fn admission_rejected(&self) -> bool {
+        self.admission_rejected
+    }
+    pub fn terminal(&self) -> bool {
+        self.terminal
+    }
+    /// The same ledger accepted this exact paused-owner terminal before this
+    /// later queued grant returned a definite no-work rejection. An arbitrary
+    /// older JobTerminated cannot be paired with this opaque settlement.
+    pub fn terminated_owner_receipt(&self) -> Option<&CpuJobTermination> {
+        self.terminated_owner.as_deref()
+    }
+}
+
+/// Definite pre-enqueue release is not a zero-work worker completion.
+#[derive(Clone, Debug)]
+pub struct ReleasedCpuReservation {
+    ledger: CpuLedgerIdentity,
+    grant: SliceGrant,
+}
+impl ReleasedCpuReservation {
+    pub fn ledger_identity(&self) -> &CpuLedgerIdentity {
+        &self.ledger
+    }
+    pub fn grant(&self) -> SliceGrant {
+        self.grant
+    }
+}
+
+/// Read-only dispatch eligibility. A logically waiting parent still owns its
+/// private paused stack; it is not an idle physical worker for a child Job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuOwnerAdmission {
+    Unstarted,
+    SameOwnerResume,
+    BlockedBy(CpuJobId),
 }
 impl CpuCreditLedger {
     pub fn new(
@@ -379,6 +648,7 @@ impl CpuCreditLedger {
             ));
         }
         Ok(Self {
+            identity: CpuLedgerIdentity(Arc::new(())),
             jobs: HashMap::new(),
             authority,
             clock,
@@ -387,6 +657,9 @@ impl CpuCreditLedger {
             highest_job_sequence: 0,
             highest_execution_sequence: 0,
         })
+    }
+    pub fn identity(&self) -> CpuLedgerIdentity {
+        self.identity.clone()
     }
     pub fn register(&mut self, envelope: CpuJobEnvelope) -> Result<(), CpuWorkerError> {
         if envelope.id.authority != self.authority
@@ -426,19 +699,58 @@ impl CpuCreditLedger {
                 terminal: false,
                 quarantine: false,
                 owner: None,
+                terminated_owner: None,
             },
         );
         Ok(())
     }
+    /// Inspect before assigning independent, not-yet-started work. This neither
+    /// reserves credit nor moves a token. `reserve` rechecks the same authority
+    /// after the manager chooses the owner.
+    pub fn owner_admission(
+        &self,
+        job: CpuJobId,
+        owner: CpuWorkerId,
+    ) -> Result<CpuOwnerAdmission, CpuWorkerError> {
+        let account = self.jobs.get(&job).ok_or(CpuWorkerError::UnknownJob)?;
+        if account.quarantine {
+            return Err(CpuWorkerError::Quarantined);
+        }
+        if account.terminal {
+            return Err(CpuWorkerError::Invalid("CPU job has terminated"));
+        }
+        if account.reservation.is_some() {
+            return Err(CpuWorkerError::AlreadyReserved);
+        }
+        if account.owner.is_some_and(|previous| previous != owner) {
+            return Err(CpuWorkerError::Invalid(
+                "CPU primary job cannot move between owners",
+            ));
+        }
+        if let Some((blocking_job, _)) = self
+            .jobs
+            .iter()
+            .find(|(id, held)| **id != job && !held.terminal && held.owner == Some(owner))
+        {
+            return Ok(CpuOwnerAdmission::BlockedBy(*blocking_job));
+        }
+        Ok(if account.owner.is_some() {
+            CpuOwnerAdmission::SameOwnerResume
+        } else {
+            CpuOwnerAdmission::Unstarted
+        })
+    }
+
     pub fn reserve(&mut self, grant: SliceGrant) -> Result<(), CpuWorkerError> {
         if grant.job.authority != self.authority
             || grant.execution.sequence <= self.highest_execution_sequence
         {
             return Err(CpuWorkerError::Duplicate);
         }
-        if self.jobs.iter().any(|(id, account)| {
-            *id != grant.job && !account.terminal && account.owner == Some(grant.owner)
-        }) {
+        if matches!(
+            self.owner_admission(grant.job, grant.owner),
+            Ok(CpuOwnerAdmission::BlockedBy(_))
+        ) {
             return Err(CpuWorkerError::Invalid(
                 "CPU owner already holds another primary job",
             ));
@@ -517,16 +829,23 @@ impl CpuCreditLedger {
         };
         let invalid_result = match &report.result {
             Ok(value) => {
+                let paused = matches!(
+                    value.report.completion,
+                    CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+                );
                 value.report.nodes != work.nodes
                     || value.report.quiescence_nodes != work.quiescence_nodes
                     || value.report.tt_hits != work.tt_hits
                     || value.report.resume.is_some()
-                    || (value.report.completion == CpuCompletion::Yielded
-                        && (report.terminal || !report.continuation_retained))
-                    || (value.report.completion != CpuCompletion::Yielded
-                        && (!report.terminal || report.continuation_retained))
+                    || (paused && (report.terminal || !report.continuation_retained))
+                    || (!paused && (!report.terminal || report.continuation_retained))
+                    || ((value.report.completion == CpuCompletion::AwaitReciprocal)
+                        != report.reciprocal_request.is_some())
             }
-            Err(_) => !report.admission_rejected && !report.terminal,
+            Err(_) => {
+                (!report.admission_rejected && !report.terminal)
+                    || report.reciprocal_request.is_some()
+            }
         };
         let spent = account.spent.checked_add(work.nodes);
         let global_spent = self.global_spent.checked_add(work.nodes);
@@ -535,6 +854,10 @@ impl CpuCreditLedger {
             || (!report.admission_rejected && spent != Some(report.cumulative_nodes))
             || global_spent.is_none_or(|sum| sum > self.global_limit)
             || invalid_result
+            || report.reciprocal_request.as_ref().is_some_and(|request| {
+                request.scope().job != account.envelope
+                    || request.scope().owner != report.grant.owner
+            })
             || (report.terminal && report.continuation_retained)
             || (report.admission_rejected
                 && (work != CpuWork::default() || report.result.is_ok() || report.terminal))
@@ -559,6 +882,32 @@ impl CpuCreditLedger {
         }
         account.terminal |= report.terminal;
         Ok(())
+    }
+    /// A consumer can bind this successful accounting transition to its own
+    /// outstanding token. Cloned receipts still describe one settlement and
+    /// must be consumed once by the downstream owner.
+    pub fn settle_attested(
+        &mut self,
+        report: &CpuSliceReport,
+    ) -> Result<SettledCpuSlice, CpuWorkerError> {
+        self.settle(report)?;
+        Ok(SettledCpuSlice {
+            ledger: self.identity(),
+            grant: report.grant,
+            actual_work: report
+                .actual_work
+                .expect("successful settlement has known work"),
+            admission_rejected: report.admission_rejected,
+            terminal: report.terminal,
+            terminated_owner: report
+                .admission_rejected
+                .then(|| {
+                    self.jobs
+                        .get(&report.grant.job)
+                        .and_then(|account| account.terminated_owner.clone())
+                })
+                .flatten(),
+        })
     }
     /// Roll back only a command proved not to have entered its worker queue.
     /// Execution high water remains advanced, so the rejected ID cannot replay.
@@ -586,6 +935,16 @@ impl CpuCreditLedger {
             account.owner = None;
         }
         Ok(())
+    }
+    pub fn release_unadmitted_attested(
+        &mut self,
+        rejection: &CpuAdmissionRejection,
+    ) -> Result<ReleasedCpuReservation, CpuWorkerError> {
+        self.release_unadmitted(rejection)?;
+        Ok(ReleasedCpuReservation {
+            ledger: self.identity(),
+            grant: rejection.grant,
+        })
     }
     /// Abandon a queued-but-never-started question. An admitted reservation or
     /// an owned continuation requires its worker's actual terminal receipt.
@@ -639,6 +998,7 @@ impl CpuCreditLedger {
                 "CPU paused termination is not attested",
             ));
         }
+        account.terminated_owner = Some(Arc::new(termination.clone()));
         account.terminal = true;
         Ok(())
     }
@@ -682,6 +1042,7 @@ impl CpuCreditLedger {
 enum CpuCommand {
     Begin(Box<CpuJob>, SliceGrant),
     Resume(SliceGrant),
+    ResumeWithReply(SliceGrant, Box<CpuReciprocalReply>),
 }
 struct TimedCpuCommand {
     original: CpuCommand,
@@ -690,7 +1051,7 @@ struct TimedCpuCommand {
 impl CpuCommand {
     fn grant(&self) -> SliceGrant {
         match self {
-            Self::Begin(_, grant) | Self::Resume(grant) => *grant,
+            Self::Begin(_, grant) | Self::Resume(grant) | Self::ResumeWithReply(grant, _) => *grant,
         }
     }
 }
@@ -769,6 +1130,7 @@ struct ActiveJob {
     terminal_permit: Option<
         ReliablePermit<TimedCpuCommand, CpuWorkerEventObservation, CpuWorkerProgressObservation>,
     >,
+    nnuec_capture: Option<NnuecActiveCapture>,
 }
 #[derive(Clone, Debug)]
 pub struct CpuWorkerProgress {
@@ -815,8 +1177,16 @@ pub struct CpuWorkerSliceTiming {
     analyze_returned_at: Instant,
     report_ready_at: Instant,
     resume_admission_and_restore: Option<Duration>,
+    #[cfg(feature = "nnuec-scalar-diagnostics")]
+    nnuec_scalar: Option<crate::cpu_value::nnuec::v2::scalar_diagnostic::SliceObservation>,
 }
 impl CpuWorkerSliceTiming {
+    #[cfg(feature = "nnuec-scalar-diagnostics")]
+    pub fn nnuec_scalar(
+        &self,
+    ) -> Option<crate::cpu_value::nnuec::v2::scalar_diagnostic::SliceObservation> {
+        self.nnuec_scalar
+    }
     pub fn run_started_at(&self) -> Instant {
         self.run_started_at
     }
@@ -871,9 +1241,13 @@ pub struct CpuWorker {
     affinity_finished: Option<Result<CpuThreadAffinityObservation, CpuThreadAffinityFinishError>>,
     pub signal: CompletionSignal,
     submission: Mutex<CpuSubmissionFence>,
+    /// One independently bounded install seat. A pending owner readback blocks
+    /// new job/profile admission; it never transfers an active or paused job.
+    installation: Mutex<prepared_value::Endpoint>,
     join: Option<JoinHandle<CpuWorkerExit>>,
     recovered_engine: Option<CpuEngine>,
     joined_known: bool,
+    deferred_nnuec_source: Option<DeferredNnuecRSource>,
 }
 
 impl CpuWorker {
@@ -1029,10 +1403,15 @@ impl CpuWorker {
         }
         let max_depth = engine.config().max_depth;
         let paused_bytes_limit = engine.paused_stack_max_bytes();
-        let evaluation_namespace = match cpu_evaluation_namespace_digest(&engine) {
-            Ok(namespace) => namespace,
-            Err(reason) => return Err((engine, reason)),
+        let initial_value_binding = match engine.job_binding_digest() {
+            Ok(binding) => binding,
+            Err(error) => return Err((engine, CpuWorkerError::Cpu(error))),
         };
+        let evaluation_namespace =
+            match prepared_value::registered_namespace(&engine, initial_value_binding) {
+                Ok(namespace) => namespace,
+                Err(reason) => return Err((engine, reason)),
+            };
         let search_conditions = cpu_search_conditions_digest(&engine);
         let shutdown = Arc::new(AtomicBool::new(false));
         // One terminal seat belongs to the paused Job. A one-command profile
@@ -1046,6 +1425,7 @@ impl CpuWorker {
             };
         let worker_shutdown = shutdown.clone();
         let worker_mailbox = mailbox.clone();
+        let (installation, mut worker_installation) = prepared_value::channel();
         let ready_readback = Arc::new(OnceLock::new());
         let worker_readback = ready_readback.clone();
         let affinity_ready = cpus.as_ref().map(|_| Arc::new(OnceLock::new()));
@@ -1119,6 +1499,7 @@ impl CpuWorker {
             let mut active: Option<ActiveJob> = None;
             let mut progress_sequence = 0u64;
             let mut engine_reusable = true;
+            let mut value_binding = initial_value_binding;
             loop {
                 let observed = worker_mailbox.signal().version();
                 // A paused owner keeps a reliable terminal seat. Atomic
@@ -1143,6 +1524,16 @@ impl CpuWorker {
                                 .acknowledge_cancel(snapshot.cancel_sequence);
                         }
                         let controls = task.job.mailbox.seal_terminal();
+                        if task
+                            .job
+                            .retire_nnuec_capture(
+                                owner,
+                                NnuecCaptureEnding::CpuTerminal(completion),
+                            )
+                            .is_err()
+                        {
+                            engine_reusable = false;
+                        }
                         if let Some(mut permit) = task.terminal_permit.take() {
                             let termination = CpuJobTermination {
                                 job: task.job.envelope.id,
@@ -1163,6 +1554,25 @@ impl CpuWorker {
                         }
                         active = None;
                     }
+                }
+                // This actual owner decides whether its engine, token and
+                // reliable seats are idle. A producer's claim of idleness
+                // cannot authorize replacement of a private paused traversal.
+                if worker_installation
+                    .service(
+                        &mut engine,
+                        &mut value_binding,
+                        active.is_none(),
+                        engine_reusable,
+                        worker_mailbox.occupancy(),
+                        worker_shutdown.load(Ordering::Acquire),
+                        &worker_mailbox.signal(),
+                    )
+                    .is_err()
+                {
+                    engine_reusable = false;
+                    worker_shutdown.store(true, Ordering::Release);
+                    worker_mailbox.close();
                 }
                 // A source fixture can hold this exact boundary after paused
                 // termination was checked and before the next shutdown read.
@@ -1193,7 +1603,12 @@ impl CpuWorker {
                 };
                 let admitted_at = command.command.admitted_at;
                 let mut rejected_controls = None;
-                let (grant, accepted_command) = match command.command.original {
+                #[cfg(feature = "nnuec-scalar-diagnostics")]
+                let diagnostic_resume_command = matches!(
+                    &command.command.original,
+                    CpuCommand::Resume(_) | CpuCommand::ResumeWithReply(_, _)
+                );
+                let (grant, accepted_command, reciprocal_reply) = match command.command.original {
                     CpuCommand::Begin(job, grant) => {
                         let fresh_eligible = !worker_shutdown.load(Ordering::Acquire)
                             && grant.job == job.envelope.id
@@ -1203,9 +1618,10 @@ impl CpuWorker {
                                     job: grant.job,
                                     owner,
                                 }
-                            && job.envelope.evaluation_namespace
-                                == cpu_evaluation_namespace_digest(&engine)
-                                    .unwrap_or(Digest([0; 32]))
+                            && prepared_value::registered_namespace(&engine, value_binding)
+                                .is_ok_and(|namespace| {
+                                    job.envelope.evaluation_namespace == namespace
+                                })
                             && job.envelope.search_conditions
                                 == cpu_search_conditions_digest(&engine)
                             && job.target_depth <= engine.config().max_depth
@@ -1214,7 +1630,38 @@ impl CpuWorker {
                                     .validate(&job.envelope, job.clock.domain(), now)
                                     .is_ok()
                             });
-                        if active.is_none() && fresh_eligible {
+                        let capture = if active.is_none() && fresh_eligible {
+                            match &job.nnuec_capture {
+                                Some(capture) => engine
+                                    .job_binding_digest()
+                                    .map_err(|_| CaptureError::Stale)
+                                    .and_then(|binding| {
+                                        binding.ok_or(CaptureError::Invalid(
+                                            "capture requires contextual value binding",
+                                        ))
+                                    })
+                                    .and_then(|binding| {
+                                        capture.bind_job(
+                                            job.envelope,
+                                            owner,
+                                            &job.position,
+                                            job.clock,
+                                            binding,
+                                        )
+                                    })
+                                    .map(Some),
+                                None => Ok(None),
+                            }
+                        } else {
+                            Ok(None)
+                        };
+                        let capture_ok = capture.is_ok();
+                        if let Err(error) = &capture {
+                            if let Some(scope) = &job.nnuec_capture {
+                                scope.record_error(error.clone());
+                            }
+                        }
+                        if active.is_none() && fresh_eligible && capture_ok {
                             active = Some(ActiveJob {
                                 job: *job,
                                 token: None,
@@ -1223,8 +1670,9 @@ impl CpuWorker {
                                 last_sequence: 0,
                                 last_control_sequence: 0,
                                 terminal_permit: None,
+                                nnuec_capture: capture.expect("checked capture admission"),
                             });
-                            (grant, true)
+                            (grant, true, None)
                         } else {
                             // This owned Begin never ran. Closing its
                             // question admission is distinct from an
@@ -1236,14 +1684,18 @@ impl CpuWorker {
                                 .is_some_and(|task| Arc::ptr_eq(&task.job.mailbox, &job.mailbox));
                             if !aliases_primary {
                                 rejected_controls = Some(job.mailbox.seal_terminal());
+                                let _ =
+                                    job.retire_nnuec_capture(owner, NnuecCaptureEnding::NotStarted);
                             }
-                            (grant, false)
+                            (grant, false, None)
                         }
                     }
-                    CpuCommand::Resume(grant) => (grant, true),
+                    CpuCommand::Resume(grant) => (grant, true, None),
+                    CpuCommand::ResumeWithReply(grant, reply) => (grant, true, Some(reply)),
                 };
                 let mut report = CpuSliceReport {
                     grant,
+                    reciprocal_request: None,
                     actual_work: Some(CpuWork::default()),
                     result: Err(CpuError::InvalidLimits(
                         "slice does not name the live private job",
@@ -1255,8 +1707,32 @@ impl CpuWorker {
                     admission_rejected: true,
                     controls: rejected_controls,
                 };
+                // Reject malformed/late replies before taking the old terminal
+                // seat or invoking the engine. A rejected Resume must preserve
+                // the original paused stack and charge no new native work.
+                let reciprocal_admission_error =
+                    active
+                        .as_ref()
+                        .and_then(|task| match &task.job.reciprocal_scope {
+                            Some(scope) => engine
+                                .validate_reciprocal_resume(
+                                    task.token.as_ref(),
+                                    scope,
+                                    reciprocal_reply.as_deref(),
+                                )
+                                .err(),
+                            None if reciprocal_reply.is_some()
+                                || engine.pending_reciprocal_request().is_some() =>
+                            {
+                                Some(CpuError::ResumeMismatch(
+                                    "plain CPU Resume cannot bypass a reciprocal question",
+                                ))
+                            }
+                            None => None,
+                        });
                 let eligible = !worker_shutdown.load(Ordering::Acquire)
                     && accepted_command
+                    && reciprocal_admission_error.is_none()
                     && active.as_ref().is_some_and(|task| {
                         grant.job == task.job.envelope.id
                             && grant.owner == owner
@@ -1277,6 +1753,9 @@ impl CpuWorker {
                                     sum <= task.job.envelope.total_native_node_credit
                                 })
                     });
+                if let Some(error) = reciprocal_admission_error {
+                    report.result = Err(error);
+                }
                 let mut owner_timing = None;
                 if eligible {
                     let task = active.as_mut().expect("checked private job");
@@ -1291,61 +1770,90 @@ impl CpuWorker {
                     let mut first_publication = true;
                     let mut resume_admission_and_restore = None;
                     let mut invoked = false;
+                    #[cfg(feature = "nnuec-scalar-diagnostics")]
+                    let diagnostic_before = (task.token.is_some(), engine.paused_stack_snapshot());
+                    #[cfg(feature = "nnuec-scalar-diagnostics")]
+                    let diagnostic =
+                        crate::cpu_value::nnuec::v2::scalar_diagnostic::Invocation::begin();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         CpuSliceControl::new(grant.node_credit, lease, task.job.mailbox.clone())
+                            .and_then(|control| match &task.nnuec_capture {
+                                Some(capture) => control.with_nnuec_capture(capture.clone()),
+                                None => Ok(control),
+                            })
                             .and_then(|control| {
                                 invoked = true;
-                                engine.analyze_controlled(
-                                    &task.job.position,
-                                    task.job.root_moves.as_deref(),
-                                    CpuLimits {
-                                        max_depth: task.job.target_depth,
-                                        max_nodes: task.job.envelope.total_native_node_credit
-                                            - task.spent,
-                                        deadline: Some(task.job.hard_deadline),
-                                    },
-                                    &worker_shutdown,
-                                    &control,
-                                    task.token.as_ref(),
-                                    |iteration| {
-                                        if iteration.completed_depth == 0 {
-                                            return;
-                                        }
-                                        let published_at = Instant::now();
-                                        if first_publication
-                                            && resumed_depth == Some(iteration.completed_depth)
-                                            && iteration.nodes == 0
-                                        {
-                                            // The existing stack owner publishes its
-                                            // reused iteration after exact restoration.
-                                            // This is not a newly completed depth.
-                                            resume_admission_and_restore =
-                                                published_at.checked_duration_since(admitted_at);
-                                        }
-                                        first_publication = false;
-                                        let advanced_depth = iteration.completed_depth > last_depth;
-                                        last_depth = last_depth.max(iteration.completed_depth);
-                                        progress_sequence = progress_sequence.saturating_add(1);
-                                        let _ = worker_mailbox.publish_progress(
-                                            progress_sequence,
-                                            CpuWorkerProgressObservation {
-                                                original: CpuWorkerProgress {
-                                                    job: grant.job,
-                                                    execution: grant.execution,
-                                                    owner,
-                                                    sequence: progress_sequence,
-                                                    iteration,
-                                                },
-                                                run_started_at,
-                                                published_at,
-                                                interval_started_at,
-                                                advanced_depth,
-                                                resume_admission_and_restore,
+                                let limits = CpuLimits {
+                                    max_depth: task.job.target_depth,
+                                    max_nodes: task.job.envelope.total_native_node_credit
+                                        - task.spent,
+                                    deadline: Some(task.job.hard_deadline),
+                                };
+                                let mut observer = |iteration: CpuIterationProgress| {
+                                    if iteration.completed_depth == 0 {
+                                        return;
+                                    }
+                                    let published_at = Instant::now();
+                                    if first_publication
+                                        && resumed_depth == Some(iteration.completed_depth)
+                                        && iteration.nodes == 0
+                                    {
+                                        // The existing stack owner publishes its
+                                        // reused iteration after exact restoration.
+                                        // This is not a newly completed depth.
+                                        resume_admission_and_restore =
+                                            published_at.checked_duration_since(admitted_at);
+                                    }
+                                    first_publication = false;
+                                    let advanced_depth = iteration.completed_depth > last_depth;
+                                    last_depth = last_depth.max(iteration.completed_depth);
+                                    progress_sequence = progress_sequence.saturating_add(1);
+                                    let _ = worker_mailbox.publish_progress(
+                                        progress_sequence,
+                                        CpuWorkerProgressObservation {
+                                            original: CpuWorkerProgress {
+                                                job: grant.job,
+                                                execution: grant.execution,
+                                                owner,
+                                                sequence: progress_sequence,
+                                                iteration,
                                             },
-                                        );
-                                        interval_started_at = published_at;
-                                    },
-                                )
+                                            run_started_at,
+                                            published_at,
+                                            interval_started_at,
+                                            advanced_depth,
+                                            resume_admission_and_restore,
+                                        },
+                                    );
+                                    interval_started_at = published_at;
+                                };
+                                match &task.job.reciprocal_scope {
+                                    Some(scope) => engine
+                                        .analyze_controlled_reciprocal(
+                                            &task.job.position,
+                                            task.job.root_moves.as_deref(),
+                                            limits,
+                                            &worker_shutdown,
+                                            &control,
+                                            task.token.as_ref(),
+                                            scope,
+                                            reciprocal_reply.as_deref(),
+                                            &mut observer,
+                                        )
+                                        .map(|value| {
+                                            report.reciprocal_request = value.request;
+                                            value.controlled
+                                        }),
+                                    None => engine.analyze_controlled(
+                                        &task.job.position,
+                                        task.job.root_moves.as_deref(),
+                                        limits,
+                                        &worker_shutdown,
+                                        &control,
+                                        task.token.as_ref(),
+                                        &mut observer,
+                                    ),
+                                }
                             })
                     }));
                     let analyze_returned_at = Instant::now();
@@ -1354,6 +1862,16 @@ impl CpuWorker {
                         analyze_returned_at,
                         report_ready_at: analyze_returned_at,
                         resume_admission_and_restore,
+                        #[cfg(feature = "nnuec-scalar-diagnostics")]
+                        nnuec_scalar: Some(
+                            crate::cpu_value::nnuec::v2::scalar_diagnostic::SliceObservation {
+                                scalar: diagnostic.finish(),
+                                resume_command: diagnostic_resume_command,
+                                prior_token_present: diagnostic_before.0,
+                                before: diagnostic_before.1,
+                                after: engine.paused_stack_snapshot(),
+                            },
+                        ),
                     });
                     let panicked = result.is_err();
                     let mut result = result.unwrap_or_else(|_| {
@@ -1365,6 +1883,9 @@ impl CpuWorker {
                         if let Err(error) = engine.validate_frozen_value_namespace() {
                             result = Err(error);
                         }
+                    }
+                    if result.is_err() {
+                        report.reciprocal_request = None;
                     }
                     report.actual_work = if panicked {
                         None
@@ -1389,7 +1910,12 @@ impl CpuWorker {
                     task.token = result
                         .as_ref()
                         .ok()
-                        .filter(|value| value.report.completion == CpuCompletion::Yielded)
+                        .filter(|value| {
+                            matches!(
+                                value.report.completion,
+                                CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+                            )
+                        })
                         .and_then(|value| value.report.resume.clone());
                     task.retained_completed_depth = result
                         .as_ref()
@@ -1404,17 +1930,39 @@ impl CpuWorker {
                         .as_ref()
                         .is_some_and(|token| engine.token_is_current(token));
                     report.terminal = match &result {
-                        Ok(value) => value.report.completion != CpuCompletion::Yielded,
+                        Ok(value) => !matches!(
+                            value.report.completion,
+                            CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+                        ),
                         Err(_) => true,
                     };
                     report.admission_rejected = false;
                     report.result = result;
                     report.progress_sequence = progress_sequence;
-                    if report.actual_work.is_none() || report.result.is_err() {
+                    let mut nnuec_soft_terminal = report.result.as_ref().err().and_then(|error| {
+                        owned_soft_value_terminal(&engine, value_binding, error, report.actual_work)
+                    });
+                    if report.actual_work.is_none()
+                        || (report.result.is_err() && nnuec_soft_terminal.is_none())
+                    {
                         engine_reusable = false;
                     }
                     if report.terminal {
                         engine.discard_paused_stack();
+                        if nnuec_soft_terminal.is_some()
+                            && (!engine.paused_stack_snapshot().is_some_and(|snapshot| {
+                                snapshot.complete
+                                    && snapshot.owner_id != 0
+                                    && snapshot.tokens_retained == 0
+                                    && snapshot.bytes_current == 0
+                            }) || engine.paused_stack_bytes().is_some()
+                                || engine.pending_reciprocal_request().is_some())
+                        {
+                            // No repair of counters, owner IDs, states or
+                            // unknown cleanup. Preserve the original Err.
+                            engine_reusable = false;
+                            nnuec_soft_terminal = None;
+                        }
                         let snapshot = task.job.mailbox.snapshot();
                         if snapshot.cancel_sequence > snapshot.cancel_ack {
                             let _ = task
@@ -1424,6 +1972,25 @@ impl CpuWorker {
                         }
                         task.job.mailbox.seal_terminal();
                         report.controls = Some(task.job.mailbox.snapshot());
+                        let ending = if report.actual_work.is_none() {
+                            NnuecCaptureEnding::Unknown
+                        } else {
+                            match &report.result {
+                                Ok(value) => {
+                                    NnuecCaptureEnding::CpuTerminal(value.report.completion)
+                                }
+                                Err(_) => nnuec_soft_terminal.map_or(
+                                    NnuecCaptureEnding::Failed,
+                                    NnuecCaptureEnding::CpuTerminal,
+                                ),
+                            }
+                        };
+                        if task.job.retire_nnuec_capture(owner, ending).is_err() {
+                            engine_reusable = false;
+                            report.result = Err(CpuError::InvalidLimits(
+                                "NNUEC capture retirement is not attested",
+                            ));
+                        }
                         active = None;
                     } else {
                         report.controls = Some(task.job.mailbox.snapshot());
@@ -1443,6 +2010,9 @@ impl CpuWorker {
                         // work exists, so return the admission rejection
                         // with its actual closed question scope.
                         report.controls = Some(task.job.mailbox.seal_terminal());
+                        let _ = task
+                            .job
+                            .retire_nnuec_capture(owner, NnuecCaptureEnding::NotStarted);
                         active = None;
                     }
                 }
@@ -1469,6 +2039,9 @@ impl CpuWorker {
             }
             if let Some(task) = active {
                 task.job.mailbox.seal_terminal();
+                let _ = task
+                    .job
+                    .retire_nnuec_capture(owner, NnuecCaptureEnding::Unknown);
                 engine_reusable = false;
             }
             engine.discard_paused_stack();
@@ -1520,9 +2093,11 @@ impl CpuWorker {
             mailbox,
             signal,
             submission: Mutex::new(CpuSubmissionFence::default()),
+            installation: Mutex::new(installation),
             join: Some(join),
             recovered_engine: None,
             joined_known: false,
+            deferred_nnuec_source: None,
         })
     }
     /// Build a question from the immutable worker profile without copying its
@@ -1538,6 +2113,14 @@ impl CpuWorker {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(CpuWorkerError::Disconnected);
         }
+        if self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?
+            .pending()
+        {
+            return Err(CpuWorkerError::AlreadyReserved);
+        }
         CpuJob::from_profile(
             envelope,
             position,
@@ -1551,6 +2134,8 @@ impl CpuWorker {
             self.signal.clone(),
         )
     }
+    /// Last actual owner profile whose installation readback was collected.
+    /// Use acknowledged_profile() to exclude an in-progress replacement.
     pub fn profile(&self) -> CpuWorkerProfile {
         CpuWorkerProfile {
             owner: self.owner,
@@ -1558,6 +2143,91 @@ impl CpuWorker {
             evaluation_namespace: self.evaluation_namespace,
             search_conditions: self.search_conditions,
         }
+    }
+    pub fn acknowledged_profile(&self) -> Result<CpuWorkerProfile, CpuWorkerError> {
+        if self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?
+            .pending()
+        {
+            return Err(CpuWorkerError::AlreadyReserved);
+        }
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(CpuWorkerError::Disconnected);
+        }
+        Ok(self.profile())
+    }
+    pub fn value_install_pending(&self) -> Result<bool, CpuWorkerError> {
+        Ok(self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?
+            .pending())
+    }
+    /// A historical receipt from another worker with an equal numeric owner
+    /// cannot authorize this owner's current value profile.
+    pub fn validates_installation_receipt(&self, receipt: &ValueInstallReceipt) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
+            && receipt.installed_profile() == Some(self.profile())
+            && self
+                .installation
+                .lock()
+                .is_ok_and(|endpoint| endpoint.validates_receipt(receipt))
+    }
+    /// Reserve one installation/readback seat without granting a native node
+    /// or claiming that an actual owner is idle. Only its command decides that.
+    pub fn try_install_prepared_value(
+        &self,
+        payload: PreparedValueInstallation,
+    ) -> Result<InstallId, InstallRejected> {
+        let _fence = match self.submission.lock() {
+            Ok(fence) => fence,
+            Err(_) => return Err(InstallRejected::new(payload, CpuWorkerError::Quarantined)),
+        };
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(InstallRejected::new(payload, CpuWorkerError::Disconnected));
+        }
+        if self.thread_affinity_requested() && !matches!(self.thread_affinity_ready(), Some(Ok(_)))
+        {
+            return Err(InstallRejected::new(
+                payload,
+                CpuWorkerError::Invalid("CPU worker affinity apply/readback not ready"),
+            ));
+        }
+        let mut installation = match self.installation.lock() {
+            Ok(installation) => installation,
+            Err(_) => return Err(InstallRejected::new(payload, CpuWorkerError::Quarantined)),
+        };
+        let id = installation.try_submit(payload, self.profile())?;
+        self.signal.notify();
+        Ok(id)
+    }
+    /// The endpoint verifies this worker's private channel/sequence/binding
+    /// before returning a receipt. No caller-supplied profile can update it.
+    pub fn try_install_readback(&mut self) -> Result<Option<ValueInstallReceipt>, CpuWorkerError> {
+        let _fence = self
+            .submission
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?;
+        let mut installation = self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?;
+        let receipt = installation.try_ack()?;
+        if let Some(profile) = receipt
+            .as_ref()
+            .and_then(|receipt| receipt.result().ok())
+            .map(ValueInstallReadback::profile)
+        {
+            if profile.owner != self.owner {
+                return Err(CpuWorkerError::Quarantined);
+            }
+            self.max_depth = profile.max_depth;
+            self.evaluation_namespace = profile.evaluation_namespace;
+            self.search_conditions = profile.search_conditions;
+        }
+        Ok(receipt)
     }
     /// The actual mailbox and engine ceilings captured before worker start.
     pub fn command_capacity(&self) -> usize {
@@ -1595,6 +2265,23 @@ impl CpuWorker {
         };
         if let Err(error) = fence.claim(self.owner, command.grant()) {
             return Err(CpuSubmissionRejected::from_command(error, command, false));
+        }
+        match self.installation.lock() {
+            Ok(installation) if installation.pending() => {
+                return Err(CpuSubmissionRejected::from_command(
+                    CpuWorkerError::AlreadyReserved,
+                    command,
+                    true,
+                ));
+            }
+            Err(_) => {
+                return Err(CpuSubmissionRejected::from_command(
+                    CpuWorkerError::Quarantined,
+                    command,
+                    true,
+                ));
+            }
+            _ => {}
         }
         if self.shutdown.load(Ordering::Acquire) {
             return Err(CpuSubmissionRejected::from_command(
@@ -1664,6 +2351,22 @@ impl CpuWorker {
         job: CpuJob,
         grant: SliceGrant,
     ) -> Result<CpuSubmissionRejected, CpuWorkerError> {
+        // Preserve the legacy caller's error-only disposition. New cleanup
+        // consumers retain the original Job through the boundary below.
+        self.reject_prepared_retaining(job, grant)
+            .map_err(|(error, _job)| error)
+    }
+    /// Actual worker/fence rejection of a unique prepared Job. Validation or
+    /// fence failure returns that same Job without retiring its capture. Only
+    /// the successful, definitely unqueued branch may publish NotStarted.
+    /// This is not a ledger refund; the caller still settles the original
+    /// reservation using the resulting CpuAdmissionRejection proof.
+    #[allow(clippy::result_large_err)]
+    pub fn reject_prepared_retaining(
+        &self,
+        job: CpuJob,
+        grant: SliceGrant,
+    ) -> Result<CpuSubmissionRejected, (CpuWorkerError, CpuJob)> {
         if grant.owner != self.owner
             || grant.job != job.envelope.id
             || job.mailbox.scope()
@@ -1674,15 +2377,18 @@ impl CpuWorker {
             || job.envelope.evaluation_namespace != self.evaluation_namespace
             || job.envelope.search_conditions != self.search_conditions
         {
-            return Err(CpuWorkerError::Invalid(
-                "CPU prepared rejection scope mismatch",
+            return Err((
+                CpuWorkerError::Invalid("CPU prepared rejection scope mismatch"),
+                job,
             ));
         }
-        let mut fence = self
-            .submission
-            .lock()
-            .map_err(|_| CpuWorkerError::Quarantined)?;
-        fence.claim(self.owner, grant)?;
+        let mut fence = match self.submission.lock() {
+            Ok(fence) => fence,
+            Err(_) => return Err((CpuWorkerError::Quarantined, job)),
+        };
+        if let Err(error) = fence.claim(self.owner, grant) {
+            return Err((error, job));
+        }
         Ok(CpuSubmissionRejected::from_command(
             CpuWorkerError::Invalid("CPU prepared question declined before enqueue"),
             CpuCommand::Begin(Box::new(job), grant),
@@ -1714,6 +2420,16 @@ impl CpuWorker {
     }
     pub fn resume_attested(&self, grant: SliceGrant) -> Result<(), CpuSubmissionRejected> {
         self.submit(CpuCommand::Resume(grant))
+    }
+
+    /// Validate and consume the reply on the original private owner as one
+    /// command. Rejection before invocation leaves its pending token intact.
+    pub fn resume_with_reply_attested(
+        &self,
+        grant: SliceGrant,
+        reply: CpuReciprocalReply,
+    ) -> Result<(), CpuSubmissionRejected> {
+        self.submit(CpuCommand::ResumeWithReply(grant, Box::new(reply)))
     }
     pub fn try_event(&self) -> Result<Option<CpuWorkerEvent>, CpuWorkerError> {
         self.try_event_observed()
@@ -1774,6 +2490,15 @@ impl CpuWorker {
             events.push(event.original);
         }
         let last_progress = self.latest_progress();
+        let (value_installation_receipt, value_installation_error) =
+            match self.try_install_readback() {
+                Ok(receipt) => (receipt, None),
+                Err(error) => (None, Some(error)),
+            };
+        if value_installation_error.is_some() {
+            self.recovered_engine = None;
+            self.joined_known = false;
+        }
         CpuWorkerShutdown {
             owner: self.owner,
             events,
@@ -1791,6 +2516,8 @@ impl CpuWorker {
                 CpuWorkerThreadAffinityShutdown::NotRequested
             },
             engine_recoverable: self.joined_known,
+            value_installation_receipt,
+            value_installation_error,
         }
     }
     /// Move the same engine/TT out only after a known joined owner exit. The
@@ -1897,6 +2624,8 @@ mod owner_clock_tests {
             analyze_returned_at: started + Duration::from_millis(100),
             report_ready_at: started + Duration::from_millis(102),
             resume_admission_and_restore: None,
+            #[cfg(feature = "nnuec-scalar-diagnostics")]
+            nnuec_scalar: None,
         };
         assert_eq!(timing.return_processing(), Duration::from_millis(2));
         assert_eq!(timing.resume_admission_and_restore(), None);

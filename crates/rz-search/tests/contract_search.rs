@@ -370,6 +370,283 @@ fn new_search(position: Position, cap: u64) -> ContractSearch<Position> {
 }
 
 #[test]
+fn root_restriction_keeps_full_nn_order_and_excludes_the_better_outside_move() {
+    let allowed = chess_move(12, 28);
+    let excluded = chess_move(11, 27);
+    let mut search = new_search(two_terminal_children(), 3);
+    search.set_root_moves(&[allowed]).unwrap();
+    assert_eq!(search.best_move(), Some(allowed));
+    let mut runtime = ScriptedEvaluator::default();
+    let clock = ManualClock::new(1);
+    pump(&mut search, &mut runtime, &clock);
+    let request = runtime.submissions[0].clone();
+    assert_eq!(request.legal().moves(), [allowed, excluded]);
+    // All raw prior mass, as well as the winning child, is outside the domain.
+    // The declared zero-subset-mass policy uses uniform only within the domain.
+    let output = completed(&request, &[0.0, 1.0], [0.0, 1.0, 0.0]);
+    runtime
+        .results
+        .push_back(EvalResult::Completed(output.clone()));
+    assert!(matches!(
+        pump(&mut search, &mut runtime, &clock),
+        ContractPumpEvent::Accepted { .. }
+    ));
+    assert_eq!(output.policy.probabilities(), [0.0, 1.0]);
+    for _ in 0..3 {
+        assert!(matches!(
+            pump(&mut search, &mut runtime, &clock),
+            ContractPumpEvent::Accepted {
+                traversed_edges: 1,
+                ..
+            }
+        ));
+        assert_eq!(search.best_move(), Some(allowed));
+    }
+    pump(&mut search, &mut runtime, &clock);
+    let outcome = search.outcome();
+    assert!(matches!(outcome.status, ContractSearchStatus::Completed));
+    assert_eq!(outcome.best_move, Some(allowed));
+    assert!(!outcome.fallback_used);
+    assert_eq!(
+        outcome.root_stats,
+        [(
+            allowed,
+            EdgeStats {
+                prior: 1.0,
+                visits: 3,
+                value_sum: 0.0
+            }
+        )]
+    );
+    assert_eq!(runtime.submissions.len(), 1);
+}
+
+#[test]
+fn root_restriction_never_projects_the_opponent_child_legal_array() {
+    let excluded = chess_move(12, 28);
+    let allowed = chess_move(11, 27);
+    let response = chess_move(52, 36);
+    let position = Position::from_nodes(vec![
+        ongoing(Color::White, &[(excluded, 1), (allowed, 2)]),
+        terminal(Color::Black, Some(Color::White)),
+        ongoing(Color::Black, &[(response, 3)]),
+        terminal(Color::White, None),
+    ]);
+    let mut search = new_search(position, 2);
+    // Index 1 exists at the root and does not exist in its one-move child.
+    search.set_root_moves(&[allowed]).unwrap();
+    let mut runtime = ScriptedEvaluator::default();
+    let clock = ManualClock::new(1);
+    pump(&mut search, &mut runtime, &clock);
+    let root = runtime.submissions[0].clone();
+    runtime.results.push_back(EvalResult::Completed(completed(
+        &root,
+        &[0.9, 0.1],
+        [0.0, 1.0, 0.0],
+    )));
+    pump(&mut search, &mut runtime, &clock);
+    pump(&mut search, &mut runtime, &clock);
+    let child = runtime.submissions[1].clone();
+    assert_eq!(child.legal().moves(), [response]);
+    assert_eq!(child.position().side_to_move(), Color::Black);
+    runtime.results.push_back(EvalResult::Completed(completed(
+        &child,
+        &[1.0],
+        [0.0, 1.0, 0.0],
+    )));
+    assert!(matches!(
+        pump(&mut search, &mut runtime, &clock),
+        ContractPumpEvent::Accepted {
+            traversed_edges: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        pump(&mut search, &mut runtime, &clock),
+        ContractPumpEvent::Accepted {
+            traversed_edges: 2,
+            ..
+        }
+    ));
+    pump(&mut search, &mut runtime, &clock);
+    assert_eq!(search.outcome().best_move, Some(allowed));
+    assert_eq!(search.outcome().root_stats[0].1.visits, 2);
+}
+
+#[test]
+fn root_restriction_preserves_rules_order_promotions_and_zero_work_fallback() {
+    let position = promotion_position();
+    let legal = position.legal().moves().to_vec();
+    let mut search = new_search(position, 0);
+    search.set_root_moves(&[legal[3], legal[1]]).unwrap();
+    let mut runtime = ScriptedEvaluator::default();
+    pump(&mut search, &mut runtime, &ManualClock::new(1));
+    assert_eq!(search.outcome().best_move, Some(legal[1]));
+    assert!(search.outcome().fallback_used);
+    assert!(runtime.submissions.is_empty());
+    assert_eq!(runtime.polls, 0);
+}
+
+#[test]
+fn root_subset_priors_are_conditioned_without_changing_raw_head_order() {
+    let position = promotion_position();
+    let legal = position.legal().moves().to_vec();
+    let mut search = new_search(position, 1);
+    search.set_root_moves(&[legal[3], legal[1]]).unwrap();
+    let mut runtime = ScriptedEvaluator::default();
+    let clock = ManualClock::new(1);
+    pump(&mut search, &mut runtime, &clock);
+    let request = runtime.submissions[0].clone();
+    assert_eq!(request.legal().moves(), legal);
+    runtime.results.push_back(EvalResult::Completed(completed(
+        &request,
+        &[0.1, 0.2, 0.3, 0.4],
+        [0.0, 1.0, 0.0],
+    )));
+    pump(&mut search, &mut runtime, &clock);
+    let edges = search.outcome().root_stats;
+    assert_eq!(
+        edges
+            .iter()
+            .map(|(movement, _)| *movement)
+            .collect::<Vec<_>>(),
+        [legal[1], legal[3]]
+    );
+    assert!((edges[0].1.prior - 1.0 / 3.0).abs() < 1e-12);
+    assert!((edges[1].1.prior - 2.0 / 3.0).abs() < 1e-12);
+    assert_eq!(search.best_move(), Some(legal[1]));
+}
+
+#[test]
+fn rejected_or_late_root_restrictions_do_not_change_the_admitted_domain() {
+    let first = chess_move(12, 28);
+    let second = chess_move(11, 27);
+    for requested in [vec![], vec![first, first], vec![chess_move(0, 8)]] {
+        let mut search = new_search(two_terminal_children(), 1);
+        let rejected = search.set_root_moves(&requested).unwrap_err();
+        assert_eq!(rejected.code, ErrorCode::InvalidInput);
+        assert_eq!(rejected.stage, Stage::Admission);
+        assert_eq!(search.best_move(), Some(first));
+        search.set_root_moves(&[second]).unwrap();
+        assert_eq!(search.best_move(), Some(second));
+    }
+    let mut search = new_search(two_terminal_children(), 1);
+    search.set_root_moves(&[second]).unwrap();
+    let mut runtime = ScriptedEvaluator::default();
+    pump(&mut search, &mut runtime, &ManualClock::new(1));
+    let original = search.pending_request();
+    let rejected = search.set_root_moves(&[first]).unwrap_err();
+    assert_eq!(rejected.code, ErrorCode::UnsupportedContract);
+    assert_eq!(rejected.stage, Stage::Admission);
+    assert_eq!(search.pending_request(), original);
+    assert_eq!(search.best_move(), Some(second));
+}
+
+#[test]
+fn root_restriction_does_not_relax_the_original_full_legal_view_resource_bound() {
+    let mut settings = config(Arc::new(IdAllocator::new(EPOCH)), 1);
+    settings.tree_limits.max_legal_moves = 1;
+    let mut search = ContractSearch::new(two_terminal_children(), settings).unwrap();
+    let allowed = chess_move(11, 27);
+    search.set_root_moves(&[allowed]).unwrap();
+    let mut runtime = ScriptedEvaluator::default();
+    pump(&mut search, &mut runtime, &ManualClock::new(1));
+    assert!(matches!(
+        search.outcome().status,
+        ContractSearchStatus::Failed(ContractSearchFailure::Tree(
+            rz_search::SearchError::EdgeLimit
+        ))
+    ));
+    assert_eq!(search.outcome().best_move, Some(allowed));
+    assert!(search.outcome().fallback_used);
+    assert!(runtime.submissions.is_empty());
+}
+
+#[cfg(feature = "experimental-batch")]
+#[test]
+fn restricted_root_survives_parallel_child_completion_order_and_late_cancellation_results() {
+    let excluded = chess_move(12, 28);
+    let allowed = [chess_move(11, 27), chess_move(6, 21)];
+    let replies = [chess_move(52, 36), chess_move(51, 35)];
+    for order in [Some([1, 2]), Some([2, 1]), None] {
+        let position = Position::from_nodes(vec![
+            ongoing(
+                Color::White,
+                &[(excluded, 1), (allowed[0], 2), (allowed[1], 3)],
+            ),
+            terminal(Color::Black, Some(Color::White)),
+            ongoing(Color::Black, &[(replies[0], 4)]),
+            ongoing(Color::Black, &[(replies[1], 4)]),
+            terminal(Color::White, None),
+        ]);
+        let mut search = new_search(position, 2);
+        search.set_root_moves(&allowed).unwrap();
+        search.set_parallelism(2).unwrap();
+        let mut runtime = ScriptedEvaluator::default();
+        let clock = ManualClock::new(1);
+        pump(&mut search, &mut runtime, &clock);
+        let root = runtime.submissions[0].clone();
+        assert_eq!(root.legal().moves(), [excluded, allowed[0], allowed[1]]);
+        runtime.results.push_back(EvalResult::Completed(completed(
+            &root,
+            &[0.98, 0.01, 0.01],
+            [0.0, 1.0, 0.0],
+        )));
+        pump(&mut search, &mut runtime, &clock);
+        assert!(matches!(
+            pump(&mut search, &mut runtime, &clock),
+            ContractPumpEvent::Submitted { .. }
+        ));
+        assert!(matches!(
+            pump(&mut search, &mut runtime, &clock),
+            ContractPumpEvent::Submitted { .. }
+        ));
+        assert_eq!(runtime.submissions.len(), 3);
+        for child in &runtime.submissions[1..] {
+            let node = child.position().state().node;
+            assert!((2..=3).contains(&node));
+            assert_eq!(child.legal().moves(), [replies[node - 2]]);
+        }
+        if let Some(order) = order {
+            for index in order {
+                let child = runtime.submissions[index].clone();
+                runtime.results.push_back(EvalResult::Completed(completed(
+                    &child,
+                    &[1.0],
+                    [0.0, 1.0, 0.0],
+                )));
+                assert!(matches!(
+                    pump(&mut search, &mut runtime, &clock),
+                    ContractPumpEvent::Accepted {
+                        traversed_edges: 1,
+                        ..
+                    }
+                ));
+            }
+            pump(&mut search, &mut runtime, &clock);
+            let outcome = search.outcome();
+            assert_eq!(outcome.root_stats.len(), 2);
+            assert!(
+                outcome
+                    .root_stats
+                    .iter()
+                    .all(|(movement, edge)| allowed.contains(movement) && edge.visits == 1)
+            );
+            assert!(allowed.contains(&outcome.best_move.unwrap()));
+        } else {
+            let late = completed(&runtime.submissions[1], &[1.0], [0.0, 1.0, 0.0]);
+            clock.set(100);
+            pump(&mut search, &mut runtime, &clock);
+            assert_eq!(runtime.canceled.len(), 2);
+            runtime.results.push_back(EvalResult::Completed(late));
+            pump(&mut search, &mut runtime, &clock);
+            assert_eq!(search.outcome().counters.completed_visits, 0);
+            assert_eq!(search.outcome().best_move, Some(allowed[0]));
+        }
+    }
+}
+
+#[test]
 fn artificial_terminal_tree_has_independent_visit_and_value_expectations() {
     let mut search = new_search(two_terminal_children(), 3);
     let mut runtime = ScriptedEvaluator::default();

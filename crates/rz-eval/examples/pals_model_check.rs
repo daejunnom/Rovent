@@ -22,33 +22,9 @@ use std::path::Path;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-/// Opt-in crash localization for the numerical checker only. Stage records
-/// are not provider fences or performance evidence. Never used by the engine.
-struct NativeStartupTrace(Option<Instant>);
-impl NativeStartupTrace {
-    fn new(cost_mode: bool) -> Result<Self, Box<dyn Error>> {
-        let enabled =
-            std::env::var_os("RZ_PALS_NUMERIC_STARTUP_TRACE").is_some_and(|value| value == "1");
-        if enabled && cost_mode {
-            return Err("native startup trace cannot be combined with cost measurement".into());
-        }
-        Ok(Self(enabled.then(Instant::now)))
-    }
-
-    fn stage(&self, stage: &'static str) {
-        if let Some(started) = self.0 {
-            // Best effort diagnostics must not turn a successful numerical
-            // check into a failure when its diagnostic sink is unavailable.
-            let mut stderr = std::io::stderr().lock();
-            let _ = writeln!(
-                stderr,
-                "RZ_PALS_CHECK_STAGE stage={stage} elapsed_ns={} performance_evidence_eligible=false physical_completion=unknown",
-                started.elapsed().as_nanos()
-            );
-            let _ = stderr.flush();
-        }
-    }
-}
+#[path = "support/native_startup_trace.rs"]
+mod native_startup_trace;
+use native_startup_trace::NativeStartupTrace;
 
 #[cfg(feature = "experimental-io-binding")]
 #[path = "pals_model_check/resident_cuda.rs"]

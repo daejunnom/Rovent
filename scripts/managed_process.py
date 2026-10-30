@@ -193,8 +193,23 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
         command = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(arg) for arg in argv]))
         block = ctypes.create_unicode_buffer("\0".join(f"{key}={value}" for key, value in sorted(env.items(), key=lambda p: p[0].upper())) + "\0\0")
         # suspended | unicode environment | new process group | no new window
-        require(k.CreateProcessW(None, command, None, None, True, 0x4 | 0x400 | 0x200 | 0x8000000,
-                                 block, str(cwd), ctypes.byref(startup), ctypes.byref(info)))
+        process_created = k.CreateProcessW(
+            None, command, None, None, True, 0x4 | 0x400 | 0x200 | 0x8000000,
+            block, str(cwd), ctypes.byref(startup), ctypes.byref(info))
+        if not process_created:
+            # Only an explicit CreateProcessW failure proves that no child was
+            # created. Do not apply this classification to setup exceptions or
+            # failures after creation/assignment; their existing preservation
+            # path must retain the original lease and uncertain artifacts.
+            start_error = ctypes.WinError(ctypes.get_last_error())
+            return 125, True, {
+                "kind": "windows_process_not_started",
+                "stage": "CreateProcessW",
+                "process_created": False,
+                "winerror": start_error.winerror,
+                "error_type": type(start_error).__name__,
+                "message": str(start_error),
+            }
         created = True
         require(k.AssignProcessToJobObject(job, info.process))
         assigned = True

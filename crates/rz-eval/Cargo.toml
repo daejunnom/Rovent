@@ -25,6 +25,8 @@ rz-runtime = { workspace = true, optional = true, features = ["contracts"] }
 
 [features]
 experimental-batch = ["contracts", "rz-runtime/experimental-batch"]
+# Explicit GPU lifetime validation; no observer exists unless enabled before use.
+native-validation-diagnostics = ["onnx", "contracts"]
 experimental-io-buffers = ["onnx"]
 experimental-ort-cpu-arena = ["onnx"]
 experimental-ort-model = ["onnx"]
@@ -57,6 +59,10 @@ required-features = ["onnx"]
 [[example]]
 name = "pals_model_check"
 required-features = ["onnx", "contracts"]
+
+[[example]]
+name = "runtime_loader_check"
+required-features = ["onnx"]
 
 [[example]]
 name = "virtual_review_numeric_capture"

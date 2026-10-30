@@ -1,7 +1,8 @@
 //! Actual Fresh B1 ORT raw capture; numerical admission is a separate reader.
 //! This executable does not label tensor fixtures as Rules/legal-game evidence.
-//! Every CUDA graph requires the explicit V3 source/placement policy. Failures
-//! leave pending output files for recovery and never publish completed receipts.
+//! Every CUDA graph requires the explicit V3 source/placement policy. Required
+//! capture failures preserve pending recovery files. A separate post-join policy
+//! reporter failure preserves published raw data but remains a partial command.
 use rz_eval::asset;
 use rz_eval::error::BackendError;
 use rz_eval::onnx::{NativeLoadingProfile, OrtRuntime, Provider};
@@ -867,6 +868,26 @@ fn publish_pending(pending: &Path, final_path: &Path) -> Result<()> {
     fs::remove_file(pending)?;
     Ok(())
 }
+
+enum PostJoinCapturePublication {
+    Complete,
+    DiagnosticFailure(Box<dyn Error>),
+}
+
+/// Called only after the original runtime/placement checks and worker join.
+/// A separate policy reporter cannot prevent publishing the unchanged numerical
+/// payload. Its failure still makes this command partial, not fully successful.
+fn publish_joined_capture(
+    publish_raw: impl FnOnce() -> Result<()>,
+    publish_policy: impl FnOnce() -> Result<u64>,
+) -> Result<PostJoinCapturePublication> {
+    publish_raw()?;
+    Ok(match publish_policy() {
+        Ok(_) => PostJoinCapturePublication::Complete,
+        Err(error) => PostJoinCapturePublication::DiagnosticFailure(error),
+    })
+}
+
 fn command(worker: &mut Worker, command: Command, until: Instant) -> Result<Outcome> {
     if Instant::now() >= until {
         return Err("capture window expired before native dispatch".into());
@@ -1349,33 +1370,58 @@ fn execute(config: Config) -> Result<()> {
         }
     };
     output_owner.verify()?;
-    // This separate, small policy observation is never part of the unchanged
-    // numerical V5 payload. Publish only after all captured physical results,
-    // the placement/runtime audits, and normal worker join have succeeded.
-    write_exclusive_bounded(
-        &root.join("actual-cudnn-execution-policy.json"),
-        &JoinedPolicyObservation {
-            domain: "rz-pals-numerical-capture-execution-policy/1",
-            scope: "loaded_request_and_session_settings_not_selected_cudnn_plan",
-            loaded: policy_observation,
-            captured_physical_completions_known: true,
-            native_worker_joined: true,
-            actual_cudnn_plan: "unknown",
-            tf32_actual: "unknown",
-            numerical_acceptance: false,
-            performance_improvement_claim: false,
-            process_exit_evidence: "requires_external_process_owner_exit_observation",
-            cuda_profiling_window: profiling_window,
+    let publication = publish_joined_capture(
+        || {
+            for (pending, final_path) in outputs {
+                if final_path.exists() {
+                    return Err("refusing final receipt overwrite".into());
+                }
+                publish_pending(&pending, &final_path)?;
+            }
+            output_owner.verify()
         },
-        POLICY_LIMIT,
+        || {
+            // This small observation is separate from the unchanged numerical
+            // V5 payload. Required runtime/placement checks and worker join have
+            // already succeeded; consumers requiring this sidecar must still
+            // reject its absence or a partial write under their own contract.
+            write_exclusive_bounded(
+                &root.join("actual-cudnn-execution-policy.json"),
+                &JoinedPolicyObservation {
+                    domain: "rz-pals-numerical-capture-execution-policy/1",
+                    scope: "loaded_request_and_session_settings_not_selected_cudnn_plan",
+                    loaded: policy_observation,
+                    captured_physical_completions_known: true,
+                    native_worker_joined: true,
+                    actual_cudnn_plan: "unknown",
+                    tf32_actual: "unknown",
+                    numerical_acceptance: false,
+                    performance_improvement_claim: false,
+                    process_exit_evidence: "requires_external_process_owner_exit_observation",
+                    cuda_profiling_window: profiling_window,
+                },
+                POLICY_LIMIT,
+            )
+        },
     )?;
-    for (pending, final_path) in outputs {
-        if final_path.exists() {
-            return Err("refusing final receipt overwrite".into());
-        }
-        publish_pending(&pending, &final_path)?;
+    if let PostJoinCapturePublication::DiagnosticFailure(error) = &publication {
+        // Preserve the reporter failure before the final required owner check,
+        // so a later owner error remains primary without hiding this secondary.
+        let detail = error.to_string().chars().take(1024).collect::<String>();
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "RZ_NUMERIC_CAPTURE_DIAGNOSTIC_FAILURE={}",
+            serde_json::json!({"stage":"post_join_policy_observation","detail":detail,
+                "raw_payload_published":true,"full_capture_success":false})
+        );
     }
     output_owner.verify()?;
+    if let PostJoinCapturePublication::DiagnosticFailure(error) = publication {
+        println!(
+            "RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured_with_diagnostic_failure\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true,\"raw_payload_published\":true,\"diagnostics_complete\":false,\"diagnostic_failure\":\"post_join_policy_observation\"}}"
+        );
+        return Err(error);
+    }
     println!(
         "RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true}}"
     );
@@ -1432,6 +1478,62 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joined_capture_policy_failure_keeps_the_required_raw_publication() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = publish_joined_capture(
+            || {
+                calls.borrow_mut().push("raw");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("policy");
+                Err("policy reporter unavailable".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["raw", "policy"]);
+        let PostJoinCapturePublication::DiagnosticFailure(error) = result else {
+            panic!("reporter failure must not become complete capture success");
+        };
+        assert_eq!(error.to_string(), "policy reporter unavailable");
+    }
+
+    #[test]
+    fn joined_capture_required_raw_failure_does_not_run_the_policy_reporter() {
+        let policy_called = std::cell::Cell::new(false);
+        let result = publish_joined_capture(
+            || Err("required raw integrity failure".into()),
+            || {
+                policy_called.set(true);
+                Ok(1)
+            },
+        );
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "required raw integrity failure"
+        );
+        assert!(!policy_called.get());
+    }
+
+    #[test]
+    fn joined_capture_success_publishes_raw_before_the_separate_policy() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = publish_joined_capture(
+            || {
+                calls.borrow_mut().push("raw");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("policy");
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, PostJoinCapturePublication::Complete));
+        assert_eq!(*calls.borrow(), ["raw", "policy"]);
+    }
 
     fn schedule_group(role: PalsRole, bucket: usize) -> Group {
         let role_name = format!("{role:?}");

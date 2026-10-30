@@ -12,6 +12,10 @@ use rz_contracts::ExecutionId as NativeExecutionId;
 use rz_contracts::pals_adaptive::{CpuJobId, CpuWorkerId};
 use std::collections::{BTreeSet, HashMap};
 
+mod observation_writer;
+use observation_writer::ObservationShaSink;
+pub(super) use observation_writer::{BoundedObservationPreimage, ObservationSink};
+
 pub const MAX_VALIDATOR_CONTEXTS_PER_ROOT: usize = 128;
 pub const MAX_VALIDATOR_ACTIONS_PENDING: usize = 64;
 pub const MAX_ACTION_WITNESSES: usize = 64;
@@ -19,15 +23,10 @@ pub const MAX_ACTION_EXECUTIONS: usize = 4096;
 pub const MAX_ACTION_ROLE_SUBMISSIONS: u64 = 64;
 
 fn validator_write_bytes(hash: &mut Sha256, bytes: &[u8]) {
-    hash.update((bytes.len() as u64).to_le_bytes());
-    hash.update(bytes);
+    observation_writer::write_bytes(&mut ObservationShaSink(hash), bytes);
 }
 fn validator_write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), PalsError> {
-    hash.update((moves.len() as u64).to_le_bytes());
-    for movement in moves {
-        hash.update(Move16::pack(*movement)?.bits().to_le_bytes());
-    }
-    Ok(())
+    observation_writer::write_moves(&mut ObservationShaSink(hash), moves)
 }
 fn validator_write_optional_moves(
     hash: &mut Sha256,
@@ -574,9 +573,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update(target.input.question_digest.0);
         hash.update(target.input.public_context.0);
         hash.update(target.input.view.digest());
-        hash.update(self.engine.revision.to_le_bytes());
+        hash.update(self.engine.semantic.revision.to_le_bytes());
         hash.update(
-            (self.engine.stores.observations.next_observation_sequence() as u64).to_le_bytes(),
+            (self
+                .engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence() as u64)
+                .to_le_bytes(),
         );
         if let Some(admission) = self
             .cpu_admissions
@@ -632,7 +637,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         endpoints: CpuEndpointSelection,
     ) -> Result<AdaptiveValidatorQuestion, PalsError> {
         let prepared_at = Instant::now();
-        let observation_watermark = self.engine.stores.observations.next_observation_sequence();
+        let observation_watermark = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .next_observation_sequence();
         endpoints
             .validate_generation_collection()
             .map_err(|_| PalsError::InvalidConfig)?;
@@ -673,12 +683,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .ok_or(RoleError::InvalidOutput)?
                     .to_vec();
                 let node = self.replay_node(&prefix)?;
-                let position = &self.engine.nodes[node].position;
+                let position = &self.engine.semantic.nodes[node].position;
                 // Response search is meaningful at the opponent's exact
                 // ongoing anchor; there is no board-only rebase.
-                if self.engine.nodes[node].terminal.is_none()
+                if self.engine.semantic.nodes[node].terminal.is_none()
                     && position.side_to_move()
-                        != self.engine.nodes[self.root].position.side_to_move()
+                        != self.engine.semantic.nodes[self.root]
+                            .position
+                            .side_to_move()
                     && position.legal_moves().contains(&response)
                 {
                     offers[AdaptiveValidatorAction::DefendResponse.index()] =
@@ -688,7 +700,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                             moves: vec![response],
                         });
                     unsupported[AdaptiveValidatorAction::DefendResponse.index()] = None;
-                    let examined = &self.engine.nodes[node].edges;
+                    let examined = &self.engine.semantic.nodes[node].edges;
                     let moves: Vec<_> = position
                         .legal_moves()
                         .into_iter()
@@ -845,7 +857,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         })
     }
 
-    fn validator_witness_identity(
+    pub(super) fn validator_witness_identity(
         &self,
         kind: ActionWitnessKind,
         line: &[BoardMove],
@@ -895,7 +907,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update((self.engine.config.line_plies as u64).to_le_bytes());
         hash.update((self.engine.config.beam_width as u64).to_le_bytes());
         hash.update(self.engine.config.cpu_nodes_per_task.to_le_bytes());
-        validator_write_bytes(&mut hash, self.engine.cpu_registered_condition.as_bytes());
+        validator_write_bytes(
+            &mut hash,
+            self.engine.researcher.cpu_registered_condition.as_bytes(),
+        );
         for (index, offer) in offers.iter().enumerate() {
             hash.update([index as u8, u8::from(offer.is_some())]);
             match offer {
@@ -908,7 +923,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     hash.update([0]);
                     hash.update(
                         rz_position::contracts::rules_snapshot_semantic_digest(
-                            &self.engine.nodes[*node].position.snapshot(),
+                            &self.engine.semantic.nodes[*node].position.snapshot(),
                         )
                         .0,
                     );
@@ -919,7 +934,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     hash.update([1]);
                     hash.update(
                         rz_position::contracts::rules_snapshot_semantic_digest(
-                            &self.engine.nodes[*node].position.snapshot(),
+                            &self.engine.semantic.nodes[*node].position.snapshot(),
                         )
                         .0,
                     );
@@ -1032,68 +1047,105 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
     /// Follow only already-resident dependencies, with a bounded recursion.
     /// Missing/cold evidence is an explicit error; the manager does no I/O.
-    fn validator_write_observation(
+    pub(super) fn validator_write_observation(
         &self,
         hash: &mut Sha256,
         id: ObservationId,
         depth: u8,
     ) -> Result<(), PalsError> {
+        self.validator_write_observation_into(&mut ObservationShaSink(hash), id, depth)
+    }
+    pub(super) fn validator_write_observation_into<S: ObservationSink>(
+        &self,
+        hash: &mut S,
+        id: ObservationId,
+        depth: u8,
+    ) -> Result<(), PalsError> {
+        hash.check()?;
         if depth >= 8 {
             return Err(PalsError::Capacity);
         }
-        let obs = self.engine.stores.observations.get(id)?;
-        hash.update([obs.kind as u8]);
-        hash.update(
+        let obs = self.engine.semantic.stores.observations.get(id)?;
+        // Legacy witness bytes stay unchanged. This new domain includes both
+        // the submitted single-limit meaning and the actual issued clamp;
+        // neither may be reconstructed by relabeling an existing TaskKey.
+        if let EvidenceScope::ProfiledExternalUci {
+            requested,
+            issued,
+            reported_depth,
+            seldepth,
+            bound,
+        } = obs.scope
+        {
+            hash.write(b"rz-validator-profiled-external-observation/1\0");
+            observation_writer::write_profiled_constraint(hash, requested);
+            observation_writer::write_profiled_constraint(hash, issued);
+            for depth in [reported_depth, seldepth] {
+                hash.write([u8::from(depth.is_some())]);
+                if let Some(depth) = depth {
+                    hash.write(depth.to_le_bytes());
+                }
+            }
+            hash.write([bound as u8]);
+        }
+        hash.write([obs.kind as u8]);
+        hash.write(
             rz_position::contracts::rules_snapshot_semantic_digest(
-                self.engine.stores.states.get(obs.state)?,
+                self.engine.semantic.stores.states.get(obs.state)?,
             )
             .0,
         );
         for line in [obs.line, obs.cpu_pv] {
-            hash.update([u8::from(line.is_some())]);
+            hash.write([u8::from(line.is_some())]);
             if let Some(line) = line {
-                validator_write_moves(hash, &self.engine.stores.lines.moves(line)?)?;
+                observation_writer::write_moves(
+                    hash,
+                    &self.engine.semantic.stores.lines.moves(line)?,
+                )?;
             }
         }
-        hash.update(obs.budget.to_le_bytes());
-        validator_write_bytes(hash, obs.cpu_condition.as_deref().unwrap_or("").as_bytes());
+        hash.write(obs.budget.to_le_bytes());
+        observation_writer::write_bytes(
+            hash,
+            obs.cpu_condition.as_deref().unwrap_or("").as_bytes(),
+        );
         if let Some(identity) = &obs.value_identity {
-            hash.update([1]);
-            validator_write_bytes(hash, identity.semantics.as_bytes());
-            validator_write_bytes(
+            hash.write([1]);
+            observation_writer::write_bytes(hash, identity.semantics.as_bytes());
+            observation_writer::write_bytes(
                 hash,
                 identity.weights_sha256.as_deref().unwrap_or("").as_bytes(),
             );
         } else {
-            hash.update([0]);
+            hash.write([0]);
         }
         if let Some(identity) = &obs.model_value_identity {
-            hash.update([1]);
+            hash.write([1]);
             for field in [
                 &identity.semantics,
                 &identity.model,
                 &identity.encoding,
                 &identity.precision,
             ] {
-                validator_write_bytes(hash, field.as_bytes());
+                observation_writer::write_bytes(hash, field.as_bytes());
             }
-            hash.update(identity.model_epoch);
+            hash.write(identity.model_epoch);
         } else {
-            hash.update([0]);
+            hash.write([0]);
         }
         match obs.score {
-            RawScore::Unknown => hash.update([0]),
+            RawScore::Unknown => hash.write([0]),
             RawScore::Estimate { value, perspective } => {
-                hash.update([1, u8::from(perspective == Color::Black)]);
-                hash.update(value.to_bits().to_le_bytes());
+                hash.write([1, u8::from(perspective == Color::Black)]);
+                hash.write(value.to_bits().to_le_bytes());
             }
             RawScore::Cpu {
                 value,
                 perspective,
                 bound,
             } => {
-                hash.update([2, u8::from(perspective == Color::Black), bound as u8]);
-                hash.update(value.to_le_bytes());
+                hash.write([2, u8::from(perspective == Color::Black), bound as u8]);
+                hash.write(value.to_le_bytes());
             }
             RawScore::ExternalUci {
                 value,
@@ -1101,22 +1153,22 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 perspective,
                 wdl_per_mille,
             } => {
-                hash.update([3, bound as u8, u8::from(perspective == Color::Black)]);
+                hash.write([3, bound as u8, u8::from(perspective == Color::Black)]);
                 match value {
                     crate::cpu_checker::ExternalRawScore::Centipawns(value) => {
-                        hash.update([0]);
-                        hash.update(value.to_le_bytes());
+                        hash.write([0]);
+                        hash.write(value.to_le_bytes());
                     }
                     crate::cpu_checker::ExternalRawScore::MateMoves(value) => {
-                        hash.update([1]);
-                        hash.update(value.to_le_bytes());
+                        hash.write([1]);
+                        hash.write(value.to_le_bytes());
                     }
-                    crate::cpu_checker::ExternalRawScore::Unknown => hash.update([2]),
+                    crate::cpu_checker::ExternalRawScore::Unknown => hash.write([2]),
                 }
-                hash.update([u8::from(wdl_per_mille.is_some())]);
+                hash.write([u8::from(wdl_per_mille.is_some())]);
                 if let Some(wdl) = wdl_per_mille {
                     for value in wdl {
-                        hash.update(value.to_le_bytes());
+                        hash.write(value.to_le_bytes());
                     }
                 }
             }
@@ -1133,9 +1185,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 perspective,
                 ..
             } => {
-                hash.update([4, u8::from(perspective == Color::Black)]);
+                hash.write([4, u8::from(perspective == Color::Black)]);
                 for value in [win, draw, loss] {
-                    hash.update(value.to_bits().to_le_bytes());
+                    hash.write(value.to_bits().to_le_bytes());
                 }
             }
             RawScore::ConditionalWdl {
@@ -1145,10 +1197,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 counter,
                 ..
             } => {
-                hash.update([5, u8::from(perspective == Color::Black)]);
-                hash.update(expectation.to_bits().to_le_bytes());
-                self.validator_write_observation(hash, repaired, depth + 1)?;
-                self.validator_write_observation(hash, counter, depth + 1)?;
+                hash.write([5, u8::from(perspective == Color::Black)]);
+                hash.write(expectation.to_bits().to_le_bytes());
+                self.validator_write_observation_into(hash, repaired, depth + 1)?;
+                self.validator_write_observation_into(hash, counter, depth + 1)?;
             }
             RawScore::ConditionalRepairWdl {
                 expectation,
@@ -1157,12 +1209,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 after,
                 ..
             } => {
-                hash.update([6, u8::from(perspective == Color::Black)]);
-                hash.update(expectation.to_bits().to_le_bytes());
-                self.validator_write_observation(hash, before, depth + 1)?;
-                self.validator_write_observation(hash, after, depth + 1)?;
+                hash.write([6, u8::from(perspective == Color::Black)]);
+                hash.write(expectation.to_bits().to_le_bytes());
+                self.validator_write_observation_into(hash, before, depth + 1)?;
+                self.validator_write_observation_into(hash, after, depth + 1)?;
             }
-            RawScore::Terminal { winner } => hash.update([
+            RawScore::Terminal { winner } => hash.write([
                 7,
                 match winner {
                     None => 0,
@@ -1171,14 +1223,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 },
             ]),
         }
-        Ok(())
+        hash.check()
     }
-    fn validator_existing_witnesses(&self) -> Result<HashSet<ContractDigest>, PalsError> {
+    pub(super) fn validator_existing_witnesses(
+        &self,
+    ) -> Result<HashSet<ContractDigest>, PalsError> {
         let mut existing = HashSet::new();
         // Keep the bounded owner's publication history, including superseded
         // counters. Rediscovering a formerly supported line is not a new
         // witness merely because a later Repair changed its active status.
-        for (kind, moves) in self.conditional_witnesses.values() {
+        for (kind, moves, _) in self.conditional_witnesses.values() {
             // This private owner registry was populated only after the hot
             // commit. Its checked line survives archival; baseline selection
             // never tries to load a now-cold observation on the manager.
@@ -1194,11 +1248,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
     /// Only an actual owner's accepted conditional publication has utility
     /// authority. A raw Estimate/CP/terminal label cannot mint this proof.
-    fn validator_committed_witness_kind(
+    pub(super) fn validator_committed_witness_kind(
         &self,
         id: ObservationId,
     ) -> Result<Option<ActionWitnessKind>, PalsError> {
-        let observation = self.engine.stores.observations.get(id)?;
+        let observation = self.engine.semantic.stores.observations.get(id)?;
         let Some(line) = observation.line else {
             return Ok(None);
         };
@@ -1211,9 +1265,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         let root = self
             .engine
+            .semantic
             .stores
             .situations
-            .get(self.engine.nodes[self.root].situation)?;
+            .get(self.engine.semantic.nodes[self.root].situation)?;
         let Some(conclusion) = root.conclusions.get(line) else {
             return Ok(None);
         };
@@ -1223,7 +1278,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         if !expected_status
             || conclusion.evidence != Some(id)
-            || observation.state != self.engine.nodes[self.root].state
+            || observation.state != self.engine.semantic.nodes[self.root].state
         {
             return Ok(None);
         }
@@ -1241,8 +1296,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if repaired.first() != counter.first() || repaired.first().copied() != q.first {
             return Ok(None);
         }
-        let root_color = self.engine.nodes[self.root].position.side_to_move();
-        let mut position = self.engine.nodes[self.root].position.clone();
+        let root_color = self.engine.semantic.nodes[self.root]
+            .position
+            .side_to_move();
+        let mut position = self.engine.semantic.nodes[self.root].position.clone();
         let mut changed = false;
         for (ply, movement) in repaired.iter().enumerate() {
             if ply > attack
@@ -1325,7 +1382,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || ticket.view != question.input.view_seal
             || accepted.view().digest() != question.input.view.digest()
             || !Arc::ptr_eq(accepted.view(), &question.input.view)
-            || !accepted.view().validates(&self.engine.stores)
+            || !accepted.view().validates(&self.engine.semantic.stores)
         {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -1361,7 +1418,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         let effect = match offer {
             ActionOffer::Responses { node, moves, .. } => {
-                let actual_legal = self.engine.nodes[node].position.legal_moves();
+                let actual_legal = self.engine.semantic.nodes[node].position.legal_moves();
                 if moves.is_empty() || moves.iter().any(|mv| !actual_legal.contains(mv)) {
                     return Err(RoleError::InvalidOutput.into());
                 }
@@ -1369,7 +1426,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .clone()
                     .ok_or(RoleError::InvalidOutput)?;
                 if input.question.validator_root_moves.as_ref() != Some(&moves)
-                    || !input.view.validates(&self.engine.stores)
+                    || !input.view.validates(&self.engine.semantic.stores)
                 {
                     return Err(RoleError::InvalidOutput.into());
                 }
@@ -1383,7 +1440,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .clone()
                     .ok_or(RoleError::InvalidOutput)?;
                 if input.stage != RefinementStage::CriticRecheck
-                    || !input.view.validates(&self.engine.stores)
+                    || !input.view.validates(&self.engine.semantic.stores)
                 {
                     return Err(RoleError::InvalidOutput.into());
                 }
@@ -1534,6 +1591,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     && execution.epoch == self.authority.epoch
                     && !self.external_action_committed(work.input.question_digest, job, execution)
             }
+            StepExecution::ProfiledExternal { .. } => {
+                return Err(
+                    RoleError::Unsupported("profiled R has no legacy V action witness").into(),
+                );
+            }
         };
         if tracking.frame != Some(work.frame)
             || tracking.first != work.original_first_move
@@ -1546,8 +1608,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             frame: work.frame,
             question: work.input.question_digest,
             execution,
-            first_observation: self.engine.stores.observations.next_observation_sequence(),
-            generation: self.engine.stores.generation(),
+            first_observation: self
+                .engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence(),
+            generation: self.engine.semantic.stores.generation(),
         })
     }
 
@@ -1559,11 +1626,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.check_live()?;
         if guard.frame != work.frame
             || guard.question != work.input.question_digest
-            || guard.generation != self.engine.stores.generation()
+            || guard.generation != self.engine.semantic.stores.generation()
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let end = self.engine.stores.observations.next_observation_sequence();
+        let end = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .next_observation_sequence();
         // Actual semantic consumption populated the owner's exact commit
         // receipt. A different frame's accepted ID or public StepEvidence
         // cannot attach that frame's publications to this action.
@@ -1589,7 +1661,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let mut witnesses = Vec::new();
         for sequence in guard.first_observation..end {
             let observation_id = ObservationId(sequence);
-            let observation = self.engine.stores.observations.get(observation_id)?;
+            let observation = self
+                .engine
+                .semantic
+                .stores
+                .observations
+                .get(observation_id)?;
             if observation.line.is_none() {
                 continue;
             }
@@ -1606,7 +1683,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             {
                 return Err(RoleError::InvalidOutput.into());
             }
-            let mut replay = self.engine.nodes[self.root].position.clone();
+            let mut replay = self.engine.semantic.nodes[self.root].position.clone();
             for movement in &actual_line {
                 replay.make_move(*movement)?;
             }
@@ -1636,6 +1713,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     raw.update(job.sequence.to_le_bytes());
                     raw.update(execution.sequence.to_le_bytes());
                 }
+                StepExecution::ProfiledExternal { .. } => {
+                    return Err(RoleError::Unsupported(
+                        "profiled R has no legacy V action witness",
+                    )
+                    .into());
+                }
             }
             raw.update(identity.0);
             raw.update((sequence as u64).to_le_bytes());
@@ -1661,6 +1744,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             StepExecution::Role(id) => tracking.role_requests.contains(&id),
             StepExecution::Cpu { execution, .. } | StepExecution::ExternalCpu { execution, .. } => {
                 tracking.executions.contains(&execution)
+            }
+            StepExecution::ProfiledExternal { .. } => {
+                return Err(
+                    RoleError::Unsupported("profiled R has no legacy V action witness").into(),
+                );
             }
         };
         let new_count = witnesses
@@ -1699,6 +1787,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 if !tracking.executions.insert(execution) {
                     return Err(RoleError::InvalidOutput.into());
                 }
+            }
+            StepExecution::ProfiledExternal { .. } => {
+                return Err(
+                    RoleError::Unsupported("profiled R has no legacy V action witness").into(),
+                );
             }
         }
         for witness in witnesses {

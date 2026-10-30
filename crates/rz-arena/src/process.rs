@@ -500,16 +500,43 @@ impl OwnedArtifactTreeWatch {
     }
 
     fn validate(&self) -> Result<(), ArenaError> {
+        self.validate_with_file_ceiling(Self::MAX_FILES)
+    }
+    fn validate_with_file_ceiling(&self, file_ceiling: usize) -> Result<(), ArenaError> {
         if self.max_total_bytes == 0
             || self.max_file_bytes == 0
-            || !(1..=Self::MAX_FILES).contains(&self.max_files)
+            || !(1..=32_768).contains(&file_ceiling)
+            || !(1..=file_ceiling).contains(&self.max_files)
             || self.max_depth > Self::MAX_DEPTH
         {
-            return Err(ArenaError::Budget(
-                "artifact tree requires positive bytes, 1..4096 files and depth at most 32".into(),
-            ));
+            return Err(ArenaError::Budget(format!(
+                "artifact tree requires positive bytes, 1..{file_ceiling} files and depth at most 32"
+            )));
         }
         Ok(())
+    }
+}
+
+/// Explicit finite Rovent training profile. The generic/public watch keeps its
+/// original 4096-file validation. Only the crate's new trainer entrypoint may
+/// consume this private wrapper with a separately registered ceiling.
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+pub(crate) struct RoventTrainingArtifactTreeWatch(OwnedArtifactTreeWatch);
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+impl RoventTrainingArtifactTreeWatch {
+    pub(crate) fn registered(
+        max_total_bytes: u64,
+        max_file_bytes: u64,
+        max_files: usize,
+    ) -> Result<Self, ArenaError> {
+        let watch = OwnedArtifactTreeWatch {
+            max_total_bytes,
+            max_file_bytes,
+            max_files,
+            max_depth: OwnedArtifactTreeWatch::MAX_DEPTH,
+        };
+        watch.validate_with_file_ceiling(max_files)?;
+        Ok(Self(watch))
     }
 }
 
@@ -881,7 +908,7 @@ pub fn supervise_input_in_original_window(
     input: OriginalProcessInput<'_>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
     supervise_original_input(
-        program, args, directory, limits, cancel, watch, input, None, None, None,
+        program, args, directory, limits, cancel, watch, input, None, None, None, None,
     )
 }
 
@@ -911,6 +938,7 @@ pub(crate) fn supervise_verified_input_in_original_window(
         Some(verify_loaded),
         None,
         None,
+        None,
     )
 }
 
@@ -938,6 +966,37 @@ pub(crate) fn supervise_numerical_input_in_original_window(
         Some(verify_loaded),
         Some(environment),
         None,
+        None,
+    )
+}
+
+/// New trainer-only file-count profile. All execution, byte, deadline, link
+/// and owned-tree guards use the same supervisor as the generic 4096 profile.
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_rovent_training_numerical_input_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &RoventTrainingArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: LoadedImageVerifier<'_>,
+    environment: OriginalNumericalEnvironment,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        &watch.0,
+        input,
+        Some(verify_loaded),
+        Some(environment),
+        None,
+        Some(watch.0.max_files),
     )
 }
 
@@ -967,6 +1026,7 @@ pub(crate) fn supervise_verified_input_with_delegated_tree_in_original_window(
         Some(verify_loaded),
         None,
         Some(delegated),
+        None,
     )
 }
 
@@ -995,6 +1055,7 @@ pub(crate) fn supervise_numerical_input_with_delegated_tree_in_original_window(
         Some(verify_loaded),
         Some(environment),
         Some(delegated),
+        None,
     )
 }
 
@@ -1010,9 +1071,13 @@ fn supervise_original_input(
     verify_loaded: Option<LoadedImageVerifier<'_>>,
     numerical_environment: Option<OriginalNumericalEnvironment>,
     delegated: Option<&dyn DelegatedArtifactTreeWatch>,
+    artifact_file_ceiling: Option<usize>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
     input.window.check_before_spawn(limits)?;
-    watch.validate()?;
+    match artifact_file_ceiling {
+        Some(ceiling) => watch.validate_with_file_ceiling(ceiling)?,
+        None => watch.validate()?,
+    }
     if input.bytes.is_empty() || input.bytes.len() > MAX_ORIGINAL_INPUT_BYTES {
         return Err(ArenaError::Budget(
             "original input requires 1..2MiB bytes".into(),
@@ -2282,6 +2347,25 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn rovent_artifact_count_profile_does_not_relax_generic_watch() {
+            let generic = OwnedArtifactTreeWatch::bounded_output(1024, 512);
+            assert_eq!(generic.max_files, 4096);
+            assert!(
+                OwnedArtifactTreeWatch {
+                    max_files: 4097,
+                    ..generic
+                }
+                .validate()
+                .is_err()
+            );
+            let registered = RoventTrainingArtifactTreeWatch::registered(1024, 512, 32768).unwrap();
+            assert_eq!(registered.0.max_files, 32768);
+            assert!(registered.0.validate().is_err());
+            assert!(RoventTrainingArtifactTreeWatch::registered(1024, 512, 32769).is_err());
+            assert!(RoventTrainingArtifactTreeWatch::registered(0, 512, 32768).is_err());
+        }
 
         fn original_watch() -> OwnedArtifactTreeWatch {
             OwnedArtifactTreeWatch {

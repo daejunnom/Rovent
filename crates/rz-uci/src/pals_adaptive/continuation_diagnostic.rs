@@ -6,7 +6,8 @@ use rz_contracts::{ClockDomain, MonotonicTick, RequestId};
 use rz_search::pals::coordinator::{FrameCompletionScope, FrameId, RefinementStage, StepEvidence};
 use rz_search::pals::engine::adaptive_port::{
     AdaptiveRoleConsumptionEvent, AdaptiveRoleConsumptionObservation,
-    AdaptiveRoleConsumptionUnavailable, MAX_ROLE_CONSUMPTION_EVENTS,
+    AdaptiveRoleConsumptionUnavailable, MAX_ROLE_CONSUMPTION_EVENTS, ProfiledFeedbackConsumedChain,
+    ProfiledFeedbackConsumptionObservation,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
@@ -109,6 +110,7 @@ pub struct ContinuationDiagnosticSnapshot {
     pub role_unavailable: Option<AdaptiveRoleConsumptionUnavailable>,
     /// True only at the original permits_root_reuse/Finished fence.
     pub role_readback_root_fence: Option<bool>,
+    pub profiled_feedback: Option<ProfiledFeedbackConsumptionObservation>,
 }
 #[derive(Debug)]
 struct State {
@@ -119,6 +121,7 @@ struct State {
     role_events: Vec<AdaptiveRoleConsumptionEvent>,
     role_unavailable: Option<AdaptiveRoleConsumptionUnavailable>,
     role_readback_root_fence: Option<bool>,
+    profiled_feedback: Option<ProfiledFeedbackConsumptionObservation>,
 }
 #[derive(Debug)]
 struct Inner {
@@ -168,6 +171,7 @@ impl ContinuationDiagnostic {
                     role_events,
                     role_unavailable: None,
                     role_readback_root_fence: None,
+                    profiled_feedback: None,
                 }),
                 unavailable: AtomicU64::new(0),
             }),
@@ -313,7 +317,76 @@ impl ContinuationDiagnostic {
             role_events: state.role_events.clone(),
             role_unavailable: state.role_unavailable,
             role_readback_root_fence: state.role_readback_root_fence,
+            profiled_feedback: state.profiled_feedback,
         })
+    }
+    pub(crate) fn profiled_feedback_readback(
+        &self,
+        authority: SearchAuthority,
+        observed: Option<ProfiledFeedbackConsumptionObservation>,
+    ) {
+        if !self.inner.options.role_consumption {
+            return;
+        }
+        self.copy_into(|state| {
+            if state.authority != Some(authority)
+                || state.profiled_feedback.is_some()
+                || observed
+                    .as_ref()
+                    .is_some_and(|value| value.authority() != authority)
+            {
+                self.unavailable(ContinuationDiagnosticUnavailable::ScopeMismatch);
+                return;
+            }
+            state.profiled_feedback = observed;
+        });
+    }
+}
+impl ContinuationDiagnosticSnapshot {
+    /// Accepted copies of original semantic facts, not an execution/fence
+    /// permit. Missing, duplicate, unknown or cross-clock resolutions fail.
+    pub fn accepted_profiled_feedback_chain(
+        &self,
+    ) -> Result<&ProfiledFeedbackConsumedChain, &'static str> {
+        if self.unavailable_bits != 0
+            || self.role_unavailable.is_some()
+            || self.role_readback_root_fence != Some(true)
+        {
+            return Err("original_root_fence_or_journal_unavailable");
+        }
+        let observed = self
+            .profiled_feedback
+            .as_ref()
+            .ok_or("profiled_source_unavailable")?;
+        if self.authority != Some(observed.authority()) || observed.unavailable().is_some() {
+            return Err("profiled_source_or_chain_incomplete");
+        }
+        let chain = observed
+            .chain()
+            .ok_or("nonzero_repair_critic_fresh_chain_unavailable")?;
+        let mut original_clock = None;
+        for expected in chain.steps() {
+            let mut accepted = self.resolutions.iter().filter(|event| {
+                event.authority == observed.authority()
+                    && event.evidence == *expected
+                    && matches!(
+                        event.source,
+                        ContinuationResolutionSource::MachineTransition { accepted: true, .. }
+                    )
+                    && !matches!(event.transition, ContinuationTransitionKind::Unknown { .. })
+            });
+            let original = accepted
+                .next()
+                .ok_or("original_machine_acceptance_missing")?;
+            if accepted.next().is_some() {
+                return Err("original_machine_acceptance_duplicate");
+            }
+            if original_clock.is_some_and(|clock| clock != original.clock) {
+                return Err("original_machine_clock_mismatch");
+            }
+            original_clock = Some(original.clock);
+        }
+        Ok(chain)
     }
 }
 

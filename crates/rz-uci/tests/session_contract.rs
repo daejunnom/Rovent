@@ -1,9 +1,11 @@
+use rz_uci::bridge::NodeBudgetSemantics;
 use rz_uci::{
     CancelReason, Effect, EngineIdentity, OptionKind, OptionSpec, OptionValue, ParserLimits,
     PositionBase, PositionPort, PositionSpec, PreparedPosition, SearchCompletion, SearchTicket,
     Session, SessionResult,
 };
 use std::cell::{Cell, RefCell};
+use std::num::NonZeroU16;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -138,6 +140,252 @@ fn has_code(out: &SessionResult<PositionSpec>, code: &str) -> bool {
     out.diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == code)
+}
+
+fn start_line(session: &mut Session<FixturePort>, line: &str) -> (SearchTicket, rz_uci::GoLimits) {
+    let out = session.handle_line(line);
+    assert!(out.accepted, "{:?}", out.diagnostics);
+    match out.effects.as_slice() {
+        [Effect::Start { ticket, limits, .. }] => (ticket.clone(), limits.clone()),
+        other => panic!("expected one Start, got {other:?}"),
+    }
+}
+
+#[test]
+fn root_restriction_is_deduplicated_once_in_rules_order() {
+    let mut session = session(FixturePort::default());
+    let (ticket, limits) = start_line(&mut session, "go nodes 8 searchmoves e2e4 d2d4 e2e4");
+    assert_eq!(limits.searchmoves, Some(vec!["d2d4".into(), "e2e4".into()]));
+    assert_eq!(session.legal_moves(), ["d2d4", "e2e4", "g1f3"]);
+    let outside = session.progress(&ticket, "g1f3");
+    assert!(!outside.accepted && has_code(&outside, "IllegalBestMove"));
+    assert_eq!(session.handle_line("stop").protocol, ["bestmove d2d4"]);
+}
+
+#[test]
+fn node_budget_unit_registration_is_idle_only_and_legacy_remains_the_default() {
+    let mut session = session(FixturePort::default());
+    assert_eq!(
+        session.node_budget_semantics(),
+        NodeBudgetSemantics::LegacySimulations
+    );
+    let legacy_zero = session.handle_line("go nodes 0");
+    assert!(!legacy_zero.accepted && has_code(&legacy_zero, "InvalidCommand"));
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+        .unwrap();
+    let (ticket, limits) = start_line(&mut session, "go nodes 0 searchmoves e2e4");
+    assert_eq!(limits.nodes, Some(0));
+    assert!(
+        session
+            .set_node_budget_semantics(NodeBudgetSemantics::LegacySimulations)
+            .is_err()
+    );
+    assert_eq!(session.active_ticket(), Some(ticket));
+    assert_eq!(
+        session.node_budget_semantics(),
+        NodeBudgetSemantics::RoventPositionVisits
+    );
+    assert_eq!(session.handle_line("stop").protocol, ["bestmove e2e4"]);
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::LegacySimulations)
+        .unwrap();
+    assert!(!session.handle_line("go nodes 0").accepted);
+    assert!(session.handle_line("quit").accepted);
+    assert!(
+        session
+            .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+            .is_err()
+    );
+}
+
+#[test]
+fn illegal_root_restriction_preserves_prior_work_and_output_authority() {
+    let mut session = session(FixturePort::default());
+    let ticket = start(&mut session);
+    assert!(session.progress(&ticket, "g1f3").accepted);
+    let rejected = session.handle_line("go nodes 1 searchmoves e2e4 e2e5");
+    assert!(!rejected.accepted && has_code(&rejected, "InvalidSearchMoves"));
+    assert!(rejected.effects.is_empty() && rejected.protocol.is_empty());
+    assert_eq!(session.active_ticket(), Some(ticket.clone()));
+    assert_eq!(
+        session
+            .complete(&ticket, SearchCompletion::Completed { bestmove: None })
+            .protocol,
+        ["bestmove g1f3"]
+    );
+}
+
+#[test]
+fn restricted_stop_expiry_failure_and_invalid_completion_use_only_the_allowed_fallback() {
+    for end in ["stop", "expire", "failure", "illegal", "empty"] {
+        let mut session = session(FixturePort::default());
+        let (ticket, limits) = start_line(&mut session, "go nodes 8 searchmoves g1f3 e2e4");
+        assert_eq!(limits.searchmoves, Some(vec!["e2e4".into(), "g1f3".into()]));
+        assert!(!session.progress(&ticket, "d2d4").accepted);
+        let out = match end {
+            "stop" => session.handle_line("stop"),
+            "expire" => session.expire(&ticket),
+            "failure" => session.complete(
+                &ticket,
+                SearchCompletion::Failed {
+                    code: "fixture failure".into(),
+                    message: "fixture diagnostic".into(),
+                },
+            ),
+            "illegal" => session.complete(
+                &ticket,
+                SearchCompletion::Completed {
+                    bestmove: Some("d2d4".into()),
+                },
+            ),
+            _ => session.complete(&ticket, SearchCompletion::Completed { bestmove: None }),
+        };
+        assert_eq!(out.protocol, ["bestmove e2e4"], "{end}");
+        assert!(has_code(&out, "LegalFallback"), "{end}");
+        if end == "failure" {
+            assert!(!out.accepted && has_code(&out, "SearchFailed"));
+        } else if end == "illegal" {
+            assert!(!out.accepted && has_code(&out, "IllegalBestMove"));
+        }
+        assert!(session.handle_line("stop").protocol.is_empty());
+        assert_stale(session.complete(
+            &ticket,
+            SearchCompletion::Completed {
+                bestmove: Some("d2d4".into()),
+            },
+        ));
+    }
+}
+
+#[test]
+fn changing_only_root_restriction_revokes_old_progress_and_completion() {
+    let mut session = session(FixturePort::default());
+    let (old, _) = start_line(&mut session, "go nodes 8 searchmoves e2e4");
+    let out = session.handle_line("go nodes 8 searchmoves g1f3");
+    assert!(out.accepted);
+    let [
+        Effect::Cancel {
+            ticket,
+            reason: CancelReason::ReplacedSearch,
+        },
+        Effect::Start {
+            ticket: new,
+            limits,
+            ..
+        },
+    ] = out.effects.as_slice()
+    else {
+        panic!(
+            "expected old cancellation and new constrained search: {:?}",
+            out.effects
+        );
+    };
+    assert_eq!(ticket, &old);
+    assert_eq!(limits.searchmoves, Some(vec!["g1f3".into()]));
+    let new = new.clone();
+    assert_stale(session.progress(&old, "e2e4"));
+    assert_stale(session.complete(
+        &old,
+        SearchCompletion::Completed {
+            bestmove: Some("e2e4".into()),
+        },
+    ));
+    assert!(!session.progress(&new, "e2e4").accepted);
+    assert_eq!(session.handle_line("stop").protocol, ["bestmove g1f3"]);
+}
+
+#[test]
+fn root_restrictions_use_full_promotion_castling_and_en_passant_move_text() {
+    let mut session = session(FixturePort::default());
+    assert!(
+        session
+            .handle_line(&format!("position fen {PROMOTION_FEN}"))
+            .accepted
+    );
+    let (ticket, limits) = start_line(&mut session, "go nodes 1 searchmoves a7a8n a7a8r a7a8n");
+    assert_eq!(
+        limits.searchmoves,
+        Some(vec!["a7a8r".into(), "a7a8n".into()])
+    );
+    assert!(!session.progress(&ticket, "a7a8q").accepted);
+    assert_eq!(session.handle_line("stop").protocol, ["bestmove a7a8r"]);
+
+    // These hand-authored Rules-port views isolate UCI handling. Actual chess
+    // legality belongs to the independent product Rules integration checks.
+    let port = FixturePort::default();
+    *port.next_view.borrow_mut() = Some((vec!["e1g1".into(), "e5d6".into()], false));
+    let mut special = self::session(port);
+    let (_, limits) = start_line(&mut special, "go nodes 1 searchmoves e5d6 e1g1");
+    assert_eq!(limits.searchmoves, Some(vec!["e1g1".into(), "e5d6".into()]));
+    assert_eq!(special.handle_line("stop").protocol, ["bestmove e1g1"]);
+}
+
+#[test]
+fn actual_rules_terminal_with_legal_moves_is_independent_of_a_valid_restriction() {
+    let port = FixturePort::default();
+    *port.next_view.borrow_mut() = Some((vec!["d2d4".into(), "e2e4".into()], true));
+    let mut session = session(port);
+    let out = session.handle_line("go nodes 1 searchmoves e2e4");
+    assert!(out.accepted);
+    assert_eq!(out.protocol, ["bestmove 0000"]);
+    assert!(out.effects.is_empty() && session.active_ticket().is_none());
+}
+
+#[test]
+fn unsupported_or_over_capability_goals_preserve_the_active_search() {
+    let mut session = session(FixturePort::default());
+    let ticket = start(&mut session);
+    for line in ["go depth 1", "go mate 1"] {
+        let out = session.handle_line(line);
+        assert!(!out.accepted && has_code(&out, "UnsupportedSearchGoal"));
+        assert!(out.effects.is_empty() && out.protocol.is_empty());
+        assert_eq!(session.active_ticket(), Some(ticket.clone()));
+    }
+    assert!(
+        session
+            .set_search_goal_capability(NonZeroU16::new(8))
+            .is_err()
+    );
+    assert_eq!(session.search_goal_capability(), None);
+    session.handle_line("stop");
+    session
+        .set_search_goal_capability(NonZeroU16::new(8))
+        .unwrap();
+    let (ticket, limits) = start_line(&mut session, "go depth 8 mate 4 searchmoves e2e4");
+    assert_eq!(limits.depth_plies, NonZeroU16::new(8));
+    assert_eq!(limits.mate_moves, NonZeroU16::new(4));
+    for line in ["go depth 9", "go mate 5"] {
+        let out = session.handle_line(line);
+        assert!(!out.accepted && has_code(&out, "InvalidSearchGoal"));
+        assert!(out.effects.is_empty() && out.protocol.is_empty());
+        assert_eq!(session.active_ticket(), Some(ticket.clone()));
+    }
+    assert_eq!(session.handle_line("stop").protocol, ["bestmove e2e4"]);
+    session.handle_line("quit");
+    assert!(session.set_search_goal_capability(None).is_err());
+}
+
+#[test]
+fn constrained_infinite_completion_holds_only_an_allowed_move() {
+    let mut session = session(FixturePort::default());
+    session
+        .set_search_goal_capability(NonZeroU16::new(8))
+        .unwrap();
+    let (ticket, _) = start_line(
+        &mut session,
+        "go infinite depth 3 mate 2 nodes 8 searchmoves g1f3",
+    );
+    let held = session.complete(
+        &ticket,
+        SearchCompletion::Completed {
+            bestmove: Some("g1f3".into()),
+        },
+    );
+    assert!(held.accepted && held.protocol.is_empty());
+    assert_stale(session.progress(&ticket, "d2d4"));
+    assert_eq!(session.handle_line("stop").protocol, ["bestmove g1f3"]);
+    assert!(session.handle_line("stop").protocol.is_empty());
 }
 
 fn assert_stale(out: SessionResult<PositionSpec>) {

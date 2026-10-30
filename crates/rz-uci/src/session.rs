@@ -1,6 +1,12 @@
-use crate::parser::{Command, GoLimits, ParserLimits, PositionSpec, is_move_text, parse};
+use crate::bridge::NodeBudgetSemantics;
+use crate::parser::{
+    Command, GoLimits, ParserLimits, PositionSpec, ZeroNodeLimit, is_move_text,
+    parse_with_zero_node_limit,
+};
+use rz_contracts::rovent::SearchGoal;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 
 const MAX_OPTIONS: usize = 64;
@@ -178,6 +184,8 @@ pub enum SearchCompletion {
 
 struct ActiveSearch {
     ticket: SearchTicket,
+    /// Sealed once against Rules, in Rules order. None is unrestricted.
+    allowed_root_moves: Option<Arc<[String]>>,
     /// Only validated legal moves enter this slot.
     bestmove: Option<String>,
     infinite: bool,
@@ -195,6 +203,8 @@ pub struct Session<P: PositionPort> {
     values: BTreeMap<String, OptionValue>,
     position: PreparedPosition<P::Snapshot>,
     active: Option<ActiveSearch>,
+    goal_capability: Option<NonZeroU16>,
+    node_budget_semantics: NodeBudgetSemantics,
     closed: bool,
 }
 
@@ -236,6 +246,8 @@ impl<P: PositionPort> Session<P> {
             values,
             position,
             active: None,
+            goal_capability: None,
+            node_budget_semantics: NodeBudgetSemantics::LegacySimulations,
             closed: false,
         })
     }
@@ -255,18 +267,90 @@ impl<P: PositionPort> Session<P> {
     pub fn parser_limits(&self) -> ParserLimits {
         self.parser_limits
     }
+    /// Only a startup-selected driver that implements the chess goals should
+    /// register this capability. Legacy sessions reject explicit goals.
+    pub fn set_search_goal_capability(
+        &mut self,
+        max_plies: Option<NonZeroU16>,
+    ) -> Result<(), SessionError> {
+        if self.closed || self.active.is_some() {
+            return Err(SessionError(
+                "search goal capability requires an idle open session".into(),
+            ));
+        }
+        self.goal_capability = max_plies;
+        Ok(())
+    }
+    pub fn search_goal_capability(&self) -> Option<NonZeroU16> {
+        self.goal_capability
+    }
+
+    /// The selected driver registers its node unit before a search starts.
+    /// Changing the unit cannot reinterpret an already admitted request.
+    pub fn set_node_budget_semantics(
+        &mut self,
+        semantics: NodeBudgetSemantics,
+    ) -> Result<(), SessionError> {
+        if self.closed || self.active.is_some() {
+            return Err(SessionError(
+                "node budget semantics require an idle open session".into(),
+            ));
+        }
+        self.node_budget_semantics = semantics;
+        Ok(())
+    }
+
+    pub fn node_budget_semantics(&self) -> NodeBudgetSemantics {
+        self.node_budget_semantics
+    }
     pub fn active_ticket(&self) -> Option<SearchTicket> {
         self.active.as_ref().map(|a| a.ticket.clone())
+    }
+
+    /// Same-ticket concrete-owner transition. Only output ownership changes:
+    /// no new worker, root, credit or deadline is created. A result already
+    /// consumed while pondering is released once without canceling its work.
+    pub(crate) fn release_ponder_hit(
+        &mut self,
+        ticket: &SearchTicket,
+    ) -> SessionResult<P::Snapshot> {
+        if self.closed || !self.matches(ticket) {
+            return stale();
+        }
+        let active = self.active.as_mut().expect("matching original ticket");
+        if !active.infinite {
+            return stale();
+        }
+        active.infinite = false;
+        let completed = active.completion_consumed;
+        let mut out = SessionResult::default();
+        if completed {
+            self.finish(&mut out, None);
+        }
+        out
     }
 
     pub fn handle_line(&mut self, line: &str) -> SessionResult<P::Snapshot> {
         if self.closed {
             return SessionResult::reject("SessionClosed", "UCI session is closed");
         }
-        match parse(line, self.parser_limits) {
-            Ok(command) => self.dispatch(command),
+        let zero_nodes = match self.node_budget_semantics {
+            NodeBudgetSemantics::LegacySimulations => ZeroNodeLimit::Reject,
+            NodeBudgetSemantics::RoventPositionVisits => ZeroNodeLimit::Allow,
+        };
+        match parse_with_zero_node_limit(line, self.parser_limits, zero_nodes) {
+            Ok(command) => self.handle_command(command),
             Err(err) => SessionResult::reject("InvalidCommand", err.to_string()),
         }
+    }
+
+    /// Internal owner path for a parser-validated command whose output/time
+    /// ownership has been normalized without discarding its root constraints.
+    pub(crate) fn handle_command(&mut self, command: Command) -> SessionResult<P::Snapshot> {
+        if self.closed {
+            return SessionResult::reject("SessionClosed", "UCI session is closed");
+        }
+        self.dispatch(command)
     }
 
     /// Untimed progress wrapper. Timed adapters must use
@@ -407,13 +491,37 @@ impl<P: PositionPort> Session<P> {
             Command::SetOption { name, value } => return self.set_option(&name, value.as_deref()),
             Command::Position(spec) => return self.replace_position(&spec, false),
             Command::NewGame => return self.replace_position(&PositionSpec::default(), true),
-            Command::Go(limits) => {
+            Command::Go(mut limits) => {
                 if limits.ponder {
                     return SessionResult::reject(
                         "PonderNeedsOwner",
                         "ponder requires the concrete engine owner",
                     );
                 }
+                let goal = SearchGoal {
+                    depth_plies: limits.depth_plies,
+                    mate_moves: limits.mate_moves,
+                };
+                if goal.has_goal() {
+                    let Some(max_plies) = self.goal_capability else {
+                        return SessionResult::reject(
+                            "UnsupportedSearchGoal",
+                            "selected driver has no registered depth/mate capability",
+                        );
+                    };
+                    if let Err(error) = goal.validate(max_plies) {
+                        return SessionResult::reject("InvalidSearchGoal", error.to_string());
+                    }
+                }
+                // A rejected go never cancels the prior search or consumes its
+                // output authority. Validate the whole restriction first.
+                let allowed_root_moves = match self.seal_root_moves(limits.searchmoves.as_deref()) {
+                    Ok(moves) => moves,
+                    Err(error) => {
+                        return SessionResult::reject("InvalidSearchMoves", error.to_string());
+                    }
+                };
+                limits.searchmoves = allowed_root_moves.as_ref().map(|moves| moves.to_vec());
                 self.cancel(&mut out, CancelReason::ReplacedSearch);
                 if self.position.exact_terminal && !limits.infinite {
                     out.protocol.push("bestmove 0000".into());
@@ -421,6 +529,7 @@ impl<P: PositionPort> Session<P> {
                     let ticket = SearchTicket(Arc::new(TicketIdentity));
                     self.active = Some(ActiveSearch {
                         ticket: ticket.clone(),
+                        allowed_root_moves,
                         bestmove: None,
                         infinite: limits.infinite,
                         worker_started: !self.position.exact_terminal,
@@ -532,7 +641,43 @@ impl<P: PositionPort> Session<P> {
     }
 
     fn valid_bestmove(&self, bestmove: &str) -> bool {
-        is_move_text(bestmove) && self.position.legal_moves.iter().any(|m| m == bestmove)
+        let allowed = self
+            .active
+            .as_ref()
+            .and_then(|active| active.allowed_root_moves.as_deref())
+            .unwrap_or(&self.position.legal_moves);
+        is_move_text(bestmove) && allowed.iter().any(|m| m == bestmove)
+    }
+
+    fn seal_root_moves(
+        &self,
+        requested: Option<&[String]>,
+    ) -> Result<Option<Arc<[String]>>, SessionError> {
+        let Some(requested) = requested else {
+            return Ok(None);
+        };
+        if requested.is_empty() || requested.len() > self.parser_limits.max_legal_moves {
+            return Err(SessionError(
+                "explicit root restriction must be nonempty and within the move bound".into(),
+            ));
+        }
+        if requested
+            .iter()
+            .any(|movement| !self.position.legal_moves.contains(movement))
+        {
+            return Err(SessionError(
+                "searchmoves contains a move outside the exact Rules root legal list".into(),
+            ));
+        }
+        let requested: HashSet<&str> = requested.iter().map(String::as_str).collect();
+        let canonical: Vec<_> = self
+            .position
+            .legal_moves
+            .iter()
+            .filter(|movement| requested.contains(movement.as_str()))
+            .cloned()
+            .collect();
+        Ok(Some(canonical.into()))
     }
 
     fn cancel(&mut self, out: &mut SessionResult<P::Snapshot>, reason: CancelReason) {
@@ -568,7 +713,11 @@ impl<P: PositionPort> Session<P> {
                     "no completed valid root move; using first ordered legal move",
                 );
                 // Session construction/replacement rejects ongoing empty legal views.
-                self.position.legal_moves[0].clone()
+                active
+                    .allowed_root_moves
+                    .as_ref()
+                    .map_or(&self.position.legal_moves[0], |moves| &moves[0])
+                    .clone()
             }
         };
         out.protocol.push(format!("bestmove {bestmove}"));

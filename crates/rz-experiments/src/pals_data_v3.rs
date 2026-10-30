@@ -271,6 +271,26 @@ pub struct GenerationInputV3 {
 }
 impl GenerationInputV3 {
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validate_common_fields()?;
+        let ids: BTreeSet<_> = self.divergence_record_ids.iter().collect();
+        ensure(
+            ids.len() == self.divergence_record_ids.len()
+                && self.divergence_record_ids.len()
+                    == self.encoded_model_input["divergences"]
+                        .as_array()
+                        .map_or(usize::MAX, Vec::len)
+                && ids.into_iter().all(|id| {
+                    self.selected_view
+                        .records
+                        .iter()
+                        .any(|r| &r.record_id == id && r.kind == GenerationRecordKindV3::Counter)
+                }),
+            "submitted divergence candidate/order mismatch",
+        )
+    }
+    /// 새 Rovent 입력도 사용하는 공통 계산이다. legacy V3의 record-index
+    /// 검증이나 입력 권한을 발급하지 않으며 공개 validate는 이를 계속 강제한다.
+    pub(crate) fn validate_common_fields(&self) -> Result<(), ManifestError> {
         for value in [
             &self.game_id,
             &self.opening_id,
@@ -306,22 +326,7 @@ impl GenerationInputV3 {
             self.legal_moves.iter().collect::<BTreeSet<_>>().len() == self.legal_moves.len(),
             "duplicate legal generation candidates",
         )?;
-        validate_encoded(self)?;
-        let ids: BTreeSet<_> = self.divergence_record_ids.iter().collect();
-        ensure(
-            ids.len() == self.divergence_record_ids.len()
-                && self.divergence_record_ids.len()
-                    == self.encoded_model_input["divergences"]
-                        .as_array()
-                        .map_or(usize::MAX, Vec::len)
-                && ids.into_iter().all(|id| {
-                    self.selected_view
-                        .records
-                        .iter()
-                        .any(|r| &r.record_id == id && r.kind == GenerationRecordKindV3::Counter)
-                }),
-            "submitted divergence candidate/order mismatch",
-        )
+        validate_encoded(self)
     }
     pub fn sha256(&self) -> Result<String, ManifestError> {
         self.validate()?;
@@ -330,25 +335,37 @@ impl GenerationInputV3 {
         // untouched. This projection is specific to the new V3 input domain.
         let mut value =
             serde_json::to_value(self).map_err(|e| ManifestError::Integrity(e.to_string()))?;
-        let payload = &mut value["encoded_model_input"];
-        for anchor in payload["anchors"].as_array_mut().unwrap() {
-            for field in anchor["metadata"].as_array_mut().unwrap() {
-                *field = serde_json::Value::String(format!(
-                    "{:08x}",
-                    (field.as_f64().unwrap() as f32).to_bits()
-                ));
-            }
-        }
-        for row in payload["divergences"].as_array_mut().unwrap() {
-            for field in row.as_array_mut().unwrap() {
-                *field = serde_json::Value::String(format!(
-                    "{:08x}",
-                    (field.as_f64().unwrap() as f32).to_bits()
-                ));
-            }
-        }
+        project_generation_input_float_bits(&mut value)?;
         generation_digest(GENERATION_INPUT_DOMAIN, &value)
     }
+}
+
+/// 검증된 입력의 기존 FP32 bit projection만 공유한다. JSON 파일 bytes/hash나
+/// legacy domain을 변경하지 않으며 새 입력은 자기 domain으로 별도 봉인한다.
+pub(crate) fn project_generation_input_float_bits(
+    value: &mut serde_json::Value,
+) -> Result<(), ManifestError> {
+    let payload = &mut value["encoded_model_input"];
+    for anchor in payload["anchors"]
+        .as_array_mut()
+        .ok_or_else(|| ManifestError::Integrity("encoded anchors array".into()))?
+    {
+        for field in anchor["metadata"].as_array_mut().unwrap() {
+            *field = serde_json::Value::String(format!(
+                "{:08x}",
+                (field.as_f64().unwrap() as f32).to_bits()
+            ));
+        }
+    }
+    for row in payload["divergences"].as_array_mut().unwrap() {
+        for field in row.as_array_mut().unwrap() {
+            *field = serde_json::Value::String(format!(
+                "{:08x}",
+                (field.as_f64().unwrap() as f32).to_bits()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_encoded(input: &GenerationInputV3) -> Result<(), ManifestError> {

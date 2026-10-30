@@ -55,7 +55,7 @@ fn missing_review_closure<'a>(
         .collect())
 }
 
-impl<M: RoleModel> PalsEngine<M> {
+impl<M: RoleModel> PalsSemanticState<M> {
     /// New-game store owners may restart numeric handles. Recreate the selected
     /// index rather than rebinding old IDs. Pair-owned views release by RAII.
     pub(super) fn reset_review_context(&mut self) {
@@ -71,6 +71,7 @@ impl<M: RoleModel> PalsEngine<M> {
     /// only publishes a checked projection into the bounded active index.
     pub(super) fn publish_review_record(
         &mut self,
+        config: &PalsSemanticConfig,
         record: &RoleRecord,
         evidence: Option<ObservationId>,
     ) -> Result<(), PalsError> {
@@ -82,7 +83,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     [record.parent_revision, record.supersedes_revision]
                         .into_iter()
                         .flatten(),
-                    self.config.max_records,
+                    config.max_records,
                 )?;
                 for ancestor in ancestors {
                     // Archive/index reappearance is not a new accepted witness.
@@ -99,12 +100,12 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Raw engine topology has already been committed successfully by its
     /// exact-history archive loader. A selected-index issue cannot retroactively
     /// turn that successful raw recovery into a failed or incomplete load.
-    pub(super) fn restore_review_context_after_load(&mut self) {
+    pub(super) fn restore_review_context_after_load(&mut self, config: &PalsSemanticConfig) {
         let result = match (&mut self.review_index, self.review_policy) {
             (Some(index), Some(_)) => (|| -> Result<(), ReviewError> {
                 let roots = self.records.iter().map(|record| record.revision);
                 let records =
-                    missing_review_closure(index, &self.records, roots, self.config.max_records)?;
+                    missing_review_closure(index, &self.records, roots, config.max_records)?;
                 for record in records {
                     index.restore_record(&self.stores, record, None)?;
                 }
@@ -123,6 +124,7 @@ impl<M: RoleModel> PalsEngine<M> {
     /// order remains caller-owned, but every move must belong to this endpoint.
     fn review_root_for_question(
         &self,
+        config: &PalsSemanticConfig,
         node: usize,
         question: RoleQuestion<'_>,
         legal: &[BoardMove],
@@ -136,11 +138,11 @@ impl<M: RoleModel> PalsEngine<M> {
             .nodes
             .get(node)
             .ok_or(StoreError::InvalidHandle("review query node"))?;
-        if question.prefix.len() > self.config.line_plies
-            || question.proposal.len() > self.config.line_plies
+        if question.prefix.len() > config.line_plies
+            || question.proposal.len() > config.line_plies
             || question
                 .refutation
-                .is_some_and(|line| line.len() > self.config.line_plies)
+                .is_some_and(|line| line.len() > config.line_plies)
             || legal.len() > 256
         {
             return Err(ReviewError::ViewCapacity.into());
@@ -222,6 +224,7 @@ impl<M: RoleModel> PalsEngine<M> {
 
     pub(super) fn prepare_review_view(
         &mut self,
+        config: &PalsSemanticConfig,
         node: usize,
         question: RoleQuestion<'_>,
         legal: &[BoardMove],
@@ -231,7 +234,7 @@ impl<M: RoleModel> PalsEngine<M> {
             (Some(_), Some(_)) => {}
             _ => return Err(PalsError::InvalidConfig),
         }
-        let root = self.review_root_for_question(node, question, legal)?;
+        let root = self.review_root_for_question(config, node, question, legal)?;
         let query = ReviewQuerySequences {
             purpose: question.purpose,
             prefix: question.prefix,
@@ -256,6 +259,7 @@ impl<M: RoleModel> PalsEngine<M> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_frozen_review_views(
         &mut self,
+        config: &PalsSemanticConfig,
         first_node: usize,
         first_question: RoleQuestion<'_>,
         first_legal: &[BoardMove],
@@ -268,8 +272,11 @@ impl<M: RoleModel> PalsEngine<M> {
             (Some(_), Some(_)) => {}
             _ => return Err(PalsError::InvalidConfig),
         }
-        let root = self.review_root_for_question(first_node, first_question, first_legal)?;
-        if self.review_root_for_question(second_node, second_question, second_legal)? != root {
+        let root =
+            self.review_root_for_question(config, first_node, first_question, first_legal)?;
+        if self.review_root_for_question(config, second_node, second_question, second_legal)?
+            != root
+        {
             return Err(ReviewError::AnchorMismatch.into());
         }
         let first = ReviewQuerySequences {
@@ -306,6 +313,66 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         Ok(Some((first, second)))
     }
+}
+
+impl<M: RoleModel> PalsEngine<M> {
+    pub(super) fn reset_review_context(&mut self) {
+        self.semantic.reset_review_context();
+    }
+    #[cfg(test)]
+    pub(super) fn publish_review_record(
+        &mut self,
+        record: &RoleRecord,
+        evidence: Option<ObservationId>,
+    ) -> Result<(), PalsError> {
+        let config = self.semantic_sequence_config();
+        self.semantic
+            .publish_review_record(&config, record, evidence)
+    }
+    #[cfg(test)]
+    pub(super) fn restore_review_context_after_load(&mut self) {
+        let config = self.semantic_sequence_config();
+        self.semantic.restore_review_context_after_load(&config);
+    }
+    #[cfg(test)]
+    fn review_policy_for_question(
+        &self,
+        root: StateId,
+        question: RoleQuestion<'_>,
+    ) -> Result<ReviewSelectionPolicy, PalsError> {
+        self.semantic.review_policy_for_question(root, question)
+    }
+    pub(super) fn prepare_review_view(
+        &mut self,
+        node: usize,
+        question: RoleQuestion<'_>,
+        legal: &[BoardMove],
+    ) -> Result<Option<Arc<ReviewView>>, PalsError> {
+        let config = self.semantic_sequence_config();
+        self.semantic
+            .prepare_review_view(&config, node, question, legal)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_frozen_review_views(
+        &mut self,
+        first_node: usize,
+        first_question: RoleQuestion<'_>,
+        first_legal: &[BoardMove],
+        second_node: usize,
+        second_question: RoleQuestion<'_>,
+        second_legal: &[BoardMove],
+    ) -> Result<Option<FrozenReviewViews>, PalsError> {
+        let config = self.semantic_sequence_config();
+        self.semantic.prepare_frozen_review_views(
+            &config,
+            first_node,
+            first_question,
+            first_legal,
+            second_node,
+            second_question,
+            second_legal,
+        )
+    }
 
     /// Both Fresh WDL calls retain their own physical input lifetime. This
     /// helper freezes selected records only; it never reuses raw NN outputs or
@@ -323,27 +390,28 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<(), PalsError> {
         // Preserve the old terminal/mixed/disabled path without adding view
         // allocation, model capability requirements, or new acceptance gates.
-        if self.review_policy.is_none()
-            || self.nodes[first_node].terminal.is_some()
-            || self.nodes[second_node].terminal.is_some()
+        if self.semantic.review_policy.is_none()
+            || self.semantic.nodes[first_node].terminal.is_some()
+            || self.semantic.nodes[second_node].terminal.is_some()
             || self.stopped(limits, cancel).is_some()
         {
             self.evaluate_model_value(first_node, first_line, limits, cancel, counters)?;
             return self.evaluate_model_value(second_node, second_line, limits, cancel, counters);
         }
-        let revision = self.revision;
-        let generation = self.stores.generation();
-        let actual_root = self.stores.root();
+        let revision = self.semantic.revision;
+        let generation = self.semantic.stores.generation();
+        let actual_root = self.semantic.stores.root();
         let identity = self
+            .semantic
             .model_registered_value
             .as_ref()
             .ok_or(RoleError::Unavailable)?
             .clone();
-        if self.model.value_identity() != Some(&identity) {
+        if self.semantic.model.value_identity() != Some(&identity) {
             return Err(RoleError::InvalidOutput.into());
         }
-        let first_legal = self.nodes[first_node].position.legal_moves();
-        let second_legal = self.nodes[second_node].position.legal_moves();
+        let first_legal = self.semantic.nodes[first_node].position.legal_moves();
+        let second_legal = self.semantic.nodes[second_node].position.legal_moves();
         let first_question = RoleQuestion {
             purpose: RoleQueryPurpose::ValueFresh,
             prefix: first_line,
@@ -377,10 +445,10 @@ impl<M: RoleModel> PalsEngine<M> {
             counters,
             Some(first_view),
         )?;
-        if self.revision != revision
-            || self.stores.generation() != generation
-            || self.stores.root() != actual_root
-            || self.model.value_identity() != Some(&identity)
+        if self.semantic.revision != revision
+            || self.semantic.stores.generation() != generation
+            || self.semantic.stores.root() != actual_root
+            || self.semantic.model.value_identity() != Some(&identity)
         {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -392,10 +460,10 @@ impl<M: RoleModel> PalsEngine<M> {
             counters,
             Some(second_view),
         )?;
-        if self.revision != revision
-            || self.stores.generation() != generation
-            || self.stores.root() != actual_root
-            || self.model.value_identity() != Some(&identity)
+        if self.semantic.revision != revision
+            || self.semantic.stores.generation() != generation
+            || self.semantic.stores.root() != actual_root
+            || self.semantic.model.value_identity() != Some(&identity)
         {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -425,10 +493,17 @@ mod tests {
     fn setup_root(engine: &mut PalsEngine<LegalOrderRoleMock>) -> (Position, StateId) {
         let position = Position::startpos();
         let situation = engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
-        let state = engine.stores.situations.get(situation).unwrap().state;
+        let state = engine
+            .semantic
+            .stores
+            .situations
+            .get(situation)
+            .unwrap()
+            .state;
         engine.intern(position.clone()).unwrap();
         (position, state)
     }
@@ -474,7 +549,7 @@ mod tests {
 
     fn engine_with_retired_bundle() -> (PalsEngine<LegalOrderRoleMock>, StateId) {
         let mut engine = selected_engine();
-        engine.review_index = Some(
+        engine.semantic.review_index = Some(
             ReviewContextIndex::new(ReviewIndexLimits {
                 active_bundles: 4,
                 records_per_bundle: 64,
@@ -487,11 +562,12 @@ mod tests {
             raw_record(state, 2, RecordKind::Counterexample, "e2e4 e7e5", Some(1)),
         ] {
             engine.publish_review_record(&record, None).unwrap();
-            engine.records.push(record);
+            engine.semantic.records.push(record);
         }
         // Two distinct eligible input consumptions, not two sequences carrying
         // one identical digest, exhaust the witness's observation protection.
         let witness_bundle = engine
+            .semantic
             .review_index
             .as_ref()
             .unwrap()
@@ -519,13 +595,15 @@ mod tests {
             }
             previous_digest = Some(view.digest());
             engine
+                .semantic
                 .review_index
                 .as_mut()
                 .unwrap()
-                .consume(&view, &engine.stores)
+                .consume(&view, &engine.semantic.stores)
                 .unwrap();
             assert_eq!(
                 engine
+                    .semantic
                     .review_index
                     .as_ref()
                     .unwrap()
@@ -541,15 +619,34 @@ mod tests {
             raw_record(state, 5, RecordKind::Proposal, "b2b4", None),
         ] {
             engine.publish_review_record(&record, None).unwrap();
-            engine.records.push(record);
+            engine.semantic.records.push(record);
         }
         assert_eq!(
-            engine.review_index.as_ref().unwrap().active_bundle_count(),
+            engine
+                .semantic
+                .review_index
+                .as_ref()
+                .unwrap()
+                .active_bundle_count(),
             4
         );
-        assert_eq!(engine.review_index.as_mut().unwrap().compact(), 2);
-        assert!(!engine.review_index.as_ref().unwrap().contains_revision(1));
-        assert!(!engine.review_index.as_ref().unwrap().contains_revision(2));
+        assert_eq!(engine.semantic.review_index.as_mut().unwrap().compact(), 2);
+        assert!(
+            !engine
+                .semantic
+                .review_index
+                .as_ref()
+                .unwrap()
+                .contains_revision(1)
+        );
+        assert!(
+            !engine
+                .semantic
+                .review_index
+                .as_ref()
+                .unwrap()
+                .contains_revision(2)
+        );
         (engine, state)
     }
 
@@ -564,7 +661,7 @@ mod tests {
             engine.prepare_review_view(node, value_question(&[]), &position.legal_moves()),
             Err(PalsError::Review(ReviewError::AnchorMismatch))
         ));
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]
@@ -585,7 +682,7 @@ mod tests {
             engine.prepare_review_view(node, value_question(&prefix), &legal),
             Err(PalsError::Review(ReviewError::InvalidLine))
         ));
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]
@@ -630,12 +727,12 @@ mod tests {
         assert_eq!(first.record_scope_digest(), second.record_scope_digest());
         assert_ne!(first.digest(), second.digest());
         assert_ne!(first.seal_digest(), second.seal_digest());
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 2);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 2);
         drop(first);
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 1);
-        assert!(second.validates(&engine.stores));
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 1);
+        assert!(second.validates(&engine.semantic.stores));
         drop(second);
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]
@@ -647,41 +744,47 @@ mod tests {
             .prepare_review_view(root_node, value_question(&[]), &position.legal_moves())
             .unwrap()
             .unwrap();
-        let limits = engine.review_index.as_ref().unwrap().limits();
-        engine.last_review_issue = Some(ReviewError::ViewCapacity);
+        let limits = engine.semantic.review_index.as_ref().unwrap().limits();
+        engine.semantic.last_review_issue = Some(ReviewError::ViewCapacity);
         engine.reset_review_context();
-        assert_eq!(engine.review_index.as_ref().unwrap().limits(), limits);
-        assert!(engine.last_review_issue.is_none());
+        assert_eq!(
+            engine.semantic.review_index.as_ref().unwrap().limits(),
+            limits
+        );
+        assert!(engine.semantic.last_review_issue.is_none());
         assert!(matches!(
             engine
+                .semantic
                 .review_index
                 .as_mut()
                 .unwrap()
-                .consume(&view, &engine.stores),
+                .consume(&view, &engine.semantic.stores),
             Err(ReviewError::OwnerMismatch)
         ));
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 1);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 1);
         drop(view);
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]
     fn cold_index_restore_preserves_raw_facts_without_reviving_witness_protection() {
         let (mut engine, _) = engine_with_retired_bundle();
         let before: Vec<_> = engine
+            .semantic
             .records
             .iter()
             .map(|record| (record.revision, record.line.clone(), record.parent_revision))
             .collect();
         engine.restore_review_context_after_load();
-        assert!(engine.last_review_issue.is_none());
-        let index = engine.review_index.as_ref().unwrap();
+        assert!(engine.semantic.last_review_issue.is_none());
+        let index = engine.semantic.review_index.as_ref().unwrap();
         let bundle = index.bundle_for_revision(2).unwrap();
         assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 0);
         assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2]);
         assert_eq!(
             before,
             engine
+                .semantic
                 .records
                 .iter()
                 .map(|record| (record.revision, record.line.clone(), record.parent_revision))
@@ -695,35 +798,42 @@ mod tests {
         let mut repair = raw_record(state, 6, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(2));
         repair.supersedes_revision = Some(1);
         engine.publish_review_record(&repair, None).unwrap();
-        let index = engine.review_index.as_ref().unwrap();
+        let index = engine.semantic.review_index.as_ref().unwrap();
         let bundle = index.bundle_for_revision(6).unwrap();
         assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2, 6]);
         assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 2);
         // This helper only publishes the index. Its caller owns raw commit.
-        assert_eq!(engine.records.len(), 5);
+        assert_eq!(engine.semantic.records.len(), 5);
     }
 
     #[test]
     fn successful_raw_load_keeps_typed_missing_relation_as_separate_review_issue() {
         let mut engine = selected_engine();
         let (_, state) = setup_root(&mut engine);
-        engine.records.push(raw_record(
+        engine.semantic.records.push(raw_record(
             state,
             10,
             RecordKind::Repair,
             "e2e4 e7e5",
             Some(9),
         ));
-        let nodes_before = engine.nodes.len();
+        let nodes_before = engine.semantic.nodes.len();
         engine.restore_review_context_after_load();
         assert_eq!(
-            engine.last_review_issue,
+            engine.semantic.last_review_issue,
             Some(ReviewError::MissingRelation(9))
         );
-        assert_eq!(engine.records.len(), 1);
-        assert_eq!(engine.records[0].revision, 10);
-        assert_eq!(engine.nodes.len(), nodes_before);
-        assert!(!engine.review_index.as_ref().unwrap().contains_revision(10));
+        assert_eq!(engine.semantic.records.len(), 1);
+        assert_eq!(engine.semantic.records[0].revision, 10);
+        assert_eq!(engine.semantic.nodes.len(), nodes_before);
+        assert!(
+            !engine
+                .semantic
+                .review_index
+                .as_ref()
+                .unwrap()
+                .contains_revision(10)
+        );
     }
 
     #[test]
@@ -750,15 +860,15 @@ mod tests {
             raw_record(state, 3, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(2)),
         ] {
             engine.publish_review_record(&record, None).unwrap();
-            engine.records.push(record);
+            engine.semantic.records.push(record);
         }
-        engine.review_policy.as_mut().unwrap().max_records = 2;
+        engine.semantic.review_policy.as_mut().unwrap().max_records = 2;
         // A three-record dependency cannot be trimmed to fit two records.
         assert!(matches!(
             engine.prepare_review_view(node, question, &position.legal_moves()),
             Err(PalsError::Review(ReviewError::ViewCapacity))
         ));
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]
@@ -781,12 +891,18 @@ mod tests {
         let record = raw_record(state, 1, RecordKind::Proposal, "d2d4", None);
         engine.publish_review_record(&record, None).unwrap();
         let explicit = engine
+            .semantic
             .review_index
             .as_ref()
             .unwrap()
             .bundle_for_revision(1)
             .unwrap();
-        engine.review_policy.as_mut().unwrap().required_bundle = Some(explicit);
+        engine
+            .semantic
+            .review_policy
+            .as_mut()
+            .unwrap()
+            .required_bundle = Some(explicit);
         assert_eq!(
             engine
                 .review_policy_for_question(state, question)
@@ -794,7 +910,7 @@ mod tests {
                 .required_bundle,
             Some(explicit)
         );
-        assert_eq!(engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(engine.semantic.stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]
@@ -823,15 +939,15 @@ mod tests {
         assert!(actual.counters.accepted_proposer_outputs > 0);
         assert!(actual.counters.accepted_critic_outputs > 0);
         assert!(actual.counters.completed_cpu_tasks > 0);
-        assert!(!selected.records.is_empty());
+        assert!(!selected.semantic.records.is_empty());
         assert!(position.legal_moves().contains(&actual.best_move.unwrap()));
         assert_eq!(actual.best_move, expected.best_move);
         assert_eq!(actual.score, expected.score);
         assert_eq!(actual.value_scope, expected.value_scope);
         assert_eq!(actual.completion, expected.completion);
         assert_eq!(actual.counters, expected.counters);
-        assert!(selected.last_review_issue.is_none());
-        assert_eq!(selected.stores.review_pin_count().unwrap(), 0);
+        assert!(selected.semantic.last_review_issue.is_none());
+        assert_eq!(selected.semantic.stores.review_pin_count().unwrap(), 0);
 
         // Inspect a selected view after actual publication, then release its
         // lease. This is a correctness bound, not a time or memory acceptance.
@@ -843,7 +959,7 @@ mod tests {
         assert!(!view.records().is_empty());
         assert!(view.records().len() <= 64);
         drop(view);
-        assert_eq!(selected.stores.review_pin_count().unwrap(), 0);
-        assert!(selected.last_review_issue.is_none());
+        assert_eq!(selected.semantic.stores.review_pin_count().unwrap(), 0);
+        assert!(selected.semantic.last_review_issue.is_none());
     }
 }

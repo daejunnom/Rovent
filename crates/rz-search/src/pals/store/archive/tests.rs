@@ -1773,6 +1773,374 @@ fn foreign_observation(
     o
 }
 
+fn live_profiled_fixture(
+    store: &mut PalsStores,
+    requested: ProfiledExternalConstraint,
+) -> Observation {
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let mut key = foreign_key(state);
+    key.question = TaskQuestion::ProfiledExternal { requested };
+    key.requested_depth = requested.requested_depth().unwrap_or(0);
+    key.node_budget = requested.requested_nodes().unwrap_or(0);
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            key,
+            TaskConsumer {
+                id: 71,
+                situation: root,
+                revision: 0,
+                generation: store.generation(),
+                deadline_tick: 100,
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("profiled archive task")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    let mut raw = foreign_observation(state, execution, pv, mv("e2e4"), Color::White, 1);
+    let report = raw.external_report.as_mut().unwrap();
+    report.requested_depth = requested.requested_depth().unwrap_or(0);
+    raw.scope = EvidenceScope::ProfiledExternalUci {
+        requested,
+        issued: requested,
+        reported_depth: report.reported_depth,
+        seldepth: report.seldepth,
+        bound: report.bound,
+    };
+    raw
+}
+
+#[test]
+fn retirement_writers_preserve_existing_wire_bytes_and_unpublished_source_values() {
+    let mut store = PalsStores::new(limits());
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    );
+    let source = store.states.get(raw.state).unwrap().clone();
+    let pv = raw.cpu_pv.unwrap();
+    let before = store.hot_stats();
+    let mut actual = Vec::new();
+    store
+        .write_retirement_state(raw.state, &mut actual as &mut dyn Write)
+        .unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&StateWire::encode(raw.state, &source).unwrap()).unwrap()
+    );
+    actual.clear();
+    store.write_retirement_line(pv, &mut actual).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&LineWire::encode(pv, store.lines.get(pv).unwrap())).unwrap()
+    );
+    actual.clear();
+    store
+        .write_retirement_observation_value(&raw, &mut actual)
+        .unwrap();
+    let expected = serde_json::to_vec(&ObservationWire::encode(&raw).unwrap()).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(store.hot_stats(), before);
+    assert_eq!(store.observations.len(), 0);
+    let report = raw.external_report.as_deref().unwrap();
+    actual.clear();
+    store
+        .write_retirement_external_report(report, &mut actual)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&actual).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&expected).unwrap()["external"]
+    );
+    let observation = store.append_observation(raw.clone()).unwrap();
+    actual.clear();
+    store
+        .write_retirement_observation(observation, &mut actual)
+        .unwrap();
+    assert_eq!(actual, expected);
+    let record = crate::pals::engine::RoleRecord {
+        revision: 7,
+        parent_revision: Some(3),
+        supersedes_revision: Some(2),
+        origin_state: raw.state,
+        kind: crate::pals::engine::RecordKind::Counterexample,
+        line: vec![mv("e2e4")],
+        value: None,
+        completed_depth: 0,
+        score_scope: None,
+        cpu_observation: Some(observation),
+        perspective: Color::White,
+        critical: true,
+    };
+    actual.clear();
+    store
+        .write_retirement_role_record(&record, &mut actual)
+        .unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&RoleRecordWire::encode(&record).unwrap()).unwrap()
+    );
+    // An original source snapshot is not replaced by today's hot state/board.
+    let absent = StateId(usize::MAX);
+    actual.clear();
+    assert!(store.write_retirement_state(absent, &mut actual).is_err());
+    assert!(actual.is_empty());
+    store
+        .write_retirement_snapshot(absent, &source, &mut actual)
+        .unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&StateWire::encode(absent, &source).unwrap()).unwrap()
+    );
+    assert!(store.states.get(absent).is_err());
+    assert_eq!(store.observations.len(), 1);
+}
+
+#[test]
+fn retirement_writer_preserves_the_bounded_sink_io_failure() {
+    struct FailedWriter;
+    impl Write for FailedWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "authored bounded writer failure",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut store = PalsStores::new(limits());
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    );
+    let before = store.hot_stats();
+    assert_eq!(
+        store.write_retirement_observation_value(&raw, &mut FailedWriter),
+        Err(StoreError::ArchiveIo {
+            stage: "retirement record serialization",
+            kind: std::io::ErrorKind::BrokenPipe
+        })
+    );
+    assert_eq!(store.hot_stats(), before);
+    assert_eq!(store.observations.len(), 0);
+}
+
+#[test]
+fn retirement_closure_keeps_original_consumers_and_checks_unique_pin_bound() {
+    let mut store = PalsStores::new(limits());
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let focus = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    let other = store.situations.insert(state, focus).unwrap();
+    let original = TaskConsumer {
+        id: 81,
+        situation: root,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let TaskAdmission::Start(execution) = store.request_task(key(state), original, 0).unwrap()
+    else {
+        panic!("retirement closure task")
+    };
+    assert!(
+        matches!(store.request_task(key(state), TaskConsumer { id: 82, situation: other, ..original }, 0).unwrap(), TaskAdmission::Join(id) if id == execution)
+    );
+    store.tasks.cancel_consumer(execution, original.id).unwrap();
+    store.tasks.fail(execution).unwrap();
+    let evidence = store.append_observation(observation(state)).unwrap();
+    store.dependencies.add(evidence, other).unwrap();
+    let seed = StorePins {
+        executions: BTreeSet::from([execution]),
+        ..StorePins::default()
+    };
+    let original_seed = seed.clone();
+    let before = store.hot_stats();
+    let closure = store.retirement_dependency_closure(&seed, 32).unwrap();
+    assert_eq!(closure.situations, BTreeSet::from([root, other]));
+    assert!(closure.lines.contains(&focus));
+    assert!(closure.states.contains(&state));
+    assert!(closure.observations.contains(&evidence));
+    assert_eq!(
+        store.retirement_dependency_edges().collect::<Vec<_>>(),
+        vec![(evidence, &BTreeSet::from([other]))]
+    );
+    assert_eq!(
+        store
+            .retirement_dependency_closure(&seed, closure.count())
+            .unwrap(),
+        closure
+    );
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, closure.count() - 1),
+        Err(StoreError::Capacity("retirement dependency closure"))
+    );
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, 0),
+        Err(StoreError::Capacity("retirement dependency closure"))
+    );
+    // Existing archive selection semantics do not start retaining historical
+    // consumers merely because the retirement reader requires their records.
+    let legacy = store.expand_pins(seed.clone()).unwrap();
+    assert!(legacy.situations.is_empty());
+    assert!(!legacy.observations.contains(&evidence));
+    assert_eq!(seed, original_seed);
+    assert_eq!(store.hot_stats(), before);
+}
+
+#[test]
+fn profiled_archive_roundtrip_retains_missing_limits_raw_units_and_question() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let requested = ProfiledExternalConstraint::MoveTime { milliseconds: 100 };
+    let raw = live_profiled_fixture(&mut store, requested);
+    let execution = raw.execution.unwrap();
+    let wire = ObservationWire::encode(&raw).unwrap();
+    let json = serde_json::to_vec(&wire).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<ObservationWire>(&json)
+            .unwrap()
+            .decode()
+            .unwrap(),
+        raw
+    );
+    let task_json = serde_json::to_vec(store.tasks.get(execution).unwrap()).unwrap();
+    let decoded: TaskRecord = serde_json::from_slice(&task_json).unwrap();
+    assert_eq!(decoded.key, store.tasks.get(execution).unwrap().key);
+    let observation = store
+        .append_observation_checked_with_archive_budget(raw.clone(), &mut budget())
+        .unwrap();
+    assert!(store.complete_task(execution, observation).is_err());
+    store.tasks.fail(execution).unwrap();
+    let mut next = Position::startpos();
+    next.make_move(mv("e2e4")).unwrap();
+    store.focus_actual_moves(next.snapshot()).unwrap();
+    let receipt = store.archive_inactive(budget()).unwrap().unwrap();
+    assert!(store.observations.get(observation).is_err());
+    let loaded = store
+        .pin_load(&receipt.observation_handle(observation), budget())
+        .unwrap();
+    assert_eq!(store.observations.get(observation).unwrap(), &raw);
+    assert_eq!(
+        store.tasks.get(execution).unwrap().key.question,
+        TaskQuestion::ProfiledExternal { requested }
+    );
+    assert_eq!(store.tasks.get(execution).unwrap().key.requested_depth, 0);
+    assert_eq!(store.tasks.get(execution).unwrap().key.node_budget, 0);
+    assert_eq!(
+        store.tasks.get(execution).unwrap().status,
+        TaskStatus::Failed
+    );
+    drop(loaded);
+}
+
+#[test]
+fn controlled_retirement_closure_interrupts_clone_and_parent_walk_without_store_mutation() {
+    let mut store = PalsStores::new(StoreLimits {
+        line_chunks: 64,
+        line_plies: 64,
+        ..limits()
+    });
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let mut line = store.situations.get(root).unwrap().focus;
+    let mut all_lines = BTreeSet::from([line]);
+    // A source-authored coordinate-chunk graph exercises parent traversal.
+    // This fixture issues no checked CPU PV, Rules proof or execution receipt.
+    for _ in 0..24 {
+        line = store.lines.append(line, &[mv("e2e4")]).unwrap();
+        all_lines.insert(line);
+    }
+    for seed in [
+        StorePins {
+            lines: BTreeSet::from([line]),
+            ..StorePins::default()
+        },
+        StorePins {
+            lines: all_lines,
+            ..StorePins::default()
+        },
+    ] {
+        let original = seed.clone();
+        let before = store.hot_stats();
+        let expected = store.retirement_dependency_closure(&seed, 64).unwrap();
+        let mut total_checks = 0usize;
+        let completed = store
+            .retirement_dependency_closure_controlled(&seed, 64, &mut || {
+                total_checks += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(completed, expected);
+        assert!(total_checks > 64);
+        for (stop_at, error) in [
+            (1, StoreError::ArchiveCanceled),
+            (3, StoreError::ArchiveDeadline),
+            (27, StoreError::ArchiveCanceled),
+            (total_checks / 2, StoreError::ArchiveDeadline),
+            (total_checks, StoreError::ArchiveCanceled),
+        ] {
+            let mut checks = 0usize;
+            assert_eq!(
+                store.retirement_dependency_closure_controlled(&seed, 64, &mut || {
+                    checks += 1;
+                    if checks == stop_at {
+                        Err(error.clone())
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(error.clone())
+            );
+            assert_eq!(checks, stop_at);
+            assert_eq!(seed, original);
+            assert_eq!(store.hot_stats(), before);
+        }
+    }
+}
+
+#[test]
+fn profiled_cold_load_rejects_an_individually_valid_but_replaced_constraint() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::MoveTime { milliseconds: 100 },
+    );
+    let execution = raw.execution.unwrap();
+    let observation = store
+        .append_observation_checked_with_archive_budget(raw, &mut budget())
+        .unwrap();
+    store.tasks.fail(execution).unwrap();
+    // Corruption fixture bypasses the public writer; the committed segment has
+    // a valid checksum, so its original task/observation relation must be checked.
+    let key = &mut store.tasks.tasks.get_mut(execution.0).unwrap().key;
+    key.question = TaskQuestion::ProfiledExternal {
+        requested: ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    };
+    key.node_budget = 16;
+    let mut next = Position::startpos();
+    next.make_move(mv("e2e4")).unwrap();
+    store.focus_actual_moves(next.snapshot()).unwrap();
+    let receipt = store.archive_inactive(budget()).unwrap().unwrap();
+    let before = store.hot_stats();
+    assert_eq!(
+        store
+            .pin_load(&receipt.observation_handle(observation), budget())
+            .unwrap_err(),
+        StoreError::ArchiveIntegrity("profiled observation task constraint")
+    );
+    assert_eq!(store.hot_stats(), before);
+    assert!(store.observations.get(observation).is_err());
+}
+
 #[test]
 fn foreign_request_uniqueness_scan_shares_explicit_budget_and_fails_closed() {
     let root = TestRoot::new();

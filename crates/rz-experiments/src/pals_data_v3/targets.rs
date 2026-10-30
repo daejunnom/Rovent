@@ -184,6 +184,15 @@ fn valid_outcome(
 }
 impl GenerationPolicyTargetV3 {
     pub fn probabilities(&self, input: &GenerationInputV3) -> Result<Vec<f64>, ManifestError> {
+        self.probabilities_for_source(input, "stockfish19_completed_multipv")
+    }
+    /// 조건부 순위 의견의 기존 계산을 공유한다. source 이름은 각 명시
+    /// 형식의 caller가 고정하며 native/teacher 권한을 이 함수가 발급하지 않는다.
+    pub(crate) fn probabilities_for_source(
+        &self,
+        input: &GenerationInputV3,
+        source: &str,
+    ) -> Result<Vec<f64>, ManifestError> {
         base(
             input,
             self.observed_sequence,
@@ -193,7 +202,7 @@ impl GenerationPolicyTargetV3 {
         )?;
         validate_generation_moves(&self.ranked_moves, 4)?;
         ensure(
-            self.source == "stockfish19_completed_multipv"
+            self.source == source
                 && self.completed
                 && !self.stale
                 && self.anchor == input.rules_anchor

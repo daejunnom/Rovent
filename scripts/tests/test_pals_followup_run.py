@@ -292,16 +292,19 @@ class DriverLookupTests(unittest.TestCase):
         self.assertFalse(evidence["cu_init_performed"])
         self.assertFalse(evidence["model_executed"])
         self.assertFalse(evidence["linker_settings_changed"])
+        self.assertTrue(evidence["output_eof_observed"])
         spawn.assert_called_once()
 
     def test_missing_driver_signal_and_incomplete_cleanup_are_not_success(self):
-        for index, result in enumerate(((125, True, None), (-11, True, None),
-                                        (0, False, None), (0, True, "budget failure"))):
+        for index, result in enumerate(((125, True, None), (-11, True, None), (124, True, None),
+                                        (0, False, None), (0, "unknown", None),
+                                        (0, True, "budget failure"))):
             self.receipt = self.root / f"failure-{index}.json"
             with self.subTest(result=result):
                 evidence, _ = self.probe(result=result)
                 self.assertEqual(evidence["status"], "lookup_or_supervision_failed")
                 self.assertEqual(evidence["tree_gone"], result[1])
+                self.assertFalse(evidence["output_eof_observed"])
                 self.assertTrue(Path(evidence["log"]).is_file())
 
     def test_raised_supervisor_preserves_unknown_ownership(self):
@@ -310,10 +313,9 @@ class DriverLookupTests(unittest.TestCase):
         self.assertEqual(evidence["tree_gone"], "unknown")
         self.assertEqual(evidence["child_spawned"], "unknown")
 
-    def test_invalid_or_oversized_probe_output_is_not_admitted(self):
+    def test_bounded_decode_and_format_failures_preserve_unknown_observation(self):
         valid = {"status": "available", "resolved_path": self.driver}
-        values = (b"not JSON", b"{}", b"[]", b"\xff", b"x" * (64 * 1024 + 1),
-                  json.dumps({**valid, "status": "unavailable"}).encode(),
+        values = (b"", b"not JSON", b"{}", b"[]", b"\xff",
                   json.dumps({**valid, "resolved_path": "libcuda.so.1"}).encode(),
                   json.dumps({**valid, "resolved_path": self.driver + " (deleted)"}).encode(),
                   json.dumps({**valid, "extra": True}).encode(),
@@ -323,7 +325,41 @@ class DriverLookupTests(unittest.TestCase):
             self.receipt = self.root / f"invalid-{index}.json"
             with self.subTest(index=index):
                 evidence, _ = self.probe(data=data)
-                self.assertEqual(evidence["status"], "invalid_probe_output")
+                self.assertEqual(evidence["status"], "observation_unknown")
+                self.assertEqual(evidence["exit_code"], 0)
+                self.assertIs(evidence["tree_gone"], True)
+                self.assertIsNone(evidence["supervisor_error"])
+                self.assertTrue(evidence["output_eof_observed"])
+                self.assertNotIn("resolved_path", evidence)
+                self.assertEqual(Path(evidence["log"]).read_bytes(), data)
+
+    def test_explicit_failed_observation_is_not_softened_to_unknown(self):
+        for index, status in enumerate(("unavailable", "failed", "error")):
+            self.receipt = self.root / f"reported-failure-{index}.json"
+            with self.subTest(status=status):
+                evidence, _ = self.probe(data=json.dumps({
+                    "status": status, "error_type": "OSError"}).encode())
+                self.assertEqual(evidence["status"], "lookup_reported_failure")
+                self.assertEqual(evidence["reported_status"], status)
+                self.assertTrue(evidence["output_eof_observed"])
+                self.assertNotIn("resolved_path", evidence)
+
+    def test_oversized_and_unreadable_probe_output_remain_failures(self):
+        evidence, _ = self.probe(data=b"x" * (64 * 1024 + 1))
+        self.assertEqual(evidence["status"], "invalid_probe_output")
+        self.assertFalse(evidence["output_eof_observed"])
+        self.receipt = self.root / "unreadable-output.json"
+        original_open = Path.open
+        def open_log(path, mode="r", *args, **kwargs):
+            if path == self.receipt.with_name(self.receipt.name + ".driver-lookup.log") and mode == "rb":
+                raise OSError("synthetic unreadable probe output")
+            return original_open(path, mode, *args, **kwargs)
+        with mock.patch.object(Path, "open", autospec=True, side_effect=open_log):
+            evidence, _ = self.probe()
+        self.assertEqual(evidence["status"], "probe_output_io_failed")
+        self.assertEqual(evidence["output_error_type"], "OSError")
+        self.assertTrue(evidence["tree_gone"])
+        self.assertFalse(evidence["output_eof_observed"])
 
     def test_expired_lookup_never_spawns_and_existing_log_is_not_overwritten(self):
         evidence, spawn = self.probe(remaining=0)
@@ -378,31 +414,251 @@ class DriverLookupTests(unittest.TestCase):
                      hashlib.sha256(files[name]).hexdigest()]
         return argv
 
-    def execute(self, argv, probe, clock):
+    def closed_probe(self, **overrides):
+        return {"status": "available", "tree_gone": True, "exit_code": 0,
+                "supervisor_error": None, "output_eof_observed": True, **overrides}
+
+    def captured_probe(self, data, result=(0, True, None)):
+        check = wrapper.check_colab_driver_lookup
+        def observe(*args):
+            def run(_argv, _cwd, _env, _timeout, budget):
+                budget()
+                os.write(1, data)
+                return result
+            with mock.patch.object(wrapper, "run_group", side_effect=run):
+                return check(*args)
+        return observe
+
+    def execute(self, argv, probe, *, prepared_at=2, lookup_completed_at=None,
+                native_completed_at=3, lifecycle_error=None, resource_error=None,
+                post_resource_error=None, native_error=None, native_result=(0, True, None),
+                output_budget_error_after_preflight=None):
+        # Time changes at simulated work boundaries, not at each observation.
+        # Additional monotonic() samples must not change the fixture's cost or
+        # exhaust a sequence despite preserving the original deadline contract.
+        now = [0]
+        observations = [0]
+        budgets = [0]
+        def advance_to(instant):
+            if instant is not None:
+                self.assertGreaterEqual(instant, now[0])
+                now[0] = instant
+        def observe(*_args):
+            observations[0] += 1
+            error = resource_error if observations[0] == 1 else post_resource_error
+            if error is not None:
+                raise error
+            if now[0] < prepared_at:
+                advance_to(prepared_at)
+            return {}
+        def output_budget(*_args):
+            budgets[0] += 1
+            if budgets[0] > 1 and output_budget_error_after_preflight is not None:
+                raise output_budget_error_after_preflight
+        def lookup_driver(*args):
+            observation = probe(*args) if callable(probe) else probe
+            advance_to(lookup_completed_at)
+            return observation
+        def run_native(*_args):
+            advance_to(native_completed_at)
+            if native_error is not None:
+                raise native_error
+            return native_result
         with (mock.patch.object(sys, "argv", argv),
               mock.patch.object(wrapper.sys, "platform", "linux"),
-              mock.patch.object(wrapper, "observe_resources", return_value={}),
-              mock.patch.object(wrapper, "check_resources", return_value={}),
-              mock.patch.object(wrapper, "check_colab_driver_lookup", return_value=probe) as lookup,
-              mock.patch.object(wrapper.time, "monotonic", side_effect=clock),
-              mock.patch.object(wrapper, "run_group", return_value=(0, True, None)) as native,
+              mock.patch.object(wrapper, "observe_resources", side_effect=observe),
+              mock.patch.object(wrapper, "check_resources", side_effect=observe),
+              mock.patch.object(wrapper, "check_colab_driver_lookup", side_effect=lookup_driver) as lookup,
+              mock.patch.object(wrapper.time, "monotonic", side_effect=lambda: now[0]),
+              mock.patch.object(wrapper, "run_group", side_effect=run_native) as native,
+              mock.patch.object(wrapper, "OutputLease") as lifecycle,
+              mock.patch.object(wrapper, "check_colab_output_budget", side_effect=output_budget),
               contextlib.redirect_stdout(io.StringIO())):
+            self.last_lifecycle, self.last_native, self.last_lookup = lifecycle, native, lookup
+            lifecycle.return_value.acquire.return_value.finish.side_effect = lifecycle_error
             code = wrapper.main()
         return code, json.loads(self.receipt.read_text()), lookup, native
 
-    def test_failed_probe_blocks_model_even_after_whole_window_expires(self):
-        code, receipt, lookup, native = self.execute(self.model_argv(),
-            {"status": "lookup_or_supervision_failed", "tree_gone": False}, [0, 2, 101, 102])
-        lookup.assert_called_once()
-        native.assert_not_called()
+    def test_final_lifecycle_failure_is_not_recorded_as_completed_native_success(self):
+        code, receipt, _, native = self.execute(self.model_argv(provider="cpu"), None,
+            lifecycle_error=RuntimeError("synthetic final output quota failure"))
+        native.assert_called_once()
         self.assertEqual(code, 125)
-        self.assertEqual(receipt["status"], "host_driver_lookup_failed_no_model_spawned")
-        self.assertFalse(receipt["tree_gone"])
-        self.assertFalse(receipt["child_spawned"])
+        self.assertEqual(receipt['status'], 'failed_output_lifecycle')
+        self.assertEqual(receipt['producer_exit_code'], 0)
+        self.assertEqual(receipt['exit_code'], 125)
+        self.assertEqual(receipt['storage_lifecycle_error'], {
+            'type': 'RuntimeError', 'message': 'synthetic final output quota failure'})
+        self.last_lifecycle.return_value.acquire.return_value.finish.assert_called_once()
+        self.assertFalse(receipt['output_lifecycle']['finish_returned'])
+
+    def test_resource_preflight_failure_issues_no_lease_or_child(self):
+        with self.assertRaisesRegex(ValueError, '^synthetic resource mismatch$'):
+            self.execute(self.model_argv(provider="cpu", resource="strict-local"), None,
+                resource_error=ValueError("synthetic resource mismatch"))
+        self.last_lifecycle.assert_not_called()
+        self.last_native.assert_not_called()
+        self.last_lookup.assert_not_called()
+
+    def test_after_acquire_before_child_failure_finishes_once_with_no_child(self):
+        code, receipt, _, native = self.execute(self.model_argv(provider="cpu"), None,
+            output_budget_error_after_preflight=RuntimeError("synthetic pre-dispatch quota failure"))
+        native.assert_not_called()
+        self.last_lifecycle.return_value.acquire.return_value.finish.assert_called_once_with(
+            status="failed_wrapper_supervision_or_observation", tree_gone=True)
+        self.assertEqual(code, 125)
+        self.assertFalse(receipt['producer_dispatch_attempted'])
+        self.assertFalse(receipt['producer_result_observed'])
+        self.assertIsNone(receipt['producer_exit_code'])
+        self.assertEqual(receipt['wrapper_error'], {'stage': 'before_producer_dispatch',
+            'type': 'RuntimeError', 'message': 'synthetic pre-dispatch quota failure'})
+
+    def test_raised_supervisor_finishes_once_but_preserves_unknown_and_original_error(self):
+        code, receipt, _, native = self.execute(self.model_argv(provider="cpu"), None,
+            native_error=RuntimeError("synthetic original supervisor failure"),
+            lifecycle_error=RuntimeError("synthetic finish failure"))
+        native.assert_called_once()
+        self.last_lifecycle.return_value.acquire.return_value.finish.assert_called_once_with(
+            status="failed_wrapper_supervision_or_observation", tree_gone="unknown")
+        self.assertEqual(code, 125)
+        self.assertEqual(receipt['tree_gone'], 'unknown')
+        self.assertEqual(receipt['child_spawned'], 'unknown')
+        self.assertFalse(receipt['producer_result_observed'])
+        self.assertIsNone(receipt['producer_exit_code'])
+        self.assertEqual(receipt['wrapper_error'], {'stage': 'producer_supervision',
+            'type': 'RuntimeError', 'message': 'synthetic original supervisor failure'})
+        self.assertEqual(receipt['storage_lifecycle_error'], {
+            'type': 'RuntimeError', 'message': 'synthetic finish failure'})
+
+    def test_post_run_observer_failure_preserves_actual_producer_result(self):
+        code, receipt, _, native = self.execute(self.model_argv(provider="cpu"), None,
+            post_resource_error=OSError("synthetic post-run resource read failure"))
+        native.assert_called_once()
+        self.last_lifecycle.return_value.acquire.return_value.finish.assert_called_once_with(
+            status="failed_wrapper_supervision_or_observation", tree_gone=True)
+        self.assertEqual(code, 125)
+        self.assertEqual(receipt['producer_exit_code'], 0)
+        self.assertTrue(receipt['producer_tree_gone'])
+        self.assertTrue(receipt['producer_result_observed'])
+        self.assertIsNone(receipt['producer_supervisor_error'])
+        self.assertEqual(receipt['wrapper_error'], {'stage': 'post_producer_observation',
+            'type': 'OSError', 'message': 'synthetic post-run resource read failure'})
+
+    def test_returned_supervisor_failure_does_not_become_zero_exit_success(self):
+        code, receipt, _, native = self.execute(self.model_argv(provider="cpu"), None,
+            native_result=(0, True, "synthetic original cleanup diagnostic"))
+        native.assert_called_once()
+        self.last_lifecycle.return_value.acquire.return_value.finish.assert_called_once_with(
+            status="failed_ownership_preserved", tree_gone=True)
+        self.assertEqual(code, 125)
+        self.assertEqual(receipt['producer_exit_code'], 0)
+        self.assertEqual(receipt['producer_supervisor_error'], "synthetic original cleanup diagnostic")
+        self.assertEqual(receipt['supervisor_error'], "synthetic original cleanup diagnostic")
+        self.assertEqual(receipt['status'], 'failed_ownership_preserved')
+
+    def test_original_control_flow_is_rethrown_after_unknown_finish_and_receipt(self):
+        for index, original in enumerate((KeyboardInterrupt("synthetic cancellation"), SystemExit(7))):
+            self.receipt = self.root / f"control-flow-{index}.json"
+            with self.subTest(kind=type(original).__name__), self.assertRaises(type(original)) as caught:
+                self.execute(self.model_argv(provider="cpu"), None, native_error=original,
+                    lifecycle_error=RuntimeError("synthetic finish failure during cancellation"))
+            self.assertIs(caught.exception, original)
+            self.last_native.assert_called_once()
+            self.last_lifecycle.return_value.acquire.return_value.finish.assert_called_once_with(
+                status="failed_wrapper_supervision_or_observation", tree_gone="unknown")
+            receipt = json.loads(self.receipt.read_text())
+            self.assertEqual(receipt['status'], 'interrupted_control_flow')
+            self.assertIsNone(receipt['exit_code'])
+            self.assertEqual(receipt['tree_gone'], 'unknown')
+            self.assertFalse(receipt['producer_result_observed'])
+            self.assertIsNone(receipt['producer_exit_code'])
+            self.assertEqual(receipt['control_flow_exception'], {
+                'type': type(original).__name__, 'message': str(original)})
+            self.assertEqual(receipt['wrapper_error'], {'stage': 'producer_supervision',
+                'type': type(original).__name__, 'message': str(original)})
+            self.assertEqual(receipt['storage_lifecycle_error'], {'type': 'RuntimeError',
+                'message': 'synthetic finish failure during cancellation'})
+
+    def test_finish_control_flow_is_not_swallowed_after_original_producer_result(self):
+        original = KeyboardInterrupt("synthetic finish cancellation")
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            self.execute(self.model_argv(provider="cpu"), None, lifecycle_error=original)
+        self.assertIs(caught.exception, original)
+        self.last_lifecycle.return_value.acquire.return_value.finish.assert_called_once()
+        receipt = json.loads(self.receipt.read_text())
+        self.assertEqual(receipt['status'], 'interrupted_control_flow')
+        self.assertIsNone(receipt['exit_code'])
+        self.assertEqual(receipt['producer_exit_code'], 0)
+        self.assertTrue(receipt['producer_result_observed'])
+        self.assertTrue(receipt['producer_tree_gone'])
+        self.assertEqual(receipt['storage_lifecycle_error'], {
+            'type': 'KeyboardInterrupt', 'message': 'synthetic finish cancellation'})
+
+    def test_failed_probe_blocks_model_even_after_whole_window_expires(self):
+        cases = (
+            (b"not JSON", (125, True, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (-11, True, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (124, True, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (0, False, None), "lookup_or_supervision_failed"),
+            (b"not JSON", (0, "unknown", None), "lookup_or_supervision_failed"),
+            (b"not JSON", (0, True, "budget failure"), "lookup_or_supervision_failed"),
+            (b"x" * (64 * 1024 + 1), (0, True, None), "invalid_probe_output"),
+            (b'{"status":"unavailable"}', (0, True, None), "lookup_reported_failure"),
+        )
+        for index, (data, result, status) in enumerate(cases):
+            self.receipt = self.root / f"blocked-model-{index}.json"
+            with self.subTest(status=status, result=result):
+                code, receipt, lookup, native = self.execute(self.model_argv(),
+                    self.captured_probe(data, result), lookup_completed_at=101)
+                lookup.assert_called_once()
+                native.assert_not_called()
+                self.assertEqual(code, 125)
+                self.assertEqual(receipt["status"], "host_driver_lookup_failed_no_model_spawned")
+                self.assertEqual(receipt["host_driver_lookup"]["status"], status)
+                self.assertEqual(receipt["tree_gone"], result[1])
+                self.assertFalse(receipt["child_spawned"])
+                self.assertFalse(receipt["producer_dispatch_attempted"])
+
+    def test_unknown_probe_requires_original_closure_and_complete_output_before_dispatch(self):
+        cases = ({"exit_code": None}, {"exit_code": 125}, {"tree_gone": "unknown"},
+                 {"supervisor_error": "original supervision failure"},
+                 {"output_eof_observed": False}, {"status": "probe_output_io_failed"})
+        for index, changed in enumerate(cases):
+            self.receipt = self.root / f"incomplete-observation-{index}.json"
+            with self.subTest(changed=changed):
+                code, receipt, _, native = self.execute(self.model_argv(),
+                    self.closed_probe(status="observation_unknown") | changed)
+                native.assert_not_called()
+                self.assertEqual(code, 125)
+                self.assertFalse(receipt["producer_dispatch_attempted"])
+
+    def test_malformed_closed_probe_output_dispatches_original_model_command(self):
+        for index, data in enumerate((b"not JSON", b"\xff")):
+            self.receipt = self.root / f"unknown-observation-{index}.json"
+            argv = self.model_argv()
+            flag = lambda name: argv[argv.index("--" + name) + 1]
+            expected = [flag(name) for name in ("binary", "export", "export-sha256", "runtime",
+                        "runtime-sha256", "fixtures", "model-report", "provider", "runtime-cache", "cuda-bundle")]
+            with self.subTest(data=data):
+                code, receipt, lookup, native = self.execute(argv, self.captured_probe(data),
+                    lookup_completed_at=8, native_completed_at=9)
+                native.assert_called_once()
+                self.assertEqual(native.call_args.args[0], expected)
+                self.assertEqual(native.call_args.args[3], 92)
+                self.assertIs(lookup.call_args.args[2], native.call_args.args[2])
+                observation = receipt["host_driver_lookup"]
+                self.assertEqual(observation["status"], "observation_unknown")
+                self.assertTrue(observation["output_eof_observed"])
+                self.assertNotIn("resolved_path", observation)
+                self.assertEqual(Path(observation["log"]).read_bytes(), data)
+                self.assertTrue(receipt["producer_dispatch_attempted"])
+                self.assertTrue(receipt["producer_result_observed"])
+                self.assertEqual(code, 0)
+                self.assertEqual(receipt["status"], "completed_observed_profile")
 
     def test_successful_probe_cost_is_charged_to_original_model_window(self):
         code, receipt, lookup, native = self.execute(self.model_argv(),
-            {"status": "available", "tree_gone": True}, [0, 2, 8, 9])
+            self.closed_probe(), lookup_completed_at=8, native_completed_at=9)
         lookup.assert_called_once()
         native.assert_called_once()
         self.assertEqual(native.call_args.args[3], 92)
@@ -410,15 +666,28 @@ class DriverLookupTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(receipt["status"], "completed_observed_profile")
 
+    def test_successful_probe_cannot_restart_an_expired_original_model_window(self):
+        for index, status in enumerate(("available", "observation_unknown")):
+            self.receipt = self.root / f"expired-model-window-{index}.json"
+            with self.subTest(status=status):
+                code, receipt, lookup, native = self.execute(self.model_argv(),
+                    self.closed_probe(status=status), lookup_completed_at=101)
+                lookup.assert_called_once()
+                native.assert_not_called()
+                self.assertEqual(code, 124)
+                self.assertEqual(receipt["status"], "preparation_deadline_expired")
+                self.assertTrue(receipt["tree_gone"])
+                self.assertFalse(receipt["child_spawned"])
+
     def test_planning_cpu_and_strict_local_do_not_run_host_lookup(self):
-        cases = (("cuda", "colab-observed", False, [0, 1]),
-                 ("cpu", "colab-observed", True, [0, 2, 3]),
-                 ("cuda", "strict-local", True, [0, 1, 2]))
-        for index, (provider, resource, execute, clock) in enumerate(cases):
+        cases = (("cuda", "colab-observed", False),
+                 ("cpu", "colab-observed", True),
+                 ("cuda", "strict-local", True))
+        for index, (provider, resource, execute) in enumerate(cases):
             self.receipt = self.root / f"no-lookup-{index}.json"
             with self.subTest(provider=provider, resource=resource, execute=execute):
                 code, receipt, lookup, native = self.execute(
-                    self.model_argv(provider, resource, execute), None, clock)
+                    self.model_argv(provider, resource, execute), None)
                 lookup.assert_not_called()
                 self.assertNotIn("host_driver_lookup", receipt)
                 self.assertEqual(native.call_count, int(execute))
@@ -470,11 +739,16 @@ class ResourceObservationTests(unittest.TestCase):
             self.assertEqual(evidence["observations"][name]["status"], "unknown")
 
     def test_unsafe_membership_is_not_used_for_limit_reads(self):
+        read_paths = []
+        def read_membership(path, **unused):
+            read_paths.append(path)
+            self.assertEqual(path, Path("/proc/self/cgroup"))
+            return "0::/../outside\n"
         with mock.patch.object(wrapper.sys, "platform", "linux"), \
                 mock.patch.object(wrapper.os, "sched_getaffinity", return_value={0, 2}, create=True), \
-                mock.patch.object(Path, "read_text", return_value="0::/../outside\n") as reads:
+                mock.patch.object(Path, "read_text", autospec=True, side_effect=read_membership):
             evidence = wrapper.observe_resources([0, 2])
-        self.assertEqual(reads.call_count, 1)
+        self.assertIn(Path("/proc/self/cgroup"), read_paths)
         self.assertIsNone(evidence["cgroup_membership"])
         self.assertEqual(evidence["observations"]["cpu_quota"]["status"], "unknown")
 

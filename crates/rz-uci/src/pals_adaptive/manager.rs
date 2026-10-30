@@ -13,13 +13,17 @@ use super::{
 };
 use crate::pals_native::ticketed::{
     NativeRootFence, PreparationId, TicketExecutionEvidence, TicketNativeBackend,
-    TicketNativeEvent, TicketOwnerRunWitness, TicketPreparation, TicketServiceError,
-    TicketedNativeService,
+    TicketNativeEvent, TicketNativeObservationDisposition, TicketNativeObservationFailure,
+    TicketNativeObservationFailures, TicketNativeObservationStage, TicketOwnerRunWitness,
+    TicketPreparation, TicketServiceError, TicketedNativeService,
 };
 use rz_contracts::pals::{Move16, Role, RoleOutput, RolePayload, SearchAuthority};
 use rz_contracts::pals_adaptive::{
     CpuJobEnvelope, CpuJobId, CpuWorkerId, ExternalCpuJobEnvelope, ExternalSliceGrant,
     ReviewViewSeal, RoleTicketEnvelope, SliceGrant,
+};
+use rz_contracts::rovent::{
+    ExecutionMode, QuestionEnvelope, ReciprocalQuestionId, SearchRecipient,
 };
 use rz_contracts::{
     ClockDomain, ContractError, Deadline, Digest, ExecutionId, MonotonicTick, RequestId,
@@ -34,11 +38,15 @@ use rz_runtime::adaptive::{
 };
 use rz_runtime::contracts::{ContractClock as _, ContractSystemClock};
 use rz_search::contract_time::InstantClock;
-use rz_search::cpu::{CpuCompletion, CpuControlMailbox, CpuEngine};
+use rz_search::cpu::{
+    CpuCompletion, CpuControlMailbox, CpuEngine, CpuReciprocalReply, CpuReciprocalRequest,
+    CpuReciprocalScope,
+};
 use rz_search::cpu_worker::{
-    CPU_JOB_CAPACITY, CpuAdmissionRejection, CpuCreditLedger, CpuJobTermination, CpuSliceReport,
-    CpuWorker, CpuWorkerError, CpuWorkerEvent, CpuWorkerEventObservation, CpuWorkerProfile,
-    CpuWorkerProgress, CpuWorkerProgressObservation, CpuWorkerSliceTiming,
+    CPU_JOB_CAPACITY, CpuAdmissionRejection, CpuCreditLedger, CpuJobTermination, CpuLedgerIdentity,
+    CpuSliceReport, CpuWorker, CpuWorkerError, CpuWorkerEvent, CpuWorkerEventObservation,
+    CpuWorkerProfile, CpuWorkerProgress, CpuWorkerProgressObservation, CpuWorkerSliceTiming,
+    ReleasedCpuReservation, SettledCpuSlice,
 };
 use rz_search::external_cpu::worker::{
     ExternalCpuWorker, ExternalJob, ExternalRootFence, ExternalTeacherDispatch,
@@ -61,10 +69,14 @@ use rz_search::pals::engine::adaptive_port::validator_port::{
     AdaptiveValidatorAction, AdaptiveValidatorActionPlan, ValidatorActionId, ValidatorActionOutcome,
 };
 use rz_search::pals::engine::adaptive_port::{
-    AdaptiveDeferredRepair, AdaptiveQueuedRecheck, AdaptiveRulesPairProof, CheckedRootCandidate,
-    DeferredRootCandidate,
+    AdaptiveDeferredRepair, AdaptiveGoalLocalAdmission, AdaptiveQueuedRecheck,
+    AdaptiveReviewLeaseAdmission, AdaptiveRulesPairProof, CheckedRootCandidate,
+    DeferredRootCandidate, GoalLocalBlockReason, GoalLocalInput, GoalLocalStep,
 };
 use rz_search::pals::review_context::ReviewView;
+use rz_search::pals::rovent_frontier::{
+    FrontierError, FrontierFrameKind, NativeCloseReason, NativeReservation,
+};
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,6 +85,96 @@ use std::time::{Duration, Instant};
 
 const MAX_EVENT_DRAIN: usize = 256;
 const MAX_ROLE_PENDING: usize = 16;
+
+mod admitted;
+mod cleanup;
+mod collection;
+mod cpu_semantic;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_cohort;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_intervention;
+mod utility_route;
+pub use cpu_semantic::{
+    AdaptiveCpuCaptureCustody, AdaptiveCpuCapturePlan, AdaptiveCpuSemanticObserver,
+    AdaptiveCpuSemanticObserverBox, AdaptiveCpuSemanticRetirement,
+    AdaptiveCpuSemanticRetirementParts,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort::{
+    UtilityCohortReadyDisposition, UtilityCohortReadyObserver, UtilityCohortReadyOffer,
+    UtilityCohortReadyRejection, UtilityCohortReadySnapshot, UtilityCohortTrialCustody,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_intervention::{
+    UtilityInterventionSourceDisposition, UtilityInterventionSourceObserver,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_route::UtilityCohortRootClosureProof;
+pub use utility_route::{
+    UtilityRouteClosureProof, UtilityRouteFinalizationRejection, UtilityRoutePendingClosure,
+};
+mod effective_clock;
+mod researcher_resources;
+pub use researcher_resources::AdaptiveResearcherSourceKind;
+use researcher_resources::{NativeResearcherResources, ResearcherResources};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_source;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use profiled_external_source::{
+    ExternalManagerLock, ExternalManagerRoot, ProfiledExternalManagerSource,
+    ProfiledExternalSourceRejection,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_receipt;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use profiled_external_receipt::{
+    ProfiledExternalPersistentParts, ProfiledExternalShutdownReceipt,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_dispatch;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_manager;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use profiled_external_manager::{
+    ProfiledExternalExecutionManager, ProfiledExternalManagerAdmissionRejection,
+    ProfiledExternalPersistentRejection,
+};
+mod frontier;
+mod goal_local;
+mod goals;
+mod nnuec;
+mod reciprocal;
+mod registered_ledger;
+mod role_only;
+use cleanup::{CleanupBoundary, automatic_cleanup_deadline};
+pub use collection::*;
+pub use frontier::{RoventNativeAccountingObservation, RoventReviewLeaseObservation};
+#[cfg(feature = "pals-adaptive-diagnostics")]
+pub use nnuec::NnuecPreparationAckObservation;
+pub use nnuec::{
+    AdaptiveNnuecRetiredOwner, AdaptiveNnuecRootParts, NnuecPreparationRecord, NnuecWorkError,
+};
+pub use reciprocal::{
+    PeerFollowupDisposition, PeerFollowupObservation, RoventPeerFollowupPolicy,
+    RoventReciprocalPolicy,
+};
+pub use registered_ledger::{
+    AdaptiveRegisteredLedgerAdmissionRejection, AdaptiveRegisteredLedgerSources,
+};
+pub use role_only::*;
+
+/// Search-issued immutable child input. The engine port keeps the opaque CPU
+/// request seal and Store pins; the manager owns submission and physical custody.
+pub struct AdaptiveReciprocalQuestion<Q> {
+    pub question: QuestionEnvelope,
+    pub input: FrameInput<ReviewView, Q>,
+}
+pub struct AdaptivePeerQuestion<Q> {
+    pub origin: rz_search::pals::coordinator::AcceptedRoleOrigin,
+    pub question: QuestionEnvelope,
+    pub input: FrameInput<ReviewView, Q>,
+}
 
 /// Concrete queue/owner ceilings. These values are applied during physical
 /// owner admission, rather than copied into receipts without enforcement.
@@ -112,17 +214,64 @@ impl AdaptiveExecutionLimits {
 
 #[derive(Clone, Debug)]
 pub enum AdaptiveManagerError {
+    NativeObservation(TicketNativeObservationFailure),
+    Collection(AdaptiveCollectionError),
     Coordinator(CoordinatorError),
     Contract(ContractError),
     Native(TicketServiceError),
     Cpu(CpuWorkerError),
+    Frontier(FrontierError),
+    GoalLocalBlocked(GoalLocalBlockReason),
+    NnuecPreparation(NnuecWorkError),
+    NnuecCapture(Arc<rz_search::pals::engine::adaptive_port::AdaptiveNnuecCaptureError>),
+    ProfiledExternal(rz_search::cpu_checker::CheckerError),
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledQueryUnsupported(rz_search::pals::engine::adaptive_port::ProfiledExternalUnsupported),
+    AdmissionClosed,
+    ReviewLeaseBackpressure {
+        current: usize,
+        capacity: usize,
+        required_new: usize,
+        replacement_reserve: usize,
+    },
     Invalid(&'static str),
+    /// Two independently reconstructed intervention roots did not seal the
+    /// same target. Neither digest is a live authority or a valid label.
+    InterventionNeutralMismatch {
+        expected: Digest,
+        actual: Digest,
+        reference_matches: bool,
+        model_matches: bool,
+    },
     Semantic(String),
     Capacity(&'static str),
     PhysicalUnknown,
     Deadline,
     AuxiliaryPending,
     RoleCallLimit,
+}
+impl AdaptiveManagerError {
+    /// Preserve the original semantic cause while identifying the manager
+    /// boundary that received it. Typed capacity, cancellation, and physical
+    /// errors must retain their original variants and handling.
+    fn at_semantic_stage(self, stage: &'static str) -> Self {
+        match self {
+            Self::Semantic(cause) => Self::Semantic(format!("{stage}: {cause}")),
+            other => other,
+        }
+    }
+}
+#[cfg(test)]
+#[test]
+fn semantic_stage_preserves_original_cause_and_typed_failures() {
+    let observed = AdaptiveManagerError::Semantic("PALS: Role(InvalidOutput)".into())
+        .at_semantic_stage("deliver_roles");
+    assert!(matches!(observed, AdaptiveManagerError::Semantic(cause)
+        if cause == "deliver_roles: PALS: Role(InvalidOutput)"));
+    assert!(matches!(AdaptiveManagerError::PhysicalUnknown.at_semantic_stage("deliver_roles"),
+        AdaptiveManagerError::PhysicalUnknown));
+    assert!(matches!(AdaptiveManagerError::AdmissionClosed.at_semantic_stage("schedule"),
+        AdaptiveManagerError::AdmissionClosed));
 }
 impl From<CoordinatorError> for AdaptiveManagerError {
     fn from(error: CoordinatorError) -> Self {
@@ -142,6 +291,11 @@ impl From<TicketServiceError> for AdaptiveManagerError {
 impl From<CpuWorkerError> for AdaptiveManagerError {
     fn from(error: CpuWorkerError) -> Self {
         Self::Cpu(error)
+    }
+}
+impl From<FrontierError> for AdaptiveManagerError {
+    fn from(error: FrontierError) -> Self {
+        Self::Frontier(error)
     }
 }
 impl std::fmt::Display for AdaptiveManagerError {
@@ -201,8 +355,868 @@ pub struct CandidateFrame<Q> {
 /// Rules lines and commit hot facts; they MUST NOT run a model, CPU search,
 /// archive I/O, an external pipe drain, or wait for a worker. Archive effects
 /// remain with the independent archive owner and finish after worker fences.
+/// A failed target bind returns every original owner to the caller.
+pub type UtilityInterventionTargetBinding<Q> = Result<
+    rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
+    (
+        AdaptiveManagerError,
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        rz_search::pals::coordinator::UtilityInterventionReadySource<Q>,
+        Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ),
+>;
+
 pub trait AdaptiveSearchDriver<Q> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_common_work(
+        &self,
+    ) -> Result<
+        Option<(
+            Option<u64>,
+            rz_search::pals::rovent_frontier::FrontierNodeWork,
+        )>,
+        AdaptiveManagerError,
+    > {
+        Ok(None)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn freeze_utility_witness_bodies(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityConditionalWitnessBodies,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "utility original witness bodies unsupported",
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_offer_semantics(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::UtilityCohortOfferSemanticSource<Q>,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "utility cohort offer semantics unsupported",
+        ))
+    }
+    fn prepare_utility_route(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: u16,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility source",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_intervention_target(
+        &self,
+        preparation: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        source: rz_search::pals::coordinator::UtilityInterventionReadySource<Q>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> UtilityInterventionTargetBinding<Q> {
+        Err((
+            AdaptiveManagerError::Invalid("intervention target factory unsupported"),
+            preparation,
+            source,
+            input,
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn prepare_utility_intervention(
+        &mut self,
+        target: rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
+        _: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteRecipient,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate<Q>,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention query factory unsupported"),
+            target,
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_intervention_route(
+        &self,
+        admission:rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission<Q>,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission<Q>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention action factory unsupported"),
+            admission,
+        ))
+    }
+    fn prepare_utility_intervention_arm_request(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+        _: Arc<AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "intervention arm Request unsupported",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn attach_utility_intervention_arm_request(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        request: rz_search::cpu_value::nnuec::v2::review::Request,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::review::Request,
+        (
+            AdaptiveManagerError,
+            rz_search::cpu_value::nnuec::v2::review::Request,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention original arm Request unsupported"),
+            request,
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_intervention_arm_capture(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        (),
+        (
+            AdaptiveManagerError,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention arm capture unsupported"),
+            input,
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_intervention_arm_metadata(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<serde_json::Value, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "intervention arm metadata unsupported",
+        ))
+    }
+    fn prepare_utility_route_input_request(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+        _: Arc<AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility Request factory",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_route_input(
+        &self,
+        preparation: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        _: &CoordinatorWork<ReviewView, Q>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("driver has no utility input binding"),
+            preparation,
+            input,
+        ))
+    }
+    fn validate_utility_route_work(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility dependency",
+        ))
+    }
+    fn begin_utility_route_commit(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: StepExecution,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no utility precommit guard",
+        ))
+    }
+    fn register_utility_route_descendant(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original utility descendant source",
+        ))
+    }
+    fn register_utility_route_peer(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::ReciprocalDependencyProof<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual sealed utility peer",
+        ))
+    }
+    fn commit_utility_route_step(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility CPU consumption",
+        ))
+    }
+    fn commit_utility_route_await(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility Await source",
+        ))
+    }
+    fn commit_utility_route_role(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility accepted head consumption",
+        ))
+    }
+    fn record_utility_route_r_pc_consumption(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no utility selected R observation",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn finish_utility_route_semantics(
+        &self,
+        action: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("driver has no utility semantic closure"),
+            action,
+        ))
+    }
+    fn reserve_cpu_nnuec_capture(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        _: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        _: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        _: u64,
+        _: rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLimits,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureReservation,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original R capture factory",
+        ))
+    }
+    fn cpu_semantic_publication_recorded(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> bool {
+        false
+    }
+    fn cpu_semantic_witnesses(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+        _: &SettledCpuSlice,
+        _: &rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLineage,
+    ) -> Result<Vec<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>, AdaptiveManagerError>
+    {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual R semantic witness factory",
+        ))
+    }
+    fn selected_cpu_pc_consumption(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+        _: &FrameInput<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual selected R observation consumer",
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &ExternalCpuConfig,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: ReciprocalQuestionId,
+        _: ExecutionId,
+        _: rz_search::external_cpu::ExternalGoConstraint,
+        _: Duration,
+        _: rz_runtime::CompletionSignal,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalPreparation,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no profiled external producer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_admitted(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: &rz_search::external_cpu::ProfiledExternalDispatch,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalAdmission,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no actual profiled external binding",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn commit_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        _: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<CheckedStep<Q>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no actual profiled external consumer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn observe_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        _: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no profiled external raw observer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn consume_profiled_reciprocal_cpu(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        _: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::CheckedProfiledExternalResponse,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no actual profiled reciprocal consumer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn reject_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no unsubmitted profiled question",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration(
+        &self,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: &Arc<crate::rovent_root_admission::RoventRootAdmission>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no original profiled external source registration",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration_v2(
+        &self,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no original V2 profiled external source registration",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_work(
+        &self,
+    ) -> Option<rz_search::pals::rovent_frontier::FrontierExternalWork> {
+        None
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_retained_host_bytes(&self) -> Option<u64> {
+        None
+    }
     fn root_rules(&self) -> Arc<ContractState>;
+    fn validate_cpu_nnuec_model(
+        &self,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual NNUEC researcher",
+        ))
+    }
+    fn prepare_cpu_nnuec_review(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+        _: Arc<AtomicBool>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewRequest,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original NNUEC question",
+        ))
+    }
+    fn install_cpu_nnuec_review(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        _: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        _: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+    ) -> Result<rz_search::cpu_worker::PreparedValueInstallation, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original NNUEC installation",
+        ))
+    }
+    fn accept_cpu_nnuec_installation(
+        &mut self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        _: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        _: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        _: &rz_search::cpu_worker::ValueInstallReceipt,
+        _: &CpuWorker,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual NNUEC install acknowledgement",
+        ))
+    }
+    fn release_cpu_nnuec_installation(
+        &mut self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual NNUEC installation cleanup",
+        ))
+    }
+    fn next_rovent_goal_input(
+        &mut self,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<AdaptiveGoalLocalAdmission<Q>, AdaptiveManagerError> {
+        Ok(AdaptiveGoalLocalAdmission::NoQuestion)
+    }
+    fn validate_rovent_goal_input(
+        &self,
+        _: &GoalLocalInput<Q>,
+        _: &RoleTicketEnvelope,
+        _: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual GoalLocal source",
+        ))
+    }
+    fn consume_rovent_goal_input(
+        &mut self,
+        _: &GoalLocalInput<Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<GoalLocalStep, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual GoalLocal consumer",
+        ))
+    }
+    fn discard_rovent_goal_input(
+        &mut self,
+        _: &GoalLocalInput<Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual GoalLocal cleanup",
+        ))
+    }
+    fn rovent_goal_has_pending(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn close_rovent_goal_admission(&mut self) -> Result<(), AdaptiveManagerError> {
+        Ok(())
+    }
+    fn release_rovent_goal_state(&mut self) -> Result<(), AdaptiveManagerError> {
+        Ok(())
+    }
+    fn rovent_goal_consumption_recorded(
+        &self,
+        _: &RoleTicketEnvelope,
+        _: &ReviewView,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn validate_collection_admission(
+        &self,
+        _: &RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual Rovent collection frontier",
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_collection_admission_v2(
+        &self,
+        _: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual V2 collection frontier",
+        ))
+    }
+    /// Report support for observing the exact original admission, including
+    /// its acceptance and consumption paths. This does not establish that the
+    /// separately owned teacher started, finished, or physically retired.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn collection_v2_observation_complete(&self, _admission: &RoventCollectionRootAdmissionV2) -> bool {
+        false
+    }
+    fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    /// Read the same current controller; no caller-supplied stop/receipt can
+    /// establish a capacity boundary for another root or a legacy driver.
+    fn rovent_public_record_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    /// The exact public review-bundle producer stopped this same controller.
+    /// Other index/view/sequence/owner failures do not establish this boundary.
+    fn rovent_public_review_index_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_publication_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(self.rovent_public_record_capacity_closed()?
+            || self.rovent_public_review_index_capacity_closed()?)
+    }
+    fn close_rovent_role_call_budget(
+        &mut self,
+        _: u64,
+        _: u64,
+    ) -> Result<(), AdaptiveManagerError> {
+        Ok(())
+    }
+    fn rovent_frame_admitted(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: FrontierFrameKind,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_lane_selected(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_fresh_accepted(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_rules_endpoint(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn prepare_rovent_goal_boundary(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::AdaptiveGoalBoundary<Q>>,
+        AdaptiveManagerError,
+    > {
+        Ok(None)
+    }
+    fn rovent_root_round_sealed(
+        &mut self,
+        _: Digest,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn validate_registered_native_ledger(
+        &self,
+        _: &CpuLedgerIdentity,
+        _: &rz_search::cpu_worker::CpuLedgerRegistrationObservation,
+        _: Digest,
+        _: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original registered native ledger",
+        ))
+    }
+    fn review_lease_admission(
+        &self,
+    ) -> Result<Option<AdaptiveReviewLeaseAdmission>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    /// Optional common-node controller. Legacy PALS has no such owner.
+    fn frontier_native_capacity(
+        &mut self,
+        _: u64,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<Option<u64>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    fn frontier_native_reserve(
+        &mut self,
+        _: &CpuJobEnvelope,
+        _: SliceGrant,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<Option<NativeReservation>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    fn frontier_native_settled(
+        &mut self,
+        _: &NativeReservation,
+        _: &CpuSliceReport,
+        _: &SettledCpuSlice,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("native frontier absent"))
+    }
+    fn frontier_native_released(
+        &mut self,
+        _: &NativeReservation,
+        _: &ReleasedCpuReservation,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("native frontier absent"))
+    }
+    fn frontier_native_unknown(
+        &mut self,
+        _: &NativeReservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("native frontier absent"))
+    }
+    fn reciprocal_parent(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuJobEnvelope,
+        _: ReciprocalQuestionId,
+        _: ExecutionMode,
+        _: Digest,
+    ) -> Result<QuestionEnvelope, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal CPU parent consumer",
+        ))
+    }
+    fn register_cpu_reciprocal_scope(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuJobEnvelope,
+        _: &QuestionEnvelope,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no existing reciprocal R scope consumer",
+        ))
+    }
+    fn prepare_cpu_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuReciprocalRequest,
+        _: ReciprocalQuestionId,
+        _: ExecutionMode,
+        _: Digest,
+    ) -> Result<AdaptiveReciprocalQuestion<Q>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal native input consumer",
+        ))
+    }
+    fn cpu_reciprocal_wait(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal wait receipt consumer",
+        ))
+    }
+    fn discard_cpu_reciprocal(
+        &mut self,
+        _: ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal pin retirement consumer",
+        ))
+    }
+    // The original work, accepted head/output, question identity, mode, budget
+    // and recipient remain independent checked provenance at this boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_accepted_role_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: ReciprocalQuestionId,
+        _: ExecutionMode,
+        _: Digest,
+        _: SearchRecipient,
+    ) -> Result<Option<AdaptivePeerQuestion<Q>>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted-role peer question producer",
+        ))
+    }
+    fn accept_accepted_role_source(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no staged accepted role source consumer",
+        ))
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    fn diagnostic_accepted_source_revision(
+        &self,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+    ) -> Option<u64> {
+        None
+    }
+    fn consume_accepted_role_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted peer opinion consumer",
+        ))
+    }
+    fn consume_reciprocal_cpu(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual reciprocal CPU answer consumer",
+        ))
+    }
+    fn consume_cpu_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        _: &[(CpuReciprocalRequest, ReciprocalQuestionId)],
+    ) -> Result<Vec<CpuReciprocalReply>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted reciprocal reply consumer",
+        ))
+    }
+    fn discard_accepted_role_reciprocal(
+        &mut self,
+        _: ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted peer pin retirement consumer",
+        ))
+    }
     /// Immutable root registration, separate from per-frame ceilings, CPU
     /// credit, semantic consumption and physical NN/cache accounting.
     fn root_role_call_limit(&self) -> Result<Option<u64>, AdaptiveManagerError> {
@@ -331,12 +1345,14 @@ pub trait AdaptiveSearchDriver<Q> {
         output: &RoleOutput,
         physical: Option<TicketExecutionEvidence>,
     ) -> Result<CheckedStep<Q>, AdaptiveManagerError>;
+    /// Use the manager's already resolved endpoint. The driver must not choose
+    /// the Collection teacher again after native R admission/preparation.
     fn cpu_question(
         &mut self,
         work: &CoordinatorWork<ReviewView, Q>,
         profiles: &[CpuWorkerProfile],
         external: Option<&ExternalCpuConfig>,
-        selection: CpuEndpointSelection,
+        endpoint: CpuEndpoint,
         physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError>;
     fn commit_cpu(
@@ -352,6 +1368,17 @@ pub trait AdaptiveSearchDriver<Q> {
         _: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
         Ok(())
+    }
+    /// Original known terminal with no CPU score. This is a cleanup consumer,
+    /// never an ordinary commit/after_cpu or a successful reciprocal response.
+    fn cpu_no_value_terminated(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "CPU no-value consumer is unavailable",
+        ))
     }
     fn cpu_partial_continuation_eligible(
         &self,
@@ -890,6 +1917,8 @@ impl AdaptiveShutdownReceipt {
 
 struct RoleBinding<Q, O> {
     preparation: PreparationId,
+    prepared_observed: bool,
+    cancellation_requested: bool,
     work: Option<CoordinatorWork<ReviewView, Q>>,
     input: FrameInput<ReviewView, Q>,
     ticket: Option<RoleTicketEnvelope>,
@@ -899,6 +1928,11 @@ struct RoleBinding<Q, O> {
     admission_charged: bool,
     dispatch_pending: bool,
     collection_registered: bool,
+    rovent_collection_registered: bool,
+    /// The V2 observer may own this ticket's original capture or a staged
+    /// reservation. Disabled-only tickets must not consume capture custody.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    v2_capture_possible: bool,
     physical: Option<TicketExecutionEvidence>,
     prepared_at: Instant,
     preparation_elapsed: Option<Duration>,
@@ -909,15 +1943,26 @@ struct RoleBinding<Q, O> {
     class: Option<CostClass>,
     delivered: Option<Arc<O>>,
     ack_accepted: Option<bool>,
+    ack_dispatched: bool,
+    revoked_acceptance: Option<RoleFailure>,
     native_acceptance_recorded: bool,
     consumption_recorded: bool,
+    // A failed owner readback cannot establish whether search consumed the
+    // accepted result. Retain its binding rather than retry or count it unused.
+    consumption_unknown: bool,
     purpose: RolePurpose,
+    reciprocal_acceptance: Option<rz_search::pals::coordinator::AcceptedRoleStep>,
+    goal_local: Option<GoalLocalInput<Q>>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RolePurpose {
     RootRanking,
     Refinement,
     Validator,
+    Reciprocal,
+    RoventRefinement,
+    RoventFresh,
+    RoventGoalLocal,
 }
 struct NativeAck {
     preparation: PreparationId,
@@ -942,7 +1987,17 @@ struct OwnBinding<Q> {
     last_yield_ack: u64,
     requested_yield: Option<(u64, Instant)>,
     pending_slice: Option<CpuSliceReport>,
+    // A prior paused stack may terminate before an already-enqueued Resume
+    // returns its definite no-work report. Retain both original obligations.
+    queued_resume_termination: Option<CpuJobTermination>,
     validator_reviewed_execution: Option<ExecutionId>,
+    reciprocal: Option<reciprocal::OwnReciprocalCustody>,
+    // Linear custody of the same grant in the root's common-node controller.
+    // Its accepted native-ledger receipt is kept until the semantic owner
+    // returns; a cold Store never turns a reservation into zero work.
+    native_frontier: Option<NativeReservation>,
+    nnuec: Option<Arc<nnuec::NnuecJobCustody>>,
+    semantic_settlement: Option<SettledCpuSlice>,
 }
 struct OwnSlot<Q> {
     worker: Option<CpuWorker>,
@@ -954,6 +2009,8 @@ struct OwnSlot<Q> {
     ready_readback: Option<
         Result<rz_runtime::adaptive::CpuThreadReadback, rz_runtime::adaptive::CpuResourceError>,
     >,
+    last_value_installation: Option<rz_search::cpu_worker::ValueInstallReceipt>,
+    nnuec_retirement: Option<rz_search::cpu_worker::RecoveredNnuecEngine>,
 }
 struct ForeignBinding<Q> {
     work: CoordinatorWork<ReviewView, Q>,
@@ -1005,6 +2062,11 @@ pub struct RetainedNativeCompletion<O> {
 // Inline variants avoid allocating error-recovery boxes per deferred receipt.
 #[allow(clippy::large_enum_variant)]
 enum DeferredCommit<Q> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledExternal {
+        binding: profiled_external_dispatch::ProfiledExternalBinding<Q>,
+        packet: Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    },
     Role {
         ticket: RoleTicketEnvelope,
         accepted: bool,
@@ -1012,6 +2074,13 @@ enum DeferredCommit<Q> {
     Own {
         binding: OwnBinding<Q>,
         report: CpuSliceReport,
+    },
+    OwnNoValue {
+        binding: OwnBinding<Q>,
+        report: CpuSliceReport,
+        // A publication retry retains the actual committed Unknown closure;
+        // it must not attempt to retire the already-removed frame twice.
+        closed: Option<ClosedFrame>,
     },
     External {
         binding: ForeignBinding<Q>,
@@ -1029,6 +2098,16 @@ enum DeferredCommit<Q> {
     TokenDiscard {
         work: CoordinatorWork<ReviewView, Q>,
         termination: CpuJobTermination,
+    },
+    ReciprocalWait {
+        work: CoordinatorWork<ReviewView, Q>,
+        report: CpuSliceReport,
+    },
+    ReciprocalDiscard {
+        question: ReciprocalQuestionId,
+    },
+    PeerDiscard {
+        question: ReciprocalQuestionId,
     },
 }
 pub struct ExternalManagerWorker {
@@ -1104,6 +2183,16 @@ where
     pub error: AdaptiveManagerError,
     pub manager: AdaptiveExecutionManager<Q, B, D>,
 }
+/// A session already owns the original manager in a Box.  A rejected transfer
+/// returns that very allocation instead of materializing the whole manager on
+/// the caller's stack or changing its physical ownership.
+pub(crate) struct AdaptiveBoxedPersistentRejection<Q, B, D>
+where
+    B: TicketNativeBackend<ReviewView, Q>,
+{
+    pub error: AdaptiveManagerError,
+    pub manager: Box<AdaptiveExecutionManager<Q, B, D>>,
+}
 /// Admission owns the actual process/session and engines. Every failed check
 /// returns this complete source bundle rather than dropping physical owners.
 pub struct AdaptiveManagerSources<Q, B, D>
@@ -1124,6 +2213,29 @@ where
     pub continuation: Option<AdaptiveSequenceContinuation>,
 }
 
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveCollectionV2ObserverStatus {
+    AdmissionNotCalled,
+    AdmissionFailed,
+    AdmissionPanicked,
+    AdmissionSucceededRecheckFailed,
+    AdmissionSucceededRecheckPanicked,
+    ManagerValidationPanicked,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub(crate) struct AdaptiveCollectionV2Rejection<Q, O> {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV2,
+    pub observer: AdaptiveCollectionObserverBoxV2<Q, O>,
+    /// Failed or panicked callbacks may have changed this original observer;
+    /// the status does not grant permission to reuse it.
+    pub observer_status: AdaptiveCollectionV2ObserverStatus,
+    /// A panic payload can own resources. Keep it with the rejected observer.
+    pub panic_payload: Option<Box<dyn std::any::Any + Send>>,
+}
+
 /// The actual single writer owns native service handles and private CPU workers.
 /// tick is bounded and nonblocking. It does not execute inference/search or join
 /// a live worker. Two pending role questions retain independent submitted views.
@@ -1141,18 +2253,60 @@ where
     machine: RefinementMachine<ReviewView, Q>,
     driver: D,
     role_call_limit: Option<u64>,
+    collection_observer: Option<AdaptiveCollectionObserverBox<Q, B::Output>>,
+    collection_admission: Option<RoventCollectionRootAdmission>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_observer_v2: Option<AdaptiveCollectionObserverBoxV2<Q, B::Output>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_disabled: bool,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_disabled_first_ticket: Option<RoleTicketEnvelope>,
+    /// A Busy capture may already hold an original staged reservation. Keep
+    /// this ticket ahead of any later collection dispatch until it resolves.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_busy_ticket: Option<RoleTicketEnvelope>,
+    /// The first collection-only failure is retained even if the bounded
+    /// diagnostic history rolls over. It is not a native completion result.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_first_failure: Option<AdaptiveCollectionError>,
+    /// Original discarded tickets whose observer cleanup failed. Their native
+    /// discard ACK is confirmed, but their capture remains with the observer
+    /// until this same root's physical fence and settlement.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_abandon_custody: Vec<RoleTicketEnvelope>,
+    /// A failed bypass must stop admission; retrying or treating it as a
+    /// completed capture could drop the original input owner.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_disable_failed: bool,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_admission_v2: Option<RoventCollectionRootAdmissionV2>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_settlement: Option<Result<(), AdaptiveCollectionError>>,
+    cpu_semantic: Option<cpu_semantic::CpuSemanticState<Q>>,
+    utility_route: Option<utility_route::UtilityRouteState<Q>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    utility_cohort: Option<utility_cohort::UtilityCohortState<Q>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    utility_intervention: Option<utility_intervention::UtilityInterventionState<Q>>,
+    utility_route_sequence: u64,
+    // Failed unique prepared-job cleanup retains the same job and grant. No
+    // unverified rejection can refund credit or discard its capture custody.
+    retained_cpu_jobs: Vec<(rz_search::cpu_worker::CpuJob, SliceGrant)>,
     roles: Vec<RoleBinding<Q, B::Output>>,
     acknowledgements: VecDeque<NativeAck>,
     own: Vec<OwnSlot<Q>>,
     external: Option<ExternalManagerWorker>,
     foreign: Option<ForeignBinding<Q>>,
-    ledger: CpuCreditLedger,
+    researcher: ResearcherResources,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_binding: Option<profiled_external_dispatch::ProfiledExternalBinding<Q>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_orphan: Option<profiled_external_source::ProfiledExternalManagerCompletion>,
     cpu_slice_diagnostic: OnceLock<AdaptiveCpuSliceDiagnostic>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     continuation_diagnostic: Option<ContinuationDiagnostic>,
     ready: ReadySelector<FrameId, Move16, Digest>,
     costs: CostEstimator,
-    controller: AdaptiveController,
     advised_yield: Option<YieldSelection>,
     /// Actual completed role namespaces retained only for this root. A lookup
     /// for the next Critic is a prospective S scope, not a submitted role or
@@ -1167,12 +2321,15 @@ where
     native_joined: bool,
     native_root_fence: Option<NativeRootFence>,
     close_mode: AdaptiveCloseMode,
+    native_root_quiesce_requested: bool,
     external_finished: Option<bool>,
     external_root_fence: Option<ExternalRootFence>,
     external_startup_observed: bool,
     counters: AdaptiveManagerCounters,
     native_accounting: AdaptiveNativeAccountingSnapshot,
     shutdown_until: Option<Instant>,
+    cleanup_boundary: Option<CleanupBoundary>,
+    effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
     native_ready: bool,
     native_verifier_registered: bool,
     retained_native_permits: Vec<NativeAcceptancePermit>,
@@ -1180,10 +2337,13 @@ where
     failures: VecDeque<AdaptiveManagerError>,
     quarantine_rejections: Vec<RoleCompletion<Arc<B::Output>>>,
     retained_native_completions: Vec<RetainedNativeCompletion<B::Output>>,
+    native_observation_failures: Vec<TicketNativeObservationFailure>,
     quarantined_cpu_receipts: Vec<CpuWorkerEvent>,
     quarantined_foreign_receipts: Vec<ExternalWorkerReport>,
     ready_ids: Vec<FrameId>,
     deferred: VecDeque<DeferredCommit<Q>>,
+    native_frontier_events: VecDeque<frontier::NativeFrontierEvent>,
+    review_leases: RoventReviewLeaseObservation,
     validator_waiting: Vec<FrameId>,
     root_started: bool,
     cpu_node_limit_reached: bool,
@@ -1192,6 +2352,22 @@ where
     registered_action: Option<AdaptiveValidatorAction>,
     exclusive_scope: Option<ExclusiveActionScope>,
     finished_at: Option<Instant>,
+    reciprocal_policy: Option<RoventReciprocalPolicy>,
+    reciprocal_routing: Option<reciprocal::RoventQuestionRouting>,
+    next_reciprocal_question: u64,
+    peer_policy: Option<RoventPeerFollowupPolicy>,
+    accepted_roles: Vec<reciprocal::AcceptedRoleCustody<Q, B::Output>>,
+    peer_sources_admitted: u16,
+    peer_observations: Vec<PeerFollowupObservation>,
+    // A local duty is never represented by an invented refinement frame.
+    // Keep the exact private source until native retirement or known cleanup.
+    goal_prepared: Option<GoalLocalInput<Q>>,
+    goal_continuation_pending: bool,
+    nnuec: Option<nnuec::NnuecRootPreparation>,
+    nnuec_pending: Option<nnuec::NnuecWorkPreparation<Q>>,
+    nnuec_jobs: Vec<Arc<nnuec::NnuecJobCustody>>,
+    nnuec_observations: Vec<NnuecPreparationRecord>,
+    nnuec_observations_omitted: u64,
 }
 
 impl<Q, B, D> AdaptiveExecutionManager<Q, B, D>
@@ -1256,6 +2432,55 @@ where
         sources: AdaptiveManagerSources<Q, B, D>,
         check_native_limits: bool,
     ) -> Result<Self, AdaptiveManagerAdmissionRejection<Q, B, D>> {
+        Self::admit_sources_with_ledger(
+            registration,
+            clock,
+            limits,
+            sources,
+            check_native_limits,
+            None,
+        )
+        .map_err(|rejected| {
+            debug_assert!(rejected.original.is_none());
+            AdaptiveManagerAdmissionRejection {
+                error: rejected.error,
+                sources: rejected.sources,
+                continuation: None,
+            }
+        })
+    }
+    #[allow(clippy::result_large_err)]
+    fn admit_sources_with_ledger(
+        registration: AdaptiveManagerRegistration,
+        clock: ContractSystemClock,
+        limits: AdaptiveExecutionLimits,
+        sources: AdaptiveManagerSources<Q, B, D>,
+        check_native_limits: bool,
+        original: Option<registered_ledger::RegisteredLedger>,
+    ) -> Result<Self, registered_ledger::SourceAdmissionRejection<Q, B, D>> {
+        // Preserve the move-only ledger outside every fallible source check.
+        // In particular, no temporary replacement ledger is constructed.
+        let original_registration = match original
+            .as_ref()
+            .map(|original| {
+                registered_ledger::validate_registered_ledger::<Q, D>(
+                    &registration,
+                    &clock,
+                    &sources.driver,
+                    original,
+                )
+            })
+            .transpose()
+        {
+            Ok(registered) => registered,
+            Err(error) => {
+                return Err(registered_ledger::SourceAdmissionRejection {
+                    error,
+                    sources,
+                    original,
+                });
+            }
+        };
         let native = &sources.native;
         let own_workers = &sources.own_workers;
         let external = &sources.external;
@@ -1325,6 +2550,19 @@ where
                     })?;
             }
             for (at, worker) in own_workers.iter().enumerate() {
+                if original_registration.is_some() {
+                    if !matches!(worker.ready_readback(), Some(Ok(_)))
+                        || (worker.thread_affinity_requested()
+                            && !matches!(worker.thread_affinity_ready(), Some(Ok(_))))
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "original ledger requires an actually ready CPU owner",
+                        ));
+                    }
+                    // This actual owner API excludes an in-progress value
+                    // replacement; a declared profile is not Ready evidence.
+                    worker.acknowledged_profile()?;
+                }
                 if worker.command_capacity() != limits.worker_commands_max
                     || worker.paused_bytes_limit() != limits.paused_bytes_per_worker_max
                 {
@@ -1379,11 +2617,6 @@ where
                 deadline,
                 registration.token_budget,
             )?;
-            let ledger = CpuCreditLedger::new(
-                registration.authority,
-                registration.native_cpu_node_limit,
-                cpu_clock,
-            )?;
             let ready = ReadySelector::new(limits.waiting_jobs_max)
                 .map_err(|_| AdaptiveManagerError::Capacity("ready selector"))?;
             let costs = CostEstimator::new(4096)
@@ -1397,7 +2630,6 @@ where
                 registry,
                 native_verifier_registered,
                 machine,
-                ledger,
                 ready,
                 costs,
                 controller,
@@ -1411,7 +2643,6 @@ where
             registry,
             native_verifier_registered,
             machine,
-            ledger,
             ready,
             costs,
             controller,
@@ -1419,90 +2650,65 @@ where
         ) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                return Err(AdaptiveManagerAdmissionRejection {
+                return Err(registered_ledger::SourceAdmissionRejection {
                     error,
                     sources,
-                    continuation: None,
+                    original,
                 });
             }
         };
-        let AdaptiveManagerSources {
-            native,
-            own_workers,
-            external,
-            driver,
-        } = sources;
-        Ok(Self {
+        let (ledger, next_job, next_execution, cleanup_boundary) = if let Some(original) = original
+        {
+            let (observed, cleanup) = original_registration
+                .expect("same retained ledger validated before source admission");
+            (
+                original.ledger,
+                observed.highest_job_sequence + 1,
+                observed.highest_execution_sequence + 1,
+                Some(cleanup),
+            )
+        } else {
+            let ledger = match CpuCreditLedger::new(
+                registration.authority,
+                registration.native_cpu_node_limit,
+                cpu_clock,
+            ) {
+                Ok(ledger) => ledger,
+                Err(error) => {
+                    return Err(registered_ledger::SourceAdmissionRejection {
+                        error: error.into(),
+                        sources,
+                        original: None,
+                    });
+                }
+            };
+            (ledger, 1, 1, None)
+        };
+        Ok(Self::assemble(
             registration,
-            limits,
             clock,
-            cpu_clock,
-            deadline,
-            native,
-            registry,
-            machine,
-            driver,
-            role_call_limit,
-            roles: Vec::with_capacity(limits.role_tickets_max),
-            acknowledgements: VecDeque::with_capacity(limits.role_tickets_max),
-            own: own_workers
-                .into_iter()
-                .map(|worker| OwnSlot {
-                    worker: Some(worker),
-                    binding: None,
-                    joined: false,
-                    panicked: false,
-                    settled_execution: None,
-                    recovered_engine: None,
-                    ready_readback: None,
-                })
-                .collect(),
-            external,
-            foreign: None,
-            ledger,
-            cpu_slice_diagnostic: OnceLock::new(),
-            #[cfg(feature = "pals-adaptive-diagnostics")]
-            continuation_diagnostic: None,
-            ready,
-            costs,
-            controller,
-            advised_yield: None,
-            observed_role_classes: Vec::with_capacity(64),
-            observation_sequence: 0,
-            next_job: 1,
-            next_execution: 1,
-            next_control: 1,
-            phase: ManagerPhase::Running,
-            native_finished: None,
-            native_joined: false,
-            native_root_fence: None,
-            close_mode: AdaptiveCloseMode::ProcessShutdown,
-            external_finished: None,
-            external_root_fence: None,
-            external_startup_observed: false,
-            counters: AdaptiveManagerCounters::default(),
-            native_accounting: AdaptiveNativeAccountingSnapshot::default(),
-            shutdown_until: None,
-            native_ready,
-            native_verifier_registered,
-            retained_native_permits: Vec::with_capacity(limits.role_tickets_max),
-            retained_native_receipts: Vec::with_capacity(limits.role_tickets_max),
-            failures: VecDeque::with_capacity(64),
-            quarantine_rejections: Vec::with_capacity(16),
-            retained_native_completions: Vec::with_capacity(limits.role_tickets_max),
-            quarantined_cpu_receipts: Vec::with_capacity(8),
-            quarantined_foreign_receipts: Vec::with_capacity(1),
-            ready_ids: Vec::with_capacity(limits.waiting_jobs_max),
-            deferred: VecDeque::with_capacity(128),
-            validator_waiting: Vec::with_capacity(limits.waiting_jobs_max),
-            root_started: false,
-            cpu_node_limit_reached: false,
-            root_ranking_proof: None,
-            exclusive_requested: false,
-            registered_action: None,
-            exclusive_scope: None,
-            finished_at: None,
-        })
+            limits,
+            sources,
+            admitted::ManagerAssembly {
+                cpu_clock,
+                deadline,
+                native_ready,
+                registry,
+                native_verifier_registered,
+                machine,
+                ready,
+                costs,
+                researcher: ResearcherResources::Native(NativeResearcherResources {
+                    ledger,
+                    controller,
+                }),
+                role_call_limit,
+                next_job,
+                next_execution,
+                next_control: 1,
+                cleanup_boundary,
+            },
+        ))
     }
     pub fn new_continued(
         registration: AdaptiveManagerRegistration,
@@ -1621,12 +2827,91 @@ where
     ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>> {
         self.into_settled_parts(AdaptiveCloseMode::ProcessShutdown)
     }
-    // Owner transfer failure preserves the manager and every linear owner.
+    /// Reuse a manager already held on the heap without moving the complete
+    /// physical owner onto the session's stack, including on rejection.
+    pub(crate) fn into_persistent_parts_boxed(
+        self: Box<Self>,
+    ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptiveBoxedPersistentRejection<Q, B, D>> {
+        self.into_settled_parts_boxed(AdaptiveCloseMode::RootQuiesce)
+    }
+    pub(crate) fn into_process_parts_boxed(
+        self: Box<Self>,
+    ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptiveBoxedPersistentRejection<Q, B, D>> {
+        self.into_settled_parts_boxed(AdaptiveCloseMode::ProcessShutdown)
+    }
+    fn into_settled_parts_boxed(
+        mut self: Box<Self>,
+        mode: AdaptiveCloseMode,
+    ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptiveBoxedPersistentRejection<Q, B, D>> {
+        let (receipt, cpu, continuation) = match self.prepare_settled_transfer(mode) {
+            Ok(parts) => parts,
+            Err(error) => {
+                return Err(AdaptiveBoxedPersistentRejection {
+                    error,
+                    manager: self,
+                });
+            }
+        };
+        // All fallible checks and CPU transfers are finished. Move the actual
+        // fields separately from the same allocation; do not move `*self`.
+        Ok(AdaptivePersistentParts {
+            native: self.native,
+            cpu,
+            external: self.external,
+            driver: self.driver,
+            continuation,
+            receipt,
+        })
+    }
+    // Existing by-value API remains compatible and uses the same checks.
     #[allow(clippy::result_large_err)]
     fn into_settled_parts(
         mut self,
         mode: AdaptiveCloseMode,
     ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>> {
+        let (receipt, cpu, continuation) = match self.prepare_settled_transfer(mode) {
+            Ok(parts) => parts,
+            Err(error) => {
+                return Err(AdaptivePersistentRejection {
+                    error,
+                    manager: self,
+                });
+            }
+        };
+        Ok(AdaptivePersistentParts {
+            native: self.native,
+            cpu,
+            external: self.external,
+            driver: self.driver,
+            continuation,
+            receipt,
+        })
+    }
+    /// Every failure happens while the original manager still owns all of its
+    /// resources. Successfully recovered CPU engines remain in their slots if
+    /// a later worker transfer fails.
+    fn prepare_settled_transfer(
+        &mut self,
+        mode: AdaptiveCloseMode,
+    ) -> Result<
+        (
+            AdaptiveShutdownReceipt,
+            Vec<PersistentCpuOwner>,
+            AdaptiveSequenceContinuation,
+        ),
+        AdaptiveManagerError,
+    > {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.collection_observer_v2.is_some() || self.collection_admission_v2.is_some() {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 collection observer must be returned",
+            ));
+        }
+        if self.nnuec.is_some() || self.own.iter().any(|slot| slot.nnuec_retirement.is_some()) {
+            return Err(AdaptiveManagerError::Invalid(
+                "NNUEC requires actual actor retirement transfer",
+            ));
+        }
         let receipt = match self.shutdown_receipt() {
             Ok(receipt)
                 if self.phase == ManagerPhase::Finished
@@ -1639,40 +2924,24 @@ where
                 receipt
             }
             Ok(_) => {
-                return Err(AdaptivePersistentRejection {
-                    error: AdaptiveManagerError::Invalid(
-                        "owner transfer needs actual finished root/process fence",
-                    ),
-                    manager: self,
-                });
+                return Err(AdaptiveManagerError::Invalid(
+                    "owner transfer needs actual finished root/process fence",
+                ));
             }
-            Err(error) => {
-                return Err(AdaptivePersistentRejection {
-                    error,
-                    manager: self,
-                });
-            }
+            Err(error) => return Err(error),
         };
-        // Retain already-recovered values locally on any later error. This
-        // path only polls completed owner transfer, never waits for CPU work.
         for index in 0..self.own.len() {
             if self.own[index].recovered_engine.is_some() {
                 continue;
             }
             let Some(worker) = self.own[index].worker.as_mut() else {
-                return Err(AdaptivePersistentRejection {
-                    error: AdaptiveManagerError::Invalid("persistent CPU owner missing"),
-                    manager: self,
-                });
+                return Err(AdaptiveManagerError::Invalid(
+                    "persistent CPU owner missing",
+                ));
             };
             match worker.take_engine() {
                 Ok(engine) => self.own[index].recovered_engine = Some(engine),
-                Err(error) => {
-                    return Err(AdaptivePersistentRejection {
-                        error: error.into(),
-                        manager: self,
-                    });
-                }
+                Err(error) => return Err(error.into()),
             }
         }
         let cpu = self
@@ -1697,20 +2966,293 @@ where
             next_execution: self.next_execution,
             next_control: self.next_control,
         };
-        Ok(AdaptivePersistentParts {
-            native: self.native,
-            cpu,
-            external: self.external,
-            driver: self.driver,
-            continuation,
-            receipt,
-        })
+        Ok((receipt, cpu, continuation))
     }
     pub fn phase(&self) -> ManagerPhase {
         self.phase
     }
     pub fn counters(&self) -> AdaptiveManagerCounters {
         self.counters
+    }
+    /// Borrow the original admitted source; this read grants no new root,
+    /// authority, native execution or collection capability.
+    pub fn collection_root_admission(&self) -> Option<&RoventCollectionRootAdmission> {
+        self.collection_admission.as_ref()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn collection_root_admission_v2(&self) -> Option<&RoventCollectionRootAdmissionV2> {
+        self.collection_admission_v2.as_ref()
+    }
+
+    /// Issue the original no-capture scope only before any root role/observer
+    /// starts. The caller must still register it with the actual native input
+    /// observer and retain the cause; this does not prove physical completion.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn no_capture_root_v2(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<collection::RoventNoCaptureRootCapabilityV2, AdaptiveManagerError> {
+        if self.root_started || !self.roles.is_empty() || self.phase != ManagerPhase::Running
+            || self.collection_observer_v2.is_some() || self.collection_admission_v2.is_some()
+            || self.collection_observer.is_some() || self.collection_admission.is_some()
+            || admission.root_admission().authority() != self.registration.authority
+            || admission.root_admission().hard_deadline() != self.deadline
+            || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+        {
+            return Err(AdaptiveManagerError::Invalid("no-capture root scope or admission order"));
+        }
+        let verifier = self.native.native_acceptance_verifier().ok_or(
+            AdaptiveManagerError::Invalid("no-capture native verifier unavailable"),
+        )?;
+        collection::RoventNoCaptureRootCapabilityV2::new(admission.clone(), verifier)
+            .map_err(|error| match error {
+                collection::RoventNoCaptureIssueErrorV2::Busy(_original) => AdaptiveManagerError::AuxiliaryPending,
+                collection::RoventNoCaptureIssueErrorV2::Rejected(error) => error.into(),
+            })
+    }
+
+    /// Install an observation-only V2 owner at the actual attached root.
+    /// On error return the original admission and observer to the caller.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn install_collection_observer_v2(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV2,
+        mut observer: AdaptiveCollectionObserverBoxV2<Q, B::Output>,
+    ) -> Result<(), AdaptiveCollectionV2Rejection<Q, B::Output>> {
+        let mut observer_called = false;
+        let mut observer_succeeded = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), AdaptiveManagerError> {
+                if self.root_started
+                    || !self.roles.is_empty()
+                    || self.phase != ManagerPhase::Running
+                    || self.collection_observer.is_some()
+                    || self.collection_admission.is_some()
+                    || self.collection_observer_v2.is_some()
+                    || self.collection_admission_v2.is_some()
+                {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "V2 collection observer installation order",
+                    ));
+                }
+                if !self.driver.collection_v2_observation_complete(&admission) {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "V2 adaptive collection observation is not fully connected",
+                    ));
+                }
+                let root = admission.root_admission();
+                if root.authority() != self.registration.authority
+                    || root.hard_deadline() != self.deadline
+                    || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+                {
+                    return Err(AdaptiveManagerError::Invalid("V2 collection root scope"));
+                }
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("V2 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v2(&admission)?;
+                observer_called = true;
+                observer.admitted(&admission)?;
+                observer_succeeded = true;
+                // The callback can race expiration or revoke. Do not install
+                // an admission based only on the earlier scope observation.
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("V2 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v2(&admission)?;
+                self.check_running()?;
+                Ok(())
+            },
+        ));
+        let rejected = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some((
+                error,
+                if observer_succeeded {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionSucceededRecheckFailed
+                } else if observer_called {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionFailed
+                } else {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionNotCalled
+                },
+                None,
+            )),
+            Err(payload) => Some((
+                AdaptiveManagerError::Invalid("adaptive V2 collection admission panicked"),
+                if observer_succeeded {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionSucceededRecheckPanicked
+                } else if observer_called {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionPanicked
+                } else {
+                    AdaptiveCollectionV2ObserverStatus::ManagerValidationPanicked
+                },
+                Some(payload),
+            )),
+        };
+        if let Some((error, observer_status, panic_payload)) = rejected {
+            return Err(AdaptiveCollectionV2Rejection {
+                error,
+                admission,
+                observer,
+                observer_status,
+                panic_payload,
+            });
+        }
+        self.collection_admission_v2 = Some(admission);
+        self.collection_observer_v2 = Some(observer);
+        Ok(())
+    }
+
+    /// Return the original objects after the actual owner fence and an
+    /// attempted observer settlement. The original settlement result is
+    /// returned separately; teacher process retirement is separate.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn take_collection_observer_v2(
+        &mut self,
+    ) -> Result<
+        Option<(
+            RoventCollectionRootAdmissionV2,
+            AdaptiveCollectionObserverBoxV2<Q, B::Output>,
+            Result<(), AdaptiveCollectionError>,
+        )>,
+        AdaptiveManagerError,
+    > {
+        if self.collection_observer_v2.is_none() && self.collection_admission_v2.is_none() {
+            return Ok(None);
+        }
+        if self.collection_observer_v2.is_none() || self.collection_admission_v2.is_none() {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 collection owner mismatch",
+            ));
+        }
+        let receipt = self.shutdown_receipt()?;
+        if self.phase != ManagerPhase::Finished
+            || self.collection_v2_settlement.is_none()
+            || !(receipt.permits_root_reuse() || receipt.permits_archive_close())
+        {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        Ok(Some((
+            self.collection_admission_v2
+                .take()
+                .expect("checked admission"),
+            self.collection_observer_v2
+                .take()
+                .expect("checked observer"),
+            self.collection_v2_settlement
+                .take()
+                .expect("checked settlement"),
+        )))
+    }
+    /// 실제 수집을 요청한 caller만 root 시작 전에 설치한다. 기존 dispatch
+    /// observer와 native owner 입력 observer는 별도 원 소유 경계로 유지한다.
+    pub fn set_collection_observer(
+        &mut self,
+        mut observer: AdaptiveCollectionObserverBox<Q, B::Output>,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.root_started
+            || !self.roles.is_empty()
+            || self.phase != ManagerPhase::Running
+            || self.collection_observer.is_some()
+            || self.has_collection_v2()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "collection observer installation order",
+            ));
+        }
+        let admission = self
+            .collection_admission
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "collection requires original Rovent root admission",
+            ))?;
+        observer.admitted(admission)?;
+        self.collection_observer = Some(observer);
+        Ok(())
+    }
+    pub(crate) fn admit_collection_root(
+        &mut self,
+        admission: RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.driver.validate_collection_admission(&admission)?;
+        if self.root_started
+            || !self.roles.is_empty()
+            || self.collection_admission.is_some()
+            || self.has_collection_v2()
+            || self.phase != ManagerPhase::Running
+            || admission.authority() != self.registration.authority
+            || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "original Rovent collection root scope",
+            ));
+        }
+        self.collection_admission = Some(admission);
+        Ok(())
+    }
+    fn has_collection_v2(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            self.collection_admission_v2.is_some() || self.collection_observer_v2.is_some()
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            false
+        }
+    }
+    fn has_collection_failure(&self) -> bool {
+        !self.collection_failure_is_independent()
+            && self
+                .failures
+                .iter()
+                .any(|error| matches!(error, AdaptiveManagerError::Collection(_)))
+    }
+    fn collection_failure_is_independent(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            self.collection_observer_v2.is_some()
+                && self.collection_admission_v2.is_some()
+                && self.collection_observer.is_none()
+                && !self.collection_v2_disable_failed
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            false
+        }
+    }
+    fn has_execution_failure(&self) -> bool {
+        self.failures.iter().any(|error| {
+            !matches!(error, AdaptiveManagerError::Collection(_))
+                || !self.collection_failure_is_independent()
+        })
+    }
+    /// V2 Collection is optional to the native search. Its original failure
+    /// remains in the receipt; an unavailable disabled marker still fails
+    /// closed before the next native dispatch. Legacy Collection stays strict.
+    pub(crate) fn record_collection_caller_failure(
+        &mut self,
+        error: AdaptiveCollectionError,
+        until: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.record_failure(AdaptiveManagerError::Collection(error));
+        if self.collection_failure_is_independent() {
+            Ok(())
+        } else {
+            self.begin_root_quiesce(until)
+        }
+    }
+    /// 다음 root에서 재사용할 observer 반환은 실제 owner fence 뒤만 허용한다.
+    pub fn take_collection_observer(
+        &mut self,
+    ) -> Result<Option<AdaptiveCollectionObserverBox<Q, B::Output>>, AdaptiveManagerError> {
+        if self.phase != ManagerPhase::Finished {
+            return Err(AdaptiveManagerError::Invalid(
+                "collection observer requires settled root",
+            ));
+        }
+        Ok(self.collection_observer.take())
     }
     /// Explicit diagnostic opt-in before root/CPU admission. This can be used
     /// from the read-only diagnostic root hook: it installs observation only,
@@ -1754,7 +3296,7 @@ where
                 "root observations require actual settled owner closure",
             ));
         }
-        let (cpu_spent, cpu_reserved) = self.ledger.global_usage()?;
+        let (cpu_spent, cpu_reserved) = self.native_ledger()?.global_usage()?;
         Ok(AdaptiveRootObservationSnapshot {
             authority: self.registration.authority,
             close_mode: self.close_mode,
@@ -1810,6 +3352,38 @@ where
     }
     pub fn driver_mut(&mut self) -> &mut D {
         &mut self.driver
+    }
+    /// Register the caller's original finite cleanup deadline before this
+    /// root admits work. This policy can shorten closure, never extend it.
+    pub fn register_cleanup_deadline(
+        &mut self,
+        original_cleanup_deadline: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.cleanup_boundary.is_some()
+            || self.phase != ManagerPhase::Running
+            || self.root_started
+            || self.shutdown_until.is_some()
+            || self.counters.native_preparations != 0
+            || !self.roles.is_empty()
+            || self.own.iter().any(|slot| slot.binding.is_some())
+            || self.foreign.is_some()
+            || self.profiled_busy()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "original cleanup deadline admission",
+            ));
+        }
+        self.cleanup_boundary = Some(CleanupBoundary::admit(
+            self.registration.hard_deadline,
+            original_cleanup_deadline,
+        )?);
+        Ok(())
+    }
+    pub fn registered_cleanup_deadline(&self) -> Option<Instant> {
+        self.cleanup_boundary.map(CleanupBoundary::original)
+    }
+    fn cleanup_until(&self) -> Result<Instant, AdaptiveManagerError> {
+        automatic_cleanup_deadline(self.cleanup_boundary)
     }
     pub fn enable_exclusive_action_capture(&mut self) -> Result<(), AdaptiveManagerError> {
         if self.root_started
@@ -1897,11 +3471,68 @@ where
     pub fn failures(&self) -> impl Iterator<Item = &AdaptiveManagerError> {
         self.failures.iter()
     }
+    /// The original independent collection failure survives bounded-history
+    /// rollover and must be included in the caller's partial receipt.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn first_v2_collection_failure(&self) -> Option<&AdaptiveCollectionError> {
+        self.collection_v2_first_failure.as_ref()
+    }
     pub fn retained_native_completions(&self) -> &[RetainedNativeCompletion<B::Output>] {
         &self.retained_native_completions
     }
+
+    /// Original non-physical capture failures. These are not NN failures.
+    pub fn native_observation_failures(&self) -> &[TicketNativeObservationFailure] {
+        &self.native_observation_failures
+    }
+
+    fn observe_native_failures(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        failures: &TicketNativeObservationFailures,
+        retired: bool,
+    ) -> Option<AdaptiveManagerError> {
+        let mut gate = None;
+        for failure in failures.iter() {
+            let error = if failure.cause == RoleFailure::PhysicalUnknown {
+                Some(AdaptiveManagerError::PhysicalUnknown)
+            } else if failure.ticket != *ticket
+                || match failure.stage {
+                    TicketNativeObservationStage::Submitted
+                    | TicketNativeObservationStage::Completed => retired,
+                    TicketNativeObservationStage::Retired => !retired,
+                    TicketNativeObservationStage::Retrieval => false,
+                }
+                || failure.disposition == TicketNativeObservationDisposition::RequiredAfterPhysical
+            {
+                Some(AdaptiveManagerError::NativeObservation(failure.clone()))
+            } else {
+                None
+            };
+            if self.native_observation_failures.len()
+                < self.limits.role_tickets_max.saturating_mul(2)
+            {
+                self.native_observation_failures.push(failure.clone());
+            } else if gate.is_none() {
+                gate = Some(AdaptiveManagerError::NativeObservation(failure.clone()));
+            }
+            if gate.is_none() || matches!(&error, Some(AdaptiveManagerError::PhysicalUnknown)) {
+                gate = error.or(gate);
+            }
+        }
+        gate
+    }
     pub fn native_cpu_usage(&self) -> Result<(u64, u64), AdaptiveManagerError> {
-        Ok(self.ledger.global_usage()?)
+        Ok(self.native_ledger()?.global_usage()?)
+    }
+    /// Actual single-writer identity for opt-in root-controller attachment.
+    /// A digest or a freshly constructed ledger cannot replace this owner.
+    pub fn cpu_ledger_identity(&self) -> CpuLedgerIdentity {
+        self.try_cpu_ledger_identity()
+            .expect("native manager facade owns its original ledger")
+    }
+    pub fn try_cpu_ledger_identity(&self) -> Result<CpuLedgerIdentity, AdaptiveManagerError> {
+        Ok(self.native_ledger()?.identity())
     }
     pub fn cpu_node_limit_reached(&self) -> bool {
         self.cpu_node_limit_reached
@@ -1931,11 +3562,20 @@ where
             .is_none_or(|limit| spent.saturating_add(reserved) < limit)
     }
     pub fn has_pending_work(&self) -> bool {
+        self.ordinary_pending_work()
+            || self.goal_prepared.is_some()
+            || self.goal_continuation_pending
+            || self.utility_scope_open()
+    }
+    fn ordinary_pending_work(&self) -> bool {
         !self.roles.is_empty()
+            || !self.accepted_roles.is_empty()
             || self.machine.frames().next().is_some()
             || self.own.iter().any(|slot| slot.binding.is_some())
             || self.foreign.is_some()
+            || self.profiled_busy()
             || !self.deferred.is_empty()
+            || !self.native_frontier_events.is_empty()
             || !self.driver.semantic_owner_available()
     }
     /// The root P call is issued exactly once. Candidate frames are admitted
@@ -1944,6 +3584,20 @@ where
         &mut self,
         input: FrameInput<ReviewView, Q>,
     ) -> Result<PreparationId, AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let ResearcherResources::ProfiledExternal(source) = &self.researcher {
+            if let Some(root) = source.root_admission_v1() {
+                self.driver
+                    .validate_profiled_external_registration(source.current_source(), root)?;
+            } else if let Some(root) = source.root_admission_v2() {
+                self.driver
+                    .validate_profiled_external_registration_v2(source.current_source(), root)?;
+            } else {
+                return Err(AdaptiveManagerError::Invalid(
+                    "profiled external original root absent",
+                ));
+            }
+        }
         if input.stage != RefinementStage::ProposerRanking
             || !self.roles.is_empty()
             || self.machine.frames().next().is_some()
@@ -2091,34 +3745,54 @@ where
         self.deadline
             .accepts(self.clock.domain(), now)
             .map_err(|_| AdaptiveManagerError::Deadline)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.cohort_action_expired(Instant::now()) {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         Ok(now)
     }
     fn role_pending_limit(&self) -> usize {
-        if self.registration.policy == CoordinatorPolicy::Synchronous {
+        let declared = if self.registration.policy == CoordinatorPolicy::Synchronous {
             1
         } else {
             self.limits.role_tickets_max
-        }
+        };
+        self.driver
+            .review_lease_admission()
+            .ok()
+            .flatten()
+            .filter(|state| state.frontier_owner_present)
+            .map_or(declared, |state| {
+                declared.min(
+                    state
+                        .capacity
+                        .saturating_sub(1)
+                        .saturating_sub(state.frontier_replacement_reserve),
+                )
+            })
     }
     /// Jobs waiting before their first physical CPU slice share this ceiling.
     /// A started paused owner waiting for V feedback is not a new queued Job;
     /// charging it again can deadlock a one-seat queue behind an idle worker.
     fn waiting_jobs_occupancy(&self) -> usize {
-        self.ready.len().saturating_add(
-            self.validator_waiting
-                .iter()
-                .filter(|frame| {
-                    !self.own.iter().any(|slot| {
-                        slot.binding
+        self.ready
+            .len()
+            .saturating_add(usize::from(self.nnuec_pending.is_some()))
+            .saturating_add(
+                self.validator_waiting
+                    .iter()
+                    .filter(|frame| {
+                        !self.own.iter().any(|slot| {
+                            slot.binding
+                                .as_ref()
+                                .is_some_and(|binding| binding.work.frame == **frame)
+                        }) && !self
+                            .foreign
                             .as_ref()
                             .is_some_and(|binding| binding.work.frame == **frame)
-                    }) && !self
-                        .foreign
-                        .as_ref()
-                        .is_some_and(|binding| binding.work.frame == **frame)
-                })
-                .count(),
-        )
+                    })
+                    .count(),
+            )
     }
     fn validator_waiting_limit(&self) -> usize {
         self.limits
@@ -2133,11 +3807,26 @@ where
         input: FrameInput<ReviewView, Q>,
         purpose: RolePurpose,
     ) -> Result<PreparationId, AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
+        if self.utility_scope_open()
+            && work
+                .as_ref()
+                .is_none_or(|work| !self.utility_allows_frame(work.frame))
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "unrelated role in utility route scope",
+            ));
+        }
         if let Some(scope) = &self.exclusive_scope {
             let allowed = match purpose {
-                RolePurpose::RootRanking => false,
+                RolePurpose::RootRanking | RolePurpose::RoventGoalLocal => false,
                 RolePurpose::Validator => scope.action.is_none(),
-                RolePurpose::Refinement => {
+                RolePurpose::Refinement
+                | RolePurpose::Reciprocal
+                | RolePurpose::RoventRefinement
+                | RolePurpose::RoventFresh => {
                     work.as_ref().is_some_and(|work| scope.allows(work.frame))
                 }
             };
@@ -2186,12 +3875,17 @@ where
             .map_err(|(error, _)| AdaptiveManagerError::Native(error))?;
         self.roles.push(RoleBinding {
             preparation,
+            prepared_observed: false,
+            cancellation_requested: false,
             work,
             input,
             ticket: None,
             admission_charged: false,
             dispatch_pending: false,
             collection_registered: false,
+            rovent_collection_registered: false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            v2_capture_possible: false,
             physical: None,
             prepared_at: Instant::now(),
             preparation_elapsed: None,
@@ -2202,9 +3896,14 @@ where
             class: None,
             delivered: None,
             ack_accepted: None,
+            ack_dispatched: false,
+            revoked_acceptance: None,
             native_acceptance_recorded: false,
             consumption_recorded: false,
+            consumption_unknown: false,
             purpose,
+            reciprocal_acceptance: None,
+            goal_local: None,
         });
         self.counters.native_preparations += 1;
         Ok(preparation)
@@ -2215,10 +3914,22 @@ where
         if self.phase == ManagerPhase::Finished {
             return Ok(false);
         }
+        if self.phase == ManagerPhase::Running && self.effective_hard_expired() {
+            self.begin_selected_shutdown(self.cleanup_until()?)?;
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.phase == ManagerPhase::Running && self.cohort_action_expired(Instant::now()) {
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+        }
         let mut changed = false;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        match self.poll_profiled_events() {
+            Ok(progress) => changed |= progress,
+            Err(error) => self.record_failure(error.at_semantic_stage("poll_profiled_events")),
+        }
         match self.driver.poll_auxiliary() {
             Ok(progress) => changed |= progress,
-            Err(error) => self.record_failure(error),
+            Err(error) => self.record_failure(error.at_semantic_stage("poll_auxiliary")),
         }
         for _ in 0..MAX_EVENT_DRAIN {
             let Some(event) = self.native.poll() else {
@@ -2226,7 +3937,7 @@ where
             };
             changed = true;
             if let Err(error) = self.native_event(event) {
-                self.record_failure(error);
+                self.physical_event_error(error.at_semantic_stage("native_event"))?;
             }
         }
         for slot in 0..self.own.len() {
@@ -2239,7 +3950,7 @@ where
                     Ok(Some(event)) => {
                         changed = true;
                         if let Err(error) = self.own_event_observed(slot, event) {
-                            self.record_failure(error);
+                            self.physical_event_error(error.at_semantic_stage("own_event"))?;
                         }
                     }
                     Ok(None) => break,
@@ -2258,7 +3969,7 @@ where
             {
                 changed = true;
                 if let Err(error) = self.own_progress_observed(slot, progress) {
-                    self.record_failure(error);
+                    self.record_failure(error.at_semantic_stage("own_progress"));
                 }
             }
         }
@@ -2284,7 +3995,7 @@ where
         {
             changed = true;
             if let Err(error) = self.foreign_event(completion) {
-                self.record_failure(error);
+                self.physical_event_error(error.at_semantic_stage("foreign_event"))?;
             }
         }
         if let Some((sequence, progress)) = self
@@ -2294,92 +4005,147 @@ where
         {
             changed = true;
             if let Err(error) = self.foreign_progress_observed(sequence, progress) {
-                self.record_failure(error);
+                self.record_failure(error.at_semantic_stage("foreign_progress"));
             }
         }
         if let Err(error) = self.flush_acks() {
-            self.record_failure(error);
+            self.record_failure(error.at_semantic_stage("flush_acks"));
         }
-        if !self.failures.is_empty() && self.shutdown_until.is_none() {
-            self.begin_selected_shutdown(
-                Instant::now()
-                    .checked_add(Duration::from_secs(30))
-                    .ok_or(AdaptiveManagerError::Deadline)?,
-            )?;
+        // Reliable physical owner events above are always processed before an
+        // optional collector callback can fail. Its original capture remains
+        // separate custody and cannot undo an accepted native-ledger receipt.
+        self.poll_cpu_semantic();
+        if self.has_execution_failure() && self.shutdown_until.is_none() {
+            self.begin_selected_shutdown(self.cleanup_until()?)?;
         }
         if self.phase == ManagerPhase::Running {
             if self.check_running().is_err() {
-                self.begin_selected_shutdown(
-                    Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?,
-                )?;
+                self.begin_selected_shutdown(self.cleanup_until()?)?;
             } else {
-                for action in [
-                    Self::flush_deferred,
-                    Self::dispatch_roles,
-                    Self::deliver_roles,
-                    Self::schedule,
-                    Self::schedule_root_round,
+                for (stage, action) in [
+                    (
+                        "flush_deferred",
+                        Self::flush_deferred as fn(&mut Self) -> Result<bool, AdaptiveManagerError>,
+                    ),
+                    ("dispatch_roles", Self::dispatch_roles),
+                    ("deliver_roles", Self::deliver_roles),
+                    ("schedule", Self::schedule),
+                    ("schedule_root_round", Self::schedule_root_round),
                 ] {
                     match action(self) {
                         Ok(progress) => changed |= progress,
                         Err(error) => {
-                            self.record_failure(error);
+                            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                            if matches!(error, AdaptiveManagerError::AdmissionClosed)
+                                && self.cohort_action_expired(Instant::now())
+                            {
+                                self.begin_root_quiesce(self.cleanup_until()?)?;
+                                changed = true;
+                                break;
+                            }
+                            self.frontier_boundary_or_failure(error.at_semantic_stage(stage))?;
                             break;
                         }
+                    }
+                    if self.has_collection_failure() {
+                        break;
                     }
                 }
                 let exclusive_completed = self
                     .exclusive_scope
                     .as_ref()
                     .is_some_and(|scope| scope.completed);
-                if self.failures.is_empty()
+                if !self.has_execution_failure()
                     && (exclusive_completed
                         // Every admitted role retains its original physical
                         // completion/ack/semantic commit obligations. Budget
                         // exhaustion only closes new work; it cannot discard
                         // an already reserved output to manufacture success.
-                        || (self.role_call_limit_reached() && self.roles.is_empty()))
+                        || (self.role_call_limit_reached() && self.roles.is_empty() && self.accepted_roles.is_empty() && self.driver.semantic_owner_available()))
                 {
-                    let until = Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?;
+                    let until = self.cleanup_until()?;
                     if exclusive_completed {
                         self.begin_root_quiesce(until)?;
                     } else {
+                        let limit = self.role_call_limit.ok_or(AdaptiveManagerError::Invalid(
+                            "settled role-call limit absent",
+                        ))?;
+                        let (spent, _) = self.role_call_budget_usage();
+                        if let Err(error) = self.driver.close_rovent_role_call_budget(spent, limit)
+                        {
+                            self.record_failure(error.at_semantic_stage("close_role_budget"));
+                        }
                         self.begin_selected_shutdown(until)?;
                     }
                 }
-                if !self.failures.is_empty() {
-                    self.begin_selected_shutdown(
-                        Instant::now()
-                            .checked_add(Duration::from_secs(30))
-                            .ok_or(AdaptiveManagerError::Deadline)?,
-                    )?;
+                if self.has_execution_failure() {
+                    self.begin_selected_shutdown(self.cleanup_until()?)?;
                 }
             }
         } else {
             match self.deliver_roles() {
                 Ok(progress) => changed |= progress,
-                Err(error) => self.record_failure(error),
+                Err(error) => self.record_failure(error.at_semantic_stage("drain_deliver_roles")),
             }
             match self.flush_deferred() {
                 Ok(progress) => changed |= progress,
-                Err(error) => self.record_failure(error),
+                Err(error) => self.record_failure(error.at_semantic_stage("drain_flush_deferred")),
             }
             match self.poll_shutdown() {
                 Ok(progress) => changed |= progress,
-                Err(error) => self.record_failure(error),
+                Err(error) => self.record_failure(error.at_semantic_stage("poll_shutdown")),
             }
         }
         Ok(changed)
     }
+    /// These event handlers return a future-admission error only after
+    /// retaining the original owner, receipt/report and deferred commit.
+    /// Their actual terminal must still drain when a cohort window expires.
+    fn physical_event_error(
+        &mut self,
+        error: AdaptiveManagerError,
+    ) -> Result<(), AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if matches!(error, AdaptiveManagerError::AdmissionClosed)
+            && self.cohort_action_expired(Instant::now())
+        {
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+            return Ok(());
+        }
+        self.frontier_boundary_or_failure(error)
+    }
+    fn frontier_boundary_or_failure(
+        &mut self,
+        error: AdaptiveManagerError,
+    ) -> Result<(), AdaptiveManagerError> {
+        let controlled_capacity = self.phase == ManagerPhase::Running
+            && match &error {
+                AdaptiveManagerError::Frontier(FrontierError::PublicRecordCapacity) => {
+                    self.driver.rovent_public_record_capacity_closed()?
+                }
+                AdaptiveManagerError::Frontier(FrontierError::PublicReviewIndexCapacity) => {
+                    self.driver.rovent_public_review_index_capacity_closed()?
+                }
+                _ => false,
+            };
+        if controlled_capacity {
+            // The rejected output/report remains in its original binding or
+            // deferred queue. Quiescence drains it without semantic retry or
+            // fabricated utility; the original frontier retains Capacity.
+            self.fail_utility_route();
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+        } else {
+            self.record_failure(error);
+        }
+        Ok(())
+    }
     fn schedule_root_round(&mut self) -> Result<bool, AdaptiveManagerError> {
         if !self.root_started
-            || self.has_pending_work()
-            || !self.failures.is_empty()
+            || !self.can_admit_work()
+            || self.ordinary_pending_work()
+            || self.has_execution_failure()
             || self.exclusive_scope.is_some()
+            || self.utility_scope_open()
             || !self.role_call_admission_available()
         {
             return Ok(false);
@@ -2422,6 +4188,7 @@ where
             };
             self.driver
                 .root_candidate_admitted(frame, candidate.first_move, &input)?;
+            self.rovent_candidate_ready(frame)?;
             return Ok(true);
         }
         if let Some(recheck) = self.driver.next_fixed_iterative_repair()? {
@@ -2432,7 +4199,8 @@ where
         }
         self.root_ranking_proof = None;
         let Some(input) = self.driver.next_root_round_input()? else {
-            return Ok(false);
+            self.rovent_seal_root_round()?;
+            return self.drive_goal_local();
         };
         self.prepare_root_ranking(input)?;
         Ok(true)
@@ -2447,19 +4215,69 @@ where
         Ok(())
     }
     fn record_failure(&mut self, error: AdaptiveManagerError) {
-        if matches!(error, AdaptiveManagerError::AuxiliaryPending) {
+        if matches!(
+            error,
+            AdaptiveManagerError::AuxiliaryPending | AdaptiveManagerError::AdmissionClosed
+        ) {
             return;
+        }
+        if let AdaptiveManagerError::ReviewLeaseBackpressure {
+            current,
+            capacity,
+            required_new,
+            replacement_reserve,
+        } = &error
+        {
+            self.review_leases.record_blocked(
+                *current,
+                *capacity,
+                *required_new,
+                *replacement_reserve,
+            );
+            if self.review_lease_return_can_progress() {
+                // The existing source packet remains in its original binding
+                // or deferred queue. Wait for a real owner event; never drop
+                // its view to make room or count this as semantic success.
+                return;
+            }
+            self.review_leases.terminal_capacity = true;
         }
         if self.failures.len() == 64 {
             self.failures.pop_front();
         }
         let unsafe_completion = matches!(error, AdaptiveManagerError::PhysicalUnknown)
+            || (matches!(error, AdaptiveManagerError::NnuecPreparation(_))
+                && (!self.nnuec_cleanup_settled() || !self.utility_cleanup_settled()))
+            || matches!(
+                error,
+                AdaptiveManagerError::GoalLocalBlocked(GoalLocalBlockReason::Frontier(
+                    FrontierError::NativeUnknown
+                ))
+            )
+            || matches!(
+                error,
+                AdaptiveManagerError::Frontier(FrontierError::NativeUnknown)
+            )
             || matches!(
                 error,
                 AdaptiveManagerError::Cpu(
                     CpuWorkerError::UnknownUsage | CpuWorkerError::Quarantined
                 )
             );
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let independent_collection = matches!(&error, AdaptiveManagerError::Collection(_))
+            && self.collection_failure_is_independent();
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if independent_collection {
+            if let AdaptiveManagerError::Collection(original) = &error {
+                self.collection_v2_first_failure
+                    .get_or_insert_with(|| original.clone());
+            }
+        }
+        // A utility experiment depends on its collection evidence even when
+        // ordinary native/search work does not. Never turn the failed target
+        // into a valid utility sample merely to keep the search alive.
+        self.fail_utility_route();
         self.failures.push_back(error);
         if unsafe_completion {
             self.phase = ManagerPhase::Quarantined;
@@ -2469,511 +4287,736 @@ where
         &mut self,
         event: TicketNativeEvent<B::Output>,
     ) -> Result<(), AdaptiveManagerError> {
-        match event {
-            TicketNativeEvent::Ready { clock } => {
-                if clock.domain() != self.clock.domain() || clock.origin() != self.clock.origin() {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "native owner clock origin mismatch",
-                    ));
-                }
-                self.native_ready = true;
-                if self.phase == ManagerPhase::Running && !self.native_verifier_registered {
-                    // Startup may finish after a terminal root or cancellation
-                    // has already revoked admission. Its real Ready remains a
-                    // clock/owner observation; it cannot install new acceptance
-                    // authority into the closed registry. The next root uses
-                    // the same native owner's persistent verifier readback.
-                    let verifier = self.native.native_acceptance_verifier().ok_or(
-                        AdaptiveManagerError::Invalid(
-                            "native Ready has no owner acceptance verifier",
-                        ),
-                    )?;
-                    self.registry
-                        .register_native_acceptance_verifier(verifier)?;
-                    self.native_verifier_registered = true;
-                }
+        let mut collection_failures = Vec::new();
+        if let Some(observer) = &mut self.collection_observer {
+            if let Err(error) = observer.native_event(&event) {
+                collection_failures.push(error);
             }
-            TicketNativeEvent::StartupFailed(failure) => {
-                return Err(AdaptiveManagerError::Semantic(format!(
-                    "native startup: {failure:?}"
-                )));
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(observer) = &mut self.collection_observer_v2 {
+            let verifier = self.native.native_acceptance_verifier();
+            let result = self
+                .collection_admission_v2
+                .as_ref()
+                .zip(verifier.as_ref())
+                .ok_or_else(|| {
+                    AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::NativeEvent,
+                        "NativeOwnerUnavailable",
+                        "original admission or native verifier unavailable",
+                    )
+                })
+                .and_then(|(admission, verifier)| {
+                    collection::RoventCollectionNativeEventWitnessV2::new(
+                        admission, verifier, &event,
+                    )
+                })
+                .and_then(|witness| observer.native_event(witness));
+            if let Err(error) = result {
+                collection_failures.push(error);
             }
-            TicketNativeEvent::Prepared(prepared) => {
-                let index = self
-                    .roles
-                    .iter()
-                    .position(|binding| binding.preparation == prepared.preparation)
-                    .ok_or(AdaptiveManagerError::Invalid("unknown native preparation"))?;
-                let binding = &self.roles[index];
-                if binding.ticket.is_some()
-                    || binding.admission_charged
-                    || prepared.question != binding.input.question_digest
-                    || prepared.view != binding.input.view_seal
-                    || Some(prepared.role) != binding.input.stage.role()
-                    || prepared.original_deadline != self.deadline
-                {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "prepared immutable question echo mismatch",
-                    ));
-                }
-                if self.phase != ManagerPhase::Running || self.check_running().is_err() {
-                    self.native.cancel(prepared.preparation)?;
-                    self.counters.canceled_preparations += 1;
-                    return Ok(());
-                }
-                let now = self.check_running()?;
-                let ticket = self.registry.admit(
-                    RoleSubmission {
-                        question: prepared.question,
-                        view: prepared.view,
-                        representation: prepared.representation,
-                        role: prepared.role,
-                        original_deadline: prepared.original_deadline,
-                    },
-                    Arc::clone(&binding.input.view),
-                    self.clock.domain(),
-                    now,
-                )?;
-                let work = binding.work.clone();
-                let preparation_elapsed = binding.prepared_at.elapsed();
-                self.roles[index].admission_charged = true;
-                if let Some(work) = &work {
-                    if matches!(
-                        work.input.stage,
-                        RefinementStage::FreshRepairedEndpoint
-                            | RefinementStage::FreshCounterEndpoint
-                    ) {
-                        // Endpoint input differs, while the public scope is
-                        // frozen. The actual Root Rules perspective is fixed.
-                        self.machine.seal_fresh_pair(
-                            work.frame,
-                            FreshPairSeal::from_ticket(
-                                &ticket,
-                                work.input.public_context,
-                                self.driver.root_rules().snapshot().side_to_move(),
+        }
+        // 수집 오류가 non-Clone permit/receipt나 물리 완료 packet을 버리게
+        // 해서는 안 된다. 원 runtime 처리를 먼저 마치고 오류를 따로 남긴다.
+        let runtime_result = (|| -> Result<(), AdaptiveManagerError> {
+            match event {
+                TicketNativeEvent::Ready { clock } => {
+                    if clock.domain() != self.clock.domain()
+                        || clock.origin() != self.clock.origin()
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "native owner clock origin mismatch",
+                        ));
+                    }
+                    self.native_ready = true;
+                    if self.phase == ManagerPhase::Running && !self.native_verifier_registered {
+                        // Startup may finish after a terminal root or cancellation
+                        // has already revoked admission. Its real Ready remains a
+                        // clock/owner observation; it cannot install new acceptance
+                        // authority into the closed registry. The next root uses
+                        // the same native owner's persistent verifier readback.
+                        let verifier = self.native.native_acceptance_verifier().ok_or(
+                            AdaptiveManagerError::Invalid(
+                                "native Ready has no owner acceptance verifier",
                             ),
                         )?;
+                        self.registry
+                            .register_native_acceptance_verifier(verifier)?;
+                        self.native_verifier_registered = true;
                     }
-                    self.machine
-                        .bind_role(work.frame, &ticket, self.clock.domain(), now)?;
                 }
-                let class = role_cost_class(&ticket, self.registration.device_digest);
-                // Cache/Fresh ownership is known only at the actual completion.
-                // Retain this duration rather than training an assumed Miss.
-                self.roles[index].ticket = Some(ticket);
-                self.roles[index].class = Some(class);
-                self.roles[index].preparation_elapsed = Some(preparation_elapsed);
-                self.roles[index].dispatch_pending = true;
-                if let Some(frame) = self.roles[index].work.as_ref().map(|work| work.frame) {
-                    self.roles[index].work = Some(
+                TicketNativeEvent::StartupFailed(failure) => {
+                    return Err(AdaptiveManagerError::Semantic(format!(
+                        "native startup: {failure:?}"
+                    )));
+                }
+                TicketNativeEvent::Prepared(prepared) => {
+                    let index = self
+                        .roles
+                        .iter()
+                        .position(|binding| binding.preparation == prepared.preparation)
+                        .ok_or(AdaptiveManagerError::Invalid("unknown native preparation"))?;
+                    let binding = &self.roles[index];
+                    if binding.ticket.is_some()
+                        || binding.prepared_observed
+                        || binding.admission_charged
+                        || prepared.question != binding.input.question_digest
+                        || prepared.view != binding.input.view_seal
+                        || Some(prepared.role) != binding.input.stage.role()
+                        || prepared.original_deadline != self.deadline
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "prepared immutable question echo mismatch",
+                        ));
+                    }
+                    self.roles[index].prepared_observed = true;
+                    if self.phase != ManagerPhase::Running || self.check_running().is_err() {
+                        // Close may have canceled this same preparation before
+                        // its older Prepared event reached the manager. Retain
+                        // that real request; a retired control is not recanceled.
+                        if !self.roles[index].cancellation_requested {
+                            self.native.cancel(prepared.preparation)?;
+                            self.roles[index].cancellation_requested = true;
+                        }
+                        self.counters.canceled_preparations += 1;
+                        return Ok(());
+                    }
+                    let now = self.check_running()?;
+                    let binding = &self.roles[index];
+                    let ticket = self.registry.admit(
+                        RoleSubmission {
+                            question: prepared.question,
+                            view: prepared.view,
+                            representation: prepared.representation,
+                            role: prepared.role,
+                            original_deadline: prepared.original_deadline,
+                        },
+                        Arc::clone(&binding.input.view),
+                        self.clock.domain(),
+                        now,
+                    )?;
+                    let work = binding.work.clone();
+                    let preparation_elapsed = binding.prepared_at.elapsed();
+                    self.roles[index].admission_charged = true;
+                    if let Some(work) = &work {
+                        if matches!(
+                            work.input.stage,
+                            RefinementStage::FreshRepairedEndpoint
+                                | RefinementStage::FreshCounterEndpoint
+                        ) {
+                            // Endpoint input differs, while the public scope is
+                            // frozen. The actual Root Rules perspective is fixed.
+                            self.machine.seal_fresh_pair(
+                                work.frame,
+                                FreshPairSeal::from_ticket(
+                                    &ticket,
+                                    work.input.public_context,
+                                    self.driver.root_rules().snapshot().side_to_move(),
+                                ),
+                            )?;
+                        }
                         self.machine
-                            .bound_work(frame, StepExecution::Role(ticket.id))?,
-                    );
+                            .bind_role(work.frame, &ticket, self.clock.domain(), now)?;
+                    }
+                    let class = role_cost_class(&ticket, self.registration.device_digest);
+                    // Cache/Fresh ownership is known only at the actual completion.
+                    // Retain this duration rather than training an assumed Miss.
+                    self.roles[index].ticket = Some(ticket);
+                    self.roles[index].class = Some(class);
+                    self.roles[index].preparation_elapsed = Some(preparation_elapsed);
+                    self.roles[index].dispatch_pending = true;
+                    if let Some(frame) = self.roles[index].work.as_ref().map(|work| work.frame) {
+                        self.roles[index].work = Some(
+                            self.machine
+                                .bound_work(frame, StepExecution::Role(ticket.id))?,
+                        );
+                    }
+                    self.counters.submitted_role_tickets += 1;
+                    self.counters.validator_ticket_admissions +=
+                        u64::from(self.roles[index].purpose == RolePurpose::Validator);
                 }
-                self.counters.submitted_role_tickets += 1;
-                self.counters.validator_ticket_admissions +=
-                    u64::from(self.roles[index].purpose == RolePurpose::Validator);
-            }
-            TicketNativeEvent::Started(ticket) => {
-                self.registry.physical_started(&ticket)?;
-                let binding = self.role_mut(ticket.id)?;
-                if binding.ticket != Some(ticket) {
-                    return Err(AdaptiveManagerError::Invalid("started ticket echo"));
+                TicketNativeEvent::Started(ticket) => {
+                    self.registry.physical_started(&ticket)?;
+                    let binding = self.role_mut(ticket.id)?;
+                    if binding.ticket != Some(ticket) {
+                        return Err(AdaptiveManagerError::Invalid("started ticket echo"));
+                    }
                 }
-            }
-            TicketNativeEvent::OwnerRunStarted { ticket, started_at } => {
-                if started_at < self.clock.origin() || started_at > Instant::now() {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "owner service clock timestamp",
-                    ));
+                TicketNativeEvent::OwnerRunStarted { ticket, started_at } => {
+                    if started_at < self.clock.origin() || started_at > Instant::now() {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "owner service clock timestamp",
+                        ));
+                    }
+                    let binding = self.role_mut(ticket.id)?;
+                    if binding.ticket != Some(ticket) || binding.dispatched_at.is_some() {
+                        return Err(AdaptiveManagerError::Invalid("owner service start ticket"));
+                    }
+                    let admitted_at =
+                        binding
+                            .queue_admitted_at
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "owner start lacks queue admission clock",
+                            ))?;
+                    binding.queue_wait =
+                        Some(started_at.checked_duration_since(admitted_at).ok_or(
+                            AdaptiveManagerError::Invalid("owner start predates queue admission"),
+                        )?);
+                    binding.dispatched_at = Some(started_at);
                 }
-                let binding = self.role_mut(ticket.id)?;
-                if binding.ticket != Some(ticket) || binding.dispatched_at.is_some() {
-                    return Err(AdaptiveManagerError::Invalid("owner service start ticket"));
-                }
-                let admitted_at =
-                    binding
-                        .queue_admitted_at
-                        .ok_or(AdaptiveManagerError::Invalid(
-                            "owner start lacks queue admission clock",
-                        ))?;
-                binding.queue_wait = Some(started_at.checked_duration_since(admitted_at).ok_or(
-                    AdaptiveManagerError::Invalid("owner start predates queue admission"),
-                )?);
-                binding.dispatched_at = Some(started_at);
-            }
-            TicketNativeEvent::Completed {
-                completion,
-                evidence,
-                owner_run,
-                owner_service_elapsed,
-            } => {
-                let retained = RetainedNativeCompletion {
-                    completion: RoleCompletion {
-                        ticket: completion.ticket,
-                        physical: completion.physical,
-                        result: completion.result.clone(),
-                    },
+                TicketNativeEvent::Completed {
+                    completion,
                     evidence,
                     owner_run,
                     owner_service_elapsed,
-                };
-                #[cfg(feature = "pals-adaptive-diagnostics")]
-                let diagnostic_completion_ticket = completion.ticket.id;
-                let outcome = (|| -> Result<(), AdaptiveManagerError> {
-                    let ticket = completion.ticket;
-                    let physical = completion.physical;
-                    let success = completion.result.is_ok();
-                    let failure = completion.result.as_ref().err().cloned();
-                    let binding = self
-                        .roles
-                        .iter_mut()
-                        .find(|binding| binding.ticket == Some(ticket))
-                        .ok_or(AdaptiveManagerError::Invalid(
-                            "completion has no original native binding",
-                        ))?;
-                    if binding.service_completed {
-                        // Reject the repeated source event before replacing
-                        // the original evidence or charging raw NN inputs.
-                        return Err(AdaptiveManagerError::Invalid(
-                            "duplicate original native completion",
-                        ));
+                    observation_failures,
+                } => {
+                    let retained = RetainedNativeCompletion {
+                        completion: RoleCompletion {
+                            ticket: completion.ticket,
+                            physical: completion.physical,
+                            result: completion.result.clone(),
+                        },
+                        evidence,
+                        owner_run,
+                        owner_service_elapsed,
+                    };
+                    if let Some(error) = self.observe_native_failures(
+                        &completion.ticket,
+                        &observation_failures,
+                        false,
+                    ) {
+                        self.retained_native_completions.push(retained);
+                        return Err(error);
                     }
-                    if owner_run.ticket() != &ticket {
-                        return Err(AdaptiveManagerError::Invalid(
-                            "completion owner-run witness differs from original ticket",
-                        ));
-                    }
-                    binding.physical = evidence;
-                    binding.service_completed = true;
-                    let mut class = binding.class;
-                    if let (Some(class), Some(evidence)) = (&mut class, evidence) {
-                        if let Some(fresh) = evidence.physical_fresh {
-                            class.invocation = if fresh {
-                                InvocationClass::Fresh
-                            } else {
-                                InvocationClass::Warm
-                            };
+                    #[cfg(feature = "pals-adaptive-diagnostics")]
+                    let diagnostic_completion_ticket = completion.ticket.id;
+                    let outcome = (|| -> Result<(), AdaptiveManagerError> {
+                        let ticket = completion.ticket;
+                        let physical = completion.physical;
+                        let success = completion.result.is_ok();
+                        let failure = completion.result.as_ref().err().cloned();
+                        let binding = self
+                            .roles
+                            .iter_mut()
+                            .find(|binding| binding.ticket == Some(ticket))
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "completion has no original native binding",
+                            ))?;
+                        if binding.service_completed {
+                            // Reject the repeated source event before replacing
+                            // the original evidence or charging raw NN inputs.
+                            return Err(AdaptiveManagerError::Invalid(
+                                "duplicate original native completion",
+                            ));
                         }
-                        class.cache = observed_public_cache_class(physical, evidence);
-                    }
-                    binding.class = class;
-                    let preparation_elapsed = binding.preparation_elapsed.take();
-                    let queue_wait = binding.queue_wait.take();
-                    // Receive-time differences can collapse to zero when Started
-                    // and Completed share one manager turn. Use owner measurement.
-                    // A public cache hit may still run a private role head.
-                    // Zero/unknown NN inputs alone never decide cache class.
-                    let elapsed = if evidence.is_some_and(|actual| {
-                        actual.measurement_complete
-                            && actual.completed_nn_inputs.is_some()
-                            && actual.physical_fresh.is_some()
-                    }) {
-                        owner_service_elapsed
-                    } else {
-                        None
-                    };
-                    let purpose = binding.purpose;
-                    self.native_accounting
-                        .observe_completion(&ticket, &owner_run, physical, success, evidence)?;
-                    let disposition = if physical == PhysicalRoleCompletion::Unknown {
-                        CostDisposition::Censored(CensorReason::PhysicalUnknown)
-                    } else if success {
-                        CostDisposition::Completed
-                    } else {
-                        CostDisposition::Censored(CensorReason::Failed)
-                    };
-                    if let Some(class) = class {
-                        if disposition == CostDisposition::Completed && elapsed.is_some() {
-                            let mut query = class;
-                            query.invocation = InvocationClass::Fresh;
-                            query.cache = CacheClass::Unknown;
-                            if !self.observed_role_classes.contains(&(ticket.role, query))
-                                && self.observed_role_classes.len() < 64
-                            {
-                                self.observed_role_classes.push((ticket.role, query));
+                        if owner_run.ticket() != &ticket {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "completion owner-run witness differs from original ticket",
+                            ));
+                        }
+                        binding.physical = evidence;
+                        binding.service_completed = true;
+                        let mut class = binding.class;
+                        if let (Some(class), Some(evidence)) = (&mut class, evidence) {
+                            if let Some(fresh) = evidence.physical_fresh {
+                                class.invocation = if fresh {
+                                    InvocationClass::Fresh
+                                } else {
+                                    InvocationClass::Warm
+                                };
                             }
+                            class.cache = observed_public_cache_class(physical, evidence);
                         }
-                        for (stage, elapsed) in [
-                            (CostStage::Preparation, preparation_elapsed),
-                            (CostStage::QueueWait, queue_wait),
-                        ] {
+                        binding.class = class;
+                        let preparation_elapsed = binding.preparation_elapsed.take();
+                        let queue_wait = binding.queue_wait.take();
+                        // Receive-time differences can collapse to zero when Started
+                        // and Completed share one manager turn. Use owner measurement.
+                        // A public cache hit may still run a private role head.
+                        // Zero/unknown NN inputs alone never decide cache class.
+                        let elapsed = if evidence.is_some_and(|actual| {
+                            actual.measurement_complete
+                                && actual.completed_nn_inputs.is_some()
+                                && actual.physical_fresh.is_some()
+                        }) {
+                            owner_service_elapsed
+                        } else {
+                            None
+                        };
+                        let purpose = binding.purpose;
+                        self.native_accounting
+                            .observe_completion(&ticket, &owner_run, physical, success, evidence)?;
+                        let disposition = if physical == PhysicalRoleCompletion::Unknown {
+                            CostDisposition::Censored(CensorReason::PhysicalUnknown)
+                        } else if success {
+                            CostDisposition::Completed
+                        } else {
+                            CostDisposition::Censored(CensorReason::Failed)
+                        };
+                        if let Some(class) = class {
+                            if disposition == CostDisposition::Completed && elapsed.is_some() {
+                                let mut query = class;
+                                query.invocation = InvocationClass::Fresh;
+                                query.cache = CacheClass::Unknown;
+                                if !self.observed_role_classes.contains(&(ticket.role, query))
+                                    && self.observed_role_classes.len() < 64
+                                {
+                                    self.observed_role_classes.push((ticket.role, query));
+                                }
+                            }
+                            for (stage, elapsed) in [
+                                (CostStage::Preparation, preparation_elapsed),
+                                (CostStage::QueueWait, queue_wait),
+                            ] {
+                                self.observe_observation(
+                                    class,
+                                    stage,
+                                    CostObservation {
+                                        elapsed: elapsed
+                                            .map_or(ObservedCost::Unknown, ObservedCost::Known),
+                                        disposition: if elapsed.is_some() {
+                                            CostDisposition::Completed
+                                        } else {
+                                            disposition
+                                        },
+                                    },
+                                )?;
+                            }
                             self.observe_observation(
                                 class,
-                                stage,
+                                CostStage::GpuService,
                                 CostObservation {
                                     elapsed: elapsed
                                         .map_or(ObservedCost::Unknown, ObservedCost::Known),
-                                    disposition: if elapsed.is_some() {
-                                        CostDisposition::Completed
-                                    } else {
-                                        disposition
-                                    },
+                                    disposition,
+                                },
+                            )?;
+                            // No backend phase witness separates the physical fence
+                            // wait from service. Do not relabel service as this cost.
+                            self.observe_observation(
+                                class,
+                                CostStage::PhysicalCompletionWait,
+                                CostObservation {
+                                    elapsed: ObservedCost::Unknown,
+                                    disposition,
                                 },
                             )?;
                         }
-                        self.observe_observation(
-                            class,
-                            CostStage::GpuService,
-                            CostObservation {
-                                elapsed: elapsed.map_or(ObservedCost::Unknown, ObservedCost::Known),
-                                disposition,
-                            },
-                        )?;
-                        // No backend phase witness separates the physical fence
-                        // wait from service. Do not relabel service as this cost.
-                        self.observe_observation(
-                            class,
-                            CostStage::PhysicalCompletionWait,
-                            CostObservation {
-                                elapsed: ObservedCost::Unknown,
-                                disposition,
-                            },
-                        )?;
-                    }
-                    if let Some(evidence) = evidence {
-                        if evidence.measurement_complete {
-                            if let Some(count) = evidence.completed_nn_inputs {
-                                self.counters.completed_nn_inputs =
-                                    self.counters.completed_nn_inputs.checked_add(count).ok_or(
-                                        AdaptiveManagerError::Capacity("completed NN input count"),
-                                    )?;
+                        if let Some(evidence) = evidence {
+                            if evidence.measurement_complete {
+                                if let Some(count) = evidence.completed_nn_inputs {
+                                    self.counters.completed_nn_inputs = self
+                                        .counters
+                                        .completed_nn_inputs
+                                        .checked_add(count)
+                                        .ok_or(AdaptiveManagerError::Capacity(
+                                            "completed NN input count",
+                                        ))?;
+                                } else {
+                                    self.counters.nn_input_count_unknown += 1;
+                                }
                             } else {
                                 self.counters.nn_input_count_unknown += 1;
                             }
-                        } else {
+                        } else if owner_run.backend_run_invoked()
+                            || physical != PhysicalRoleCompletion::Confirmed
+                            || success
+                        {
                             self.counters.nn_input_count_unknown += 1;
                         }
-                    } else if owner_run.backend_run_invoked()
-                        || physical != PhysicalRoleCompletion::Confirmed
-                        || success
-                    {
-                        self.counters.nn_input_count_unknown += 1;
-                    }
-                    self.counters.physical_role_completions +=
-                        u64::from(physical == PhysicalRoleCompletion::Confirmed);
-                    let completed = match purpose {
-                        RolePurpose::RootRanking => {
-                            self.registry.complete_proposer_ranking(completion)
+                        self.counters.physical_role_completions +=
+                            u64::from(physical == PhysicalRoleCompletion::Confirmed);
+                        let completed = match purpose {
+                            RolePurpose::RootRanking => {
+                                self.registry.complete_proposer_ranking(completion)
+                            }
+                            RolePurpose::Validator => {
+                                self.registry.complete_validator_task(completion)
+                            }
+                            RolePurpose::Refinement if self.has_collection_v2() => {
+                                self.registry.complete_reciprocal_role(completion)
+                            }
+                            RolePurpose::Refinement => self.registry.complete(completion),
+                            RolePurpose::Reciprocal => {
+                                self.registry.complete_reciprocal_role(completion)
+                            }
+                            RolePurpose::RoventRefinement
+                            | RolePurpose::RoventFresh
+                            | RolePurpose::RoventGoalLocal => {
+                                self.registry.complete_reciprocal_role(completion)
+                            }
+                        };
+                        if let Err(rejected) = completed {
+                            self.counters.rejected_events += 1;
+                            if rejected.completion.physical == PhysicalRoleCompletion::Unknown {
+                                // Worker protocol bounds this storage. On corruption,
+                                // retaining is mandatory; do not invent a fence.
+                                self.quarantine_rejections.push(rejected.completion);
+                                return Err(AdaptiveManagerError::PhysicalUnknown);
+                            }
+                            return Err(AdaptiveManagerError::Coordinator(rejected.error));
                         }
-                        RolePurpose::Validator => self.registry.complete_validator_task(completion),
-                        RolePurpose::Refinement => self.registry.complete(completion),
-                    };
-                    if let Err(rejected) = completed {
-                        self.counters.rejected_events += 1;
-                        if rejected.completion.physical == PhysicalRoleCompletion::Unknown {
-                            // Worker protocol bounds this storage. On corruption,
-                            // retaining is mandatory; do not invent a fence.
-                            self.quarantine_rejections.push(rejected.completion);
+                        if physical == PhysicalRoleCompletion::Unknown {
                             return Err(AdaptiveManagerError::PhysicalUnknown);
                         }
-                        return Err(AdaptiveManagerError::Coordinator(rejected.error));
+                        if self.phase == ManagerPhase::Running {
+                            if let Some(failure) = failure {
+                                return Err(AdaptiveManagerError::Semantic(format!(
+                                    "native role execution: {failure:?}"
+                                )));
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = outcome {
+                        // Preserve unknown binding, observation overflow and
+                        // registry rejection just as carefully as backend errors.
+                        self.retained_native_completions.push(retained);
+                        return Err(error);
                     }
-                    if physical == PhysicalRoleCompletion::Unknown {
-                        return Err(AdaptiveManagerError::PhysicalUnknown);
-                    }
-                    if self.phase == ManagerPhase::Running {
-                        if let Some(failure) = failure {
-                            return Err(AdaptiveManagerError::Semantic(format!(
-                                "native role execution: {failure:?}"
-                            )));
+                    #[cfg(feature = "pals-adaptive-diagnostics")]
+                    self.observe_pending_diagnostic(
+                        ContinuationPendingSource::CompletionProcessed,
+                        diagnostic_completion_ticket,
+                        None,
+                    );
+                }
+                TicketNativeEvent::PreparationFailed {
+                    preparation,
+                    failure,
+                } => {
+                    if let Some(index) = self
+                        .roles
+                        .iter()
+                        .position(|binding| binding.preparation == preparation)
+                    {
+                        if self.roles[index].ticket.is_none()
+                            && self.roles[index].goal_local.is_none()
+                        {
+                            self.roles.remove(index);
+                        } else {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "prepared ticket failed after issue",
+                            ));
                         }
                     }
-                    Ok(())
-                })();
-                if let Err(error) = outcome {
-                    // Preserve unknown binding, observation overflow and
-                    // registry rejection just as carefully as backend errors.
-                    self.retained_native_completions.push(retained);
-                    return Err(error);
+                    if self.phase == ManagerPhase::Running {
+                        return Err(AdaptiveManagerError::Semantic(format!(
+                            "native preparation: {failure:?}"
+                        )));
+                    }
                 }
-                #[cfg(feature = "pals-adaptive-diagnostics")]
-                self.observe_pending_diagnostic(
-                    ContinuationPendingSource::CompletionProcessed,
-                    diagnostic_completion_ticket,
-                    None,
-                );
-            }
-            TicketNativeEvent::PreparationFailed {
-                preparation,
-                failure,
-            } => {
-                if let Some(index) = self
-                    .roles
-                    .iter()
-                    .position(|binding| binding.preparation == preparation)
-                {
-                    if self.roles[index].ticket.is_none() {
-                        self.roles.remove(index);
+                TicketNativeEvent::Rejected { preparation, error } => {
+                    if self.phase != ManagerPhase::Running {
+                        if let Some(index) = self.roles.iter().position(|binding| {
+                            binding.preparation == preparation
+                                && binding.ticket.is_none()
+                                && binding.goal_local.is_none()
+                        }) {
+                            self.roles.remove(index);
+                        }
                     } else {
-                        return Err(AdaptiveManagerError::Invalid(
-                            "prepared ticket failed after issue",
-                        ));
+                        return Err(AdaptiveManagerError::Native(error));
                     }
                 }
-                if self.phase == ManagerPhase::Running {
-                    return Err(AdaptiveManagerError::Semantic(format!(
-                        "native preparation: {failure:?}"
-                    )));
-                }
-            }
-            TicketNativeEvent::Rejected { preparation, error } => {
-                if self.phase != ManagerPhase::Running {
-                    if let Some(index) = self.roles.iter().position(|binding| {
-                        binding.preparation == preparation && binding.ticket.is_none()
-                    }) {
-                        self.roles.remove(index);
+                TicketNativeEvent::Retired {
+                    ticket,
+                    accepted,
+                    result,
+                    native_receipt,
+                    rejected_permit,
+                    observation_failures,
+                } => {
+                    if let Some(error) =
+                        self.observe_native_failures(&ticket, &observation_failures, true)
+                    {
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        if let Some(permit) = rejected_permit {
+                            self.retained_native_permits.push(permit);
+                        }
+                        return Err(error);
                     }
-                } else {
-                    return Err(AdaptiveManagerError::Native(error));
-                }
-            }
-            TicketNativeEvent::Retired {
-                ticket,
-                accepted,
-                result,
-                native_receipt,
-                rejected_permit,
-            } => {
-                let index = self
-                    .roles
-                    .iter()
-                    .position(|binding| binding.ticket == Some(ticket));
-                let Some(index) = index else {
-                    // A malformed/late echo cannot discard linear owner
-                    // evidence. Keep it quarantined until a real fence.
+                    let index = self
+                        .roles
+                        .iter()
+                        .position(|binding| binding.ticket == Some(ticket));
+                    let Some(index) = index else {
+                        // A malformed/late echo cannot discard linear owner
+                        // evidence. Keep it quarantined until a real fence.
+                        if let Some(permit) = rejected_permit {
+                            self.retained_native_permits.push(permit);
+                        }
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        return Err(AdaptiveManagerError::Invalid("unknown native retirement"));
+                    };
+                    let revoked_ack = rejected_permit.as_ref().is_some_and(|permit| {
+                        self.is_revoked_acceptance_ack(
+                            index,
+                            &ticket,
+                            accepted,
+                            &result,
+                            permit,
+                            native_receipt.is_some(),
+                        )
+                    });
                     if let Some(permit) = rejected_permit {
                         self.retained_native_permits.push(permit);
                     }
-                    if let Some(receipt) = native_receipt {
-                        self.retained_native_receipts.push(receipt);
+                    if revoked_ack {
+                        // The owner rejected this exact queued Accept before
+                        // successful backend acceptance. Preserve its original
+                        // output/permit and typed reason until the real fence;
+                        // do not create an accepted step or semantic retirement.
+                        self.roles[index].revoked_acceptance =
+                            Some(result.expect_err("validated original revoked Accept"));
+                        return Ok(());
                     }
-                    return Err(AdaptiveManagerError::Invalid("unknown native retirement"));
-                };
-                if let Some(permit) = rejected_permit {
-                    self.retained_native_permits.push(permit);
-                }
-                if let Err(failure) = result {
-                    if let Some(receipt) = native_receipt {
-                        self.retained_native_receipts.push(receipt);
+                    if let Err(failure) = result {
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        // A failed accept reports accepted=false. Preserve the
+                        // original output until the owner's discard/fence rather
+                        // than treating the echo as an accepted seed.
+                        return Err(if failure == RoleFailure::PhysicalUnknown {
+                            AdaptiveManagerError::PhysicalUnknown
+                        } else {
+                            AdaptiveManagerError::Semantic(format!(
+                                "native retirement: {failure:?}"
+                            ))
+                        });
                     }
-                    // A failed accept reports accepted=false. Preserve the
-                    // original output until the owner's discard/fence rather
-                    // than treating the echo as an accepted seed.
-                    return Err(if failure == RoleFailure::PhysicalUnknown {
-                        AdaptiveManagerError::PhysicalUnknown
-                    } else {
-                        AdaptiveManagerError::Semantic(format!("native retirement: {failure:?}"))
-                    });
-                }
-                if self.roles[index].ack_accepted != Some(accepted) {
-                    if let Some(receipt) = native_receipt {
-                        self.retained_native_receipts.push(receipt);
+                    if self.roles[index].ack_accepted != Some(accepted) {
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        return Err(AdaptiveManagerError::Invalid(
+                            "native acceptance ack mismatch",
+                        ));
                     }
-                    return Err(AdaptiveManagerError::Invalid(
-                        "native acceptance ack mismatch",
-                    ));
-                }
-                if accepted && !self.roles[index].native_acceptance_recorded {
-                    let mut native_accounting = self.native_accounting;
-                    native_accounting
-                        .observe_owner_acceptance(ticket.role, self.roles[index].physical)?;
-                    match self.roles[index]
-                        .physical
-                        .filter(|physical| physical.measurement_complete)
-                        .and_then(|physical| physical.completed_nn_inputs)
+                    if accepted && !self.roles[index].native_acceptance_recorded {
+                        let mut native_accounting = self.native_accounting;
+                        let accounting_result = (|| {
+                            native_accounting.observe_owner_acceptance(
+                                ticket.role,
+                                self.roles[index].physical,
+                            )?;
+                            let count = self.roles[index]
+                                .physical
+                                .filter(|physical| physical.measurement_complete)
+                                .and_then(|physical| physical.completed_nn_inputs);
+                            let (inputs, unknown) = match count {
+                                Some(count) => (
+                                    self.counters.accepted_nn_inputs.checked_add(count),
+                                    Some(self.counters.accepted_nn_input_count_unknown),
+                                ),
+                                None => (
+                                    Some(self.counters.accepted_nn_inputs),
+                                    self.counters.accepted_nn_input_count_unknown.checked_add(1),
+                                ),
+                            };
+                            Ok::<_, AdaptiveManagerError>((
+                                inputs.ok_or(AdaptiveManagerError::Capacity(
+                                    "native accepted NN count",
+                                ))?,
+                                unknown.ok_or(AdaptiveManagerError::Capacity(
+                                    "native accepted unknown count",
+                                ))?,
+                            ))
+                        })();
+                        let (inputs, unknown) = match accounting_result {
+                            Ok(counts) => counts,
+                            Err(error) => {
+                                if let Some(receipt) = native_receipt {
+                                    self.retained_native_receipts.push(receipt);
+                                }
+                                return Err(error);
+                            }
+                        };
+                        self.counters.accepted_nn_inputs = inputs;
+                        self.counters.accepted_nn_input_count_unknown = unknown;
+                        self.roles[index].native_acceptance_recorded = true;
+                        self.native_accounting = native_accounting;
+                    }
+                    let published_head = matches!(
+                        self.roles[index].purpose,
+                        RolePurpose::RootRanking | RolePurpose::Validator
+                    );
+                    if accepted
+                        && (matches!(
+                            self.roles[index].purpose,
+                            RolePurpose::Reciprocal
+                                | RolePurpose::RoventRefinement
+                                | RolePurpose::RoventFresh
+                                | RolePurpose::RoventGoalLocal
+                        ) || (self.roles[index].purpose == RolePurpose::Refinement
+                            && self.has_collection_v2()))
                     {
-                        Some(count) => {
-                            self.counters.accepted_nn_inputs =
-                                self.counters.accepted_nn_inputs.checked_add(count).ok_or(
-                                    AdaptiveManagerError::Capacity("native accepted NN count"),
-                                )?;
+                        let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
+                            "reciprocal acceptance has no actual native-owner receipt",
+                        ))?;
+                        if let (ManagerPhase::Running, Ok(now)) = (self.phase, self.check_running())
+                        {
+                            match self.registry.accept_reciprocal_native(
+                                receipt,
+                                self.clock.domain(),
+                                now,
+                            ) {
+                                Ok(accepted_step) => {
+                                    self.roles[index].reciprocal_acceptance = Some(accepted_step);
+                                    if let Some(observer) = &mut self.collection_observer {
+                                        let binding = &self.roles[index];
+                                        if let (Some(proof), Some(output)) =
+                                            (&binding.reciprocal_acceptance, &binding.delivered)
+                                        {
+                                            if let Err(error) = observer.accepted(
+                                                proof,
+                                                &binding.input,
+                                                output.as_ref(),
+                                            ) {
+                                                collection_failures.push(error);
+                                            }
+                                        } else {
+                                            collection_failures.push(AdaptiveCollectionError::new(AdaptiveCollectionStage::Accepted,"MissingOriginalOutput","accepted native proof has no original retained output"));
+                                        }
+                                    }
+                                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                                    let collection_verifier =
+                                        self.native.native_acceptance_verifier();
+                                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                                    if let Some(observer) = &mut self.collection_observer_v2 {
+                                        let binding = &self.roles[index];
+                                        if let (Some(proof), Some(output), Some(admission)) = (
+                                            &binding.reciprocal_acceptance,
+                                            &binding.delivered,
+                                            &self.collection_admission_v2,
+                                        ) {
+                                            let raw = output.proposer_ranking_output();
+                                            let result = collection_verifier
+                                                .as_ref()
+                                                .ok_or_else(|| {
+                                                    AdaptiveCollectionError::new(
+                                                        AdaptiveCollectionStage::Accepted,
+                                                        "NativeVerifierUnavailable",
+                                                        "V2 original native verifier unavailable",
+                                                    )
+                                                })
+                                                .and_then(|verifier| {
+                                                    RoventCollectionAcceptedWitnessV2::new(
+                                                        admission, verifier, proof, raw,
+                                                    )
+                                                })
+                                                .and_then(|witness| {
+                                                    observer.accepted(
+                                                        witness,
+                                                        &binding.input,
+                                                        output.as_ref(),
+                                                    )
+                                                });
+                                            if let Err(error) = result {
+                                                collection_failures.push(error);
+                                            }
+                                        } else {
+                                            collection_failures.push(AdaptiveCollectionError::new(AdaptiveCollectionStage::Accepted,
+                                                "MissingOriginalOutput", "V2 accepted proof has no original output or admission"));
+                                        }
+                                    }
+                                }
+                                Err(rejected) => {
+                                    self.retained_native_receipts.push(rejected.receipt);
+                                    return Err(rejected.error.into());
+                                }
+                            }
+                        } else {
+                            self.retained_native_receipts.push(receipt);
                         }
-                        None => self.counters.accepted_nn_input_count_unknown += 1,
-                    }
-                    self.roles[index].native_acceptance_recorded = true;
-                    self.native_accounting = native_accounting;
-                }
-                let published_head = matches!(
-                    self.roles[index].purpose,
-                    RolePurpose::RootRanking | RolePurpose::Validator
-                );
-                if accepted && published_head {
-                    let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
-                        "P/V acceptance has no actual native-owner receipt",
-                    ))?;
-                    if self.phase == ManagerPhase::Running && self.check_running().is_ok() {
-                        let now = self.check_running()?;
-                        if let Err(rejected) = self.registry.confirm_native_acceptance(
-                            receipt,
-                            self.clock.domain(),
-                            now,
-                        ) {
-                            self.retained_native_receipts.push(rejected.receipt);
-                            return Err(rejected.error.into());
+                    } else if accepted && published_head {
+                        let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
+                            "P/V acceptance has no actual native-owner receipt",
+                        ))?;
+                        if let (ManagerPhase::Running, Ok(now)) = (self.phase, self.check_running())
+                        {
+                            if let Err(rejected) = self.registry.confirm_native_acceptance(
+                                receipt,
+                                self.clock.domain(),
+                                now,
+                            ) {
+                                self.retained_native_receipts.push(rejected.receipt);
+                                return Err(rejected.error.into());
+                            }
+                        } else {
+                            // Logical revocation never turns a late owner success
+                            // into new search-consumption permission.
+                            self.retained_native_receipts.push(receipt);
                         }
-                    } else {
-                        // Logical revocation never turns a late owner success
-                        // into new search-consumption permission.
+                    } else if let Some(receipt) = native_receipt {
                         self.retained_native_receipts.push(receipt);
+                        return Err(AdaptiveManagerError::Invalid(
+                            "unexpected native publication receipt",
+                        ));
                     }
-                } else if let Some(receipt) = native_receipt {
-                    self.retained_native_receipts.push(receipt);
-                    return Err(AdaptiveManagerError::Invalid(
-                        "unexpected native publication receipt",
-                    ));
+                    // Retirement may need an archive owner turn before its hot
+                    // commit. Keep the original ticket/binding until that barrier
+                    // succeeds, including when receipt delivery raced shutdown.
+                    self.defer(DeferredCommit::Role { ticket, accepted })?;
                 }
-                // Retirement may need an archive owner turn before its hot
-                // commit. Keep the original ticket/binding until that barrier
-                // succeeds, including when receipt delivery raced shutdown.
-                self.defer(DeferredCommit::Role { ticket, accepted })?;
-            }
-            TicketNativeEvent::AcceptanceRejected {
-                preparation,
-                ticket,
-                error,
-                permit,
-            } => {
-                // This linear authority must survive failure until the actual
-                // root/process fence; reissuing a permit would be a duplicate.
-                let original = self.roles.iter().any(|binding| {
-                    binding.preparation == preparation && binding.ticket == Some(ticket)
-                });
-                self.retained_native_permits.push(permit);
-                if !original {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "unknown native acceptance rejection",
-                    ));
+                TicketNativeEvent::AcceptanceRejected {
+                    preparation,
+                    ticket,
+                    error,
+                    permit,
+                } => {
+                    // This linear authority must survive failure until the actual
+                    // root/process fence; reissuing a permit would be a duplicate.
+                    let original = self.roles.iter().any(|binding| {
+                        binding.preparation == preparation && binding.ticket == Some(ticket)
+                    });
+                    self.retained_native_permits.push(permit);
+                    if !original {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "unknown native acceptance rejection",
+                        ));
+                    }
+                    return Err(error.into());
                 }
-                return Err(error.into());
-            }
-            TicketNativeEvent::Finished {
-                physical_shutdown_confirmed,
-            } => {
-                if self.native_finished.is_some() {
-                    return Err(AdaptiveManagerError::Invalid("duplicate native shutdown"));
+                TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed,
+                } => {
+                    if self.native_finished.is_some() {
+                        return Err(AdaptiveManagerError::Invalid("duplicate native shutdown"));
+                    }
+                    self.native_finished = Some(physical_shutdown_confirmed);
+                    if !physical_shutdown_confirmed {
+                        return Err(AdaptiveManagerError::PhysicalUnknown);
+                    }
                 }
-                self.native_finished = Some(physical_shutdown_confirmed);
-                if !physical_shutdown_confirmed {
-                    return Err(AdaptiveManagerError::PhysicalUnknown);
-                }
-            }
-            TicketNativeEvent::RootQuiesced(fence) => {
-                if self.close_mode != AdaptiveCloseMode::RootQuiesce
-                    || fence.authority() != self.registration.authority
-                    || self.native_root_fence.is_some()
-                {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "unexpected native root fence",
-                    ));
-                }
-                self.native_root_fence = Some(fence);
-                if !fence.permits_reuse() {
-                    return Err(AdaptiveManagerError::PhysicalUnknown);
+                TicketNativeEvent::RootQuiesced(fence) => {
+                    if !self.native_root_quiesce_requested
+                        || fence.authority() != self.registration.authority
+                        || self.native_root_fence.is_some()
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "unexpected native root fence",
+                        ));
+                    }
+                    self.native_root_fence = Some(fence);
+                    if !fence.permits_reuse() {
+                        return Err(AdaptiveManagerError::PhysicalUnknown);
+                    }
                 }
             }
+            Ok(())
+        })();
+        for error in collection_failures {
+            self.record_failure(error.into());
         }
-        Ok(())
+        runtime_result
     }
     fn role_mut(
         &mut self,
@@ -2983,6 +5026,73 @@ where
             .iter_mut()
             .find(|binding| binding.ticket.is_some_and(|ticket| ticket.id == request))
             .ok_or(AdaptiveManagerError::Invalid("unknown role request"))
+    }
+    fn is_revoked_acceptance_ack(
+        &mut self,
+        index: usize,
+        ticket: &RoleTicketEnvelope,
+        accepted: bool,
+        result: &Result<(), RoleFailure>,
+        permit: &NativeAcceptancePermit,
+        has_native_receipt: bool,
+    ) -> bool {
+        let binding = &self.roles[index];
+        let actual_expiry = self.clock.try_now().ok().is_some_and(|now| {
+            self.clock.domain() == ticket.original_deadline.clock
+                && now.0 >= ticket.original_deadline.at.0
+        });
+        let cancellation_failure = match result {
+            Err(RoleFailure::Canceled) => true,
+            Err(RoleFailure::Expired) => actual_expiry,
+            _ => false,
+        };
+        if self.phase != ManagerPhase::Draining
+            || self.shutdown_until.is_none()
+            || ticket.authority != self.registration.authority
+            || ticket.original_deadline != self.deadline
+            || binding.ticket != Some(*ticket)
+            || accepted
+            || has_native_receipt
+            || !binding.cancellation_requested
+            || !binding.ack_dispatched
+            || binding.ack_accepted != Some(true)
+            || binding.revoked_acceptance.is_some()
+            || binding.native_acceptance_recorded
+            || binding.consumption_recorded
+            || binding.reciprocal_acceptance.is_some()
+            || !binding.service_completed
+            || !cancellation_failure
+            || binding.delivered.as_ref().and_then(|output| {
+                rz_search::pals::coordinator::native_acceptance_output_digest(
+                    output.proposer_ranking_output(),
+                )
+                .ok()
+            }) != Some(permit.output_digest())
+        {
+            return false;
+        }
+        let purpose = binding.purpose;
+        // Delivered + successful payload + original issued seal in the
+        // registry also proves Confirmed physical completion: Unknown enters
+        // Quarantined and cannot issue or satisfy either permit validator.
+        match purpose {
+            RolePurpose::RootRanking | RolePurpose::Validator => self
+                .registry
+                .validate_revoked_published_head_native_permit(ticket, permit)
+                .is_ok(),
+            RolePurpose::Reciprocal
+            | RolePurpose::RoventRefinement
+            | RolePurpose::RoventFresh
+            | RolePurpose::RoventGoalLocal => self
+                .registry
+                .validate_revoked_reciprocal_native_permit(ticket, permit)
+                .is_ok(),
+            RolePurpose::Refinement if self.has_collection_v2() => self
+                .registry
+                .validate_revoked_reciprocal_native_permit(ticket, permit)
+                .is_ok(),
+            RolePurpose::Refinement => false,
+        }
     }
     fn retire_role(
         &mut self,
@@ -2995,6 +5105,18 @@ where
             .iter()
             .position(|binding| binding.ticket == Some(ticket))
             .ok_or(AdaptiveManagerError::Invalid("unknown semantic retirement"))?;
+        if self.roles[index].consumption_unknown {
+            return Err(AdaptiveManagerError::Invalid(
+                "semantic consumption remains unknown",
+            ));
+        }
+        if accepted
+            && self.roles[index].purpose == RolePurpose::RoventRefinement
+            && self.phase == ManagerPhase::Running
+            && self.check_running().is_ok()
+        {
+            return self.retain_accepted_role_for_peer(index);
+        }
         if accepted && self.phase == ManagerPhase::Running && self.check_running().is_ok() {
             // Fallible hot commits must not erase the original immutable
             // question or owner evidence. A deferred retry/drain still owns
@@ -3013,19 +5135,72 @@ where
                     .ok_or(AdaptiveManagerError::Invalid(
                         "accepted native ack has no output",
                     ))?;
+            if let Some(work) = &work {
+                self.utility_begin_commit(work, StepExecution::Role(ticket.id))
+                    .map_err(|error| error.at_semantic_stage("retire_role.utility_begin_commit"))?;
+            }
+            let utility_work = work.clone();
             let attempted = (|| -> Result<(), AdaptiveManagerError> {
-                if let Some(work) = work {
+                if purpose == RolePurpose::RoventGoalLocal {
+                    self.consume_goal_local_role(
+                        index,
+                        &ticket,
+                        output.proposer_ranking_output(),
+                        physical,
+                    ).map_err(|error| error.at_semantic_stage("retire_role.goal_local"))?;
+                } else if purpose == RolePurpose::Reciprocal {
+                    let work = work.ok_or(AdaptiveManagerError::Invalid(
+                        "reciprocal role lost its exact child frame",
+                    ))?;
+                    self.consume_reciprocal_role(
+                        index,
+                        &work,
+                        &ticket,
+                        output.proposer_ranking_output(),
+                        physical,
+                    ).map_err(|error| error.at_semantic_stage("retire_role.reciprocal"))?;
+                } else if let Some(work) = work {
+                    if purpose == RolePurpose::RoventFresh {
+                        let accepted = self.roles[index].reciprocal_acceptance.as_ref().ok_or(
+                            AdaptiveManagerError::Invalid(
+                                "Fresh endpoint lost original retired native proof",
+                            ),
+                        )?;
+                        self.driver.rovent_fresh_accepted(
+                            &work,
+                            accepted,
+                            output.proposer_ranking_output(),
+                            physical,
+                            self.clock.domain(),
+                            self.check_running()?,
+                        ).map_err(|error| error.at_semantic_stage("retire_role.fresh_accepted"))?;
+                    }
                     let committed = self.driver.commit_role(
                         &work,
                         &ticket,
                         output.proposer_ranking_output(),
                         physical,
-                    )?;
-                    self.driver.role_consumed(&ticket, &input.view)?;
-                    self.registry
-                        .accept(&ticket, self.clock.domain(), self.check_running()?)?;
-                    self.mark_role_consumed(index)?;
-                    self.resolve(work, StepExecution::Role(ticket.id), committed)?;
+                    ).map_err(|error| error.at_semantic_stage("retire_role.commit_role"))?;
+                    self.driver.role_consumed(&ticket, &input.view)
+                        .map_err(|error| error.at_semantic_stage("retire_role.role_consumed"))?;
+                    if purpose != RolePurpose::RoventFresh
+                        && !(purpose == RolePurpose::Refinement
+                            && self.roles[index].reciprocal_acceptance.is_some())
+                    {
+                        self.registry.accept(
+                            &ticket,
+                            self.clock.domain(),
+                            self.check_running()?,
+                        )?;
+                    }
+                    self.mark_role_consumed(index, false)?;
+                    if self.has_collection_failure() {
+                        return Ok(());
+                    }
+                    self.utility_role_at(index, &work, output.proposer_ranking_output())
+                        .map_err(|error| error.at_semantic_stage("retire_role.utility_role"))?;
+                    self.resolve(work, StepExecution::Role(ticket.id), committed)
+                        .map_err(|error| error.at_semantic_stage("retire_role.resolve"))?;
                 } else if purpose == RolePurpose::RootRanking {
                     let ranking = self.registry.accept_proposer_ranking(
                         &ticket,
@@ -3033,13 +5208,78 @@ where
                         self.clock.domain(),
                         self.check_running()?,
                     )?;
+                    self.root_ranking_proof = Some(ranking.clone());
                     let candidates = self.driver.ranking_published(&ranking)?;
                     if candidates.len() > 64 {
                         return Err(AdaptiveManagerError::Capacity("root candidate fanout"));
                     }
                     self.driver.role_consumed(&ticket, &input.view)?;
-                    self.mark_role_consumed(index)?;
-                    self.root_ranking_proof = Some(ranking.clone());
+                    self.mark_role_consumed(index, false)?;
+                    let mut ranking_observation_failed = false;
+                    // Collection observes the actual root ranking even when
+                    // no optional reciprocal/peer routing was configured.
+                    if self.reciprocal_routing.is_some()
+                        || self.peer_policy.is_some()
+                        || self.collection_observer.is_some()
+                        || self.has_collection_v2()
+                    {
+                        if let Some(observer) = &mut self.collection_observer {
+                            let proof = match self.collection_admission.as_ref() {
+                                Some(admission) => {
+                                    RoventRootRankingAcceptance::from_current_ranking(
+                                        &ranking, admission,
+                                    )
+                                }
+                                None => Err(AdaptiveCollectionError::new(
+                                    AdaptiveCollectionStage::Accepted,
+                                    "MissingRoventRootAdmission",
+                                    "root ranking has no original Rovent collection admission",
+                                )),
+                            };
+                            let result = proof.and_then(|proof| {
+                                observer.root_ranking(&proof, &input, output.as_ref())
+                            });
+                            if let Err(error) = result {
+                                ranking_observation_failed = true;
+                                self.record_failure(error.into());
+                            }
+                        }
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        if let Some(observer) = &mut self.collection_observer_v2 {
+                            let result = self
+                                .collection_admission_v2
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AdaptiveCollectionError::new(
+                                        AdaptiveCollectionStage::Accepted,
+                                        "MissingV2Admission",
+                                        "V2 root ranking has no original admission",
+                                    )
+                                })
+                                .and_then(|admission| {
+                                    admission.validate_output(
+                                        &ticket,
+                                        output.proposer_ranking_output(),
+                                    )?;
+                                    RoventRootRankingAcceptanceV2::from_current_ranking(
+                                        &ranking, admission,
+                                    )
+                                })
+                                .and_then(|proof| {
+                                    observer.adaptive_root_ranking(&proof, &input, output.as_ref())
+                                });
+                            if let Err(error) = result {
+                                ranking_observation_failed = true;
+                                self.record_failure(error.into());
+                            }
+                        }
+                    }
+                    // Ranking and search consumption have already happened.
+                    // An optional V2 collection failure cannot undo them;
+                    // strict/legacy collection still stops candidate fanout.
+                    if ranking_observation_failed && !self.collection_failure_is_independent() {
+                        return Ok(());
+                    }
                     for candidate in candidates {
                         let input = candidate.input.clone();
                         let now = self.check_running()?;
@@ -3072,6 +5312,7 @@ where
                         };
                         self.driver
                             .root_candidate_admitted(frame, candidate.first_move, &input)?;
+                        self.rovent_candidate_ready(frame)?;
                     }
                 } else if purpose == RolePurpose::Validator {
                     let published = self.registry.accept_validator_task(
@@ -3136,7 +5377,7 @@ where
                         self.validator_waiting.retain(|frame| *frame != parent);
                     }
                     self.driver.role_consumed(&ticket, &input.view)?;
-                    self.mark_role_consumed(index)?;
+                    self.mark_role_consumed(index, false)?;
                 } else {
                     return Err(AdaptiveManagerError::Invalid(
                         "role purpose lacks refinement work",
@@ -3156,14 +5397,38 @@ where
                 // Store consumption precedes next-view materialization. A
                 // later failure must retain both the semantic error and the
                 // actual source consumption, without retrying its commit.
-                match self.driver.role_consumption_recorded(&ticket, &input.view) {
+                let consumed = if purpose == RolePurpose::RoventGoalLocal {
+                    self.driver
+                        .rovent_goal_consumption_recorded(&ticket, &input.view)
+                } else {
+                    self.driver.role_consumption_recorded(&ticket, &input.view)
+                };
+                match consumed {
                     Ok(true) if !self.roles[index].consumption_recorded => {
-                        if let Err(observation) = self.mark_role_consumed(index) {
-                            self.record_failure(observation);
+                        if let Err(observation) = self.mark_role_consumed(index, true) {
+                            self.record_failure(
+                                observation.at_semantic_stage("mark_role_consumed_after_error"),
+                            );
                         }
                     }
                     Ok(_) => {}
-                    Err(readback) => self.record_failure(readback),
+                    Err(readback) => {
+                        if !self.roles[index].consumption_recorded {
+                            self.roles[index].consumption_unknown = true;
+                        }
+                        self.record_failure(
+                            readback.at_semantic_stage("role_consumption_readback"),
+                        );
+                    }
+                }
+                if self.roles[index].consumption_recorded {
+                    if let Some(work) = &utility_work {
+                        if let Err(observation) =
+                            self.utility_role_at(index, work, output.proposer_ranking_output())
+                        {
+                            self.record_failure(observation.at_semantic_stage("utility_role_after_error"));
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -3176,6 +5441,28 @@ where
                 self.registry.discard_delivered(&ticket)?;
             }
             let consumed = self.roles[index].consumption_recorded;
+            if let Some(original) = &self.roles[index].goal_local {
+                self.driver.discard_rovent_goal_input(original)?;
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if !consumed && self.roles[index].v2_capture_possible {
+                let result = self.collection_observer_v2.as_mut().map(|observer| observer.abandoned(&ticket));
+                if let Some(Err(error)) = result {
+                    // Keep the same ticket even when observer cleanup fails;
+                    // settlement can retry only after the actual root fence.
+                    // Captures are bounded by the original in-flight limit and
+                    // the first failure disables new captured dispatches.
+                    if self.collection_v2_abandon_custody.len() >= self.limits.role_tickets_max {
+                        self.record_failure(error.into());
+                        return Err(AdaptiveManagerError::Capacity("V2 abandoned ticket custody"));
+                    }
+                    self.collection_v2_abandon_custody.try_reserve(1)
+                        .map_err(|_| AdaptiveManagerError::Capacity("V2 abandoned ticket custody"))?;
+                    self.collection_v2_abandon_custody.push(ticket);
+                    self.collection_v2_first_failure.get_or_insert_with(|| error.clone());
+                    self.record_failure(error.into());
+                }
+            }
             self.roles.remove(index);
             if !consumed {
                 self.counters.unused_role_results += 1;
@@ -3183,23 +5470,89 @@ where
         }
         Ok(())
     }
-    fn mark_role_consumed(&mut self, index: usize) -> Result<(), AdaptiveManagerError> {
-        let binding = &self.roles[index];
-        if binding.consumption_recorded {
+    fn mark_role_consumed(
+        &mut self,
+        index: usize,
+        after_error_readback: bool,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.roles[index].consumption_recorded {
             return Ok(());
         }
+        // Driver confirmed consumption before this method. Preserve that fact
+        // even if the separate accounting or observer path fails.
+        self.roles[index].consumption_recorded = true;
+        let ticket = self.roles[index]
+            .ticket
+            .ok_or(AdaptiveManagerError::Invalid(
+                "original consumed role ticket missing",
+            ))?;
+        let physical = self.roles[index].physical;
+        self.record_role_consumption(ticket, physical)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let (Some(accepted), Some(output)) = (
+            self.roles[index].reciprocal_acceptance.as_ref(),
+            self.roles[index].delivered.as_ref(),
+        ) {
+            let verifier = self.native.native_acceptance_verifier();
+            let observed = collection::notify_adaptive_consumed_v2(
+                &mut self.collection_observer_v2,
+                self.collection_admission_v2.as_ref(),
+                verifier.as_ref(),
+                accepted,
+                output.proposer_ranking_output(),
+                after_error_readback,
+            );
+            if let Err(error) = observed {
+                self.record_failure(error.into());
+            }
+        } else if self.collection_observer_v2.is_some()
+            && self.roles[index].reciprocal_acceptance.is_some()
+        {
+            self.record_failure(
+                AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Accepted,
+                    "MissingOriginalOutput",
+                    "V2 consumed proof has no retained output",
+                )
+                .into(),
+            );
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let _ = after_error_readback;
+        let failures = if let (Some(state), Some(accepted), Some(output)) = (
+            self.cpu_semantic.as_mut(),
+            self.roles[index].reciprocal_acceptance.as_ref(),
+            self.roles[index].delivered.as_ref(),
+        ) {
+            cpu_semantic::promote_selected(
+                state,
+                &self.driver,
+                &self.roles[index].input,
+                accepted,
+                output.proposer_ranking_output(),
+            )
+        } else {
+            Vec::new()
+        };
+        for failure in failures {
+            self.record_cpu_semantic_failure(failure);
+        }
+        self.poll_cpu_semantic();
+        Ok(())
+    }
+    fn record_role_consumption(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+        physical: Option<TicketExecutionEvidence>,
+    ) -> Result<(), AdaptiveManagerError> {
         let mut counters = self.counters;
         let mut native_accounting = self.native_accounting;
-        let ticket = binding.ticket.ok_or(AdaptiveManagerError::Invalid(
-            "original consumed role ticket missing",
-        ))?;
-        native_accounting.observe_search_consumption(ticket.role, binding.physical)?;
+        native_accounting.observe_search_consumption(ticket.role, physical)?;
         counters.consumed_role_outputs = counters
             .consumed_role_outputs
             .checked_add(1)
             .ok_or(AdaptiveManagerError::Capacity("role consumption count"))?;
-        match binding
-            .physical
+        match physical
             .filter(|physical| physical.measurement_complete)
             .and_then(|physical| physical.completed_nn_inputs)
         {
@@ -3214,7 +5567,6 @@ where
         }
         self.counters = counters;
         self.native_accounting = native_accounting;
-        self.roles[index].consumption_recorded = true;
         Ok(())
     }
     fn defer(&mut self, event: DeferredCommit<Q>) -> Result<(), AdaptiveManagerError> {
@@ -3229,8 +5581,27 @@ where
         Ok(())
     }
     fn flush_deferred(&mut self) -> Result<bool, AdaptiveManagerError> {
-        let mut changed = false;
+        // The root common ledger receives only the real native ledger's
+        // opaque success receipt, before any later semantic CPU publication.
+        let mut changed = self.flush_frontier_native()?;
         for index in 0..self.own.len() {
+            if self.own[index]
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.queued_resume_termination.is_some())
+            {
+                // These two original receipts are one retirement obligation.
+                // Generic raw publication cannot consume just one side while
+                // an archive transfer/frontier settlement is still pending.
+                if self.own[index]
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.pending_slice.is_some())
+                {
+                    changed |= self.retire_queued_resume_after_owner_termination(index)?;
+                }
+                continue;
+            }
             if !self.driver.semantic_owner_available() {
                 break;
             }
@@ -3254,19 +5625,33 @@ where
             if self.phase == ManagerPhase::Running && !self.driver.prepare_semantic_commit()? {
                 break;
             }
-            let Some(event) = self.deferred.pop_front() else {
+            let Some(mut event) = self.deferred.pop_front() else {
                 break;
             };
+            let changed_before_event = changed;
+            let consumed_before_event = self.counters.consumed_role_outputs;
             changed = true;
-            let result = match &event {
-                DeferredCommit::Role { ticket, accepted } => self.retire_role(*ticket, *accepted),
+            let result = match &mut event {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                DeferredCommit::ProfiledExternal { binding, packet } => {
+                    self.commit_profiled_packet(binding, packet)
+                }
+                DeferredCommit::Role { ticket, accepted } => self.retire_role(*ticket, *accepted)
+                    .map_err(|error| error.at_semantic_stage("deferred.role")),
                 DeferredCommit::Own { binding, report } => {
                     if self.phase == ManagerPhase::Running {
                         self.commit_own(binding, report)
                     } else {
-                        self.driver.cpu_slice_observed(&binding.work, report)
+                        self.driver
+                            .cpu_slice_observed(&binding.work, report)
+                            .and_then(|_| self.release_nnuec_report(&binding.work, report))
                     }
                 }
+                DeferredCommit::OwnNoValue {
+                    binding,
+                    report,
+                    closed,
+                } => self.commit_own_no_value(binding, report, closed),
                 DeferredCommit::External { binding, report } => {
                     if self.phase == ManagerPhase::Running {
                         self.commit_foreign(binding, report)
@@ -3275,31 +5660,70 @@ where
                     }
                 }
                 DeferredCommit::Closed(closed) => self.publish_closed_frame(closed),
-                DeferredCommit::OwnRaw { work, report } => {
-                    self.driver.cpu_slice_observed(work, report)
+                DeferredCommit::OwnRaw { work, report } => self
+                    .driver
+                    .cpu_slice_observed(work, report)
+                    .and_then(|_| self.release_nnuec_report(work, report)),
+                DeferredCommit::DetachedOwn { work, report } => self
+                    .driver
+                    .cpu_detached_slice_observed(work, report)
+                    .and_then(|_| self.release_nnuec_report(work, report)),
+                DeferredCommit::TokenDiscard { work, termination } => self
+                    .driver
+                    .cpu_token_discarded(work, termination)
+                    .and_then(|_| self.release_nnuec_terminal(work, termination.job)),
+                DeferredCommit::ReciprocalWait { work, report } => {
+                    self.driver.cpu_reciprocal_wait(work, report)
                 }
-                DeferredCommit::DetachedOwn { work, report } => {
-                    self.driver.cpu_detached_slice_observed(work, report)
+                DeferredCommit::ReciprocalDiscard { question } => {
+                    self.driver.discard_cpu_reciprocal(*question)
                 }
-                DeferredCommit::TokenDiscard { work, termination } => {
-                    self.driver.cpu_token_discarded(work, termination)
+                DeferredCommit::PeerDiscard { question } => {
+                    self.driver.discard_accepted_role_reciprocal(*question)
                 }
             };
             if let Err(error) = result {
                 // A failed hot commit cannot erase the original worker receipt.
                 // Shutdown may still settle it without restoring consumption.
                 self.deferred.push_front(event);
+                if self.semantic_replay_can_wait(&error)? {
+                    // Native terminals are drained/settled before this queue.
+                    // Keep the exact accepted head and make no synthetic tick
+                    // progress while waiting for its actual owner receipt.
+                    return Ok(changed_before_event
+                        || self.counters.consumed_role_outputs != consumed_before_event);
+                }
                 return Err(error);
+            }
+            // A collection failure closes normal admission, but once shutdown
+            // has started every already-admitted terminal still has to drain.
+            // The failure remains in `self.failures`, so using it as an
+            // unconditional stop condition here would repeatedly strand the
+            // remaining deferred receipts during draining.
+            if self.phase == ManagerPhase::Running && self.has_collection_failure() {
+                break;
             }
         }
         Ok(changed)
     }
     fn dispatch_roles(&mut self) -> Result<bool, AdaptiveManagerError> {
-        if !self.native_ready {
+        if !self.native_ready || !self.can_admit_work() {
             return Ok(false);
         }
         while let Some(dispatch) = self.registry.take_dispatch() {
             self.role_mut(dispatch.ticket.id)?.dispatch_pending = true;
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(busy) = self.collection_v2_busy_ticket {
+            if !self
+                .roles
+                .iter()
+                .any(|role| role.dispatch_pending && role.ticket == Some(busy))
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "original busy collection ticket lost",
+                ));
+            }
         }
         let mut changed = false;
         for index in 0..self.roles.len() {
@@ -3309,6 +5733,13 @@ where
             let Some(ticket) = self.roles[index].ticket else {
                 continue;
             };
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if self
+                .collection_v2_busy_ticket
+                .is_some_and(|busy| busy != ticket)
+            {
+                continue;
+            }
             if self.registration.endpoints.execution_use == CpuExecutionUse::Collection
                 && !self.roles[index].collection_registered
             {
@@ -3316,8 +5747,174 @@ where
                     .collection_before_dispatch(&ticket, &self.roles[index].input)?;
                 self.roles[index].collection_registered = true;
             }
+            if !self.roles[index].rovent_collection_registered {
+                let result = match &mut self.collection_observer {
+                    Some(observer) => observer.dispatch(&ticket, &self.roles[index].input),
+                    None => Ok(()),
+                };
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let mut collection_errors = Vec::new();
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let mut boundary_busy = false;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let mut v2_capture_possible = self.roles[index].v2_capture_possible;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                let result = result.and_then(|()| {
+                    match &mut self.collection_observer_v2 {
+                        Some(observer) => {
+                            let verifier = self.native.native_acceptance_verifier();
+                            let (admission, verifier) = self.collection_admission_v2.as_ref()
+                                .zip(verifier.as_ref())
+                                .ok_or_else(|| AdaptiveCollectionError::new(
+                                    AdaptiveCollectionStage::Dispatch,
+                                    "MissingV2Admission",
+                                    "V2 observer lost its original admission or native verifier",
+                                ))?;
+                            let witness = match collection::RoventCollectionDispatchWitnessV2::try_new(
+                                admission, verifier, &ticket,
+                            ) {
+                                Ok(witness) => witness,
+                                Err(collection::RoventDispatchWitnessFailureV2::Ticket(error))
+                                    if error.kind == collection::RoventTicketValidationKindV2::Busy => {
+                                        boundary_busy = true;
+                                        return Ok(());
+                                    }
+                                Err(collection::RoventDispatchWitnessFailureV2::Ticket(error)) => return Err(error.error),
+                                Err(collection::RoventDispatchWitnessFailureV2::NativeIdentity(error)) => return Err(error),
+                            };
+                            if self.collection_v2_disabled {
+                                let first = self.collection_v2_disabled_first_ticket.ok_or_else(||
+                                    AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,
+                                        "MissingDisabledBoundary", "disabled root lacks original first ticket"))?;
+                                if ticket.id.epoch != first.id.epoch || ticket.authority != first.authority {
+                                    return Err(AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch,
+                                        "DisabledBoundaryMismatch", "ticket differs from disabled root"));
+                                }
+                                if ticket.id.sequence < first.id.sequence {
+                                    match observer.allow_disabled_prior_ticket(witness)? {
+                                        collection::AdaptiveCollectionBoundaryV2::Ready => {}
+                                        collection::AdaptiveCollectionBoundaryV2::Busy => boundary_busy = true,
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            if let Some(original) = self.collection_v2_first_failure.as_ref() {
+                                match observer.disable_after_failure(witness, original) {
+                                    Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {
+                                        self.collection_v2_disabled = true;
+                                        self.collection_v2_disabled_first_ticket = Some(ticket);
+                                    }
+                                    Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => boundary_busy = true,
+                                    Err(error) => {
+                                        collection_errors.push(error);
+                                        return Err(original.clone());
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            match observer.dispatch(witness, &self.roles[index].input) {
+                                Ok(collection::AdaptiveCollectionDispatchV2::Captured) => {
+                                    v2_capture_possible = true;
+                                }
+                                Ok(collection::AdaptiveCollectionDispatchV2::Busy) => {
+                                    // Busy can retain an original staged reservation.
+                                    v2_capture_possible = true;
+                                    boundary_busy = true;
+                                }
+                                Ok(collection::AdaptiveCollectionDispatchV2::DisabledBackpressure) => {
+                                    self.collection_v2_disabled = true;
+                                    self.collection_v2_disabled_first_ticket = Some(ticket);
+                                }
+                                Err(original) => {
+                                    // An error may retain a partial staged owner.
+                                    v2_capture_possible = true;
+                                    self.collection_v2_first_failure = Some(original.clone());
+                                    collection_errors.push(original.clone());
+                                    let witness = match collection::RoventCollectionDispatchWitnessV2::try_new(
+                                        admission, verifier, &ticket,
+                                    ) {
+                                        Ok(witness) => witness,
+                                        Err(collection::RoventDispatchWitnessFailureV2::Ticket(error))
+                                            if error.kind == collection::RoventTicketValidationKindV2::Busy => {
+                                                boundary_busy = true;
+                                                return Ok(());
+                                            }
+                                        Err(collection::RoventDispatchWitnessFailureV2::Ticket(error)) => return Err(error.error),
+                                        Err(collection::RoventDispatchWitnessFailureV2::NativeIdentity(error)) => return Err(error),
+                                    };
+                                    match observer.disable_after_failure(witness, &original) {
+                                        Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {
+                                            self.collection_v2_disabled = true;
+                                            self.collection_v2_disabled_first_ticket = Some(ticket);
+                                        }
+                                        Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => boundary_busy = true,
+                                        Err(error) => {
+                                            collection_errors.push(error);
+                                            return Err(original);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
+                        None => Ok(()),
+                    }
+                });
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                {
+                    self.roles[index].v2_capture_possible = v2_capture_possible;
+                    if result.is_err() && self.collection_observer_v2.is_some() {
+                        self.collection_v2_disable_failed = true;
+                    }
+                    for error in collection_errors {
+                        self.record_failure(error.into());
+                    }
+                }
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if boundary_busy {
+                    // Retain the same unissued ticket and retry only inside
+                    // its original admission/deadline; a staged reservation
+                    // must resolve before another collection can disable.
+                    self.collection_v2_busy_ticket = Some(ticket);
+                    break;
+                }
+                if let Err(error) = result {
+                    let cancel = self.native.cancel(self.roles[index].preparation);
+                    if cancel.is_ok() {
+                        self.roles[index].cancellation_requested = true;
+                    }
+                    let abandoned = self
+                        .collection_observer
+                        .as_mut()
+                        .map(|observer| observer.abandoned(&ticket));
+                    if let Some(Err(other)) = abandoned {
+                        self.record_failure(other.into());
+                    }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if let Some(observer) = &mut self.collection_observer_v2 {
+                        if let Err(other) = observer.abandoned(&ticket) {
+                            self.record_failure(other.into());
+                        }
+                    }
+                    if let Err(native) = cancel {
+                        self.record_failure(error.into());
+                        return Err(native.into());
+                    }
+                    return Err(error.into());
+                }
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if self.collection_v2_busy_ticket == Some(ticket) {
+                    self.collection_v2_busy_ticket = None;
+                }
+                self.roles[index].rovent_collection_registered = true;
+            }
             if self.roles[index].queue_admitted_at.is_some() {
                 return Err(AdaptiveManagerError::Invalid("duplicate queue admission"));
+            }
+            // Preserve the original prepared ticket if a collector callback
+            // crossed its future-admission window before actual enqueue.
+            if !self.can_admit_work() {
+                break;
             }
             match self
                 .native
@@ -3335,7 +5932,22 @@ where
                     changed = true;
                 }
                 Err(TicketServiceError::Capacity) => break,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    let abandoned = self
+                        .collection_observer
+                        .as_mut()
+                        .map(|observer| observer.abandoned(&ticket));
+                    if let Some(Err(other)) = abandoned {
+                        self.record_failure(other.into());
+                    }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if let Some(observer) = &mut self.collection_observer_v2 {
+                        if let Err(other) = observer.abandoned(&ticket) {
+                            self.record_failure(other.into());
+                        }
+                    }
+                    return Err(error.into());
+                }
             }
         }
         Ok(changed)
@@ -3371,6 +5983,15 @@ where
                             &ticket,
                             output.proposer_ranking_output(),
                         )?;
+                    } else if self.roles[index].purpose == RolePurpose::RoventGoalLocal {
+                        let original = self.roles[index].goal_local.as_ref().ok_or(
+                            AdaptiveManagerError::Invalid("GoalLocal original input missing"),
+                        )?;
+                        self.driver.validate_rovent_goal_input(
+                            original,
+                            &ticket,
+                            output.proposer_ranking_output(),
+                        )?;
                     } else if self.roles[index].purpose == RolePurpose::RootRanking {
                         validate_root_ranking_view(&ready.view, self.driver.root_rules().as_ref())?;
                     } else {
@@ -3394,10 +6015,25 @@ where
                 return Err(AdaptiveManagerError::Capacity("native ack queue"));
             }
             let permit = if accepted
+                && (matches!(
+                    self.roles[index].purpose,
+                    RolePurpose::Reciprocal
+                        | RolePurpose::RoventRefinement
+                        | RolePurpose::RoventFresh
+                        | RolePurpose::RoventGoalLocal
+                ) || (self.roles[index].purpose == RolePurpose::Refinement
+                    && self.has_collection_v2())) {
+                Some(self.registry.issue_reciprocal_native_acceptance(
+                    &ticket,
+                    self.clock.domain(),
+                    now,
+                )?)
+            } else if accepted
                 && matches!(
                     self.roles[index].purpose,
                     RolePurpose::RootRanking | RolePurpose::Validator
-                ) {
+                )
+            {
                 Some(
                     self.registry
                         .issue_native_acceptance(&ticket, self.clock.domain(), now)?,
@@ -3416,6 +6052,11 @@ where
         Ok(changed)
     }
     fn flush_acks(&mut self) -> Result<(), AdaptiveManagerError> {
+        // The original native close now owns disposal. Preserve unsent ACKs
+        // and linear permits until its fence; do not enqueue into a retired root.
+        if self.phase != ManagerPhase::Running {
+            return Ok(());
+        }
         while let Some(mut ack) = self.acknowledgements.pop_front() {
             let result = if let Some(permit) = ack.permit.take() {
                 match self
@@ -3434,7 +6075,19 @@ where
                 self.native.discard(ack.preparation, ack.ticket)
             };
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    let binding = self
+                        .roles
+                        .iter_mut()
+                        .find(|binding| {
+                            binding.preparation == ack.preparation
+                                && binding.ticket == Some(ack.ticket)
+                        })
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "original dispatched native ACK binding",
+                        ))?;
+                    binding.ack_dispatched = true;
+                }
                 Err(TicketServiceError::Capacity) => {
                     self.acknowledgements.push_front(ack);
                     break;
@@ -3612,17 +6265,21 @@ where
         match event {
             CpuWorkerEvent::Slice(report) => {
                 self.counters.cpu_slice_receipts += 1;
-                if let Err(error) = self.ledger.settle(&report) {
-                    if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
-                        diagnostic.mark_unavailable(
-                            AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
-                        );
+                let settled = match self.native_ledger_mut()?.settle_attested(&report) {
+                    Ok(settled) => settled,
+                    Err(error) => {
+                        self.quarantine_frontier_slot(slot);
+                        if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
+                            diagnostic.mark_unavailable(
+                                AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
+                            );
+                        }
+                        self.quarantined_cpu_receipts
+                            .push(CpuWorkerEvent::Slice(report));
+                        self.phase = ManagerPhase::Quarantined;
+                        return Err(error.into());
                     }
-                    self.quarantined_cpu_receipts
-                        .push(CpuWorkerEvent::Slice(report));
-                    self.phase = ManagerPhase::Quarantined;
-                    return Err(error.into());
-                }
+                };
                 self.own[slot].settled_execution = Some(report.grant.execution);
                 let Some(mut binding) = self.own[slot].binding.take() else {
                     if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
@@ -3638,6 +6295,9 @@ where
                     ));
                 };
                 if report.grant != binding.grant {
+                    if let Some(reservation) = binding.native_frontier.take() {
+                        self.retain_frontier_unknown(reservation);
+                    }
                     if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
                         diagnostic.mark_unavailable(
                             AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
@@ -3651,15 +6311,65 @@ where
                         "CPU slice grant echo mismatch",
                     ));
                 }
+                // Validate the original submitted question before preserving a
+                // worker cause or taking the exact soft no-value path.
+                if report.grant.job != binding.envelope.id
+                    || binding.work.frame.authority != binding.envelope.id.authority
+                    || binding.work.input.question_digest != binding.envelope.question
+                    || binding.work.original_deadline != binding.envelope.hard_deadline
+                {
+                    self.own[slot].binding = Some(binding);
+                    self.quarantined_cpu_receipts
+                        .push(CpuWorkerEvent::Slice(report));
+                    self.phase = ManagerPhase::Quarantined;
+                    return Err(AdaptiveManagerError::Invalid(
+                        "CPU receipt original question binding",
+                    ));
+                }
+                let rejected_after_owner_termination = binding.queued_resume_termination.is_some()
+                    && report.admission_rejected
+                    && report.actual_work == Some(rz_search::cpu::CpuWork::default())
+                    && !report.terminal
+                    && !report.continuation_retained;
+                if let Err(error) = &report.result {
+                    if !rejected_after_owner_termination
+                        && error.value_authority_stop().is_none()
+                        && !self.failures.iter().any(|failure| {
+                            matches!(failure, AdaptiveManagerError::Cpu(CpuWorkerError::Cpu(_)))
+                        })
+                    {
+                        // Preserve the first hard cause before any later
+                        // generic recovery failure. The raw typed error stays
+                        // in the original binding/deferred receipt as well.
+                        self.record_failure(AdaptiveManagerError::Cpu(CpuWorkerError::Cpu(
+                            error.clone(),
+                        )));
+                    }
+                }
+                // The same accepted native-ledger receipt remains available
+                // for collection after actual Store consumption. It is never
+                // recreated from reported counters or a global snapshot.
+                binding.semantic_settlement = Some(settled.clone());
+                if let Some(reservation) = binding.native_frontier.take() {
+                    self.retain_frontier_settlement(reservation, report.clone(), settled);
+                    if let Err(error) = self.flush_frontier_native() {
+                        // Keep original execution/receipt custody even when
+                        // common accounting rejects it. No zero-work fallback.
+                        binding.pending_slice = Some(report);
+                        self.own[slot].binding = Some(binding);
+                        self.phase = ManagerPhase::Quarantined;
+                        return Err(error);
+                    }
+                }
                 // Copy only after the original ledger and binding/grant
                 // checks. This is prior to timing/semantic/yield processing;
                 // those paths may still fail with their original errors.
                 if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
                     let accounting = self
-                        .ledger
+                        .native_ledger()?
                         .global_usage()
                         .ok()
-                        .zip(self.ledger.usage(report.grant.job).ok())
+                        .zip(self.native_ledger()?.usage(report.grant.job).ok())
                         .map(
                             |(
                                 (global_spent, global_reserved),
@@ -3695,6 +6405,16 @@ where
                         accounting,
                         timing,
                     );
+                }
+                if binding.queued_resume_termination.is_some() {
+                    // The real terminal already discarded the OLD paused
+                    // token; this newer queued grant has only now settled.
+                    // Preserve both original reports until their joint close.
+                    binding.pending_slice = Some(report);
+                    self.own[slot].binding = Some(binding);
+                    return self
+                        .retire_queued_resume_after_owner_termination(slot)
+                        .map(|_| ());
                 }
                 // Original worker boundaries only. Queue delivery, paused
                 // residence and manager processing are outside these scopes.
@@ -3784,6 +6504,8 @@ where
                     return Err(error);
                 }
                 if report.admission_rejected {
+                    // A rejected command remains the original admission error;
+                    // it is not relabelled as an entered no-value termination.
                     // Credit has been settled by a definite no-work report. Do
                     // not manufacture a CPU result or move an existing stack.
                     if report.continuation_retained {
@@ -3799,6 +6521,31 @@ where
                     return Err(AdaptiveManagerError::Invalid(
                         "private CPU admission was rejected",
                     ));
+                }
+                if report
+                    .result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.value_authority_stop())
+                    .is_some()
+                {
+                    // Keep the original worker terminal and its typed cause.
+                    // The Search consumer validates every terminal/known-work
+                    // condition; no JobTerminated packet or score is minted.
+                    self.defer(DeferredCommit::OwnNoValue {
+                        binding,
+                        report,
+                        closed: None,
+                    })?;
+                    self.flush_deferred()?;
+                    return Ok(());
+                }
+                if report
+                    .result
+                    .as_ref()
+                    .is_ok_and(|actual| actual.report.completion == CpuCompletion::AwaitReciprocal)
+                {
+                    return self.retain_reciprocal_wait(slot, binding, report);
                 }
                 if report.continuation_retained && !report.terminal {
                     if binding.feedback_forwarded {
@@ -3968,13 +6715,17 @@ where
                 }
             }
             CpuWorkerEvent::JobTerminated(termination) => {
-                if let Err(error) = self.ledger.accept_job_termination(&termination) {
+                if let Err(error) = self
+                    .native_ledger_mut()?
+                    .accept_job_termination(&termination)
+                {
+                    self.quarantine_frontier_slot(slot);
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::JobTerminated(termination));
                     self.phase = ManagerPhase::Quarantined;
                     return Err(error.into());
                 }
-                let Some(binding) = self.own[slot].binding.take() else {
+                let Some(mut binding) = self.own[slot].binding.take() else {
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::JobTerminated(termination));
                     self.phase = ManagerPhase::Quarantined;
@@ -3993,11 +6744,48 @@ where
                         "CPU token termination owner mismatch",
                     ));
                 }
+                if termination.last_execution != binding.grant.execution {
+                    let usage = self.native_ledger()?.usage(binding.envelope.id)?;
+                    if binding.queued_resume_termination.is_some()
+                        || termination.last_execution.epoch != binding.grant.execution.epoch
+                        || termination.last_execution.sequence >= binding.grant.execution.sequence
+                        || usage.1 != binding.grant.node_credit
+                        || usage.2
+                    {
+                        self.own[slot].binding = Some(binding);
+                        self.quarantined_cpu_receipts
+                            .push(CpuWorkerEvent::JobTerminated(termination));
+                        self.phase = ManagerPhase::Quarantined;
+                        return Err(AdaptiveManagerError::Invalid(
+                            "CPU termination does not precede its outstanding Resume",
+                        ));
+                    }
+                    // The ledger accepted the old stack's actual terminal but
+                    // intentionally retained the newer reservation. Its owner
+                    // must still return that queued command's original report.
+                    binding.resume_pending = false;
+                    binding.queued_resume_termination = Some(termination);
+                    self.own[slot].binding = Some(binding);
+                    return Ok(());
+                }
                 if let Some(report) = binding.pending_slice {
                     self.defer(DeferredCommit::OwnRaw {
                         work: binding.work.clone(),
                         report,
                     })?;
+                }
+                if let Some(custody) = binding.reciprocal {
+                    if !custody.observed {
+                        self.defer(DeferredCommit::ReciprocalWait {
+                            work: binding.work.clone(),
+                            report: custody.report,
+                        })?;
+                    }
+                    if let Some(question) = custody.question {
+                        self.defer(DeferredCommit::ReciprocalDiscard {
+                            question: question.id,
+                        })?;
+                    }
                 }
                 self.defer(DeferredCommit::TokenDiscard {
                     work: binding.work.clone(),
@@ -4018,6 +6806,105 @@ where
             }
         }
         Ok(())
+    }
+    fn retire_queued_resume_after_owner_termination(
+        &mut self,
+        slot: usize,
+    ) -> Result<bool, AdaptiveManagerError> {
+        if !self.driver.semantic_owner_available() {
+            return Ok(false);
+        }
+        let binding = self.own[slot]
+            .binding
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "terminated queued Resume binding",
+            ))?;
+        let termination =
+            binding
+                .queued_resume_termination
+                .as_ref()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "original paused owner terminal",
+                ))?;
+        let report = binding
+            .pending_slice
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "original queued Resume report",
+            ))?;
+        let settled = binding
+            .semantic_settlement
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "queued Resume ledger settlement",
+            ))?;
+        if binding.native_frontier.is_some() || self.pending_frontier_for(binding.envelope.id) {
+            return Ok(false);
+        }
+        if !report.admission_rejected
+            || report.actual_work != Some(rz_search::cpu::CpuWork::default())
+            || report.result.is_ok()
+            || report.terminal
+            || report.continuation_retained
+            || settled.grant() != binding.grant
+            || settled.ledger_identity() != &self.native_ledger()?.identity()
+            || settled.terminated_owner_receipt() != Some(termination)
+            || binding.reciprocal.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "terminated owner requires its settled no-work Resume rejection",
+            ));
+        }
+        // Reserve every deferred seat before changing Search or releasing the
+        // binding. Capacity failure leaves the two original reports in custody.
+        let slots = 2 + usize::from(!binding.feedback_forwarded);
+        if self
+            .deferred
+            .len()
+            .checked_add(slots)
+            .is_none_or(|sum| sum > 128)
+        {
+            return Ok(false);
+        }
+        self.deferred
+            .try_reserve(slots)
+            .map_err(|_| AdaptiveManagerError::Capacity("terminated Resume handoff"))?;
+        let closed = if binding.feedback_forwarded {
+            None
+        } else {
+            Some(self.machine.retire_rejected_cpu_resume(
+                binding.work.frame,
+                termination,
+                settled,
+                receipt_digest(b"cpu-queued-resume-discard", report.grant.execution),
+                "CPU owner terminated before queued Resume",
+            )?)
+        };
+        let mut binding = self.own[slot]
+            .binding
+            .take()
+            .expect("validated original binding");
+        let report = binding
+            .pending_slice
+            .take()
+            .expect("retained original report");
+        let termination = binding
+            .queued_resume_termination
+            .take()
+            .expect("retained original terminal");
+        self.deferred.push_back(DeferredCommit::OwnRaw {
+            work: binding.work.clone(),
+            report,
+        });
+        self.deferred.push_back(DeferredCommit::TokenDiscard {
+            work: binding.work,
+            termination,
+        });
+        if let Some(closed) = closed {
+            self.deferred.push_back(DeferredCommit::Closed(closed));
+        }
+        Ok(true)
     }
     fn observe_yield_ack_latency(
         &mut self,
@@ -4131,7 +7018,7 @@ where
                 .push(completion.into_report());
             self.phase = ManagerPhase::Quarantined;
             if let Err(error) = teacher_observed {
-                self.record_failure(error);
+                self.record_failure(error.at_semantic_stage("foreign_old_scope_observation"));
             }
             return Err(AdaptiveManagerError::Invalid(
                 "external old-go or unsupported exact resume",
@@ -4233,12 +7120,114 @@ where
         self.flush_deferred()?;
         Ok(())
     }
+    fn validate_own_nnuec_custody(
+        &self,
+        binding: &OwnBinding<Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        if let Some(original) = &binding.nnuec {
+            if original.seal.frame() != binding.work.frame
+                || original.seal.question_digest() != binding.envelope.question
+                || !Arc::ptr_eq(original.seal.view(), &binding.work.input.view)
+                || original.receipt.binding_digest() != binding.envelope.evaluation_namespace
+                || !original.receipt.matches_bound(&original.bound)
+                || !original.receipt.installed_profile().is_some_and(|profile| {
+                    profile.owner == binding.grant.owner
+                        && profile.search_conditions == binding.envelope.search_conditions
+                })
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "CPU result lost original installed NNUEC custody",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn commit_own_no_value(
+        &mut self,
+        binding: &OwnBinding<Q>,
+        report: &CpuSliceReport,
+        closed: &mut Option<ClosedFrame>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.validate_own_nnuec_custody(binding)?;
+        let receipt_seal = self.driver.cpu_no_value_terminated(&binding.work, report)?;
+        self.release_nnuec_report(&binding.work, report)?;
+        if binding.feedback_forwarded {
+            // Only old CPU custody ended. Its already-advanced logical frame
+            // and any new P/C/Fresh responsibility remain untouched.
+            return Ok(());
+        }
+        if closed.is_none() {
+            *closed = Some(self.machine.retire_cpu_no_value(
+                &binding.work,
+                report,
+                receipt_seal,
+            )?);
+        }
+        let closed = closed
+            .as_ref()
+            .expect("actual no-value retirement retained");
+        self.release_accepted_role_waiters(closed.id)?;
+        // The existing publisher records an Unknown closure only. In particular
+        // there is no utility_cpu_committed/after_cpu/goal completion here.
+        self.publish_closed_frame(closed)
+    }
     fn commit_own(
         &mut self,
         binding: &OwnBinding<Q>,
         report: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
-        let checked = self.driver.commit_cpu(&binding.work, report)?;
+        let utility_execution = StepExecution::Cpu {
+            job: binding.envelope.id,
+            execution: report.grant.execution,
+        };
+        self.utility_begin_commit(&binding.work, utility_execution)?;
+        self.validate_own_nnuec_custody(binding)?;
+        if self
+            .accepted_roles
+            .iter()
+            .any(|held| held.child == Some(binding.work.frame))
+        {
+            let consumed = self.driver.consume_reciprocal_cpu(&binding.work, report);
+            if consumed.is_ok()
+                || self
+                    .driver
+                    .cpu_semantic_publication_recorded(&binding.work, report)
+            {
+                self.utility_cpu_committed(&binding.work, utility_execution)?;
+                self.observe_cpu_semantic_use(binding, report);
+            }
+            let digest = consumed?;
+            self.release_nnuec_report(&binding.work, report)?;
+            self.machine.resolve_reciprocal_cpu_response(
+                StepEvidence {
+                    frame: binding.work.frame,
+                    stage: binding.work.input.stage,
+                    execution: StepExecution::Cpu {
+                        job: binding.envelope.id,
+                        execution: report.grant.execution,
+                    },
+                    submitted_question: binding.work.input.question_digest,
+                    submitted_view: binding.work.input.view_seal,
+                    completed_evidence: digest,
+                },
+                report,
+                self.clock.domain(),
+                self.check_running()?,
+            )?;
+            self.release_accepted_role_waiters(binding.work.frame)?;
+            return Ok(());
+        }
+        let committed = self.driver.commit_cpu(&binding.work, report);
+        if committed.is_ok()
+            || self
+                .driver
+                .cpu_semantic_publication_recorded(&binding.work, report)
+        {
+            self.utility_cpu_committed(&binding.work, utility_execution)?;
+            self.observe_cpu_semantic_use(binding, report);
+        }
+        let checked = committed?;
+        self.release_nnuec_report(&binding.work, report)?;
         self.resolve(
             binding.work.clone(),
             StepExecution::Cpu {
@@ -4371,16 +7360,27 @@ where
                 });
             }
             published?;
+        } else {
+            self.rovent_lane_after_resolve(&work)?;
+            self.utility_register_descendant(work.frame)?;
         }
         Ok(())
     }
     fn schedule(&mut self) -> Result<bool, AdaptiveManagerError> {
-        if !self.role_call_admission_available() {
+        if !self.role_call_admission_available() && self.peer_policy.is_none() {
             return Ok(false);
         }
         if !self.driver.prepare_semantic_commit()? {
             return Ok(false);
         }
+        let peers_changed = self.drive_accepted_role_parents()?;
+        if self.maybe_close_utility_route()? {
+            return Ok(true);
+        }
+        if !self.can_admit_work() {
+            return Ok(peers_changed);
+        }
+        let reciprocal_changed = self.admit_waiting_reciprocal_questions()?;
         let now = self.check_running()?;
         let now_duration = Duration::from_nanos(now.0);
         // Small ID list only; no record payload, tensor or statistics snapshot
@@ -4390,11 +7390,18 @@ where
             .frames()
             .filter(|frame| {
                 frame.phase == FramePhase::Ready
+                    && self.utility_allows_frame(frame.id)
+                    && self.machine.waiting_on(frame.id).is_none()
                     && self
                         .exclusive_scope
                         .as_ref()
                         .is_none_or(|scope| scope.allows(frame.id))
                     && !self.ready_ids.contains(&frame.id)
+                    && !self.profiled_frame_pending(frame.id)
+                    && self
+                        .nnuec_pending
+                        .as_ref()
+                        .is_none_or(|pending| pending.work.frame != frame.id)
                     && !self.validator_waiting.contains(&frame.id)
                     && !self.roles.iter().any(|role| {
                         role.work
@@ -4445,9 +7452,19 @@ where
                 .map_err(|_| AdaptiveManagerError::Capacity("ready frame descriptor"))?;
             self.ready_ids.push(id);
         }
-        let advice = self.advice(now)?;
-        let mut changed = false;
-        if advice.yield_selected_worker {
+        let advice = if self.researcher_source_kind() == AdaptiveResearcherSourceKind::Native {
+            Some(self.advice(now)?)
+        } else {
+            None
+        };
+        let native_worker_limit = advice.map_or(0, |advice| usize::from(advice.workers));
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let cohort_changed =
+            self.maybe_admit_utility_cohort()? | self.maybe_admit_utility_intervention()?;
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let cohort_changed = false;
+        let mut changed = peers_changed || reciprocal_changed || cohort_changed;
+        if advice.is_some_and(|advice| advice.yield_selected_worker) {
             if let Some(selection) = self.advised_yield.take() {
                 // Advice and delivery refer to the same original execution;
                 // do not rescan and transfer one owner's forecast to another.
@@ -4459,6 +7476,7 @@ where
                             binding.grant.execution == execution
                                 && !binding.feedback_forwarded
                                 && !binding.resume_pending
+                                && binding.reciprocal.is_none()
                                 && binding.requested_yield.is_none()
                         }) {
                             let sequence = self.issue_control()?;
@@ -4493,7 +7511,17 @@ where
         }
         for index in 0..self.own.len() {
             if !self.role_call_admission_available() {
-                break;
+                let retained_peer_r = self.own[index].binding.as_ref().is_some_and(|binding| {
+                    self.accepted_roles
+                        .iter()
+                        .any(|held| held.child == Some(binding.work.frame))
+                });
+                if self.peer_policy.is_none() {
+                    break;
+                }
+                if !retained_peer_r {
+                    continue;
+                }
             }
             if self.own[index].binding.as_ref().is_some_and(|binding| {
                 binding.feedback_forwarded
@@ -4517,9 +7545,23 @@ where
                         .map_err(|_| AdaptiveManagerError::Invalid("detached CPU cancel"))?;
                     binding.resume_pending = false;
                     changed = true;
-                } else if let Some(slice) = advice.slice {
-                    self.resume_cpu(index, slice.node_credit, slice.soft_lease)?;
+                } else if self.utility_scope_open() {
+                    // The completed action step's old stack is sunk custody,
+                    // not another utility route. Cancel the same owner/token;
+                    // its terminal and final drain remain inside this cost.
+                    let sequence = self.issue_control()?;
+                    let binding = self.own[index]
+                        .binding
+                        .as_mut()
+                        .expect("original utility CPU owner");
+                    binding.controls.request_cancel(sequence).map_err(|_| {
+                        AdaptiveManagerError::Invalid("utility detached CPU cancel")
+                    })?;
+                    binding.resume_pending = false;
                     changed = true;
+                } else if let Some(slice) = advice.and_then(|advice| advice.slice) {
+                    let result = self.resume_cpu(index, slice.node_credit, slice.soft_lease);
+                    changed |= self.native_admission_result(result)?;
                 }
                 continue;
             }
@@ -4527,13 +7569,21 @@ where
                 !binding.feedback_forwarded
                     && binding.resume_pending
                     && binding.pending_slice.is_none()
+                    && binding
+                        .reciprocal
+                        .as_ref()
+                        .is_none_or(|held| held.reply.is_some())
                     && !self.validator_waiting.contains(&binding.work.frame)
                     && self
                         .exclusive_scope
                         .as_ref()
                         .is_none_or(|scope| scope.allows(binding.work.frame))
             }) {
-                if self.registration.endpoints.load_v
+                if self.own[index]
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.reciprocal.is_none())
+                    && self.registration.endpoints.load_v
                     && self.registration.endpoints.execution_use == CpuExecutionUse::Collection
                 {
                     let binding = self.own[index]
@@ -4584,31 +7634,40 @@ where
                             .validator_reviewed_execution = Some(execution);
                     }
                 }
-                let Some(slice) = advice.slice else {
+                let Some(slice) = advice.and_then(|advice| advice.slice) else {
                     continue;
                 };
-                self.resume_cpu(index, slice.node_credit, slice.soft_lease)?;
-                changed = true;
+                let result = self.resume_cpu(index, slice.node_credit, slice.soft_lease);
+                changed |= self.native_admission_result(result)?;
             }
+        }
+        if self.phase != ManagerPhase::Running {
+            return Ok(changed);
         }
         if self.registration.policy == CoordinatorPolicy::Synchronous
             && (!self.roles.is_empty()
-                || self.own.iter().any(|slot| slot.binding.is_some())
+                || self.own.iter().any(|slot| {
+                    slot.binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.reciprocal.is_none())
+                })
                 || self.foreign.is_some()
+                || self.profiled_busy()
                 || !self.deferred.is_empty())
         {
             return Ok(changed);
         }
         for _ in 0..64 {
-            if self.roles.len() >= self.role_pending_limit()
-                || !self.role_call_admission_available()
+            if (self.roles.len() >= self.role_pending_limit()
+                || !self.role_call_admission_available())
+                && self.peer_policy.is_none()
             {
                 break;
             }
             let own_available = self
                 .own
                 .iter()
-                .take(usize::from(advice.workers))
+                .take(native_worker_limit)
                 .any(|slot| slot.binding.is_none() && !slot.joined);
             // Do not keep selecting an ineligible CPU job merely to alter its
             // deficit. The role queue may still progress while CPU is occupied.
@@ -4619,9 +7678,14 @@ where
                     self.machine.frame(*id).map(|frame| {
                         (
                             *id,
-                            (frame.input.stage.role().is_some()
-                                || own_available
-                                || (self.external.is_some() && self.foreign.is_none()))
+                            (if frame.input.stage.role().is_some() {
+                                self.role_call_admission_available()
+                                    && self.roles.len() < self.role_pending_limit()
+                            } else {
+                                (own_available && self.nnuec_work_eligible(frame.id))
+                                    || (self.external.is_some() && self.foreign.is_none())
+                                    || self.profiled_dispatch_available()
+                            }) && self.utility_allows_frame(frame.id)
                                 && self
                                     .exclusive_scope
                                     .as_ref()
@@ -4635,11 +7699,18 @@ where
                     .set_dependencies_ready(&id, eligible)
                     .map_err(|_| AdaptiveManagerError::Invalid("ready dependency update"))?;
             }
-            let Some(selected) = self
-                .ready
-                .select(now_duration, None)
-                .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
-            else {
+            let selected = if let Some(pending) = self
+                .nnuec_pending
+                .as_ref()
+                .filter(|pending| pending.job_ready() && pending.slot < native_worker_limit)
+            {
+                Some(pending.selection.clone())
+            } else {
+                self.ready
+                    .select(now_duration, None)
+                    .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
+            };
+            let Some(selected) = selected else {
                 break;
             };
             self.ready_ids.retain(|id| *id != selected.job.job);
@@ -4648,7 +7719,39 @@ where
                 self.clock.domain(),
                 self.check_running()?,
             )?;
-            if let Some(mut terminal) = self.driver.short_circuit(&work)? {
+            let utility_started = match self.maybe_start_utility_route(&work) {
+                Ok(started) => started,
+                Err(AdaptiveManagerError::AuxiliaryPending) => {
+                    self.ready.admit(selected.job).map_err(|_| {
+                        AdaptiveManagerError::Capacity("original utility waiting descriptor")
+                    })?;
+                    self.ready_ids.push(work.frame);
+                    return Ok(changed);
+                }
+                Err(error) => return Err(error),
+            };
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let preparing_intervention = self.utility_intervention.is_some();
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            let preparing_intervention = false;
+            if utility_started && (work.input.stage.role().is_some() || preparing_intervention) {
+                self.ready.admit(selected.job).map_err(|_| {
+                    AdaptiveManagerError::Capacity("original utility ready descriptor")
+                })?;
+                self.ready_ids.push(work.frame);
+                return Ok(true);
+            }
+            let reciprocal_child = self.is_reciprocal_child(work.frame);
+            if let Some(mut terminal) = if reciprocal_child {
+                None
+            } else {
+                self.driver.short_circuit(&work)?
+            } {
+                self.driver.rovent_rules_endpoint(
+                    &work,
+                    self.clock.domain(),
+                    self.check_running()?,
+                )?;
                 if terminal.checked.fresh_pair.is_some() {
                     return Err(AdaptiveManagerError::Invalid(
                         "Rules proof cannot claim neural Fresh pair",
@@ -4703,14 +7806,26 @@ where
                 changed = true;
                 continue;
             }
-            if self.registration.endpoints.load_v {
+            if !reciprocal_child {
+                if let Some(boundary) = self.driver.prepare_rovent_goal_boundary(&work)? {
+                    self.machine.advance_original_goal_boundary(
+                        work.frame,
+                        boundary,
+                        self.clock.domain(),
+                        self.check_running()?,
+                    )?;
+                    changed = true;
+                    continue;
+                }
+            }
+            if self.registration.endpoints.load_v && !reciprocal_child {
                 if self.exclusive_requested && self.exclusive_scope.is_none() {
                     if !self.roles.is_empty()
                         || self.own.iter().any(|slot| slot.binding.is_some())
                         || self.foreign.is_some()
                         || !self.deferred.is_empty()
                         || self.registry.occupancy() != 0
-                        || self.ledger.global_usage()?.1 != 0
+                        || self.native_credit_outstanding()?
                     {
                         return Err(AdaptiveManagerError::Invalid(
                             "exclusive scope requires idle physical owners",
@@ -4772,7 +7887,27 @@ where
             }
             if work.input.stage.role().is_some() {
                 let input = work.input.clone();
-                match self.prepare_role(Some(work), input, RolePurpose::Refinement) {
+                let purpose = if reciprocal_child {
+                    RolePurpose::Reciprocal
+                } else if goals::is_fresh_endpoint(work.input.stage)
+                    && self.driver.rovent_root_budget()?.is_some()
+                {
+                    RolePurpose::RoventFresh
+                } else if self.peer_policy.is_some()
+                    && matches!(
+                        work.input.stage,
+                        RefinementStage::ProposalContinuation
+                            | RefinementStage::Repair
+                            | RefinementStage::CriticDivergence
+                            | RefinementStage::CriticReply
+                            | RefinementStage::CounterContinuation
+                    )
+                {
+                    RolePurpose::RoventRefinement
+                } else {
+                    RolePurpose::Refinement
+                };
+                match self.prepare_role(Some(work), input, purpose) {
                     Ok(_) => {
                         changed = true;
                     }
@@ -4780,12 +7915,15 @@ where
                     Err(error) => return Err(error),
                 }
             } else {
-                let profiles: Vec<_> = self
-                    .own
-                    .iter()
-                    .filter_map(|slot| slot.worker.as_ref().map(CpuWorker::profile))
-                    .collect();
-                let (spent, reserved) = self.ledger.global_usage()?;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if self.researcher_source_kind() == AdaptiveResearcherSourceKind::ProfiledExternal {
+                    changed |= self.begin_profiled_cpu(work)?;
+                    if self.registration.policy == CoordinatorPolicy::Synchronous {
+                        break;
+                    }
+                    continue;
+                }
+                let (spent, reserved) = self.native_ledger()?.global_usage()?;
                 let total = spent
                     .checked_add(reserved)
                     .ok_or(AdaptiveManagerError::Invalid(
@@ -4796,12 +7934,11 @@ where
                         "native CPU root credit overrun",
                     ));
                 }
-                let endpoint =
-                    if self.registration.endpoints.execution_use == CpuExecutionUse::Collection {
-                        self.registration.endpoints.cpu_t
-                    } else {
-                        self.registration.endpoints.cpu_r
-                    };
+                let endpoint = dispatch_cpu_endpoint(
+                    self.registration.endpoints,
+                    self.researcher_source_kind(),
+                    self.nnuec.is_some(),
+                );
                 // Outstanding reservations are not completed work. Leave the
                 // still-ready frame for the next tick after its real receipt.
                 if endpoint == CpuEndpoint::Own
@@ -4813,24 +7950,93 @@ where
                 let physical_budget_exhausted = endpoint == CpuEndpoint::Own
                     && spent == self.registration.native_cpu_node_limit
                     && reserved == 0;
-                let question = self
-                    .driver
-                    .cpu_question(
-                        &work,
-                        &profiles,
-                        self.external.as_ref().map(|external| &external.config),
-                        self.registration.endpoints,
-                        physical_budget_exhausted,
-                    )
-                    .map_err(|error| match error {
-                        AdaptiveManagerError::Semantic(detail) => {
-                            let usage = self.ledger.global_usage();
-                            AdaptiveManagerError::Semantic(format!(
-                                "CPU question dispatch manager_spent_reserved={usage:?}; {detail}"
-                            ))
+                if self.nnuec.is_some()
+                    && endpoint == CpuEndpoint::Own
+                    && !physical_budget_exhausted
+                    && self.nnuec_pending.is_none()
+                {
+                    let Some(slot) =
+                        self.own.iter().take(native_worker_limit).position(|slot| {
+                            slot.binding.is_none() && !slot.joined && !slot.panicked
+                        })
+                    else {
+                        break;
+                    };
+                    // Common quota is checked before C preparation or TT work.
+                    // No native reservation or new Job exists at this point.
+                    let capacity = self.driver.frontier_native_capacity(
+                        1,
+                        self.clock.domain(),
+                        self.check_running()?,
+                    );
+                    match capacity {
+                        Ok(Some(0)) => {
+                            changed |= self.native_admission_result(Err(
+                                AdaptiveManagerError::Frontier(FrontierError::NodeBudget),
+                            ))?;
+                            return Ok(changed);
                         }
-                        other => other,
-                    })?;
+                        Ok(_) => {}
+                        Err(error) if self.semantic_replay_can_wait(&error)? => {
+                            self.ready.admit(selected.job).map_err(|_| {
+                                AdaptiveManagerError::Capacity("original NNUEC ready descriptor")
+                            })?;
+                            self.ready_ids.push(work.frame);
+                            return Ok(changed);
+                        }
+                        Err(error) => {
+                            changed |= self.native_admission_result(Err(error))?;
+                            return Ok(changed);
+                        }
+                    }
+                    self.start_nnuec_work(&work, slot, selected)?;
+                    return Ok(true);
+                }
+                let profiles: Vec<_> = if self.nnuec.is_some() && !physical_budget_exhausted {
+                    let pending =
+                        self.nnuec_pending
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "NNUEC exact work preparation missing",
+                            ))?;
+                    if pending.work.frame != work.frame || !pending.job_ready() {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "NNUEC work is not acknowledged by original owner",
+                        ));
+                    }
+                    vec![
+                        self.own[pending.slot]
+                            .worker
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "NNUEC original worker missing",
+                            ))?
+                            .acknowledged_profile()?,
+                    ]
+                } else {
+                    self.own
+                        .iter()
+                        .filter_map(|slot| slot.worker.as_ref().map(CpuWorker::profile))
+                        .collect()
+                };
+                let question = match self.driver.cpu_question(
+                    &work,
+                    &profiles,
+                    self.external.as_ref().map(|external| &external.config),
+                    endpoint,
+                    physical_budget_exhausted,
+                ) {
+                    Ok(question) => question,
+                    Err(AdaptiveManagerError::Semantic(detail)) => {
+                        let usage = self
+                            .native_ledger()
+                            .and_then(|ledger| ledger.global_usage().map_err(Into::into));
+                        return Err(AdaptiveManagerError::Semantic(format!(
+                            "CPU question dispatch manager_spent_reserved={usage:?}; {detail}"
+                        )));
+                    }
+                    Err(other) => return Err(other),
+                };
                 match question {
                     CpuQuestion::OwnBudgetExhausted {
                         semantic_limit,
@@ -4839,7 +8045,7 @@ where
                         if !physical_budget_exhausted
                             || semantic_limit != self.registration.native_cpu_node_limit
                             || semantic_spent > spent
-                            || !self.failures.is_empty()
+                            || self.has_execution_failure()
                             || !self.quarantined_cpu_receipts.is_empty()
                         {
                             return Err(AdaptiveManagerError::Invalid(
@@ -4847,27 +8053,35 @@ where
                             ));
                         }
                         self.cpu_node_limit_reached = true;
-                        self.begin_root_quiesce(
-                            Instant::now()
-                                .checked_add(Duration::from_secs(30))
-                                .ok_or(AdaptiveManagerError::Deadline)?,
-                        )?;
+                        self.begin_root_quiesce(self.cleanup_until()?)?;
                         return Ok(true);
                     }
                     CpuQuestion::Own(question) => {
-                        let Some(slot) = self
-                            .own
-                            .iter()
-                            .take(usize::from(advice.workers))
-                            .position(|slot| slot.binding.is_none() && !slot.joined)
-                        else {
+                        let slot = if self.nnuec.is_some() {
+                            self.nnuec_pending.as_ref().map(|pending| pending.slot)
+                        } else {
+                            self.own
+                                .iter()
+                                .take(native_worker_limit)
+                                .position(|slot| slot.binding.is_none() && !slot.joined)
+                        };
+                        let Some(slot) = slot else {
                             break;
                         };
-                        let Some(slice) = advice.slice else {
+                        let Some(slice) = advice.and_then(|advice| advice.slice) else {
                             break;
                         };
-                        self.begin_cpu(slot, work, question, slice.node_credit, slice.soft_lease)?;
-                        changed = true;
+                        let result = self.begin_cpu(
+                            slot,
+                            work,
+                            question,
+                            slice.node_credit,
+                            slice.soft_lease,
+                        );
+                        changed |= self.native_admission_result(result)?;
+                        if self.phase != ManagerPhase::Running {
+                            return Ok(changed);
+                        }
                     }
                     CpuQuestion::External(question) => {
                         if self.foreign.is_some() {
@@ -5093,21 +8307,27 @@ where
                     .find_map(|slot| slot.binding.as_ref())
                     .and_then(|binding| self.costs.estimate(binding.class, CostStage::YieldLatency))
             });
-        self.controller
-            .advise(ControllerInput {
-                observation_sequence: self.observation_sequence,
-                now: Duration::from_nanos(now.0),
-                deadline_remaining: Duration::from_nanos(self.deadline.at.0.saturating_sub(now.0)),
-                role_service,
-                yield_overhead,
-                backlog,
-                waiting_cpu_jobs: self.ready.len(),
-                // Typed S forecast is distinct from realized benefit/witness.
-                selected_progress: selected.map(|selection| WorkerProgress {
-                    has_new_consistent_progress: true,
-                    expected_feedback_gain: Some(selection.gain()),
-                }),
-            })
+        let input = ControllerInput {
+            observation_sequence: self.observation_sequence,
+            now: Duration::from_nanos(now.0),
+            deadline_remaining: Duration::from_nanos(self.deadline.at.0.saturating_sub(now.0)),
+            role_service,
+            yield_overhead,
+            backlog,
+            waiting_cpu_jobs: self
+                .ready
+                .len()
+                .saturating_add(usize::from(self.nnuec_pending.is_some())),
+            // Typed S forecast is distinct from realized benefit/witness.
+            selected_progress: selected.map(|selection| WorkerProgress {
+                has_new_consistent_progress: true,
+                expected_feedback_gain: Some(selection.gain()),
+            }),
+        };
+        self.researcher
+            .native_mut()?
+            .controller
+            .advise(input)
             .map_err(|_| AdaptiveManagerError::Invalid("adaptive advice"))
     }
     fn begin_cpu(
@@ -5118,11 +8338,15 @@ where
         requested_credit: u64,
         requested_lease: Duration,
     ) -> Result<(), AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         let profile = self.own[index]
             .worker
             .as_ref()
             .ok_or(AdaptiveManagerError::Invalid("CPU owner joined"))?
             .profile();
+        let nnuec = self.claim_nnuec_job(&work, index)?;
         let state = question
             .position
             .export()
@@ -5143,7 +8367,7 @@ where
             total_native_node_credit: question.total_native_node_credit,
             hard_deadline: self.deadline,
         };
-        let prepared = self.own[index]
+        let mut prepared = self.own[index]
             .worker
             .as_ref()
             .expect("checked owner")
@@ -5154,8 +8378,49 @@ where
                 question.target_depth,
                 &self.cpu_clock,
             )?;
-        self.ledger.register(envelope)?;
-        let grant = self.next_grant(envelope, profile.owner, requested_credit, requested_lease)?;
+        if let Some(policy) = self
+            .reciprocal_policy
+            .filter(|_| !self.is_reciprocal_child(work.frame))
+        {
+            let parent = if let Some(original) = self.machine.reciprocal_question(work.frame) {
+                self.driver
+                    .register_cpu_reciprocal_scope(&work, &envelope, &original)?;
+                original
+            } else {
+                let id = self.issue_reciprocal_question()?;
+                let parent = self.driver.reciprocal_parent(
+                    &work,
+                    &envelope,
+                    id,
+                    policy.mode,
+                    policy.root_budget,
+                )?;
+                self.machine.register_reciprocal_parent(
+                    work.frame,
+                    parent,
+                    self.clock.domain(),
+                    self.check_running()?,
+                )?;
+                parent
+            };
+            prepared.enable_reciprocal_questions(CpuReciprocalScope {
+                job: envelope,
+                owner: profile.owner,
+                parent,
+                recipient: policy.recipient,
+                max_questions: policy.max_questions_per_job,
+                node_interval: policy.node_interval,
+            })?;
+        }
+        self.native_ledger_mut()?.register(envelope)?;
+        let grant =
+            match self.next_grant(envelope, profile.owner, requested_credit, requested_lease) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
+                    return Err(error);
+                }
+            };
         let controls = Arc::clone(&prepared.mailbox);
         let class = cpu_cost_class(
             profile.evaluation_namespace,
@@ -5165,23 +8430,90 @@ where
         let admitted_at = match self.check_running() {
             Ok(now) => now,
             Err(error) => {
-                self.ledger.retire_unstarted(envelope.id)?;
+                self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
                 return Err(error);
             }
         };
-        if let Err(error) = self.ledger.reserve(grant) {
-            self.ledger.retire_unstarted(envelope.id)?;
+        if let Err(error) = self.native_ledger_mut()?.reserve(grant) {
+            self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
             return Err(error.into());
         }
+        let native_frontier = match self.driver.frontier_native_reserve(
+            &envelope,
+            grant,
+            self.clock.domain(),
+            admitted_at,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let rejected = self.own[index]
+                    .worker
+                    .as_ref()
+                    .expect("checked owner")
+                    .reject_prepared(prepared, grant)?;
+                self.release_frontier_before_enqueue(None, rejected.proof())?;
+                self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
+                return Err(error);
+            }
+        };
         if let Err(error) = self.driver.cpu_admitted(&work, &envelope, &grant) {
-            let rejected = self.own[index]
+            let rejected = match self.own[index]
                 .worker
                 .as_ref()
                 .expect("checked owner")
-                .reject_prepared(prepared, grant)?;
-            self.ledger.release_unadmitted(rejected.proof())?;
-            self.ledger.retire_unstarted(envelope.id)?;
+                .reject_prepared(prepared, grant)
+            {
+                Ok(rejected) => rejected,
+                Err(rejection_error) => {
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    return Err(rejection_error.into());
+                }
+            };
+            self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
+            self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
             return Err(error);
+        }
+        // PonderHit or root control may close future admission during bounded
+        // preparation. Only this actual unqueued owner proof may release the
+        // original grant; an effective clock never refunds it by itself.
+        let admission_error = if !self.can_admit_work() {
+            Some(AdaptiveManagerError::AdmissionClosed)
+        } else if let Some(capture) = nnuec.as_ref().and_then(|custody| custody.capture.as_ref()) {
+            prepared
+                .enable_nnuec_capture(capture.clone())
+                .err()
+                .map(|(error, _same_capture)| AdaptiveManagerError::Cpu(error))
+        } else {
+            None
+        };
+        let admission_error = admission_error
+            .or_else(|| (!self.can_admit_work()).then_some(AdaptiveManagerError::AdmissionClosed));
+        if let Some(error) = admission_error {
+            match self.own[index]
+                .worker
+                .as_ref()
+                .expect("checked owner")
+                .reject_prepared_retaining(prepared, grant)
+            {
+                Ok(rejected) => {
+                    self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
+                    self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
+                    self.driver
+                        .cpu_rejected(&work, &envelope, rejected.proof())?;
+                    return Err(error);
+                }
+                Err((cleanup_error, original_job)) => {
+                    self.retained_cpu_jobs.push((original_job, grant));
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    self.native_ledger_mut()?.quarantine(envelope.id)?;
+                    self.phase = ManagerPhase::Quarantined;
+                    return Err(cleanup_error.into());
+                }
+            }
         }
         match self.own[index]
             .worker
@@ -5191,12 +8523,15 @@ where
         {
             Ok(()) => {}
             Err(rejected) => {
-                self.ledger.release_unadmitted(rejected.proof())?;
-                self.ledger.retire_unstarted(envelope.id)?;
+                self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
+                self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
                 self.driver
                     .cpu_rejected(&work, &envelope, rejected.proof())?;
                 return Err(AdaptiveManagerError::Cpu(rejected.reason().clone()));
             }
+        }
+        if let Some(state) = &mut self.cpu_semantic {
+            state.enqueued(envelope);
         }
         // The manager is the only writer. No worker response is read between
         // successful admission and binding the exact execution to this frame.
@@ -5218,7 +8553,12 @@ where
             last_yield_ack: 0,
             requested_yield: None,
             pending_slice: None,
+            queued_resume_termination: None,
             validator_reviewed_execution: None,
+            reciprocal: None,
+            native_frontier,
+            nnuec,
+            semantic_settlement: None,
         });
         self.machine
             .bind_cpu(frame, &envelope, &grant, self.clock.domain(), admitted_at)?;
@@ -5233,6 +8573,41 @@ where
                 execution: grant.execution,
             },
         )?;
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        if let (Some(diagnostic), Some(binding)) = (
+            self.cpu_slice_diagnostic.get(),
+            self.own[index].binding.as_ref(),
+        ) {
+            if let Some(custody) = &binding.nnuec {
+                // The worker acknowledged this actual custody before Begin.
+                // This row attests enqueue + frame bind only; invocation,
+                // numeric readout and paused resume need their own receipts.
+                diagnostic.record_nnuec_chain(
+                    super::cpu_slice_observation::NnuecChainEvent::NnuecJobBound(
+                        super::cpu_slice_observation::NnuecJobBindingObservation {
+                            frame: binding.work.frame,
+                            question: binding.work.input.question_digest,
+                            view: binding.work.input.view_seal,
+                            full_view: custody.seal.full_view_digest(),
+                            job: binding.envelope,
+                            first_grant: binding.grant,
+                            installation_sequence: custody.receipt.installation_id().sequence(),
+                            installation_succeeded: custody.receipt.is_installed(),
+                            binding: custody.receipt.binding_digest(),
+                            installed_owner: custody
+                                .receipt
+                                .installed_profile()
+                                .map(|profile| profile.owner),
+                            actual_stack_owner_id: custody
+                                .receipt
+                                .result()
+                                .ok()
+                                .map(|readback| readback.actual_stack_owner_id()),
+                        },
+                    ),
+                );
+            }
+        }
         Ok(())
     }
     fn resume_cpu(
@@ -5241,6 +8616,9 @@ where
         credit: u64,
         lease: Duration,
     ) -> Result<(), AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         if self.own[index].worker.is_none() {
             return Err(AdaptiveManagerError::Invalid("paused CPU worker joined"));
         }
@@ -5248,6 +8626,22 @@ where
             .binding
             .take()
             .ok_or(AdaptiveManagerError::Invalid("missing paused CPU owner"))?;
+        if binding.native_frontier.is_some() || self.pending_frontier_for(binding.envelope.id) {
+            self.own[index].binding = Some(binding);
+            return Err(AdaptiveManagerError::Frontier(FrontierError::NodesReserved));
+        }
+        let reply = match binding.reciprocal.as_ref() {
+            Some(held) => match held.reply.clone() {
+                Some(reply) => Some(reply),
+                None => {
+                    self.own[index].binding = Some(binding);
+                    return Err(AdaptiveManagerError::Invalid(
+                        "reciprocal checkpoint lacks accepted reply",
+                    ));
+                }
+            },
+            None => None,
+        };
         let grant = match self.next_grant(binding.envelope, binding.grant.owner, credit, lease) {
             Ok(grant) => grant,
             Err(error) => {
@@ -5262,10 +8656,28 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = self.ledger.reserve(grant) {
+        if let Err(error) = self.native_ledger_mut()?.reserve(grant) {
             self.own[index].binding = Some(binding);
             return Err(error.into());
         }
+        let native_frontier = match self.driver.frontier_native_reserve(
+            &binding.envelope,
+            grant,
+            self.clock.domain(),
+            admitted_at,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let rejected = self.own[index]
+                    .worker
+                    .as_ref()
+                    .expect("checked paused owner")
+                    .reject_unsubmitted_resume(grant);
+                self.own[index].binding = Some(binding);
+                self.release_frontier_before_enqueue(None, rejected?.proof())?;
+                return Err(error);
+            }
+        };
         if let Err(error) = self
             .driver
             .cpu_admitted(&binding.work, &binding.envelope, &grant)
@@ -5276,18 +8688,64 @@ where
                 .expect("checked paused owner")
                 .reject_unsubmitted_resume(grant);
             self.own[index].binding = Some(binding);
-            self.ledger.release_unadmitted(rejected?.proof())?;
+            let rejected = match rejected {
+                Ok(rejected) => rejected,
+                Err(rejection_error) => {
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    return Err(rejection_error.into());
+                }
+            };
+            self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
             return Err(error);
         }
-        match self.own[index]
-            .worker
-            .as_ref()
-            .expect("checked paused CPU worker")
-            .resume_attested(grant)
-        {
+        let final_admission_error = self
+            .check_running()
+            .err()
+            .or_else(|| (!self.can_admit_work()).then_some(AdaptiveManagerError::AdmissionClosed));
+        if let Some(admission_error) = final_admission_error {
+            let rejected = self.own[index]
+                .worker
+                .as_ref()
+                .expect("same paused CPU worker")
+                .reject_unsubmitted_resume(grant);
+            self.own[index].binding = Some(binding);
+            let rejected = match rejected {
+                Ok(rejected) => rejected,
+                Err(error) => {
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    return Err(error.into());
+                }
+            };
+            self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
+            let binding = self.own[index]
+                .binding
+                .as_ref()
+                .expect("same paused custody");
+            self.driver
+                .cpu_rejected(&binding.work, &binding.envelope, rejected.proof())?;
+            return Err(admission_error);
+        }
+        let submitted = match reply {
+            Some(reply) => self.own[index]
+                .worker
+                .as_ref()
+                .expect("checked paused CPU worker")
+                .resume_with_reply_attested(grant, reply),
+            None => self.own[index]
+                .worker
+                .as_ref()
+                .expect("checked paused CPU worker")
+                .resume_attested(grant),
+        };
+        match submitted {
             Ok(()) => {}
             Err(rejected) => {
-                let released = self.ledger.release_unadmitted(rejected.proof());
+                let released =
+                    self.release_frontier_before_enqueue(native_frontier, rejected.proof());
                 let cleanup =
                     self.driver
                         .cpu_rejected(&binding.work, &binding.envelope, rejected.proof());
@@ -5299,7 +8757,14 @@ where
         }
         let frame = binding.work.frame;
         let envelope = binding.envelope;
+        let reciprocal_question = binding
+            .reciprocal
+            .as_ref()
+            .and_then(|held| held.question)
+            .map(|question| question.id);
         binding.grant = grant;
+        binding.native_frontier = native_frontier;
+        binding.reciprocal = None;
         binding.resume_pending = false;
         binding.started_at = Instant::now();
         binding.progress_published_at = None;
@@ -5340,6 +8805,9 @@ where
                 execution: grant.execution,
             },
         )?;
+        if let Some(question) = reciprocal_question {
+            self.defer(DeferredCommit::ReciprocalDiscard { question })?;
+        }
         Ok(())
     }
     fn next_grant(
@@ -5349,12 +8817,12 @@ where
         credit: u64,
         lease: Duration,
     ) -> Result<SliceGrant, AdaptiveManagerError> {
-        let (spent, reserved, quarantined) = self.ledger.usage(envelope.id)?;
-        let (global_spent, global_reserved) = self.ledger.global_usage()?;
+        let (spent, reserved, quarantined) = self.native_ledger()?.usage(envelope.id)?;
+        let (global_spent, global_reserved) = self.native_ledger()?.global_usage()?;
         if quarantined || reserved != 0 {
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }
-        let credit = credit
+        let mut credit = credit
             .min(envelope.total_native_node_credit.saturating_sub(spent))
             .min(
                 self.registration
@@ -5363,6 +8831,15 @@ where
                     .saturating_sub(global_reserved),
             );
         let now = self.check_running()?;
+        if let Some(capacity) =
+            self.driver
+                .frontier_native_capacity(credit, self.clock.domain(), now)?
+        {
+            credit = credit.min(capacity);
+            if credit == 0 {
+                return Err(AdaptiveManagerError::Frontier(FrontierError::NodesReserved));
+            }
+        }
         let lease = lease.min(Duration::from_nanos(
             self.deadline.at.0.saturating_sub(now.0),
         ));
@@ -5385,6 +8862,9 @@ where
         work: CoordinatorWork<ReviewView, Q>,
         question: ForeignCpuQuestion,
     ) -> Result<(), AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         if self.registration.endpoints.cpu_r != CpuEndpoint::ExternalUci
             && self.registration.endpoints.cpu_t != CpuEndpoint::ExternalUci
         {
@@ -5577,6 +9057,13 @@ where
         until: Instant,
         mode: AdaptiveCloseMode,
     ) -> Result<(), AdaptiveManagerError> {
+        let until = self
+            .cleanup_boundary
+            .map_or(until, |boundary| boundary.cap(until));
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let until = self
+            .cohort_cleanup_ceiling()
+            .map_or(until, |cap| cap.min(until));
         if self.phase == ManagerPhase::Finished {
             return Ok(());
         }
@@ -5603,17 +9090,39 @@ where
         }
         self.registry.revoke_all();
         self.machine.revoke();
+        self.cancel_utility_preparation();
+        // The same semantic owner closes its non-submitted local duties now.
+        // If an archive transfer owns it, manager admission is already closed
+        // and the exact owner close is retried before post-fence retirement.
+        if self.driver.semantic_owner_available() {
+            if let Err(error) = self.driver.close_rovent_goal_admission() {
+                self.record_failure(error.at_semantic_stage("close_goal_admission"));
+            }
+        }
+        if let Some(preparation) = &self.nnuec {
+            preparation.canceled.store(true, Ordering::Release);
+        }
         // First revoke question authority, then cancel each same-owner task.
         for index in 0..self.own.len() {
-            let sequence = self.issue_control()?;
-            if let Some(binding) = &self.own[index].binding {
-                let _ = binding.controls.request_cancel(sequence);
+            if self.own[index]
+                .binding
+                .as_ref()
+                .is_some_and(|binding| close_cancel_needed(&binding.controls))
+            {
+                let sequence = self.issue_control()?;
+                if let Some(binding) = &self.own[index].binding {
+                    let _ = binding.controls.request_cancel(sequence);
+                }
             }
             if let Some(worker) = &self.own[index].worker {
                 worker.request_shutdown();
             }
         }
-        if self.foreign.is_some() {
+        if self
+            .foreign
+            .as_ref()
+            .is_some_and(|binding| close_cancel_needed(&binding.job.control))
+        {
             let sequence = self.issue_control()?;
             if let Some(binding) = &self.foreign {
                 let _ = binding.job.control.request_cancel(sequence);
@@ -5630,13 +9139,20 @@ where
                     })?,
             }
         }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        self.begin_profiled_close(until, mode)?;
         // Prepared/running logical cancellation never releases a GPU buffer.
-        for role in &self.roles {
-            self.native.cancel(role.preparation).ok();
+        for role in &mut self.roles {
+            if !role.cancellation_requested {
+                role.cancellation_requested = self.native.cancel(role.preparation).is_ok();
+            }
         }
         match mode {
             AdaptiveCloseMode::ProcessShutdown => self.native.begin_shutdown(until),
-            AdaptiveCloseMode::RootQuiesce => self.native.begin_root_quiesce(until)?,
+            AdaptiveCloseMode::RootQuiesce => {
+                self.native.begin_root_quiesce(until)?;
+                self.native_root_quiesce_requested = true;
+            }
         }
         self.driver.begin_auxiliary_shutdown(until)?;
         Ok(())
@@ -5644,11 +9160,13 @@ where
     fn poll_shutdown(&mut self) -> Result<bool, AdaptiveManagerError> {
         let mut changed = false;
         if self.shutdown_until.is_none() {
-            let until = Instant::now()
-                .checked_add(Duration::from_secs(30))
-                .ok_or(AdaptiveManagerError::Deadline)?;
+            let until = self.cleanup_until()?;
             self.begin_selected_shutdown(until)?;
             changed = true;
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            changed |= self.poll_profiled_close()?;
         }
         for index in 0..self.own.len() {
             if self.own[index].joined {
@@ -5662,20 +9180,55 @@ where
             let Some(receipt) = joined else {
                 continue;
             };
+            let nnuec_readback_error = if let Some(pending) = &mut self.nnuec_pending {
+                if pending.slot == index {
+                    pending.observe_shutdown(&receipt).err()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(actual) = receipt
+                .value_installation_receipt
+                .as_ref()
+                .filter(|actual| actual.is_installed())
+            {
+                self.own[index].last_value_installation = Some(actual.clone());
+            }
             changed = true;
             // Receipts retained at owner shutdown MUST settle before dropping
             // the worker and before archive close; progress never settles them.
             for event in receipt.events {
                 if let Err(error) = self.own_event(index, event) {
-                    self.record_failure(error);
+                    self.record_failure(error.at_semantic_stage("shutdown_own_event"));
                 }
             }
             self.own[index].joined = receipt.thread_joined;
             self.own[index].panicked = receipt.thread_panicked;
             self.own[index].ready_readback = receipt.ready_readback;
+            if let Some(error) = nnuec_readback_error {
+                self.record_failure(AdaptiveManagerError::NnuecPreparation(error));
+            }
+            if let Some(error) = receipt.value_installation_error {
+                // The independently retained terminal is not contingent on
+                // there still being a matching pending installation slot.
+                self.record_failure(AdaptiveManagerError::Cpu(error));
+            }
+            if !receipt.engine_recoverable {
+                // A joined, non-panicked thread is not an engine ownership
+                // fence. Keep actual usage settlement above, but never issue
+                // a clean archive/root reuse receipt for this owner.
+                self.record_failure(AdaptiveManagerError::Cpu(CpuWorkerError::Quarantined));
+            }
             if receipt.thread_panicked {
-                if let Some(binding) = &self.own[index].binding {
-                    self.ledger.quarantine(binding.envelope.id)?;
+                self.quarantine_frontier_slot(index);
+                if let Some(job) = self.own[index]
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.envelope.id)
+                {
+                    self.native_ledger_mut()?.quarantine(job)?;
                 }
                 self.phase = ManagerPhase::Quarantined;
             }
@@ -5733,12 +9286,37 @@ where
             && self.own.iter().all(|slot| slot.joined)
             && self.external_owner_closed()
             && self.deferred.is_empty()
+            && self.nnuec_cleanup_settled()
+            && self.utility_cleanup_settled()
+            && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
                     .as_ref()
                     .is_none_or(|binding| binding.pending_slice.is_none())
             })
         {
+            // A physical fence cannot resolve an ambiguous semantic commit.
+            // Keep the original bindings and driver custody intact; in
+            // particular do not discard a GoalLocal input or count its result
+            // as unused when owner readback failed.
+            if self.roles.iter().any(|binding| binding.consumption_unknown)
+                || self
+                    .accepted_roles
+                    .iter()
+                    .any(|held| held.binding.consumption_unknown)
+            {
+                self.phase = ManagerPhase::Quarantined;
+                return Ok(changed);
+            }
+            self.release_nnuec_custody()?;
+            self.driver.close_rovent_goal_admission()?;
+            self.discard_goal_local_custody()?;
+            if self.driver.rovent_goal_has_pending()? {
+                return Err(AdaptiveManagerError::Invalid(
+                    "GoalLocal owner did not retire after native fence",
+                ));
+            }
+            self.driver.release_rovent_goal_state()?;
             self.driver.finish_auxiliary_shutdown()?;
         }
         if native_closed
@@ -5746,6 +9324,9 @@ where
             && self.external_owner_closed()
             && self.driver.auxiliary_shutdown_confirmed()
             && self.deferred.is_empty()
+            && self.nnuec_cleanup_settled()
+            && self.utility_cleanup_settled()
+            && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
                     .as_ref()
@@ -5755,6 +9336,42 @@ where
         {
             // Finished is an owner fence, not a late output acceptance.
             // Canceled questions are retired with zero search consumption.
+            if let Some(observer) = &mut self.collection_observer {
+                let tickets = self
+                    .roles
+                    .iter()
+                    .filter_map(|r| r.ticket)
+                    .collect::<Vec<_>>();
+                if let Err(error) = observer.settled(&tickets) {
+                    self.record_failure(error.into());
+                }
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if let Some(observer) = &mut self.collection_observer_v2 {
+                let tickets = self
+                    .roles
+                    .iter()
+                    .filter_map(|r| r.ticket)
+                    // A peer source is moved out of `roles` after native
+                    // acceptance. If shutdown arrives before search consumes
+                    // it, its actual ticket still owns an observer input and
+                    // must be retired at this same physical fence.
+                    .chain(
+                        self.accepted_roles
+                            .iter()
+                            .filter_map(|held| held.binding.ticket),
+                    )
+                    .chain(self.collection_v2_abandon_custody.iter().copied())
+                    .collect::<Vec<_>>();
+                let result = observer.settled(&tickets);
+                self.collection_v2_settlement = Some(result.clone());
+                if result.is_ok() {
+                    self.collection_v2_abandon_custody.clear();
+                }
+                if let Err(error) = result {
+                    self.record_failure(error.into());
+                }
+            }
             let retired = self.registry.retire_revoked_after_worker_join()?;
             self.counters.unused_role_results = self
                 .counters
@@ -5762,20 +9379,33 @@ where
                 .checked_add(retired.len() as u64)
                 .ok_or(AdaptiveManagerError::Capacity("unused result sum"))?;
             self.roles.clear();
+            let unused_accepted = self
+                .accepted_roles
+                .iter()
+                .filter(|held| !held.binding.consumption_recorded)
+                .count() as u64;
+            self.counters.unused_role_results = self
+                .counters
+                .unused_role_results
+                .checked_add(unused_accepted)
+                .ok_or(AdaptiveManagerError::Capacity("unused accepted role sum"))?;
+            self.accepted_roles.clear();
             self.acknowledgements.clear();
             self.retained_native_permits.clear();
             self.retained_native_receipts.clear();
-            self.machine.retired_after_worker_join();
             self.ready_ids.clear();
             self.validator_waiting.clear();
             self.root_ranking_proof = None;
-            let (_, reserved) = self.ledger.global_usage()?;
-            if reserved != 0
+            if self.native_credit_outstanding()?
                 || self.own.iter().any(|slot| slot.binding.is_some())
                 || self.foreign.is_some()
+                || !self.retained_cpu_jobs.is_empty()
             {
                 self.phase = ManagerPhase::Quarantined;
             } else {
+                // Retain the original intervention source if final credit or
+                // CPU custody checks quarantine this otherwise drained root.
+                self.machine.retired_after_worker_join();
                 self.phase = ManagerPhase::Finished;
                 self.finished_at.get_or_insert_with(Instant::now);
             }
@@ -5783,7 +9413,7 @@ where
         Ok(changed)
     }
     pub fn shutdown_receipt(&self) -> Result<AdaptiveShutdownReceipt, AdaptiveManagerError> {
-        let (spent, reserved) = self.ledger.global_usage()?;
+        let (spent, reserved) = self.native_ledger()?.global_usage()?;
         Ok(AdaptiveShutdownReceipt {
             authority: self.registration.authority,
             native_owner_joined: self.native_joined,
@@ -5799,7 +9429,13 @@ where
                 self.external_root_fence
                     .is_some_and(|fence| fence.permits_reuse())
             }),
-            auxiliary_shutdown_confirmed: self.driver.auxiliary_shutdown_confirmed(),
+            auxiliary_shutdown_confirmed: self.driver.auxiliary_shutdown_confirmed()
+                && self.nnuec_cleanup_settled()
+                && self.utility_cleanup_settled()
+                && self.nnuec_pending.is_none()
+                && self.nnuec_jobs.is_empty()
+                && self.goal_prepared.is_none()
+                && !self.goal_continuation_pending,
             native_cpu_spent: spent,
             native_cpu_reserved: reserved,
             pending_tickets: self.registry.occupancy(),
@@ -5807,7 +9443,10 @@ where
                 || self.native.is_quarantined()
                 || !self.quarantine_rejections.is_empty()
                 || !self.quarantined_cpu_receipts.is_empty()
-                || !self.quarantined_foreign_receipts.is_empty(),
+                || !self.quarantined_foreign_receipts.is_empty()
+                || !self.native_frontier_events.is_empty(),
+            // Common accounting remains separate from the original
+            // native ledger totals but can veto a clean owner closure.
             request_sequence_high_water: self.registry.next_request_sequence().saturating_sub(1),
             counters: self.counters,
             native_cpu_thread_observation: self.native.ready_cpu_thread_observation(),
@@ -5827,16 +9466,20 @@ where
         })
     }
     fn external_owner_closed(&self) -> bool {
-        self.external
-            .as_ref()
-            .is_none_or(|external| match self.close_mode {
-                AdaptiveCloseMode::ProcessShutdown => self.external_finished == Some(true),
-                AdaptiveCloseMode::RootQuiesce => self.external_root_fence.is_some_and(|fence| {
-                    fence.authority() == self.registration.authority
-                        && fence.owner() == external.owner
-                        && fence.permits_reuse()
-                }),
-            })
+        self.profiled_owner_closed()
+            && self
+                .external
+                .as_ref()
+                .is_none_or(|external| match self.close_mode {
+                    AdaptiveCloseMode::ProcessShutdown => self.external_finished == Some(true),
+                    AdaptiveCloseMode::RootQuiesce => {
+                        self.external_root_fence.is_some_and(|fence| {
+                            fence.authority() == self.registration.authority
+                                && fence.owner() == external.owner
+                                && fence.permits_reuse()
+                        })
+                    }
+                })
     }
     /// Caller chooses and renews a finite window. There is no user-visible
     /// hidden infinite retry or manager spin loop. Notification shares the CPU
@@ -5877,15 +9520,23 @@ where
         canceled: &AtomicBool,
         observer: &mut dyn FnMut(&mut Self) -> Result<(), AdaptiveManagerError>,
     ) -> Result<AdaptiveShutdownReceipt, AdaptiveManagerError> {
+        self.run_owner_until_observed(until, canceled, observer)?;
+        self.shutdown_receipt()
+    }
+    fn run_owner_until_observed(
+        &mut self,
+        until: Instant,
+        canceled: &AtomicBool,
+        observer: &mut dyn FnMut(&mut Self) -> Result<(), AdaptiveManagerError>,
+    ) -> Result<(), AdaptiveManagerError> {
+        let until = self
+            .cleanup_boundary
+            .map_or(until, |boundary| boundary.cap(until));
         loop {
             let signal = self.native.signal();
             let observed = signal.version();
             if canceled.load(Ordering::Acquire) && self.phase == ManagerPhase::Running {
-                self.begin_selected_shutdown(
-                    Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?,
-                )?;
+                self.begin_selected_shutdown(self.cleanup_until()?)?;
             }
             // Apply the caller's soft/admission boundary before a tick may
             // dispatch another immutable question. This control observation
@@ -5898,24 +9549,26 @@ where
             observer(self)?;
             if self.phase == ManagerPhase::Running && self.root_started && !self.has_pending_work()
             {
-                self.begin_selected_shutdown(
-                    Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?,
-                )?;
+                self.begin_selected_shutdown(self.cleanup_until()?)?;
             }
             if self.phase == ManagerPhase::Finished {
-                return self.shutdown_receipt();
+                return Ok(());
             }
-            if Instant::now() >= until {
-                self.begin_selected_shutdown(until)?;
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let owner_until = self
+                .cohort_cleanup_ceiling()
+                .map_or(until, |cap| cap.min(until));
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            let owner_until = until;
+            if Instant::now() >= owner_until {
+                self.begin_selected_shutdown(owner_until)?;
                 self.tick()?;
-                return self.shutdown_receipt();
+                return Ok(());
             }
             if !changed {
                 // The closing poll bounds the scheduling gap between final
                 // owner notify and JoinHandle::is_finished publication.
-                let wait = until
+                let wait = owner_until
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(10));
                 self.counters.notification_waits += 1;
@@ -5923,6 +9576,14 @@ where
             }
         }
     }
+}
+
+// The manager is the sole control writer for its Job. Once cancellation is
+// published, retain that exact sequence for the owner acknowledgement and
+// terminal receipt; shutdown must not replace an in-flight cancellation.
+fn close_cancel_needed<S>(controls: &rz_runtime::adaptive::ControlMailbox<S>) -> bool {
+    let snapshot = controls.snapshot();
+    !snapshot.terminal && !snapshot.is_cancelled()
 }
 
 /// A natural terminal/cancel racing with S-policy advice remains an owner
@@ -6080,6 +9741,51 @@ fn observed_public_cache_class(
         _ => CacheClass::Unknown,
     }
 }
+/// Native NNUEC is the actual R owner in both product uses. Collection's
+/// independent teacher does not replace that worker. Legacy PALS still uses
+/// its existing Collection teacher/deployment researcher selection.
+fn dispatch_cpu_endpoint(
+    endpoints: CpuEndpointSelection,
+    source: AdaptiveResearcherSourceKind,
+    has_nnuec: bool,
+) -> CpuEndpoint {
+    if (has_nnuec && source == AdaptiveResearcherSourceKind::Native)
+        || endpoints.execution_use == CpuExecutionUse::Deployment
+    {
+        endpoints.cpu_r
+    } else {
+        endpoints.cpu_t
+    }
+}
+
+#[cfg(test)]
+mod endpoint_selection_tests {
+    use super::*;
+
+    #[test]
+    fn native_nnuec_keeps_r_while_legacy_collection_keeps_teacher_selection() {
+        let mut collection = CpuEndpointSelection::deployment();
+        collection.execution_use = CpuExecutionUse::Collection;
+        assert_eq!(
+            dispatch_cpu_endpoint(collection, AdaptiveResearcherSourceKind::Native, true),
+            CpuEndpoint::Own,
+        );
+        collection.cpu_t = CpuEndpoint::ExternalUci;
+        assert_eq!(
+            dispatch_cpu_endpoint(collection, AdaptiveResearcherSourceKind::Native, false),
+            CpuEndpoint::ExternalUci,
+        );
+        assert_eq!(
+            dispatch_cpu_endpoint(
+                CpuEndpointSelection::deployment(),
+                AdaptiveResearcherSourceKind::Native,
+                false,
+            ),
+            CpuEndpoint::Own,
+        );
+    }
+}
+
 #[cfg(test)]
 mod observed_cache_tests {
     use super::*;

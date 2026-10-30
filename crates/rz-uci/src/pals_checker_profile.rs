@@ -33,6 +33,8 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+pub mod rovent;
+
 pub const PALS_CHECKER_PROFILE_SCHEMA: &str = "rz-pals-external-checker-profile/1";
 pub const PALS_CHECKER_REGISTRATION_SCHEMA: &str = "rz-pals-external-checker-registration/1";
 pub const PALS_ADAPTIVE_CHECKER_PROFILE_V5_SCHEMA: &str =

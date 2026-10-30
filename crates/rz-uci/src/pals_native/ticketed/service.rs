@@ -36,6 +36,78 @@ pub struct TicketPreparation<V, Q> {
     pub query: Q,
 }
 
+/// A read-only handle to the same native ticket cancellation word. It grants
+/// no right to cancel, accept, consume, or establish physical completion.
+#[derive(Clone)]
+pub struct NativeTicketCancelObservation {
+    original: Arc<AtomicBool>,
+}
+impl NativeTicketCancelObservation {
+    pub fn is_canceled(&self) -> bool { self.original.load(Ordering::Acquire) }
+    /// Establish the ordering of an optional submission against cancellation.
+    /// A successful claim does not dispatch, accept or complete any work.
+    pub fn try_claim_submission(&self) -> bool {
+        self.original.compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+}
+
+/// Borrowed context produced only on the native worker after it validates
+/// the original ticket against its held preparation. It conveys no acceptance
+/// or physical-completion authority and cannot be constructed or cloned by a
+/// backend caller. The exact question and prepared input remain borrowed.
+pub struct TicketOwnerDispatchContext<'a, V, Q, P> {
+    verifier: &'a NativeAcceptanceVerifier,
+    ticket: &'a RoleTicketEnvelope,
+    question: &'a TicketPreparation<V, Q>,
+    prepared: &'a P,
+    canceled: &'a Arc<AtomicBool>,
+}
+
+impl<'a, V, Q, P> TicketOwnerDispatchContext<'a, V, Q, P> {
+    pub fn ticket(&self) -> &'a RoleTicketEnvelope {
+        self.ticket
+    }
+    pub fn question(&self) -> &'a TicketPreparation<V, Q> {
+        self.question
+    }
+    pub fn prepared(&self) -> &'a P {
+        self.prepared
+    }
+    /// Retain the same original native cancellation observation, not a new
+    /// cancel authority or evidence that the NN request was accepted.
+    pub fn original_cancellation(&self) -> NativeTicketCancelObservation {
+        NativeTicketCancelObservation { original: Arc::clone(self.canceled) }
+    }
+    pub fn same_owner(&self, verifier: &NativeAcceptanceVerifier) -> bool {
+        self.verifier.same_owner(verifier)
+    }
+
+    /// Internal projection retains the same ticket and exact original view.
+    /// The projection owner must first validate that `prepared` is the
+    /// projection retained with this original service preparation.
+    pub(crate) fn project<Q2, P2>(
+        self,
+        question: &'a TicketPreparation<V, Q2>,
+        prepared: &'a P2,
+    ) -> Result<TicketOwnerDispatchContext<'a, V, Q2, P2>, RoleFailure> {
+        if question.question != self.question.question
+            || question.seal != self.question.seal
+            || question.role != self.question.role
+            || question.deadline != self.question.deadline
+            || !Arc::ptr_eq(&question.view, &self.question.view)
+        {
+            return Err(RoleFailure::InvalidOutput);
+        }
+        Ok(TicketOwnerDispatchContext {
+            verifier: self.verifier,
+            ticket: self.ticket,
+            question,
+            prepared,
+            canceled: self.canceled,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparedTicketSeal {
     pub preparation: PreparationId,
@@ -58,6 +130,46 @@ impl PreparedTicketSeal {
 pub struct TicketPhysicalResult<O> {
     pub physical: PhysicalRoleCompletion,
     pub output: Result<O, RoleFailure>,
+}
+
+/// A collection/semantic report, separate from the owner's physical result.
+/// At most two reports can accompany a backend callback; neither is proof of
+/// acceptance, NN completion, or a physical fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketNativeObservationStage {
+    Submitted,
+    Completed,
+    Retired,
+    Retrieval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketNativeObservationDisposition {
+    Observation,
+    RequiredAfterPhysical,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketNativeObservationFailure {
+    pub ticket: RoleTicketEnvelope,
+    pub stage: TicketNativeObservationStage,
+    pub disposition: TicketNativeObservationDisposition,
+    pub cause: RoleFailure,
+}
+
+/// Bounded observations carried atomically with their original physical
+/// terminal. Empty is the compatibility default for existing backends.
+#[derive(Default, Debug)]
+pub struct TicketNativeObservationFailures {
+    entries: [Option<TicketNativeObservationFailure>; 2],
+}
+impl TicketNativeObservationFailures {
+    pub fn iter(&self) -> impl Iterator<Item = &TicketNativeObservationFailure> {
+        self.entries.iter().flatten()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
 }
 /// Unknown measurement is neither completed-input zero nor logical consumption.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +258,15 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
         prepared: &Self::Prepared,
         canceled: &AtomicBool,
     ) -> TicketPhysicalResult<Self::Output>;
+    /// The service uses this entrypoint for actual dispatch. Existing backends
+    /// retain their original execution behavior through this default method.
+    fn run_owned(
+        &mut self,
+        context: TicketOwnerDispatchContext<'_, V, Q, Self::Prepared>,
+        canceled: &AtomicBool,
+    ) -> TicketPhysicalResult<Self::Output> {
+        self.run(context.ticket, context.question, context.prepared, canceled)
+    }
     fn output_host_bytes(&self, output: &Self::Output) -> u64;
     /// Exact original P/V head digest for an owner acknowledgement. Other
     /// payloads/backends retain the historical acceptance path explicitly.
@@ -153,6 +274,12 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
         None
     }
     fn execution_evidence(&mut self, _: &RoleTicketEnvelope) -> Option<TicketExecutionEvidence> {
+        None
+    }
+    /// At most two separately retained failures from the immediately preceding
+    /// run, accept or discard callback. Backends must retain its original cause
+    /// and must not use this to downgrade physical or pre-execution failures.
+    fn take_observation_failure(&mut self) -> Option<TicketNativeObservationFailure> {
         None
     }
     /// Only a manager acknowledgement reaches this callback. A backend may
@@ -173,6 +300,34 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
     }
     /// True requires the actual physical fence and worker join, not a timeout.
     fn finish(&mut self, until: Instant) -> bool;
+}
+
+fn take_observation_failures<V, Q, B: TicketNativeBackend<V, Q>>(
+    backend: &mut B,
+    ticket: RoleTicketEnvelope,
+) -> TicketNativeObservationFailures {
+    let mut failures = TicketNativeObservationFailures::default();
+    for entry in &mut failures.entries {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.take_observation_failure()
+        })) {
+            Ok(Some(failure)) => *entry = Some(failure),
+            Ok(None) => break,
+            Err(_) => {
+                *entry = Some(TicketNativeObservationFailure {
+                    ticket,
+                    stage: TicketNativeObservationStage::Retrieval,
+                    disposition: TicketNativeObservationDisposition::RequiredAfterPhysical,
+                    cause: RoleFailure::Backend(
+                        "observation failure retrieval panicked; original report unavailable"
+                            .into(),
+                    ),
+                });
+                break;
+            }
+        }
+    }
+    failures
 }
 
 /// Produced only by the owner after root cancellation, physical completion and
@@ -263,6 +418,8 @@ pub enum TicketNativeEvent<O> {
         /// Actual owner run section, including admission/transfer/fence/decode;
         /// excludes preparation/queue wait and is not pure NN kernel time.
         owner_service_elapsed: Option<Duration>,
+        /// Recorded independently from, and inseparably with, this terminal.
+        observation_failures: TicketNativeObservationFailures,
     },
     Rejected {
         preparation: PreparationId,
@@ -274,6 +431,7 @@ pub enum TicketNativeEvent<O> {
         result: Result<(), RoleFailure>,
         native_receipt: Option<NativeAcceptanceReceipt>,
         rejected_permit: Option<NativeAcceptancePermit>,
+        observation_failures: TicketNativeObservationFailures,
     },
     AcceptanceRejected {
         preparation: PreparationId,
@@ -312,7 +470,24 @@ struct PreparationControl {
     /// queued execution is submitted work even before Held::ticket is set.
     queued_executions: usize,
 }
+#[cfg(test)]
+struct CancellationScanTestGate {
+    preparation: PreparationId,
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+    until: Instant,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct CancellationScanTestState {
+    installed: bool,
+    pending: Option<CancellationScanTestGate>,
+}
 struct Shared {
+    #[cfg(feature = "native-validation-diagnostics")]
+    validation_trace: std::sync::OnceLock<
+        rz_eval::pals_onnx::virtual_review::native_validation_diagnostics::GpuLifecycleTrace,
+    >,
     controls: Mutex<BTreeMap<PreparationId, PreparationControl>>,
     pending_capacity: usize,
     command_capacity: usize,
@@ -332,6 +507,8 @@ struct Shared {
             Result<rz_runtime::adaptive::CpuThreadReadback, rz_runtime::adaptive::CpuResourceError>,
         >,
     >,
+    #[cfg(test)]
+    cancellation_scan_test: Mutex<CancellationScanTestState>,
 }
 impl Shared {
     fn reports_available(&self) -> bool {
@@ -422,6 +599,8 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         let (acknowledgements, ack_receiver) = mpsc::sync_channel(pending_capacity);
         let (event_sender, events) = mpsc::sync_channel(EVENTS);
         let shared = Arc::new(Shared {
+            #[cfg(feature = "native-validation-diagnostics")]
+            validation_trace: std::sync::OnceLock::new(),
             controls: Mutex::new(BTreeMap::new()),
             pending_capacity,
             command_capacity,
@@ -437,6 +616,8 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
             pending_reports: AtomicUsize::new(0),
             signal: CompletionSignal::default(),
             ready_cpu: Mutex::new(None),
+            #[cfg(test)]
+            cancellation_scan_test: Mutex::new(CancellationScanTestState::default()),
         });
         let event_sender = EventPublisher {
             sender: event_sender,
@@ -482,6 +663,27 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         self.shared.command_capacity
     }
 
+    /// Explicit validation only, before the first actual preparation.
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub fn enable_gpu_lifecycle_validation(
+        &mut self,
+        trace: rz_eval::pals_onnx::virtual_review::native_validation_diagnostics::GpuLifecycleTrace,
+    ) -> Result<(), TicketServiceError> {
+        if self.next_preparation != 1
+            || !self
+                .shared
+                .controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            return Err(TicketServiceError::Duplicate);
+        }
+        self.shared
+            .validation_trace
+            .set(trace)
+            .map_err(|_| TicketServiceError::Duplicate)
+    }
     // Failed admission returns the exact immutable question/view ownership;
     // no extra allocation or early drop is introduced at this boundary.
     #[allow(clippy::result_large_err)]
@@ -592,6 +794,10 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         }
         drop(controls);
         self.shared.signal.notify();
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(trace) = self.shared.validation_trace.get() {
+            trace.admitted(preparation.0, ticket, admitted_at);
+        }
         Ok(admitted_at)
     }
     pub fn cancel(&self, preparation: PreparationId) -> Result<(), TicketServiceError> {
@@ -603,7 +809,20 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         let canceled = controls
             .get(&preparation)
             .ok_or(TicketServiceError::UnknownPreparation)?;
+        #[cfg(feature = "native-validation-diagnostics")]
+        let validation_before = Instant::now();
+        #[cfg(feature = "native-validation-diagnostics")]
+        let validation_first = !canceled.canceled.load(Ordering::Acquire);
         canceled.canceled.store(true, Ordering::Release);
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(trace) = self.shared.validation_trace.get() {
+            trace.cancel_flag_store(
+                preparation.0,
+                validation_before,
+                Instant::now(),
+                validation_first,
+            );
+        }
         self.shared.signal.notify();
         Ok(())
     }
@@ -744,6 +963,29 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
     pub fn poll(&self) -> Option<TicketNativeEvent<B::Output>> {
         let event = self.events.try_recv().ok()?;
         self.shared.pending_reports.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(trace) = self.shared.validation_trace.get() {
+            match &event {
+                TicketNativeEvent::Completed { completion, .. } => trace.logical_completed(
+                    completion.ticket,
+                    completion.physical == PhysicalRoleCompletion::Confirmed,
+                    matches!(&completion.result, Err(RoleFailure::Canceled)),
+                ),
+                TicketNativeEvent::Retired {
+                    ticket,
+                    accepted,
+                    result,
+                    ..
+                } => trace.retired(*ticket, *accepted, result.is_ok()),
+                TicketNativeEvent::RootQuiesced(fence) => {
+                    trace.root_fence(fence.authority(), fence.permits_reuse())
+                }
+                TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed,
+                } => trace.finished(*physical_shutdown_confirmed),
+                _ => {}
+            }
+        }
         Some(event)
     }
     pub fn completion_signal(&self) -> CompletionSignal {
@@ -794,6 +1036,50 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+    /// Pause this test owner's cancellation scan once, only after the original
+    /// preparation is actually held. Dropping the release sender unblocks it;
+    /// no gate can wait past the caller's original deadline.
+    #[cfg(test)]
+    pub(crate) fn pause_after_cancellation_scan_for_test(
+        &self,
+        preparation: PreparationId,
+        until: Instant,
+    ) -> Result<(mpsc::Receiver<()>, mpsc::SyncSender<()>), TicketServiceError> {
+        if Instant::now() >= until
+            || self.shared.closed.load(Ordering::Acquire)
+            || self.shared.root_closed.load(Ordering::Acquire)
+        {
+            return Err(TicketServiceError::Closed);
+        }
+        if !self
+            .shared
+            .controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&preparation)
+        {
+            return Err(TicketServiceError::UnknownPreparation);
+        }
+        let mut state = self
+            .shared
+            .cancellation_scan_test
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.installed {
+            return Err(TicketServiceError::Duplicate);
+        }
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        state.installed = true;
+        state.pending = Some(CancellationScanTestGate {
+            preparation,
+            entered,
+            release: released,
+            until,
+        });
+        self.shared.signal.notify();
+        Ok((observed, release))
     }
     pub fn is_quarantined(&self) -> bool {
         self.shared.quarantine.load(Ordering::Acquire)
@@ -866,6 +1152,10 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         }
         if let Some(thread) = self.thread.take() {
             thread.join().map_err(|_| TicketServiceError::WorkerGone)?;
+            #[cfg(feature = "native-validation-diagnostics")]
+            if let Some(trace) = self.shared.validation_trace.get() {
+                trace.joined();
+            }
         }
         Ok(true)
     }
@@ -912,6 +1202,44 @@ struct Held<V, Q, P, O> {
 }
 type HeldTickets<V, Q, P, O> = BTreeMap<PreparationId, Held<V, Q, P, O>>;
 
+fn retire_canceled_unsubmitted<V, Q, P, O>(
+    held: &mut HeldTickets<V, Q, P, O>,
+    events: &EventPublisher<O>,
+    shared: &Shared,
+) {
+    let (unsubmitted, retired_preparations) = {
+        let mut controls = shared.controls.lock().unwrap_or_else(|e| e.into_inner());
+        let unsubmitted: Vec<_> = held
+            .iter()
+            .filter_map(|(id, value)| {
+                (value.ticket.is_none()
+                    && value.canceled.load(Ordering::Acquire)
+                    && controls
+                        .get(id)
+                        .is_none_or(|control| control.queued_executions == 0))
+                .then_some(*id)
+            })
+            .collect();
+        let mut retired = Vec::with_capacity(unsubmitted.len());
+        for id in &unsubmitted {
+            if let Some(value) = held.remove(id) {
+                retired.push(value);
+            }
+            controls.remove(id);
+        }
+        (unsubmitted, retired)
+    };
+    // Backend-prepared data and immutable view pins may have nontrivial
+    // destructors; never run those while holding the control mailbox lock.
+    drop(retired_preparations);
+    for id in unsubmitted {
+        let _ = events.send(TicketNativeEvent::PreparationFailed {
+            preparation: id,
+            failure: RoleFailure::Canceled,
+        });
+    }
+}
+
 fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>(
     mut backend: B,
     commands: mpsc::Receiver<Command<V, Q>>,
@@ -925,7 +1253,7 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
     *shared
         .acceptance_verifier
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(acceptance_verifier);
+        .unwrap_or_else(|e| e.into_inner()) = Some(acceptance_verifier.clone());
     *shared.ready_clock.lock().unwrap_or_else(|e| e.into_inner()) = Some(clock.clone());
     *shared.ready_cpu.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(rz_runtime::adaptive::observe_current_cpu_thread(
@@ -958,36 +1286,29 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                 &acceptance_issuer,
             );
         }
-        let (unsubmitted, retired_preparations) = {
-            let mut controls = shared.controls.lock().unwrap_or_else(|e| e.into_inner());
-            let unsubmitted: Vec<_> = held
-                .iter()
-                .filter_map(|(id, value)| {
-                    (value.ticket.is_none()
-                        && value.canceled.load(Ordering::Acquire)
-                        && controls
-                            .get(id)
-                            .is_none_or(|control| control.queued_executions == 0))
-                    .then_some(*id)
-                })
-                .collect();
-            let mut retired = Vec::with_capacity(unsubmitted.len());
-            for id in &unsubmitted {
-                if let Some(value) = held.remove(id) {
-                    retired.push(value);
+        retire_canceled_unsubmitted(&mut held, &events, &shared);
+        #[cfg(test)]
+        {
+            let gate = {
+                let mut state = shared
+                    .cancellation_scan_test
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if state.pending.as_ref().is_some_and(|gate| {
+                    held.get(&gate.preparation)
+                        .is_some_and(|value| value.ticket.is_none())
+                }) {
+                    state.pending.take()
+                } else {
+                    None
                 }
-                controls.remove(id);
+            };
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate
+                    .release
+                    .recv_timeout(gate.until.saturating_duration_since(Instant::now()));
             }
-            (unsubmitted, retired)
-        };
-        // Backend-prepared data and immutable view pins may have nontrivial
-        // destructors; never run those while holding the control mailbox lock.
-        drop(retired_preparations);
-        for id in unsubmitted {
-            let _ = events.send(TicketNativeEvent::PreparationFailed {
-                preparation: id,
-                failure: RoleFailure::Canceled,
-            });
         }
         let until = *shared
             .shutdown_until
@@ -1035,6 +1356,10 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                     }
                 }
             }
+            // Cancellation may have arrived after this iteration's first scan.
+            // Retire the original never-submitted preparation exactly once,
+            // before physical quiesce clears its remaining root custody.
+            retire_canceled_unsubmitted(&mut held, &events, &shared);
             let cleanup_known = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 held.values().all(|value| {
                     value
@@ -1215,7 +1540,16 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                     service_started = Some(started_at);
                     let _ = events.send(TicketNativeEvent::OwnerRunStarted { ticket, started_at });
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        backend.run(&ticket, &value.question, &value.prepared, &value.canceled)
+                        backend.run_owned(
+                            TicketOwnerDispatchContext {
+                                verifier: &acceptance_verifier,
+                                ticket: &ticket,
+                                question: &value.question,
+                                prepared: &value.prepared,
+                                canceled: &value.canceled,
+                            },
+                            &value.canceled,
+                        )
                     }))
                     .unwrap_or(TicketPhysicalResult {
                         physical: PhysicalRoleCompletion::Unknown,
@@ -1267,6 +1601,11 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                     output = Err(RoleFailure::Expired);
                 }
                 value.completed = physical == PhysicalRoleCompletion::Confirmed;
+                let observation_failures = if service_started.is_some() {
+                    take_observation_failures::<V, Q, B>(&mut backend, ticket)
+                } else {
+                    TicketNativeObservationFailures::default()
+                };
                 let _ = events.send(TicketNativeEvent::Completed {
                     completion: RoleCompletion {
                         ticket,
@@ -1279,6 +1618,7 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                         invoked: service_started.is_some(),
                     },
                     owner_service_elapsed: service_started.map(|started| started.elapsed()),
+                    observation_failures,
                 });
                 if physical == PhysicalRoleCompletion::Unknown {
                     quarantine(backend, held, commands, &shared);
@@ -1338,6 +1678,7 @@ fn acknowledge<V, Q, B: TicketNativeBackend<V, Q>>(
     if accepted {
         value.ack_attempted = true;
     }
+    let mut backend_called = false;
     let result = if accepted {
         if value.canceled.load(Ordering::Acquire)
             || shared.closed.load(Ordering::Acquire)
@@ -1356,13 +1697,20 @@ fn acknowledge<V, Q, B: TicketNativeBackend<V, Q>>(
             }) {
                 Err(RoleFailure::InvalidOutput)
             } else {
+                backend_called = true;
                 backend.accept(&ticket, &value.question, &value.prepared, output)
             }
         } else {
             Err(RoleFailure::InvalidOutput)
         }
     } else {
+        backend_called = true;
         backend.discard(&ticket)
+    };
+    let observation_failures = if backend_called {
+        take_observation_failures::<V, Q, B>(backend, ticket)
+    } else {
+        TicketNativeObservationFailures::default()
     };
     if !accepted || result.is_ok() {
         held.remove(&id);
@@ -1380,6 +1728,7 @@ fn acknowledge<V, Q, B: TicketNativeBackend<V, Q>>(
         },
         rejected_permit: permit,
         result,
+        observation_failures,
     };
     // An acknowledgement can partially record telemetry before failing. It is
     // attempted once, preserving input/output until explicit discard or the

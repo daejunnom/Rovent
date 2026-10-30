@@ -12,6 +12,7 @@ use rz_position::contracts::ContractState;
 use rz_runtime::CompletionSignal;
 use rz_search::cpu_worker::{
     CpuAdmissionRejection, CpuJobTermination, CpuSliceReport, CpuWorkerProfile, CpuWorkerProgress,
+    ReleasedCpuReservation, SettledCpuSlice,
 };
 use rz_search::external_cpu::worker::{
     ExternalJob, ExternalTeacherDispatch, ExternalWorkerCompletion, ExternalWorkerReport,
@@ -32,18 +33,28 @@ use rz_search::pals::engine::adaptive_port::validator_port::{
     ValidatorActionId, ValidatorActionOutcome,
 };
 use rz_search::pals::engine::adaptive_port::{
-    AdaptiveDeferredRepair, AdaptiveEnginePort, AdaptivePortMaterializedStep, AdaptivePortQuestion,
-    AdaptivePortRoleEvidence, AdaptiveRootFanoutPolicy, AdaptiveRulesPairProof,
+    AdaptiveDeferredRepair, AdaptiveEnginePort, AdaptiveFrontierReceipt, AdaptiveFrontierStartup,
+    AdaptivePortMaterializedStep, AdaptivePortQuestion, AdaptivePortRoleEvidence,
+    AdaptiveReviewLeaseAdmission, AdaptiveRootFanoutPolicy, AdaptiveRulesPairProof,
 };
 use rz_search::pals::engine::{PalsCompletion, PalsError, PalsResult, RoleModel};
 use rz_search::pals::review_context::ReviewView;
-use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StorePins};
+use rz_search::pals::rovent_frontier::{
+    FrontierFrameKind, FrontierLimits, FrontierRegistration, NativeCloseReason, NativeReservation,
+};
+use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StoreError, StorePins};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
+mod profiled_external;
+use profiled_external::ProfiledDriverState;
 
 const MAX_RETAINED_QUESTIONS: usize = 64;
 const MAX_ARCHIVE_RECEIPTS: usize = 64;
+
+mod role_only;
+pub use role_only::PcPortDriver;
 
 /// A coherent iteration publication is scoped to its original question and
 /// physical owner. It is not CPU credit settlement or a new semantic witness.
@@ -125,6 +136,7 @@ pub struct AdaptivePortDriver<M: RoleModel + 'static> {
     transfer: Option<ArchiveTransfer>,
     foreign_transfer_question: Option<Digest>,
     foreign_permit: Option<(Digest, ForeignAppendPermit)>,
+    profiled: ProfiledDriverState,
     archive_receipts: VecDeque<ArchiveWorkReceipt>,
     quarantine: Option<Box<ArchiveQuarantine<M>>>,
     unexpected_archive_owner: Option<Box<ArchiveOwner<M>>>,
@@ -225,6 +237,7 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
             transfer: None,
             foreign_transfer_question: None,
             foreign_permit: None,
+            profiled: ProfiledDriverState::default(),
             archive_receipts: VecDeque::with_capacity(MAX_ARCHIVE_RECEIPTS),
             quarantine: None,
             unexpected_archive_owner: None,
@@ -271,9 +284,41 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
                 .and_then(|port| port.role_consumption_observation()),
             original_root_fence,
         );
+        diagnostic.profiled_feedback_readback(
+            self.authority,
+            self.port()
+                .map(|port| port.profiled_feedback_consumption_observation()),
+        );
     }
     pub fn port(&self) -> Option<&AdaptiveEnginePort<M>> {
         self.port.as_deref()
+    }
+    pub fn attach_rovent_frontier(
+        &mut self,
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        actual: AdaptiveFrontierStartup<'_>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .attach_rovent_frontier(registration, limits, actual, clock, now)?;
+        Ok(())
+    }
+    /// Evidence recovery does not retire the controller or release its pins.
+    pub fn rovent_frontier_receipt(
+        &self,
+    ) -> Result<Option<AdaptiveFrontierReceipt>, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_frontier_receipt())
+    }
+    pub fn retire_rovent_frontier(
+        &mut self,
+    ) -> Result<Option<AdaptiveFrontierReceipt>, AdaptiveManagerError> {
+        Ok(self.hot()?.retire_rovent_frontier()?)
     }
     pub fn set_collection_dispatch_observer(
         &mut self,
@@ -306,6 +351,31 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
     }
     pub fn prepare_root_rules(&mut self) -> Result<(), AdaptiveManagerError> {
         self.hot()?.prepare_root_rules().map_err(semantic)
+    }
+    pub fn prepare_rovent_root_rules(
+        &mut self,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.prepare_rovent_root_rules(clock, now)?;
+        Ok(())
+    }
+    pub fn root_state_id(&self) -> Result<rz_search::pals::store::StateId, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .root_state_id())
+    }
+    pub fn model_namespace(
+        &self,
+    ) -> Result<&rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace, AdaptiveManagerError>
+    {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .model_namespace()
+            .map_err(semantic)
     }
     pub fn root_is_terminal(&self) -> Result<bool, AdaptiveManagerError> {
         Ok(self
@@ -348,6 +418,7 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         receipt: &AdaptiveShutdownReceipt,
     ) -> Result<AdaptiveEnginePort<M>, (Self, AdaptiveManagerError)> {
         if !receipt.permits_semantic_closure()
+            || self.profiled.source.is_some()
             || receipt.authority != self.authority
             || !self.archive_joined
             || self.transfer.is_some()
@@ -388,7 +459,13 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         if self.archive_close_requested
             || self.transfer.is_some()
             || self.foreign_permit.is_some()
-            || (self.closing && !matches!(&operation, ArchiveOperation::PrepareForeign { .. }))
+            || self.profiled.permit.is_some()
+            || (self.closing
+                && !matches!(
+                    &operation,
+                    ArchiveOperation::PrepareForeign { .. }
+                        | ArchiveOperation::PrepareProfiledForeign { .. }
+                ))
         {
             return Err(AdaptiveManagerError::AuxiliaryPending);
         }
@@ -407,20 +484,34 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
                 ArchiveOperation::PrepareForeign { issued, .. } => {
                     self.hard_deadline.min(issued.retain_until())
                 }
+                ArchiveOperation::PrepareProfiledForeign { issued, .. } => {
+                    self.hard_deadline.min(issued.retain_until())
+                }
                 _ => self.hard_deadline,
             },
             max_io_bytes: port.archive_remaining_io().min(16 * 1024 * 1024),
             operation,
         };
+        let profiled = matches!(
+            &work.operation,
+            ArchiveOperation::PrepareProfiledForeign { .. }
+        );
         match worker.submit(ArchiveOwner::Port(*port), self.authority, work) {
             Ok(transfer) => {
                 self.transfer = Some(transfer);
-                self.foreign_transfer_question = question;
+                if profiled {
+                    self.profiled.transfer_question = question;
+                } else {
+                    self.foreign_transfer_question = question;
+                }
                 Ok(())
             }
             Err(rejected) => {
-                if let ArchiveOwner::Port(port) = rejected.owner {
-                    self.port = Some(Box::new(port));
+                match rejected.owner {
+                    ArchiveOwner::Port(port) => self.port = Some(Box::new(port)),
+                    owner @ (ArchiveOwner::Engine(_) | ArchiveOwner::Idle(_)) => {
+                        self.unexpected_archive_owner = Some(Box::new(owner));
+                    }
                 }
                 Err(semantic(rejected.error))
             }
@@ -504,7 +595,39 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
     }
 }
 fn semantic(error: PalsError) -> AdaptiveManagerError {
-    AdaptiveManagerError::Semantic(error.to_string())
+    match error {
+        PalsError::Rovent(error) => AdaptiveManagerError::Frontier(error),
+        PalsError::Store(StoreError::ReviewLeaseBackpressure {
+            current,
+            capacity,
+            required_new,
+            replacement_reserve,
+        }) => AdaptiveManagerError::ReviewLeaseBackpressure {
+            current,
+            capacity,
+            required_new,
+            replacement_reserve,
+        },
+        other => AdaptiveManagerError::Semantic(other.to_string()),
+    }
+}
+fn nnuec_preparation(
+    error: rz_search::pals::engine::adaptive_port::AdaptiveNnuecPreparationError,
+) -> AdaptiveManagerError {
+    use rz_search::pals::engine::adaptive_port::AdaptiveNnuecPreparationError as Error;
+    match error {
+        Error::Semantic(error) => semantic(error),
+        Error::Preparation(error) => {
+            AdaptiveManagerError::NnuecPreparation(NnuecWorkError::Preparation(error))
+        }
+        Error::Worker(error) => AdaptiveManagerError::Cpu(error),
+        Error::StateMismatch => AdaptiveManagerError::NnuecPreparation(NnuecWorkError::Invalid(
+            "NNUEC original question/model/owner mismatch",
+        )),
+        Error::Neural(error) => {
+            AdaptiveManagerError::Semantic(format!("NNUEC preparation: {error:?}"))
+        }
+    }
 }
 fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuestion> {
     CheckedStep {
@@ -516,8 +639,1112 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_common_work(
+        &self,
+    ) -> Result<
+        Option<(
+            Option<u64>,
+            rz_search::pals::rovent_frontier::FrontierNodeWork,
+        )>,
+        AdaptiveManagerError,
+    > {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_frontier()
+            .map(|frontier| {
+                let snapshot = frontier.snapshot();
+                (snapshot.requested_nodes, snapshot.work)
+            }))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn freeze_utility_witness_bodies(
+        &self,
+        outcome: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityConditionalWitnessBodies,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .freeze_utility_witness_bodies(outcome)
+            .map_err(semantic)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_offer_semantics(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::UtilityCohortOfferSemanticSource,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .utility_cohort_offer_semantics(work)
+            .map_err(semantic)
+    }
+    fn prepare_utility_route(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        target: u16,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_deref_mut()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_utility_route(work, target)
+            .map_err(semantic)
+    }
+    fn prepare_utility_route_input_request(
+        &self,
+        prep: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+        canceled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_utility_route_input_request(prep, work, model, canceled)
+            .map_err(|error| AdaptiveManagerError::Semantic(format!("{error:?}")))
+    }
+    fn bind_utility_intervention_target(
+        &self,
+        prep: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        source: rz_search::pals::coordinator::UtilityInterventionReadySource<AdaptivePortQuestion>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+            rz_search::pals::coordinator::UtilityInterventionReadySource<AdaptivePortQuestion>,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, prep, source, input));
+        };
+        port.bind_utility_intervention_target(prep, source, input)
+            .map_err(|r| (semantic(r.error), r.preparation, r.source, r.input))
+    }
+    fn prepare_utility_intervention(
+        &mut self,
+        target: rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget,
+        recipient: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteRecipient,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget,
+        ),
+    > {
+        let Some(port) = self.port.as_deref_mut() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, target));
+        };
+        port.prepare_utility_intervention(target, recipient)
+            .map_err(|(e, t)| (semantic(e), t))
+    }
+    fn bind_utility_intervention_route(
+        &self,
+        admission:rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, admission));
+        };
+        port.bind_utility_intervention_route(admission, work)
+            .map_err(|r| (semantic(r.error), r.admission))
+    }
+    fn prepare_utility_intervention_arm_request(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_utility_intervention_arm_request(action, work, model, cancel)
+            .map_err(|e| AdaptiveManagerError::Semantic(format!("{e:?}")))
+    }
+    fn attach_utility_intervention_arm_request(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        request: rz_search::cpu_value::nnuec::v2::review::Request,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::review::Request,
+        (
+            AdaptiveManagerError,
+            rz_search::cpu_value::nnuec::v2::review::Request,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, request));
+        };
+        port.attach_utility_intervention_arm_request(action, work, request)
+            .map_err(|(e, r)| (AdaptiveManagerError::Semantic(format!("{e:?}")), r))
+    }
+    fn bind_utility_intervention_arm_capture(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        (),
+        (
+            AdaptiveManagerError,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, input));
+        };
+        port.bind_utility_intervention_arm_capture(action, work, input)
+            .map_err(|(e, i)| (semantic(e), i))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_intervention_arm_metadata(
+        &self,
+        action: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<serde_json::Value, AdaptiveManagerError> {
+        super::utility_intervention_historical::arm_query(action, work)
+    }
+    fn bind_utility_route_input(
+        &self,
+        prep: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, prep, input));
+        };
+        port.bind_utility_route_input(prep, work, input)
+            .map_err(|rejected| {
+                (
+                    semantic(rejected.error),
+                    rejected.preparation,
+                    rejected.input,
+                )
+            })
+    }
+    fn validate_utility_route_work(
+        &self,
+        action: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .validate_utility_route_work(action, work)
+            .map_err(semantic)
+    }
+    fn begin_utility_route_commit(
+        &self,
+        action: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        execution: StepExecution,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .begin_utility_route_commit(action, work, execution)
+            .map_err(semantic)
+    }
+    fn register_utility_route_descendant(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .register_utility_route_descendant(action, work)
+            .map_err(semantic)
+    }
+    fn register_utility_route_peer(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        proof: &rz_search::pals::coordinator::ReciprocalDependencyProof<
+            ReviewView,
+            AdaptivePortQuestion,
+        >,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .register_utility_route_peer(action, work, proof)
+            .map_err(semantic)
+    }
+    fn commit_utility_route_step(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        guard: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .commit_utility_route_step(action, guard, work)
+            .map_err(semantic)
+    }
+    fn commit_utility_route_await(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .commit_utility_route_await(action, work, report)
+            .map_err(semantic)
+    }
+    fn commit_utility_route_role(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        guard: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .commit_utility_route_role(action, guard, work, accepted, output)
+            .map_err(semantic)
+    }
+    fn record_utility_route_r_pc_consumption(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        witness: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .record_utility_route_r_pc_consumption(action, witness)
+            .map_err(semantic)
+    }
+    fn finish_utility_route_semantics(
+        &self,
+        action: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, action));
+        };
+        port.finish_utility_route_semantics(action)
+            .map_err(|(error, action)| (semantic(error), action))
+    }
+    fn reserve_cpu_nnuec_capture(
+        &self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        model: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        bound: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        sequence: u64,
+        limits: rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLimits,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureReservation,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .reserve_cpu_nnuec_capture(seal, model, bound, sequence, limits)
+            .map_err(|error| AdaptiveManagerError::NnuecCapture(Arc::new(error)))
+    }
+    fn cpu_semantic_publication_recorded(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> bool {
+        self.port
+            .as_deref()
+            .is_some_and(|port| port.cpu_semantic_publication_recorded(work, report))
+    }
+    fn cpu_semantic_witnesses(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+        settled: &SettledCpuSlice,
+        capture: &rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLineage,
+    ) -> Result<Vec<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>, AdaptiveManagerError>
+    {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .cpu_semantic_witnesses(work, report, settled, capture)
+            .map_err(semantic)
+    }
+    fn selected_cpu_pc_consumption(
+        &self,
+        source: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .selected_cpu_pc_consumption(source, input, accepted, output)
+            .map_err(semantic)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration(
+        &self,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        root: &Arc<crate::rovent_root_admission::RoventRootAdmission>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_validate(source, root)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration_v2(
+        &self,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        root: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_validate_v2(source, root)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_work(
+        &self,
+    ) -> Option<rz_search::pals::rovent_frontier::FrontierExternalWork> {
+        self.profile_work()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_retained_host_bytes(&self) -> Option<u64> {
+        self.profile_retained_host_bytes()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn prepare_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        config: &ExternalCpuConfig,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        execution: rz_contracts::ExecutionId,
+        constraint: rz_search::external_cpu::ExternalGoConstraint,
+        quantum: Duration,
+        signal: CompletionSignal,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalPreparation,
+        AdaptiveManagerError,
+    > {
+        self.profile_prepare(
+            work, config, source, id, execution, constraint, quantum, signal, clock, now,
+        )
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_admitted(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        dispatch: &rz_search::external_cpu::ProfiledExternalDispatch,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalAdmission,
+        AdaptiveManagerError,
+    > {
+        self.profile_admitted(work, source, dispatch, clock, now)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn commit_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        reservation: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        packet: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<CheckedStep<AdaptivePortQuestion>, AdaptiveManagerError> {
+        self.profile_commit(work, source, reservation, packet)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn observe_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        reservation: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        packet: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_observe(work, source, reservation, packet)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn consume_profiled_reciprocal_cpu(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        reservation: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        packet: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::CheckedProfiledExternalResponse,
+        AdaptiveManagerError,
+    > {
+        self.profile_consume_reciprocal(work, source, reservation, packet)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn reject_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_reject(work)
+    }
+    fn review_lease_admission(
+        &self,
+    ) -> Result<Option<AdaptiveReviewLeaseAdmission>, AdaptiveManagerError> {
+        let observed = self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .review_lease_admission()
+            .map_err(semantic)?;
+        Ok(observed.frontier_owner_present.then_some(observed))
+    }
+    fn frontier_native_capacity(
+        &mut self,
+        requested: u64,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<u64>, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.native_capacity(requested, clock, now))
+            .map_err(Into::into)
+    }
+    fn frontier_native_reserve(
+        &mut self,
+        job: &CpuJobEnvelope,
+        grant: SliceGrant,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<NativeReservation>, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.reserve_native(job, grant, clock, now))
+            .map_err(Into::into)
+    }
+    fn frontier_native_settled(
+        &mut self,
+        reservation: &NativeReservation,
+        report: &CpuSliceReport,
+        accepted: &SettledCpuSlice,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| {
+                frontier.settle_native(reservation, report, accepted)
+            })?
+            .ok_or(AdaptiveManagerError::Invalid(
+                "native frontier owner absent",
+            ))
+    }
+    fn frontier_native_released(
+        &mut self,
+        reservation: &NativeReservation,
+        accepted: &ReleasedCpuReservation,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.release_unqueued(reservation, accepted))?
+            .ok_or(AdaptiveManagerError::Invalid(
+                "native frontier owner absent",
+            ))
+    }
+    fn frontier_native_unknown(
+        &mut self,
+        reservation: &NativeReservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.native_usage_unknown(reservation))?
+            .ok_or(AdaptiveManagerError::Invalid(
+                "native frontier owner absent",
+            ))
+    }
+    fn register_cpu_reciprocal_scope(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        job: &CpuJobEnvelope,
+        question: &rz_contracts::rovent::QuestionEnvelope,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .register_cpu_reciprocal_scope(work, job, question)
+            .map_err(semantic)
+    }
+    fn prepare_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        budget: Digest,
+        recipient: rz_contracts::rovent::SearchRecipient,
+    ) -> Result<Option<AdaptivePeerQuestion<AdaptivePortQuestion>>, AdaptiveManagerError> {
+        Ok(self
+            .hot()?
+            .prepare_accepted_role_reciprocal(work, accepted, output, id, mode, budget, recipient)
+            .map_err(semantic)?
+            .map(|prepared| AdaptivePeerQuestion {
+                origin: prepared.origin,
+                question: prepared.question,
+                input: prepared.input,
+            }))
+    }
+    fn accept_accepted_role_source(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .accept_accepted_role_source(work, accepted, output)
+            .map_err(semantic)
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    fn diagnostic_accepted_source_revision(
+        &self,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+    ) -> Option<u64> {
+        // Observation only: do not invoke hot(), mutate archive ownership or
+        // turn absent/failed publication evidence into a manager error.
+        if self.quarantine.is_some() {
+            return None;
+        }
+        self.port
+            .as_deref()?
+            .diagnostic_accepted_source_revision(accepted)
+    }
+    fn consume_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        let physical = physical.map(|evidence| AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        });
+        self.hot()?
+            .consume_accepted_role_reciprocal(work, accepted, output, physical)
+            .map_err(semantic)
+    }
+    fn consume_reciprocal_cpu(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        self.hot()?
+            .consume_reciprocal_cpu(work, report)
+            .map_err(semantic)
+    }
+    fn discard_accepted_role_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.discard_accepted_role_reciprocal(id);
+        Ok(())
+    }
+    fn reciprocal_parent(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        job: &CpuJobEnvelope,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<rz_contracts::rovent::QuestionEnvelope, AdaptiveManagerError> {
+        self.hot()?
+            .cpu_reciprocal_parent(work, job, id, mode, root_budget)
+            .map_err(semantic)
+    }
+    fn prepare_cpu_reciprocal(
+        &mut self,
+        parent: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        request: &rz_search::cpu::CpuReciprocalRequest,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<AdaptiveReciprocalQuestion<AdaptivePortQuestion>, AdaptiveManagerError> {
+        let prepared = self
+            .hot()?
+            .prepare_cpu_reciprocal(parent, request, id, mode, root_budget)
+            .map_err(semantic)?;
+        Ok(AdaptiveReciprocalQuestion {
+            question: prepared.question,
+            input: prepared.input,
+        })
+    }
+    fn cpu_reciprocal_wait(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .cpu_reciprocal_wait(work, report)
+            .map_err(semantic)
+    }
+    fn discard_cpu_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.discard_cpu_reciprocal(id);
+        Ok(())
+    }
+    fn consume_cpu_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+        requests: &[(
+            rz_search::cpu::CpuReciprocalRequest,
+            rz_contracts::rovent::ReciprocalQuestionId,
+        )],
+    ) -> Result<Vec<rz_search::cpu::CpuReciprocalReply>, AdaptiveManagerError> {
+        let physical = physical.map(|evidence| AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        });
+        let answer = self
+            .hot()?
+            .consume_cpu_reciprocal(work, accepted, output, physical)
+            .map_err(semantic)?;
+        requests
+            .iter()
+            .map(|(request, id)| {
+                self.hot()?
+                    .cpu_reciprocal_reply(&answer, request, *id)
+                    .map_err(semantic)
+            })
+            .collect()
+    }
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
+    }
+    fn validate_cpu_nnuec_model(
+        &self,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .validate_cpu_nnuec_model(model)
+            .map_err(nnuec_preparation)
+    }
+    fn prepare_cpu_nnuec_review(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+        canceled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewRequest,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_cpu_nnuec_review(work, model, canceled)
+            .map_err(nnuec_preparation)
+    }
+    fn install_cpu_nnuec_review(
+        &self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        model: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        bound: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+    ) -> Result<rz_search::cpu_worker::PreparedValueInstallation, AdaptiveManagerError> {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .install_cpu_nnuec_review(seal, model, bound)
+            .map_err(nnuec_preparation)
+    }
+    fn accept_cpu_nnuec_installation(
+        &mut self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        model: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        bound: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        receipt: &rz_search::cpu_worker::ValueInstallReceipt,
+        worker: &rz_search::cpu_worker::CpuWorker,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .accept_cpu_nnuec_installation(seal, model, bound, receipt, worker)
+            .map_err(nnuec_preparation)
+    }
+    fn release_cpu_nnuec_installation(
+        &mut self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .release_cpu_nnuec_installation(seal)
+            .map_err(nnuec_preparation)
+    }
+    fn next_rovent_goal_input(
+        &mut self,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveGoalLocalAdmission,
+        AdaptiveManagerError,
+    > {
+        self.hot()?
+            .next_rovent_goal_input(clock, now)
+            .map_err(semantic)
+    }
+    fn validate_rovent_goal_input(
+        &self,
+        input: &rz_search::pals::engine::adaptive_port::GoalLocalInput,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .validate_rovent_goal_input(input, ticket, output)
+            .map_err(semantic)
+    }
+    fn consume_rovent_goal_input(
+        &mut self,
+        input: &rz_search::pals::engine::adaptive_port::GoalLocalInput,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<rz_search::pals::engine::adaptive_port::GoalLocalStep, AdaptiveManagerError> {
+        let evidence = physical.ok_or(AdaptiveManagerError::Invalid(
+            "GoalLocal native execution evidence absent",
+        ))?;
+        let physical = AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        };
+        self.hot()?
+            .consume_rovent_goal_input(input, accepted, output, physical, clock, now)
+            .map_err(semantic)
+    }
+    fn discard_rovent_goal_input(
+        &mut self,
+        input: &rz_search::pals::engine::adaptive_port::GoalLocalInput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .discard_rovent_goal_input(input)
+            .map_err(semantic)
+    }
+    fn rovent_goal_has_pending(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_goal_has_pending())
+    }
+    fn close_rovent_goal_admission(&mut self) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.close_rovent_goal_admission().map_err(semantic)
+    }
+    fn prepare_rovent_goal_boundary(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::AdaptiveGoalBoundary<AdaptivePortQuestion>>,
+        AdaptiveManagerError,
+    > {
+        self.hot()?
+            .prepare_rovent_goal_boundary(work)
+            .map_err(semantic)
+    }
+    fn release_rovent_goal_state(&mut self) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.release_rovent_goal_state().map_err(semantic)
+    }
+    fn rovent_goal_consumption_recorded(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        view: &ReviewView,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_goal_consumption_recorded(ticket, view))
+    }
+    fn validate_collection_admission(
+        &self,
+        admission: &RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .as_ref()
+            .and_then(|port| port.rovent_frontier())
+            .ok_or(AdaptiveManagerError::Invalid(
+                "collection requires the actual attached Rovent frontier",
+            ))?;
+        let original = frontier.registration();
+        if !admission.validates_registration(
+            self.authority,
+            original.mode,
+            original.root_budget,
+            original.original_deadline,
+        ) || admission.selective_policy() != original.selective_policy
+            || !Arc::ptr_eq(admission.rules(), &original.root_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &original.root_moves)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "collection cap differs from the actual PCR registration",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_collection_admission_v2(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .as_ref()
+            .and_then(|port| port.rovent_frontier())
+            .ok_or(AdaptiveManagerError::Invalid(
+                "V2 collection requires the actual attached Rovent frontier",
+            ))?;
+        admission.validate_frontier(frontier)?;
+        let original = frontier.registration();
+        let root = admission.root_admission();
+        let namespace = admission
+            .native_origin()
+            .startup_snapshot()
+            .model_namespace()
+            .map_err(|_| AdaptiveManagerError::Invalid("V2 original Ready namespace"))?;
+        let active = root
+            .original_context()
+            .accepts()
+            .map_err(|_| AdaptiveManagerError::Invalid("V2 collection root unavailable"))?;
+        if !active
+            || root.authority() != self.authority
+            || root.authority() != original.authority
+            || root.hard_deadline() != original.original_deadline
+            || root.goal() != original.goal
+            || root.requested_nodes() != original.nodes
+            || admission.root_budget() != original.root_budget
+            || admission.selective_policy() != original.selective_policy
+            || admission
+                .native_origin()
+                .sources()
+                .lock()
+                .manifest
+                .engine
+                .mode
+                != original.mode
+            || original.model_namespace.as_ref() != &namespace
+            || !Arc::ptr_eq(admission.rules(), &original.root_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &original.root_moves)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 collection cap differs from the actual PCR registration",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn collection_v2_observation_complete(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> bool {
+        // This only reports that this driver's V-free observation paths can
+        // consume the exact attached admission.  The independent Arena
+        // teacher still reports its own startup and physical retirement.
+        let origin = admission.native_origin();
+        !self.closing
+            && origin.sources().lock().manifest.engine.pc.validator.is_none()
+            && !origin.startup_snapshot().validator_loaded
+            && self.validate_collection_admission_v2(admission).is_ok()
+    }
+    fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_frontier()
+            .map(|frontier| frontier.registration().root_budget))
+    }
+    fn rovent_public_record_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        let port = self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let Some(frontier) = port.rovent_frontier() else {
+            return Ok(false);
+        };
+        if frontier.registration().authority != self.authority {
+            return Err(AdaptiveManagerError::Invalid(
+                "capacity controller differs from the actual driver root",
+            ));
+        }
+        Ok(frontier.public_record_capacity_refused())
+    }
+    fn close_rovent_role_call_budget(
+        &mut self,
+        admitted: u64,
+        limit: u64,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .close_rovent_role_call_budget(admitted, limit)
+            .map_err(semantic)
+    }
+    fn rovent_public_review_index_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        let port = self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let Some(frontier) = port.rovent_frontier() else {
+            return Ok(false);
+        };
+        if frontier.registration().authority != self.authority {
+            return Err(AdaptiveManagerError::Invalid(
+                "review capacity controller differs from the actual driver root",
+            ));
+        }
+        Ok(frontier.public_review_index_capacity_refused())
+    }
+    fn rovent_lane_selected(
+        &mut self,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        selected: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_lane_selected(original, selected, clock, now)
+            .map_err(semantic)
+    }
+    fn rovent_frame_admitted(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        kind: FrontierFrameKind,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_frame_admitted(work, kind, clock, now)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn rovent_fresh_accepted(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        let evidence = physical.ok_or(AdaptiveManagerError::Invalid(
+            "Fresh endpoint lacks original native execution evidence",
+        ))?;
+        let physical = AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        };
+        self.hot()?
+            .rovent_fresh_accepted(work, accepted, output, physical, clock, now)
+            .map_err(semantic)
+    }
+    fn rovent_rules_endpoint(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_rules_endpoint(work, clock, now)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn rovent_root_round_sealed(
+        &mut self,
+        root_budget: Digest,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_root_round_sealed(root_budget, clock, now)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn validate_registered_native_ledger(
+        &self,
+        identity: &rz_search::cpu_worker::CpuLedgerIdentity,
+        observed: &rz_search::cpu_worker::CpuLedgerRegistrationObservation,
+        root_budget: Digest,
+        hard_deadline: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        let port = self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let frontier = port.rovent_frontier().ok_or(AdaptiveManagerError::Invalid(
+            "original ledger requires the actual attached frontier",
+        ))?;
+        let registration = frontier.registration();
+        let work = frontier.snapshot().work;
+        let clock = rz_search::contract_time::InstantClock::new(
+            observed.clock_domain,
+            observed.clock_origin,
+        );
+        if registration.authority != self.authority
+            || observed.authority != self.authority
+            || registration.original_deadline.clock != observed.clock_domain
+            || clock
+                .instant_at(registration.original_deadline.at)
+                .map_err(|_| AdaptiveManagerError::Deadline)?
+                != hard_deadline
+            || self.hard_deadline != hard_deadline
+            || registration.root_budget != root_budget
+            || registration.native_ledger.as_ref() != Some(identity)
+            || !Arc::ptr_eq(&registration.root_rules, &self.rules)
+            || !work.native_usage_known
+            || work.native_nodes != observed.spent_native_nodes
+            || work.reserved_native_nodes != observed.reserved_native_nodes
+            || work.outstanding_native_executions != observed.outstanding_executions
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "original native ledger differs from its actual root frontier",
+            ));
+        }
+        Ok(())
     }
     fn root_role_call_limit(&self) -> Result<Option<u64>, AdaptiveManagerError> {
         Ok(Some(
@@ -551,8 +1778,16 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             })? {
                 let nonce = transfer.nonce();
                 let foreign = self.foreign_transfer_question.take();
+                let profiled = self.profiled.transfer_question.take();
                 self.transfer = None;
-                let installed = if let Some(question) = foreign {
+                let installed = if let Some(question) = profiled {
+                    completed
+                        .install_with_profiled_foreign(self.authority, nonce)
+                        .map(|(owner, receipt, permit)| {
+                            self.profiled.permit = Some((question, permit));
+                            (owner, receipt)
+                        })
+                } else if let Some(question) = foreign {
                     completed.install_with_foreign(self.authority, nonce).map(
                         |(owner, receipt, permit)| {
                             self.foreign_permit = Some((question, permit));
@@ -570,7 +1805,7 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
                         }
                         self.archive_receipts.push_back(receipt);
                     }
-                    Ok((owner @ ArchiveOwner::Engine(_), _)) => {
+                    Ok((owner @ (ArchiveOwner::Engine(_) | ArchiveOwner::Idle(_)), _)) => {
                         self.unexpected_archive_owner = Some(Box::new(owner));
                         return Err(AdaptiveManagerError::Invalid(
                             "archive returned a different semantic owner kind",
@@ -640,7 +1875,11 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         Ok(())
     }
     fn finish_auxiliary_shutdown(&mut self) -> Result<(), AdaptiveManagerError> {
-        if self.transfer.is_some() || self.foreign_permit.is_some() {
+        if self.transfer.is_some()
+            || self.foreign_permit.is_some()
+            || self.profiled.permit.is_some()
+            || self.profiled.transfer_question.is_some()
+        {
             return Err(AdaptiveManagerError::AuxiliaryPending);
         }
         self.archive_close_requested = true;
@@ -655,6 +1894,13 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             && self.port.is_some()
             && self.quarantine.is_none()
             && self.unexpected_archive_owner.is_none()
+            && self.port.as_ref().is_none_or(|port| {
+                port.rovent_frontier_receipt().is_none_or(|receipt| {
+                    receipt.snapshot.work.native_usage_known
+                        && receipt.snapshot.work.reserved_native_nodes == 0
+                        && receipt.snapshot.work.outstanding_native_executions == 0
+                })
+            })
     }
     fn short_circuit(
         &mut self,
@@ -779,14 +2025,9 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         profiles: &[CpuWorkerProfile],
         external: Option<&ExternalCpuConfig>,
-        selection: CpuEndpointSelection,
+        endpoint: CpuEndpoint,
         physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError> {
-        let endpoint = if selection.execution_use == CpuExecutionUse::Collection {
-            selection.cpu_t
-        } else {
-            selection.cpu_r
-        };
         match endpoint {
             CpuEndpoint::Own => {
                 let port = self.hot()?;
@@ -988,6 +2229,20 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
                 .map(|_| ())
                 .map_err(semantic)
         }
+    }
+    fn cpu_no_value_terminated(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        // Unlike cpu_slice_observed, this remains observation-only while
+        // Running, and cannot enter commit_cpu_report/after_cpu.
+        let original = self
+            .hot()?
+            .observe_cpu_no_value_termination(work, report)
+            .map_err(semantic)?;
+        self.cpu_feedback.remove(&work.input.question_digest);
+        Ok(original)
     }
     fn cpu_rejected(
         &mut self,

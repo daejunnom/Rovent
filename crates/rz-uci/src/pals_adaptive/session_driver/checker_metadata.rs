@@ -20,6 +20,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[cfg(feature = "pals-adaptive")]
+mod profiled_external;
+#[cfg(feature = "pals-adaptive")]
+use profiled_external::ProfiledExternalMetadataBinding;
+
 const MAX_CONDITIONS_BYTES: usize = 8192;
 const METADATA_ONLY: &str = "adaptive metadata mirror has no physical checker owner";
 
@@ -44,6 +49,8 @@ struct ResetState {
     sequence: u64,
     pending: Option<MetadataResetArm>,
     external: Option<ExternalOwnerBinding>,
+    #[cfg(feature = "pals-adaptive")]
+    profiled: Option<ProfiledExternalMetadataBinding>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,9 +59,19 @@ struct ResetState {
     reason = "the bounded reset arm keeps its original Copy fence inline without a reset-path allocation"
 )]
 enum MetadataResetArm {
-    Owned { deadline: Instant },
-    InitialExternal { deadline: Instant },
-    External { fence: ExternalNewGameFence },
+    Owned {
+        deadline: Instant,
+    },
+    InitialExternal {
+        deadline: Instant,
+    },
+    External {
+        fence: ExternalNewGameFence,
+    },
+    #[cfg(feature = "pals-adaptive")]
+    ProfiledExternal {
+        deadline: Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -285,6 +302,12 @@ impl AdaptiveCheckerMetadata {
             .reset
             .lock()
             .map_err(|_| CheckerError::Invalid("metadata reset owner poisoned"))?;
+        #[cfg(feature = "pals-adaptive")]
+        if reset.profiled.is_some() {
+            return Err(CheckerError::Invalid(
+                "external metadata profiled owner already bound",
+            ));
+        }
         if reset.pending.is_some() || reset.external.is_some() {
             return Err(CheckerError::Invalid(
                 "external metadata owner already bound or armed",
@@ -624,6 +647,9 @@ impl CpuChecker for AdaptiveCheckerMetadataMirror {
     fn owned_resume_policy(&self) -> Option<CpuResumePolicy> {
         self.metadata.resume_policy()
     }
+    fn registered_worker_stack_owner_id(&self) -> Option<u64> {
+        self.metadata.actual_owner_id
+    }
     fn start(&mut self, _: Instant, _: &AtomicBool) -> Result<(), CheckerError> {
         Err(CheckerError::Unsupported(METADATA_ONLY))
     }
@@ -685,6 +711,8 @@ impl CpuChecker for AdaptiveCheckerMetadataMirror {
             MetadataResetArm::Owned { deadline: owner } => deadline.min(owner),
             MetadataResetArm::InitialExternal { deadline: owner } => deadline.min(owner),
             MetadataResetArm::External { .. } => deadline,
+            #[cfg(feature = "pals-adaptive")]
+            MetadataResetArm::ProfiledExternal { deadline: owner } => deadline.min(owner),
         };
         check_controls(effective_deadline, cancel)
     }

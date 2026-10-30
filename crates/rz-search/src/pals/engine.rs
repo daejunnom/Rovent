@@ -42,13 +42,24 @@ mod archive_lifecycle;
 mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;
+pub mod idle_archive;
+pub mod pc_port;
+pub mod preparing_root;
+mod researcher_admission;
+mod researcher_profile;
 mod review_lifecycle;
+pub use researcher_profile::ResearcherSemanticProfile;
+mod semantic_state;
 pub use followup_execution::{
     PALS_FOLLOWUP_EXECUTION_TRACE_MAX, PALS_FOLLOWUP_EXECUTION_VERSION,
     PalsExecutionEndpointSnapshot, PalsExecutionEndpointValue, PalsFollowupExecutionScope,
     PalsFollowupExecutionSnapshot, PalsFollowupObservationIssue, PalsFollowupOwnerSnapshot,
     PalsFrozenComparisonExecution, PalsFrozenValueExecution, PalsRepairExecutionTrace,
     PalsRepairRecheckExecution, RoleExecutionContext, RoleValueExecutionEvidence,
+};
+pub use semantic_state::{
+    NoResearcher, PalsSemanticConfig, PalsSemanticState, PcSemanticOwner, PcSemanticProfile,
+    RegisteredResearcher, RoventSemanticProfile,
 };
 
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
@@ -124,6 +135,107 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
         &[
             ("pals/engine.rs", include_str!("engine.rs")),
             (
+                "pals/engine/semantic_state.rs",
+                include_str!("engine/semantic_state.rs"),
+            ),
+            (
+                "pals/engine/researcher_admission.rs",
+                include_str!("engine/researcher_admission.rs"),
+            ),
+            (
+                "pals/engine/researcher_profile.rs",
+                include_str!("engine/researcher_profile.rs"),
+            ),
+            (
+                "pals/engine/preparing_root.rs",
+                include_str!("engine/preparing_root.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/controls.rs",
+                include_str!("engine/preparing_root/controls.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/handoff.rs",
+                include_str!("engine/preparing_root/handoff.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/initial_cleanup.rs",
+                include_str!("engine/preparing_root/initial_cleanup.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/initial_cleanup_tests.rs",
+                include_str!("engine/preparing_root/initial_cleanup_tests.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/lifecycle.rs",
+                include_str!("engine/preparing_root/lifecycle.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/retirement.rs",
+                include_str!("engine/preparing_root/retirement.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/registration.rs",
+                include_str!("engine/preparing_root/registration.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/preparing_nnuec.rs",
+                include_str!("engine/adaptive_port/preparing_nnuec.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/preparing_port.rs",
+                include_str!("engine/adaptive_port/preparing_port.rs"),
+            ),
+            (
+                "pals/engine/no_researcher_lifecycle.rs",
+                include_str!("engine/no_researcher_lifecycle.rs"),
+            ),
+            ("pals/engine/pc_port.rs", include_str!("engine/pc_port.rs")),
+            (
+                "pals/engine/pc_port/shared_nnuec.rs",
+                include_str!("engine/pc_port/shared_nnuec.rs"),
+            ),
+            (
+                "cpu_value/nnuec_v2_shared_readout.rs",
+                include_str!("../cpu_value/nnuec_v2_shared_readout.rs"),
+            ),
+            (
+                "pals/engine/pc_port/frontier_port.rs",
+                include_str!("engine/pc_port/frontier_port.rs"),
+            ),
+            (
+                "pals/engine/pc_port/goal_local.rs",
+                include_str!("engine/pc_port/goal_local.rs"),
+            ),
+            (
+                "pals/engine/pc_port/peer_questions.rs",
+                include_str!("engine/pc_port/peer_questions.rs"),
+            ),
+            (
+                "pals/engine/pc_port/attack_source.rs",
+                include_str!("engine/pc_port/attack_source.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_cycle.rs",
+                include_str!("engine/pc_port/repair_cycle.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_followup.rs",
+                include_str!("engine/pc_port/repair_followup.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_witness.rs",
+                include_str!("engine/pc_port/repair_witness.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_report.rs",
+                include_str!("engine/pc_port/repair_report.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_cycle_tests.rs",
+                include_str!("engine/pc_port/repair_cycle_tests.rs"),
+            ),
+            (
                 "pals/engine/frozen_recheck.rs",
                 include_str!("engine/frozen_recheck.rs"),
             ),
@@ -132,8 +244,16 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/archive_lifecycle.rs"),
             ),
             (
+                "pals/engine/idle_archive.rs",
+                include_str!("engine/idle_archive.rs"),
+            ),
+            (
                 "pals/engine/review_lifecycle.rs",
                 include_str!("engine/review_lifecycle.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/goal_hooks.rs",
+                include_str!("engine/adaptive_port/goal_hooks.rs"),
             ),
             (
                 "pals/engine/adaptive_port.rs",
@@ -147,6 +267,80 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 "pals/engine/adaptive_port/role_commit.rs",
                 include_str!("engine/adaptive_port/role_commit.rs"),
             ),
+            (
+                "pals/engine/adaptive_port/checked_replay.rs",
+                include_str!("engine/adaptive_port/checked_replay.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/cpu_evidence_context.rs",
+                include_str!("engine/adaptive_port/cpu_evidence_context.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/cpu_semantic_witness.rs",
+                include_str!("engine/adaptive_port/cpu_semantic_witness.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/goal_local.rs",
+                include_str!("engine/adaptive_port/goal_local.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/legacy_full_context.rs",
+                include_str!("engine/adaptive_port/legacy_full_context.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/mate_strategy.rs",
+                include_str!("engine/adaptive_port/mate_strategy.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/nnuec_installation.rs",
+                include_str!("engine/adaptive_port/nnuec_installation.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/nnuec_port.rs",
+                include_str!("engine/adaptive_port/nnuec_port.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_external_port.rs",
+                include_str!("engine/adaptive_port/profiled_external_port.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_external_port/feedback_observation.rs",
+                include_str!("engine/adaptive_port/profiled_external_port/feedback_observation.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_retirement_archive.rs",
+                include_str!("engine/adaptive_port/profiled_retirement_archive.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_retirement_archive/codec.rs",
+                include_str!("engine/adaptive_port/profiled_retirement_archive/codec.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_retirement_archive/io.rs",
+                include_str!("engine/adaptive_port/profiled_retirement_archive/io.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/reciprocal_port/fresh_usage.rs",
+                include_str!("engine/adaptive_port/reciprocal_port/fresh_usage.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/reciprocal_port.rs",
+                include_str!("engine/adaptive_port/reciprocal_port.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/frontier_port.rs",
+                include_str!("engine/adaptive_port/frontier_port.rs"),
+            ),
+            (
+                "pals/rovent_frontier.rs",
+                include_str!("rovent_frontier.rs"),
+            ),
+            (
+                "pals/rovent_frontier/question.rs",
+                include_str!("rovent_frontier/question.rs"),
+            ),
+            ("pals/rovent_goals.rs", include_str!("rovent_goals.rs")),
+            ("pals/rovent_solved.rs", include_str!("rovent_solved.rs")),
             (
                 "pals/engine/adaptive_port/consumption_observation.rs",
                 include_str!("engine/adaptive_port/consumption_observation.rs"),
@@ -182,6 +376,40 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             (
                 "pals/engine/adaptive_port/validator_port.rs",
                 include_str!("engine/adaptive_port/validator_port.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/validator_port/observation_writer.rs",
+                include_str!("engine/adaptive_port/validator_port/observation_writer.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_route.rs",
+                include_str!("engine/adaptive_port/utility_route.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_route/intervention.rs",
+                include_str!("engine/adaptive_port/utility_route/intervention.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_route/conditional_witness.rs",
+                include_str!("engine/adaptive_port/utility_route/conditional_witness.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_route/conditional_witness/historical.rs",
+                include_str!(
+                    "engine/adaptive_port/utility_route/conditional_witness/historical.rs"
+                ),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_conditional_basis.rs",
+                include_str!("engine/adaptive_port/utility_conditional_basis.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_conditional_basis/raw_join.rs",
+                include_str!("engine/adaptive_port/utility_conditional_basis/raw_join.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_dependencies.rs",
+                include_str!("engine/adaptive_port/utility_dependencies.rs"),
             ),
             (
                 "pals/engine/cpu_lifecycle.rs",
@@ -334,19 +562,8 @@ impl Default for PalsConfig {
 }
 impl PalsConfig {
     pub fn validate(&self) -> Result<(), PalsError> {
-        if self.beam_width == 0
-            || self.beam_width > 16
-            || self.line_plies == 0
-            || self.line_plies > 16
-            || self.max_nodes < 257
-            || self.max_nodes > 65_536
-            || self.max_records < 4
-            || self.max_records > 128
-            || self.max_role_calls == 0
-            || self.max_role_calls > 1_000_000
-            || self.cpu_nodes_per_task == 0
-            || self.cpu_nodes_per_task > 10_000_000
-        {
+        PalsSemanticConfig::from(self).validate()?;
+        if self.cpu_nodes_per_task == 0 || self.cpu_nodes_per_task > 10_000_000 {
             return Err(PalsError::InvalidConfig);
         }
         Ok(())
@@ -1150,6 +1367,12 @@ pub enum PalsError {
     Capacity,
     RoleCallLimit,
     Review(ReviewError),
+    Rovent(crate::pals::rovent_frontier::FrontierError),
+}
+impl From<crate::pals::rovent_frontier::FrontierError> for PalsError {
+    fn from(error: crate::pals::rovent_frontier::FrontierError) -> Self {
+        Self::Rovent(error)
+    }
 }
 impl From<ReviewError> for PalsError {
     fn from(error: ReviewError) -> Self {
@@ -1217,6 +1440,7 @@ struct Node {
 }
 #[derive(Clone, Debug)]
 struct CpuEvidence {
+    context: Option<Arc<adaptive_port::CpuEvidenceContextSeal>>,
     score: i32,
     depth: u16,
     scope: CpuScoreScope,
@@ -1302,40 +1526,15 @@ pub struct PalsEngine<M: RoleModel> {
     post_repair_recheck: PostRepairRecheckPolicy,
     cpu_interleave: CpuInterleavePolicy,
     held_cpu_task: Option<HeldCpuTask>,
-    model: M,
-    cpu: Box<dyn CpuChecker>,
-    checker_registered_identity: CheckerIdentity,
-    cpu_registered_value: Option<CpuValueIdentity>,
-    model_registered_value: Option<ModelValueIdentity>,
-    cpu_registered_condition: String,
-    checker_new_game_pending: bool,
-    last_external_attempt: Option<u64>,
-    external_attempts: Vec<CheckerAttempt>,
-    nodes: Vec<Node>,
-    records: Vec<RoleRecord>,
-    review_index: Option<ReviewContextIndex>,
-    review_policy: Option<ReviewSelectionPolicy>,
-    /// Explicit legacy-baseline input ownership. Selected/compact consumers
-    /// never allocate or scan this separate immutable raw-record snapshot.
-    legacy_full_native_context: bool,
-    last_review_issue: Option<ReviewError>,
-    revision: u64,
-    // Store handles may restart from zero after reset; this checked namespace
-    // prevents old-game logical questions from acquiring the new authority.
-    game_generation: Option<u64>,
-    adaptive_root_registry: adaptive_root::AdaptiveRootRegistry,
-    stores: PalsStores,
-    clock_origin: Instant,
-    consumer_id: u64,
-    last_search_counters: Option<PalsCounters>,
-    last_recheck_observer_error: Option<RoleError>,
+    rovent_root_prefix_plies: Option<u16>,
+    deferred_researcher_source: Option<crate::cpu_worker::DeferredNnuecRSource>,
+    deferred_researcher_initial: Option<preparing_root::DeferredResearcherInitialReadback>,
+    // Explicit shutdown still supplies completion evidence. On ordinary Rust
+    // destruction, release the actual researcher before its Store/context owner.
+    researcher: RegisteredResearcher,
+    semantic: PalsSemanticState<M>,
     last_cpu_checkpoint_cleanup_error: Option<PalsError>,
-    repair_queue: std::collections::VecDeque<frozen_recheck::RepairWork>,
-    repair_questions: HashSet<(BoardMove, u64, Vec<BoardMove>)>,
-    repair_counts: std::collections::HashMap<BoardMove, u8>,
-    archive_state: archive_lifecycle::EngineArchiveLifecycle,
     followup_execution: followup_execution::FollowupExecutionRecorder,
-    new_game_transition_error: Option<PalsError>,
 }
 impl<M: RoleModel> PalsEngine<M> {
     /// Retain the original full-context encoder's raw public-memory input in
@@ -1344,12 +1543,12 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Startup selects this once, after selecting CurrentRootOnly review
     /// authorization and before any root/Store generation is registered.
     pub fn with_legacy_full_native_context(mut self) -> Result<Self, PalsError> {
-        if self.stores.generation() != 0
-            || !self.nodes.is_empty()
-            || !self.records.is_empty()
-            || self.legacy_full_native_context
-            || self.review_index.is_none()
-            || !self.review_policy.is_some_and(|policy| {
+        if self.semantic.stores.generation() != 0
+            || !self.semantic.nodes.is_empty()
+            || !self.semantic.records.is_empty()
+            || self.semantic.legacy_full_native_context
+            || self.semantic.review_index.is_none()
+            || !self.semantic.review_policy.is_some_and(|policy| {
                 policy.mode == crate::pals::review_context::ReviewAnchorMode::CurrentRootOnly
             })
         {
@@ -1358,7 +1557,7 @@ impl<M: RoleModel> PalsEngine<M> {
             )
             .into());
         }
-        self.legacy_full_native_context = true;
+        self.semantic.legacy_full_native_context = true;
         Ok(self)
     }
 
@@ -1369,22 +1568,7 @@ impl<M: RoleModel> PalsEngine<M> {
         policy: ReviewSelectionPolicy,
         limits: ReviewIndexLimits,
     ) -> Result<Self, PalsError> {
-        policy.validate()?;
-        if !self.model.supports_selected_review_view() {
-            return Err(RoleError::Unavailable.into());
-        }
-        if self.stores.generation() != 0
-            || !self.nodes.is_empty()
-            || !self.records.is_empty()
-            || self.review_policy.is_some()
-        {
-            return Err(StoreError::InvalidConditions(
-                "review context is selected once before search",
-            )
-            .into());
-        }
-        self.review_index = Some(ReviewContextIndex::new(limits)?);
-        self.review_policy = Some(policy);
+        self.semantic.select_review_context(policy, limits)?;
         Ok(self)
     }
     pub fn new(config: PalsConfig, model: M, cpu: CpuEngine) -> Result<Self, PalsError> {
@@ -1472,144 +1656,16 @@ impl<M: RoleModel> PalsEngine<M> {
         resolver: ResolverPolicy,
         policy: PostRepairRecheckPolicy,
     ) -> Result<Self, PalsError> {
-        config.validate()?;
-        cpu.identity().validate()?;
-        if resolver == ResolverPolicy::OwnRawRestricted
-            && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
-        {
-            return Err(CpuError::Unsupported("foreign checker with own raw resolver").into());
-        }
-        if policy != PostRepairRecheckPolicy::Disabled
-            && !policy.uses_frozen_model_wdl()
-            && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
-        {
-            return Err(CpuError::Unsupported(
-                "post-Repair recheck v1 requires completed own CPU evidence",
-            )
-            .into());
-        }
-        let capabilities = cpu.capabilities();
-        if !capabilities.divergence || !capabilities.root_moves {
-            return Err(CpuError::Unsupported(
-                "PALS independent CPU divergence/root-move discovery",
-            )
-            .into());
-        }
-        if capabilities.max_depth == 0
-            || capabilities.max_depth > 64
-            || capabilities.max_prefix_plies < config.line_plies.saturating_sub(1)
-            || capabilities.max_root_moves < 256
-            || cpu.conditions().is_empty()
-            || cpu.conditions().len()
-                > if matches!(cpu.identity(), CheckerIdentity::ExternalUci(_)) {
-                    8192
-                } else {
-                    2048
-                }
-            || cpu.conditions().chars().any(char::is_control)
-        {
-            return Err(CpuError::Unsupported("PALS CPU bounded search capabilities").into());
-        }
-        let (cpu_registered_value, model_registered_value) = match cpu.identity() {
-            CheckerIdentity::Owned(identity) => {
-                let descriptor = cpu
-                    .owned_descriptor()
-                    .ok_or(CheckerError::Invalid("owned configuration missing"))?;
-                if descriptor.config.max_depth == 0
-                    || descriptor.config.max_depth > 64
-                    || descriptor.config.quiescence_ply > 32
-                    || capabilities.max_depth < descriptor.config.max_depth
-                    || descriptor.search_identity.is_empty()
-                {
-                    return Err(CpuError::Unsupported("PALS own CPU configuration").into());
-                }
-                (Some(identity.clone()), None)
-            }
-            CheckerIdentity::ExternalUci(_) => {
-                if cpu.owned_descriptor().is_some() || capabilities.resume {
-                    return Err(CheckerError::Invalid(
-                        "foreign helper cannot disclose own/resume semantics",
-                    )
-                    .into());
-                }
-                let identity = model
-                    .value_identity()
-                    .ok_or(RoleError::Unavailable)?
-                    .clone();
-                identity.validate()?;
-                if identity.model != model.identity()
-                    || identity.semantics != MODEL_WDL_VALUE_SEMANTICS
-                {
-                    return Err(RoleError::InvalidOutput.into());
-                }
-                (None, Some(identity))
-            }
-        };
-        let model_registered_value = if resolver == ResolverPolicy::ModelWdlRestricted
-            || policy.uses_frozen_model_wdl()
-        {
-            let identity = model
-                .value_identity()
-                .ok_or(RoleError::Unavailable)?
-                .clone();
-            identity.validate()?;
-            if identity.model != model.identity() || identity.semantics != MODEL_WDL_VALUE_SEMANTICS
-            {
-                return Err(RoleError::InvalidOutput.into());
-            }
-            Some(identity)
-        } else {
-            model_registered_value
-        };
-        let checker_registered_identity = cpu.identity().clone();
-        let cpu_registered_condition = Self::cpu_condition_for(cpu.as_ref());
-        let mut nodes = Vec::new();
-        nodes
-            .try_reserve(config.max_nodes)
-            .map_err(|_| PalsError::Capacity)?;
-        let mut records = Vec::new();
-        records
-            .try_reserve(config.max_records)
-            .map_err(|_| PalsError::Capacity)?;
-        let stores = PalsStores::new(Self::store_limits(&config));
-        Ok(Self {
-            config,
-            resolver,
-            followup_lane: true,
-            post_repair_recheck: policy,
-            cpu_interleave: CpuInterleavePolicy::ReplaceOnFresh,
-            held_cpu_task: None,
+        let mut admission =
+            Self::admit_researcher(&config, &model, cpu.as_ref(), resolver, policy)?;
+        let semantic = PalsSemanticState::new_admitted(
+            &PalsSemanticConfig::from(&config),
             model,
-            cpu,
-            checker_registered_identity,
-            cpu_registered_value,
-            model_registered_value,
-            cpu_registered_condition,
-            checker_new_game_pending: false,
-            last_external_attempt: None,
-            external_attempts: Vec::new(),
-            nodes,
-            records,
-            review_index: None,
-            review_policy: None,
-            legacy_full_native_context: false,
-            last_review_issue: None,
-            revision: 0,
-            game_generation: Some(0),
-            adaptive_root_registry: adaptive_root::AdaptiveRootRegistry::default(),
-            stores,
-            clock_origin: Instant::now(),
-            consumer_id: 0,
-            last_search_counters: None,
-            last_recheck_observer_error: None,
-            last_cpu_checkpoint_cleanup_error: None,
-            repair_queue: std::collections::VecDeque::new(),
-            repair_questions: HashSet::new(),
-            repair_counts: std::collections::HashMap::new(),
-            archive_state: archive_lifecycle::EngineArchiveLifecycle::default(),
-            followup_execution: followup_execution::FollowupExecutionRecorder::default(),
-            new_game_transition_error: None,
-        })
+            admission.model_registered_value.take(),
+        )?;
+        Ok(Self::from_admitted_researcher(
+            config, cpu, resolver, policy, None, admission, semantic,
+        ))
     }
 
     /// Immutable opt-in requiring an owner which can actually preserve one
@@ -1637,72 +1693,85 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(engine)
     }
     pub fn new_game(&mut self) {
+        if let Err(error) = self.semantic.ensure_frontier_retired() {
+            self.semantic.new_game_transition_error = Some(error);
+            return;
+        }
         if self.archive_config().is_some() {
             // The void compatibility entry has no original caller controls and
             // cannot certify the old physical/archive release boundary.
-            self.new_game_transition_error = Some(PalsError::Store(StoreError::InvalidConditions(
-                "archive new_game requires try_new_game with original controls",
-            )));
+            self.semantic.new_game_transition_error =
+                Some(PalsError::Store(StoreError::InvalidConditions(
+                    "archive new_game requires try_new_game with original controls",
+                )));
             return;
         }
-        self.game_generation = self
+        self.semantic.game_generation = self
+            .semantic
             .game_generation
             .and_then(|generation| generation.checked_add(1));
-        self.nodes.clear();
+        self.semantic.nodes.clear();
         self.held_cpu_task = None;
-        self.records.clear();
+        self.semantic.records.clear();
         self.reset_review_context();
         // Preserve the old synchronous own clear. A foreign reset can fail and
         // needs caller controls; defer it to search or explicit try_new_game.
         if self.is_external() {
-            self.checker_new_game_pending = true;
+            self.researcher.checker_new_game_pending = true;
         } else {
             let never_cancel = AtomicBool::new(false);
-            self.checker_new_game_pending = self
+            self.researcher.checker_new_game_pending = self
+                .researcher
                 .cpu
                 .new_game(Instant::now() + Duration::from_secs(1), &never_cancel)
                 .is_err();
         }
-        self.model.new_game_with_generation(self.game_generation);
-        self.revision = 0;
-        self.stores = PalsStores::new(Self::store_limits(&self.config));
+        self.semantic
+            .model
+            .new_game_with_generation(self.semantic.game_generation);
+        self.semantic.revision = 0;
+        self.semantic.stores = PalsStores::new(self.semantic_sequence_config().store_limits());
         self.reset_archive_new_game();
-        self.consumer_id = 0;
-        self.last_search_counters = None;
-        self.last_recheck_observer_error = None;
+        self.semantic.consumer_id = 0;
+        self.semantic.last_search_counters = None;
+        self.semantic.last_recheck_observer_error = None;
         self.last_cpu_checkpoint_cleanup_error = None;
-        self.external_attempts.clear();
-        self.last_external_attempt = None;
-        self.repair_queue.clear();
-        self.repair_questions.clear();
-        self.repair_counts.clear();
+        self.researcher.external_attempts.clear();
+        self.researcher.last_external_attempt = None;
+        self.semantic.repair_queue.clear();
+        self.semantic.repair_questions.clear();
+        self.semantic.repair_counts.clear();
         self.clear_followup_game();
-        self.new_game_transition_error = None;
+        self.semantic.new_game_transition_error = None;
     }
     pub fn try_new_game(
         &mut self,
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
+        if let Err(error) = self.semantic.ensure_frontier_retired() {
+            self.semantic.new_game_transition_error = Some(error.clone());
+            return Err(error);
+        }
         if self.archive_config().is_some() {
             let result = self.try_new_archive_game(deadline, cancel);
             if let Err(error) = &result {
-                self.new_game_transition_error = Some(error.clone());
+                self.semantic.new_game_transition_error = Some(error.clone());
             } else {
                 self.held_cpu_task = None;
             }
             return result;
         }
         self.new_game();
-        if self.checker_new_game_pending {
-            self.cpu.new_game(deadline, cancel)?;
+        if self.researcher.checker_new_game_pending {
+            self.researcher.cpu.new_game(deadline, cancel)?;
         }
-        self.checker_new_game_pending = false;
-        self.last_external_attempt = None;
+        self.researcher.checker_new_game_pending = false;
+        self.researcher.last_external_attempt = None;
         Ok(())
     }
     pub fn shutdown_checker(&mut self, deadline: Instant) -> Result<CheckerShutdown, PalsError> {
-        Ok(self.cpu.shutdown(deadline)?)
+        Ok(self.researcher.cpu.shutdown(deadline)?)
     }
     pub fn start_checker(
         &mut self,
@@ -1710,49 +1779,50 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
         self.validate_checker_namespace()?;
-        if self.cpu.identity() != &self.checker_registered_identity
-            || self.cpu_condition() != self.cpu_registered_condition
+        if self.researcher.cpu.identity() != &self.researcher.checker_registered_identity
+            || self.cpu_condition() != self.researcher.cpu_registered_condition
         {
             return Err(StoreError::InvalidConditions("checker startup namespace changed").into());
         }
-        self.cpu.start(deadline, cancel)?;
+        self.researcher.cpu.start(deadline, cancel)?;
         self.validate_checker_namespace()?;
-        if self.cpu.identity() != &self.checker_registered_identity
-            || self.cpu_condition() != self.cpu_registered_condition
+        if self.researcher.cpu.identity() != &self.researcher.checker_registered_identity
+            || self.cpu_condition() != self.researcher.cpu_registered_condition
         {
             return Err(StoreError::InvalidConditions("checker startup namespace changed").into());
         }
         Ok(())
     }
     pub fn checker_identity(&self) -> &CheckerIdentity {
-        &self.checker_registered_identity
+        &self.researcher.checker_registered_identity
     }
     /// Actual foreign attempt/process evidence, including failed/partial work.
     /// Bounded per search; raw foreign scores do not enter the own resolver.
     pub fn checker_attempts(&self) -> &[CheckerAttempt] {
-        &self.external_attempts
+        &self.researcher.external_attempts
     }
     /// Latest actual adapter ledger, including lifecycle updates after a search.
     /// This is not a second physical attempt or an additional work charge.
     pub fn checker_last_attempt(&self) -> Option<&CheckerAttempt> {
-        self.cpu.last_attempt()
+        self.researcher.cpu.last_attempt()
     }
     pub fn checker_startup_uci(&self) -> Option<crate::cpu_checker::ExternalUciIdentity> {
-        self.cpu.startup_uci()
+        self.researcher.cpu.startup_uci()
     }
     fn is_external(&self) -> bool {
         matches!(
-            self.checker_registered_identity,
+            self.researcher.checker_registered_identity,
             CheckerIdentity::ExternalUci(_)
         )
     }
     fn owned_descriptor(&self) -> Result<OwnedCheckerDescriptor, PalsError> {
-        self.cpu
+        self.researcher
+            .cpu
             .owned_descriptor()
             .ok_or(CheckerError::Invalid("own CPU-only operation on foreign helper").into())
     }
     fn owned_identity(&self) -> Result<&CpuValueIdentity, PalsError> {
-        match self.cpu.identity() {
+        match self.researcher.cpu.identity() {
             CheckerIdentity::Owned(identity) => Ok(identity),
             CheckerIdentity::ExternalUci(_) => {
                 Err(CheckerError::Invalid("foreign helper has no own score identity").into())
@@ -1760,10 +1830,13 @@ impl<M: RoleModel> PalsEngine<M> {
         }
     }
     fn validate_checker_namespace(&self) -> Result<(), PalsError> {
-        self.cpu.validate_namespace().map_err(|error| match error {
-            CheckerError::Invalid(reason) => StoreError::InvalidConditions(reason).into(),
-            error => error.into(),
-        })
+        self.researcher
+            .cpu
+            .validate_namespace()
+            .map_err(|error| match error {
+                CheckerError::Invalid(reason) => StoreError::InvalidConditions(reason).into(),
+                error => error.into(),
+            })
     }
     fn checker_admission_error(error: CheckerError) -> PalsError {
         match error {
@@ -1792,24 +1865,24 @@ impl<M: RoleModel> PalsEngine<M> {
         self.resolver == ResolverPolicy::ModelWdlRestricted
     }
     pub fn retained_situations(&self) -> usize {
-        self.nodes.len()
+        self.semantic.nodes.len()
     }
     pub fn records(&self) -> &[RoleRecord] {
-        &self.records
+        &self.semantic.records
     }
     pub fn review_policy(&self) -> Option<ReviewSelectionPolicy> {
-        self.review_policy
+        self.semantic.review_policy
     }
     pub fn last_review_issue(&self) -> Option<&ReviewError> {
-        self.last_review_issue.as_ref()
+        self.semantic.last_review_issue.as_ref()
     }
     pub fn model_identity(&self) -> &str {
-        self.model.identity()
+        self.semantic.model.identity()
     }
     /// Immutable startup metadata from the selected evaluator. This describes
     /// its frozen value namespace; it is not evidence of a neural execution.
     pub fn model_value_identity(&self) -> Option<&ModelValueIdentity> {
-        self.model.value_identity()
+        self.semantic.model.value_identity()
     }
     pub fn post_repair_recheck_policy(&self) -> PostRepairRecheckPolicy {
         self.post_repair_recheck
@@ -1838,18 +1911,18 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Snapshot of the most recent entered search, including errors. Read after
     /// that search returns; the caller owns cumulative per-process accounting.
     pub fn last_search_counters(&self) -> Option<PalsCounters> {
-        self.last_search_counters
+        self.semantic.last_search_counters
     }
     pub fn cpu_interleave_policy(&self) -> CpuInterleavePolicy {
         self.cpu_interleave
     }
     pub fn cpu_side_scope_snapshot(&self) -> Option<CpuSideScopeSnapshot> {
-        self.cpu.paused_side_scope_snapshot()
+        self.researcher.cpu.paused_side_scope_snapshot()
     }
     /// First secondary finish-callback error in the latest entered search. The
     /// original operation error takes precedence. Reset on search and new_game.
     pub fn last_recheck_observer_error(&self) -> Option<&RoleError> {
-        self.last_recheck_observer_error.as_ref()
+        self.semantic.last_recheck_observer_error.as_ref()
     }
     /// Independent checkpoint cleanup failure when the original search already
     /// failed. The caller can preserve both errors without replacing either.
@@ -1857,25 +1930,32 @@ impl<M: RoleModel> PalsEngine<M> {
         self.last_cpu_checkpoint_cleanup_error.as_ref()
     }
     pub fn stores(&self) -> &PalsStores {
-        &self.stores
+        &self.semantic.stores
+    }
+    /// Historical, unclaimed external work follows this exact Store owner.
+    /// Unknown accounting stays unknown; this does not certify root cleanup.
+    pub fn retired_profiled_external_host_bytes(&self) -> Option<u64> {
+        self.semantic
+            .retired_profiled_external
+            .as_ref()
+            .map_or(Some(0), |custody| custody.owned_host_bytes())
+    }
+    /// Backing retained by the exact retired GoalLocal owner. This projection
+    /// excludes allocator/shared overhead and does not certify physical peak
+    /// memory, completion, or permission to release the retained Store pins.
+    pub fn retired_goal_local_host_bytes(&self) -> Option<u64> {
+        self.semantic
+            .retired_goal_local
+            .as_ref()
+            .map_or(Some(0), |custody| custody.owned_host_bytes())
     }
     /// Derived neural cache eviction does not remove raw CPU/Rules observations.
     pub fn evict_derived_cache(&mut self) -> usize {
-        self.stores.evict_derived_cache()
+        self.semantic.stores.evict_derived_cache()
     }
 
     fn store_limits(config: &PalsConfig) -> StoreLimits {
-        StoreLimits {
-            states: config.max_nodes,
-            situations: config.max_nodes,
-            line_chunks: config.max_nodes * 16,
-            line_plies: config.line_plies,
-            observations: config.max_nodes * 16,
-            dependency_edges: config.max_nodes * 16,
-            executions: config.max_nodes * 8,
-            consumers: config.max_nodes * 16,
-            ..StoreLimits::default()
-        }
+        PalsSemanticConfig::from(config).store_limits()
     }
 
     pub fn search(
@@ -1909,16 +1989,17 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         progress: F,
     ) -> Result<PalsResult, PalsError> {
-        self.last_recheck_observer_error = None;
-        self.last_review_issue = None;
+        self.semantic.ensure_frontier_retired()?;
+        self.semantic.last_recheck_observer_error = None;
+        self.semantic.last_review_issue = None;
         self.last_cpu_checkpoint_cleanup_error = None;
-        self.repair_queue.clear();
-        self.repair_questions.clear();
-        self.repair_counts.clear();
+        self.semantic.repair_queue.clear();
+        self.semantic.repair_questions.clear();
+        self.semantic.repair_counts.clear();
         self.begin_followup_execution(position);
         let mut counters = PalsCounters::default();
-        self.external_attempts.clear();
-        let mut result = if self.game_generation.is_none() {
+        self.researcher.external_attempts.clear();
+        let mut result = if self.semantic.game_generation.is_none() {
             Err(PalsError::Capacity)
         } else {
             self.search_inner(position, limits, cancel, progress, &mut counters)
@@ -1946,8 +2027,8 @@ impl<M: RoleModel> PalsEngine<M> {
         if let Ok(report) = &result {
             counters = report.counters;
         }
-        counters.retained_situations = self.nodes.len();
-        self.last_search_counters = Some(counters);
+        counters.retained_situations = self.semantic.nodes.len();
+        self.semantic.last_search_counters = Some(counters);
         let closure = match &result {
             Err(PalsError::Role(RoleError::PhysicalCompletionUnknown)) => {
                 RoleSearchClosure::PhysicalCompletionUnknown
@@ -1964,7 +2045,7 @@ impl<M: RoleModel> PalsEngine<M> {
             },
             Err(_) => RoleSearchClosure::Failed,
         };
-        self.model.finish_search(closure);
+        self.semantic.model.finish_search(closure);
         self.finish_followup_execution(closure, result.as_ref().err(), counters);
         result
     }
@@ -1977,10 +2058,11 @@ impl<M: RoleModel> PalsEngine<M> {
         counters: &mut PalsCounters,
     ) -> Result<PalsResult, PalsError> {
         self.validate_checker_namespace()?;
-        if self.cpu.identity() != &self.checker_registered_identity
-            || self.cpu_condition() != self.cpu_registered_condition
-            || (self.model_registered_value.is_some()
-                && self.model.value_identity() != self.model_registered_value.as_ref())
+        if self.researcher.cpu.identity() != &self.researcher.checker_registered_identity
+            || self.cpu_condition() != self.researcher.cpu_registered_condition
+            || (self.semantic.model_registered_value.is_some()
+                && self.semantic.model.value_identity()
+                    != self.semantic.model_registered_value.as_ref())
         {
             return Err(StoreError::InvalidConditions(
                 "startup-selected CPU search/value identity changed",
@@ -1990,11 +2072,11 @@ impl<M: RoleModel> PalsEngine<M> {
         if limits.max_rounds == 0
             || limits.max_cpu_nodes == 0
             || limits.cpu_depth == 0
-            || limits.cpu_depth > self.cpu.capabilities().max_depth
+            || limits.cpu_depth > self.researcher.cpu.capabilities().max_depth
         {
             return Err(PalsError::InvalidLimits);
         }
-        if let Some(error) = &self.new_game_transition_error {
+        if let Some(error) = &self.semantic.new_game_transition_error {
             return Err(error.clone());
         }
         self.ensure_archive_admission_open()?;
@@ -2004,15 +2086,15 @@ impl<M: RoleModel> PalsEngine<M> {
             // accepted after an already observed cancellation/deadline.
             return self.unsearched_result(position, completion, Instant::now());
         }
-        if self.checker_new_game_pending {
-            self.cpu.new_game(limits.deadline, cancel)?;
-            self.checker_new_game_pending = false;
-            self.last_external_attempt = None;
+        if self.researcher.checker_new_game_pending {
+            self.researcher.cpu.new_game(limits.deadline, cancel)?;
+            self.researcher.checker_new_game_pending = false;
+            self.researcher.last_external_attempt = None;
         }
         let started = Instant::now();
         self.prepare_archive_root(position, limits.deadline, cancel)?;
         let root = loop {
-            let attempt = match self.stores.focus_actual_moves(position.snapshot()) {
+            let attempt = match self.semantic.stores.focus_actual_moves(position.snapshot()) {
                 Ok(_) => self.intern_checked(position.clone(), limits, cancel),
                 Err(StoreError::Capacity(_)) => Err(PalsError::Capacity),
                 Err(error) => Err(error.into()),
@@ -2037,15 +2119,15 @@ impl<M: RoleModel> PalsEngine<M> {
         self.observe_followup_root(root);
         // Archive old input/evidence ownership before invalidating the live
         // projection. Previous-search WDL is not a current-context cache hit.
-        for node in &mut self.nodes {
+        for node in &mut self.semantic.nodes {
             node.model_value = None;
             node.model_observation = None;
             node.model_value_revision = None;
         }
-        self.refresh_projection(self.nodes[root].state);
+        self.refresh_projection(self.semantic.nodes[root].state);
         let legal = position.legal_moves();
-        if let Some((reason, value)) = self.nodes[root].terminal {
-            counters.retained_situations = self.nodes.len();
+        if let Some((reason, value)) = self.semantic.nodes[root].terminal {
+            counters.retained_situations = self.semantic.nodes.len();
             counters.root_scope_observation_complete = true;
             return Ok(PalsResult {
                 best_move: None,
@@ -2055,15 +2137,15 @@ impl<M: RoleModel> PalsEngine<M> {
                     Some(value)
                 },
                 resolved_value: self.rules_value(root),
-                model_value_identity: self.model_registered_value.clone(),
-                checker_identity: self.checker_registered_identity.clone(),
+                model_value_identity: self.semantic.model_registered_value.clone(),
+                checker_identity: self.researcher.checker_registered_identity.clone(),
                 value_scope: PalsValueScope::RulesTerminal,
                 terminal: Some(reason),
                 completion: PalsCompletion::Terminal,
                 counters: *counters,
                 root_values: Vec::new(),
                 elapsed: started.elapsed(),
-                model_identity: self.model.identity().to_owned(),
+                model_identity: self.semantic.model.identity().to_owned(),
                 resolver_version: self.resolver_version(),
             });
         }
@@ -2141,6 +2223,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     issue @ (ReviewError::ViewCapacity
                     | ReviewError::AnchorMismatch
                     | ReviewError::MissingRelation(_)
+                    | ReviewError::BundleRecordCapacity
                     | ReviewError::IndexCapacity
                     | ReviewError::Store(
                         StoreError::Capacity(_)
@@ -2148,7 +2231,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         | StoreError::ColdRecord(_),
                     )),
                 )) => {
-                    self.last_review_issue = Some(issue);
+                    self.semantic.last_review_issue = Some(issue);
                     completion = PalsCompletion::Capacity;
                     break;
                 }
@@ -2163,12 +2246,12 @@ impl<M: RoleModel> PalsEngine<M> {
         let mut score = None;
         let mut scope = PalsValueScope::Unknown;
         for &movement in &legal {
-            let edge = self.nodes[root]
+            let edge = self.semantic.nodes[root]
                 .edges
                 .iter()
                 .find(|edge| edge.movement == movement);
             let (value, child_scope, examined, unexplored) = if let Some(edge) = edge {
-                let child = &self.nodes[edge.child];
+                let child = &self.semantic.nodes[edge.child];
                 let value = self
                     .value(edge.child, self.config.line_plies.saturating_sub(1))
                     .map(|v| -v);
@@ -2217,7 +2300,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 unexplored_replies: unexplored,
             });
         }
-        counters.retained_situations = self.nodes.len();
+        counters.retained_situations = self.semantic.nodes.len();
         counters.root_scope_observation_complete = true;
         Ok(PalsResult {
             best_move: best,
@@ -2228,15 +2311,15 @@ impl<M: RoleModel> PalsEngine<M> {
                     perspective: position.side_to_move(),
                 }
             }),
-            model_value_identity: self.model_registered_value.clone(),
-            checker_identity: self.checker_registered_identity.clone(),
+            model_value_identity: self.semantic.model_registered_value.clone(),
+            checker_identity: self.researcher.checker_registered_identity.clone(),
             value_scope: scope,
             terminal: None,
             completion,
             counters: *counters,
             root_values,
             elapsed: started.elapsed(),
-            model_identity: self.model.identity().to_owned(),
+            model_identity: self.semantic.model.identity().to_owned(),
             resolver_version: self.resolver_version(),
         })
     }
@@ -2293,8 +2376,8 @@ impl<M: RoleModel> PalsEngine<M> {
                 },
                 PlayStatus::Ongoing => PalsResolvedValue::Unknown,
             },
-            model_value_identity: self.model_registered_value.clone(),
-            checker_identity: self.checker_registered_identity.clone(),
+            model_value_identity: self.semantic.model_registered_value.clone(),
+            checker_identity: self.researcher.checker_registered_identity.clone(),
             value_scope: if terminal.is_some() {
                 PalsValueScope::RulesTerminal
             } else {
@@ -2307,7 +2390,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 completion
             },
             counters: PalsCounters {
-                retained_situations: self.nodes.len(),
+                retained_situations: self.semantic.nodes.len(),
                 unknown_root_children: if terminal.is_some() {
                     0
                 } else {
@@ -2333,7 +2416,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     .collect()
             },
             elapsed: started.elapsed(),
-            model_identity: self.model.identity().to_owned(),
+            model_identity: self.semantic.model.identity().to_owned(),
             resolver_version: self.resolver_version(),
         })
     }
@@ -2356,20 +2439,26 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<usize, PalsError> {
         Self::check_logical_controls(controls)?;
         let snapshot = position.snapshot();
-        if let Some(state) = self.stores.states.find(&snapshot) {
-            if let Some(index) = self.nodes.iter().position(|node| node.state == state) {
+        if let Some(state) = self.semantic.stores.states.find(&snapshot) {
+            if let Some(index) = self
+                .semantic
+                .nodes
+                .iter()
+                .position(|node| node.state == state)
+            {
                 return Ok(index);
             }
         }
-        if self.nodes.len() >= self.config.max_nodes {
+        if self.semantic.nodes.len() >= self.config.max_nodes {
             if self.archive_enabled() {
                 return Err(StoreError::PinSaturated("resident engine node arena").into());
             }
             return Err(PalsError::Capacity);
         }
-        let situation = if let Some(root) = self.stores.root().filter(|&root| {
-            self.stores.situations.get(root).is_ok_and(|s| {
-                self.stores
+        let situation = if let Some(root) = self.semantic.stores.root().filter(|&root| {
+            self.semantic.stores.situations.get(root).is_ok_and(|s| {
+                self.semantic
+                    .stores
                     .states
                     .get(s.state)
                     .is_ok_and(|s| s.same_state(&snapshot))
@@ -2379,7 +2468,7 @@ impl<M: RoleModel> PalsEngine<M> {
         } else {
             self.archive_insert_situation(snapshot, controls)?
         };
-        let state = self.stores.situations.get(situation)?.state;
+        let state = self.semantic.stores.situations.get(situation)?.state;
         let terminal = match position.classify_position()?.play_status {
             PlayStatus::Ongoing => None,
             PlayStatus::Terminal { reason, winner } => Some((
@@ -2395,7 +2484,7 @@ impl<M: RoleModel> PalsEngine<M> {
             self.archive_append_rules_terminal(&position, situation, controls)?;
         }
         Self::check_logical_controls(controls)?;
-        self.nodes.push(Node {
+        self.semantic.nodes.push(Node {
             position,
             state,
             situation,
@@ -2407,7 +2496,7 @@ impl<M: RoleModel> PalsEngine<M> {
             model_value_revision: None,
             resume: None,
         });
-        Ok(self.nodes.len() - 1)
+        Ok(self.semantic.nodes.len() - 1)
     }
     #[cfg(test)]
     fn connect(
@@ -2445,7 +2534,7 @@ impl<M: RoleModel> PalsEngine<M> {
         controls: Option<(Instant, &AtomicBool)>,
     ) -> Result<usize, PalsError> {
         Self::check_logical_controls(controls)?;
-        if let Some(edge) = self.nodes[parent]
+        if let Some(edge) = self.semantic.nodes[parent]
             .edges
             .iter()
             .find(|edge| edge.movement == movement)
@@ -2453,7 +2542,9 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(edge.child);
         }
         let child = self.intern_with_controls(child, controls)?;
-        self.nodes[parent].edges.push(Edge { movement, child });
+        self.semantic.nodes[parent]
+            .edges
+            .push(Edge { movement, child });
         counters.examined_edges += 1;
         Ok(child)
     }
@@ -2474,7 +2565,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if counters.role_calls >= self.config.max_role_calls {
             return Err(PalsError::RoleCallLimit);
         }
-        let legal = self.nodes[node].position.legal_moves();
+        let legal = self.semantic.nodes[node].position.legal_moves();
         if legal.len() > 256 {
             return Err(PalsError::Capacity);
         }
@@ -2492,19 +2583,20 @@ impl<M: RoleModel> PalsEngine<M> {
         let context = self.role_context(node, question)?;
         let review = self.prepare_review_view(node, question, &legal)?;
         if let Some(view) = &review {
-            self.model
+            self.semantic
+                .model
                 .bind_selected_review_view(Arc::clone(view), &context)?;
         }
         let query = RoleQuery {
-            position: &self.nodes[node].position,
+            position: &self.semantic.nodes[node].position,
             legal: &legal,
             prefix,
             proposal,
             counterexample: refutation,
             records: review
                 .as_ref()
-                .map_or(self.records.as_slice(), |view| view.records()),
-            revision: self.revision,
+                .map_or(self.semantic.records.as_slice(), |view| view.records()),
+            revision: self.semantic.revision,
             deadline: limits.deadline,
             cancel,
         };
@@ -2516,9 +2608,9 @@ impl<M: RoleModel> PalsEngine<M> {
             Call::Repair => counters.repair_calls += 1,
         }
         let evaluation = match call {
-            Call::Propose => self.model.propose_with_context(query, &context)?,
-            Call::Reply => self.model.reply_with_context(query, &context)?,
-            Call::Repair => self.model.repair_with_context(query, &context)?,
+            Call::Propose => self.semantic.model.propose_with_context(query, &context)?,
+            Call::Reply => self.semantic.model.reply_with_context(query, &context)?,
+            Call::Repair => self.semantic.model.repair_with_context(query, &context)?,
         };
         evaluation.validate(legal.len())?;
         match call {
@@ -2535,10 +2627,11 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.accept_role_output(node, &context, question, limits, cancel)?;
         if let Some(view) = &review {
-            self.review_index
+            self.semantic
+                .review_index
                 .as_mut()
                 .ok_or(PalsError::InvalidConfig)?
-                .consume(view, &self.stores)?;
+                .consume(view, &self.semantic.stores)?;
         }
         if matches!(call, Call::Repair) {
             self.observe_repair_question(&context);
@@ -2563,56 +2656,8 @@ impl<M: RoleModel> PalsEngine<M> {
         node: usize,
         question: RoleQuestion<'_>,
     ) -> Result<RoleLogicalContext, PalsError> {
-        let game_generation = self.game_generation.ok_or(PalsError::Capacity)?;
-        let node = self
-            .nodes
-            .get(node)
-            .ok_or(StoreError::InvalidHandle("role node"))?;
-        let situation = self.stores.situations.get(node.situation)?;
-        if situation.state != node.state
-            || !self
-                .stores
-                .states
-                .get(node.state)?
-                .same_state(&node.position.snapshot())
-            || self.stores.lines.get(situation.focus)?.start_state != node.state
-        {
-            return Err(StoreError::InvalidHandle("role checked situation/state/focus").into());
-        }
-        if question.prefix.len() > self.config.line_plies
-            || question.proposal.len() > self.config.line_plies
-            || question
-                .refutation
-                .is_some_and(|line| line.len() > self.config.line_plies)
-            || question.divergences.len() > self.config.line_plies
-        {
-            return Err(PalsError::Capacity);
-        }
-        let focus = self.stores.lines.moves(situation.focus)?;
-        let mut prefix = Vec::new();
-        prefix
-            .try_reserve_exact(question.prefix.len())
-            .map_err(|_| PalsError::Capacity)?;
-        prefix.extend_from_slice(question.prefix);
-        Ok(RoleLogicalContext {
-            game_generation,
-            search_generation: self.stores.generation(),
-            situation: node.situation,
-            state: node.state,
-            focus: situation.focus,
-            purpose: question.purpose,
-            prefix,
-            focus_sha256: role_line_sha256(b"focus", &focus)?,
-            prefix_sha256: role_line_sha256(b"prefix", question.prefix)?,
-            proposal_sha256: role_line_sha256(b"proposal", question.proposal)?,
-            refutation_sha256: question
-                .refutation
-                .map(|line| role_line_sha256(b"refutation", line))
-                .transpose()?,
-            divergence_sha256: role_divergence_sha256(question.divergences)?,
-            public_revision: self.revision,
-            situation_revision: situation.revision,
-        })
+        self.semantic
+            .role_context(&self.semantic_sequence_config(), node, question)
     }
 
     fn accept_role_output(
@@ -2627,13 +2672,15 @@ impl<M: RoleModel> PalsEngine<M> {
         if current != *prepared {
             return Err(RoleError::InvalidOutput.into());
         }
-        let snapshot = self.nodes[node].position.snapshot();
-        self.model.accepted_output_checked(RoleAcceptance {
-            snapshot: &snapshot,
-            context: &current,
-            deadline: limits.deadline,
-            cancel,
-        })?;
+        let snapshot = self.semantic.nodes[node].position.snapshot();
+        self.semantic
+            .model
+            .accepted_output_checked(RoleAcceptance {
+                snapshot: &snapshot,
+                context: &current,
+                deadline: limits.deadline,
+                cancel,
+            })?;
         Ok(())
     }
     // A bounded continuation mutates only its legal prefix and work ledger;
@@ -2651,7 +2698,9 @@ impl<M: RoleModel> PalsEngine<M> {
         counters: &mut PalsCounters,
     ) -> Result<usize, PalsError> {
         let mut current = from;
-        while prefix.len() < self.config.line_plies && self.nodes[current].terminal.is_none() {
+        while prefix.len() < self.config.line_plies
+            && self.semantic.nodes[current].terminal.is_none()
+        {
             if self.stopped(limits, cancel).is_some() {
                 break;
             }
@@ -2661,7 +2710,7 @@ impl<M: RoleModel> PalsEngine<M> {
             let Some(movement) = ranked.first().copied() else {
                 break;
             };
-            let mut child = self.nodes[current].position.clone();
+            let mut child = self.semantic.nodes[current].position.clone();
             child.make_move(movement)?;
             // Retain the shape-valid returned movement as a Rules-checked raw
             // prefix even if acceptance canceled the graph connection. The
@@ -2693,7 +2742,7 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
     ) -> Result<(), PalsError> {
-        if self.nodes[node].terminal.is_some() {
+        if self.semantic.nodes[node].terminal.is_some() {
             return Ok(());
         }
         if self.stopped(limits, cancel).is_some() {
@@ -2702,11 +2751,18 @@ impl<M: RoleModel> PalsEngine<M> {
         self.validate_checker_namespace()?;
         if self.is_external() {
             let root_state = self
+                .semantic
                 .stores
                 .situations
-                .get(self.stores.root().ok_or(StoreError::StaleConsumer)?)?
+                .get(
+                    self.semantic
+                        .stores
+                        .root()
+                        .ok_or(StoreError::StaleConsumer)?,
+                )?
                 .state;
             let root = self
+                .semantic
                 .nodes
                 .iter()
                 .position(|candidate| candidate.state == root_state)
@@ -2721,21 +2777,27 @@ impl<M: RoleModel> PalsEngine<M> {
                 .held_cpu_task
                 .as_ref()
                 .is_some_and(|held| held.node == node && held.target_depth == limits.cpu_depth)
-            && self.nodes[node]
+            && self.semantic.nodes[node]
                 .resume
                 .as_ref()
-                .is_some_and(|token| token.is_paused_stack() && self.cpu.token_is_current(token))
+                .is_some_and(|token| {
+                    token.is_paused_stack() && self.researcher.cpu.token_is_current(token)
+                })
         {
             // Ordinary frontier visits preserve this live original task. Only
             // the accepted Repair/C barrier moves its held context and admits
             // its real TaskTable resume; cache and side work cannot do so early.
             return Ok(());
         }
-        if self.nodes[node].evidence.as_ref().is_some_and(|e| {
-            e.depth >= limits.cpu_depth
-                && e.scope == CpuScoreScope::CompletedIteration
-                && Some(&e.value_identity) == self.cpu_registered_value.as_ref()
-        }) {
+        if self.semantic.nodes[node]
+            .evidence
+            .as_ref()
+            .is_some_and(|e| {
+                e.depth >= limits.cpu_depth
+                    && e.scope == CpuScoreScope::CompletedIteration
+                    && Some(&e.value_identity) == self.researcher.cpu_registered_value.as_ref()
+            })
+        {
             counters.evidence_cache_hits += 1;
             counters.consumed_cached_cpu_values += 1;
             return Ok(());
@@ -2765,22 +2827,27 @@ impl<M: RoleModel> PalsEngine<M> {
             "{};q={}",
             descriptor.search_identity, descriptor.config.quiescence_ply
         ));
-        self.consumer_id = self.consumer_id.checked_add(1).ok_or(PalsError::Capacity)?;
-        let consumer_id = self.consumer_id;
+        self.semantic.consumer_id = self
+            .semantic
+            .consumer_id
+            .checked_add(1)
+            .ok_or(PalsError::Capacity)?;
+        let consumer_id = self.semantic.consumer_id;
         let consumer = TaskConsumer {
             id: consumer_id,
-            situation: self.nodes[node].situation,
+            situation: self.semantic.nodes[node].situation,
             revision: self
+                .semantic
                 .stores
                 .situations
-                .get(self.nodes[node].situation)?
+                .get(self.semantic.nodes[node].situation)?
                 .revision,
-            generation: self.stores.generation(),
+            generation: self.semantic.stores.generation(),
             deadline_tick: self.tick_at(limits.deadline),
         };
         let admission = match self.archive_request_task(
             TaskKey {
-                state: self.nodes[node].state,
+                state: self.semantic.nodes[node].state,
                 line: None,
                 question: TaskQuestion::AnalyzePosition,
                 root_moves: Vec::new(),
@@ -2810,7 +2877,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 observation,
             } => {
                 if self.stopped(limits, cancel).is_none() {
-                    match self.stores.consume_task(
+                    match self.semantic.stores.consume_task(
                         execution,
                         consumer_id,
                         self.tick_at(Instant::now()),
@@ -2826,10 +2893,11 @@ impl<M: RoleModel> PalsEngine<M> {
                         RawScore::Cpu { value, .. },
                         EvidenceScope::DepthLimited { depth, .. },
                     ) = (
-                        self.stores.observations.get(observation)?.score,
-                        self.stores.observations.get(observation)?.scope,
+                        self.semantic.stores.observations.get(observation)?.score,
+                        self.semantic.stores.observations.get(observation)?.scope,
                     ) {
-                        self.nodes[node].evidence = Some(CpuEvidence {
+                        self.semantic.nodes[node].evidence = Some(CpuEvidence {
+                            context: None,
                             score: value,
                             depth,
                             scope: CpuScoreScope::CompletedIteration,
@@ -2851,8 +2919,8 @@ impl<M: RoleModel> PalsEngine<M> {
                 ..
             } => {
                 if checkpoint != node as u64
-                    || self.nodes[node].resume.is_none()
-                    || !self.cpu.capabilities().resume
+                    || self.semantic.nodes[node].resume.is_none()
+                    || !self.researcher.cpu.capabilities().resume
                 {
                     return Err(
                         StoreError::InvalidConditions("CPU checkpoint owner mismatch").into(),
@@ -2874,9 +2942,9 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         counters.cpu_tasks_requested += 1;
         let report = match if matches!(admission, TaskAdmission::Resume { .. }) {
-            self.cpu.resume(
-                &self.nodes[node].position,
-                self.nodes[node]
+            self.researcher.cpu.resume(
+                &self.semantic.nodes[node].position,
+                self.semantic.nodes[node]
                     .resume
                     .as_ref()
                     .expect("validated CPU checkpoint"),
@@ -2884,14 +2952,15 @@ impl<M: RoleModel> PalsEngine<M> {
                 cancel,
             )
         } else {
-            self.cpu
-                .analyze(&self.nodes[node].position, cpu_limits, cancel)
+            self.researcher
+                .cpu
+                .analyze(&self.semantic.nodes[node].position, cpu_limits, cancel)
         } {
             Ok(report) => match Self::own_report(report) {
                 Ok(report) => report,
                 Err(error) => {
                     self.observe_cpu_failure(counters, task_nodes);
-                    self.stores.tasks.fail(execution)?;
+                    self.semantic.stores.tasks.fail(execution)?;
                     return Err(error);
                 }
             },
@@ -2900,12 +2969,12 @@ impl<M: RoleModel> PalsEngine<M> {
                     counters.cpu_tasks += 1;
                 }
                 self.observe_cpu_failure(counters, task_nodes);
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error.into());
             }
         };
         let admission = self.validate_cpu_report(
-            &self.nodes[node].position,
+            &self.semantic.nodes[node].position,
             &report,
             &value_identity,
             &cpu_condition,
@@ -2915,14 +2984,14 @@ impl<M: RoleModel> PalsEngine<M> {
         let requested_coverage_complete =
             Self::observe_cpu_report(counters, &report, limits.cpu_depth, admission.is_ok());
         if let Err(error) = admission {
-            self.stores.tasks.fail(execution)?;
+            self.semantic.stores.tasks.fail(execution)?;
             return Err(error);
         }
         // A stopped task retains completed depth evidence, but never pretends to
         // have examined the requested remaining depth or to prove a mate.
         let observation = match self.append_engine_observation_with_controls(
             Observation {
-                state: self.nodes[node].state,
+                state: self.semantic.nodes[node].state,
                 line: None,
                 source: stable_id(report.score_provenance),
                 epoch: 0,
@@ -2934,12 +3003,12 @@ impl<M: RoleModel> PalsEngine<M> {
                 score: if report.score_scope == CpuScoreScope::FrontierOnly {
                     RawScore::Estimate {
                         value: report.score as f32,
-                        perspective: self.nodes[node].position.side_to_move(),
+                        perspective: self.semantic.nodes[node].position.side_to_move(),
                     }
                 } else {
                     RawScore::Cpu {
                         value: report.score,
-                        perspective: self.nodes[node].position.side_to_move(),
+                        perspective: self.semantic.nodes[node].position.side_to_move(),
                         bound: BoundKind::ExactWithinSearch,
                     }
                 },
@@ -2960,18 +3029,18 @@ impl<M: RoleModel> PalsEngine<M> {
         ) {
             Ok(observation) => observation,
             Err(error) => {
-                self.nodes[node].resume = None;
-                self.stores.tasks.fail(execution)?;
+                self.semantic.nodes[node].resume = None;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error);
             }
         };
         if requested_coverage_complete {
-            if let Err(error) = self.stores.complete_task(execution, observation) {
-                self.nodes[node].resume = None;
-                self.stores.tasks.fail(execution)?;
+            if let Err(error) = self.semantic.stores.complete_task(execution, observation) {
+                self.semantic.nodes[node].resume = None;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error.into());
             }
-            self.nodes[node].resume = None;
+            self.semantic.nodes[node].resume = None;
         } else if let Some(token) = report.resume {
             let held = if let Some(prefix) = held_prefix.filter(|_| token.is_paused_stack()) {
                 // Reserve both the live path and the bounded replacement path
@@ -2988,14 +3057,18 @@ impl<M: RoleModel> PalsEngine<M> {
                     > crate::cpu::CPU_PAUSED_STACK_MAX_BYTES
                 {
                     self.discard_cpu_stack_owner()?;
-                    self.nodes[node].resume = None;
+                    self.semantic.nodes[node].resume = None;
                     self.held_cpu_task = None;
-                    self.stores.tasks.fail(execution)?;
+                    self.semantic.stores.tasks.fail(execution)?;
                     return Err(PalsError::Capacity);
                 }
-                let root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
+                let root = self
+                    .semantic
+                    .stores
+                    .root()
+                    .ok_or(StoreError::StaleConsumer)?;
                 Some(HeldCpuTask {
-                    active_root: self.stores.situations.get(root)?.state,
+                    active_root: self.semantic.stores.situations.get(root)?.state,
                     node,
                     execution,
                     target_depth: limits.cpu_depth,
@@ -3004,27 +3077,29 @@ impl<M: RoleModel> PalsEngine<M> {
             } else {
                 None
             };
-            self.nodes[node].resume = Some(token);
-            if let Err(error) = self
-                .stores
-                .pause_task(execution, node as u64, Some(observation))
+            self.semantic.nodes[node].resume = Some(token);
+            if let Err(error) =
+                self.semantic
+                    .stores
+                    .pause_task(execution, node as u64, Some(observation))
             {
-                self.nodes[node].resume = None;
-                self.stores.tasks.fail(execution)?;
+                self.semantic.nodes[node].resume = None;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error.into());
             }
             if let Some(held) = held {
                 self.held_cpu_task = Some(held);
             }
         } else {
-            self.stores.tasks.fail(execution)?;
+            self.semantic.stores.tasks.fail(execution)?;
         }
         if self.stopped(limits, cancel).is_none() {
             if requested_coverage_complete {
-                match self
-                    .stores
-                    .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
-                {
+                match self.semantic.stores.consume_task(
+                    execution,
+                    consumer_id,
+                    self.tick_at(Instant::now()),
+                ) {
                     Ok(_) => {}
                     Err(StoreError::ExpiredConsumer) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -3033,7 +3108,8 @@ impl<M: RoleModel> PalsEngine<M> {
             if self.stopped(limits, cancel).is_some() {
                 return Ok(());
             }
-            self.nodes[node].evidence = Some(CpuEvidence {
+            self.semantic.nodes[node].evidence = Some(CpuEvidence {
+                context: None,
                 score: report.score,
                 depth: report.completed_depth,
                 scope: report.score_scope,
@@ -3049,17 +3125,23 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             // Register exactly the situation and active root which depend on this
             // evidence. Evicting derived model memory will not remove these facts.
-            self.archive_add_dependency(observation, self.nodes[node].situation, limits, cancel)?;
-            if let Some(root) = self.stores.root() {
+            self.archive_add_dependency(
+                observation,
+                self.semantic.nodes[node].situation,
+                limits,
+                cancel,
+            )?;
+            if let Some(root) = self.semantic.stores.root() {
                 self.archive_add_dependency(observation, root, limits, cancel)?;
             }
-            self.record_checked(
+            self.record_with_cpu_checked(
                 RecordKind::CpuVerification,
                 line,
                 Some(report.score),
                 report.completed_depth,
                 Some(report.score_scope),
-                Some(self.nodes[node].position.side_to_move()),
+                Some(self.semantic.nodes[node].position.side_to_move()),
+                Some(observation),
                 limits,
                 cancel,
             )?;
@@ -3094,21 +3176,22 @@ impl<M: RoleModel> PalsEngine<M> {
         counters: &mut PalsCounters,
         frozen: Option<Arc<ReviewView>>,
     ) -> Result<(), PalsError> {
-        if self.nodes[node].terminal.is_some() || self.stopped(limits, cancel).is_some() {
+        if self.semantic.nodes[node].terminal.is_some() || self.stopped(limits, cancel).is_some() {
             return Ok(());
         }
         if counters.role_calls >= self.config.max_role_calls {
             return Err(PalsError::RoleCallLimit);
         }
         let identity = self
+            .semantic
             .model_registered_value
             .as_ref()
             .ok_or(RoleError::Unavailable)?
             .clone();
-        if self.model.value_identity() != Some(&identity) {
+        if self.semantic.model.value_identity() != Some(&identity) {
             return Err(RoleError::InvalidOutput.into());
         }
-        let legal = self.nodes[node].position.legal_moves();
+        let legal = self.semantic.nodes[node].position.legal_moves();
         if legal.len() > 256 {
             return Err(PalsError::Capacity);
         }
@@ -3122,7 +3205,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let context = self.role_context(node, question)?;
         let review = match frozen {
             Some(view) => {
-                if !view.validates(&self.stores)
+                if !view.validates(&self.semantic.stores)
                     || view.query().prefix != line
                     || view.query().proposal != line
                     || view.query().legal != legal
@@ -3135,36 +3218,40 @@ impl<M: RoleModel> PalsEngine<M> {
             None => self.prepare_review_view(node, question, &legal)?,
         };
         if let Some(view) = &review {
-            self.model
+            self.semantic
+                .model
                 .bind_selected_review_view(Arc::clone(view), &context)?;
         }
         let query = RoleQuery {
-            position: &self.nodes[node].position,
+            position: &self.semantic.nodes[node].position,
             legal: &legal,
             prefix: line,
             proposal: line,
             counterexample: None,
             records: review
                 .as_ref()
-                .map_or(self.records.as_slice(), |view| view.records()),
-            revision: self.revision,
+                .map_or(self.semantic.records.as_slice(), |view| view.records()),
+            revision: self.semantic.revision,
             deadline: limits.deadline,
             cancel,
         };
         query.check_control()?;
         counters.role_calls += 1;
         counters.value_calls += 1;
-        let output = self.model.evaluate_value_with_context(query, &context)?;
+        let output = self
+            .semantic
+            .model
+            .evaluate_value_with_context(query, &context)?;
         // Capture before another model callback can replace its one-value slot.
         // Logical acceptance is recorded only after the gates below succeed.
-        let execution_evidence = self.model.last_value_execution_evidence();
-        output.validate(&self.nodes[node].position, &identity)?;
+        let execution_evidence = self.semantic.model.last_value_execution_evidence();
+        output.validate(&self.semantic.nodes[node].position, &identity)?;
         counters.completed_value_calls += 1;
         // Keep the full actual input identity; numeric scope IDs are metadata.
         // No exact-input cache reuse is granted by a model namespace or board.
         let observation = self.append_engine_observation_with_controls(
             Observation {
-                state: self.nodes[node].state,
+                state: self.semantic.nodes[node].state,
                 line: None,
                 source: stable_id(&identity.semantics),
                 epoch: 0,
@@ -3191,7 +3278,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         draw: output.wdl[1],
                         loss: output.wdl[2],
                         perspective: output.perspective,
-                        context_revision: self.revision,
+                        context_revision: self.semantic.revision,
                     }
                 } else {
                     RawScore::Wdl {
@@ -3214,8 +3301,13 @@ impl<M: RoleModel> PalsEngine<M> {
         if Instant::now() >= limits.deadline {
             return Err(RoleError::Deadline.into());
         }
-        self.archive_add_dependency(observation, self.nodes[node].situation, limits, cancel)?;
-        if let Some(root) = self.stores.root() {
+        self.archive_add_dependency(
+            observation,
+            self.semantic.nodes[node].situation,
+            limits,
+            cancel,
+        )?;
+        if let Some(root) = self.semantic.stores.root() {
             self.archive_add_dependency(observation, root, limits, cancel)?;
         }
         // Acknowledgement occurs only after successful publication/dependency
@@ -3228,19 +3320,20 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.accept_role_output(node, &context, question, limits, cancel)?;
         if let Some(view) = &review {
-            self.review_index
+            self.semantic
+                .review_index
                 .as_mut()
                 .ok_or(PalsError::InvalidConfig)?
-                .consume(view, &self.stores)?;
+                .consume(view, &self.semantic.stores)?;
         }
         counters.consumed_role_outputs += 1;
         counters.accepted_value_outputs += 1;
         let observed_input = output.input_sha256;
         let observed_epoch = output.identity.model_epoch;
         let observed_perspective = output.perspective;
-        self.nodes[node].model_value = Some(output);
-        self.nodes[node].model_observation = Some(observation);
-        self.nodes[node].model_value_revision = Some(self.revision);
+        self.semantic.nodes[node].model_value = Some(output);
+        self.semantic.nodes[node].model_observation = Some(observation);
+        self.semantic.nodes[node].model_value_revision = Some(self.semantic.revision);
         self.observe_value_execution(
             observation,
             observed_input,
@@ -3260,10 +3353,10 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: CpuLimits,
     ) -> Result<(), PalsError> {
         report.identity.validate()?;
-        if self.cpu.identity() != &self.checker_registered_identity
-            || self.checker_registered_identity
+        if self.researcher.cpu.identity() != &self.researcher.checker_registered_identity
+            || self.researcher.checker_registered_identity
                 != CheckerIdentity::ExternalUci(report.identity.clone())
-            || self.cpu.conditions() != self.cpu_registered_condition
+            || self.researcher.cpu.conditions() != self.researcher.cpu_registered_condition
             || report.perspective != position.side_to_move()
             || report.requested_depth != limits.max_depth
             || report.root_restricted != alternatives.is_some()
@@ -3307,7 +3400,7 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Capture one physical foreign request once. Budget reservations and actual
     /// reported nodes are different quantities, including on node overshoot.
     fn observe_external_attempt(&mut self, counters: &mut PalsCounters) -> Result<(), PalsError> {
-        let Some(attempt) = self.cpu.last_attempt() else {
+        let Some(attempt) = self.researcher.cpu.last_attempt() else {
             counters.external_checker_work_incomplete = true;
             return Ok(());
         };
@@ -3316,12 +3409,13 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(CheckerError::Invalid("foreign attempt has own ledger").into());
         };
         if self
+            .researcher
             .last_external_attempt
             .is_some_and(|prior| evidence.request_id <= prior)
         {
             return Err(CheckerError::Invalid("foreign physical request ID was reused").into());
         }
-        self.last_external_attempt = Some(evidence.request_id);
+        self.researcher.last_external_attempt = Some(evidence.request_id);
         if let Some(nodes) = attempt.work.nodes {
             counters.external_checker_nodes_observed = counters
                 .external_checker_nodes_observed
@@ -3350,10 +3444,10 @@ impl<M: RoleModel> PalsEngine<M> {
                 return Err(CheckerError::Invalid("unbounded retained foreign attempt").into());
             }
         }
-        if self.external_attempts.len() >= self.config.max_records {
+        if self.researcher.external_attempts.len() >= self.config.max_records {
             return Err(PalsError::Capacity);
         }
-        self.external_attempts.push(attempt.clone());
+        self.researcher.external_attempts.push(attempt.clone());
         Ok(())
     }
 
@@ -3393,13 +3487,13 @@ impl<M: RoleModel> PalsEngine<M> {
         counters: &mut PalsCounters,
     ) -> Result<Option<CpuCandidate>, PalsError> {
         if self.stopped(limits, cancel).is_some()
-            || self.nodes[divergence].terminal.is_some()
+            || self.semantic.nodes[divergence].terminal.is_some()
             || alternatives.is_some_and(|moves| moves.is_empty())
         {
             return Ok(None);
         }
         self.validate_checker_namespace()?;
-        if self.external_attempts.len() >= self.config.max_records {
+        if self.researcher.external_attempts.len() >= self.config.max_records {
             return Err(PalsError::Capacity);
         }
         let remaining = limits
@@ -3416,13 +3510,18 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         // A too-short foreign wall closes this search before allocating a task,
         // reserving nodes or recording physical dispatch/unknown work.
-        self.cpu
+        self.researcher
+            .cpu
             .preflight_task(cpu_limits)
             .map_err(Self::checker_admission_error)?;
-        let generation = self.stores.generation();
-        let active_root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
-        let root_revision = self.stores.situations.get(active_root)?.revision;
-        let identity = self.checker_registered_identity.clone();
+        let generation = self.semantic.stores.generation();
+        let active_root = self
+            .semantic
+            .stores
+            .root()
+            .ok_or(StoreError::StaleConsumer)?;
+        let root_revision = self.semantic.stores.situations.get(active_root)?.revision;
+        let identity = self.researcher.checker_registered_identity.clone();
         let question = if verification {
             TaskQuestion::AnalyzePosition
         } else if alternatives.is_some() {
@@ -3446,7 +3545,7 @@ impl<M: RoleModel> PalsEngine<M> {
         // a different time allowance is not an exact-question cache hit.
         let condition = format!(
             "{};question={:?};ordered-root-mask={};prefix-plies={};deadline-tick={};nodes={};depth={}",
-            self.cpu_registered_condition,
+            self.researcher.cpu_registered_condition,
             question,
             ordered_mask,
             prefix.len(),
@@ -3459,22 +3558,27 @@ impl<M: RoleModel> PalsEngine<M> {
                 StoreError::InvalidConditions("foreign full condition exceeds bound").into(),
             );
         }
-        self.consumer_id = self.consumer_id.checked_add(1).ok_or(PalsError::Capacity)?;
-        let consumer_id = self.consumer_id;
+        self.semantic.consumer_id = self
+            .semantic
+            .consumer_id
+            .checked_add(1)
+            .ok_or(PalsError::Capacity)?;
+        let consumer_id = self.semantic.consumer_id;
         let consumer = TaskConsumer {
             id: consumer_id,
-            situation: self.nodes[divergence].situation,
+            situation: self.semantic.nodes[divergence].situation,
             revision: self
+                .semantic
                 .stores
                 .situations
-                .get(self.nodes[divergence].situation)?
+                .get(self.semantic.nodes[divergence].situation)?
                 .revision,
             generation,
             deadline_tick: self.tick_at(limits.deadline),
         };
         let admission = match self.archive_request_task(
             TaskKey {
-                state: self.nodes[divergence].state,
+                state: self.semantic.nodes[divergence].state,
                 line: None,
                 question,
                 root_moves,
@@ -3522,20 +3626,27 @@ impl<M: RoleModel> PalsEngine<M> {
                 .checked_add(task_nodes)
                 .ok_or(PalsError::Capacity)?;
             counters.external_checker_tasks += 1;
-            self.cpu.reset_attempt();
+            self.researcher.cpu.reset_attempt();
             let response = if verification {
-                self.cpu
-                    .analyze(&self.nodes[divergence].position, cpu_limits, cancel)
+                self.researcher.cpu.analyze(
+                    &self.semantic.nodes[divergence].position,
+                    cpu_limits,
+                    cancel,
+                )
             } else if let Some(moves) = alternatives {
-                self.cpu.analyze_root_moves(
-                    &self.nodes[divergence].position,
+                self.researcher.cpu.analyze_root_moves(
+                    &self.semantic.nodes[divergence].position,
                     moves,
                     cpu_limits,
                     cancel,
                 )
             } else {
-                self.cpu
-                    .analyze_divergence(&self.nodes[root].position, prefix, cpu_limits, cancel)
+                self.researcher.cpu.analyze_divergence(
+                    &self.semantic.nodes[root].position,
+                    prefix,
+                    cpu_limits,
+                    cancel,
+                )
             };
             if matches!(
                 &response,
@@ -3543,12 +3654,12 @@ impl<M: RoleModel> PalsEngine<M> {
                     stage: "admission",
                     code: "insufficient_stop_reserve"
                 })
-            ) && self.cpu.last_attempt().is_none()
+            ) && self.researcher.cpu.last_attempt().is_none()
             {
                 // The real adapter rechecks immediately before go. A race can
                 // refuse after caller reservation, but it started no physical
                 // work: close the task and release only this unused reservation.
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 counters.external_checker_node_budget_reserved = counters
                     .external_checker_node_budget_reserved
                     .checked_sub(task_nodes)
@@ -3568,29 +3679,30 @@ impl<M: RoleModel> PalsEngine<M> {
                     report
                 }
                 Ok(CheckerReport::Owned(_)) => {
-                    self.stores.tasks.fail(execution)?;
+                    self.semantic.stores.tasks.fail(execution)?;
                     return Err(CheckerError::Invalid("own report in foreign namespace").into());
                 }
                 Err(error) => {
-                    self.stores.tasks.fail(execution)?;
+                    self.semantic.stores.tasks.fail(execution)?;
                     capture?;
                     return Err(error.into());
                 }
             };
             if let Err(error) = capture {
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error);
             }
             if let Err(error) = self.validate_external_report(
-                &self.nodes[divergence].position,
+                &self.semantic.nodes[divergence].position,
                 &report,
                 alternatives,
                 cpu_limits,
             ) {
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error);
             }
             if self
+                .researcher
                 .cpu
                 .last_attempt()
                 .and_then(|attempt| attempt.external.as_ref())
@@ -3599,7 +3711,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         || attempt.partial_report.as_ref() != Some(&report)
                 })
             {
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(CheckerError::Invalid(
                     "foreign report has no matching physical attempt",
                 )
@@ -3619,7 +3731,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 };
                 let observation = self.append_engine_observation_with_controls(
                     Observation {
-                        state: self.nodes[divergence].state,
+                        state: self.semantic.nodes[divergence].state,
                         line: None,
                         source: stable_id(&report.identity.adapter_semantics),
                         epoch: 0,
@@ -3655,21 +3767,21 @@ impl<M: RoleModel> PalsEngine<M> {
             let observation = match publication {
                 Ok(observation) => observation,
                 Err(error) => {
-                    self.stores.tasks.fail(execution)?;
+                    self.semantic.stores.tasks.fail(execution)?;
                     return Err(error);
                 }
             };
             if report.completion == ExternalCompletion::BestMove && report.work.nodes.is_some() {
-                if let Err(error) = self.stores.complete_task(execution, observation) {
-                    self.stores.tasks.fail(execution)?;
+                if let Err(error) = self.semantic.stores.complete_task(execution, observation) {
+                    self.semantic.stores.tasks.fail(execution)?;
                     return Err(error.into());
                 }
             } else {
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
             }
             observation
         };
-        let evidence = self.stores.observations.get(observation)?;
+        let evidence = self.semantic.stores.observations.get(observation)?;
         let report = evidence
             .external_report
             .as_deref()
@@ -3684,16 +3796,17 @@ impl<M: RoleModel> PalsEngine<M> {
             .take(self.config.line_plies.saturating_sub(prefix.len()))
             .collect();
         if self.stopped(limits, cancel).is_some()
-            || generation != self.stores.generation()
+            || generation != self.semantic.stores.generation()
             || !valid_response
         {
             return Ok(None);
         }
         if complete {
-            match self
-                .stores
-                .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
-            {
+            match self.semantic.stores.consume_task(
+                execution,
+                consumer_id,
+                self.tick_at(Instant::now()),
+            ) {
                 Ok(_) => {}
                 Err(StoreError::ExpiredConsumer) => return Ok(None),
                 Err(error) => return Err(error.into()),
@@ -3707,11 +3820,16 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.archive_add_dependency(
             observation,
-            self.nodes[divergence].situation,
+            self.semantic.nodes[divergence].situation,
             limits,
             cancel,
         )?;
-        self.archive_add_dependency(observation, self.nodes[root].situation, limits, cancel)?;
+        self.archive_add_dependency(
+            observation,
+            self.semantic.nodes[root].situation,
+            limits,
+            cancel,
+        )?;
         Ok(Some(CpuCandidate {
             pv,
             observation,
@@ -3723,7 +3841,7 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn cpu_condition(&self) -> String {
-        Self::cpu_condition_for(self.cpu.as_ref())
+        Self::cpu_condition_for(self.researcher.cpu.as_ref())
     }
     fn cpu_condition_for(cpu: &dyn CpuChecker) -> String {
         if let Some(descriptor) = cpu.owned_descriptor() {
@@ -3773,7 +3891,7 @@ impl<M: RoleModel> PalsEngine<M> {
             || report.pv.is_empty()
             || report.pv.len()
                 > limits.max_depth as usize + descriptor.config.quiescence_ply as usize
-            || (report.resume.is_some() && !self.cpu.capabilities().resume)
+            || (report.resume.is_some() && !self.researcher.cpu.capabilities().resume)
         {
             return Err(StoreError::InvalidEvidence(
                 "CPU report differs from admitted immutable search/value conditions",
@@ -3826,8 +3944,7 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn observe_cpu_failure(&self, counters: &mut PalsCounters, requested_nodes: u64) {
-        if let Some(work) = self
-            .cpu
+        if let Some(work) = self.researcher.cpu
             .last_attempt().map(|attempt| attempt.work)
             .filter(|work| matches!((work.nodes, work.qnodes), (Some(nodes), Some(qnodes)) if nodes <= requested_nodes && qnodes <= nodes) && work.tt_hits.is_some())
         {
@@ -3852,20 +3969,24 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
     ) -> Result<Option<CpuCandidate>, PalsError> {
-        if self.stopped(limits, cancel).is_some() || self.nodes[divergence].terminal.is_some() {
+        if self.stopped(limits, cancel).is_some()
+            || self.semantic.nodes[divergence].terminal.is_some()
+        {
             return Ok(None);
         }
         self.validate_checker_namespace()?;
-        let mut checked = self.nodes[root].position.clone();
+        let mut checked = self.semantic.nodes[root].position.clone();
         for &movement in prefix {
             checked.make_move(movement)?;
         }
-        if checked.position_identity() != self.nodes[divergence].position.position_identity()
-            || self.stores.root().is_none_or(|situation| {
-                self.stores
+        if checked.position_identity()
+            != self.semantic.nodes[divergence].position.position_identity()
+            || self.semantic.stores.root().is_none_or(|situation| {
+                self.semantic
+                    .stores
                     .situations
                     .get(situation)
-                    .map_or(true, |s| s.state != self.nodes[root].state)
+                    .map_or(true, |s| s.state != self.semantic.nodes[root].state)
             })
         {
             return Err(StoreError::StaleConsumer.into());
@@ -3886,9 +4007,13 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(None);
         }
         self.synchronize_cpu_checkpoints()?;
-        let generation = self.stores.generation();
-        let active_root = self.stores.root().ok_or(StoreError::StaleConsumer)?;
-        let root_revision = self.stores.situations.get(active_root)?.revision;
+        let generation = self.semantic.stores.generation();
+        let active_root = self
+            .semantic
+            .stores
+            .root()
+            .ok_or(StoreError::StaleConsumer)?;
+        let root_revision = self.semantic.stores.situations.get(active_root)?.revision;
         let task_nodes = remaining.min(self.config.cpu_nodes_per_task);
         let descriptor = self.owned_descriptor()?;
         let profile = stable_id(descriptor.config.profile.identity());
@@ -3922,22 +4047,27 @@ impl<M: RoleModel> PalsEngine<M> {
             ordered_mask,
             prefix.len()
         );
-        self.consumer_id = self.consumer_id.checked_add(1).ok_or(PalsError::Capacity)?;
-        let consumer_id = self.consumer_id;
+        self.semantic.consumer_id = self
+            .semantic
+            .consumer_id
+            .checked_add(1)
+            .ok_or(PalsError::Capacity)?;
+        let consumer_id = self.semantic.consumer_id;
         let consumer = TaskConsumer {
             id: consumer_id,
-            situation: self.nodes[divergence].situation,
+            situation: self.semantic.nodes[divergence].situation,
             revision: self
+                .semantic
                 .stores
                 .situations
-                .get(self.nodes[divergence].situation)?
+                .get(self.semantic.nodes[divergence].situation)?
                 .revision,
             generation,
             deadline_tick: self.tick_at(limits.deadline),
         };
         let admission = match self.archive_request_task(
             TaskKey {
-                state: self.nodes[divergence].state,
+                state: self.semantic.nodes[divergence].state,
                 line: None,
                 question,
                 root_moves,
@@ -3967,19 +4097,21 @@ impl<M: RoleModel> PalsEngine<M> {
                 execution,
                 observation,
             } => {
-                let evidence = self.stores.observations.get(observation)?;
+                let evidence = self.semantic.stores.observations.get(observation)?;
                 let Some(line) = evidence.cpu_pv else {
                     return Ok(None);
                 };
-                let pv = self.stores.lines.moves(line)?;
-                if self.stopped(limits, cancel).is_some() || generation != self.stores.generation()
+                let pv = self.semantic.stores.lines.moves(line)?;
+                if self.stopped(limits, cancel).is_some()
+                    || generation != self.semantic.stores.generation()
                 {
                     return Ok(None);
                 }
-                match self
-                    .stores
-                    .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
-                {
+                match self.semantic.stores.consume_task(
+                    execution,
+                    consumer_id,
+                    self.tick_at(Instant::now()),
+                ) {
                     Ok(_) => {}
                     Err(StoreError::ExpiredConsumer) => return Ok(None),
                     Err(error) => return Err(error.into()),
@@ -4016,23 +4148,25 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         counters.cpu_tasks_requested += 1;
         let report = match alternatives {
-            Some(moves) => self.cpu.analyze_root_moves(
-                &self.nodes[divergence].position,
+            Some(moves) => self.researcher.cpu.analyze_root_moves(
+                &self.semantic.nodes[divergence].position,
                 moves,
                 cpu_limits,
                 cancel,
             ),
-            None => {
-                self.cpu
-                    .analyze_divergence(&self.nodes[root].position, prefix, cpu_limits, cancel)
-            }
+            None => self.researcher.cpu.analyze_divergence(
+                &self.semantic.nodes[root].position,
+                prefix,
+                cpu_limits,
+                cancel,
+            ),
         };
         let report = match report {
             Ok(report) => match Self::own_report(report) {
                 Ok(report) => report,
                 Err(error) => {
                     self.observe_cpu_failure(counters, task_nodes);
-                    self.stores.tasks.fail(execution)?;
+                    self.semantic.stores.tasks.fail(execution)?;
                     return Err(error);
                 }
             },
@@ -4041,13 +4175,13 @@ impl<M: RoleModel> PalsEngine<M> {
                     counters.cpu_tasks += 1;
                 }
                 self.observe_cpu_failure(counters, task_nodes);
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error.into());
             }
         };
         let admission = self
             .validate_cpu_report(
-                &self.nodes[divergence].position,
+                &self.semantic.nodes[divergence].position,
                 &report,
                 &value_identity,
                 &search_condition,
@@ -4071,7 +4205,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let complete =
             Self::observe_cpu_report(counters, &report, limits.cpu_depth, admission.is_ok());
         if let Err(error) = admission {
-            self.stores.tasks.fail(execution)?;
+            self.semantic.stores.tasks.fail(execution)?;
             return Err(error);
         }
         // The store facade independently checks the entire CPU PV with Rules.
@@ -4085,13 +4219,13 @@ impl<M: RoleModel> PalsEngine<M> {
         let pv_line = match self.archive_append_cpu_pv(divergence, &pv, limits, cancel) {
             Ok(line) => line,
             Err(error) => {
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error);
             }
         };
         let observation = match self.append_engine_observation_with_controls(
             Observation {
-                state: self.nodes[divergence].state,
+                state: self.semantic.nodes[divergence].state,
                 line: None,
                 source: stable_id(report.score_provenance),
                 epoch: 0,
@@ -4111,12 +4245,12 @@ impl<M: RoleModel> PalsEngine<M> {
                 score: if report.score_scope == CpuScoreScope::FrontierOnly {
                     RawScore::Estimate {
                         value: report.score as f32,
-                        perspective: self.nodes[divergence].position.side_to_move(),
+                        perspective: self.semantic.nodes[divergence].position.side_to_move(),
                     }
                 } else {
                     RawScore::Cpu {
                         value: report.score,
-                        perspective: self.nodes[divergence].position.side_to_move(),
+                        perspective: self.semantic.nodes[divergence].position.side_to_move(),
                         bound: BoundKind::ExactWithinSearch,
                     }
                 },
@@ -4129,28 +4263,30 @@ impl<M: RoleModel> PalsEngine<M> {
         ) {
             Ok(observation) => observation,
             Err(error) => {
-                self.stores.tasks.fail(execution)?;
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error);
             }
         };
         if complete {
-            if let Err(error) = self.stores.complete_task(execution, observation) {
-                self.stores.tasks.fail(execution)?;
+            if let Err(error) = self.semantic.stores.complete_task(execution, observation) {
+                self.semantic.stores.tasks.fail(execution)?;
                 return Err(error.into());
             }
         } else {
             // Partial discovery evidence survives, but no generic node resume
             // token is borrowed for a differently restricted CPU question.
-            self.stores.tasks.fail(execution)?;
+            self.semantic.stores.tasks.fail(execution)?;
         }
-        if self.stopped(limits, cancel).is_some() || generation != self.stores.generation() {
+        if self.stopped(limits, cancel).is_some() || generation != self.semantic.stores.generation()
+        {
             return Ok(None);
         }
         if complete {
-            match self
-                .stores
-                .consume_task(execution, consumer_id, self.tick_at(Instant::now()))
-            {
+            match self.semantic.stores.consume_task(
+                execution,
+                consumer_id,
+                self.tick_at(Instant::now()),
+            ) {
                 Ok(_) => {}
                 Err(StoreError::ExpiredConsumer) => return Ok(None),
                 Err(error) => return Err(error.into()),
@@ -4168,11 +4304,16 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.archive_add_dependency(
             observation,
-            self.nodes[divergence].situation,
+            self.semantic.nodes[divergence].situation,
             limits,
             cancel,
         )?;
-        self.archive_add_dependency(observation, self.nodes[root].situation, limits, cancel)?;
+        self.archive_add_dependency(
+            observation,
+            self.semantic.nodes[root].situation,
+            limits,
+            cancel,
+        )?;
         Ok(Some(CpuCandidate {
             pv,
             observation,
@@ -4198,9 +4339,15 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.stopped(limits, cancel).is_some() || Instant::now() >= candidate.deadline {
             return Ok(None);
         }
-        if candidate.generation != self.stores.generation()
-            || self.stores.root() != Some(candidate.root)
-            || self.stores.situations.get(candidate.root)?.revision != candidate.root_revision
+        if candidate.generation != self.semantic.stores.generation()
+            || self.semantic.stores.root() != Some(candidate.root)
+            || self
+                .semantic
+                .stores
+                .situations
+                .get(candidate.root)?
+                .revision
+                != candidate.root_revision
         {
             return Err(StoreError::StaleConsumer.into());
         }
@@ -4213,13 +4360,17 @@ impl<M: RoleModel> PalsEngine<M> {
         if candidate.pv.len() > self.config.line_plies.saturating_sub(prefix.len()) {
             return Err(StoreError::Capacity("CPU candidate exceeds registered PALS line").into());
         }
-        let evidence = self.stores.observations.get(candidate.observation)?;
+        let evidence = self
+            .semantic
+            .stores
+            .observations
+            .get(candidate.observation)?;
         if (if self.is_external() {
-            evidence.checker_identity.as_ref() != Some(&self.checker_registered_identity)
+            evidence.checker_identity.as_ref() != Some(&self.researcher.checker_registered_identity)
         } else {
-            evidence.value_identity.as_ref() != self.cpu_registered_value.as_ref()
+            evidence.value_identity.as_ref() != self.researcher.cpu_registered_value.as_ref()
         }) || evidence.cpu_pv.is_none_or(|line| {
-            self.stores.lines.moves(line).map_or(true, |pv| {
+            self.semantic.stores.lines.moves(line).map_or(true, |pv| {
                 if self.is_external() {
                     !pv.starts_with(&candidate.pv)
                 } else {
@@ -4232,19 +4383,26 @@ impl<M: RoleModel> PalsEngine<M> {
             )
             .into());
         }
-        let mut checked = self.nodes[root].position.clone();
+        let mut checked = self.semantic.nodes[root].position.clone();
         for &movement in prefix {
             checked.make_move(movement)?;
         }
-        if checked.position_identity() != self.nodes[divergence].position.position_identity()
-            || self.stores.root().is_none_or(|situation| {
-                self.stores
+        if checked.position_identity()
+            != self.semantic.nodes[divergence].position.position_identity()
+            || self.semantic.stores.root().is_none_or(|situation| {
+                self.semantic
+                    .stores
                     .situations
                     .get(situation)
-                    .map_or(true, |s| s.state != self.nodes[root].state)
+                    .map_or(true, |s| s.state != self.semantic.nodes[root].state)
             })
-            || self.stores.observations.get(candidate.observation)?.state
-                != self.nodes[divergence].state
+            || self
+                .semantic
+                .stores
+                .observations
+                .get(candidate.observation)?
+                .state
+                != self.semantic.nodes[divergence].state
         {
             return Err(StoreError::StaleConsumer.into());
         }
@@ -4261,7 +4419,7 @@ impl<M: RoleModel> PalsEngine<M> {
             if self.stopped(limits, cancel).is_some() {
                 return Ok(None);
             }
-            let mut next = self.nodes[current].position.clone();
+            let mut next = self.semantic.nodes[current].position.clone();
             next.make_move(movement)?;
             current = self.connect_checked(current, movement, next, counters, limits, cancel)?;
             first.get_or_insert(current);
@@ -4271,7 +4429,7 @@ impl<M: RoleModel> PalsEngine<M> {
     }
     fn tick_at(&self, instant: Instant) -> u64 {
         instant
-            .saturating_duration_since(self.clock_origin)
+            .saturating_duration_since(self.semantic.clock_origin)
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64
     }
@@ -4358,11 +4516,17 @@ impl<M: RoleModel> PalsEngine<M> {
         controls: Option<(Instant, &AtomicBool)>,
     ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
         Self::check_logical_controls(controls)?;
-        let revision = self.revision.checked_add(1).ok_or(PalsError::Capacity)?;
-        let root = self.stores.root().ok_or(PalsError::Capacity)?;
-        let root_state = self.stores.situations.get(root)?.state;
-        let perspective = perspective.unwrap_or(self.stores.states.get(root_state)?.side_to_move());
+        let revision = self
+            .semantic
+            .revision
+            .checked_add(1)
+            .ok_or(PalsError::Capacity)?;
+        let root = self.semantic.stores.root().ok_or(PalsError::Capacity)?;
+        let root_state = self.semantic.stores.situations.get(root)?.state;
+        let perspective =
+            perspective.unwrap_or(self.semantic.stores.states.get(root_state)?.side_to_move());
         let supersedes_revision = self
+            .semantic
             .records
             .iter()
             .rev()
@@ -4373,6 +4537,7 @@ impl<M: RoleModel> PalsEngine<M> {
             })
             .map(|record| record.revision);
         let parent_revision = self
+            .semantic
             .records
             .iter()
             .rev()
@@ -4400,15 +4565,16 @@ impl<M: RoleModel> PalsEngine<M> {
                     && record.kind == kind
                     && record.line.first() == line.first())
         };
-        let obsolete = if self.records.len() == self.config.max_records {
+        let obsolete = if self.semantic.records.len() == self.config.max_records {
             let obsolete = self
+                .semantic
                 .records
                 .iter()
                 .position(|record| {
                     !remains_critical(record)
                         && Some(record.revision) != parent_revision
                         && Some(record.revision) != supersedes_revision
-                        && !self.records.iter().any(|active| {
+                        && !self.semantic.records.iter().any(|active| {
                             remains_critical(active)
                                 && (active.parent_revision == Some(record.revision)
                                     || active.supersedes_revision == Some(record.revision))
@@ -4445,16 +4611,19 @@ impl<M: RoleModel> PalsEngine<M> {
             self.publish_record(record, obsolete, None)?;
             return Ok(None);
         }
-        let line_id =
-            self.archive_append_line(self.stores.situations.get(root)?.focus, line, controls)?;
+        let line_id = self.archive_append_line(
+            self.semantic.stores.situations.get(root)?.focus,
+            line,
+            controls,
+        )?;
         let observation = self.append_engine_observation_with_controls(
             Observation {
                 state: root_state,
                 line: Some(line_id),
-                source: stable_id(self.model.identity()),
+                source: stable_id(self.semantic.model.identity()),
                 epoch: 0,
                 scope: EvidenceScope::Model {
-                    model: stable_id(self.model.identity()),
+                    model: stable_id(self.semantic.model.identity()),
                     encoding: stable_id("pals-role-query-v1"),
                     input: revision,
                 },
@@ -4490,21 +4659,9 @@ impl<M: RoleModel> PalsEngine<M> {
         obsolete: Option<usize>,
         evidence: Option<ObservationId>,
     ) -> Result<(), PalsError> {
-        self.publish_review_record(&record, evidence)?;
-        for previous in &mut self.records {
-            if previous.origin_state == record.origin_state
-                && previous.kind == record.kind
-                && previous.line.first() == record.line.first()
-            {
-                previous.critical = false;
-            }
-        }
-        if let Some(index) = obsolete {
-            self.records.remove(index);
-        }
-        self.revision = record.revision;
-        self.records.push(record);
-        Ok(())
+        let config = self.semantic_sequence_config();
+        self.semantic
+            .publish_record(&config, record, obsolete, evidence)
     }
     fn check_logical_controls(controls: Option<(Instant, &AtomicBool)>) -> Result<(), PalsError> {
         if let Some((deadline, cancel)) = controls {
@@ -4518,14 +4675,7 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
     fn refresh_projection(&mut self, root_state: StateId) {
-        if let Some(index) = &mut self.review_index {
-            index.refresh_root(root_state);
-        }
-        let mut newest = HashSet::new();
-        for record in self.records.iter_mut().rev() {
-            record.critical = record.origin_state == root_state
-                && newest.insert((record.kind, record.line.first().copied()));
-        }
+        self.semantic.refresh_projection(root_state)
     }
     fn refine(
         &mut self,
@@ -4550,12 +4700,12 @@ impl<M: RoleModel> PalsEngine<M> {
         // registered beam. CPU restricted values prioritize the incumbent roots;
         // a reserved slot admits a new first move despite a low neural prior.
         let width = (self.config.beam_width + round as usize).min(root_rank.len());
-        let root_color = self.nodes[root].position.side_to_move();
+        let root_color = self.semantic.nodes[root].position.side_to_move();
         let mut frontier: Vec<_> = root_rank.iter().take(width).copied().collect();
         frontier.sort_by(|a, b| {
             if self.uses_model_resolver() {
                 let value = |movement| {
-                    self.nodes[root]
+                    self.semantic.nodes[root]
                         .edges
                         .iter()
                         .find(|edge| edge.movement == movement)
@@ -4572,7 +4722,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     });
             }
             let value = |movement| {
-                self.nodes[root]
+                self.semantic.nodes[root]
                     .edges
                     .iter()
                     .find(|e| e.movement == movement)
@@ -4589,7 +4739,7 @@ impl<M: RoleModel> PalsEngine<M> {
             })
         });
         let new_root = root_rank.iter().take(width).copied().find(|movement| {
-            !self.nodes[root]
+            !self.semantic.nodes[root]
                 .edges
                 .iter()
                 .any(|edge| edge.movement == *movement)
@@ -4609,7 +4759,7 @@ impl<M: RoleModel> PalsEngine<M> {
             {
                 break;
             }
-            let mut child = self.nodes[root].position.clone();
+            let mut child = self.semantic.nodes[root].position.clone();
             child.make_move(movement)?;
             let first = self.connect_checked(root, movement, child, counters, limits, cancel)?;
             let mut proposal = vec![movement];
@@ -4641,7 +4791,7 @@ impl<M: RoleModel> PalsEngine<M> {
             path.push(root);
             let mut current = root;
             for mv in &proposal {
-                current = self.nodes[current]
+                current = self.semantic.nodes[current]
                     .edges
                     .iter()
                     .find(|edge| edge.movement == *mv)
@@ -4654,8 +4804,8 @@ impl<M: RoleModel> PalsEngine<M> {
                 .enumerate()
                 .filter_map(|(ply, &node)| {
                     (ply < proposal.len()
-                        && self.nodes[node].terminal.is_none()
-                        && self.nodes[node].position.side_to_move() != root_color)
+                        && self.semantic.nodes[node].terminal.is_none()
+                        && self.semantic.nodes[node].position.side_to_move() != root_color)
                         .then_some(ply)
                 })
                 .collect();
@@ -4684,18 +4834,19 @@ impl<M: RoleModel> PalsEngine<M> {
             let context = self.role_context(root, question)?;
             let review = self.prepare_review_view(root, question, &[])?;
             if let Some(view) = &review {
-                self.model
+                self.semantic
+                    .model
                     .bind_selected_review_view(Arc::clone(view), &context)?;
             }
-            let scores = self.model.divergences_with_context(
+            let scores = self.semantic.model.divergences_with_context(
                 DivergenceQuery {
-                    root: &self.nodes[root].position,
+                    root: &self.semantic.nodes[root].position,
                     proposal: &proposal,
                     candidates: &divergences,
                     records: review
                         .as_ref()
-                        .map_or(self.records.as_slice(), |view| view.records()),
-                    revision: self.revision,
+                        .map_or(self.semantic.records.as_slice(), |view| view.records()),
+                    revision: self.semantic.revision,
                     deadline: limits.deadline,
                     cancel,
                 },
@@ -4713,10 +4864,11 @@ impl<M: RoleModel> PalsEngine<M> {
             }
             self.accept_role_output(root, &context, question, limits, cancel)?;
             if let Some(view) = &review {
-                self.review_index
+                self.semantic
+                    .review_index
                     .as_mut()
                     .ok_or(PalsError::InvalidConfig)?
-                    .consume(view, &self.stores)?;
+                    .consume(view, &self.semantic.stores)?;
             }
             counters.consumed_role_outputs += 1;
             counters.accepted_critic_outputs += 1;
@@ -4735,7 +4887,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 .as_ref()
                 .is_none_or(|candidate| candidate.pv.first().copied() == Some(proposal[ply]))
             {
-                let alternatives: Vec<_> = self.nodes[divergence]
+                let alternatives: Vec<_> = self.semantic.nodes[divergence]
                     .position
                     .legal_moves()
                     .into_iter()
@@ -4798,7 +4950,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         .map(|candidate| candidate.observation),
                 ));
             }
-            let examined: Vec<_> = self.nodes[divergence]
+            let examined: Vec<_> = self.semantic.nodes[divergence]
                 .edges
                 .iter()
                 .map(|e| e.movement)
@@ -4816,7 +4968,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         .find(|mv| *mv != proposal[ply] && Some(*mv) != cpu_response)
                 });
             if let Some(response) = response.filter(|_| self.stopped(limits, cancel).is_none()) {
-                let mut state = self.nodes[divergence].position.clone();
+                let mut state = self.semantic.nodes[divergence].position.clone();
                 state.make_move(response)?;
                 let response_node =
                     self.connect_checked(divergence, response, state, counters, limits, cancel)?;
@@ -4886,7 +5038,7 @@ impl<M: RoleModel> PalsEngine<M> {
                             cancel,
                         )?;
                         self.archive_refute_continuation(
-                            self.nodes[root].situation,
+                            self.semantic.nodes[root].situation,
                             line,
                             evidence,
                             limits,
@@ -4926,7 +5078,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     limits,
                     cancel,
                 )?;
-                let repair_record_revision = self.revision;
+                let repair_record_revision = self.semantic.revision;
                 if counters.accepted_repair_outputs > accepted_repairs_before {
                     if let Some((line, _)) = repair_record {
                         self.observe_accepted_repair(root, movement, line, repair_record_revision);
@@ -4956,7 +5108,7 @@ impl<M: RoleModel> PalsEngine<M> {
                             cancel,
                         )?;
                         self.archive_repair(
-                            self.nodes[root].situation,
+                            self.semantic.nodes[root].situation,
                             old_line,
                             new_line,
                             evidence,
@@ -5040,18 +5192,20 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.validate_checker_namespace()?;
         let root = self
+            .semantic
             .nodes
             .get(repair.root)
             .ok_or(StoreError::InvalidHandle("repair recheck root"))?;
         let root_situation = root.situation;
         let root_state = root.state;
         let root_color = root.position.side_to_move();
-        if self.stores.root() != Some(root_situation) {
+        if self.semantic.stores.root() != Some(root_situation) {
             return Err(StoreError::StaleConsumer.into());
         }
-        let current = self.stores.situations.get(root_situation)?;
+        let current = self.semantic.stores.situations.get(root_situation)?;
         if current.state != root_state
             || !self
+                .semantic
                 .stores
                 .states
                 .get(root_state)?
@@ -5060,7 +5214,7 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(StoreError::InvalidEvidence("repair recheck root state mismatch").into());
         }
         let root_revision = current.revision;
-        let generation = self.stores.generation();
+        let generation = self.semantic.stores.generation();
         let previous_evidence = current
             .conclusions
             .get(repair.repaired_line)
@@ -5070,9 +5224,21 @@ impl<M: RoleModel> PalsEngine<M> {
             || repair.attack_ply >= repair.refutation.len()
             || repair.repaired.first().copied() != Some(repair.original_first)
             || repair.repaired[..=repair.attack_ply] != repair.refutation[..=repair.attack_ply]
-            || self.stores.lines.get(repair.repaired_line)?.start_state != root_state
-            || self.stores.lines.moves(repair.repaired_line)?.as_slice() != repair.repaired
-            || !self.records.iter().any(|record| {
+            || self
+                .semantic
+                .stores
+                .lines
+                .get(repair.repaired_line)?
+                .start_state
+                != root_state
+            || self
+                .semantic
+                .stores
+                .lines
+                .moves(repair.repaired_line)?
+                .as_slice()
+                != repair.repaired
+            || !self.semantic.records.iter().any(|record| {
                 record.origin_state == root_state
                     && record.kind == RecordKind::Repair
                     && record.revision == repair.repair_record_revision
@@ -5097,7 +5263,7 @@ impl<M: RoleModel> PalsEngine<M> {
         path.push(repair.root);
         let mut node = repair.root;
         for movement in repair.repaired {
-            node = self.nodes[node]
+            node = self.semantic.nodes[node]
                 .edges
                 .iter()
                 .find(|edge| edge.movement == *movement)
@@ -5109,13 +5275,13 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(StoreError::InvalidEvidence("repair recheck leaf mismatch").into());
         }
         let changed_own = (repair.attack_ply + 1..repair.repaired.len()).find(|&ply| {
-            self.nodes[path[ply]].position.side_to_move() == root_color
+            self.semantic.nodes[path[ply]].position.side_to_move() == root_color
                 && repair.refutation.get(ply) != Some(&repair.repaired[ply])
         });
         let Some(anchor_ply) = changed_own.and_then(|changed| {
             (changed + 1..repair.repaired.len()).find(|&ply| {
-                self.nodes[path[ply]].position.side_to_move() != root_color
-                    && self.nodes[path[ply]].terminal.is_none()
+                self.semantic.nodes[path[ply]].position.side_to_move() != root_color
+                    && self.semantic.nodes[path[ply]].terminal.is_none()
             })
         }) else {
             return Ok(()); // No eligible opponent anchor is not a proof of defense.
@@ -5132,7 +5298,7 @@ impl<M: RoleModel> PalsEngine<M> {
             },
         )?;
         let identity = RecheckIdentity {
-            game_generation: self.game_generation.ok_or(PalsError::Capacity)?,
+            game_generation: self.semantic.game_generation.ok_or(PalsError::Capacity)?,
             search_generation: generation,
             root: root_situation,
             root_revision,
@@ -5141,22 +5307,29 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         // Only the bounded facts needed by the observer are retained here. No
         // node, store, or graph is copied. Snapshots preserve actual Rules history.
-        let root_snapshot = self.nodes[repair.root].position.snapshot();
-        let anchor_snapshot = self.nodes[anchor].position.snapshot();
-        let repaired_snapshot = self.nodes[repair.repaired_leaf].position.snapshot();
+        let root_snapshot = self.semantic.nodes[repair.root].position.snapshot();
+        let anchor_snapshot = self.semantic.nodes[anchor].position.snapshot();
+        let repaired_snapshot = self.semantic.nodes[repair.repaired_leaf]
+            .position
+            .snapshot();
         let deadline_tick = self.tick_at(limits.deadline);
         let mut examined_responses = Vec::new();
         if self.post_repair_recheck == PostRepairRecheckPolicy::ActualOpponentContinuationV1 {
             examined_responses
-                .try_reserve_exact(self.nodes[anchor].edges.len())
+                .try_reserve_exact(self.semantic.nodes[anchor].edges.len())
                 .map_err(|_| PalsError::Capacity)?;
-            examined_responses.extend(self.nodes[anchor].edges.iter().map(|edge| edge.movement));
+            examined_responses.extend(
+                self.semantic.nodes[anchor]
+                    .edges
+                    .iter()
+                    .map(|edge| edge.movement),
+            );
         }
         let mut trace = RecheckProgress::default();
         let prepared = {
             let repaired_endpoint = Self::recheck_endpoint(
-                &self.nodes[repair.repaired_leaf],
-                &self.stores,
+                &self.semantic.nodes[repair.repaired_leaf],
+                &self.semantic.stores,
                 &repaired_snapshot,
             );
             let invalid = match &repaired_endpoint.evidence {
@@ -5167,6 +5340,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 Err(PalsError::Store(error))
             } else {
                 let record = self
+                    .semantic
                     .records
                     .iter()
                     .find(|record| {
@@ -5178,14 +5352,15 @@ impl<M: RoleModel> PalsEngine<M> {
                     .ok_or(StoreError::InvalidEvidence(
                         "accepted Repair record disappeared",
                     ))?;
-                self.model
+                self.semantic
+                    .model
                     .recheck_prepared(RecheckPrepared {
                         policy: self.post_repair_recheck,
                         identity,
                         root_state,
                         root_snapshot: &root_snapshot,
-                        anchor_state: self.nodes[anchor].state,
-                        anchor_situation: self.nodes[anchor].situation,
+                        anchor_state: self.semantic.nodes[anchor].state,
+                        anchor_situation: self.semantic.nodes[anchor].situation,
                         anchor_snapshot: &anchor_snapshot,
                         anchor_ply,
                         examined_responses: &examined_responses,
@@ -5198,8 +5373,8 @@ impl<M: RoleModel> PalsEngine<M> {
                         deadline_tick,
                         cancel,
                         config: &self.config,
-                        checker_identity: &self.checker_registered_identity,
-                        cpu_condition: &self.cpu_registered_condition,
+                        checker_identity: &self.researcher.checker_registered_identity,
+                        cpu_condition: &self.researcher.cpu_registered_condition,
                     })
                     .map_err(PalsError::Role)
             }
@@ -5229,24 +5404,29 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         let counter_snapshot = trace
             .counter_leaf
-            .map(|node| self.nodes[node].position.snapshot());
+            .map(|node| self.semantic.nodes[node].position.snapshot());
         let counter_endpoint =
             trace
                 .counter_leaf
                 .zip(counter_snapshot.as_ref())
                 .map(|(node, snapshot)| {
-                    Self::recheck_endpoint(&self.nodes[node], &self.stores, snapshot)
+                    Self::recheck_endpoint(
+                        &self.semantic.nodes[node],
+                        &self.semantic.stores,
+                        snapshot,
+                    )
                 });
         let repaired_endpoint = Self::recheck_endpoint(
-            &self.nodes[repair.repaired_leaf],
-            &self.stores,
+            &self.semantic.nodes[repair.repaired_leaf],
+            &self.semantic.stores,
             &repaired_snapshot,
         );
         let publication = match trace
             .publication
             .map(|observation_id| {
-                let observation = self.stores.observations.get(observation_id)?;
+                let observation = self.semantic.stores.observations.get(observation_id)?;
                 let conclusion = self
+                    .semantic
                     .stores
                     .situations
                     .get(root_situation)?
@@ -5279,7 +5459,7 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         // Closing already prepared output must not be skipped merely because the
         // original deadline/cancel fired. The callback receives those controls.
-        let finished = self.model.recheck_finished(RecheckFinished {
+        let finished = self.semantic.model.recheck_finished(RecheckFinished {
             policy: self.post_repair_recheck,
             identity,
             prepared_accepted: trace.prepared_accepted,
@@ -5301,8 +5481,8 @@ impl<M: RoleModel> PalsEngine<M> {
             cancel,
         });
         if let Err(error) = finished {
-            if self.last_recheck_observer_error.is_none() {
-                self.last_recheck_observer_error = Some(error.clone());
+            if self.semantic.last_recheck_observer_error.is_none() {
+                self.semantic.last_recheck_observer_error = Some(error.clone());
             }
             if result.is_ok() {
                 return Err(error.into());
@@ -5360,7 +5540,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .copied()
             .find(|movement| {
                 *movement != original_response
-                    && !self.nodes[anchor]
+                    && !self.semantic.nodes[anchor]
                         .edges
                         .iter()
                         .any(|edge| edge.movement == *movement)
@@ -5382,7 +5562,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .map_err(|_| PalsError::Capacity)?;
         let counter = &mut trace.counterline;
         counter.extend_from_slice(&repair.repaired[..anchor_ply]);
-        let mut state = self.nodes[anchor].position.clone();
+        let mut state = self.semantic.nodes[anchor].position.clone();
         state.make_move(response)?;
         let mut counter_leaf =
             self.connect_checked(anchor, response, state, counters, limits, cancel)?;
@@ -5393,7 +5573,7 @@ impl<M: RoleModel> PalsEngine<M> {
             // moves it predicts. Every call uses the current exact Rules prefix,
             // the existing acceptance guard and the original global role budget.
             while counter.len() < repair.repaired.len()
-                && self.nodes[counter_leaf].terminal.is_none()
+                && self.semantic.nodes[counter_leaf].terminal.is_none()
                 && self.stopped(limits, cancel).is_none()
             {
                 let ranked = self.ranked(
@@ -5409,7 +5589,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 let Some(movement) = ranked.first().copied() else {
                     break;
                 };
-                let mut state = self.nodes[counter_leaf].position.clone();
+                let mut state = self.semantic.nodes[counter_leaf].position.clone();
                 state.make_move(movement)?;
                 counter_leaf =
                     self.connect_checked(counter_leaf, movement, state, counters, limits, cancel)?;
@@ -5421,8 +5601,8 @@ impl<M: RoleModel> PalsEngine<M> {
             let mut full_suffix = true;
             for movement in &repair.repaired[anchor_ply + 1..] {
                 if self.stopped(limits, cancel).is_some()
-                    || self.nodes[counter_leaf].terminal.is_some()
-                    || !self.nodes[counter_leaf]
+                    || self.semantic.nodes[counter_leaf].terminal.is_some()
+                    || !self.semantic.nodes[counter_leaf]
                         .position
                         .legal_moves()
                         .contains(movement)
@@ -5430,7 +5610,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     full_suffix = false;
                     break;
                 }
-                let mut state = self.nodes[counter_leaf].position.clone();
+                let mut state = self.semantic.nodes[counter_leaf].position.clone();
                 state.make_move(*movement)?;
                 counter_leaf =
                     self.connect_checked(counter_leaf, *movement, state, counters, limits, cancel)?;
@@ -5453,9 +5633,15 @@ impl<M: RoleModel> PalsEngine<M> {
         )?;
         self.verify(counter_leaf, counter.as_slice(), limits, cancel, counters)?;
         self.publish_choice(repair.root, limits, cancel, progress)?;
-        if self.stores.root() != Some(root_situation)
-            || self.stores.generation() != generation
-            || self.stores.situations.get(root_situation)?.revision != root_revision
+        if self.semantic.stores.root() != Some(root_situation)
+            || self.semantic.stores.generation() != generation
+            || self
+                .semantic
+                .stores
+                .situations
+                .get(root_situation)?
+                .revision
+                != root_revision
         {
             return Err(StoreError::StaleConsumer.into());
         }
@@ -5520,7 +5706,7 @@ impl<M: RoleModel> PalsEngine<M> {
             cancel,
         )?;
         self.archive_refute_continuation(
-            self.nodes[repair.root].situation,
+            self.semantic.nodes[repair.root].situation,
             repair.repaired_line,
             evidence,
             limits,
@@ -5609,8 +5795,8 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn comparable_recheck_evidence(&self, repaired: usize, counter: usize, required: u16) -> bool {
-        let repaired = &self.nodes[repaired];
-        let counter = &self.nodes[counter];
+        let repaired = &self.semantic.nodes[repaired];
+        let counter = &self.semantic.nodes[counter];
         match (repaired.terminal, counter.terminal) {
             (Some(_), Some(_)) => true,
             (None, None) => match (&repaired.evidence, &counter.evidence) {
@@ -5620,7 +5806,8 @@ impl<M: RoleModel> PalsEngine<M> {
                         && repaired.depth >= required
                         && repaired.depth == counter.depth
                         && repaired.value_identity == counter.value_identity
-                        && self.cpu_registered_value.as_ref() == Some(&repaired.value_identity)
+                        && self.researcher.cpu_registered_value.as_ref()
+                            == Some(&repaired.value_identity)
                 }
                 _ => false,
             },
@@ -5631,7 +5818,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.uses_model_resolver() {
             return None;
         }
-        let node = &self.nodes[node];
+        let node = &self.semantic.nodes[node];
         if let Some((_, score)) = node.terminal {
             return Some(score);
         }
@@ -5647,105 +5834,40 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         node.evidence
             .as_ref()
-            .filter(|e| Some(&e.value_identity) == self.cpu_registered_value.as_ref())
+            .filter(|e| Some(&e.value_identity) == self.researcher.cpu_registered_value.as_ref())
             .map(|e| e.score)
     }
     fn completed_line_value(&self, leaf: usize, plies: usize, required_depth: u16) -> Option<i32> {
         if self.uses_model_resolver() {
             return None;
         }
-        let value = self.nodes[leaf]
+        let value = self.semantic.nodes[leaf]
             .terminal
             .map(|(_, value)| value)
             .or_else(|| {
-                self.nodes[leaf]
+                self.semantic.nodes[leaf]
                     .evidence
                     .as_ref()
                     .filter(|e| {
                         e.scope == CpuScoreScope::CompletedIteration
                             && e.depth >= required_depth
-                            && Some(&e.value_identity) == self.cpu_registered_value.as_ref()
+                            && Some(&e.value_identity)
+                                == self.researcher.cpu_registered_value.as_ref()
                     })
                     .map(|e| e.score)
             })?;
         Some(if plies % 2 == 0 { value } else { -value })
     }
     fn rules_value(&self, node: usize) -> PalsResolvedValue {
-        let perspective = self.nodes[node].position.side_to_move();
-        match self.nodes[node].terminal {
-            Some((_, score)) => PalsResolvedValue::RulesTerminal {
-                winner: if score > 0 {
-                    Some(perspective)
-                } else if score < 0 {
-                    Some(perspective.opposite())
-                } else {
-                    None
-                },
-                perspective,
-            },
-            None => PalsResolvedValue::Unknown,
-        }
+        self.semantic.rules_value(node)
     }
+    #[cfg(test)]
     fn model_value(&self, index: usize, remaining: usize) -> PalsResolvedValue {
-        let node = &self.nodes[index];
-        if node.terminal.is_some() {
-            return self.rules_value(index);
-        }
-        if remaining > 0 {
-            let mut best = PalsResolvedValue::Unknown;
-            // Equal W-L distributions/conditional outcomes preserve Rules order.
-            for movement in node.position.legal_moves() {
-                if let Some(edge) = node.edges.iter().find(|edge| edge.movement == movement) {
-                    let value = flip_resolved_value(self.model_value(edge.child, remaining - 1));
-                    if better_model_choice(value, best, false, false) {
-                        best = value;
-                    }
-                }
-            }
-            if !matches!(best, PalsResolvedValue::Unknown) {
-                return best;
-            }
-        }
-        node.model_value
-            .as_ref()
-            .filter(|output| {
-                Some(&output.identity) == self.model_registered_value.as_ref()
-                    && output.state == node.position.position_identity()
-                    && output.perspective == node.position.side_to_move()
-            })
-            .map_or(PalsResolvedValue::Unknown, |output| {
-                PalsResolvedValue::ModelWdl {
-                    wdl: output.wdl,
-                    perspective: output.perspective,
-                }
-            })
+        self.semantic.model_value(index, remaining)
     }
     fn root_model_value(&self, child: usize) -> (PalsResolvedValue, PalsValueScope) {
-        let terminal = self.nodes[child].terminal.is_some();
-        let value = self.model_value(child, self.config.line_plies.saturating_sub(1));
-        let mut flipped = flip_resolved_value(value);
-        if terminal {
-            // This is the directly selected child's current-state fact. Deeper
-            // terminal lines remain RestrictedRulesLine with estimate scope.
-            if let PalsResolvedValue::RestrictedRulesLine {
-                winner,
-                perspective,
-            } = flipped
-            {
-                flipped = PalsResolvedValue::RulesTerminal {
-                    winner,
-                    perspective,
-                };
-            }
-        }
-        let scope = if terminal {
-            PalsValueScope::RulesTerminal
-        } else if matches!(flipped, PalsResolvedValue::Unknown) {
-            PalsValueScope::Unknown
-        } else {
-            PalsValueScope::RestrictedEstimate
-        };
-        (flipped, scope)
+        self.semantic
+            .root_model_value(&self.semantic_sequence_config(), child)
     }
     fn model_result(
         &self,
@@ -5760,12 +5882,12 @@ impl<M: RoleModel> PalsEngine<M> {
         let mut scope = PalsValueScope::Unknown;
         let mut root_values = Vec::with_capacity(legal.len());
         for &movement in legal {
-            let edge = self.nodes[root]
+            let edge = self.semantic.nodes[root]
                 .edges
                 .iter()
                 .find(|edge| edge.movement == movement);
             let (value, child_scope, examined, unexplored) = if let Some(edge) = edge {
-                let child = &self.nodes[edge.child];
+                let child = &self.semantic.nodes[edge.child];
                 let (value, scope) = self.root_model_value(edge.child);
                 let legal_count = if child.terminal.is_some() {
                     0
@@ -5803,21 +5925,21 @@ impl<M: RoleModel> PalsEngine<M> {
                 unexplored_replies: unexplored,
             });
         }
-        counters.retained_situations = self.nodes.len();
+        counters.retained_situations = self.semantic.nodes.len();
         counters.root_scope_observation_complete = true;
         Ok(PalsResult {
             best_move,
             score: None,
             resolved_value,
-            model_value_identity: self.model_registered_value.clone(),
-            checker_identity: self.checker_registered_identity.clone(),
+            model_value_identity: self.semantic.model_registered_value.clone(),
+            checker_identity: self.researcher.checker_registered_identity.clone(),
             value_scope: scope,
             terminal: None,
             completion,
             counters: *counters,
             root_values,
             elapsed: started.elapsed(),
-            model_identity: self.model.identity().to_owned(),
+            model_identity: self.semantic.model.identity().to_owned(),
             resolver_version: self.resolver_version(),
         })
     }
@@ -5865,14 +5987,14 @@ impl<M: RoleModel> PalsEngine<M> {
         // a finite CPU mate score cannot mint RulesTerminal through this route.
         self.append_engine_observation_with_controls(
             Observation {
-                state: self.nodes[root].state,
+                state: self.semantic.nodes[root].state,
                 line: Some(line),
                 source: stable_id(self.search_identity()),
                 epoch: 0,
                 scope: EvidenceScope::Model {
-                    model: stable_id(self.model.identity()),
+                    model: stable_id(self.semantic.model.identity()),
                     encoding: stable_id("pals-restricted-summary-v1"),
-                    input: self.revision,
+                    input: self.semantic.revision,
                 },
                 value_identity: None,
                 checker_identity: None,
@@ -5884,7 +6006,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 cpu_pv: None,
                 score: RawScore::Estimate {
                     value: value as f32,
-                    perspective: self.nodes[root].position.side_to_move(),
+                    perspective: self.semantic.nodes[root].position.side_to_move(),
                 },
                 budget: 0,
                 kind,
@@ -5912,8 +6034,8 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.uses_model_resolver() {
             let mut best_value = PalsResolvedValue::Unknown;
             let mut best_terminal = false;
-            for movement in self.nodes[root].position.legal_moves() {
-                if let Some(edge) = self.nodes[root]
+            for movement in self.semantic.nodes[root].position.legal_moves() {
+                if let Some(edge) = self.semantic.nodes[root]
                     .edges
                     .iter()
                     .find(|edge| edge.movement == movement)
@@ -5928,7 +6050,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 }
             }
             if let Some(movement) = best {
-                progress(movement, &self.stores, &self.records);
+                progress(movement, &self.semantic.stores, &self.semantic.records);
             }
             if let Some(stop) = self.stopped(limits, cancel) {
                 return Err(match stop {
@@ -5941,12 +6063,12 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         let mut best_score = None;
         let mut best_scope = PalsValueScope::Unknown;
-        for edge in &self.nodes[root].edges {
+        for edge in &self.semantic.nodes[root].edges {
             if let Some(score) = self
                 .value(edge.child, self.config.line_plies.saturating_sub(1))
                 .map(|v| -v)
             {
-                let scope = if self.nodes[edge.child].terminal.is_some() {
+                let scope = if self.semantic.nodes[edge.child].terminal.is_some() {
                     PalsValueScope::RulesTerminal
                 } else {
                     PalsValueScope::RestrictedEstimate
@@ -5959,7 +6081,7 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         }
         if let Some(movement) = best {
-            progress(movement, &self.stores, &self.records);
+            progress(movement, &self.semantic.stores, &self.semantic.records);
         }
         // Progress belongs to the UCI consumer and may itself spend time or
         // trigger stop. A final round must not report RoundLimit after that
@@ -6376,8 +6498,8 @@ mod tests {
         assert_eq!(report.counters.cpu_tasks_requested, 0);
         assert_eq!(report.counters.cpu_nodes, 0);
         assert!(engine.checker_attempts().is_empty());
-        assert!(engine.stores.tasks.is_empty());
-        assert_eq!(engine.consumer_id, 0);
+        assert!(engine.semantic.stores.tasks.is_empty());
+        assert_eq!(engine.semantic.consumer_id, 0);
         assert!(!cancel.load(Ordering::Acquire));
     }
 
@@ -6386,6 +6508,7 @@ mod tests {
         let position = Position::startpos();
         let mut engine = foreign_engine(ForeignFixtureMode::BudgetRace);
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -6405,10 +6528,11 @@ mod tests {
         ));
         assert_eq!(counters, PalsCounters::default());
         assert!(engine.checker_attempts().is_empty());
-        assert!(engine.stores.observations.is_empty());
-        assert_eq!(engine.stores.tasks.len(), 1);
+        assert!(engine.semantic.stores.observations.is_empty());
+        assert_eq!(engine.semantic.stores.tasks.len(), 1);
         assert!(matches!(
             engine
+                .semantic
                 .stores
                 .tasks
                 .get(super::super::store::ExecutionId(0))
@@ -6427,6 +6551,7 @@ mod tests {
             let position = Position::startpos();
             let mut engine = foreign_engine(ForeignFixtureMode::AdmissionFailure(stage, code));
             engine
+                .semantic
                 .stores
                 .focus_actual_moves(position.snapshot())
                 .unwrap();
@@ -6448,7 +6573,7 @@ mod tests {
                 })) if (actual_stage, actual_code) == (stage, code)
             ));
             assert_eq!(counters, PalsCounters::default());
-            assert!(engine.stores.tasks.is_empty());
+            assert!(engine.semantic.stores.tasks.is_empty());
             assert!(engine.checker_attempts().is_empty());
         }
     }
@@ -6511,6 +6636,7 @@ mod tests {
             PalsEngine::new_with_cpu(PalsConfig::default(), LegalOrderRoleMock, cpu).unwrap();
         let position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -6519,10 +6645,10 @@ mod tests {
         engine
             .verify(root, &[], limits(), &AtomicBool::new(false), &mut counters)
             .unwrap();
-        assert!(engine.nodes[root].evidence.is_some());
+        assert!(engine.semantic.nodes[root].evidence.is_some());
         assert_eq!(calls.load(Ordering::Acquire), 1);
         let before = counters;
-        let consumer_before = engine.consumer_id;
+        let consumer_before = engine.semantic.consumer_id;
         changed.store(true, Ordering::Release);
         assert!(matches!(
             engine.verify(root, &[], limits(), &AtomicBool::new(false), &mut counters),
@@ -6531,7 +6657,7 @@ mod tests {
             )))
         ));
         assert_eq!(counters, before);
-        assert_eq!(engine.consumer_id, consumer_before);
+        assert_eq!(engine.semantic.consumer_id, consumer_before);
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert!(matches!(
             engine.search(&position, limits(), &AtomicBool::new(false)),
@@ -6578,8 +6704,9 @@ mod tests {
                 + first.counters.accepted_repair_outputs
                 + first.counters.accepted_value_outputs
         );
-        for index in 0..positive.stores.observations.len() {
+        for index in 0..positive.semantic.stores.observations.len() {
             let observation = positive
+                .semantic
                 .stores
                 .observations
                 .get(ObservationId(index))
@@ -6594,6 +6721,7 @@ mod tests {
         }
         assert!(
             positive
+                .semantic
                 .nodes
                 .iter()
                 .all(|node| node.evidence.is_none() && node.resume.is_none())
@@ -6605,8 +6733,8 @@ mod tests {
         let previous = foreign_engine(ForeignFixtureMode::Normal(200));
         let rejected = PalsEngine::new_with_boxed_checker_and_policies(
             previous.config,
-            previous.model,
-            previous.cpu,
+            previous.semantic.model,
+            previous.researcher.cpu,
             ResolverPolicy::OwnRawRestricted,
             PostRepairRecheckPolicy::FrozenModelWdlV2,
         );
@@ -6622,14 +6750,15 @@ mod tests {
                 line_plies: 6,
                 ..previous.config
             },
-            previous.model,
-            previous.cpu,
+            previous.semantic.model,
+            previous.researcher.cpu,
             ResolverPolicy::ModelWdlRestricted,
             PostRepairRecheckPolicy::FrozenModelWdlV2,
         )
         .unwrap();
         let position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -6647,7 +6776,7 @@ mod tests {
             .unwrap();
         let mut leaf = root;
         for movement in &repaired {
-            let mut child = engine.nodes[leaf].position.clone();
+            let mut child = engine.semantic.nodes[leaf].position.clone();
             child.make_move(*movement).unwrap();
             leaf = engine
                 .connect(leaf, *movement, child, &mut counters)
@@ -6664,7 +6793,7 @@ mod tests {
                     original_first: repaired[0],
                     attack_ply: 1,
                     repaired_line,
-                    repair_record_revision: engine.revision,
+                    repair_record_revision: engine.semantic.revision,
                     repaired_leaf: leaf,
                     repaired,
                     refutation,
@@ -6695,6 +6824,7 @@ mod tests {
             let position = Position::startpos();
             let mut engine = foreign_engine(mode);
             engine
+                .semantic
                 .stores
                 .focus_actual_moves(position.snapshot())
                 .unwrap();
@@ -6739,6 +6869,7 @@ mod tests {
             }
             assert!(matches!(
                 engine
+                    .semantic
                     .stores
                     .tasks
                     .get(super::super::store::ExecutionId(0))
@@ -6746,7 +6877,7 @@ mod tests {
                     .status,
                 super::super::store::TaskStatus::Failed
             ));
-            assert!(engine.nodes[root].evidence.is_none());
+            assert!(engine.semantic.nodes[root].evidence.is_none());
         }
     }
     #[test]
@@ -6754,11 +6885,12 @@ mod tests {
         let position = Position::startpos();
         let mut engine = foreign_engine(ForeignFixtureMode::Normal(999));
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
         let root = engine.intern(position).unwrap();
-        engine.stores.observations = super::super::store::ObservationStore::new(0);
+        engine.semantic.stores.observations = super::super::store::ObservationStore::new(0);
         let mut counters = PalsCounters::default();
         assert!(matches!(
             engine.external_candidate(
@@ -6777,6 +6909,7 @@ mod tests {
         assert_eq!(counters.consumed_external_checker_tasks, 0);
         assert!(matches!(
             engine
+                .semantic
                 .stores
                 .tasks
                 .get(super::super::store::ExecutionId(0))
@@ -6828,6 +6961,7 @@ mod tests {
         )
         .unwrap();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -6846,13 +6980,14 @@ mod tests {
         assert_eq!(counters.value_calls, 1);
         assert_eq!(counters.completed_value_calls, 1);
         assert_eq!(counters.accepted_value_outputs, 0);
-        assert!(engine.nodes[root].model_value.is_none());
+        assert!(engine.semantic.nodes[root].model_value.is_none());
     }
     #[test]
     fn restricted_terminal_line_retains_actual_leaf_without_all_defenses_claim() {
         let position = Position::from_fen("7k/5K2/6Q1/8/8/8/8/8 w - - 0 1").unwrap();
         let mut engine = foreign_engine(ForeignFixtureMode::Normal(-999));
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -6891,7 +7026,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(engine.nodes[root].terminal.is_none());
+        assert!(engine.semantic.nodes[root].terminal.is_none());
         let result = engine
             .model_result(
                 root,
@@ -7229,6 +7364,7 @@ mod tests {
         .unwrap();
         let position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -7237,7 +7373,7 @@ mod tests {
         let mut path = vec![root];
         let mut node = root;
         for movement in &repaired {
-            let mut child = engine.nodes[node].position.clone();
+            let mut child = engine.semantic.nodes[node].position.clone();
             child.make_move(*movement).unwrap();
             node = engine
                 .connect(node, *movement, child, &mut counters)
@@ -7246,7 +7382,8 @@ mod tests {
         }
         let leaf = node;
         let identity = engine.owned_identity().unwrap().clone();
-        engine.nodes[leaf].evidence = Some(CpuEvidence {
+        engine.semantic.nodes[leaf].evidence = Some(CpuEvidence {
+            context: None,
             score: 100,
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,
@@ -7261,7 +7398,8 @@ mod tests {
             // Intern the leaf without connecting its anchor edge, so C's
             // preferred alternative remains the first unexamined response.
             let counter_leaf = engine.intern(counter_position).unwrap();
-            engine.nodes[counter_leaf].evidence = Some(CpuEvidence {
+            engine.semantic.nodes[counter_leaf].evidence = Some(CpuEvidence {
+                context: None,
                 score: -100,
                 depth: 1,
                 scope: CpuScoreScope::CompletedIteration,
@@ -7277,8 +7415,13 @@ mod tests {
             .conclusion_observation(root, old_line, ObservationKind::Refutation, 50, None)
             .unwrap();
         engine
+            .semantic
             .stores
-            .refute_continuation(engine.nodes[root].situation, old_line, old_evidence)
+            .refute_continuation(
+                engine.semantic.nodes[root].situation,
+                old_line,
+                old_evidence,
+            )
             .unwrap();
         let ranked = engine
             .ranked(
@@ -7297,7 +7440,7 @@ mod tests {
             .record(RecordKind::Repair, &repaired, None, 0, None, None)
             .unwrap()
             .unwrap();
-        let repair_record_revision = engine.revision;
+        let repair_record_revision = engine.semantic.revision;
         let repair_evidence = engine
             .conclusion_observation(
                 root,
@@ -7308,9 +7451,10 @@ mod tests {
             )
             .unwrap();
         engine
+            .semantic
             .stores
             .repair(
-                engine.nodes[root].situation,
+                engine.semantic.nodes[root].situation,
                 old_line,
                 repaired_line,
                 repair_evidence,
@@ -7336,10 +7480,13 @@ mod tests {
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
         let requested = limits();
         fixture.run(requested, &AtomicBool::new(false)).unwrap();
-        assert_eq!(fixture.engine.model.prepared.len(), 1);
-        assert_eq!(fixture.engine.model.finished.len(), 1);
-        let finished = &fixture.engine.model.finished[0];
-        assert_eq!(finished.identity, fixture.engine.model.prepared[0].0);
+        assert_eq!(fixture.engine.semantic.model.prepared.len(), 1);
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
+        let finished = &fixture.engine.semantic.model.finished[0];
+        assert_eq!(
+            finished.identity,
+            fixture.engine.semantic.model.prepared[0].0
+        );
         assert_eq!(finished.deadline, requested.deadline);
         assert!(finished.prepared_accepted && finished.attempted && finished.accepted);
         assert_eq!(
@@ -7360,6 +7507,7 @@ mod tests {
         assert_eq!(
             fixture
                 .engine
+                .semantic
                 .stores
                 .situations
                 .get(finished.identity.root)
@@ -7378,15 +7526,15 @@ mod tests {
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
         let primary = RoleError::Backend("observer reservation refused".into());
         let secondary = RoleError::Backend("observer close failed".into());
-        fixture.engine.model.prepare_error = Some(primary.clone());
-        fixture.engine.model.finish_error = Some(secondary.clone());
+        fixture.engine.semantic.model.prepare_error = Some(primary.clone());
+        fixture.engine.semantic.model.finish_error = Some(secondary.clone());
         assert!(
             matches!(fixture.run(limits(), &AtomicBool::new(false)), Err(PalsError::Role(error)) if error == primary)
         );
-        assert_eq!(fixture.engine.model.prepared.len(), 1);
-        assert_eq!(fixture.engine.model.finished.len(), 1);
-        assert!(fixture.engine.model.replies.is_empty());
-        let finished = &fixture.engine.model.finished[0];
+        assert_eq!(fixture.engine.semantic.model.prepared.len(), 1);
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
+        assert!(fixture.engine.semantic.model.replies.is_empty());
+        let finished = &fixture.engine.semantic.model.finished[0];
         assert!(!finished.prepared_accepted && !finished.attempted && !finished.accepted);
         assert!(finished.counterline.is_empty());
         assert_eq!(finished.disposition, RecheckDisposition::PreparedRejected);
@@ -7405,14 +7553,14 @@ mod tests {
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
         let primary = RoleError::PhysicalCompletionUnknown;
         let secondary = RoleError::Backend("observer close failed".into());
-        fixture.engine.model.reply_error = Some(primary.clone());
-        fixture.engine.model.finish_error = Some(secondary.clone());
-        fixture.engine.model.cancel_after_finish = true;
+        fixture.engine.semantic.model.reply_error = Some(primary.clone());
+        fixture.engine.semantic.model.finish_error = Some(secondary.clone());
+        fixture.engine.semantic.model.cancel_after_finish = true;
         assert!(
             matches!(fixture.run(limits(), &AtomicBool::new(false)), Err(PalsError::Role(error)) if error == primary)
         );
-        assert_eq!(fixture.engine.model.finished.len(), 1);
-        let finished = &fixture.engine.model.finished[0];
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
+        let finished = &fixture.engine.semantic.model.finished[0];
         assert!(finished.prepared_accepted && finished.attempted && !finished.accepted);
         assert!(
             finished.selected.is_none()
@@ -7432,17 +7580,17 @@ mod tests {
         for after_reply in [false, true] {
             let mut fixture =
                 recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-            fixture.engine.model.cancel_after_prepare = !after_reply;
-            fixture.engine.model.cancel_after_reply = after_reply;
+            fixture.engine.semantic.model.cancel_after_prepare = !after_reply;
+            fixture.engine.semantic.model.cancel_after_reply = after_reply;
             let requested = limits();
             let cancel = AtomicBool::new(false);
             assert!(matches!(
                 fixture.run(requested, &cancel),
                 Err(PalsError::Role(RoleError::Canceled))
             ));
-            assert_eq!(fixture.engine.model.prepared.len(), 1);
-            assert_eq!(fixture.engine.model.finished.len(), 1);
-            let finished = &fixture.engine.model.finished[0];
+            assert_eq!(fixture.engine.semantic.model.prepared.len(), 1);
+            assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
+            let finished = &fixture.engine.semantic.model.finished[0];
             assert!(finished.prepared_accepted);
             assert_eq!(finished.attempted, after_reply);
             assert!(!finished.accepted);
@@ -7456,7 +7604,7 @@ mod tests {
     fn recheck_successful_finish_rechecks_external_cancel_at_return_boundary() {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-        fixture.engine.model.cancel_after_finish = true;
+        fixture.engine.semantic.model.cancel_after_finish = true;
         let requested = limits();
         let cancel = AtomicBool::new(false);
         assert!(matches!(
@@ -7464,11 +7612,15 @@ mod tests {
             Err(PalsError::Role(RoleError::Canceled))
         ));
         assert!(cancel.load(Ordering::Acquire));
-        assert_eq!(fixture.engine.model.finished.len(), 1);
-        assert!(!fixture.engine.model.finished[0].original_failed);
-        assert!(fixture.engine.model.finished[0].publication.is_some());
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
+        assert!(!fixture.engine.semantic.model.finished[0].original_failed);
+        assert!(
+            fixture.engine.semantic.model.finished[0]
+                .publication
+                .is_some()
+        );
         assert_eq!(
-            fixture.engine.model.finished[0].deadline,
+            fixture.engine.semantic.model.finished[0].deadline,
             requested.deadline
         );
         assert_eq!(fixture.engine.last_recheck_observer_error(), None);
@@ -7478,7 +7630,7 @@ mod tests {
     fn recheck_successful_finish_time_is_charged_to_original_deadline() {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-        fixture.engine.model.finish_cross_deadline = true;
+        fixture.engine.semantic.model.finish_cross_deadline = true;
         let requested = PalsLimits {
             deadline: Instant::now() + Duration::from_millis(100),
             ..limits()
@@ -7487,11 +7639,15 @@ mod tests {
             fixture.run(requested, &AtomicBool::new(false)),
             Err(PalsError::Role(RoleError::Deadline))
         ));
-        assert_eq!(fixture.engine.model.finished.len(), 1);
-        assert!(!fixture.engine.model.finished[0].original_failed);
-        assert!(fixture.engine.model.finished[0].publication.is_some());
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
+        assert!(!fixture.engine.semantic.model.finished[0].original_failed);
+        assert!(
+            fixture.engine.semantic.model.finished[0]
+                .publication
+                .is_some()
+        );
         assert_eq!(
-            fixture.engine.model.finished[0].deadline,
+            fixture.engine.semantic.model.finished[0].deadline,
             requested.deadline
         );
         assert!(Instant::now() >= requested.deadline);
@@ -7503,18 +7659,18 @@ mod tests {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
         let secondary = RoleError::Backend("observer close failed".into());
-        fixture.engine.model.finish_error = Some(secondary.clone());
+        fixture.engine.semantic.model.finish_error = Some(secondary.clone());
         assert!(
             matches!(fixture.run(limits(), &AtomicBool::new(false)), Err(PalsError::Role(error)) if error == secondary)
         );
-        assert!(!fixture.engine.model.finished[0].original_failed);
+        assert!(!fixture.engine.semantic.model.finished[0].original_failed);
         assert_eq!(
             fixture.engine.last_recheck_observer_error(),
             Some(&secondary)
         );
         fixture.engine.new_game();
         assert_eq!(fixture.engine.last_recheck_observer_error(), None);
-        fixture.engine.last_recheck_observer_error = Some(secondary);
+        fixture.engine.semantic.last_recheck_observer_error = Some(secondary);
         assert!(matches!(
             fixture.engine.search(
                 &Position::startpos(),
@@ -7533,7 +7689,7 @@ mod tests {
     fn recheck_actual_append_and_reuse_preserve_exact_observation_execution_and_task() {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-        fixture.engine.nodes[fixture.leaf].evidence = None;
+        fixture.engine.semantic.nodes[fixture.leaf].evidence = None;
         let requested = limits();
         let cancel = AtomicBool::new(false);
         let mut first = PalsCounters::default();
@@ -7547,16 +7703,18 @@ mod tests {
                 &mut first,
             )
             .unwrap();
-        let ids = fixture.engine.nodes[fixture.leaf]
+        let ids = fixture.engine.semantic.nodes[fixture.leaf]
             .evidence
             .as_ref()
             .unwrap()
             .provenance
             .unwrap();
-        let snapshot = fixture.engine.nodes[fixture.leaf].position.snapshot();
+        let snapshot = fixture.engine.semantic.nodes[fixture.leaf]
+            .position
+            .snapshot();
         let endpoint = PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
-            &fixture.engine.nodes[fixture.leaf],
-            &fixture.engine.stores,
+            &fixture.engine.semantic.nodes[fixture.leaf],
+            &fixture.engine.semantic.stores,
             &snapshot,
         );
         match endpoint.evidence {
@@ -7576,7 +7734,7 @@ mod tests {
             }
             other => panic!("actual completed store evidence missing: {other:?}"),
         }
-        fixture.engine.nodes[fixture.leaf].evidence = None;
+        fixture.engine.semantic.nodes[fixture.leaf].evidence = None;
         let mut reused = PalsCounters::default();
         fixture
             .engine
@@ -7589,7 +7747,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fixture.engine.nodes[fixture.leaf]
+            fixture.engine.semantic.nodes[fixture.leaf]
                 .evidence
                 .as_ref()
                 .unwrap()
@@ -7598,15 +7756,15 @@ mod tests {
         );
         assert_eq!(reused.cpu_tasks_requested, 0);
         assert_eq!(reused.reused_completed_cpu_tasks_consumed, 1);
-        fixture.engine.nodes[fixture.leaf]
+        fixture.engine.semantic.nodes[fixture.leaf]
             .evidence
             .as_mut()
             .unwrap()
             .depth += 1;
         assert!(matches!(
             PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
-                &fixture.engine.nodes[fixture.leaf],
-                &fixture.engine.stores,
+                &fixture.engine.semantic.nodes[fixture.leaf],
+                &fixture.engine.semantic.stores,
                 &snapshot
             )
             .evidence,
@@ -7618,7 +7776,7 @@ mod tests {
     fn recheck_invalid_provenance_is_distinct_from_absence_and_closes_without_reply() {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-        fixture.engine.nodes[fixture.leaf]
+        fixture.engine.semantic.nodes[fixture.leaf]
             .evidence
             .as_mut()
             .unwrap()
@@ -7628,10 +7786,11 @@ mod tests {
             Err(PalsError::Store(StoreError::InvalidHandle(_)))
         ));
         assert!(
-            fixture.engine.model.prepared.is_empty() && fixture.engine.model.replies.is_empty()
+            fixture.engine.semantic.model.prepared.is_empty()
+                && fixture.engine.semantic.model.replies.is_empty()
         );
-        assert_eq!(fixture.engine.model.finished.len(), 1);
-        let finished = &fixture.engine.model.finished[0];
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
+        let finished = &fixture.engine.semantic.model.finished[0];
         assert!(finished.repaired_invalid && !finished.repaired_observed);
         assert!(!finished.prepared_accepted && !finished.attempted && finished.original_failed);
         assert_eq!(finished.disposition, RecheckDisposition::PreparedRejected);
@@ -7651,8 +7810,8 @@ mod tests {
         let node = fixture.engine.intern(terminal).unwrap();
         assert!(matches!(
             PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
-                &fixture.engine.nodes[node],
-                &fixture.engine.stores,
+                &fixture.engine.semantic.nodes[node],
+                &fixture.engine.semantic.stores,
                 &snapshot
             )
             .evidence,
@@ -7661,7 +7820,7 @@ mod tests {
                 ..
             }
         ));
-        fixture.engine.nodes[fixture.leaf].evidence = None;
+        fixture.engine.semantic.nodes[fixture.leaf].evidence = None;
         let mut work = PalsCounters::default();
         fixture
             .engine
@@ -7676,10 +7835,12 @@ mod tests {
                 &mut work,
             )
             .unwrap();
-        let snapshot = fixture.engine.nodes[fixture.leaf].position.snapshot();
+        let snapshot = fixture.engine.semantic.nodes[fixture.leaf]
+            .position
+            .snapshot();
         match PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
-            &fixture.engine.nodes[fixture.leaf],
-            &fixture.engine.stores,
+            &fixture.engine.semantic.nodes[fixture.leaf],
+            &fixture.engine.semantic.stores,
             &snapshot,
         )
         .evidence
@@ -7702,6 +7863,7 @@ mod tests {
         }
         let anchor = fixture
             .engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.position.position_identity() == position.position_identity())
@@ -7719,20 +7881,25 @@ mod tests {
                 },
             )
             .unwrap();
-        let root_snapshot = fixture.engine.nodes[fixture.root].position.snapshot();
-        let anchor_snapshot = fixture.engine.nodes[anchor].position.snapshot();
-        let repaired_snapshot = fixture.engine.nodes[fixture.leaf].position.snapshot();
+        let root_snapshot = fixture.engine.semantic.nodes[fixture.root]
+            .position
+            .snapshot();
+        let anchor_snapshot = fixture.engine.semantic.nodes[anchor].position.snapshot();
+        let repaired_snapshot = fixture.engine.semantic.nodes[fixture.leaf]
+            .position
+            .snapshot();
         let requested = limits();
         let cancel = AtomicBool::new(false);
         let identity = RecheckIdentity {
             game_generation: context.game_generation,
             search_generation: context.search_generation,
-            root: fixture.engine.nodes[fixture.root].situation,
+            root: fixture.engine.semantic.nodes[fixture.root].situation,
             root_revision: fixture
                 .engine
+                .semantic
                 .stores
                 .situations
-                .get(fixture.engine.nodes[fixture.root].situation)
+                .get(fixture.engine.semantic.nodes[fixture.root].situation)
                 .unwrap()
                 .revision,
             repair_record_revision: fixture.repair_record_revision,
@@ -7741,16 +7908,17 @@ mod tests {
         let prepared = || RecheckPrepared {
             policy: fixture.engine.post_repair_recheck_policy(),
             identity,
-            root_state: fixture.engine.nodes[fixture.root].state,
+            root_state: fixture.engine.semantic.nodes[fixture.root].state,
             root_snapshot: &root_snapshot,
-            anchor_state: fixture.engine.nodes[anchor].state,
-            anchor_situation: fixture.engine.nodes[anchor].situation,
+            anchor_state: fixture.engine.semantic.nodes[anchor].state,
+            anchor_situation: fixture.engine.semantic.nodes[anchor].situation,
             anchor_snapshot: &anchor_snapshot,
             anchor_ply: 3,
             examined_responses: &[],
             reply_context: &context,
             repair_record: fixture
                 .engine
+                .semantic
                 .records
                 .iter()
                 .find(|record| record.kind == RecordKind::Repair)
@@ -7758,16 +7926,16 @@ mod tests {
             repaired: &fixture.repaired,
             refutation: &fixture.refutation,
             repaired_endpoint: PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
-                &fixture.engine.nodes[fixture.leaf],
-                &fixture.engine.stores,
+                &fixture.engine.semantic.nodes[fixture.leaf],
+                &fixture.engine.semantic.stores,
                 &repaired_snapshot,
             ),
             limits: requested,
             deadline_tick: fixture.engine.tick_at(requested.deadline),
             cancel: &cancel,
             config: &fixture.engine.config,
-            checker_identity: &fixture.engine.checker_registered_identity,
-            cpu_condition: &fixture.engine.cpu_registered_condition,
+            checker_identity: &fixture.engine.researcher.checker_registered_identity,
+            cpu_condition: &fixture.engine.researcher.cpu_registered_condition,
         };
         let finished = || RecheckFinished {
             policy: fixture.engine.post_repair_recheck_policy(),
@@ -7781,8 +7949,8 @@ mod tests {
             full_suffix_replayed: false,
             counterline_completed: false,
             repaired_endpoint: PalsEngine::<RecheckRoleFixture>::recheck_endpoint(
-                &fixture.engine.nodes[fixture.leaf],
-                &fixture.engine.stores,
+                &fixture.engine.semantic.nodes[fixture.leaf],
+                &fixture.engine.semantic.stores,
                 &repaired_snapshot,
             ),
             counter_endpoint: None,
@@ -7815,9 +7983,10 @@ mod tests {
         assert_eq!(engine().refinement_conditions(), None);
         let mut fixture = recheck_fixture(PostRepairRecheckPolicy::Disabled, true, false);
         fixture.run(limits(), &AtomicBool::new(false)).unwrap();
-        assert!(fixture.engine.model.replies.is_empty());
+        assert!(fixture.engine.semantic.model.replies.is_empty());
         assert!(
-            fixture.engine.model.prepared.is_empty() && fixture.engine.model.finished.is_empty()
+            fixture.engine.semantic.model.prepared.is_empty()
+                && fixture.engine.semantic.model.finished.is_empty()
         );
         assert_eq!(fixture.counters.critic_calls, 0);
         assert_eq!(fixture.counters.supported_refutations, 0);
@@ -7844,8 +8013,8 @@ mod tests {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
         fixture.run(limits(), &AtomicBool::new(false)).unwrap();
-        assert_eq!(fixture.engine.model.replies.len(), 1);
-        let context = &fixture.engine.model.replies[0];
+        assert_eq!(fixture.engine.semantic.model.replies.len(), 1);
+        let context = &fixture.engine.semantic.model.replies[0];
         assert_eq!(context.purpose, RoleQueryPurpose::ReplyPolicy);
         assert_eq!(context.prefix, fixture.repaired[..3]);
         assert_eq!(
@@ -7864,9 +8033,10 @@ mod tests {
         assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
         let situation = fixture
             .engine
+            .semantic
             .stores
             .situations
-            .get(fixture.engine.nodes[fixture.root].situation)
+            .get(fixture.engine.semantic.nodes[fixture.root].situation)
             .unwrap();
         assert!(situation.dirty);
         assert_eq!(
@@ -7877,6 +8047,7 @@ mod tests {
         assert_eq!(conclusion.status, ContinuationStatus::Refuted);
         let evidence = fixture
             .engine
+            .semantic
             .stores
             .observations
             .get(conclusion.evidence.unwrap())
@@ -7888,7 +8059,7 @@ mod tests {
         );
         assert!(matches!(evidence.scope, EvidenceScope::Model { .. }));
         assert!(
-            fixture.engine.nodes[fixture.root]
+            fixture.engine.semantic.nodes[fixture.root]
                 .edges
                 .iter()
                 .any(|edge| edge.movement == fixture.repaired[0])
@@ -7909,8 +8080,8 @@ mod tests {
                 .iter()
                 .map(|text| BoardMove::from_uci(text).unwrap())
                 .collect();
-            assert_eq!(fixture.engine.model.replies.len(), 3);
-            for (i, context) in fixture.engine.model.replies.iter().enumerate() {
+            assert_eq!(fixture.engine.semantic.model.replies.len(), 3);
+            for (i, context) in fixture.engine.semantic.model.replies.iter().enumerate() {
                 assert_eq!(context.prefix, expected[..3 + i]);
                 assert_eq!(context.purpose, RoleQueryPurpose::ReplyPolicy);
                 assert_eq!(
@@ -7924,6 +8095,7 @@ mod tests {
                 assert!(
                     fixture
                         .engine
+                        .semantic
                         .stores
                         .states
                         .get(context.state)
@@ -7933,7 +8105,7 @@ mod tests {
             }
             assert_eq!(fixture.counters.critic_calls, 3);
             assert_eq!(fixture.counters.accepted_critic_outputs, 3);
-            let finish = &fixture.engine.model.finished[0];
+            let finish = &fixture.engine.semantic.model.finished[0];
             assert_eq!(
                 finish.policy,
                 PostRepairRecheckPolicy::ActualOpponentContinuationV1
@@ -7945,9 +8117,10 @@ mod tests {
             assert_eq!(fixture.counters.supported_refutations, 1);
             let situation = fixture
                 .engine
+                .semantic
                 .stores
                 .situations
-                .get(fixture.engine.nodes[fixture.root].situation)
+                .get(fixture.engine.semantic.nodes[fixture.root].situation)
                 .unwrap();
             assert_eq!(
                 situation.conclusions.get(fixture.old_line).unwrap().status,
@@ -7957,6 +8130,7 @@ mod tests {
             assert_eq!(conclusion.status, ContinuationStatus::Refuted);
             let evidence = fixture
                 .engine
+                .semantic
                 .stores
                 .observations
                 .get(conclusion.evidence.unwrap())
@@ -7979,10 +8153,10 @@ mod tests {
                 false,
             );
             if failure == 0 {
-                fixture.engine.model.cancel_reply_number = Some(2);
+                fixture.engine.semantic.model.cancel_reply_number = Some(2);
             }
             if failure == 1 {
-                fixture.engine.model.invalid_reply_number = Some(2);
+                fixture.engine.semantic.model.invalid_reply_number = Some(2);
             }
             if failure == 2 {
                 fixture.engine.config.max_role_calls = fixture.counters.role_calls + 1;
@@ -7996,7 +8170,7 @@ mod tests {
             ));
             assert_eq!(fixture.counters.accepted_critic_outputs, 1);
             assert_eq!(fixture.counters.supported_refutations, 0);
-            let finish = &fixture.engine.model.finished[0];
+            let finish = &fixture.engine.semantic.model.finished[0];
             assert_eq!(finish.counterline.len(), 4);
             assert!(!finish.full_suffix);
             assert!(!finish.counterline_completed);
@@ -8017,7 +8191,7 @@ mod tests {
         let mut bounded = limits();
         bounded.max_cpu_nodes = 1;
         fixture.run(bounded, &AtomicBool::new(false)).unwrap();
-        let finish = &fixture.engine.model.finished[0];
+        let finish = &fixture.engine.semantic.model.finished[0];
         assert!(finish.counterline_completed);
         assert!(!finish.comparable);
         assert_eq!(finish.disposition, RecheckDisposition::IncomparableEvidence);
@@ -8031,18 +8205,23 @@ mod tests {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, true);
         fixture.run(limits(), &AtomicBool::new(false)).unwrap();
-        assert_eq!(fixture.engine.model.replies.len(), 1);
+        assert_eq!(fixture.engine.semantic.model.replies.len(), 1);
         assert_eq!(fixture.counters.supported_refutations, 0);
         assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
-        assert_eq!(fixture.engine.model.finished.len(), 1);
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
         assert_eq!(
-            fixture.engine.model.finished[0].disposition,
+            fixture.engine.semantic.model.finished[0].disposition,
             RecheckDisposition::IncompleteCounterline
         );
-        assert!(!fixture.engine.model.finished[0].full_suffix);
-        assert!(fixture.engine.model.finished[0].publication.is_none());
+        assert!(!fixture.engine.semantic.model.finished[0].full_suffix);
+        assert!(
+            fixture.engine.semantic.model.finished[0]
+                .publication
+                .is_none()
+        );
         let record = fixture
             .engine
+            .semantic
             .records
             .iter()
             .rev()
@@ -8054,9 +8233,10 @@ mod tests {
         assert_eq!(
             fixture
                 .engine
+                .semantic
                 .stores
                 .situations
-                .get(fixture.engine.nodes[fixture.root].situation)
+                .get(fixture.engine.semantic.nodes[fixture.root].situation)
                 .unwrap()
                 .conclusions
                 .get(fixture.repaired_line)
@@ -8083,15 +8263,16 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-        assert_eq!(fixture.engine.model.replies.len(), 1);
+        assert_eq!(fixture.engine.semantic.model.replies.len(), 1);
         assert!(fixture.counters.cpu_nodes <= 1);
         assert_eq!(fixture.counters.supported_refutations, 0);
         assert_eq!(
             fixture
                 .engine
+                .semantic
                 .stores
                 .situations
-                .get(fixture.engine.nodes[fixture.root].situation)
+                .get(fixture.engine.semantic.nodes[fixture.root].situation)
                 .unwrap()
                 .conclusions
                 .get(fixture.repaired_line)
@@ -8106,17 +8287,17 @@ mod tests {
             exhausted.run(limits(), &AtomicBool::new(false)),
             Err(PalsError::RoleCallLimit)
         ));
-        assert!(exhausted.engine.model.replies.is_empty());
-        assert_eq!(exhausted.engine.model.finished.len(), 1);
-        assert!(!exhausted.engine.model.finished[0].attempted);
-        assert!(exhausted.engine.model.finished[0].original_failed);
+        assert!(exhausted.engine.semantic.model.replies.is_empty());
+        assert_eq!(exhausted.engine.semantic.model.finished.len(), 1);
+        assert!(!exhausted.engine.semantic.model.finished[0].attempted);
+        assert!(exhausted.engine.semantic.model.finished[0].original_failed);
         let mut cpu_exhausted =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
         cpu_exhausted.counters.cpu_nodes = limits().max_cpu_nodes;
         cpu_exhausted
             .run(limits(), &AtomicBool::new(false))
             .unwrap();
-        assert!(cpu_exhausted.engine.model.replies.is_empty());
+        assert!(cpu_exhausted.engine.semantic.model.replies.is_empty());
         assert_eq!(cpu_exhausted.counters.supported_refutations, 0);
         let mut canceled =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
@@ -8124,7 +8305,7 @@ mod tests {
             canceled.run(limits(), &AtomicBool::new(true)),
             Err(PalsError::Role(RoleError::Canceled))
         ));
-        assert!(canceled.engine.model.replies.is_empty());
+        assert!(canceled.engine.semantic.model.replies.is_empty());
     }
 
     #[test]
@@ -8132,7 +8313,7 @@ mod tests {
         use super::super::store::ContinuationStatus;
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-        for node in &mut fixture.engine.nodes {
+        for node in &mut fixture.engine.semantic.nodes {
             if let Some(evidence) = node
                 .evidence
                 .as_mut()
@@ -8144,18 +8325,19 @@ mod tests {
         fixture.run(limits(), &AtomicBool::new(false)).unwrap();
         assert_eq!(fixture.counters.consumed_cached_cpu_values, 1);
         assert_eq!(fixture.counters.supported_refutations, 0);
-        assert_eq!(fixture.engine.model.finished.len(), 1);
+        assert_eq!(fixture.engine.semantic.model.finished.len(), 1);
         assert_eq!(
-            fixture.engine.model.finished[0].disposition,
+            fixture.engine.semantic.model.finished[0].disposition,
             RecheckDisposition::IncomparableEvidence
         );
-        assert!(!fixture.engine.model.finished[0].comparable);
+        assert!(!fixture.engine.semantic.model.finished[0].comparable);
         assert_eq!(
             fixture
                 .engine
+                .semantic
                 .stores
                 .situations
-                .get(fixture.engine.nodes[fixture.root].situation)
+                .get(fixture.engine.semantic.nodes[fixture.root].situation)
                 .unwrap()
                 .conclusions
                 .get(fixture.repaired_line)
@@ -8179,14 +8361,14 @@ mod tests {
             stale.run(limits(), &AtomicBool::new(false)),
             Err(PalsError::Store(StoreError::InvalidEvidence(_)))
         ));
-        assert!(stale.engine.model.replies.is_empty());
+        assert!(stale.engine.semantic.model.replies.is_empty());
     }
 
     #[test]
     fn post_repair_late_reply_is_completed_but_not_accepted_or_consumed() {
         let mut fixture =
             recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-        fixture.engine.model.cancel_after_reply = true;
+        fixture.engine.semantic.model.cancel_after_reply = true;
         let consumed_before = fixture.counters.consumed_role_outputs;
         assert!(matches!(
             fixture.run(limits(), &AtomicBool::new(false)),
@@ -8200,6 +8382,7 @@ mod tests {
         assert!(
             !fixture
                 .engine
+                .semantic
                 .records
                 .iter()
                 .any(|record| record.kind == RecordKind::Counterexample)
@@ -8212,17 +8395,18 @@ mod tests {
         for canceled in [true, false] {
             let mut fixture =
                 recheck_fixture(PostRepairRecheckPolicy::SameRepairedLineOnceV1, true, false);
-            let root_situation = fixture.engine.nodes[fixture.root].situation;
+            let root_situation = fixture.engine.semantic.nodes[fixture.root].situation;
             let before = fixture
                 .engine
+                .semantic
                 .stores
                 .situations
                 .get(root_situation)
                 .unwrap();
             let revision_before = before.revision;
             let dirty_before = before.dirty;
-            let observations_before = fixture.engine.stores.observations.len();
-            let records_before = fixture.engine.records.len();
+            let observations_before = fixture.engine.semantic.stores.observations.len();
+            let records_before = fixture.engine.semantic.records.len();
             let mut final_limits = limits();
             if !canceled {
                 final_limits.deadline = Instant::now();
@@ -8254,6 +8438,7 @@ mod tests {
             ));
             let after = fixture
                 .engine
+                .semantic
                 .stores
                 .situations
                 .get(root_situation)
@@ -8264,10 +8449,10 @@ mod tests {
             assert_eq!(conclusion.status, ContinuationStatus::Supported);
             assert_eq!(conclusion.evidence, Some(fixture.repair_evidence));
             assert_eq!(
-                fixture.engine.stores.observations.len(),
+                fixture.engine.semantic.stores.observations.len(),
                 observations_before
             );
-            assert_eq!(fixture.engine.records.len(), records_before);
+            assert_eq!(fixture.engine.semantic.records.len(), records_before);
             assert_eq!(fixture.counters.supported_refutations, 0);
         }
     }
@@ -8429,6 +8614,7 @@ mod tests {
         let mut engine = engine();
         let position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -8442,12 +8628,16 @@ mod tests {
             divergences: &[],
         };
         let original = engine.role_context(root, question).unwrap();
-        assert_eq!(original.situation, engine.nodes[root].situation);
-        assert_eq!(original.state, engine.nodes[root].state);
-        assert_eq!(original.search_generation, engine.stores.generation());
+        assert_eq!(original.situation, engine.semantic.nodes[root].situation);
+        assert_eq!(original.state, engine.semantic.nodes[root].state);
+        assert_eq!(
+            original.search_generation,
+            engine.semantic.stores.generation()
+        );
         assert_eq!(original.prefix, prefix);
-        engine.revision += 1;
+        engine.semantic.revision += 1;
         engine
+            .semantic
             .stores
             .situations
             .get_mut(original.situation)
@@ -8473,7 +8663,12 @@ mod tests {
             revised.refutation_sha256,
             empty_refutation.refutation_sha256
         );
-        engine.stores.situations.remove(original.situation).unwrap();
+        engine
+            .semantic
+            .stores
+            .situations
+            .remove(original.situation)
+            .unwrap();
         assert!(matches!(
             engine.role_context(root, question),
             Err(PalsError::Store(StoreError::InvalidHandle(_)))
@@ -8488,6 +8683,7 @@ mod tests {
             .unwrap();
         assert!(
             engine
+                .semantic
                 .model
                 .accepted
                 .iter()
@@ -8495,22 +8691,24 @@ mod tests {
         );
         assert_eq!(
             report.counters.consumed_role_outputs as usize,
-            engine.model.accepted.len()
+            engine.semantic.model.accepted.len()
         );
         assert!(
             engine
+                .semantic
                 .model
                 .accepted
                 .iter()
                 .all(|c| c.game_generation == 0 && c.search_generation == 1)
         );
-        assert!(engine.model.pending.is_none());
+        assert!(engine.semantic.model.pending.is_none());
     }
 
     #[test]
     fn checked_acceptance_failure_is_propagated_without_consumption() {
         let mut engine = logical_probe();
-        engine.model.failure = Some(RoleError::Backend("provisional commit rejected".into()));
+        engine.semantic.model.failure =
+            Some(RoleError::Backend("provisional commit rejected".into()));
         assert!(matches!(
             engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
             Err(PalsError::Role(RoleError::Backend(message))) if message == "provisional commit rejected"
@@ -8519,8 +8717,8 @@ mod tests {
         assert_eq!(counters.completed_proposer_calls, 1);
         assert_eq!(counters.consumed_role_outputs, 0);
         assert_eq!(counters.accepted_proposer_outputs, 0);
-        assert!(engine.model.accepted.is_empty());
-        assert!(engine.model.pending.is_none());
+        assert!(engine.semantic.model.accepted.is_empty());
+        assert!(engine.semantic.model.pending.is_none());
     }
 
     #[test]
@@ -8528,6 +8726,7 @@ mod tests {
         let mut engine = logical_probe();
         let position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -8543,9 +8742,11 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let prepared = engine.role_context(root, question).unwrap();
         engine
+            .semantic
             .model
             .prepare(&position, &prepared, control.deadline, &cancel);
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -8553,18 +8754,19 @@ mod tests {
             engine.accept_role_output(root, &prepared, question, control, &cancel),
             Err(PalsError::Role(RoleError::InvalidOutput))
         ));
-        assert!(engine.model.accepted.is_empty());
-        engine.model.pending = None;
+        assert!(engine.semantic.model.accepted.is_empty());
+        engine.semantic.model.pending = None;
         let current = engine.role_context(root, question).unwrap();
         engine
+            .semantic
             .model
             .prepare(&position, &current, control.deadline, &cancel);
-        engine.revision += 1;
+        engine.semantic.revision += 1;
         assert!(matches!(
             engine.accept_role_output(root, &current, question, control, &cancel),
             Err(PalsError::Role(RoleError::InvalidOutput))
         ));
-        assert!(engine.model.accepted.is_empty());
+        assert!(engine.semantic.model.accepted.is_empty());
     }
 
     #[test]
@@ -8572,6 +8774,7 @@ mod tests {
         let mut engine = logical_probe();
         let position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -8587,6 +8790,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let control = limits();
         engine
+            .semantic
             .model
             .prepare(&position, &context, control.deadline, &cancel);
         cancel.store(true, Ordering::Release);
@@ -8594,21 +8798,22 @@ mod tests {
             engine.accept_role_output(root, &context, question, control, &cancel),
             Err(PalsError::Role(RoleError::Canceled))
         ));
-        assert!(engine.model.accepted.is_empty());
-        engine.model.pending = None;
+        assert!(engine.semantic.model.accepted.is_empty());
+        engine.semantic.model.pending = None;
         cancel.store(false, Ordering::Release);
         let expired = PalsLimits {
             deadline: Instant::now(),
             ..control
         };
         engine
+            .semantic
             .model
             .prepare(&position, &context, expired.deadline, &cancel);
         assert!(matches!(
             engine.accept_role_output(root, &context, question, expired, &cancel),
             Err(PalsError::Role(RoleError::Deadline))
         ));
-        assert!(engine.model.accepted.is_empty());
+        assert!(engine.semantic.model.accepted.is_empty());
     }
 
     #[test]
@@ -8621,6 +8826,7 @@ mod tests {
         .unwrap();
         let position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -8629,9 +8835,9 @@ mod tests {
         engine
             .evaluate_model_value(root, &[], limits(), &AtomicBool::new(false), &mut counters)
             .unwrap();
-        assert_eq!(engine.model.accepted.len(), 1);
+        assert_eq!(engine.semantic.model.accepted.len(), 1);
         assert_eq!(
-            engine.model.accepted[0].purpose,
+            engine.semantic.model.accepted[0].purpose,
             RoleQueryPurpose::ValueFresh
         );
         assert_eq!(counters.accepted_value_outputs, 1);
@@ -8645,12 +8851,13 @@ mod tests {
         engine
             .search(&Position::startpos(), limits(), &AtomicBool::new(false))
             .unwrap();
-        let old = engine.model.accepted[0].clone();
+        let old = engine.semantic.model.accepted[0].clone();
         engine.new_game();
         engine
             .search(&Position::startpos(), limits(), &AtomicBool::new(false))
             .unwrap();
         let new = engine
+            .semantic
             .model
             .accepted
             .iter()
@@ -8659,17 +8866,17 @@ mod tests {
         assert_eq!(old.situation, new.situation);
         assert_eq!(old.search_generation, new.search_generation);
         assert_ne!(old.game_generation, new.game_generation);
-        assert_eq!(engine.model.resets, [Some(1)]);
-        engine.game_generation = Some(u64::MAX);
+        assert_eq!(engine.semantic.model.resets, [Some(1)]);
+        engine.semantic.game_generation = Some(u64::MAX);
         engine.new_game();
-        assert_eq!(engine.game_generation, None);
-        assert_eq!(engine.model.resets.last(), Some(&None));
+        assert_eq!(engine.semantic.game_generation, None);
+        assert_eq!(engine.semantic.model.resets.last(), Some(&None));
         assert!(matches!(
             engine.search(&Position::startpos(), limits(), &AtomicBool::new(false)),
             Err(PalsError::Capacity)
         ));
         engine.new_game();
-        assert_eq!(engine.game_generation, None);
+        assert_eq!(engine.semantic.game_generation, None);
     }
     #[test]
     fn boxed_role_accounting_closes_each_search_once_without_claiming_physical_completion() {
@@ -8843,6 +9050,7 @@ mod tests {
         assert_eq!(&candidate.line[..2], &[first, defense]);
         assert_eq!(candidate.value, None);
         let observation = engine
+            .semantic
             .stores
             .observations
             .get(candidate.cpu_observation.unwrap())
@@ -8860,6 +9068,7 @@ mod tests {
         divergence.make_move(first).unwrap();
         assert_eq!(
             engine
+                .semantic
                 .stores
                 .states
                 .get(observation.state)
@@ -8869,6 +9078,7 @@ mod tests {
         );
         assert_eq!(
             engine
+                .semantic
                 .stores
                 .lines
                 .moves(observation.cpu_pv.unwrap())
@@ -8903,6 +9113,7 @@ mod tests {
             }
             assert!(
                 engine
+                    .semantic
                     .nodes
                     .iter()
                     .any(|node| node.position.position_identity() == checked.position_identity())
@@ -8915,6 +9126,7 @@ mod tests {
         let position = Position::from_fen("2r4k/8/8/8/2Q5/8/7P/K7 b - - 0 1").unwrap();
         let mut engine = engine();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -8933,7 +9145,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(candidate.pv[0], BoardMove::from_uci("c8c4").unwrap());
-        assert!(engine.nodes[root].evidence.is_none());
+        assert!(engine.semantic.nodes[root].evidence.is_none());
         let mut reused = PalsCounters::default();
         let cached = engine
             .cpu_candidate(
@@ -8971,13 +9183,15 @@ mod tests {
         assert_ne!(other.pv[0], candidate.pv[0]);
         assert_eq!(restricted.cpu_tasks_requested, 1);
         assert_eq!(restricted.reused_completed_cpu_tasks_consumed, 0);
-        assert!(engine.nodes[root].evidence.is_none());
+        assert!(engine.semantic.nodes[root].evidence.is_none());
         assert!(matches!(
             engine
+                .semantic
                 .stores
                 .tasks
                 .get(
                     engine
+                        .semantic
                         .stores
                         .observations
                         .get(other.observation)
@@ -8999,7 +9213,11 @@ mod tests {
         let mut actual = start.clone();
         actual.make_move(movement).unwrap();
         let mut engine = engine();
-        engine.stores.focus_actual_moves(start.snapshot()).unwrap();
+        engine
+            .semantic
+            .stores
+            .focus_actual_moves(start.snapshot())
+            .unwrap();
         let root = engine.intern(start.clone()).unwrap();
         let divergence = engine.intern(actual.clone()).unwrap();
         let mut counters = PalsCounters::default();
@@ -9029,7 +9247,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let proposal = vec![movement, BoardMove::from_uci("h8h7").unwrap()];
-        let before = engine.nodes.len();
+        let before = engine.semantic.nodes.len();
         assert!(
             engine
                 .insert_cpu_candidate(
@@ -9045,7 +9263,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(engine.nodes.len(), before);
+        assert_eq!(engine.semantic.nodes.len(), before);
         let original_deadline = candidate.deadline;
         candidate.deadline = Instant::now();
         assert!(
@@ -9064,8 +9282,12 @@ mod tests {
                 .is_none()
         );
         candidate.deadline = original_deadline;
-        assert_eq!(engine.nodes.len(), before);
-        engine.stores.focus_actual_moves(start.snapshot()).unwrap();
+        assert_eq!(engine.semantic.nodes.len(), before);
+        engine
+            .semantic
+            .stores
+            .focus_actual_moves(start.snapshot())
+            .unwrap();
         assert!(matches!(
             engine.insert_cpu_candidate(
                 root,
@@ -9079,8 +9301,12 @@ mod tests {
             ),
             Err(PalsError::Store(StoreError::StaleConsumer))
         ));
-        assert_eq!(engine.nodes.len(), before);
-        engine.stores.focus_actual_moves(actual.snapshot()).unwrap();
+        assert_eq!(engine.semantic.nodes.len(), before);
+        engine
+            .semantic
+            .stores
+            .focus_actual_moves(actual.snapshot())
+            .unwrap();
         assert!(matches!(
             engine.insert_cpu_candidate(
                 root,
@@ -9094,7 +9320,7 @@ mod tests {
             ),
             Err(PalsError::Store(StoreError::StaleConsumer))
         ));
-        assert_eq!(engine.nodes.len(), before);
+        assert_eq!(engine.semantic.nodes.len(), before);
         // The same FEN loses earlier known repetition history and is another
         // exact task state; it cannot reuse the old discovery execution/PV.
         let without_history = Position::from_fen(&actual.to_fen()).unwrap();
@@ -9103,6 +9329,7 @@ mod tests {
             without_history.position_identity()
         );
         engine
+            .semantic
             .stores
             .focus_actual_moves(without_history.snapshot())
             .unwrap();
@@ -9270,6 +9497,7 @@ mod tests {
             )
             .unwrap();
             engine
+                .semantic
                 .stores
                 .focus_actual_moves(position.snapshot())
                 .unwrap();
@@ -9287,7 +9515,7 @@ mod tests {
                 ));
                 assert_eq!(counters.cpu_tasks_requested, 1);
                 assert_eq!(counters.consumed_cpu_tasks, 0);
-                assert!(engine.nodes[root].evidence.is_none());
+                assert!(engine.semantic.nodes[root].evidence.is_none());
                 continue;
             }
             let result = engine.cpu_candidate(
@@ -9305,13 +9533,13 @@ mod tests {
             );
             assert_eq!(counters.cpu_tasks_requested, 1);
             assert_eq!(counters.consumed_cpu_tasks, 0);
-            assert!(engine.nodes[root].edges.is_empty());
-            assert!(engine.nodes[root].evidence.is_none());
+            assert!(engine.semantic.nodes[root].edges.is_empty());
+            assert!(engine.semantic.nodes[root].evidence.is_none());
             match mode {
                 Mode::Late => {
                     assert!(result.unwrap().is_none());
                     assert_eq!(counters.cpu_tasks, 1);
-                    assert_eq!(engine.stores.observations.len(), 1);
+                    assert_eq!(engine.semantic.stores.observations.len(), 1);
                 }
                 Mode::UnknownFailure => {
                     assert!(matches!(result, Err(PalsError::Cpu(_))));
@@ -9331,7 +9559,7 @@ mod tests {
                         assert!(counters.cpu_quiescence_nodes <= counters.cpu_nodes);
                         assert!(!counters.cpu_work_observation_incomplete);
                         assert_eq!(counters.completed_cpu_tasks, 0);
-                        assert_eq!(engine.stores.observations.len(), 0);
+                        assert_eq!(engine.semantic.stores.observations.len(), 0);
                     }
                     if matches!(mode, Mode::ChangedIdentityUnknownWork) {
                         // Returned-report rejection is known, but independent
@@ -9341,7 +9569,7 @@ mod tests {
                         assert!(counters.cpu_work_observation_incomplete);
                         assert_eq!(counters.cpu_nodes, 0);
                         assert_eq!(counters.completed_cpu_tasks, 0);
-                        assert_eq!(engine.stores.observations.len(), 0);
+                        assert_eq!(engine.semantic.stores.observations.len(), 0);
                     }
                 }
             }
@@ -9381,8 +9609,8 @@ mod tests {
         assert_eq!(result.best_move, None);
         for (canceled, expired) in [(true, false), (false, true)] {
             let mut stopped_engine = engine();
-            let before = stopped_engine.stores.hot_stats();
-            let reset_pending = stopped_engine.checker_new_game_pending;
+            let before = stopped_engine.semantic.stores.hot_stats();
+            let reset_pending = stopped_engine.researcher.checker_new_game_pending;
             let mut requested = limits();
             if expired {
                 requested.deadline = Instant::now();
@@ -9415,13 +9643,16 @@ mod tests {
             assert_eq!(terminal.counters.value_calls, 0);
             assert_eq!(terminal.counters.cpu_tasks_requested, 0);
             assert!(progress.is_empty());
-            assert_eq!(stopped_engine.stores.hot_stats(), before);
-            assert_eq!(stopped_engine.stores.root(), None);
-            assert_eq!(stopped_engine.stores.generation(), 0);
-            assert_eq!(stopped_engine.revision, 0);
-            assert!(stopped_engine.nodes.is_empty());
+            assert_eq!(stopped_engine.semantic.stores.hot_stats(), before);
+            assert_eq!(stopped_engine.semantic.stores.root(), None);
+            assert_eq!(stopped_engine.semantic.stores.generation(), 0);
+            assert_eq!(stopped_engine.semantic.revision, 0);
+            assert!(stopped_engine.semantic.nodes.is_empty());
             assert!(stopped_engine.records().is_empty());
-            assert_eq!(stopped_engine.checker_new_game_pending, reset_pending);
+            assert_eq!(
+                stopped_engine.researcher.checker_new_game_pending,
+                reset_pending
+            );
             assert_eq!(
                 stopped_engine.last_search_counters(),
                 Some(terminal.counters)
@@ -9441,8 +9672,8 @@ mod tests {
         assert_eq!(result.counters.cpu_tasks, 0);
         assert_eq!(result.counters.cpu_tasks_requested, 0);
         assert_eq!(result.counters.role_calls, 0);
-        assert_eq!(stopped_engine.stores.root(), None);
-        assert!(stopped_engine.nodes.is_empty());
+        assert_eq!(stopped_engine.semantic.stores.root(), None);
+        assert!(stopped_engine.semantic.nodes.is_empty());
         let mut invalid = limits();
         invalid.max_rounds = 0;
         assert!(matches!(
@@ -9474,10 +9705,10 @@ mod tests {
         let first = repair.line[0];
         assert!(result.root_values.iter().any(|v| v.movement == first));
         let retained = engine.retained_situations();
-        let before = engine.stores.hot_stats();
-        let root = engine.stores.root();
-        let generation = engine.stores.generation();
-        let revision = engine.revision;
+        let before = engine.semantic.stores.hot_stats();
+        let root = engine.semantic.stores.root();
+        let generation = engine.semantic.stores.generation();
+        let revision = engine.semantic.revision;
         let records: Vec<_> = engine
             .records()
             .iter()
@@ -9495,6 +9726,7 @@ mod tests {
             })
             .collect();
         let nodes: Vec<_> = engine
+            .semantic
             .nodes
             .iter()
             .map(|node| {
@@ -9559,10 +9791,10 @@ mod tests {
             assert_eq!(stopped.counters.value_calls, 0);
             assert!(progress.is_empty());
             assert_eq!(engine.last_search_counters(), Some(stopped.counters));
-            assert_eq!(engine.stores.hot_stats(), before);
-            assert_eq!(engine.stores.root(), root);
-            assert_eq!(engine.stores.generation(), generation);
-            assert_eq!(engine.revision, revision);
+            assert_eq!(engine.semantic.stores.hot_stats(), before);
+            assert_eq!(engine.semantic.stores.root(), root);
+            assert_eq!(engine.semantic.stores.generation(), generation);
+            assert_eq!(engine.semantic.revision, revision);
             assert_eq!(engine.retained_situations(), retained);
             assert_eq!(
                 engine
@@ -9583,6 +9815,7 @@ mod tests {
             );
             assert_eq!(
                 engine
+                    .semantic
                     .nodes
                     .iter()
                     .map(|node| (
@@ -9648,7 +9881,8 @@ mod tests {
         let child = engine
             .connect(root, movement, child, &mut PalsCounters::default())
             .unwrap();
-        engine.nodes[child].evidence = Some(CpuEvidence {
+        engine.semantic.nodes[child].evidence = Some(CpuEvidence {
+            context: None,
             score: -25,
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,
@@ -9681,9 +9915,10 @@ mod tests {
             .unwrap();
         assert_eq!(result.counters.cpu_nodes, 1);
         assert_eq!(result.counters.completed_cpu_tasks, 0);
-        let cpu_records: Vec<_> = (0..engine.stores.observations.len())
+        let cpu_records: Vec<_> = (0..engine.semantic.stores.observations.len())
             .filter_map(|index| {
                 let record = engine
+                    .semantic
                     .stores
                     .observations
                     .get(ObservationId(index))
@@ -9736,6 +9971,7 @@ mod tests {
         )
         .unwrap();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -9760,12 +9996,13 @@ mod tests {
         assert_eq!(counters.consumed_cpu_tasks, 0);
         assert_eq!(counters.consumed_partial_cpu_values, 1);
         assert_eq!(counters.consumed_frontier_cpu_values, 0);
-        let partial = engine.nodes[root].evidence.as_ref().unwrap();
+        let partial = engine.semantic.nodes[root].evidence.as_ref().unwrap();
         assert_eq!(partial.depth, 1);
         assert_eq!(partial.scope, CpuScoreScope::CompletedIteration);
         assert_eq!(engine.value(root, 0), Some(partial.score));
         assert_eq!(engine.completed_line_value(root, 0, 2), None);
         let task = engine
+            .semantic
             .stores
             .tasks
             .get(super::super::store::ExecutionId(0))
@@ -9784,12 +10021,13 @@ mod tests {
             partial_record.score_scope,
             Some(CpuScoreScope::CompletedIteration)
         );
-        let previous_generation = engine.stores.generation();
+        let previous_generation = engine.semantic.stores.generation();
         engine
+            .semantic
             .stores
-            .focus_actual_moves(engine.nodes[root].position.snapshot())
+            .focus_actual_moves(engine.semantic.nodes[root].position.snapshot())
             .unwrap();
-        assert_ne!(engine.stores.generation(), previous_generation);
+        assert_ne!(engine.semantic.stores.generation(), previous_generation);
         let mut resumed = PalsCounters::default();
         engine
             .verify(
@@ -9807,6 +10045,7 @@ mod tests {
         assert_eq!(resumed.cpu_tasks_requested, 1);
         assert_eq!(
             engine
+                .semantic
                 .stores
                 .tasks
                 .get(super::super::store::ExecutionId(1))
@@ -9816,6 +10055,7 @@ mod tests {
         );
         assert_eq!(
             engine
+                .semantic
                 .stores
                 .tasks
                 .get(super::super::store::ExecutionId(1))
@@ -9914,11 +10154,11 @@ mod tests {
                 .count()
                 >= 6
         );
-        let observations = engine.stores.observations.len();
-        let executions = engine.stores.tasks.len();
+        let observations = engine.semantic.stores.observations.len();
+        let executions = engine.semantic.stores.tasks.len();
         engine.evict_derived_cache();
-        assert_eq!(engine.stores.observations.len(), observations);
-        assert_eq!(engine.stores.tasks.len(), executions);
+        assert_eq!(engine.semantic.stores.observations.len(), observations);
+        assert_eq!(engine.semantic.stores.tasks.len(), executions);
         let repeated = engine
             .search(&position, limits(), &AtomicBool::new(false))
             .unwrap();
@@ -10176,6 +10416,7 @@ mod tests {
         let position = Position::startpos();
         let mut engine = engine();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -10204,7 +10445,7 @@ mod tests {
         assert_eq!(node_reuse.consumed_cpu_tasks, 0);
         // Evict only the derived node projection, retaining the immutable
         // completed task and observation. A new task consumer can now reuse it.
-        engine.nodes[root].evidence = None;
+        engine.semantic.nodes[root].evidence = None;
         let mut task_reuse = PalsCounters::default();
         engine
             .verify(
@@ -10227,13 +10468,14 @@ mod tests {
         let position = Position::startpos();
         let mut engine = engine();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
         let root = engine.intern(position).unwrap();
         // A zero-capacity evidence store simulates exhausted retained evidence;
         // CPU work must still be observed and its in-flight task must be closed.
-        engine.stores.observations = super::super::store::ObservationStore::new(0);
+        engine.semantic.stores.observations = super::super::store::ObservationStore::new(0);
         let mut counters = PalsCounters::default();
         assert!(matches!(
             engine.verify(root, &[], limits(), &AtomicBool::new(false), &mut counters),
@@ -10247,6 +10489,7 @@ mod tests {
         assert!(!counters.cpu_work_observation_incomplete);
         assert!(matches!(
             engine
+                .semantic
                 .stores
                 .tasks
                 .get(super::super::store::ExecutionId(0))
@@ -10254,8 +10497,8 @@ mod tests {
                 .status,
             super::super::store::TaskStatus::Failed
         ));
-        assert!(engine.nodes[root].evidence.is_none());
-        assert!(engine.nodes[root].resume.is_none());
+        assert!(engine.semantic.nodes[root].evidence.is_none());
+        assert!(engine.semantic.nodes[root].resume.is_none());
     }
 
     #[test]

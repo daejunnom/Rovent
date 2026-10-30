@@ -63,6 +63,43 @@ impl AdaptiveModelNamespace {
         &self.value
     }
 
+    /// Read-only representation namespace recorded by this owner. These
+    /// values are not a ticket, native acceptance or physical completion.
+    pub fn representation_identity(&self) -> (Digest, Digest, PrecisionProfile, u64) {
+        (self.model, self.encoding, self.precision, self.frozen_epoch)
+    }
+
+    /// Comparison-only identity of the actual registered mapping. This is not
+    /// a representation key, cache hit or authority to issue a model request.
+    pub(super) fn utility_cohort_digest(&self) -> Digest {
+        use sha2::{Digest as _, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-utility-cohort-model-namespace/1\0");
+        for text in [
+            &self.value.semantics,
+            &self.value.model,
+            &self.value.encoding,
+            &self.value.precision,
+        ] {
+            hash.update((text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        hash.update(self.value.model_epoch);
+        hash.update(self.model.0);
+        hash.update(self.encoding.0);
+        match self.precision {
+            PrecisionProfile::Fp32 => hash.update([0]),
+            PrecisionProfile::Fp16 => hash.update([1]),
+            PrecisionProfile::Bf16 => hash.update([2]),
+            PrecisionProfile::Quantized(key) => {
+                hash.update([3]);
+                hash.update(key.0);
+            }
+        }
+        hash.update(self.frozen_epoch.to_le_bytes());
+        Digest(hash.finalize().into())
+    }
+
     /// Used by the immutable metadata mirror's constructor and again before a
     /// store commit. Equal ticket/output keys alone cannot certify which loaded
     /// model or encoding issued them.

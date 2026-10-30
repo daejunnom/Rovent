@@ -15,6 +15,8 @@ use super::store::{
     StorePins, StoreReadOwner, StoreReadPin,
 };
 
+pub mod historical;
+
 pub const REVIEW_CONTEXT_VERSION: &str = "rz-pals-selected-review/1";
 const MAX_LINE: usize = 256;
 
@@ -91,6 +93,9 @@ pub enum ReviewError {
     InvalidLine,
     AnchorMismatch,
     ViewCapacity,
+    /// This original (anchor, first move) bundle cannot retain another record.
+    /// Active-bundle admission and sequence exhaustion remain IndexCapacity.
+    BundleRecordCapacity,
     IndexCapacity,
     AlreadyConsumed,
     Store(StoreError),
@@ -153,6 +158,9 @@ pub struct ReviewView {
     records: Vec<RoleRecord>,
     metadata: Vec<ReviewRecordMetadata>,
     anchors: Vec<ReviewAnchor>,
+    // 원 selected-record 순서의 source 이력이다. 모델 입력·seal의 추가 feature가
+    // 아니며 native 수집과 NNUEC 준비가 같은 immutable backing을 공유한다.
+    source_snapshots: Arc<[PositionSnapshot]>,
     query: ReviewQueryInput,
     bundles: Vec<u64>,
     tokens: u16,
@@ -181,8 +189,30 @@ impl ReviewView {
     pub fn anchors(&self) -> &[ReviewAnchor] {
         &self.anchors
     }
+    /// 원 metadata와 같은 순서·개수의 source snapshot이다. 각 snapshot의 깊은
+    /// history는 Rules의 immutable Arc를 공유하며 Store 조회나 FEN 복원을 하지 않는다.
+    /// 반환값은 역사 입력 자료로서 현재 source·pin·실행·소비 권한을 발급하지 않는다.
+    pub fn source_snapshots(&self) -> &Arc<[PositionSnapshot]> {
+        &self.source_snapshots
+    }
     pub fn query(&self) -> &ReviewQueryInput {
         &self.query
+    }
+    /// Historical selected-input metadata only. This cannot select a bundle,
+    /// reconstruct a view pin or authorize another head consumption.
+    pub(crate) fn selected_bundle_ids(&self) -> &[u64] {
+        &self.bundles
+    }
+    /// Historical observation only; it does not replace the actual index's
+    /// original view/Store checks or authorize another consumption.
+    pub(crate) fn consumption_observed(&self) -> bool {
+        self.consumed.load(Ordering::Acquire)
+    }
+    pub(crate) fn retirement_protected_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<StorePins, ReviewError> {
+        Ok(self.pin.retirement_seed(stores)?)
     }
     pub fn token_count(&self) -> u16 {
         self.tokens
@@ -192,6 +222,11 @@ impl ReviewView {
     }
     pub fn anchor_mode(&self) -> ReviewAnchorMode {
         self.policy.mode
+    }
+    /// 원 선택 정책의 읽기 전용 메타데이터다. 이 값은 source·Store 소유권이나
+    /// required bundle의 현재 제출 권한을 발급하지 않는다.
+    pub fn selection_policy(&self) -> ReviewSelectionPolicy {
+        self.policy
     }
     pub fn length_bucket(&self) -> u16 {
         self.bucket
@@ -209,8 +244,8 @@ impl ReviewView {
         self.pin.validates(stores)
     }
     /// Known owned host backing, not a measured peak. Shared Rules history
-    /// chains are conservatively charged once per retained anchor; physical
-    /// sharing is deliberately not guessed from Arc identities.
+    /// chains are conservatively charged once per retained anchor/source;
+    /// physical sharing is deliberately not guessed from Arc identities.
     pub fn owned_host_bytes(&self) -> Option<u64> {
         let mut bytes = std::mem::size_of::<Self>();
         for backing in [
@@ -223,6 +258,9 @@ impl ReviewView {
             self.anchors
                 .capacity()
                 .checked_mul(std::mem::size_of::<ReviewAnchor>())?,
+            self.source_snapshots
+                .len()
+                .checked_mul(std::mem::size_of::<PositionSnapshot>())?,
             self.bundles
                 .capacity()
                 .checked_mul(std::mem::size_of::<u64>())?,
@@ -263,37 +301,17 @@ impl ReviewView {
         for anchor in &self.anchors {
             bytes = bytes.checked_add(anchor.snapshot.retained_history_bytes()?)?;
         }
+        for source in self.source_snapshots.iter() {
+            bytes = bytes.checked_add(source.retained_history_bytes()?)?;
+        }
         u64::try_from(bytes).ok()
     }
     /// Fresh endpoint queries differ; their immutable public record/anchor
     /// scope must still be identical. No private endpoint/query is erased from
     /// the actual full input digest exposed by digest().
     pub fn record_scope_digest(&self) -> [u8; 32] {
-        let query = ReviewQueryInput {
-            purpose: RoleQueryPurpose::ProposePolicy,
-            prefix: Vec::new(),
-            proposal: Vec::new(),
-            counterexample: None,
-            legal: Vec::new(),
-            divergences: Vec::new(),
-        };
-        let input = input_digest(
-            &self.anchors,
-            &self.records,
-            &self.metadata,
-            &query,
-            self.policy,
-            self.records
-                .iter()
-                .map(|record| record.line.len() as u16)
-                .sum(),
-            256,
-        )
-        .expect("sealed validated immutable record scope");
-        let mut hash = Sha256::new();
-        hash.update(b"rz-pals-frozen-public-review-scope/1\0");
-        hash.update(input);
-        hash.finalize().into()
+        record_scope_digest(&self.anchors, &self.records, &self.metadata, self.policy)
+            .expect("sealed validated immutable record scope")
     }
 }
 
@@ -408,6 +426,61 @@ impl ReviewContextIndex {
         }
         Ok(())
     }
+    /// Preserve the existing bounded projection during idle Store maintenance.
+    /// This is not a submitted view, another lease, or consumption authority.
+    /// Keeping the source facts hot prevents optional cold-anchor skips from
+    /// changing an otherwise identical question after metadata reclamation.
+    pub(super) fn archive_projection_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<StorePins, ReviewError> {
+        self.check_owner(stores)?;
+        if self.bundles.len() > self.limits.active_bundles
+            || self.records.len() > self.limits.active_bundles * self.limits.records_per_bundle
+        {
+            return Err(ReviewError::IndexCapacity);
+        }
+        let mut pins = StorePins::default();
+        for (revision, entry) in &self.records {
+            let bundle = self
+                .bundles
+                .get(&entry.bundle)
+                .ok_or(ReviewError::RelationMismatch)?;
+            if entry.record.revision != *revision
+                || bundle.anchor != entry.record.origin_state
+                || bundle.revisions.len() > self.limits.records_per_bundle
+                || !bundle.revisions.contains(revision)
+            {
+                return Err(ReviewError::RelationMismatch);
+            }
+            for relation in [
+                entry.record.parent_revision,
+                entry.record.supersedes_revision,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if self
+                    .records
+                    .get(&relation)
+                    .is_none_or(|parent| parent.bundle != entry.bundle)
+                    || relation >= *revision
+                {
+                    return Err(ReviewError::MissingRelation(relation));
+                }
+            }
+            stores.states.get(entry.record.origin_state)?;
+            pins.states.insert(entry.record.origin_state);
+            for observation in [entry.evidence, entry.record.cpu_observation]
+                .into_iter()
+                .flatten()
+            {
+                stores.observations.get(observation)?;
+                pins.observations.insert(observation);
+            }
+        }
+        Ok(pins)
+    }
     /// Publication requires actual store ownership and a complete Rules line.
     /// Parent/supersedes records must have been published earlier in the same
     /// coherent original-first-move bundle; no guessed relationship is issued.
@@ -489,6 +562,7 @@ impl ReviewContextIndex {
             if !matches!(
                 observation.scope,
                 EvidenceScope::DepthLimited { .. }
+                    | EvidenceScope::ProfiledExternalUci { .. }
                     | EvidenceScope::ExternalUci { .. }
                     | EvidenceScope::RulesTerminal
             ) || !matches!(
@@ -536,7 +610,7 @@ impl ReviewContextIndex {
         }
         if let Some(id) = existing {
             if self.bundles[&id].revisions.len() >= self.limits.records_per_bundle {
-                return Err(ReviewError::IndexCapacity);
+                return Err(ReviewError::BundleRecordCapacity);
             }
         } else {
             self.compact_internal(None);
@@ -700,6 +774,7 @@ impl ReviewContextIndex {
         }
         let mut records = Vec::new();
         let mut metadata = Vec::new();
+        let mut source_snapshots = Vec::new();
         let mut selected_bundles = Vec::new();
         let mut anchors = vec![ReviewAnchor {
             state: root,
@@ -798,6 +873,7 @@ impl ReviewContextIndex {
                     source_line_offset: offset as u16,
                     original_first_move: bundle.original_first_move,
                 });
+                source_snapshots.push(anchor.clone());
                 pins.states.insert(entry.record.origin_state);
                 pins.observations.extend(entry.evidence);
                 pins.observations.extend(entry.record.cpu_observation);
@@ -839,17 +915,7 @@ impl ReviewContextIndex {
             tokens as u16,
             bucket,
         )?;
-        let mut seal = Sha256::new();
-        seal.update(b"rz-pals-review-view-seal/1\0");
-        seal.update(digest);
-        seal.update(sequence.to_le_bytes());
-        seal.update(stores.generation().to_le_bytes());
-        seal.update((root.0 as u64).to_le_bytes());
-        for record in &metadata {
-            seal.update(record.source_revision.to_le_bytes());
-            seal.update((record.source_state.0 as u64).to_le_bytes());
-            seal.update(record.source_line_offset.to_le_bytes());
-        }
+        let seal = view_seal_digest(digest, sequence, stores.generation(), root, &metadata);
         let pin = stores.pin_review(pins)?;
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
@@ -860,12 +926,13 @@ impl ReviewContextIndex {
             records,
             metadata,
             anchors,
+            source_snapshots: source_snapshots.into(),
             query,
             bundles: selected_bundles,
             tokens: tokens as u16,
             bucket,
             digest,
-            seal: seal.finalize().into(),
+            seal,
             pin,
             consumed: AtomicBool::new(false),
         })
@@ -934,7 +1001,7 @@ impl ReviewContextIndex {
             Ok((first, second))
         }
     }
-    fn fork_query(
+    pub(in crate::pals) fn fork_query(
         &mut self,
         stores: &PalsStores,
         source: &ReviewView,
@@ -1023,17 +1090,13 @@ impl ReviewContextIndex {
             tokens as u16,
             bucket,
         )?;
-        let mut seal = Sha256::new();
-        seal.update(b"rz-pals-review-view-seal/1\0");
-        seal.update(digest);
-        seal.update(sequence.to_le_bytes());
-        seal.update(stores.generation().to_le_bytes());
-        seal.update((source.root_state.0 as u64).to_le_bytes());
-        for record in &source.metadata {
-            seal.update(record.source_revision.to_le_bytes());
-            seal.update((record.source_state.0 as u64).to_le_bytes());
-            seal.update(record.source_line_offset.to_le_bytes());
-        }
+        let seal = view_seal_digest(
+            digest,
+            sequence,
+            stores.generation(),
+            source.root_state,
+            &source.metadata,
+        );
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
             sequence,
@@ -1043,12 +1106,13 @@ impl ReviewContextIndex {
             records: source.records.clone(),
             metadata: source.metadata.clone(),
             anchors: source.anchors.clone(),
+            source_snapshots: Arc::clone(&source.source_snapshots),
             query,
             bundles: source.bundles.clone(),
             tokens: tokens as u16,
             bucket,
             digest,
-            seal: seal.finalize().into(),
+            seal,
             pin: source.pin.reborrow(stores)?,
             consumed: AtomicBool::new(false),
         })
@@ -1116,7 +1180,9 @@ fn write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), ReviewError
     }
     Ok(())
 }
-fn snapshot_digest(snapshot: &PositionSnapshot) -> Result<[u8; 32], ReviewError> {
+pub(in crate::pals) fn snapshot_digest(
+    snapshot: &PositionSnapshot,
+) -> Result<[u8; 32], ReviewError> {
     let trace = snapshot
         .uci_replay(MAX_UCI_REPLAY_PLIES)
         .map_err(|_| ReviewError::AnchorMismatch)?;
@@ -1129,6 +1195,59 @@ fn snapshot_digest(snapshot: &PositionSnapshot) -> Result<[u8; 32], ReviewError>
     hash.update(snapshot.to_fen().as_bytes());
     Ok(hash.finalize().into())
 }
+
+/// 같은 입력의 별도 제출을 구별하는 기존 seal framing이다. 현재 owner나 pin은
+/// 발급하지 않으며 live view와 historical metadata가 같은 계산을 사용한다.
+fn view_seal_digest(
+    input: [u8; 32],
+    sequence: u64,
+    generation: u64,
+    root: StateId,
+    metadata: &[ReviewRecordMetadata],
+) -> [u8; 32] {
+    let mut seal = Sha256::new();
+    seal.update(b"rz-pals-review-view-seal/1\0");
+    seal.update(input);
+    seal.update(sequence.to_le_bytes());
+    seal.update(generation.to_le_bytes());
+    seal.update((root.0 as u64).to_le_bytes());
+    for record in metadata {
+        seal.update(record.source_revision.to_le_bytes());
+        seal.update((record.source_state.0 as u64).to_le_bytes());
+        seal.update(record.source_line_offset.to_le_bytes());
+    }
+    seal.finalize().into()
+}
+
+fn record_scope_digest(
+    anchors: &[ReviewAnchor],
+    records: &[RoleRecord],
+    metadata: &[ReviewRecordMetadata],
+    policy: ReviewSelectionPolicy,
+) -> Result<[u8; 32], ReviewError> {
+    let query = ReviewQueryInput {
+        purpose: RoleQueryPurpose::ProposePolicy,
+        prefix: Vec::new(),
+        proposal: Vec::new(),
+        counterexample: None,
+        legal: Vec::new(),
+        divergences: Vec::new(),
+    };
+    let input = input_digest(
+        anchors,
+        records,
+        metadata,
+        &query,
+        policy,
+        records.iter().map(|record| record.line.len() as u16).sum(),
+        256,
+    )?;
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-frozen-public-review-scope/1\0");
+    hash.update(input);
+    Ok(hash.finalize().into())
+}
+
 fn input_digest(
     anchors: &[ReviewAnchor],
     records: &[RoleRecord],
@@ -1319,6 +1438,16 @@ mod tests {
         assert_eq!(view.records()[0].line, line("g1f3"));
         assert_eq!(view.token_count(), 1);
         assert_eq!(view.records_metadata()[0].source_line_offset, 2);
+        assert_eq!(view.source_snapshots().len(), view.records_metadata().len());
+        assert!(
+            stores
+                .states
+                .get(origin)
+                .unwrap()
+                .weak_position_identity()
+                .matches(&view.source_snapshots()[0])
+        );
+        assert!(!view.source_snapshots()[0].same_state(&actual.snapshot()));
         assert_eq!(
             view.records_metadata()[0].original_first_move,
             Some(BoardMove::from_uci("e2e4").unwrap())
@@ -1374,6 +1503,13 @@ mod tests {
         assert_eq!(view.anchors().len(), 2);
         assert_eq!(view.records_metadata()[0].anchor, 1);
         assert!(view.anchors()[1].snapshot.same_state(&actual.snapshot()));
+        assert_eq!(view.source_snapshots().len(), 1);
+        assert!(
+            actual
+                .snapshot()
+                .weak_position_identity()
+                .matches(&view.source_snapshots()[0])
+        );
     }
 
     #[test]
@@ -1395,6 +1531,60 @@ mod tests {
             checked_rebase_offset(&anchor, &other.snapshot(), &line("e2e4 e7e5")).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn frozen_queries_share_original_source_array_without_extra_source_pin_or_digest_features() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        index
+            .publish(
+                &stores,
+                &record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None),
+                None,
+            )
+            .unwrap();
+        let first = index
+            .select(
+                &stores,
+                state,
+                empty_query(),
+                ReviewSelectionPolicy::default(),
+            )
+            .unwrap();
+        let second = index.fork_query(&stores, &first, empty_query()).unwrap();
+        assert!(Arc::ptr_eq(
+            first.source_snapshots(),
+            second.source_snapshots()
+        ));
+        assert_eq!(first.digest(), second.digest());
+        assert_eq!(first.record_scope_digest(), second.record_scope_digest());
+        assert_ne!(first.seal_digest(), second.seal_digest());
+        assert_eq!(stores.review_pin_count().unwrap(), 2);
+        let retained = Arc::clone(first.source_snapshots());
+        let history = retained[0].weak_position_identity();
+        drop(first);
+        drop(second);
+        assert_eq!(stores.review_pin_count().unwrap(), 0);
+        assert!(history.matches(&retained[0]));
+        assert!(retained[0].same_state(stores.states.get(state).unwrap()));
+    }
+
+    #[test]
+    fn empty_selected_view_retains_no_source_rows() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let view = index
+            .select(
+                &stores,
+                state,
+                empty_query(),
+                ReviewSelectionPolicy::default(),
+            )
+            .unwrap();
+        assert!(view.records_metadata().is_empty());
+        assert!(view.source_snapshots().is_empty());
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
     }
 
     #[test]
@@ -1611,6 +1801,100 @@ mod tests {
             .unwrap();
         assert_eq!(view.length_bucket(), 16);
         assert_eq!(view.token_count(), 9);
+    }
+
+    #[test]
+    fn full_bundle_keeps_original_records_and_live_view_without_widening_index_errors() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::new(ReviewIndexLimits {
+            active_bundles: 2,
+            records_per_bundle: 4,
+        })
+        .unwrap();
+        let bundle = index
+            .publish(
+                &stores,
+                &record(state, 1, RecordKind::Proposal, "e2e4", None),
+                None,
+            )
+            .unwrap();
+        for revision in 2..=4 {
+            index
+                .publish(
+                    &stores,
+                    &record(
+                        state,
+                        revision,
+                        RecordKind::Counterexample,
+                        "e2e4 e7e5",
+                        Some(revision - 1),
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let view = index
+            .select(
+                &stores,
+                state,
+                empty_query(),
+                ReviewSelectionPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(view.records().len(), 4);
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 5, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(4)),
+                None
+            ),
+            Err(ReviewError::BundleRecordCapacity),
+        );
+        assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2, 3, 4]);
+        assert_eq!(index.indexed_record_count(), 4);
+        assert!(!index.contains_revision(5));
+        assert!(view.validates(&stores));
+        let pins = index.archive_projection_pins(&stores).unwrap();
+        assert!(pins.states.contains(&state));
+        assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 2);
+        let (foreign, _) = self::stores(&Position::startpos());
+        assert_eq!(
+            index.archive_projection_pins(&foreign),
+            Err(ReviewError::OwnerMismatch)
+        );
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
+        // A protected second bundle makes the separate active-bundle cap
+        // unreclaimable. It must retain the original general error class.
+        index
+            .publish(
+                &stores,
+                &record(state, 6, RecordKind::Counterexample, "d2d4 d7d5", None),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 7, RecordKind::Proposal, "c2c4", None),
+                None
+            ),
+            Err(ReviewError::IndexCapacity),
+        );
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 8, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(99)),
+                None
+            ),
+            Err(ReviewError::MissingRelation(99)),
+        );
+        assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2, 3, 4]);
+        assert_eq!(index.indexed_record_count(), 5);
+        index.consume(&view, &stores).unwrap();
+        assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 1);
+        drop(view);
+        assert_eq!(stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]

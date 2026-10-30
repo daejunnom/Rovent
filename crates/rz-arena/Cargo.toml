@@ -13,13 +13,30 @@ experimental-snapshot-reclaim = []
 pals-collection = ["dep:rz-uci"]
 pals-collection-onnx = ["pals-collection", "rz-uci/onnx-cpu", "rz-uci/pals-adaptive", "rz-experiments/pals-content-admission"]
 native-cuda = ["dep:rz-uci", "rz-uci/onnx-cuda", "rz-experiments/pals-content-admission"]
+native-validation-diagnostics = ["rz-uci/pals-adaptive-diagnostics", "rz-uci/native-validation-diagnostics"]
 native-cuda-batch = ["native-cuda", "rz-uci/experimental-batch", "rz-eval/experimental-batch"]
 pals-followup-cuda-warm = ["native-cuda", "rz-uci/experimental-io-binding", "rz-eval/experimental-io-binding"]
+
+[[test]]
+name = "collection_v2_contention"
+path = "tests/collection_v2_contention.rs"
+harness = false
+required-features = ["pals-collection-onnx", "test-fixtures"]
 
 [[bin]]
 name = "rz-arena-fixture-engine"
 path = "src/bin/fixture-engine.rs"
 required-features = ["test-fixtures"]
+
+[[bin]]
+name = "rz-rovent-trainer"
+path = "src/bin/rovent-trainer.rs"
+required-features = ["pals-collection-onnx"]
+
+[[bin]]
+name = "rz-rovent-utility-trainer"
+path = "src/bin/rovent-utility-trainer.rs"
+required-features = ["pals-collection-onnx"]
 
 [[bin]]
 name = "rz-pals-generation-game-worker"
@@ -34,6 +51,11 @@ required-features = ["pals-collection-onnx"]
 [[bin]]
 name = "rz-pals-collect-action-outcomes"
 path = "src/bin/pals-action-outcomes.rs"
+required-features = ["pals-collection-onnx"]
+
+[[bin]]
+name = "rz-pals-action-diagnostic"
+path = "src/bin/pals-action-diagnostic.rs"
 required-features = ["pals-collection-onnx"]
 
 [[bin]]
@@ -54,6 +76,16 @@ required-features = ["pals-collection-onnx"]
 [[bin]]
 name = "rz-pals-g0-collection-deployment-numerical"
 path = "src/bin/pals-g0-collection-deployment-numerical.rs"
+required-features = ["pals-collection-onnx"]
+
+[[bin]]
+name = "rz-rovent-collect"
+path = "src/bin/rovent-collect.rs"
+required-features = ["pals-collection-onnx"]
+
+[[bin]]
+name = "rz-rovent-native"
+path = "src/bin/rovent-native.rs"
 required-features = ["pals-collection-onnx"]
 
 [[example]]

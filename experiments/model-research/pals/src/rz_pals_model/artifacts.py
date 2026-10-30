@@ -23,6 +23,36 @@ VIRTUAL_RULES_BOUNDS = {"max_records": 64, "max_anchors": 4, "max_line_plies": 2
                       "token_budgets": [128,256,512], "root_anchor": 0}
 
 
+class ExportWriteBudget:
+    """Monotone serialized-write credit for one sequential export invocation.
+
+    Reserve before opening a partial file. Failed writes retain their charge;
+    this counter neither refunds partials nor grants a storage lease or quota.
+    The caller accounts separately for journals, logs and other metadata.
+    """
+    __slots__ = ("_maximum_bytes", "_reserved_bytes")
+
+    def __init__(self, maximum_bytes):
+        if type(maximum_bytes) is not int or maximum_bytes <= 0:
+            raise ValueError("export write budget must be a positive integer")
+        self._maximum_bytes, self._reserved_bytes = maximum_bytes, 0
+
+    @property
+    def maximum_bytes(self):
+        return self._maximum_bytes
+
+    @property
+    def reserved_bytes(self):
+        return self._reserved_bytes
+
+    def __call__(self, next_bytes):
+        if type(next_bytes) is not int or next_bytes < 0:
+            raise ValueError("serialized export byte count must be a nonnegative integer")
+        if next_bytes > self._maximum_bytes - self._reserved_bytes:
+            raise ValueError("export write budget exceeded before file creation")
+        self._reserved_bytes += next_bytes
+
+
 class AtomicPublicationError(OSError):
     """A publication failed validation; already published bytes are retained."""
     def __init__(self, code, message, *, publication_state="not_published"):
@@ -440,7 +470,12 @@ def annotate_public_memory_shapes(document, config):
             dimension.dim_value = expected
 
 
-def export_checkpoint(checkpoint, directory, include_validator=False, layout="separate_pc", rules_profile_json=None):
+def export_checkpoint(checkpoint, directory, include_validator=False, layout="separate_pc", rules_profile_json=None, *, output_guard=None):
+    if output_guard is not None:
+        if not callable(output_guard):
+            raise TypeError("export output guard must be callable")
+        if layout != "virtual_review_shared_pc_if_v1":
+            raise ValueError("bounded export requires the virtual review layout")
     import onnx
     import torch
     from .model import fixture_input
@@ -453,7 +488,7 @@ def export_checkpoint(checkpoint, directory, include_validator=False, layout="se
         if layout != VIRTUAL_LAYOUT:
             raise ValueError("V3 profile requires explicit virtual_review_shared_pc_if_v1 layout")
         return export_virtual_checkpoint(model, metadata, directory, include_validator=include_validator,
-                                         rules_profile_json=rules_profile_json)
+                                         rules_profile_json=rules_profile_json, output_guard=output_guard)
     if layout == VIRTUAL_LAYOUT:
         raise ValueError("legacy/V2 model cannot use V3 virtual review layout")
     if layout == SHARED_LAYOUT and rules_profile_json is None:

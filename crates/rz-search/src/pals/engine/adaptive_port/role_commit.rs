@@ -1,5 +1,6 @@
 //! Pure checked role consumption and continuation construction. The physical
 //! owner must acknowledge the ORIGINAL ticket before calling commit_role.
+use super::checked_replay::PreparedRoleChoice;
 use super::*;
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
@@ -34,7 +35,40 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     published_line,
                 }));
         }
+        // Copy only a successful original semantic result. The separate
+        // first ConsumedView and coordinator acceptance are joined at readback.
+        let feedback_edge = self.role_consumption_observation.as_ref().and_then(|_| {
+            returned.as_ref().ok().map(|step| {
+                super::profiled_external_port::feedback_observation::ProfiledFeedbackRoleEdge {
+                    evidence: crate::pals::coordinator::StepEvidence {
+                        frame: work.frame,
+                        stage: work.input.stage,
+                        execution: crate::pals::coordinator::StepExecution::Role(ticket.id),
+                        submitted_question: work.input.question_digest,
+                        submitted_view: work.input.view_seal,
+                        completed_evidence: step.evidence,
+                    },
+                    request: ticket.id,
+                    role: ticket.role,
+                    ticket_question: ticket.question,
+                    ticket_view: ticket.view,
+                    namespace: self
+                        .model_namespace()
+                        .ok()
+                        .map(|v| v.utility_cohort_digest()),
+                    original_deadline: work.original_deadline,
+                    prefix_before_plies: work.input.question.context.prefix.len(),
+                    counter_source: work.input.question.counter_source,
+                    published_repair_line,
+                    repair_input: work.input.question.diagnostic_repair_line,
+                    fresh_pair: step.fresh_pair,
+                }
+            })
+        });
         if let Some(journal) = &mut self.role_consumption_observation {
+            if let Some(edge) = feedback_edge {
+                journal.record_feedback_role(edge);
+            }
             let (outcome, completed_evidence) = match &returned {
                 Ok(step) => (
                     AdaptiveRoleConsumptionOutcome::SemanticResult,
@@ -88,8 +122,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         repair_publication_sink: Option<&mut Option<AdaptivePublishedRepairLine>>,
     ) -> Result<AdaptivePortStep, PalsError> {
         self.validate_role(work, ticket, output)?;
-        let observations_before = self.engine.stores.observations.next_observation_sequence();
-        if self.counters.role_calls >= self.engine.config.max_role_calls {
+        if let Some(failure) = self.reciprocal_source_failure(work, ticket, output) {
+            return Err(failure);
+        }
+        let source_preconsumed = self.reciprocal_source_consumed(work, ticket, output);
+        let observations_before = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .next_observation_sequence();
+        if !source_preconsumed && self.counters.role_calls >= self.engine.config.max_role_calls {
             return Err(PalsError::RoleCallLimit);
         }
         let query = &work.input.question;
@@ -129,8 +172,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         && first.authority() == self.authority
                         && second.authority() == self.authority
                         && first.digest() == second.digest()
-                        && first.validates(&self.engine.stores)
-                        && second.validates(&self.engine.stores)
+                        && first.validates(&self.engine.semantic.stores)
+                        && second.validates(&self.engine.semantic.stores)
                 }
                 _ => false,
             };
@@ -143,7 +186,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             let seal = FreshPairSeal::from_ticket(
                 ticket,
                 work.input.public_context,
-                self.engine.nodes[self.root].position.side_to_move().into(),
+                self.engine.semantic.nodes[self.root]
+                    .position
+                    .side_to_move()
+                    .into(),
             );
             if !seal.validates_public_view(&next.view_seal, next.public_context) {
                 return Err(RoleError::InvalidOutput.into());
@@ -152,11 +198,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         } else {
             None
         };
-        if !self.attempted_role_commits.insert(ticket.id) {
+        if self.attempted_role_commits.contains(&ticket.id) {
             return Err(
                 StoreError::InvalidEvidence("role semantic commit was already attempted").into(),
             );
         }
+        let choice = self.prepare_role_choice(work, output)?;
+        // Keep the original head and graph choice intact while an actual
+        // native reservation blocks the next Rules edge. No Store publication
+        // or semantic-attempt marker has occurred when this returns Reserved.
+        self.preflight_role_choice(work, choice)?;
+        self.attempted_role_commits.insert(ticket.id);
         let evidence = role_output_digest(ticket, output);
         let mut fresh_pair = None;
         let rules_pair = None;
@@ -164,13 +216,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             RefinementStage::ProposalContinuation
             | RefinementStage::CounterContinuation
             | RefinementStage::Repair => {
-                let ranked = rank_moves(work.input.view.query().legal.as_slice(), output)?;
-                let movement = *ranked.first().ok_or(RoleError::InvalidOutput)?;
-                let node = self.connect_hot(query.node, movement)?;
+                let PreparedRoleChoice::Continuation(movement) = choice else {
+                    return Err(RoleError::InvalidOutput.into());
+                };
                 let mut prefix = query.context.prefix.clone();
                 prefix.push(movement);
-                let done = prefix.len() >= self.engine.config.line_plies
-                    || self.engine.nodes[node].terminal.is_some();
+                let node = self.replay_node(&prefix)?;
+                let done = prefix.len() >= self.continuation_limit()
+                    || self.engine.semantic.nodes[node].terminal.is_some();
                 let next = if done {
                     let (kind, stage) = match query.stage {
                         RefinementStage::ProposalContinuation => {
@@ -218,6 +271,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 } else {
                     query.repaired.clone()
                 };
+                let repair_selection = if query.stage == RefinementStage::Repair && done {
+                    self.prepare_completed_repair_goal_selection(work, &prefix)?
+                } else {
+                    None
+                };
                 let mut next = self.blueprint(
                     node,
                     next,
@@ -231,34 +289,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     None,
                     None,
                 )?;
-                next = next.with_counter_source(query.counter_source);
+                next = next
+                    .with_counter_source(query.counter_source)
+                    .with_goal_lane_selection(repair_selection)?;
                 AdaptivePortTransition::Continue(next)
             }
             RefinementStage::CriticDivergence => {
-                let RolePayload::Counterexample {
-                    divergence_logits, ..
-                } = &output.payload
-                else {
+                let PreparedRoleChoice::Divergence(ply) = choice else {
                     return Err(RoleError::InvalidOutput.into());
                 };
-                let sites = &work.input.view.query().divergences;
-                let mut ranked: Vec<_> = (0..sites.len()).collect();
-                ranked.sort_by(|a, b| {
-                    divergence_logits[*b]
-                        .total_cmp(&divergence_logits[*a])
-                        .then(a.cmp(b))
-                });
-                let best = if ranked.is_empty() {
-                    None
-                } else {
-                    Some(
-                        ranked[usize::try_from(self.root_round)
-                            .map_err(|_| PalsError::InvalidLimits)?
-                            % ranked.len()],
-                    )
-                };
-                if let Some(best) = best {
-                    let ply = sites[best];
+                if let Some(ply) = ply {
                     let prefix = query.proposal[..ply].to_vec();
                     let node = self.replay_node(&prefix)?;
                     AdaptivePortTransition::Continue(self.blueprint(
@@ -282,28 +322,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             RefinementStage::CriticReply => {
                 let ply = query.attack_ply.ok_or(RoleError::InvalidOutput)?;
-                let original = *query.proposal.get(ply).ok_or(RoleError::InvalidOutput)?;
                 let cpu_response = query
                     .counter
                     .as_ref()
                     .and_then(|line| line.get(ply))
                     .copied();
-                let ranked = rank_moves(&work.input.view.query().legal, output)?;
-                let examined = &self.engine.nodes[query.node].edges;
-                let movement = ranked
-                    .iter()
-                    .copied()
-                    .find(|mv| {
-                        *mv != original
-                            && Some(*mv) != cpu_response
-                            && !examined.iter().any(|edge| edge.movement == *mv)
-                    })
-                    .or_else(|| {
-                        ranked
-                            .iter()
-                            .copied()
-                            .find(|mv| *mv != original && Some(*mv) != cpu_response)
-                    });
+                let PreparedRoleChoice::CriticReply(movement) = choice else {
+                    return Err(RoleError::InvalidOutput.into());
+                };
                 let critic = if let Some(movement) = movement {
                     let mut prefix = query.context.prefix.clone();
                     prefix.push(movement);
@@ -315,13 +341,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     if let Some(critic) = critic {
                         self.enqueue_counter(critic)?;
                     }
-                    self.begin_counter(Self::pending_counter(
-                        query,
-                        cpu.clone(),
-                        query.counter_source,
-                    )?)?
+                    self.begin_counter(
+                        work,
+                        Self::pending_counter(query, cpu.clone(), query.counter_source)?,
+                    )?
                 } else if let Some(critic) = critic {
-                    self.begin_counter(critic)?
+                    self.begin_counter(work, critic)?
                 } else {
                     AdaptivePortTransition::Complete {
                         scope: FrameCompletionScope::NoAlternative,
@@ -340,24 +365,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             RefinementStage::CriticRecheck => {
                 let repaired = query.repaired.as_ref().ok_or(RoleError::InvalidOutput)?;
-                let ranked = rank_moves(&work.input.view.query().legal, output)?;
-                let prefix_len = query.context.prefix.len();
-                let movement = if query.recheck {
-                    ranked.first().copied()
-                } else {
-                    let old = *repaired.get(prefix_len).ok_or(RoleError::InvalidOutput)?;
-                    let examined = &self.engine.nodes[query.node].edges;
-                    ranked
-                        .iter()
-                        .copied()
-                        .find(|mv| *mv != old && !examined.iter().any(|edge| edge.movement == *mv))
-                        .or_else(|| ranked.iter().copied().find(|mv| *mv != old))
+                let PreparedRoleChoice::CriticRecheck(movement) = choice else {
+                    return Err(RoleError::InvalidOutput.into());
                 };
                 if let Some(movement) = movement {
-                    let node = self.connect_hot(query.node, movement)?;
                     let mut counterline = query.context.prefix.clone();
                     counterline.push(movement);
-                    if self.engine.nodes[node].terminal.is_some()
+                    let node = self.replay_node(&counterline)?;
+                    if self.engine.semantic.nodes[node].terminal.is_some()
                         || counterline.len() >= repaired.len()
                     {
                         if counterline.len() != repaired.len() {
@@ -424,7 +439,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 fresh_pair = Some(FreshPairSeal::from_ticket(
                     ticket,
                     work.input.public_context,
-                    self.engine.nodes[self.root].position.side_to_move().into(),
+                    self.engine.semantic.nodes[self.root]
+                        .position
+                        .side_to_move()
+                        .into(),
                 ));
                 AdaptivePortTransition::Complete {
                     scope: FrameCompletionScope::CompletedFreshPair,
@@ -442,32 +460,39 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             work.input.question_digest,
             ticket.id,
             observations_before,
-            self.engine.stores.observations.next_observation_sequence(),
+            self.engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence(),
         ));
-        self.counters.role_calls += 1;
-        self.counters.consumed_role_outputs += 1;
-        match query.context.purpose {
-            RoleQueryPurpose::ValueFresh => {
-                self.counters.value_calls += 1;
-                self.counters.completed_value_calls += 1;
-                self.counters.accepted_value_outputs += 1;
-            }
-            RoleQueryPurpose::RepairPolicy => {
-                self.counters.repair_calls += 1;
-                self.counters.completed_repair_calls += 1;
-                self.counters.accepted_repair_outputs += 1;
-            }
-            RoleQueryPurpose::ReplyPolicy | RoleQueryPurpose::DivergencePolicy => {
-                self.counters.critic_calls += 1;
-                self.counters.completed_critic_calls += 1;
-                self.counters.accepted_critic_outputs += 1;
-            }
-            _ => {
-                self.counters.proposer_calls += 1;
-                self.counters.completed_proposer_calls += 1;
-                self.counters.accepted_proposer_outputs += 1;
+        if !source_preconsumed {
+            self.counters.role_calls += 1;
+            self.counters.consumed_role_outputs += 1;
+            match query.context.purpose {
+                RoleQueryPurpose::ValueFresh => {
+                    self.counters.value_calls += 1;
+                    self.counters.completed_value_calls += 1;
+                    self.counters.accepted_value_outputs += 1;
+                }
+                RoleQueryPurpose::RepairPolicy => {
+                    self.counters.repair_calls += 1;
+                    self.counters.completed_repair_calls += 1;
+                    self.counters.accepted_repair_outputs += 1;
+                }
+                RoleQueryPurpose::ReplyPolicy | RoleQueryPurpose::DivergencePolicy => {
+                    self.counters.critic_calls += 1;
+                    self.counters.completed_critic_calls += 1;
+                    self.counters.accepted_critic_outputs += 1;
+                }
+                _ => {
+                    self.counters.proposer_calls += 1;
+                    self.counters.completed_proposer_calls += 1;
+                    self.counters.accepted_proposer_outputs += 1;
+                }
             }
         }
+        self.retire_reciprocal_source(ticket.id);
         Ok(AdaptivePortStep {
             evidence,
             transition,
@@ -496,6 +521,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let evidence = ContractDigest(hash.finalize().into());
         if !self.cpu_observation_consumed(work, observation)
             && !self.external_observation_consumed(work, observation)
+            && !self.profiled_external_observation_consumed(work, observation)
         {
             return Ok(AdaptivePortStep {
                 evidence,
@@ -513,10 +539,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             });
         }
         let transition = if query.stage == RefinementStage::CpuDiscovery {
-            let raw = self.engine.stores.observations.get(observation)?;
+            let raw = self.engine.semantic.stores.observations.get(observation)?;
             let pv = raw
                 .cpu_pv
-                .map(|line| self.engine.stores.lines.moves(line))
+                .map(|line| self.engine.semantic.stores.lines.moves(line))
                 .transpose()?
                 .unwrap_or_default();
             // A discovered restricted score is never assigned to its leaf. Only
@@ -556,7 +582,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             } else {
                 let cpu_line = if alternative {
                     let mut line = query.context.prefix.clone();
-                    let available = self.engine.config.line_plies.saturating_sub(line.len());
+                    let available = self.continuation_limit().saturating_sub(line.len());
                     line.extend(pv.iter().take(available));
                     self.replay_node(&line)?;
                     self.record_hot(RecordKind::Counterexample, &line, Some(observation))?;
@@ -603,7 +629,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 RefinementStage::RepairValidation => RefinementStage::RepairValueFresh,
                 _ => return Err(RoleError::InvalidOutput.into()),
             };
-            AdaptivePortTransition::Continue(self.blueprint(
+            let selection = self.prepare_zero_step_repair_feedback_selection(work)?;
+            let mut blueprint = self.blueprint(
                 query.node,
                 stage,
                 query.first,
@@ -615,7 +642,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 false,
                 None,
                 None,
-            )?)
+            )?;
+            if selection.is_some() {
+                blueprint = blueprint
+                    .with_counter_source(query.counter_source)
+                    .with_goal_lane_selection(selection)?;
+            }
+            AdaptivePortTransition::Continue(blueprint)
         } else {
             self.after_validation(query, Some(work))?
         };
@@ -686,7 +719,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .ok_or(RoleError::InvalidOutput)?
                     .to_vec();
                 let node = self.replay_node(&prefix)?;
-                self.begin_repair_continuation(
+                let mut transition = self.begin_repair_continuation(
                     node,
                     query.first,
                     prefix,
@@ -694,7 +727,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     counter.clone(),
                     ply,
                     query.counter_source,
-                )
+                )?;
+                if let Some(original) = parent {
+                    self.bind_zero_step_repair_goal_transition(original, &mut transition)?;
+                }
+                Ok(transition)
             }
             RefinementStage::RepairValidation | RefinementStage::RepairValueFresh => {
                 self.publish_supported_repair(query)?;
@@ -712,7 +749,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 let fixed_iterative = self.root_fanout == AdaptiveRootFanoutPolicy::SequentialFixed
                     && self.engine.post_repair_recheck
                         == PostRepairRecheckPolicy::IterativeFrozenModelWdlV2;
-                if self.engine.nodes[repaired_node].terminal.is_some() && !fixed_iterative {
+                if self.engine.semantic.nodes[repaired_node].terminal.is_some() && !fixed_iterative
+                {
                     return Ok(checked);
                 }
                 let blueprint = self.blueprint(
@@ -755,9 +793,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<AdaptivePortTransition, PalsError> {
         self.check_live()?;
         let first = first.ok_or(RoleError::InvalidOutput)?;
-        if prefix.len() > self.engine.config.line_plies
-            || proposal.len() > self.engine.config.line_plies
-            || counter.len() > self.engine.config.line_plies
+        let continuation_limit = self.continuation_limit();
+        if prefix.len() > continuation_limit
+            || proposal.len() > continuation_limit
+            || counter.len() > continuation_limit
             || prefix.first() != Some(&first)
             || proposal.first() != Some(&first)
             || counter.first() != Some(&first)
@@ -768,8 +807,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(ReviewError::AnchorMismatch.into());
         }
-        let zero_step = prefix.len() == self.engine.config.line_plies
-            || self.engine.nodes[node].terminal.is_some();
+        let zero_step = prefix.len() == continuation_limit
+            || self.engine.semantic.nodes[node].terminal.is_some();
         if !zero_step {
             return Ok(AdaptivePortTransition::Continue(
                 self.blueprint(
@@ -797,7 +836,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .repairs
             .checked_add(1)
             .ok_or(PalsError::Capacity)?;
-        if self.engine.nodes[node].terminal.is_some() {
+        if self.engine.semantic.nodes[node].terminal.is_some() {
             return Ok(AdaptivePortTransition::Complete {
                 scope: FrameCompletionScope::NoRepairContinuation,
             });
@@ -856,8 +895,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let repaired = query.repaired.as_ref().ok_or(RoleError::InvalidOutput)?;
         let counter = query.counter.as_ref().ok_or(RoleError::InvalidOutput)?;
         let attack = query.attack_ply.ok_or(RoleError::InvalidOutput)?;
-        let root_color = self.engine.nodes[self.root].position.side_to_move();
-        let mut position = self.engine.nodes[self.root].position.clone();
+        let root_color = self.engine.semantic.nodes[self.root]
+            .position
+            .side_to_move();
+        let checked = if self.rovent_frontier().is_some() {
+            Some(self.existing_checked_frontier_line(repaired)?.ok_or(
+                crate::pals::rovent_frontier::FrontierError::Invalid(
+                    "repaired source has no original charged Rules path",
+                ),
+            )?)
+        } else {
+            None
+        };
+        let mut position = self.engine.semantic.nodes[self.root].position.clone();
         let mut changed = None;
         let mut anchor = None;
         for (ply, movement) in repaired.iter().enumerate() {
@@ -878,7 +928,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 anchor = Some(ply);
                 break;
             }
-            position.make_move(*movement)?;
+            if let Some(checked) = &checked {
+                position =
+                    Position::from_snapshot(checked.steps()[ply].snapshot(), Default::default())?;
+            } else {
+                position.make_move(*movement)?;
+            }
         }
         if let Some(anchor) = anchor {
             let prefix = repaired[..anchor].to_vec();
@@ -917,6 +972,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub(super) fn record_cpu_verification_hot(
         &mut self,
         line: &[BoardMove],
+        observation: ObservationId,
         score: i32,
         depth: u16,
         scope: CpuScoreScope,
@@ -925,7 +981,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.record_hot_with_cpu_value(
             RecordKind::CpuVerification,
             line,
-            None,
+            Some(observation),
             Some((score, depth, scope, perspective)),
             None,
         )?;
@@ -943,20 +999,25 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if value.is_some() && kind != RecordKind::CpuVerification {
             return Err(StoreError::InvalidEvidence("CPU verification projection kind").into());
         }
-        if self.engine.records.len() >= self.engine.config.max_records {
+        if self.engine.semantic.records.len() >= self.engine.config.max_records {
             // Raw/failed evidence is not deleted on the manager to keep running.
+            if let Some(frontier) = self.engine.semantic.rovent_frontier.as_deref_mut() {
+                return Err(frontier.refuse_public_record_capacity().into());
+            }
             return Err(
                 StoreError::PinSaturated("adaptive public records need archive worker").into(),
             );
         }
-        let root_state = self.engine.nodes[self.root].state;
+        let root_state = self.engine.semantic.nodes[self.root].state;
         let revision = self
             .engine
+            .semantic
             .revision
             .checked_add(1)
             .ok_or(PalsError::Capacity)?;
         let supersedes_revision = self
             .engine
+            .semantic
             .records
             .iter()
             .rev()
@@ -968,6 +1029,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .map(|record| record.revision);
         let parent_revision = self
             .engine
+            .semantic
             .records
             .iter()
             .rev()
@@ -984,9 +1046,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     }
             })
             .map(|record| record.revision);
-        let mut replay = self.engine.nodes[self.root].position.clone();
-        for movement in line {
-            replay.make_move(*movement)?;
+        if self.rovent_frontier().is_some() {
+            self.replay_node(line)?;
+        } else {
+            let mut replay = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in line {
+                replay.make_move(*movement)?;
+            }
         }
         let record = RoleRecord {
             revision,
@@ -1000,51 +1066,58 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             score_scope: value.map(|value| value.2),
             cpu_observation: cpu,
             perspective: value.map_or(
-                self.engine.nodes[self.root].position.side_to_move(),
+                self.engine.semantic.nodes[self.root]
+                    .position
+                    .side_to_move(),
                 |value| value.3,
             ),
             critical: true,
         };
         if cpu.is_some() || kind == RecordKind::CpuVerification {
-            self.engine.publish_record(record, None, None)?;
+            self.publish_hot_record(record, None)?;
             return Ok(None);
         }
         let focus = self
             .engine
+            .semantic
             .stores
             .situations
-            .get(self.engine.nodes[self.root].situation)?
+            .get(self.engine.semantic.nodes[self.root].situation)?
             .focus;
-        let line = self.engine.stores.hot_append_line(focus, line)?;
-        let observation = self.engine.stores.hot_append_observation(Observation {
-            state: root_state,
-            line: Some(line),
-            source: stable_id(self.engine.model.identity()),
-            epoch: 0,
-            scope: EvidenceScope::Model {
-                model: stable_id(self.engine.model.identity()),
-                encoding: stable_id("pals-selected-review-v3"),
-                input: revision,
-            },
-            value_identity: None,
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: None,
-            cpu_pv: None,
-            score: RawScore::Unknown,
-            budget: 0,
-            kind: match kind {
-                RecordKind::Proposal => ObservationKind::Proposal,
-                RecordKind::Counterexample => ObservationKind::Refutation,
-                RecordKind::Repair => ObservationKind::Repair,
-                RecordKind::CpuVerification => ObservationKind::Proposal,
-            },
-            supersedes: None,
-            execution: None,
-        })?;
+        let line = self.engine.semantic.stores.hot_append_line(focus, line)?;
+        let observation = self
+            .engine
+            .semantic
+            .stores
+            .hot_append_observation(Observation {
+                state: root_state,
+                line: Some(line),
+                source: stable_id(self.engine.semantic.model.identity()),
+                epoch: 0,
+                scope: EvidenceScope::Model {
+                    model: stable_id(self.engine.semantic.model.identity()),
+                    encoding: stable_id("pals-selected-review-v3"),
+                    input: revision,
+                },
+                value_identity: None,
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: None,
+                cpu_pv: None,
+                score: RawScore::Unknown,
+                budget: 0,
+                kind: match kind {
+                    RecordKind::Proposal => ObservationKind::Proposal,
+                    RecordKind::Counterexample => ObservationKind::Refutation,
+                    RecordKind::Repair => ObservationKind::Repair,
+                    RecordKind::CpuVerification => ObservationKind::Proposal,
+                },
+                supersedes: None,
+                execution: None,
+            })?;
         self.engine.pin_archive_active_record(line, observation)?;
         // Copy only scalar fields of the record that this owner is about to
         // publish. No additional line clone, lookup/replay or digest is made.
@@ -1059,8 +1132,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 committed_plies: record.line.len(),
                 first_move: record.line.first().copied(),
             });
-        self.engine
-            .publish_record(record, None, Some(observation))?;
+        self.publish_hot_record(record, Some(observation))?;
         // Only the successful original publication releases this observation.
         // A later commit error still returns unchanged, alongside Rejected.
         if let Some(destination) = repair_publication_sink {
@@ -1069,19 +1141,54 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(Some((line, observation)))
     }
 
-    fn checked_role_value(
+    /// Only the original bounded bundle producer can close this root's
+    /// review-index admission. Failed observations/lines remain with their
+    /// original Store and output owners until the existing physical drain.
+    fn publish_hot_record(
+        &mut self,
+        record: RoleRecord,
+        evidence: Option<ObservationId>,
+    ) -> Result<(), PalsError> {
+        match self.engine.publish_record(record, None, evidence) {
+            Err(PalsError::Review(ReviewError::BundleRecordCapacity)) => {
+                match self.engine.semantic.rovent_frontier.as_deref_mut() {
+                    Some(frontier) => Err(frontier.refuse_public_review_index_capacity().into()),
+                    None => Err(ReviewError::BundleRecordCapacity.into()),
+                }
+            }
+            result => result,
+        }
+    }
+
+    pub(super) fn checked_role_value(
         &self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         ticket: &RoleTicketEnvelope,
         output: &RoleOutput,
         physical: Option<AdaptivePortRoleEvidence>,
     ) -> Result<ModelValueOutput, PalsError> {
+        self.checked_value_input(&work.input, ticket, output, physical)
+    }
+
+    pub(super) fn checked_value_input(
+        &self,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+        physical: Option<AdaptivePortRoleEvidence>,
+    ) -> Result<ModelValueOutput, PalsError> {
+        AdaptivePortQuestion::validate_frontier_input(input, &self.engine.semantic.stores)?;
         self.verify_registered_model_namespace(ticket, output)?;
         let physical = physical.ok_or(RoleError::InvalidOutput)?;
-        if ticket.role != Role::Proposer
-            || ticket.question != work.input.question_digest
+        if ticket.authority != self.authority
+            || ticket.original_deadline != self.deadline
+            || ticket.view != input.view_seal
+            || output.id != ticket.id
+            || output.authority != ticket.authority
+            || ticket.role != Role::Proposer
+            || ticket.question != input.question_digest
             || ticket.representation != output.key
-            || work.input.question.context.purpose != RoleQueryPurpose::ValueFresh
+            || input.question.context.purpose != RoleQueryPurpose::ValueFresh
             || physical.physical_fresh != Some(true)
             || !physical.measurement_complete
             // Fresh WDL needs a known completed evaluation. Its physical graph
@@ -1092,17 +1199,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let query = &work.input.question;
+        validate_payload(RoleQueryPurpose::ValueFresh, &input.view, output)?;
+        let query = &input.question;
         let RolePayload::Proposal { wdl, .. } = output.payload else {
             return Err(RoleError::InvalidOutput.into());
         };
         let identity = self
             .engine
+            .semantic
             .model_registered_value
             .clone()
             .ok_or(RoleError::Unavailable)?;
         if self
             .engine
+            .semantic
             .model
             .registered_representation_namespace()
             .is_some_and(|namespace| namespace.value_identity() != &identity)
@@ -1127,54 +1237,71 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         output: &RoleOutput,
         physical: Option<AdaptivePortRoleEvidence>,
     ) -> Result<ObservationId, PalsError> {
+        self.commit_value_input(&work.input, ticket, output, physical)
+    }
+
+    pub(super) fn commit_value_input(
+        &mut self,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+        physical: Option<AdaptivePortRoleEvidence>,
+    ) -> Result<ObservationId, PalsError> {
         // Recheck the immutable producer namespace at the actual Store commit
         // boundary, even though admission already validated it before attempt.
-        let value = self.checked_role_value(work, ticket, output, physical)?;
+        let value = self.checked_value_input(input, ticket, output, physical)?;
         let identity = value.identity.clone();
-        let query = &work.input.question;
-        let observation = self.engine.stores.hot_append_observation(Observation {
-            state: query.context.state,
-            line: None,
-            source: stable_id(&identity.semantics),
-            epoch: 0,
-            scope: EvidenceScope::Model {
-                model: stable_id(&identity.model),
-                encoding: stable_id(&identity.encoding),
-                input: u64::from_le_bytes(
-                    output.key.input.0[..8]
-                        .try_into()
-                        .map_err(|_| RoleError::InvalidOutput)?,
-                ),
-            },
-            value_identity: None,
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: Some(identity),
-            model_value_input: Some(output.key.input.0),
-            cpu_condition: None,
-            cpu_pv: None,
-            score: RawScore::ContextWdl {
-                win: value.wdl[0],
-                draw: value.wdl[1],
-                loss: value.wdl[2],
-                perspective: value.perspective,
-                context_revision: query.context.public_revision,
-            },
-            budget: 1,
-            kind: ObservationKind::Proposal,
-            supersedes: None,
-            execution: None,
-        })?;
+        let query = &input.question;
+        let observation = self
+            .engine
+            .semantic
+            .stores
+            .hot_append_observation(Observation {
+                state: query.context.state,
+                line: None,
+                source: stable_id(&identity.semantics),
+                epoch: 0,
+                scope: EvidenceScope::Model {
+                    model: stable_id(&identity.model),
+                    encoding: stable_id(&identity.encoding),
+                    input: u64::from_le_bytes(
+                        output.key.input.0[..8]
+                            .try_into()
+                            .map_err(|_| RoleError::InvalidOutput)?,
+                    ),
+                },
+                value_identity: None,
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: Some(identity),
+                model_value_input: Some(output.key.input.0),
+                cpu_condition: None,
+                cpu_pv: None,
+                score: RawScore::ContextWdl {
+                    win: value.wdl[0],
+                    draw: value.wdl[1],
+                    loss: value.wdl[2],
+                    perspective: value.perspective,
+                    context_revision: query.context.public_revision,
+                },
+                budget: 1,
+                kind: ObservationKind::Proposal,
+                supersedes: None,
+                execution: None,
+            })?;
         self.engine
+            .semantic
             .stores
             .hot_add_dependency(observation, query.context.situation)?;
         self.engine
+            .semantic
             .stores
-            .hot_add_dependency(observation, self.engine.nodes[self.root].situation)?;
-        self.engine.nodes[query.node].model_value = Some(value);
-        self.engine.nodes[query.node].model_observation = Some(observation);
-        self.engine.nodes[query.node].model_value_revision = Some(query.context.public_revision);
+            .hot_add_dependency(observation, self.engine.semantic.nodes[self.root].situation)?;
+        self.engine.semantic.nodes[query.node].model_value = Some(value);
+        self.engine.semantic.nodes[query.node].model_observation = Some(observation);
+        self.engine.semantic.nodes[query.node].model_value_revision =
+            Some(query.context.public_revision);
         Ok(observation)
     }
 
@@ -1188,13 +1315,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let repaired_node = self.replay_node(&repaired)?;
         let counter_node = self.replay_node(&counter)?;
         match (
-            self.engine.nodes[repaired_node].terminal,
-            self.engine.nodes[counter_node].terminal,
+            self.engine.semantic.nodes[repaired_node].terminal,
+            self.engine.semantic.nodes[counter_node].terminal,
         ) {
             (Some(_), Some(_)) => {
                 // Exact endpoints can be compared through Rules, but this alone
                 // does not certify every defense or fabricate NN executions.
-                let perspective = self.engine.nodes[self.root].position.side_to_move();
+                let perspective = self.engine.semantic.nodes[self.root]
+                    .position
+                    .side_to_move();
                 let old = self.engine.endpoint_expectation(repaired_node, perspective);
                 let new = self.engine.endpoint_expectation(counter_node, perspective);
                 if matches!((old,new),(Some(old),Some(new)) if new<old) {
@@ -1210,14 +1339,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     counter_line: counter,
                     repaired: Arc::new(
                         self.issue_rules_position(
-                            self.engine.nodes[repaired_node].position.clone(),
+                            self.engine.semantic.nodes[repaired_node].position.clone(),
                         )?
                         .export()
                         .map_err(|_| RoleError::InvalidOutput)?,
                     ),
                     counter: Arc::new(
                         self.issue_rules_position(
-                            self.engine.nodes[counter_node].position.clone(),
+                            self.engine.semantic.nodes[counter_node].position.clone(),
                         )?
                         .export()
                         .map_err(|_| RoleError::InvalidOutput)?,
@@ -1256,16 +1385,18 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         repaired: ObservationId,
         counter: ObservationId,
     ) -> Result<bool, PalsError> {
-        let before = self.engine.stores.observations.get(repaired)?;
-        let after = self.engine.stores.observations.get(counter)?;
+        let before = self.engine.semantic.stores.observations.get(repaired)?;
+        let after = self.engine.semantic.stores.observations.get(counter)?;
         if before.model_value_identity != after.model_value_identity
-            || before.model_value_identity != self.engine.model_registered_value
+            || before.model_value_identity != self.engine.semantic.model_registered_value
             || before.model_value_input.is_none()
             || after.model_value_input.is_none()
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let perspective = self.engine.nodes[self.root].position.side_to_move();
+        let perspective = self.engine.semantic.nodes[self.root]
+            .position
+            .side_to_move();
         let expected = |observation: &Observation| -> Result<(f32, u64), PalsError> {
             if let RawScore::ContextWdl {
                 win,
@@ -1300,45 +1431,58 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(PalsError::Capacity);
         }
         let repaired_line = query.repaired.as_ref().ok_or(RoleError::InvalidOutput)?;
-        let root = self.engine.nodes[self.root].situation;
-        let focus = self.engine.stores.situations.get(root)?.focus;
-        let line = self.engine.stores.hot_append_line(focus, repaired_line)?;
-        let evidence = self.engine.stores.hot_append_observation(Observation {
-            state: self.engine.nodes[self.root].state,
-            line: Some(line),
-            source: stable_id(self.engine.search_identity()),
-            epoch: 0,
-            scope: EvidenceScope::Model {
-                model: stable_id(self.engine.model.identity()),
-                encoding: stable_id("pals-frozen-pair-v3"),
-                input: before_revision,
-            },
-            value_identity: None,
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: None,
-            cpu_pv: None,
-            score: RawScore::ConditionalWdl {
-                expectation: after_value,
-                perspective,
-                context_revision: before_revision,
-                repaired,
-                counter,
-            },
-            budget: 0,
-            kind: ObservationKind::Refutation,
-            supersedes: None,
-            execution: None,
-        })?;
+        let root = self.engine.semantic.nodes[self.root].situation;
+        let focus = self.engine.semantic.stores.situations.get(root)?.focus;
+        let line = self
+            .engine
+            .semantic
+            .stores
+            .hot_append_line(focus, repaired_line)?;
+        let evidence = self
+            .engine
+            .semantic
+            .stores
+            .hot_append_observation(Observation {
+                state: self.engine.semantic.nodes[self.root].state,
+                line: Some(line),
+                source: stable_id(self.engine.search_identity()),
+                epoch: 0,
+                scope: EvidenceScope::Model {
+                    model: stable_id(self.engine.semantic.model.identity()),
+                    encoding: stable_id("pals-frozen-pair-v3"),
+                    input: before_revision,
+                },
+                value_identity: None,
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: None,
+                cpu_pv: None,
+                score: RawScore::ConditionalWdl {
+                    expectation: after_value,
+                    perspective,
+                    context_revision: before_revision,
+                    repaired,
+                    counter,
+                },
+                budget: 0,
+                kind: ObservationKind::Refutation,
+                supersedes: None,
+                execution: None,
+            })?;
         self.engine
+            .semantic
             .stores
             .hot_refute_continuation(root, line, evidence)?;
         self.conditional_witnesses.insert(
             evidence,
-            (ObservationKind::Refutation, query.context.prefix.clone()),
+            (
+                ObservationKind::Refutation,
+                query.context.prefix.clone(),
+                None,
+            ),
         );
         self.counters.supported_refutations += 1;
         Ok(true)
@@ -1369,29 +1513,34 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(())
     }
     pub fn result(&self, completion: PalsCompletion) -> Result<PalsResult, PalsError> {
-        let position = &self.engine.nodes[self.root].position;
-        if self.engine.nodes[self.root].terminal.is_some() {
+        let position = &self.engine.semantic.nodes[self.root].position;
+        if self.engine.semantic.nodes[self.root].terminal.is_some() {
             return self
                 .engine
                 .unsearched_result(position, PalsCompletion::Terminal, self.started);
         }
-        let legal = position.legal_moves();
+        let legal: Vec<_> = position
+            .legal_moves()
+            .into_iter()
+            .filter(|movement| self.root_move_allowed(*movement))
+            .collect();
         let mut counters = self.counters;
         if self.engine.uses_model_resolver() {
-            return self.engine.model_result(
+            let result = self.engine.model_result(
                 self.root,
                 &legal,
                 completion,
                 self.started,
                 &mut counters,
-            );
+            )?;
+            return self.apply_rovent_mate_strategy(result);
         }
         let mut best = legal.first().copied();
         let mut score = None;
         let mut scope = PalsValueScope::Unknown;
         let mut root_values = Vec::with_capacity(legal.len());
         for movement in legal {
-            let edge = self.engine.nodes[self.root]
+            let edge = self.engine.semantic.nodes[self.root]
                 .edges
                 .iter()
                 .find(|edge| edge.movement == movement);
@@ -1402,7 +1551,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 })
                 .map(|value| -value);
             let child_scope = edge.map_or(PalsValueScope::Unknown, |edge| {
-                if self.engine.nodes[edge.child].terminal.is_some() {
+                if self.engine.semantic.nodes[edge.child].terminal.is_some() {
                     PalsValueScope::RulesTerminal
                 } else if value.is_some() {
                     PalsValueScope::RestrictedEstimate
@@ -1428,19 +1577,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 score: value,
                 resolved_value,
                 scope: child_scope,
-                examined_replies: edge.map_or(0, |edge| self.engine.nodes[edge.child].edges.len()),
+                examined_replies: edge
+                    .map_or(0, |edge| self.engine.semantic.nodes[edge.child].edges.len()),
                 unexplored_replies: edge.map(|edge| {
-                    self.engine.nodes[edge.child]
+                    self.engine.semantic.nodes[edge.child]
                         .position
                         .legal_moves()
                         .len()
-                        .saturating_sub(self.engine.nodes[edge.child].edges.len())
+                        .saturating_sub(self.engine.semantic.nodes[edge.child].edges.len())
                 }),
             });
         }
-        counters.retained_situations = self.engine.nodes.len();
+        counters.retained_situations = self.engine.semantic.nodes.len();
         counters.root_scope_observation_complete = true;
-        Ok(PalsResult {
+        self.apply_rovent_mate_strategy(PalsResult {
             best_move: best,
             score,
             resolved_value: score.map_or(PalsResolvedValue::Unknown, |value| {
@@ -1449,20 +1599,23 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     perspective: position.side_to_move(),
                 }
             }),
-            model_value_identity: self.engine.model_registered_value.clone(),
-            checker_identity: self.engine.checker_registered_identity.clone(),
+            model_value_identity: self.engine.semantic.model_registered_value.clone(),
+            checker_identity: self.engine.researcher.checker_registered_identity.clone(),
             value_scope: scope,
             terminal: None,
             completion,
             counters,
             root_values,
             elapsed: self.started.elapsed(),
-            model_identity: self.engine.model.identity().to_owned(),
+            model_identity: self.engine.semantic.model.identity().to_owned(),
             resolver_version: self.engine.resolver_version(),
         })
     }
 }
-fn rank_moves(legal: &[BoardMove], output: &RoleOutput) -> Result<Vec<BoardMove>, PalsError> {
+pub(super) fn rank_moves(
+    legal: &[BoardMove],
+    output: &RoleOutput,
+) -> Result<Vec<BoardMove>, PalsError> {
     let logits = match &output.payload {
         RolePayload::Proposal {
             candidate_logits, ..

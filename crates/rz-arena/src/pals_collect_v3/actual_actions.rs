@@ -438,6 +438,18 @@ impl ActualGenerationActionOutcomeFactoryV3 {
         }
     }
 
+    /// Attempt to close the same retained action processes without extending
+    /// their original context or process deadlines. `None` means no context
+    /// was created, not that a native process was observed to complete.
+    pub(super) fn attempt_original_cleanup(
+        &mut self,
+        until: Instant,
+    ) -> Result<Option<Vec<AdaptiveSessionProcessReceipt>>, ArenaError> {
+        let Some(owner) = self.context.as_ref() else { return Ok(None); };
+        let original_bound = until.min(owner.original_deadline);
+        self.close_owned(original_bound).map(Some)
+    }
+
     fn fail_closed<T>(&mut self, error: ArenaError, until: Instant) -> Result<T, ArenaError> {
         if let Some(owner) = &mut self.context {
             owner.failed = Some(error.to_string());

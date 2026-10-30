@@ -6,7 +6,7 @@ pub mod diagnostic;
 pub mod external;
 mod native_backend;
 mod observations;
-mod protocol;
+pub(crate) mod protocol;
 mod resource_plan;
 mod resource_readback;
 pub mod runtime_assets;
@@ -539,6 +539,13 @@ impl PreparedAdaptiveProcessV5 {
         };
         let context = SearchSessionContext {
             authority,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
+            original_go: None,
+            original_time_budget: None,
+            original_start: None,
+            effective_clock: None,
+            requested_nodes: None,
             control: rz_search::driver::SearchControl::new(hard_deadline, self.cpu_nodes_limit),
             cancellation: CancelToken::new(),
             shutdown_deadline,
@@ -770,7 +777,13 @@ fn prepare_actual(
                     AdaptiveSessionCollectionHooks {
                         root_admission: Some(hooks.root_admission),
                         root_closure: Some(hooks.root_closure),
+                        utility_route_completed: None,
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        utility_trial_retired: None,
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        utility_intervention_trial_retired: None,
                         external_teacher: Some(hooks.teacher_observer),
+                        cooperative: None,
                     },
                 )
             }

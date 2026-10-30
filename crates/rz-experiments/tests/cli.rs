@@ -179,6 +179,127 @@ fn input_lock_and_integrity_verification_retain_readiness_false() {
     );
 }
 
+fn rovent_fixture() -> String {
+    let hash = "a".repeat(64);
+    let artifact = serde_json::json!({"path":"fixture/input.bin", "sha256":hash, "bytes":32,
+        "source":"https://example.org/rovent-cli-fixture", "license":"MIT"});
+    let model = serde_json::json!({"semantics":"fixture-model/1", "encoding":"fixture-input/1",
+        "policy_head":"legal-policy/1", "value_head":"wdl/1", "implementation_sha256":hash,
+        "weights":artifact, "provenance":artifact, "diagnostic":false});
+    serde_json::json!({
+        "domain":"rz-rovent-execution/1", "contract_revision":"rovent-search/0.1",
+        "run_id":"rovent-cli-fixture", "purpose":"validation",
+        "engine": {"source_commit":"b".repeat(40), "source_components":{"control":hash}, "binary":artifact,
+            "mode":"cpu_pc", "pc":{"proposer":model, "critic":model, "validator":null,
+                "backend":"rust_cpu", "device":{"device":"cpu"}, "backend_configuration_sha256":hash,
+                "runtime_artifacts":[], "fp32":true, "tf32":false, "batch_width":1,
+                "ort_intra_threads":null, "ort_inter_threads":null, "ort_spinning":null},
+            "researcher":null, "teachers":[], "nnuec":null,
+            "search":{"node_unit":"rovent-position-visits/1", "requested_nodes":null,
+                "depth_plies":null, "mate_moves":null, "registered_max_chess_plies":64,
+                "searchmoves":null, "search_configuration_sha256":hash,
+                "root_state_and_history_sha256":hash, "rules_profile_sha256":hash}},
+        "resources":{"cpu_quota_millicpus":2000, "pools":[{"actors":["manager","pc_caller"],
+            "max_threads":1, "cpu_charge_millicpus":1000}], "memory_high_bytes":6_u64<<30,
+            "memory_max_bytes":12_u64<<30, "gpu_devices":0, "physical_nn_concurrency":1,
+            "topology_policy":"shared-control/1"},
+        "coordinator":{"policy_sha256":hash, "questions_max":1024, "ancestor_depth_max":64,
+            "waiting_jobs_max":64, "role_tickets_max":16, "cpu_credit_limit":0,
+            "original_root_budget_sha256":hash, "original_deadline_seal_sha256":hash},
+        "wall_time_max_ms":60000, "cleanup_max_ms":30000, "output_bytes_max":1048576,
+        "agent_renewable":true, "provenance":[artifact]
+    }).to_string()
+}
+
+#[test]
+fn rovent_cli_locks_new_domain_preserves_legacy_separation_and_never_authorizes_execution() {
+    let directory = TestDirectory::new();
+    let input = directory.file("rovent.json", rovent_fixture());
+    let locked = directory.0.join("rovent.lock.json");
+    let output = run([OsStr::new("rovent-validate"), input.as_os_str()]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("execution_ready=false"));
+    assert_failure(&run([OsStr::new("validate"), input.as_os_str()]));
+    assert_failure(&run([OsStr::new("rovent-validate"), fixture().as_os_str()]));
+    let output = run([
+        OsStr::new("rovent-lock"),
+        input.as_os_str(),
+        locked.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let original = fs::read(&locked).unwrap();
+    let lock = rz_experiments::RoventInputLock::from_json(std::str::from_utf8(&original).unwrap())
+        .unwrap();
+    assert_failure(&run([
+        OsStr::new("rovent-lock"),
+        input.as_os_str(),
+        locked.as_os_str(),
+    ]));
+    assert_eq!(fs::read(&locked).unwrap(), original);
+    let hash = "a".repeat(64);
+    let artifact = serde_json::json!({"path":"fixture/evidence.json", "sha256":hash, "bytes":32,
+        "source":"https://example.org/rovent-cli-fixture", "license":"MIT"});
+    let unknown = serde_json::json!({"status":"unknown"});
+    let receipt = serde_json::json!({
+        "domain":"rz-rovent-execution-receipt/1", "run_id":lock.manifest.run_id,
+        "input_lock_sha256":lock.canonical_sha256,
+        "functional_accepted":false, "controlled_comparison_eligible":false,
+        "source_content_verified":unknown, "source_and_binary_evidence":unknown,
+        "model_content_verified":unknown, "model_configuration_sha256":unknown, "model_content_evidence":unknown,
+        "pc_device":unknown, "backend_configuration_sha256":unknown, "calls":unknown,
+        "nodes":unknown, "lifecycle":unknown, "goal":unknown, "root_moves_rules_seal":unknown,
+        "external_profiles_verified":unknown, "physical_state":unknown, "worker_joined_and_processes_closed":unknown,
+        "resources":{"limits_applied":unknown, "process_tree_quota_millicpus":unknown,
+            "memory_high_bytes":unknown, "memory_max_bytes":unknown, "inventory_complete":unknown,
+            "kernel_threads":unknown, "verified_plan_readback_sha256":unknown,
+            "host_peak_bytes":unknown, "vram_peak_bytes":unknown, "evidence":artifact},
+        "failures":[], "full_gc_requested":false, "memory_contention":false,
+        "wall_time_ms":0, "cleanup_ms":0, "output_bytes":0, "execution_evidence":artifact
+    });
+    let receipt_path = directory.file("unobserved-receipt.json", receipt.to_string());
+    let output = run([
+        OsStr::new("rovent-verify-receipt"),
+        locked.as_os_str(),
+        receipt_path.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("execution_attested=false"));
+    let mut wrong = receipt;
+    wrong["functional_accepted"] = serde_json::json!(true);
+    let wrong_path = directory.file("false-acceptance.json", wrong.to_string());
+    assert_failure(&run([
+        OsStr::new("rovent-verify-receipt"),
+        locked.as_os_str(),
+        wrong_path.as_os_str(),
+    ]));
+}
+
+#[test]
+fn rovent_cli_rejects_incomplete_arguments_and_malformed_inputs_before_writing() {
+    for args in [
+        vec!["rovent-validate"],
+        vec!["rovent-lock", "input"],
+        vec!["rovent-verify-receipt", "lock"],
+        vec!["rovent-validate", "input", "extra"],
+    ] {
+        assert_failure(&run(args));
+    }
+    let directory = TestDirectory::new();
+    let malformed = directory.file("bad.json", b"{bad");
+    let output = directory.0.join("not-created.json");
+    assert_failure(&run([
+        OsStr::new("rovent-lock"),
+        malformed.as_os_str(),
+        output.as_os_str(),
+    ]));
+    assert!(!output.exists());
+    let oversized = directory.file("oversized.json", vec![b' '; 4 * 1024 * 1024 + 1]);
+    assert!(
+        assert_failure(&run([OsStr::new("rovent-validate"), oversized.as_os_str()]))
+            .contains("4 MiB")
+    );
+}
+
 #[test]
 fn artifact_verification_requires_an_explicit_positive_budget() {
     for options in [

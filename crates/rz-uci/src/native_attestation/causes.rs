@@ -358,6 +358,13 @@ pub enum CauseNodeV1 {
     EngineSession {
         detail: TextFingerprintV1,
     },
+    /// Additive closure-failure projection. Historical cause variants retain
+    /// their exact fields; the original typed owner failure stays in EngineError.
+    EngineSearchDriverClose {
+        physical_completion_unknown: bool,
+        code: TextFingerprintV1,
+        detail: TextFingerprintV1,
+    },
     EngineTransport {
         failure: CauseLinkV1,
         cleanup: CauseListV1,
@@ -633,6 +640,13 @@ impl Budget {
                     )
                 }),
             },
+            WorkerFailureSource::RejectedDriverReport { error, .. } => {
+                CauseNodeV1::WorkerBoundary {
+                    // The original report and work remain in the typed worker
+                    // owner; this legacy graph cannot relabel them as V5 work.
+                    original: self.link(|budget| budget.contract(error, depth + 1)),
+                }
+            }
             WorkerFailureSource::Factory(error) => CauseNodeV1::WorkerFactory {
                 original: self.link(|budget| budget.contract(error, depth + 1)),
             },
@@ -658,6 +672,12 @@ impl Budget {
         Ok(match error {
             EngineError::Contract(error) => CauseNodeV1::EngineContract {
                 original: self.link(|budget| budget.contract(error, depth + 1)),
+            },
+            EngineError::SearchDriverClose(error) => CauseNodeV1::EngineSearchDriverClose {
+                physical_completion_unknown: error.physical_completion
+                    == crate::search_driver::DriverPhysicalCompletion::Unknown,
+                code: TextFingerprintV1::capture(error.code),
+                detail: TextFingerprintV1::capture(&error.detail),
             },
             EngineError::Session(error) => CauseNodeV1::EngineSession {
                 detail: TextFingerprintV1::capture(&error.0),
@@ -745,6 +765,33 @@ mod tests {
     use rz_contracts::*;
 
     const PRIVATE_TEXT: &str = "C:\\private-person\\native-runtime\\credentials-never-publish";
+
+    #[test]
+    fn driver_close_keeps_unknown_completion_and_redacts_dynamic_detail() {
+        let original = EngineError::SearchDriverClose(crate::search_driver::SearchSessionFailure {
+            physical_completion: crate::search_driver::DriverPhysicalCompletion::Unknown,
+            code: "PhysicalCompletionUnknown",
+            detail: PRIVATE_TEXT.into(),
+        });
+        let projected = engine(&original);
+        assert!(matches!(
+            &projected.projection,
+            CauseNodeV1::EngineSearchDriverClose {
+                physical_completion_unknown: true,
+                ..
+            }
+        ));
+        let bytes = serde_json::to_vec(&projected).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("private-person"));
+        let decoded: CauseReceiptV1 = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(
+            decoded.projection,
+            CauseNodeV1::EngineSearchDriverClose {
+                physical_completion_unknown: true,
+                ..
+            }
+        ));
+    }
 
     fn context() -> CompletionContext {
         let epoch = ProcessEpoch(41);

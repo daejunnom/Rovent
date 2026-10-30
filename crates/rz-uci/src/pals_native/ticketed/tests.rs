@@ -24,6 +24,18 @@ struct Facts {
     quiesced: AtomicUsize,
     fixture_evidence_produced: Mutex<Vec<(RequestId, TicketExecutionEvidence)>>,
     fixture_evidence_taken: Mutex<Vec<RequestId>>,
+    expected_dispatch: Mutex<
+        Option<(
+            NativeAcceptanceVerifier,
+            NativeAcceptanceVerifier,
+            Arc<View>,
+        )>,
+    >,
+    owned_dispatch: Mutex<Vec<(RoleTicketEnvelope, u64, u64, bool, bool, bool)>>,
+    run_observation: Mutex<Option<(TicketNativeObservationDisposition, RoleFailure)>>,
+    accept_observation: Mutex<Option<(TicketNativeObservationDisposition, RoleFailure)>>,
+    accept_failure: Mutex<Option<RoleFailure>>,
+    pending_observations: Mutex<std::collections::VecDeque<TicketNativeObservationFailure>>,
 }
 struct Fake {
     clock: ContractSystemClock,
@@ -68,6 +80,16 @@ impl TicketNativeBackend<View, u64> for Fake {
         // These are deterministic fake-backend observations, never evidence of
         // actual ORT/NN execution. Only this fixture's run produces them.
         let evidence = fixture_execution_evidence(ticket, *prepared);
+        if let Some((disposition, cause)) = self.facts.run_observation.lock().unwrap().take() {
+            self.facts.pending_observations.lock().unwrap().push_back(
+                TicketNativeObservationFailure {
+                    ticket: *ticket,
+                    stage: TicketNativeObservationStage::Completed,
+                    disposition,
+                    cause,
+                },
+            );
+        }
         self.fixture_evidence = Some((ticket.id, evidence));
         self.facts
             .fixture_evidence_produced
@@ -82,6 +104,29 @@ impl TicketNativeBackend<View, u64> for Fake {
             },
             output: Ok((*prepared, question.view.value)),
         }
+    }
+    fn run_owned(
+        &mut self,
+        context: TicketOwnerDispatchContext<'_, View, u64, u64>,
+        canceled: &AtomicBool,
+    ) -> TicketPhysicalResult<(u64, u64)> {
+        if let Some((expected, other, view)) = self.facts.expected_dispatch.lock().unwrap().as_ref()
+        {
+            self.facts.owned_dispatch.lock().unwrap().push((
+                *context.ticket(),
+                context.question().query,
+                *context.prepared(),
+                context.same_owner(expected),
+                context.same_owner(other),
+                Arc::ptr_eq(&context.question().view, view),
+            ));
+        }
+        self.run(
+            context.ticket(),
+            context.question(),
+            context.prepared(),
+            canceled,
+        )
     }
     fn output_host_bytes(&self, _: &(u64, u64)) -> u64 {
         16
@@ -107,6 +152,9 @@ impl TicketNativeBackend<View, u64> for Fake {
         self.facts.fixture_evidence_taken.lock().unwrap().push(id);
         Some(evidence)
     }
+    fn take_observation_failure(&mut self) -> Option<TicketNativeObservationFailure> {
+        self.facts.pending_observations.lock().unwrap().pop_front()
+    }
     fn accept(
         &mut self,
         ticket: &RoleTicketEnvelope,
@@ -115,6 +163,19 @@ impl TicketNativeBackend<View, u64> for Fake {
         _: &(u64, u64),
     ) -> Result<(), RoleFailure> {
         self.facts.accepted.lock().unwrap().push(ticket.id.sequence);
+        if let Some((disposition, cause)) = self.facts.accept_observation.lock().unwrap().take() {
+            self.facts.pending_observations.lock().unwrap().push_back(
+                TicketNativeObservationFailure {
+                    ticket: *ticket,
+                    stage: TicketNativeObservationStage::Retired,
+                    disposition,
+                    cause,
+                },
+            );
+        }
+        if let Some(failure) = self.facts.accept_failure.lock().unwrap().take() {
+            return Err(failure);
+        }
         if self.facts.fail_accept.load(Ordering::Acquire) {
             Err(RoleFailure::Backend(
                 "fixture observer failed after a partial acknowledgement".into(),
@@ -178,6 +239,12 @@ fn fixture_facts(gate: bool) -> Arc<Facts> {
         quiesced: AtomicUsize::new(0),
         fixture_evidence_produced: Mutex::new(Vec::new()),
         fixture_evidence_taken: Mutex::new(Vec::new()),
+        expected_dispatch: Mutex::new(None),
+        owned_dispatch: Mutex::new(Vec::new()),
+        run_observation: Mutex::new(None),
+        accept_observation: Mutex::new(None),
+        accept_failure: Mutex::new(None),
+        pending_observations: Mutex::new(std::collections::VecDeque::new()),
     })
 }
 fn authority(root: u64) -> SearchAuthority {
@@ -355,6 +422,180 @@ fn native_owner_receipt_confirms_only_after_the_original_output_acknowledgement(
         .unwrap();
     assert_eq!(service.occupancy(), 0);
     finish(service);
+}
+
+#[test]
+fn required_retirement_observation_does_not_rewrite_original_owner_acceptance() {
+    let (mut service, facts, clock) = spawn(true);
+    let (id, original, permit, mut registry) = issued_acceptance(&mut service, &clock, true);
+    let cause = RoleFailure::Backend("required retirement observation failed".into());
+    *facts.accept_observation.lock().unwrap() = Some((
+        TicketNativeObservationDisposition::RequiredAfterPhysical,
+        cause.clone(),
+    ));
+    service.accept_with_permit(id, original, permit).unwrap();
+    let receipt = match next(&service) {
+        TicketNativeEvent::Retired {
+            ticket,
+            accepted,
+            result,
+            native_receipt,
+            rejected_permit,
+            observation_failures,
+        } => {
+            assert_eq!(ticket, original);
+            assert!(accepted);
+            assert_eq!(result, Ok(()));
+            assert!(rejected_permit.is_none());
+            let reports: Vec<_> = observation_failures.iter().collect();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].ticket, original);
+            assert_eq!(reports[0].stage, TicketNativeObservationStage::Retired);
+            assert_eq!(
+                reports[0].disposition,
+                TicketNativeObservationDisposition::RequiredAfterPhysical
+            );
+            assert_eq!(reports[0].cause, cause);
+            native_receipt.expect("actual successful acceptance retains original receipt")
+        }
+        _ => panic!("expected original retirement with observation"),
+    };
+    registry
+        .confirm_native_acceptance(receipt, clock.domain(), clock.now())
+        .unwrap();
+    service.accept(id, original).unwrap();
+    assert!(matches!(next(&service), TicketNativeEvent::Rejected {
+        preparation, error: TicketServiceError::UnknownPreparation
+    } if preparation == id));
+    assert_eq!(facts.accepted.lock().unwrap().as_slice(), &[1]);
+    finish(service);
+}
+
+#[test]
+fn unknown_acceptance_preserves_failure_and_original_permit_without_replay() {
+    let (mut service, facts, clock) = spawn(true);
+    let (id, original, permit, _registry) = issued_acceptance(&mut service, &clock, true);
+    *facts.accept_failure.lock().unwrap() = Some(RoleFailure::PhysicalUnknown);
+    let cause = RoleFailure::Backend("retirement observation failed".into());
+    *facts.accept_observation.lock().unwrap() = Some((
+        TicketNativeObservationDisposition::RequiredAfterPhysical,
+        cause.clone(),
+    ));
+    service.accept_with_permit(id, original, permit).unwrap();
+    let permit = match next(&service) {
+        TicketNativeEvent::Retired {
+            ticket,
+            accepted,
+            result,
+            native_receipt,
+            rejected_permit,
+            observation_failures,
+        } => {
+            assert_eq!(ticket, original);
+            assert!(!accepted);
+            assert_eq!(result, Err(RoleFailure::PhysicalUnknown));
+            assert!(native_receipt.is_none());
+            let reports: Vec<_> = observation_failures.iter().collect();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].ticket, original);
+            assert_eq!(reports[0].stage, TicketNativeObservationStage::Retired);
+            assert_eq!(reports[0].cause, cause);
+            let permit = rejected_permit.expect("unconfirmed acceptance returns original permit");
+            assert_eq!(permit.ticket(), &original);
+            permit
+        }
+        _ => panic!("expected physical-unknown retirement"),
+    };
+    service.accept_with_permit(id, original, permit).unwrap();
+    match next(&service) {
+        TicketNativeEvent::AcceptanceRejected {
+            preparation,
+            ticket,
+            error,
+            permit,
+        } => {
+            assert_eq!(preparation, id);
+            assert_eq!(ticket, original);
+            assert_eq!(error, TicketServiceError::Duplicate);
+            assert_eq!(permit.ticket(), &original);
+        }
+        _ => panic!("expected duplicate rejection retaining permit"),
+    }
+    assert_eq!(facts.accepted.lock().unwrap().as_slice(), &[1]);
+    // This fake has no device-backed resources. Real PhysicalUnknown is not
+    // resolved by this fixture's explicit discard or fake finish callback.
+    service.discard(id, original).unwrap();
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::Retired { result: Ok(()), .. }
+    ));
+    finish(service);
+}
+
+#[test]
+fn completed_observation_is_one_terminal_and_preserves_actual_physical_result() {
+    for physical_unknown in [false, true] {
+        let (mut service, facts, clock) = spawn(true);
+        let value = if physical_unknown { 99 } else { 2 };
+        let seal = prepare(
+            &mut service,
+            value,
+            4,
+            &clock,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let original = ticket(seal, 1);
+        let cause = RoleFailure::Backend("completed observation failed".into());
+        *facts.run_observation.lock().unwrap() = Some((
+            TicketNativeObservationDisposition::RequiredAfterPhysical,
+            cause.clone(),
+        ));
+        service.execute(seal.preparation, original).unwrap();
+        let (completion, reports) = loop {
+            if let TicketNativeEvent::Completed {
+                completion,
+                observation_failures,
+                ..
+            } = next(&service)
+            {
+                break (completion, observation_failures);
+            }
+        };
+        assert_eq!(completion.ticket, original);
+        let entries: Vec<_> = reports.iter().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ticket, original);
+        assert_eq!(entries[0].stage, TicketNativeObservationStage::Completed);
+        assert_eq!(
+            entries[0].disposition,
+            TicketNativeObservationDisposition::RequiredAfterPhysical
+        );
+        assert_eq!(entries[0].cause, cause);
+        if physical_unknown {
+            assert_eq!(completion.physical, PhysicalRoleCompletion::Unknown);
+            assert!(matches!(
+                completion.result,
+                Err(RoleFailure::PhysicalUnknown)
+            ));
+            assert!(matches!(
+                next(&service),
+                TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed: false
+                }
+            ));
+            assert!(service.is_quarantined());
+            drop(service);
+        } else {
+            assert_eq!(completion.physical, PhysicalRoleCompletion::Confirmed);
+            assert_eq!(*completion.result.unwrap(), (2, 102));
+            service.discard(seal.preparation, original).unwrap();
+            assert!(matches!(
+                next(&service),
+                TicketNativeEvent::Retired { result: Ok(()), .. }
+            ));
+            finish(service);
+        }
+    }
 }
 
 #[test]
@@ -618,6 +859,123 @@ fn finish(mut service: TicketedNativeService<View, u64, Fake>) {
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[test]
+fn real_worker_dispatch_preserves_original_owner_ticket_and_prepared_input() {
+    let (mut service, facts, clock) = spawn(true);
+    let q = question(23, 7, &clock, Arc::new(AtomicUsize::new(0)));
+    let original_view = Arc::clone(&q.view);
+    let preparation = service.prepare(q).map_err(|error| error.0).unwrap();
+    let seal = loop {
+        if let TicketNativeEvent::Prepared(seal) = next(&service) {
+            assert_eq!(seal.preparation, preparation);
+            break seal;
+        }
+    };
+    let expected = service.native_acceptance_verifier().unwrap();
+    let (_other_issuer, other) = NativeAcceptanceIssuer::new_pair();
+    *facts.expected_dispatch.lock().unwrap() = Some((expected, other, original_view));
+    let original = ticket(seal, 1);
+    service.execute(preparation, original).unwrap();
+    let completion = completed(&service);
+    assert_eq!(completion.ticket, original);
+    assert_eq!(*completion.result.unwrap(), (23, 123));
+    assert_eq!(
+        facts.owned_dispatch.lock().unwrap().as_slice(),
+        &[(original, 23, 23, true, false, true)]
+    );
+    service.discard(preparation, original).unwrap();
+    assert!(matches!(
+        next(&service),
+        TicketNativeEvent::Retired { result: Ok(()), .. }
+    ));
+    finish(service);
+}
+
+#[test]
+fn owner_context_projection_requires_the_original_view_and_question_contract() {
+    let clock = ContractSystemClock::new(ProcessEpoch(17));
+    let source = question(5, 7, &clock, Arc::new(AtomicUsize::new(0)));
+    let seal = PreparedTicketSeal {
+        preparation: PreparationId(1),
+        question: source.question,
+        view: source.seal,
+        representation: key(5),
+        role: source.role,
+        original_deadline: source.deadline,
+    };
+    let original = ticket(seal, 1);
+    let (_issuer, owner) = NativeAcceptanceIssuer::new_pair();
+    let (_other_issuer, other) = NativeAcceptanceIssuer::new_pair();
+    let original_prepared = 5_u64;
+    let projected_prepared = 9_u64;
+    let original_cancellation = Arc::new(AtomicBool::new(false));
+    let projected = || TicketPreparation {
+        question: source.question,
+        seal: source.seal,
+        role: source.role,
+        deadline: source.deadline,
+        view: Arc::clone(&source.view),
+        query: 9_u64,
+    };
+    let context = || TicketOwnerDispatchContext {
+        verifier: &owner,
+        ticket: &original,
+        question: &source,
+        prepared: &original_prepared,
+        canceled: &original_cancellation,
+    };
+
+    let matching = projected();
+    let result = context().project(&matching, &projected_prepared).unwrap();
+    assert!(result.same_owner(&owner));
+    assert!(!result.same_owner(&other));
+    assert_eq!(result.ticket(), &original);
+    assert_eq!(*result.prepared(), projected_prepared);
+    assert!(Arc::ptr_eq(&result.question().view, &source.view));
+    // Projection must retain the real preparation's cancellation word, not
+    // a new flag or acceptance/fence authority.
+    let original_cancel = context().original_cancellation();
+    let projected_cancel = result.original_cancellation();
+    assert!(original_cancel.try_claim_submission());
+    original_cancellation.store(true, Ordering::Release);
+    assert!(projected_cancel.is_canceled());
+    assert!(!projected_cancel.try_claim_submission());
+
+    let mut changed = projected();
+    changed.question = Digest([42; 32]);
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.seal.view_sequence += 1;
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.role = Role::Critic;
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.deadline.at = MonotonicTick(changed.deadline.at.0 + 1);
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
+    let mut changed = projected();
+    changed.view = Arc::new(View {
+        value: source.view.value,
+        drops: Arc::clone(&source.view.drops),
+    });
+    assert!(matches!(
+        context().project(&changed, &projected_prepared),
+        Err(RoleFailure::InvalidOutput)
+    ));
 }
 
 #[test]

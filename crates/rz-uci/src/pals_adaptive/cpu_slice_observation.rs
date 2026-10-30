@@ -11,6 +11,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
+#[cfg(feature = "pals-adaptive-diagnostics")]
+mod nnuec_chain;
+#[cfg(feature = "pals-adaptive-diagnostics")]
+pub use nnuec_chain::*;
+
 pub const CPU_SLICE_DIAGNOSTIC_RECORDS_MAX: usize = 256;
 
 /// Explicit diagnostic opt-in. The ordinary manager allocates no journal.
@@ -162,17 +167,25 @@ pub struct AdaptiveCpuSliceDiagnosticSnapshot {
     pub records_max: usize,
     pub unavailable: Option<AdaptiveCpuSliceDiagnosticUnavailable>,
     pub records: Vec<AdaptiveCpuSliceObservation>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub nnuec_chain: Vec<NnuecChainObservation>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub nnuec_chain_dropped: u64,
 }
 #[derive(Debug)]
 struct State {
     authority: Option<SearchAuthority>,
     records: Vec<AdaptiveCpuSliceObservation>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    nnuec_chain: Vec<NnuecChainObservation>,
 }
 #[derive(Debug)]
 struct Inner {
     records_max: usize,
     state: Mutex<State>,
     unavailable: AtomicU8,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    nnuec_chain_dropped: std::sync::atomic::AtomicU64,
 }
 /// Explicit bounded metadata collector. It owns no worker, controls, native
 /// credit, Rules proof, tensor, callback, or I/O handle. Clone shares only this
@@ -192,14 +205,24 @@ impl AdaptiveCpuSliceDiagnostic {
         records
             .try_reserve_exact(options.records_max)
             .map_err(|_| AdaptiveCpuSliceDiagnosticError::Allocation)?;
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        let mut nnuec_chain = Vec::new();
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        nnuec_chain
+            .try_reserve_exact(options.records_max)
+            .map_err(|_| AdaptiveCpuSliceDiagnosticError::Allocation)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 records_max: options.records_max,
                 state: Mutex::new(State {
                     authority: None,
                     records,
+                    #[cfg(feature = "pals-adaptive-diagnostics")]
+                    nnuec_chain,
                 }),
                 unavailable: AtomicU8::new(0),
+                #[cfg(feature = "pals-adaptive-diagnostics")]
+                nnuec_chain_dropped: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -221,6 +244,10 @@ impl AdaptiveCpuSliceDiagnostic {
             authority: state.authority,
             records_max: self.inner.records_max,
             records: state.records.clone(),
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            nnuec_chain: state.nnuec_chain.clone(),
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            nnuec_chain_dropped: self.inner.nnuec_chain_dropped.load(Ordering::Acquire),
             unavailable: AdaptiveCpuSliceDiagnosticUnavailable::decode(
                 self.inner.unavailable.load(Ordering::Acquire),
             ),
@@ -286,7 +313,10 @@ impl AdaptiveCpuSliceDiagnostic {
             self.mark_unavailable(AdaptiveCpuSliceDiagnosticUnavailable::ScopeMismatch);
             return;
         }
-        if state.records.len() == self.inner.records_max {
+        let retained_records = state.records.len();
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        let retained_records = retained_records.saturating_add(state.nnuec_chain.len());
+        if retained_records >= self.inner.records_max {
             self.mark_unavailable(AdaptiveCpuSliceDiagnosticUnavailable::Overflow);
             return;
         }
@@ -403,6 +433,7 @@ mod tests {
             feedback_already_forwarded: false,
         };
         let report = CpuSliceReport {
+            reciprocal_request: None,
             grant: SliceGrant {
                 job: job.id,
                 execution: ExecutionId {
@@ -546,5 +577,37 @@ mod tests {
             diagnostic.snapshot(),
             Err(AdaptiveCpuSliceDiagnosticError::Poisoned)
         ));
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    #[test]
+    fn chain_and_settled_slices_share_the_original_record_budget() {
+        let diagnostic = journal(1);
+        let (scope, report, accounting) = sample();
+        diagnostic.bind(scope.authority).unwrap();
+        // Authored metadata only, not an actual installation/Begin receipt.
+        let event = NnuecChainEvent::NnuecJobBound(NnuecJobBindingObservation {
+            frame: scope.frame,
+            question: scope.question,
+            view: scope.view,
+            full_view: Digest([9; 32]),
+            job: scope.job,
+            first_grant: report.grant,
+            installation_sequence: 1,
+            installation_succeeded: true,
+            binding: scope.job.evaluation_namespace,
+            installed_owner: Some(report.grant.owner),
+            actual_stack_owner_id: None,
+        });
+        diagnostic.record_nnuec_chain(event);
+        diagnostic.record_settled(scope, &report, Some(accounting), None);
+        diagnostic.record_nnuec_chain(event);
+        let snapshot = diagnostic.snapshot().unwrap();
+        assert_eq!(snapshot.nnuec_chain.len(), 1);
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.nnuec_chain_dropped, 1);
+        assert_eq!(
+            snapshot.unavailable,
+            Some(AdaptiveCpuSliceDiagnosticUnavailable::Overflow)
+        );
     }
 }

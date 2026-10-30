@@ -1,4 +1,4 @@
-//! Retained V5 snapshot descriptors to the existing shared runtime cache.
+//! Admitted retained snapshot descriptors to the existing shared runtime cache.
 //!
 //! No library is loaded here. The native factory owner calls this before ORT
 //! initialization, away from the coordinator. A cache hit still verifies the
@@ -13,11 +13,125 @@
 //! be observed.
 
 use crate::pals_adaptive_startup::PinnedPalsStartupV5;
+use cap_std::fs::Dir;
 use rz_eval::{
     error::{BackendError, FailureKind as K, FailureStage as S},
     runtime_pin::RuntimeLibraryPin,
 };
-use rz_experiments::PalsModelBackendV3;
+use rz_experiments::{ArtifactRef, PalsModelBackendV3};
+use std::{fs::File, path::Path};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeBackend {
+    OrtCpu,
+    OrtCuda,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeAssetKind {
+    Core,
+    CudaDependency,
+    BundleManifest,
+}
+
+/// A declaration borrowed from the caller's already admitted execution lock.
+/// Artifact identity and its private snapshot name are deliberately distinct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeAssetDeclaration<'a> {
+    pub artifact: &'a ArtifactRef,
+    pub snapshot_path: &'a str,
+    pub kind: RuntimeAssetKind,
+}
+
+/// The original descriptor, not a reopened pathname or a verification flag.
+// Non-Linux callers retain this same borrowed declaration/FD shape, but the
+// admission boundary rejects that unsupported profile before reading either.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeAssetView<'a> {
+    pub declaration: RuntimeAssetDeclaration<'a>,
+    pub file: &'a File,
+}
+
+/// Only closed-roster admission can create the plan consumed by the loader.
+pub(crate) struct AdmittedRuntimeRoster<'a> {
+    #[cfg(target_os = "linux")]
+    plan: RuntimePlan<'a>,
+    #[cfg(not(target_os = "linux"))]
+    _borrow: std::marker::PhantomData<&'a File>,
+}
+
+/// Bind every held descriptor to exactly one expected declaration before any
+/// manifest read. The owner remains responsible for admitting its execution
+/// lock; this function cannot turn an arbitrary caller assertion into one.
+pub(crate) fn admit_runtime_roster<'a>(
+    backend: RuntimeBackend,
+    expected: &[RuntimeAssetDeclaration<'_>],
+    held: &[RuntimeAssetView<'a>],
+) -> Result<AdmittedRuntimeRoster<'a>, BackendError> {
+    #[cfg(target_os = "linux")]
+    {
+        let count = match backend {
+            RuntimeBackend::OrtCpu => 1,
+            RuntimeBackend::OrtCuda => 20, // Nineteen regular files + manifest.
+        };
+        require(
+            expected.len() == count && held.len() == count,
+            "runtime roster differs from the closed provider file count",
+        )?;
+        let mut expected_paths = BTreeSet::new();
+        for declaration in expected {
+            declaration
+                .artifact
+                .validate()
+                .map_err(|_| invalid("runtime artifact declaration is invalid"))?;
+            require(
+                rz_experiments::pals_private_snapshot_path_v5(declaration.snapshot_path)
+                    && expected_paths.insert(declaration.snapshot_path),
+                "runtime roster contains an unsafe or duplicate snapshot name",
+            )?;
+            require(
+                held.iter()
+                    .filter(|view| view.declaration == *declaration)
+                    .count()
+                    == 1,
+                "runtime held descriptors differ from the exact expected roster",
+            )?;
+        }
+        Ok(AdmittedRuntimeRoster {
+            plan: RuntimePlan::from_assets(backend, held)?,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (backend, expected, held);
+        Err(unavailable(
+            "retained runtime identity requires the Linux positional-descriptor profile",
+        ))
+    }
+}
+
+/// The single retained-FD to RuntimeCache path. No ORT initialization or
+/// provider execution occurs here, and no guard-free path overload is exposed.
+pub(crate) fn pin_retained_runtime(
+    root_path: &Path,
+    original_root_capability: Dir,
+    roster: AdmittedRuntimeRoster<'_>,
+) -> Result<RuntimeLibraryPin, BackendError> {
+    #[cfg(target_os = "linux")]
+    {
+        let guards = SnapshotGuards::capture(root_path, original_root_capability, &roster.plan)?;
+        let cache = RuntimeCache::for_user()?;
+        pin_plan(&cache, root_path, &roster.plan, guards)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root_path, original_root_capability, roster);
+        Err(unavailable(
+            "retained runtime identity requires the Linux positional-descriptor profile",
+        ))
+    }
+}
 
 /// Provider selection comes only from the admitted endpoint. No environment
 /// variable, path suffix or automatic CPU fallback changes that selection.
@@ -32,10 +146,28 @@ pub fn pin_runtime_v5(owner: &PinnedPalsStartupV5) -> Result<RuntimeLibraryPin, 
             .private_root_capability()
             .map_err(|_| invalid("cannot retain the original V5 snapshot root"))?;
         verify_owner_runtime_roster(owner)?;
-        let plan = RuntimePlan::from_assets(owner.config.endpoint.model.backend, owner.assets())?;
-        let guards = SnapshotGuards::capture(owner.private_cwd(), root, &plan)?;
-        let cache = RuntimeCache::for_user()?;
-        pin_plan(&cache, owner.private_cwd(), &plan, guards)
+        let expected: Vec<_> = owner
+            .config
+            .assets
+            .iter()
+            .filter_map(v5_declaration)
+            .collect();
+        let held: Vec<_> = owner
+            .assets()
+            .iter()
+            .filter_map(|asset| {
+                Some(RuntimeAssetView {
+                    declaration: v5_declaration(&asset.declaration)?,
+                    file: &asset.file,
+                })
+            })
+            .collect();
+        let roster = admit_runtime_roster(
+            v5_backend(owner.config.endpoint.model.backend)?,
+            &expected,
+            &held,
+        )?;
+        pin_retained_runtime(owner.private_cwd(), root, roster)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -67,19 +199,43 @@ fn require(ok: bool, detail: &'static str) -> Result<(), BackendError> {
 
 #[cfg(target_os = "linux")]
 use {
-    crate::pals_adaptive_startup::PinnedStartupAssetV5,
     cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt},
-    cap_std::fs::{Dir, OpenOptions},
+    cap_std::fs::OpenOptions,
     rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache},
-    rz_experiments::PalsStartupAssetPurposeV5 as Purpose,
+    rz_experiments::{PalsStartupAssetPurposeV5 as Purpose, PalsStartupAssetV5},
     sha2::{Digest as _, Sha256},
     std::{
         collections::BTreeSet,
-        fs::File,
         os::unix::fs::{FileExt, MetadataExt},
-        path::{Component, Path},
+        path::Component,
     },
 };
+
+#[cfg(target_os = "linux")]
+fn v5_backend(backend: PalsModelBackendV3) -> Result<RuntimeBackend, BackendError> {
+    match backend {
+        PalsModelBackendV3::OrtCpu => Ok(RuntimeBackend::OrtCpu),
+        PalsModelBackendV3::OrtCuda => Ok(RuntimeBackend::OrtCuda),
+        _ => Err(unavailable(
+            "this V5 runtime bridge requires an explicitly selected ORT backend",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn v5_declaration(asset: &PalsStartupAssetV5) -> Option<RuntimeAssetDeclaration<'_>> {
+    let kind = match asset.purpose {
+        Purpose::RuntimeLibrary => RuntimeAssetKind::Core,
+        Purpose::CudaLibrary => RuntimeAssetKind::CudaDependency,
+        Purpose::CudaManifest => RuntimeAssetKind::BundleManifest,
+        _ => return None,
+    };
+    Some(RuntimeAssetDeclaration {
+        artifact: &asset.artifact,
+        snapshot_path: &asset.snapshot_path,
+        kind,
+    })
+}
 
 #[cfg(target_os = "linux")]
 fn verify_owner_runtime_roster(owner: &PinnedPalsStartupV5) -> Result<(), BackendError> {
@@ -111,48 +267,42 @@ fn verify_owner_runtime_roster(owner: &PinnedPalsStartupV5) -> Result<(), Backen
 
 #[cfg(target_os = "linux")]
 struct CudaPlan<'a> {
-    manifest: &'a PinnedStartupAssetV5,
+    manifest: RuntimeAssetView<'a>,
     spec: CudaRuntimeBundleSpec,
-    files: Vec<&'a PinnedStartupAssetV5>,
+    files: Vec<RuntimeAssetView<'a>>,
     parent: String,
 }
 #[cfg(target_os = "linux")]
 struct RuntimePlan<'a> {
-    core: &'a PinnedStartupAssetV5,
+    core: RuntimeAssetView<'a>,
     cuda: Option<CudaPlan<'a>>,
 }
 #[cfg(target_os = "linux")]
 impl<'a> RuntimePlan<'a> {
     fn from_assets(
-        backend: PalsModelBackendV3,
-        assets: &'a [PinnedStartupAssetV5],
+        backend: RuntimeBackend,
+        assets: &[RuntimeAssetView<'a>],
     ) -> Result<Self, BackendError> {
-        if !matches!(
-            backend,
-            PalsModelBackendV3::OrtCpu | PalsModelBackendV3::OrtCuda
-        ) {
-            return Err(unavailable(
-                "this V5 runtime bridge requires an explicitly selected ORT backend",
-            ));
-        }
-        let exactly_one = |purpose| {
-            let mut entries = assets.iter().filter(|a| a.declaration.purpose == purpose);
+        let exactly_one = |kind| {
+            let mut entries = assets.iter().filter(|a| a.declaration.kind == kind);
             let first = entries
                 .next()
                 .ok_or_else(|| invalid("missing runtime asset purpose"))?;
             require(entries.next().is_none(), "ambiguous runtime asset purpose")?;
-            Ok::<_, BackendError>(first)
+            Ok::<_, BackendError>(*first)
         };
-        let core = exactly_one(Purpose::RuntimeLibrary)?;
+        let core = exactly_one(RuntimeAssetKind::Core)?;
         let cuda_files: Vec<_> = assets
             .iter()
-            .filter(|a| a.declaration.purpose == Purpose::CudaLibrary)
+            .filter(|a| a.declaration.kind == RuntimeAssetKind::CudaDependency)
+            .copied()
             .collect();
         let manifests: Vec<_> = assets
             .iter()
-            .filter(|a| a.declaration.purpose == Purpose::CudaManifest)
+            .filter(|a| a.declaration.kind == RuntimeAssetKind::BundleManifest)
+            .copied()
             .collect();
-        if backend == PalsModelBackendV3::OrtCpu {
+        if backend == RuntimeBackend::OrtCpu {
             require(
                 cuda_files.is_empty() && manifests.is_empty(),
                 "CPU runtime cannot carry CUDA libraries or a bundle manifest",
@@ -168,11 +318,11 @@ impl<'a> RuntimePlan<'a> {
             "CUDA runtime requires exactly one manifest and eighteen non-core files",
         )?;
         let manifest = manifests[0];
-        let raw = read_small(manifest, 64 << 10)?;
+        let raw = read_small(&manifest, 64 << 10)?;
         let spec = CudaRuntimeBundleSpec::from_json(
             std::str::from_utf8(&raw).map_err(|_| invalid("CUDA runtime manifest is not UTF-8"))?,
         )?;
-        let (parent, basename) = split_snapshot(core)?;
+        let (parent, basename) = split_snapshot(&core)?;
         let declared_core = spec
             .files
             .iter()
@@ -225,7 +375,7 @@ impl<'a> RuntimePlan<'a> {
             }),
         })
     }
-    fn originals(&self) -> Vec<&'a PinnedStartupAssetV5> {
+    fn originals(&self) -> Vec<RuntimeAssetView<'a>> {
         let mut originals = vec![self.core];
         if let Some(cuda) = &self.cuda {
             originals.push(cuda.manifest);
@@ -236,9 +386,9 @@ impl<'a> RuntimePlan<'a> {
 }
 
 #[cfg(target_os = "linux")]
-fn split_snapshot(asset: &PinnedStartupAssetV5) -> Result<(&str, &str), BackendError> {
+fn split_snapshot<'a>(asset: &RuntimeAssetView<'a>) -> Result<(&'a str, &'a str), BackendError> {
     require(
-        rz_experiments::pals_private_snapshot_path_v5(&asset.declaration.snapshot_path),
+        rz_experiments::pals_private_snapshot_path_v5(asset.declaration.snapshot_path),
         "unsafe runtime snapshot name",
     )?;
     asset
@@ -275,13 +425,13 @@ fn identity(file: &File) -> Result<FileIdentity, BackendError> {
     })
 }
 #[cfg(target_os = "linux")]
-fn verify_descriptor(asset: &PinnedStartupAssetV5) -> Result<FileIdentity, BackendError> {
+fn verify_descriptor(asset: &RuntimeAssetView<'_>) -> Result<FileIdentity, BackendError> {
     asset
         .declaration
         .artifact
         .validate()
         .map_err(|_| invalid("runtime artifact declaration is invalid"))?;
-    let before = identity(&asset.file)?;
+    let before = identity(asset.file)?;
     require(
         before.bytes == asset.declaration.artifact.bytes
             && before.bytes > 0
@@ -315,13 +465,13 @@ fn verify_descriptor(asset: &PinnedStartupAssetV5) -> Result<FileIdentity, Backe
     )?;
     require(
         format!("{:x}", hash.finalize()) == asset.declaration.artifact.sha256
-            && identity(&asset.file)? == before,
+            && identity(asset.file)? == before,
         "runtime descriptor SHA or identity changed during verification",
     )?;
     Ok(before)
 }
 #[cfg(target_os = "linux")]
-fn read_small(asset: &PinnedStartupAssetV5, limit: u64) -> Result<Vec<u8>, BackendError> {
+fn read_small(asset: &RuntimeAssetView<'_>, limit: u64) -> Result<Vec<u8>, BackendError> {
     require(
         asset.declaration.artifact.bytes > 0 && asset.declaration.artifact.bytes <= limit,
         "runtime manifest exceeds its bounded descriptor budget",
@@ -334,7 +484,7 @@ fn read_small(asset: &PinnedStartupAssetV5, limit: u64) -> Result<Vec<u8>, Backe
         .map_err(|_| io("runtime manifest positional read failed"))?;
     require(
         format!("{:x}", Sha256::digest(&bytes)) == asset.declaration.artifact.sha256
-            && identity(&asset.file)? == before,
+            && identity(asset.file)? == before,
         "runtime manifest changed while read",
     )?;
     Ok(bytes)
@@ -342,7 +492,7 @@ fn read_small(asset: &PinnedStartupAssetV5, limit: u64) -> Result<Vec<u8>, Backe
 
 #[cfg(target_os = "linux")]
 struct NamedGuard<'a> {
-    asset: &'a PinnedStartupAssetV5,
+    asset: RuntimeAssetView<'a>,
     parent: Dir,
     basename: String,
     identity: FileIdentity,
@@ -416,8 +566,8 @@ impl<'a> SnapshotGuards<'a> {
         )?;
         let mut files = Vec::new();
         for asset in plan.originals() {
-            let held_identity = verify_descriptor(asset)?;
-            let (parents, basename) = split_snapshot(asset)?;
+            let held_identity = verify_descriptor(&asset)?;
+            let (parents, basename) = split_snapshot(&asset)?;
             let mut parent = root
                 .try_clone()
                 .map_err(|_| io("cannot retain runtime snapshot parent"))?;
@@ -452,14 +602,14 @@ impl<'a> SnapshotGuards<'a> {
             "runtime snapshot root was replaced",
         )?;
         for guard in &self.files {
-            let (parents, _) = split_snapshot(guard.asset)?;
+            let (parents, _) = split_snapshot(&guard.asset)?;
             let ambient_parent = open_real_absolute_directory(&path.join(parents))?;
             require(
                 directory_identity(&ambient_parent)? == directory_identity(&guard.parent)?,
                 "runtime snapshot parent was replaced",
             )?;
             require(
-                identity(&guard.asset.file)? == guard.identity
+                identity(guard.asset.file)? == guard.identity
                     && identity(&open_named(&ambient_parent, &guard.basename)?)? == guard.identity,
                 "runtime snapshot named file or original descriptor changed",
             )?;
@@ -480,7 +630,7 @@ fn pin_plan(
         cache.cuda_bundle(&root.join(&cuda.parent), &cuda.spec)
     } else {
         cache.library(
-            &root.join(&plan.core.declaration.snapshot_path),
+            &root.join(plan.core.declaration.snapshot_path),
             &plan.core.declaration.artifact.sha256,
         )
     };

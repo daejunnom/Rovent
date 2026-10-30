@@ -25,9 +25,12 @@ pub use archive::{
     ArchiveConfig, ArchiveIoBudget, ArchiveLoadPin, ArchiveOwnerLifecycle, ArchiveOwnerSnapshot,
     ArchiveReceipt, ArchiveRecordKind, ArchiveRootCapability, ArchiveRuntimeLimits, ArchiveStats,
     ColdHandle, EngineArchiveNode, EngineArchiveReceipt, ForeignAppendPermit, ForeignGoIssuedProof,
-    LoadedArchive, StorePins, archive_accounting_source_sha256,
+    LoadedArchive, ProfiledForeignAppendPermit, ProfiledForeignGoIssuedProof, StorePins,
+    archive_accounting_source_sha256,
 };
 use hot::HotRecords;
+
+const REVIEW_PIN_CAPACITY: usize = 16;
 
 macro_rules! index_id {
     ($name:ident) => {
@@ -88,6 +91,14 @@ pub enum StoreError {
     /// The caller must report unknown and request a new bounded worker scan.
     ForeignPermitStale,
     PinSaturated(&'static str),
+    /// Admission is waiting for existing selected-view owners to retire. This
+    /// is neither archive evidence deletion nor permission to refund work.
+    ReviewLeaseBackpressure {
+        current: usize,
+        capacity: usize,
+        required_new: usize,
+        replacement_reserve: usize,
+    },
     ColdRecord(&'static str),
 }
 
@@ -461,6 +472,91 @@ pub enum BoundKind {
     UpperWithinSearch,
 }
 
+/// Store-owned external constraint namespace. Missing limits stay absent; these
+/// reported UCI limits never reserve or certify native search credit.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProfiledExternalConstraint {
+    Combined { depth: u16, reported_nodes: u64 },
+    Nodes { reported_nodes: u64 },
+    Depth { depth: u16 },
+    MoveTime { milliseconds: u64 },
+}
+
+impl From<crate::external_cpu::ExternalGoConstraint> for ProfiledExternalConstraint {
+    fn from(value: crate::external_cpu::ExternalGoConstraint) -> Self {
+        use crate::external_cpu::ExternalGoConstraint as Source;
+        match value {
+            Source::Combined {
+                depth,
+                reported_nodes,
+            } => Self::Combined {
+                depth,
+                reported_nodes,
+            },
+            Source::Nodes { reported_nodes } => Self::Nodes { reported_nodes },
+            Source::Depth { depth } => Self::Depth { depth },
+            Source::MoveTime { milliseconds } => Self::MoveTime { milliseconds },
+        }
+    }
+}
+
+impl ProfiledExternalConstraint {
+    pub fn requested_depth(self) -> Option<u16> {
+        match self {
+            Self::Combined { depth, .. } | Self::Depth { depth } => Some(depth),
+            Self::Nodes { .. } | Self::MoveTime { .. } => None,
+        }
+    }
+
+    pub fn requested_nodes(self) -> Option<u64> {
+        match self {
+            Self::Combined { reported_nodes, .. } | Self::Nodes { reported_nodes } => {
+                Some(reported_nodes)
+            }
+            Self::Depth { .. } | Self::MoveTime { .. } => None,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), StoreError> {
+        if self
+            .requested_depth()
+            .is_some_and(|depth| depth == 0 || depth > 64)
+            || self.requested_nodes() == Some(0)
+            || matches!(
+                self,
+                Self::MoveTime {
+                    milliseconds: 0 | 180_001..
+                }
+            )
+        {
+            return Err(StoreError::InvalidConditions(
+                "profiled external constraint bounds",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Only movetime may be shortened by the original physical wall allowance.
+    pub fn validate_issued(self, issued: Self) -> Result<(), StoreError> {
+        self.validate()?;
+        issued.validate()?;
+        if self == issued
+            || matches!((self, issued),
+            (Self::MoveTime { milliseconds: requested }, Self::MoveTime { milliseconds: actual })
+                if actual <= requested)
+        {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidEvidence(
+                "profiled issued constraint differs",
+            ))
+        }
+    }
+}
+
 /// A finite CPU search result is scoped by depth/profile/conditions. It does not
 /// constitute a proof of the complete chess game, even when its TT says exact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -483,6 +579,15 @@ pub enum EvidenceScope {
         model: u64,
         encoding: u64,
         input: u64,
+    },
+    /// A distinct raw UCI namespace, including queries with no depth limit.
+    /// It is never an own completed depth, native credit or a Rules proof.
+    ProfiledExternalUci {
+        requested: ProfiledExternalConstraint,
+        issued: ProfiledExternalConstraint,
+        reported_depth: Option<u16>,
+        seldepth: Option<u16>,
+        bound: ExternalBound,
     },
 }
 
@@ -600,7 +705,10 @@ pub struct Observation {
 impl Observation {
     fn validate(&self) -> Result<(), StoreError> {
         let owned_scope = matches!(self.scope, EvidenceScope::DepthLimited { .. });
-        let external_scope = matches!(self.scope, EvidenceScope::ExternalUci { .. });
+        let external_scope = matches!(
+            self.scope,
+            EvidenceScope::ExternalUci { .. } | EvidenceScope::ProfiledExternalUci { .. }
+        );
         let cpu_scope = owned_scope || external_scope;
         if owned_scope != self.value_identity.is_some()
             || cpu_scope != self.cpu_condition.is_some()
@@ -751,17 +859,39 @@ impl Observation {
         report.identity.validate().map_err(|_| {
             StoreError::InvalidEvidence("invalid or unbounded retained foreign namespace")
         })?;
+        let matching_scope = match self.scope {
+            EvidenceScope::ExternalUci {
+                requested_depth,
+                reported_depth,
+                seldepth,
+                bound,
+            } => {
+                requested_depth > 0
+                    && requested_depth == report.requested_depth
+                    && reported_depth == report.reported_depth
+                    && seldepth == report.seldepth
+                    && bound == report.bound
+            }
+            EvidenceScope::ProfiledExternalUci {
+                requested,
+                issued,
+                reported_depth,
+                seldepth,
+                bound,
+            } => {
+                requested.validate_issued(issued)?;
+                report.requested_depth == requested.requested_depth().unwrap_or(0)
+                    && reported_depth == report.reported_depth
+                    && seldepth == report.seldepth
+                    && bound == report.bound
+            }
+            _ => false,
+        };
         if report.identity != *identity
             || self.source != external_source_id(&identity.adapter_semantics)
             || self.checker_work != Some(report.work)
             || self.kind != ObservationKind::ExternalCpuAnalysis
-            || self.scope
-                != (EvidenceScope::ExternalUci {
-                    requested_depth: report.requested_depth,
-                    reported_depth: report.reported_depth,
-                    seldepth: report.seldepth,
-                    bound: report.bound,
-                })
+            || !matching_scope
             || self.score
                 != (RawScore::ExternalUci {
                     value: report.score,
@@ -769,7 +899,6 @@ impl Observation {
                     perspective: report.perspective,
                     wdl_per_mille: report.wdl_per_mille,
                 })
-            || report.requested_depth == 0
             || report.pv.len() > MAX_EXTERNAL_PV_PLIES
             || report.pv.capacity() > MAX_EXTERNAL_PV_PLIES
             || report.observed_uci.name.trim().is_empty()
@@ -1246,10 +1375,15 @@ impl DependencyIndex {
 pub enum TaskQuestion {
     AnalyzePosition,
     AnalyzeRootMoves,
-    FindAlternative { divergence_ply: u16 },
+    FindAlternative {
+        divergence_ply: u16,
+    },
     ModelProposal,
     ModelRefutation,
     ModelRepair,
+    ProfiledExternal {
+        requested: ProfiledExternalConstraint,
+    },
 }
 
 /// Exact task reuse namespace. A different requested depth, input revision,
@@ -1277,6 +1411,45 @@ pub struct TaskKey {
     pub input_revision: u64,
     pub requested_depth: u16,
     pub node_budget: u64,
+}
+
+impl TaskKey {
+    /// Known separately allocated payload of this owned key. Fixed fields are
+    /// charged by its containing owner. Tree/hash nodes and allocator overhead
+    /// are not included, so this is never a total heap or resident peak.
+    pub(crate) fn known_owned_payload_bytes(&self) -> Option<u64> {
+        fn identity_bytes(value: &CpuValueIdentity) -> Option<usize> {
+            let mut bytes = value
+                .semantics
+                .capacity()
+                .checked_add(value.weights_sha256.as_ref().map_or(0, String::capacity))?;
+            if let crate::cpu_value::CpuTrainingState::Learned {
+                run_id,
+                dataset_sha256,
+                ..
+            } = &value.training
+            {
+                bytes = bytes
+                    .checked_add(run_id.capacity())?
+                    .checked_add(dataset_sha256.capacity())?;
+            }
+            Some(bytes)
+        }
+        let mut bytes = self
+            .root_moves
+            .capacity()
+            .checked_mul(std::mem::size_of::<Move16>())?
+            .checked_add(self.cpu_condition.as_ref().map_or(0, String::capacity))?;
+        if let Some(identity) = &self.value_identity {
+            bytes = bytes.checked_add(identity_bytes(identity)?)?;
+        }
+        // Conditional own-CPU sources never carry a foreign checker. Its
+        // unsupported owned payload remains unknown rather than zero bytes.
+        if self.checker_identity.is_some() {
+            return None;
+        }
+        u64::try_from(bytes).ok()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1419,8 +1592,20 @@ impl TaskTable {
             TaskQuestion::AnalyzePosition
                 | TaskQuestion::AnalyzeRootMoves
                 | TaskQuestion::FindAlternative { .. }
+                | TaskQuestion::ProfiledExternal { .. }
         );
         let external = matches!(key.checker_identity, Some(CheckerIdentity::ExternalUci(_)));
+        if let TaskQuestion::ProfiledExternal { requested } = key.question {
+            requested.validate()?;
+            if !external
+                || key.requested_depth != requested.requested_depth().unwrap_or(0)
+                || key.node_budget != requested.requested_nodes().unwrap_or(0)
+            {
+                return Err(StoreError::InvalidConditions(
+                    "profiled external task constraint differs",
+                ));
+            }
+        }
         if (cpu_question && !external) != key.value_identity.is_some()
             || cpu_question != key.cpu_condition.is_some()
             || (!cpu_question && key.checker_identity.is_some())
@@ -1455,7 +1640,10 @@ impl TaskTable {
                 "invalid or unbounded exact CPU conditions",
             ));
         }
-        if cpu_question && (key.requested_depth == 0 || key.node_budget == 0) {
+        if cpu_question
+            && !matches!(key.question, TaskQuestion::ProfiledExternal { .. })
+            && (key.requested_depth == 0 || key.node_budget == 0)
+        {
             return Err(StoreError::InvalidConditions(
                 "CPU task requires a finite positive budget",
             ));
@@ -1725,6 +1913,38 @@ impl TaskTable {
     }
     pub fn consumer_count(&self) -> usize {
         self.consumers.len()
+    }
+    /// Actual retained consumer-vector capacities, including completed and
+    /// cancelled rows. This issues no consumer and does not change flags.
+    /// Task arrays, tree nodes, and allocator overhead remain outside this
+    /// known subset; callers must not report it as total Store memory.
+    pub(crate) fn historical_consumer_backing_bytes(&self) -> Option<u64> {
+        self.tasks.iter().try_fold(0_u64, |sum, task| {
+            let bytes = task
+                .consumers
+                .capacity()
+                .checked_mul(std::mem::size_of::<ConsumerRecord>())?;
+            sum.checked_add(u64::try_from(bytes).ok()?)
+        })
+    }
+    /// Read an already recorded use of this exact original consumer. This
+    /// historical projection never admits work, reopens a deadline or makes
+    /// a cancelled consumer live again.
+    pub(crate) fn historical_consumer_was_consumed(
+        &self,
+        execution: ExecutionId,
+        original: TaskConsumer,
+    ) -> Result<bool, StoreError> {
+        let task = self.get(execution)?;
+        let record = task
+            .consumers
+            .iter()
+            .find(|record| record.consumer.id == original.id)
+            .ok_or(StoreError::InvalidHandle("consumer"))?;
+        if record.consumer != original {
+            return Err(StoreError::StaleConsumer);
+        }
+        Ok(record.consumed)
     }
     pub fn paused_executions_for_state(
         &self,
@@ -2039,6 +2259,23 @@ impl StoreReadPin {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    /// Read only this original lease's validated seed. This neither joins the
+    /// view union nor creates another lease or retirement/admission authority.
+    pub(crate) fn retirement_seed(&self, stores: &PalsStores) -> Result<StorePins, StoreError> {
+        if !self.owner.matches(stores)
+            || self.generation != stores.generation()
+            || !Arc::ptr_eq(&self.registry, &stores.review_pins)
+        {
+            return Err(StoreError::StaleConsumer);
+        }
+        self.registry
+            .lock()
+            .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))?
+            .leases
+            .get(&self.serial)
+            .cloned()
+            .ok_or(StoreError::InvalidHandle("review pin lease"))
+    }
     pub fn reborrow(&self, stores: &PalsStores) -> Result<StoreReadPin, StoreError> {
         if !self.validates(stores) {
             return Err(StoreError::StaleConsumer);
@@ -2133,7 +2370,7 @@ impl PalsStores {
             .review_pins
             .lock()
             .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))?;
-        if registry.leases.len() >= 16 {
+        if registry.leases.len() >= REVIEW_PIN_CAPACITY {
             return Err(StoreError::PinSaturated("review view leases"));
         }
         let serial = registry.next;
@@ -2151,6 +2388,11 @@ impl PalsStores {
             .lock()
             .map(|pins| pins.leases.len())
             .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))
+    }
+    /// The exact same hard ceiling enforced by pin_review. Reading it grants
+    /// no lease and does not change the Store's capacity policy.
+    pub const fn review_pin_capacity(&self) -> usize {
+        REVIEW_PIN_CAPACITY
     }
     pub(super) fn review_pin_union(&self) -> Result<StorePins, StoreError> {
         let registry = self
@@ -2321,6 +2563,16 @@ impl PalsStores {
                 .make_move(*movement)
                 .map_err(|_| StoreError::InvalidEvidence("CPU PV failed Rules replay"))?;
         }
+        self.append_validated_cpu_pv_once(state, moves)
+    }
+
+    /// Private allocation boundary shared by a completed Rules replay and an
+    /// opaque, original-controller checked path. It issues no replay authority.
+    fn append_validated_cpu_pv_once(
+        &mut self,
+        state: StateId,
+        moves: &[BoardMove],
+    ) -> Result<LineId, StoreError> {
         let root = self.lines.root(state)?;
         let line = self.lines.append(root, moves)?;
         if self.checked_cpu_pvs.get(&line).is_some_and(|checked| {
@@ -2464,6 +2716,21 @@ impl PalsStores {
         }
         if let Some(execution) = observation.execution {
             let task = self.tasks.get(execution)?;
+            match (task.key.question, observation.scope) {
+                (
+                    TaskQuestion::ProfiledExternal {
+                        requested: question,
+                    },
+                    EvidenceScope::ProfiledExternalUci { requested, .. },
+                ) if question == requested => {}
+                (TaskQuestion::ProfiledExternal { .. }, _)
+                | (_, EvidenceScope::ProfiledExternalUci { .. }) => {
+                    return Err(StoreError::InvalidEvidence(
+                        "profiled task and observation constraint differ",
+                    ));
+                }
+                _ => {}
+            }
             if task.key.state != observation.state
                 || task.key.line != observation.line
                 || task.key.value_identity != observation.value_identity
@@ -3009,6 +3276,13 @@ impl PalsStores {
     ) -> Result<(), StoreError> {
         let task = self.tasks.get(execution)?;
         let evidence = self.observations.get(observation)?;
+        if matches!(task.key.question, TaskQuestion::ProfiledExternal { .. })
+            || matches!(evidence.scope, EvidenceScope::ProfiledExternalUci { .. })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "profiled external feedback is not completed native work",
+            ));
+        }
         if evidence.execution != Some(execution)
             || evidence.state != task.key.state
             || evidence.line != task.key.line
@@ -3239,6 +3513,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn historical_consumer_backing_counts_spare_capacity_without_changing_flags() {
+        let mut table = TaskTable::new(4, 16, 4);
+        let mut consumers = Vec::with_capacity(8);
+        consumers.push(ConsumerRecord {
+            consumer: TaskConsumer {
+                id: 1,
+                situation: SituationId {
+                    slot: 0,
+                    generation: 1,
+                },
+                revision: 3,
+                generation: 4,
+                deadline_tick: 5,
+            },
+            consumed: true,
+            cancelled: false,
+        });
+        let expected = (consumers.capacity() * std::mem::size_of::<ConsumerRecord>()) as u64;
+        table
+            .tasks
+            .push(TaskRecord {
+                key: key(StateId(0)),
+                status: TaskStatus::Completed(ObservationId(0)),
+                resumed_from: None,
+                consumers,
+            })
+            .unwrap();
+        let original = table.tasks.get(0).unwrap().consumers[0].consumer;
+        let before = serde_json::to_vec(table.tasks.get(0).unwrap()).unwrap();
+        assert_eq!(table.historical_consumer_backing_bytes(), Some(expected));
+        assert!(
+            table
+                .historical_consumer_was_consumed(ExecutionId(0), original)
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(table.tasks.get(0).unwrap()).unwrap(),
+            before
+        );
+        assert!(expected > std::mem::size_of::<ConsumerRecord>() as u64);
+    }
+
+    #[test]
+    fn historical_task_key_backing_counts_owned_namespace_capacity() {
+        let mut task = key(StateId(0));
+        let before = task.known_owned_payload_bytes().unwrap();
+        let old_capacity = task.cpu_condition.as_ref().unwrap().capacity();
+        task.cpu_condition.as_mut().unwrap().reserve(4096);
+        let new_capacity = task.cpu_condition.as_ref().unwrap().capacity();
+        assert_eq!(
+            task.known_owned_payload_bytes(),
+            Some(before + (new_capacity - old_capacity) as u64)
+        );
+        task.checker_identity = Some(CheckerIdentity::Owned(cpu_value_identity()));
+        assert!(task.known_owned_payload_bytes().is_none());
+    }
+
     fn external_identity() -> crate::cpu_checker::ExternalCheckerIdentity {
         use crate::cpu_checker::{ExternalModelMetadata, ExternalTrainingKnowledge};
         crate::cpu_checker::ExternalCheckerIdentity {
@@ -3318,6 +3650,242 @@ mod tests {
         record.external_report = Some(Box::new(report));
         record.execution = Some(execution);
         record
+    }
+
+    fn profiled_key(state: StateId, requested: ProfiledExternalConstraint) -> TaskKey {
+        let mut key = external_key(state);
+        key.question = TaskQuestion::ProfiledExternal { requested };
+        key.requested_depth = requested.requested_depth().unwrap_or(0);
+        key.node_budget = requested.requested_nodes().unwrap_or(0);
+        key
+    }
+
+    fn profiled_observation(
+        state: StateId,
+        execution: ExecutionId,
+        pv: LineId,
+        requested: ProfiledExternalConstraint,
+    ) -> Observation {
+        let mut raw = external_observation(state, execution, pv);
+        let report = raw.external_report.as_mut().unwrap();
+        report.requested_depth = requested.requested_depth().unwrap_or(0);
+        raw.scope = EvidenceScope::ProfiledExternalUci {
+            requested,
+            issued: requested,
+            reported_depth: report.reported_depth,
+            seldepth: report.seldepth,
+            bound: report.bound,
+        };
+        raw
+    }
+
+    #[test]
+    fn profiled_limits_remain_exact_raw_feedback_and_never_completed_depth() {
+        for requested in [
+            ProfiledExternalConstraint::Combined {
+                depth: 4,
+                reported_nodes: 16,
+            },
+            ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+            ProfiledExternalConstraint::Depth { depth: 4 },
+            ProfiledExternalConstraint::MoveTime { milliseconds: 100 },
+        ] {
+            let mut stores = PalsStores::new(StoreLimits::default());
+            let position = Position::startpos();
+            let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+            let state = stores.situations.get(root).unwrap().state;
+            let original = consumer(&stores, root, 1, 100);
+            let key = profiled_key(state, requested);
+            let TaskAdmission::Start(execution) =
+                stores.request_task(key.clone(), original, 0).unwrap()
+            else {
+                panic!("profiled start")
+            };
+            let pv = stores
+                .append_cpu_pv(&position, &moves("e2e4 e7e5"))
+                .unwrap();
+            let raw = profiled_observation(state, execution, pv, requested);
+            // Reported 20 may overshoot the requested 16, or nodes may not have
+            // been requested at all. Neither is a native reservation or proof.
+            let observation = stores.append_observation(raw.clone()).unwrap();
+            assert!(stores.complete_task(execution, observation).is_err());
+            assert!(
+                stores
+                    .hot_consume_sealed_profiled_foreign_feedback(
+                        execution,
+                        original,
+                        &key,
+                        &position.snapshot(),
+                        observation,
+                        1
+                    )
+                    .is_err()
+            );
+            stores.tasks.fail(execution).unwrap();
+            assert_eq!(
+                stores
+                    .hot_consume_sealed_profiled_foreign_feedback(
+                        execution,
+                        original,
+                        &key,
+                        &position.snapshot(),
+                        observation,
+                        1
+                    )
+                    .unwrap(),
+                observation
+            );
+            assert_eq!(
+                stores.hot_consume_sealed_profiled_foreign_feedback(
+                    execution,
+                    original,
+                    &key,
+                    &position.snapshot(),
+                    observation,
+                    1
+                ),
+                Err(StoreError::AlreadyConsumed)
+            );
+            assert_eq!(
+                stores
+                    .hot_validate_consumed_profiled_foreign_feedback(
+                        execution,
+                        original,
+                        &key,
+                        &position.snapshot(),
+                        observation,
+                        2
+                    )
+                    .unwrap(),
+                observation
+            );
+            assert!(
+                stores
+                    .hot_consume_sealed_foreign_feedback(
+                        execution,
+                        original,
+                        &key,
+                        &position.snapshot(),
+                        observation,
+                        2
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                stores.tasks.get(execution).unwrap().status,
+                TaskStatus::Failed
+            );
+            assert!(matches!(
+                stores
+                    .request_task(key, consumer(&stores, root, 2, 100), 2)
+                    .unwrap(),
+                TaskAdmission::Start(_)
+            ));
+            assert_eq!(stores.observations.get(observation).unwrap(), &raw);
+            stores
+                .tasks
+                .cancel_consumer(execution, original.id)
+                .unwrap();
+            assert_eq!(
+                stores.hot_validate_consumed_profiled_foreign_feedback(
+                    execution,
+                    original,
+                    &profiled_key(state, requested),
+                    &position.snapshot(),
+                    observation,
+                    3
+                ),
+                Err(StoreError::CancelledConsumer)
+            );
+        }
+    }
+
+    #[test]
+    fn profiled_absent_limits_reject_fake_positive_fields_and_legacy_zero_depth() {
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let position = Position::startpos();
+        let root = stores.focus_actual_moves(position.snapshot()).unwrap();
+        let state = stores.situations.get(root).unwrap().state;
+        let requested = ProfiledExternalConstraint::MoveTime { milliseconds: 100 };
+        let key = profiled_key(state, requested);
+        for (depth, nodes) in [(1, 0), (0, 1), (1, 1)] {
+            let mut fabricated = key.clone();
+            fabricated.requested_depth = depth;
+            fabricated.node_budget = nodes;
+            assert!(
+                stores
+                    .request_task(fabricated, consumer(&stores, root, 1, 100), 0)
+                    .is_err()
+            );
+        }
+        let original = consumer(&stores, root, 1, 100);
+        let TaskAdmission::Start(execution) =
+            stores.request_task(key.clone(), original, 0).unwrap()
+        else {
+            panic!("profiled start")
+        };
+        let pv = stores
+            .append_cpu_pv(&position, &moves("e2e4 e7e5"))
+            .unwrap();
+        let mut raw = profiled_observation(state, execution, pv, requested);
+        raw.checker_work = Some(CheckerWork::default());
+        raw.budget = 0;
+        raw.external_report.as_mut().unwrap().work = CheckerWork::default();
+        let unknown = stores.append_observation(raw.clone()).unwrap();
+        let mut legacy = raw.clone();
+        legacy.scope = EvidenceScope::ExternalUci {
+            requested_depth: 0,
+            reported_depth: Some(1),
+            seldepth: Some(3),
+            bound: ExternalBound::Lower,
+        };
+        assert!(legacy.validate().is_err());
+        let mut legacy_key = key.clone();
+        legacy_key.question = TaskQuestion::AnalyzePosition;
+        assert!(
+            stores
+                .request_task(legacy_key, consumer(&stores, root, 2, 100), 0)
+                .is_err()
+        );
+        let mut wrong_question = raw.clone();
+        wrong_question.scope = EvidenceScope::ProfiledExternalUci {
+            requested: ProfiledExternalConstraint::Nodes {
+                reported_nodes: 100,
+            },
+            issued: ProfiledExternalConstraint::Nodes {
+                reported_nodes: 100,
+            },
+            reported_depth: Some(1),
+            seldepth: Some(3),
+            bound: ExternalBound::Lower,
+        };
+        assert!(stores.append_observation(wrong_question).is_err());
+        stores.tasks.fail(execution).unwrap();
+        assert_eq!(
+            stores
+                .hot_consume_sealed_profiled_foreign_feedback(
+                    execution,
+                    original,
+                    &key,
+                    &position.snapshot(),
+                    unknown,
+                    1
+                )
+                .unwrap(),
+            unknown
+        );
+        stores.hot_focus_actual_moves(position.snapshot()).unwrap();
+        assert_eq!(
+            stores.hot_validate_consumed_profiled_foreign_feedback(
+                execution,
+                original,
+                &key,
+                &position.snapshot(),
+                unknown,
+                2
+            ),
+            Err(StoreError::StaleConsumer)
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ import time
 sys.dont_write_bytecode = True
 from managed_process import run_group
 from managed_storage import checked, tree_size
+from managed_outputs import OutputLease
 
 GIB = 1024 ** 3
 SCHEMA = "rz-pals-followup-local-wrapper/1"
@@ -261,7 +262,8 @@ def check_colab_driver_lookup(receipt_path, cwd, environment, remaining, budget)
     evidence = {"soname": "libcuda.so.1", "status": "unknown",
                 "same_environment_as_native_child": True, "cu_init_performed": False,
                 "model_executed": False, "linker_settings_changed": False,
-                "tree_gone": True, "child_spawned": False, "exit_code": None}
+                "tree_gone": True, "child_spawned": False, "exit_code": None,
+                "output_eof_observed": False}
     if remaining <= 0:
         evidence["status"] = "deadline_expired"
         return evidence
@@ -297,25 +299,38 @@ def check_colab_driver_lookup(receipt_path, cwd, environment, remaining, budget)
             os.close(original)
     evidence.update(exit_code=code, tree_gone=gone, child_spawned=True,
                     log=str(log), supervisor_error=failure)
-    if not gone or failure is not None or code != 0:
+    if gone is not True or failure is not None or type(code) is not int or code != 0:
         evidence["status"] = "lookup_or_supervision_failed"
         return evidence
-    if log.stat().st_size > 64 * 1024:
-        evidence["status"] = "invalid_probe_output"
-        return evidence
     try:
+        if log.stat().st_size > 64 * 1024:
+            evidence["status"] = "invalid_probe_output"
+            return evidence
         with log.open("rb") as stream:
             data = stream.read(64 * 1024 + 1)
-        if len(data) > 64 * 1024:
-            raise ValueError("driver lookup log exceeds finite bound")
+    except OSError as error:
+        evidence.update(status="probe_output_io_failed", output_error_type=type(error).__name__)
+        return evidence
+    if len(data) > 64 * 1024:
+        evidence["status"] = "invalid_probe_output"
+        return evidence
+    evidence["output_eof_observed"] = True
+    try:
         value = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+        if (isinstance(value, dict) and isinstance(value.get("status"), str)
+                and value["status"] != "available"):
+            evidence.update(status="lookup_reported_failure", reported_status=value["status"])
+            return evidence
         path = value["resolved_path"]
         if (set(value) != {"status", "resolved_path"} or value["status"] != "available"
                 or not isinstance(path, str) or not Path(path).is_absolute()
                 or not Path(path).name.startswith("libcuda.so") or path.endswith(" (deleted)")):
             raise ValueError("invalid driver lookup observation")
-    except (OSError, ValueError, KeyError, TypeError, UnicodeError):
-        evidence["status"] = "invalid_probe_output"
+    except (ValueError, KeyError, TypeError, UnicodeError) as error:
+        # The original probe has exited and its bounded output was read to EOF.
+        # An undecodable observation cannot establish driver availability; the
+        # native model child still performs its actual loading/provider checks.
+        evidence.update(status="observation_unknown", observation_error_type=type(error).__name__)
     else:
         evidence.update(status="available", resolved_path=path)
     return evidence
@@ -502,53 +517,120 @@ def main():
     # independently named observation profile includes preparation in its window.
     if args.resource_profile == "strict-local":
         started = time.monotonic()
+    pending_control = None
     if args.run:
+        target = args.output_root / args.label if args.mode == "arena" else args.model_report
         observer = check_resources if args.resource_profile == "strict-local" else observe_resources
+        # These checks do not launch a child or issue an output owner. A failed
+        # resource observation must not leave an otherwise unused active lease.
         receipt["actual_resources"] = observer(args.cpu_affinity)
+        check_colab_output_budget(args)
         environment = os.environ.copy()
         environment.update({"OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "PYTHONDONTWRITEBYTECODE": "1"})
-        if args.resource_profile == "strict-local":
-            code, gone, failure = run_group(command, binary.parent, environment, args.seconds,
-                                           lambda: check_resources(args.cpu_affinity))
-            receipt.update(exit_code=code, tree_gone=gone, supervisor_error=failure,
-                           status="completed" if code == 0 and gone else "failed_ownership_preserved")
-        else:
-            remaining = args.seconds - (time.monotonic() - started)
-            if sys.platform == "linux" and args.mode == "model-check" and args.provider != "cpu":
-                receipt["host_driver_lookup"] = check_colab_driver_lookup(
-                    receipt_path, binary.parent, environment, remaining,
-                    lambda: check_colab_output_budget(args))
-                remaining = args.seconds - (time.monotonic() - started)
-            if receipt.get("host_driver_lookup", {}).get("status", "available") != "available":
-                probe = receipt["host_driver_lookup"]
-                receipt.update(exit_code=125, tree_gone=probe["tree_gone"],
-                    status="host_driver_lookup_failed_no_model_spawned", child_spawned=False)
-            elif sys.platform != "linux" or remaining <= 0:
-                receipt.update(exit_code=125 if sys.platform != "linux" else 124, tree_gone=True,
-                    status="unsupported_execution_platform" if sys.platform != "linux" else "preparation_deadline_expired",
-                    child_spawned=False)
+        # Preserve the Rust consumer's fresh-path contract: it creates its own
+        # attempt directory/file after this reservation, never a borrowed asset.
+        receipt.update(tree_gone=True, child_spawned=False, producer_dispatch_attempted=False,
+            producer_result_observed=False, producer_exit_code=None,
+            producer_result_scope="original_supervisor_return_only_not_NN_execution_proof",
+            status="failed_before_child_dispatch", exit_code=125,
+            output_lifecycle={"acquired": False, "finish_attempted": False, "finish_returned": False})
+        stage = "before_child_dispatch"
+        output_lease = OutputLease(target, Path(__file__).resolve().parent.parent,
+                                   reserve=args.output_bytes_max, deferred=True).acquire()
+        try:
+            receipt["output_lifecycle"]["acquired"] = True
+            if args.resource_profile == "strict-local":
+                def strict_budget():
+                    check_resources(args.cpu_affinity)
+                    check_colab_output_budget(args)
+                    output_lease.check_budget()
+                remaining = args.seconds
+                budget = strict_budget
             else:
-                check_colab_output_budget(args)
+                remaining = args.seconds - (time.monotonic() - started)
+                if sys.platform == "linux" and args.mode == "model-check" and args.provider != "cpu":
+                    stage = "host_driver_lookup"
+                    # A raised supervisor can have started a probe. Only its
+                    # returned original closure observation may make this known.
+                    receipt["tree_gone"] = "unknown"
+                    receipt["host_driver_lookup"] = check_colab_driver_lookup(
+                        receipt_path, binary.parent, environment, remaining,
+                        lambda: check_colab_output_budget(args))
+                    receipt["tree_gone"] = receipt["host_driver_lookup"]["tree_gone"]
+                    remaining = args.seconds - (time.monotonic() - started)
+                probe = receipt.get("host_driver_lookup")
+                if probe is not None and not (
+                        probe.get("status") in ("available", "observation_unknown")
+                        and type(probe.get("exit_code")) is int and probe["exit_code"] == 0
+                        and probe.get("tree_gone") is True
+                        and probe.get("supervisor_error", "unknown") is None
+                        and probe.get("output_eof_observed") is True):
+                    receipt.update(exit_code=125, status="host_driver_lookup_failed_no_model_spawned")
+                    remaining = None
+                elif sys.platform != "linux" or remaining <= 0:
+                    receipt.update(exit_code=125 if sys.platform != "linux" else 124,
+                        status="unsupported_execution_platform" if sys.platform != "linux" else "preparation_deadline_expired")
+                    remaining = None
                 def observed_budget():
                     check_colab_output_budget(args)
-                code, gone, failure = run_group(command, binary.parent, environment, remaining, observed_budget)
-                if gone:
-                    try:
+                    output_lease.check_budget()
+                budget = observed_budget
+            if remaining is not None:
+                stage = "before_producer_dispatch"
+                check_colab_output_budget(args)
+                receipt.update(tree_gone="unknown", child_spawned="unknown", producer_dispatch_attempted=True)
+                stage = "producer_supervision"
+                code, gone, failure = run_group(command, binary.parent, environment, remaining, budget)
+                # Preserve the original result before any post-run observer can
+                # fail. Neither a zero exit nor process closure proves NN work.
+                receipt.update(producer_result_observed=True, producer_exit_code=code,
+                    producer_tree_gone=gone, producer_supervisor_error=failure,
+                    exit_code=code if failure is None and gone is True else 125,
+                    tree_gone=gone, supervisor_error=failure,
+                    status=("completed" if args.resource_profile == "strict-local" else "completed_observed_profile")
+                        if code == 0 and gone is True and failure is None else "failed_ownership_preserved")
+                stage = "post_producer_observation"
+                if args.resource_profile == "colab-observed":
+                    if gone is True:
                         check_colab_output_budget(args)
-                    except (OSError, RuntimeError) as error:
-                        code, failure = 125, str(error)
-                receipt.update(exit_code=code, tree_gone=gone, supervisor_error=failure,
-                    status="completed_observed_profile" if code == 0 and gone else "failed_ownership_preserved",
-                    actual_resources_after=observe_resources(args.cpu_affinity))
+                    receipt["actual_resources_after"] = observe_resources(args.cpu_affinity)
+        except BaseException as error:
+            receipt.update(exit_code=125, status="failed_wrapper_supervision_or_observation",
+                wrapper_error={"stage": stage, "type": type(error).__name__, "message": str(error)})
+            if not isinstance(error, Exception):
+                # Keep the original cancellation object through cleanup and
+                # receipt publication, then propagate it rather than return 125.
+                pending_control = error
+        finally:
+            # One attempt for every successfully acquired lease. Unknown child
+            # ownership remains unknown and keeps the original active record.
+            receipt["output_lifecycle"].update(finish_attempted=True, tree_gone_argument=receipt["tree_gone"])
+            try:
+                output_lease.finish(status=receipt["status"], tree_gone=receipt["tree_gone"])
+                receipt["output_lifecycle"]["finish_returned"] = True
+            except BaseException as error:
+                receipt.update(status="failed_output_lifecycle", exit_code=125,
+                    storage_lifecycle_error={"type": type(error).__name__, "message": str(error)})
+                if pending_control is None and not isinstance(error, Exception):
+                    pending_control = error
     else:
         receipt["status"] = "prepared_no_child_spawned"
-    receipt["elapsed_seconds"] = time.monotonic() - started
-    with receipt_path.open("x", encoding="utf-8") as stream:
-        json.dump(receipt, stream, sort_keys=True, ensure_ascii=False, allow_nan=False)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    print(f"wrapper_receipt={receipt_path} planning_only={not args.run} training_executed=false strength_eligible=false")
+    if pending_control is not None:
+        receipt.update(status="interrupted_control_flow", exit_code=None,
+            control_flow_exception={"type": type(pending_control).__name__, "message": str(pending_control)})
+    try:
+        receipt["elapsed_seconds"] = time.monotonic() - started
+        with receipt_path.open("x", encoding="utf-8") as stream:
+            json.dump(receipt, stream, sort_keys=True, ensure_ascii=False, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        print(f"wrapper_receipt={receipt_path} planning_only={not args.run} training_executed=false strength_eligible=false")
+    finally:
+        if pending_control is not None:
+            # A cleanup/publication error must not replace the original control
+            # flow. The unknown tree guard and producer result stay in receipt.
+            raise pending_control
     if args.run and receipt["tree_gone"] is not True:
         return 125
     return receipt["exit_code"] or 0

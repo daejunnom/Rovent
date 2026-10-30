@@ -23,12 +23,193 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub mod adaptive;
+pub mod collection_teacher;
+pub mod process_scope;
+mod profiled_researcher;
+pub mod profiled_worker;
+pub mod profiles;
 pub mod worker;
 
 pub use adaptive::*;
+pub use profiled_researcher::ProfiledResearcherAdmission;
+pub use profiled_worker::*;
+pub use profiles::*;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::FIXTURE_LOCK as EXTERNAL_FIXTURE_LOCK;
 
 pub const EXTERNAL_UCI_CHECKER_VERSION: &str = "rz-external-uci-checker/0.1";
 pub const EXTERNAL_UCI_SCORE_SEMANTICS: &str = "uci-native-cp-or-signed-mate-moves;root-side-to-move;reported-bounds;selectivity-unknown;no-cp-wdl-calibration;no-rules-proof";
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct SealedExecutionCounters {
+    sealed_spawn_returned: std::sync::atomic::AtomicU64,
+    original_fallback_attempted: std::sync::atomic::AtomicU64,
+}
+
+/// Lightweight observation which does not retain the executable or original FD.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct SealedExecutionProbe {
+    counters: Arc<SealedExecutionCounters>,
+}
+
+#[cfg(target_os = "linux")]
+impl SealedExecutionProbe {
+    pub fn execution_observations(&self) -> (u64, u64) {
+        (self.counters.sealed_spawn_returned.load(Ordering::Acquire),
+         self.counters.original_fallback_attempted.load(Ordering::Acquire))
+    }
+}
+
+/// A byte-verified, immutable executable prepared before a search root starts.
+/// The private descriptor and hash remain coupled; constructing this token does
+/// not grant process, root, or completion authority.
+#[derive(Clone, Debug)]
+pub struct VerifiedSealedExecutable {
+    #[cfg(target_os = "linux")]
+    file: Arc<File>,
+    #[cfg(target_os = "linux")]
+    original: Arc<File>,
+    #[cfg(target_os = "linux")]
+    sha256: String,
+    #[cfg(target_os = "linux")]
+    counters: Arc<SealedExecutionCounters>,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedSealedExecutable {
+    /// Copy the already admitted original into a bounded anonymous file, verify
+    /// the copied bytes and seal writes/size changes before returning its owner.
+    /// `check` is the original preparation cancellation/deadline check.
+    pub fn prepare(
+        original: &File,
+        expected_sha256: &str,
+        mut check: impl FnMut() -> Result<(), CheckerError>,
+    ) -> Result<Self, CheckerError> {
+        use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+        use nix::sys::memfd::{MFdFlags, memfd_create};
+        use std::io::Write;
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        if expected_sha256.len() != 64
+            || !expected_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(error("sealed_prepare", "invalid_sha256"));
+        }
+        check()?;
+        let before = original
+            .metadata()
+            .map_err(|_| error("sealed_prepare", "original_metadata"))?;
+        if !before.is_file()
+            || before.len() < 4
+            || before.len() > 256 * 1024 * 1024
+            || before.mode() & 0o111 == 0
+        {
+            return Err(error("sealed_prepare", "original_kind_or_size"));
+        }
+        let fd = memfd_create(
+            "rovent-teacher",
+            MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+        )
+        .map_err(|_| error("sealed_prepare", "memfd_create"))?;
+        let mut file = File::from(fd);
+        if !file.metadata().is_ok_and(|metadata| metadata.mode() & 0o111 != 0) {
+            return Err(error("sealed_prepare", "memfd_not_executable"));
+        }
+        let mut total = 0u64;
+        let mut buffer = [0u8; 65_536];
+        loop {
+            check()?;
+            let count = original
+                .read_at(&mut buffer, total)
+                .map_err(|_| error("sealed_prepare", "original_read"))?;
+            if count == 0 {
+                break;
+            }
+            if total == 0 && (count < 4 || buffer[..4] != *b"\x7fELF") {
+                return Err(error("sealed_prepare", "native_elf_required"));
+            }
+            total = total
+                .checked_add(count as u64)
+                .ok_or_else(|| error("sealed_prepare", "length_overflow"))?;
+            if total > before.len() {
+                return Err(error("sealed_prepare", "original_changed"));
+            }
+            file.write_all(&buffer[..count])
+                .map_err(|_| error("sealed_prepare", "copy"))?;
+        }
+        let after = original
+            .metadata()
+            .map_err(|_| error("sealed_prepare", "original_recheck"))?;
+        if total != before.len()
+            || after.len() != before.len()
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+        {
+            return Err(error("sealed_prepare", "original_changed"));
+        }
+        check()?;
+        let seals = SealFlag::F_SEAL_WRITE
+            | SealFlag::F_SEAL_GROW
+            | SealFlag::F_SEAL_SHRINK
+            | SealFlag::F_SEAL_SEAL;
+        fcntl(&file, FcntlArg::F_ADD_SEALS(seals)).map_err(|_| error("sealed_prepare", "seal"))?;
+        let present = fcntl(&file, FcntlArg::F_GET_SEALS)
+            .map_err(|_| error("sealed_prepare", "seal_readback"))?;
+        if (present & seals.bits()) != seals.bits() {
+            return Err(error("sealed_prepare", "seal_incomplete"));
+        }
+        // Hash the sealed file itself, not the copy buffer: only this binds the
+        // proof to the immutable bytes that the process will actually execute.
+        let mut hash = Sha256::new();
+        let mut verified = 0u64;
+        while verified < total {
+            check()?;
+            let count = file
+                .read_at(&mut buffer, verified)
+                .map_err(|_| error("sealed_prepare", "sealed_read"))?;
+            if count == 0 {
+                return Err(error("sealed_prepare", "sealed_short_read"));
+            }
+            verified = verified
+                .checked_add(count as u64)
+                .ok_or_else(|| error("sealed_prepare", "length_overflow"))?;
+            if verified > total {
+                return Err(error("sealed_prepare", "sealed_length"));
+            }
+            hash.update(&buffer[..count]);
+        }
+        if format!("{:x}", hash.finalize()) != expected_sha256 {
+            return Err(error("sealed_prepare", "hash_mismatch"));
+        }
+        check()?;
+        let original = original.try_clone().map_err(|_| error("sealed_prepare", "original_clone"))?;
+        Ok(Self {
+            file: Arc::new(file),
+            original: Arc::new(original),
+            sha256: expected_sha256.to_owned(),
+            counters: Arc::new(SealedExecutionCounters::default()),
+        })
+    }
+
+    /// Cumulative source-slot observations, not process completion evidence.
+    pub fn execution_observations(&self) -> (u64, u64) {
+        (self.counters.sealed_spawn_returned.load(Ordering::Acquire),
+         self.counters.original_fallback_attempted.load(Ordering::Acquire))
+    }
+
+    /// Retain counters without extending the sealed file's memory lifetime.
+    pub fn execution_probe(&self) -> SealedExecutionProbe {
+        SealedExecutionProbe { counters: Arc::clone(&self.counters) }
+    }
+}
 
 /// Retained executable/cwd capabilities for a private V5 snapshot. Path names
 /// remain declarations in ExternalCpuConfig; an actual start uses these held
@@ -39,9 +220,17 @@ pub struct ExternalLaunchPin {
     #[cfg(target_os = "linux")]
     executable: Arc<File>,
     #[cfg(target_os = "linux")]
+    sealed_sha256: Option<String>,
+    #[cfg(target_os = "linux")]
+    fallback_executable: Option<Arc<File>>,
+    #[cfg(target_os = "linux")]
+    sealed_counters: Option<Arc<SealedExecutionCounters>>,
+    #[cfg(target_os = "linux")]
     directory: Arc<File>,
     #[cfg(not(target_os = "linux"))]
     _unsupported: (),
+    #[cfg(target_os = "linux")]
+    collection_process_permit: Option<process_scope::CollectionProcessPermit>,
 }
 
 impl ExternalLaunchPin {
@@ -64,8 +253,49 @@ impl ExternalLaunchPin {
         }
         Ok(Self {
             executable: Arc::new(executable),
+            sealed_sha256: None,
+            fallback_executable: None,
+            sealed_counters: None,
             directory: Arc::new(directory),
+            collection_process_permit: None,
         })
+    }
+    /// Bind the verified sealed file to the same retained working directory.
+    /// Process scope and root admission are still required at actual startup.
+    #[cfg(target_os = "linux")]
+    pub fn from_verified_sealed(
+        executable: VerifiedSealedExecutable,
+        directory: File,
+    ) -> Result<Self, CheckerError> {
+        if !directory.metadata().is_ok_and(|m| m.is_dir()) {
+            return Err(error("launch_pin", "directory_metadata"));
+        }
+        Ok(Self {
+            executable: executable.file,
+            sealed_sha256: Some(executable.sha256),
+            fallback_executable: Some(executable.original),
+            sealed_counters: Some(executable.counters),
+            directory: Arc::new(directory),
+            collection_process_permit: None,
+        })
+    }
+    /// Only the Collection worker can attach its exact registered member.
+    /// Public legacy pinned checkers remain on the original singleton gate.
+    pub(crate) fn with_collection_permit(
+        self,
+        permit: process_scope::CollectionProcessPermit,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut pin = self;
+            pin.collection_process_permit = Some(permit);
+            pin
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = permit;
+            self
+        }
     }
 }
 
@@ -529,14 +759,60 @@ pub struct ExternalUciCpuChecker {
     failed_output: Option<(Vec<u8>, Vec<u8>)>,
     advertised_options: BTreeMap<String, OptionKind>,
     cooperative_opinions: Vec<ExternalPolicyOpinion>,
+    // Keep only actual exact info tuples. A later aspiration bound must not
+    // erase the last complete MultiPV iteration.
+    cooperative_exact_candidates: Vec<ExternalPolicyOpinion>,
+    // At most one completed set per actually legal first move for this job.
+    cooperative_exact_completed: Vec<Vec<ExternalPolicyOpinion>>,
+    cooperative_exact_limit: usize,
     stop_control: Option<ExternalControlObservation>,
     go_issue: ExternalGoIssue,
     startup_multipv: Option<u16>,
     last_requested_multipv: Option<u16>,
     launch_pin: Option<ExternalLaunchPin>,
+    engine_profile: Option<(ExternalEngineProfile, ExternalEnginePurpose)>,
+    last_issued_constraint: Option<ExternalGoConstraint>,
+    last_issued_go: Option<String>,
 }
 
 impl ExternalUciCpuChecker {
+    /// Engine/purpose admission for new profiles. Legacy `create` remains the
+    /// unchanged compatibility path; an arena declaration cannot start this
+    /// research checker or inherit its root/combined-limit capabilities.
+    pub fn create_profiled(
+        config: ExternalCpuConfig,
+        profile: ExternalEngineProfile,
+        purpose: ExternalEnginePurpose,
+    ) -> Result<Self, CheckerError> {
+        if purpose == ExternalEnginePurpose::ArenaOpponent {
+            return Err(CheckerError::Unsupported(
+                "arena opponent must use the arena process owner",
+            ));
+        }
+        profile.validate_identity(
+            purpose,
+            &config.identity,
+            config.expected_uci_name.as_deref().unwrap_or_default(),
+        )?;
+        let mut checker = Self::create(config)?;
+        checker.engine_profile = Some((profile, purpose));
+        checker.conditions = format!(
+            "{};score:{};profile:{profile:?};purpose:{purpose:?};depth-cap:{};prefix-cap:{};resume:unsupported;root-searchmoves:{};combined-go:{};explicit-query-constraints;task-wall:includes-stop-and-ready;single-active;game:ucinewgame+ready;output-cap:{};line-cap:{};task-ms:{};stop-ms:{};shutdown-ms:{}",
+            EXTERNAL_UCI_CHECKER_VERSION,
+            EXTERNAL_UCI_SCORE_SEMANTICS,
+            checker.config.max_depth,
+            checker.config.max_prefix_plies,
+            profile.capabilities().searchmoves,
+            profile.capabilities().combined_depth_nodes_movetime,
+            checker.config.max_output_bytes,
+            checker.config.max_line_bytes,
+            checker.config.max_task_wall_time.as_millis(),
+            checker.config.stop_grace.as_millis(),
+            checker.config.shutdown_grace.as_millis(),
+        );
+        Ok(checker)
+    }
+
     /// Create an unstarted owner so failed startup evidence remains available.
     /// The caller must use `start` and inspect `last_attempt` on failure.
     pub fn create(config: ExternalCpuConfig) -> Result<Self, CheckerError> {
@@ -569,11 +845,17 @@ impl ExternalUciCpuChecker {
             failed_output: None,
             advertised_options: BTreeMap::new(),
             cooperative_opinions: Vec::new(),
+            cooperative_exact_candidates: Vec::new(),
+            cooperative_exact_completed: Vec::new(),
+            cooperative_exact_limit: 0,
             stop_control: None,
             go_issue: ExternalGoIssue::NotIssued,
             startup_multipv: None,
             last_requested_multipv: None,
             launch_pin: None,
+            engine_profile: None,
+            last_issued_constraint: None,
+            last_issued_go: None,
         })
     }
 
@@ -862,7 +1144,71 @@ impl ExternalUciCpuChecker {
         limits: CpuLimits,
         cancel: &AtomicBool,
     ) -> Result<CheckerReport, CheckerError> {
-        self.run_with_control(position, roots, limits, cancel, None)
+        self.last_attempt = None;
+        let constraint = ExternalGoConstraint::Combined {
+            depth: limits.max_depth,
+            reported_nodes: limits.max_nodes,
+        };
+        if let Some((profile, _)) = self.engine_profile {
+            profile.require_query(constraint, roots.is_some())?;
+        }
+        self.run_with_control(position, roots, limits, cancel, None, constraint, true)
+    }
+
+    /// New explicit-constraint path for full-legal-root single-limit engines.
+    /// It reuses the same physical owner, stop/bestmove/readiness barrier and
+    /// elapsed provenance; absent limits are not filled with fictitious caps.
+    pub fn analyze_profiled(
+        &mut self,
+        position: &Position,
+        roots: Option<&[BoardMove]>,
+        requested: ExternalGoConstraint,
+        hard_deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<ProfiledExternalReport, CheckerError> {
+        self.last_attempt = None;
+        let (profile, purpose) = self.engine_profile.ok_or(CheckerError::Invalid(
+            "explicit external query requires an admitted engine profile",
+        ))?;
+        profile.require_query(requested, roots.is_some())?;
+        if requested
+            .requested_depth()
+            .is_some_and(|depth| depth > self.config.max_depth)
+        {
+            return Err(CheckerError::Invalid(
+                "external requested depth exceeds profile cap",
+            ));
+        }
+        let limits = CpuLimits {
+            max_depth: requested.requested_depth().unwrap_or(0),
+            max_nodes: requested.requested_nodes().unwrap_or(0),
+            deadline: Some(hard_deadline),
+        };
+        let CheckerReport::ExternalUci(raw) =
+            self.run_with_control(position, roots, limits, cancel, None, requested, false)?
+        else {
+            return Err(error("analysis", "foreign_report_type"));
+        };
+        let issued = self.last_issued_constraint.ok_or(CheckerError::Invalid(
+            "external query completed without issued constraint evidence",
+        ))?;
+        let issued_go = self.last_issued_go.take().ok_or(CheckerError::Invalid(
+            "external query completed without issued command evidence",
+        ))?;
+        Ok(ProfiledExternalReport {
+            profile,
+            purpose,
+            requested,
+            issued,
+            issued_go,
+            reported_node_overshoot: requested
+                .requested_nodes()
+                .is_some_and(|limit| raw.work.nodes.is_some_and(|nodes| nodes > limit)),
+            raw,
+            strict_native_nodes: None,
+            option_application_observed: None,
+            readiness_barrier_completed: true,
+        })
     }
 
     /// The synchronous checker is owned by a private external worker. The
@@ -877,6 +1223,16 @@ impl ExternalUciCpuChecker {
         control: &dyn ExternalControl,
         policy: ExternalSlicePolicy,
     ) -> Result<ExternalCooperativeReport, CheckerError> {
+        self.last_attempt = None;
+        if let Some((profile, _)) = self.engine_profile {
+            profile.require_query(
+                ExternalGoConstraint::Combined {
+                    depth: limits.max_depth,
+                    reported_nodes: policy.requested_reported_nodes,
+                },
+                roots.is_some(),
+            )?;
+        }
         let candidates = roots.map_or_else(
             || position.ordered_legal_moves().moves().len(),
             <[BoardMove]>::len,
@@ -902,14 +1258,25 @@ impl ExternalUciCpuChecker {
         }
         // Policy limits are requested foreign work, never CpuJob native credits.
         limits.max_nodes = policy.requested_reported_nodes;
-        self.cooperative_opinions.clear();
+        self.clear_cooperative_opinions();
         self.stop_control = None;
         self.go_issue = ExternalGoIssue::NotIssued;
-        let CheckerReport::ExternalUci(report) =
-            self.run_with_control(position, roots, limits, cancel, Some((control, policy)))?
+        let CheckerReport::ExternalUci(report) = self.run_with_control(
+            position,
+            roots,
+            limits,
+            cancel,
+            Some((control, policy)),
+            ExternalGoConstraint::Combined {
+                depth: limits.max_depth,
+                reported_nodes: limits.max_nodes,
+            },
+            false,
+        )?
         else {
             return Err(error("analysis", "foreign_report_type"));
         };
+        self.select_completed_exact_policy(&report, policy.multipv);
         self.cooperative_opinions
             .sort_by_key(|opinion| opinion.rank);
         let policy_target_known = report.completion == ExternalCompletion::BestMove
@@ -951,6 +1318,7 @@ impl ExternalUciCpuChecker {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_with_control(
         &mut self,
         position: &Position,
@@ -958,20 +1326,30 @@ impl ExternalUciCpuChecker {
         limits: CpuLimits,
         cancel: &AtomicBool,
         cooperative: Option<(&dyn ExternalControl, ExternalSlicePolicy)>,
+        constraint: ExternalGoConstraint,
+        enforce_reported_node_cap: bool,
     ) -> Result<CheckerReport, CheckerError> {
         self.last_attempt = None;
         self.go_issue = ExternalGoIssue::NotIssued;
+        self.last_issued_constraint = None;
+        self.last_issued_go = None;
         let start = Instant::now();
         if self.failed || self.active {
             return Err(error("analysis", "checker_not_available"));
         }
-        if limits.max_depth == 0
-            || limits.max_depth > self.config.max_depth
-            || limits.max_nodes == 0
+        if constraint
+            .requested_depth()
+            .is_some_and(|depth| depth == 0 || depth > self.config.max_depth)
+            || constraint.requested_nodes() == Some(0)
         {
             return Err(CheckerError::Invalid("external requested depth/nodes"));
         }
         let legal_view = position.ordered_legal_moves();
+        // All retained policy PVs pass validate_pv against this very position.
+        // This bound is a workload fact, not a fixed chess-move guess.
+        if cooperative.is_some() {
+            self.cooperative_exact_limit = legal_view.moves().len();
+        }
         if position
             .play_status_from_view(&legal_view)
             .map_err(|_| error("analysis", "rules_classification"))?
@@ -1052,6 +1430,8 @@ impl ExternalUciCpuChecker {
             &command,
             &mut report,
             cooperative,
+            constraint,
+            enforce_reported_node_cap,
         );
         self.capture(&mut report, start);
         if let Err(failure) = result {
@@ -1106,6 +1486,8 @@ impl ExternalUciCpuChecker {
         position_command: &str,
         report: &mut ExternalCheckerReport,
         cooperative: Option<(&dyn ExternalControl, ExternalSlicePolicy)>,
+        constraint: ExternalGoConstraint,
+        enforce_reported_node_cap: bool,
     ) -> Result<(), CheckerError> {
         budget.analysis_millis(Instant::now())?;
         let requested_width = cooperative.map(|(_, policy)| policy.multipv).or_else(|| {
@@ -1153,10 +1535,7 @@ impl ExternalUciCpuChecker {
             budget
         };
         let remaining_ms = budget.analysis_millis(ready_at)?;
-        let mut go = format!(
-            "go depth {} nodes {} movetime {}",
-            limits.max_depth, limits.max_nodes, remaining_ms
-        );
+        let (mut go, issued) = constraint.command(remaining_ms);
         if let Some(mask) = roots {
             go.push_str(" searchmoves");
             for mv in mask {
@@ -1165,6 +1544,10 @@ impl ExternalUciCpuChecker {
             }
         }
         self.go_issue = ExternalGoIssue::Unknown;
+        self.last_issued_constraint = Some(issued);
+        if self.engine_profile.is_some() {
+            self.last_issued_go = Some(go.clone());
+        }
         self.owner()?.send(&go, budget.analysis_deadline)?;
         self.go_issue = ExternalGoIssue::Issued;
         self.active = true;
@@ -1255,7 +1638,7 @@ impl ExternalUciCpuChecker {
                     }
                     report.work.nodes = Some(nodes);
                     self.capture(report, start);
-                    if cooperative.is_none() && nodes > limits.max_nodes {
+                    if enforce_reported_node_cap && nodes > limits.max_nodes {
                         return Err(error("analysis", "reported_node_budget_exceeded"));
                     }
                 }
@@ -1280,6 +1663,9 @@ impl ExternalUciCpuChecker {
                             if let Some((control, _)) = cooperative {
                                 control.publish_progress(&opinion, report.work.nodes);
                             }
+                        }
+                        if let Some((_, policy)) = cooperative {
+                            self.observe_exact_policy_iteration(&opinion, policy.multipv);
                         }
                         if let Some(prior) = self
                             .cooperative_opinions
@@ -1383,6 +1769,68 @@ impl ExternalUciCpuChecker {
         }
     }
 
+    /// Begin a new physical query without reusing a previous query's data.
+    fn clear_cooperative_opinions(&mut self) {
+        self.cooperative_opinions.clear();
+        self.cooperative_exact_candidates.clear();
+        self.cooperative_exact_completed.clear();
+        self.cooperative_exact_limit = 0;
+    }
+
+    /// Record exact, legal tuples as reported; a bounded or incomplete next
+    /// depth never replaces the most recent complete equal-depth set.
+    fn observe_exact_policy_iteration(&mut self, opinion: &ExternalPolicyOpinion, width: u16) {
+        if opinion.rank == 0 || opinion.rank > width { return; }
+        if opinion.bound != ExternalBound::ExactReported || opinion.pv.is_empty() {
+            if self.cooperative_exact_candidates.first().is_some_and(|first| first.depth == opinion.depth) {
+                self.cooperative_exact_candidates.clear();
+            }
+            return;
+        }
+        // Only an observed consecutive rank-ordered group is a completed
+        // iteration; never splice a partial later MultiPV update into it.
+        if opinion.rank == 1 {
+            self.cooperative_exact_candidates.clear();
+            self.cooperative_exact_candidates.push(opinion.clone());
+        } else if self.cooperative_exact_candidates.last().is_some_and(|last|
+            last.rank + 1 == opinion.rank && last.depth == opinion.depth)
+        {
+            self.cooperative_exact_candidates.push(opinion.clone());
+        } else {
+            self.cooperative_exact_candidates.clear();
+            return;
+        }
+        if self.cooperative_exact_candidates.len() != usize::from(width) { return; }
+        let depth = self.cooperative_exact_candidates[0].depth;
+        if self.cooperative_exact_candidates.iter().enumerate().all(|(index, item)|
+            item.rank == index as u16 + 1 && item.depth == depth
+                && !self.cooperative_exact_candidates[..index].iter().any(|prior| prior.pv.first() == item.pv.first()))
+        {
+            let first = self.cooperative_exact_candidates[0].pv[0];
+            if let Some(old) = self.cooperative_exact_completed.iter_mut().find(|set|
+                set.first().and_then(|opinion| opinion.pv.first()).copied() == Some(first))
+            {
+                if old[0].depth < depth { old.clone_from(&self.cooperative_exact_candidates); }
+            } else if self.cooperative_exact_completed.len() < self.cooperative_exact_limit {
+                self.cooperative_exact_completed.push(self.cooperative_exact_candidates.clone());
+            }
+        }
+    }
+
+    /// Use a completed iteration only after the same query naturally returned
+    /// bestmove and readiness, and only when its first move agrees. Never turn
+    /// a stopped/cancelled execution into a completed policy observation.
+    fn select_completed_exact_policy(&mut self, report: &ExternalCheckerReport, width: u16) {
+        if report.completion == ExternalCompletion::BestMove {
+            if let Some(exact) = self.cooperative_exact_completed.iter().find(|set|
+                set.len() == usize::from(width)
+                    && set.first().and_then(|item| item.pv.first()).copied() == report.best_move)
+            {
+                self.cooperative_opinions.clone_from(exact);
+            }
+        }
+    }
+
     fn capture(&mut self, report: &mut ExternalCheckerReport, start: Instant) {
         // One clock observation belongs to both copies of this physical fact.
         // Reading it again for the attempt makes an otherwise identical final
@@ -1467,17 +1915,29 @@ impl CpuChecker for ExternalUciCpuChecker {
         Ok(())
     }
     fn capabilities(&self) -> CheckerCapabilities {
+        let root_moves = self
+            .engine_profile
+            .is_none_or(|(profile, _)| profile.capabilities().searchmoves);
         CheckerCapabilities {
             max_depth: self.config.max_depth,
             max_prefix_plies: self.config.max_prefix_plies,
-            max_root_moves: 256,
-            root_moves: true,
+            max_root_moves: if root_moves { 256 } else { 0 },
+            root_moves,
             divergence: true,
             resume: false,
             selective_search: None,
         }
     }
     fn preflight_task(&self, limits: CpuLimits) -> Result<(), CheckerError> {
+        if let Some((profile, _)) = self.engine_profile {
+            profile.require_query(
+                ExternalGoConstraint::Combined {
+                    depth: limits.max_depth,
+                    reported_nodes: limits.max_nodes,
+                },
+                false,
+            )?;
+        }
         if self.failed || self.active {
             return Err(error("analysis", "checker_not_available"));
         }
@@ -1599,11 +2059,6 @@ mod process {
     use std::os::unix::process::CommandExt;
     use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-    // A quarantined owner keeps this slot occupied. Repeated failed creation
-    // cannot accumulate arbitrarily many child groups or retained handles.
-    static PROCESS_SLOT: AtomicBool = AtomicBool::new(false);
-    static QUARANTINE_PRESENT: AtomicBool = AtomicBool::new(false);
-
     pub(super) struct OwnedProcess {
         child: Option<Child>,
         stdin: Option<ChildStdin>,
@@ -1625,6 +2080,7 @@ mod process {
         lines: VecDeque<String>,
         state: CheckerShutdown,
         shutdown_grace: Duration,
+        process_slot: process_scope::ProcessLease,
     }
 
     pub(super) struct SpawnFailure {
@@ -1651,15 +2107,30 @@ mod process {
     }
 
     fn proc_identity(pid: i32) -> Result<Option<ProcIdentity>, CheckerError> {
-        let file = match File::open(format!("/proc/{pid}/stat")) {
+        read_proc_identity(File::open(format!("/proc/{pid}/stat")))
+    }
+
+    fn proc_stat_disappeared(failure: &std::io::Error) -> bool {
+        failure.kind() == ErrorKind::NotFound || failure.raw_os_error() == Some(nix::libc::ESRCH)
+    }
+
+    fn read_proc_identity<R: Read>(
+        source: std::io::Result<R>,
+    ) -> Result<Option<ProcIdentity>, CheckerError> {
+        let file = match source {
             Ok(file) => file,
-            Err(failure) if failure.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(failure) if proc_stat_disappeared(&failure) => return Ok(None),
             Err(_) => return Err(error("ownership", "proc_stat_unavailable")),
         };
         let mut bytes = Vec::new();
-        file.take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(|_| error("ownership", "proc_stat_read"))?;
+        match file.take(4097).read_to_end(&mut bytes) {
+            Ok(_) => {}
+            // A task can exit after its stat FD was opened during the bounded
+            // group scan. Never parse bytes from a failed partial read. Leader
+            // callers still reject None as a missing/disappeared owned leader.
+            Err(failure) if proc_stat_disappeared(&failure) => return Ok(None),
+            Err(_) => return Err(error("ownership", "proc_stat_read")),
+        }
         if bytes.len() > 4096 {
             return Err(error("ownership", "proc_stat_budget"));
         }
@@ -1713,23 +2184,28 @@ mod process {
             cancel: &AtomicBool,
             launch_pin: Option<&ExternalLaunchPin>,
         ) -> Result<Self, Box<SpawnFailure>> {
-            if PROCESS_SLOT
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(Box::new(SpawnFailure {
-                    error: error("spawn", "process_slot_unavailable"),
-                    process: empty_shutdown(),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }));
-            }
+            let mut process_slot = Some(
+                process_scope::ProcessLease::acquire(
+                    launch_pin.and_then(|pin| pin.collection_process_permit.as_ref()),
+                )
+                .map_err(|error| {
+                    Box::new(SpawnFailure {
+                        error,
+                        process: empty_shutdown(),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                })?,
+            );
             let mut failure_evidence = None;
-            let result =
-                Self::spawn_owned(config, deadline, cancel, launch_pin, &mut failure_evidence);
-            if result.is_err() && !QUARANTINE_PRESENT.load(Ordering::Acquire) {
-                PROCESS_SLOT.store(false, Ordering::Release);
-            }
+            let result = Self::spawn_owned(
+                config,
+                deadline,
+                cancel,
+                launch_pin,
+                &mut failure_evidence,
+                &mut process_slot,
+            );
             result.map_err(|failure| {
                 Box::new(failure_evidence.unwrap_or_else(|| {
                     let mut process = empty_shutdown();
@@ -1749,6 +2225,7 @@ mod process {
             cancel: &AtomicBool,
             launch_pin: Option<&ExternalLaunchPin>,
             failure_evidence: &mut Option<SpawnFailure>,
+            process_slot: &mut Option<process_scope::ProcessLease>,
         ) -> Result<Self, CheckerError> {
             use std::os::unix::fs::FileExt;
             let program = match launch_pin {
@@ -1778,44 +2255,69 @@ mod process {
             if header != *b"\x7fELF" {
                 return Err(error("spawn", "native_elf_required"));
             }
-            let mut hash = Sha256::new();
-            hash.update(header);
-            let mut buffer = [0u8; 65_536];
-            let mut total = 4u64;
-            loop {
-                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-                    return Err(error("spawn", "hash_cancel_or_deadline"));
+            if let Some(sealed_sha256) = launch_pin.and_then(|pin| pin.sealed_sha256.as_ref()) {
+                use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+                let required = SealFlag::F_SEAL_WRITE
+                    | SealFlag::F_SEAL_GROW
+                    | SealFlag::F_SEAL_SHRINK
+                    | SealFlag::F_SEAL_SEAL;
+                let actual = fcntl(&program, FcntlArg::F_GET_SEALS)
+                    .map_err(|_| error("spawn", "sealed_program_readback"))?;
+                if (actual & required.bits()) != required.bits()
+                    || sealed_sha256 != &config.identity.binary_sha256
+                {
+                    return Err(error("spawn", "sealed_program_identity"));
                 }
-                let count = program
-                    .read_at(&mut buffer, total)
-                    .map_err(|_| error("spawn", "program_hash_read"))?;
-                if count == 0 {
-                    break;
+            } else {
+                let mut hash = Sha256::new();
+                hash.update(header);
+                let mut buffer = [0u8; 65_536];
+                let mut total = 4u64;
+                loop {
+                    // Report both conditions when both are observed at this check.
+                    // They are independent observations, not an ordering claim:
+                    // cancellation can race with the deadline and is read first.
+                    let cancelled = cancel.load(Ordering::Acquire);
+                    let expired = Instant::now() >= deadline;
+                    match (cancelled, expired) {
+                        (false, false) => {}
+                        (true, false) => return Err(error("spawn", "hash_cancelled")),
+                        (false, true) => return Err(error("spawn", "hash_deadline_expired")),
+                        (true, true) => {
+                            return Err(error("spawn", "hash_cancelled_and_deadline_expired"));
+                        }
+                    }
+                    let count = program
+                        .read_at(&mut buffer, total)
+                        .map_err(|_| error("spawn", "program_hash_read"))?;
+                    if count == 0 {
+                        break;
+                    }
+                    total = total
+                        .checked_add(count as u64)
+                        .ok_or_else(|| error("spawn", "program_hash_overflow"))?;
+                    if total > 256 * 1024 * 1024 {
+                        return Err(error("spawn", "program_hash_budget"));
+                    }
+                    hash.update(&buffer[..count]);
                 }
-                total = total
-                    .checked_add(count as u64)
-                    .ok_or_else(|| error("spawn", "program_hash_overflow"))?;
-                if total > 256 * 1024 * 1024 {
-                    return Err(error("spawn", "program_hash_budget"));
+                let after = program
+                    .metadata()
+                    .map_err(|_| error("spawn", "program_recheck"))?;
+                if total != metadata.len()
+                    || after.len() != metadata.len()
+                    || after.dev() != metadata.dev()
+                    || after.ino() != metadata.ino()
+                    || after.mtime() != metadata.mtime()
+                    || after.mtime_nsec() != metadata.mtime_nsec()
+                    || after.ctime() != metadata.ctime()
+                    || after.ctime_nsec() != metadata.ctime_nsec()
+                {
+                    return Err(error("spawn", "program_changed_during_hash"));
                 }
-                hash.update(&buffer[..count]);
-            }
-            let after = program
-                .metadata()
-                .map_err(|_| error("spawn", "program_recheck"))?;
-            if total != metadata.len()
-                || after.len() != metadata.len()
-                || after.dev() != metadata.dev()
-                || after.ino() != metadata.ino()
-                || after.mtime() != metadata.mtime()
-                || after.mtime_nsec() != metadata.mtime_nsec()
-                || after.ctime() != metadata.ctime()
-                || after.ctime_nsec() != metadata.ctime_nsec()
-            {
-                return Err(error("spawn", "program_changed_during_hash"));
-            }
-            if format!("{:x}", hash.finalize()) != config.identity.binary_sha256 {
-                return Err(error("spawn", "program_hash_mismatch"));
+                if format!("{:x}", hash.finalize()) != config.identity.binary_sha256 {
+                    return Err(error("spawn", "program_hash_mismatch"));
+                }
             }
             let directory = match launch_pin {
                 Some(pin) => pin
@@ -1849,9 +2351,48 @@ mod process {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0);
-            let mut child = command
-                .spawn()
-                .map_err(|_| error("spawn", "native_spawn"))?;
+            // Before spawn, dropping this reservation means NotStarted. After
+            // spawn it is immediately installed in the original OS owner.
+            let mut lease = process_slot
+                .take()
+                .expect("reserved process slot before spawn");
+            lease.ensure_spawn_allowed()?;
+            let mut child = match command.spawn() {
+                Ok(child) => {
+                    if let Some(counters) = launch_pin.and_then(|pin| pin.sealed_counters.as_ref()) {
+                        if launch_pin.is_some_and(|pin| pin.sealed_sha256.is_some()) {
+                            let _ = counters.sealed_spawn_returned.fetch_update(
+                                Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
+                        }
+                    }
+                    child
+                }
+                Err(failure)
+                    if launch_pin.is_some_and(|pin| pin.sealed_sha256.is_some())
+                        && matches!(failure.raw_os_error(),
+                            Some(nix::libc::EACCES | nix::libc::EPERM | nix::libc::ETXTBSY)) =>
+                {
+                    let pin = launch_pin.expect("sealed pin checked above");
+                    let original = pin.fallback_executable.as_ref()
+                        .ok_or_else(|| error("spawn", "sealed_fallback_missing"))?;
+                    let mut fallback = pin.clone();
+                    fallback.executable = Arc::clone(original);
+                    fallback.sealed_sha256 = None;
+                    fallback.fallback_executable = None;
+                    if let Some(counters) = pin.sealed_counters.as_ref() {
+                        let _ = counters.original_fallback_attempted.fetch_update(
+                            Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
+                    }
+                    // No child was returned: transfer the *same* reservation to
+                    // the ordinary original-FD hash path, without extending its
+                    // deadline or reacquiring a one-shot collection permit.
+                    *process_slot = Some(lease);
+                    return Self::spawn_owned(config, deadline, cancel, Some(&fallback),
+                        failure_evidence, process_slot);
+                }
+                Err(_) => return Err(error("spawn", "native_spawn")),
+            };
+            lease.mark_started();
             // Linux kernel PIDs fit signed pid_t. Install the owned child before
             // any fallible setup and retain optional pipes even on setup error.
             let pid = Pid::from_raw(child.id() as i32);
@@ -1881,6 +2422,7 @@ mod process {
                 lines: VecDeque::new(),
                 state: empty_shutdown(),
                 shutdown_grace: config.shutdown_grace,
+                process_slot: lease,
             };
             let setup = (|| {
                 let identity = proc_identity(pid.as_raw())?
@@ -2198,7 +2740,7 @@ mod process {
                         self.authority = false;
                         self.state.cleanup_complete = true;
                         self.state.quarantined = false;
-                        PROCESS_SLOT.store(false, Ordering::Release);
+                        self.process_slot.complete_physical();
                         return Ok(self.state);
                     }
                 }
@@ -2229,9 +2771,118 @@ mod process {
                 if let Some(child) = self.child.take() {
                     std::mem::forget(child);
                 }
-                QUARANTINE_PRESENT.store(true, Ordering::Release);
-                PROCESS_SLOT.store(true, Ordering::Release);
+                // The ProcessLease drops as unconfirmed and keeps its original
+                // singleton/group gate occupied. No reservation is refunded.
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod proc_identity_tests {
+        use super::*;
+        use std::io::Cursor;
+
+        fn stat_bytes() -> Vec<u8> {
+            let mut fields = ["0"; 20];
+            fields[0] = "S";
+            fields[2] = "41";
+            fields[19] = "9001";
+            format!("123 (proc fixture) {}\n", fields.join(" ")).into_bytes()
+        }
+
+        struct ReadThenError {
+            bytes: Cursor<Vec<u8>>,
+            errno: i32,
+        }
+        impl Read for ReadThenError {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(buffer)?;
+                if count != 0 {
+                    Ok(count)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(self.errno))
+                }
+            }
+        }
+
+        #[test]
+        fn vanished_proc_stat_open_or_read_returns_no_identity() {
+            for errno in [nix::libc::ENOENT, nix::libc::ESRCH] {
+                let opened: std::io::Result<Cursor<Vec<u8>>> =
+                    Err(std::io::Error::from_raw_os_error(errno));
+                assert!(read_proc_identity(opened).unwrap().is_none());
+                let reader = ReadThenError {
+                    bytes: Cursor::new(Vec::new()),
+                    errno,
+                };
+                assert!(read_proc_identity(Ok(reader)).unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn vanished_proc_stat_discards_even_parseable_partial_bytes() {
+            for errno in [nix::libc::ENOENT, nix::libc::ESRCH] {
+                let reader = ReadThenError {
+                    bytes: Cursor::new(stat_bytes()),
+                    errno,
+                };
+                assert!(read_proc_identity(Ok(reader)).unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn proc_stat_permission_and_io_errors_remain_failures() {
+            for errno in [nix::libc::EACCES, nix::libc::EIO] {
+                let opened: std::io::Result<Cursor<Vec<u8>>> =
+                    Err(std::io::Error::from_raw_os_error(errno));
+                assert_eq!(
+                    read_proc_identity(opened).err(),
+                    Some(error("ownership", "proc_stat_unavailable"))
+                );
+                for bytes in [Vec::new(), stat_bytes()] {
+                    let reader = ReadThenError {
+                        bytes: Cursor::new(bytes),
+                        errno,
+                    };
+                    assert_eq!(
+                        read_proc_identity(Ok(reader)).err(),
+                        Some(error("ownership", "proc_stat_read"))
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn proc_stat_encoding_and_format_errors_remain_failures() {
+            for (bytes, code) in [
+                (vec![0xff], "proc_stat_encoding"),
+                (b"missing stat delimiter".to_vec(), "proc_stat_format"),
+                (b"123 (fixture) S 1 invalid".to_vec(), "proc_group"),
+                (b"123 (fixture) S 1 41".to_vec(), "proc_start"),
+            ] {
+                assert_eq!(
+                    read_proc_identity(Ok(Cursor::new(bytes))).err(),
+                    Some(error("ownership", code))
+                );
+            }
+        }
+
+        #[test]
+        fn proc_stat_keeps_4096_byte_parse_and_bounded_overflow() {
+            let mut bytes = stat_bytes();
+            bytes.resize(4096, b' ');
+            let identity = read_proc_identity(Ok(Cursor::new(bytes.clone())))
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.group, 41);
+            assert_eq!(identity.start, 9001);
+            bytes.resize(8192, b' ');
+            let mut reader = Cursor::new(bytes);
+            assert_eq!(
+                read_proc_identity(Ok(&mut reader)).err(),
+                Some(error("ownership", "proc_stat_budget"))
+            );
+            assert_eq!(reader.position(), 4097);
         }
     }
 }
@@ -2379,7 +3030,77 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_teacher_pin_preserves_bytes_and_original_process_lifetime() {
+        use std::os::unix::fs::FileExt;
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let config = fixture_config("fake_uci_normal");
+        let original = File::open(&config.program).unwrap();
+        let expected = &config.identity.binary_sha256;
+        let mut checks = 0;
+        let token = VerifiedSealedExecutable::prepare(&original, expected, || {
+            checks += 1;
+            Ok(())
+        }).unwrap();
+        let probe = token.execution_probe();
+        let sealed_file = Arc::downgrade(&token.file);
+        assert!(checks > 1);
+        assert!(token.file.write_at(b"changed", 0).is_err());
+        assert!(VerifiedSealedExecutable::prepare(&original, &"0".repeat(64), || Ok(())).is_err());
+        assert!(VerifiedSealedExecutable::prepare(&original, expected, || {
+            Err(CheckerError::Invalid("cancelled preparation"))
+        }).is_err());
+        let cwd = File::open(&config.working_directory).unwrap();
+        let pin = ExternalLaunchPin::from_verified_sealed(token.clone(), cwd).unwrap();
+        let mut wrong = config.clone();
+        wrong.identity.binary_sha256 = "0".repeat(64);
+        let mut denied = ExternalUciCpuChecker::create(wrong).unwrap();
+        denied.launch_pin = Some(pin.clone());
+        assert!(denied.start(Instant::now() + Duration::from_secs(10), &AtomicBool::new(false)).is_err());
+        let mut checker = ExternalUciCpuChecker::create(config).unwrap();
+        checker.launch_pin = Some(pin);
+        checker.start(Instant::now() + Duration::from_secs(10), &AtomicBool::new(false)).unwrap();
+        let closed = checker.shutdown(Instant::now() + Duration::from_secs(3)).unwrap();
+        assert!(closed.exit_observed && closed.stdout_drained && closed.stderr_drained);
+        assert!(closed.cleanup_complete);
+        assert_eq!(token.execution_observations(), (1, 0));
+        drop(denied);
+        drop(checker);
+        drop(token);
+        assert!(sealed_file.upgrade().is_none());
+        assert_eq!(probe.execution_observations(), (1, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_teacher_copy_does_not_follow_later_original_mutation() {
+        use std::io::Write;
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rz-sealed-mutation-{}-{nonce}", std::process::id()));
+        let _cleanup = Cleanup(path.clone());
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        out.write_all(&bytes).unwrap();
+        out.set_permissions(std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(out);
+        let original = File::open(&path).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        let token = VerifiedSealedExecutable::prepare(&original, &expected, || Ok(())).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_at(b"changed", 0).unwrap();
+        let mut sealed_header = [0u8; 4];
+        token.file.read_exact_at(&mut sealed_header, 0).unwrap();
+        assert_eq!(sealed_header, *b"\x7fELF");
+        assert!(VerifiedSealedExecutable::prepare(&original, &expected, || Ok(())).is_err());
+    }
 
     #[cfg(target_os = "linux")]
     fn fixture_mode(name: &str) -> bool {
@@ -2426,12 +3147,12 @@ mod tests {
                     .iter()
                     .position(|word| *word == "depth")
                     .map(|at| words[at + 1])
-                    .unwrap();
+                    .unwrap_or("2");
                 let requested: u64 = words
                     .iter()
                     .position(|word| *word == "nodes")
                     .map(|at| words[at + 1].parse().unwrap())
-                    .unwrap();
+                    .unwrap_or(10);
                 let best = words
                     .iter()
                     .position(|word| *word == "searchmoves")
@@ -2442,11 +3163,30 @@ mod tests {
                 } else {
                     requested.min(10)
                 };
+                if mode == 10 {
+                    // A completed older set agrees with final bestmove even
+                    // though a newer exact set chose another first move.
+                    let mut moves = vec![best];
+                    moves.extend(position.legal_moves().into_iter().filter(|mv| *mv != best));
+                    let older = depth.parse::<u16>().unwrap().saturating_sub(1).max(1);
+                    for rank in 1..=multipv {
+                        println!("info depth {older} multipv {rank} nodes {nodes} score cp 21 pv {}", moves[usize::from(rank - 1)]);
+                    }
+                    moves.swap(0, 1);
+                    for rank in 1..=multipv {
+                        println!("info depth {depth} multipv {rank} nodes {nodes} score cp 22 pv {}", moves[usize::from(rank - 1)]);
+                    }
+                    let later = depth.parse::<u16>().unwrap() + 1;
+                    println!("info depth {later} multipv 1 nodes {nodes} score cp 23 lowerbound pv {best}");
+                    println!("bestmove {best}");
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                }
                 if mode == 2 {
                     println!("info depth {depth} nodes {nodes} score cp NaN pv {best}");
                 } else {
                     println!("info depth {depth} seldepth 12 nodes {nodes} score cp 21 pv {best}");
-                    if mode == 6 || mode == 7 {
+                    if matches!(mode, 6 | 7 | 8 | 9) {
                         let legal = position.legal_moves();
                         for rank in 2..=multipv {
                             let other = legal
@@ -2460,9 +3200,16 @@ mod tests {
                             );
                         }
                     }
+                    if matches!(mode, 8 | 9) {
+                        let next_depth = depth.parse::<u16>().unwrap() + 1;
+                        println!("info depth {next_depth} multipv 1 nodes {nodes} score cp 32 lowerbound pv {best}");
+                    }
                 }
                 if mode == 4 || mode == 5 {
                     pending_best = Some(best);
+                } else if mode == 9 {
+                    let other = position.legal_moves().into_iter().find(|mv| *mv != best).unwrap();
+                    println!("bestmove {other}");
                 } else {
                     println!("bestmove {best}");
                 }
@@ -2541,6 +3288,24 @@ mod tests {
         if fixture_mode("external_cpu::tests::fake_uci_mixed_multipv") {
             fixture_loop(7);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_final_bound() {
+        if fixture_mode("external_cpu::tests::fake_uci_final_bound") { fixture_loop(8); }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_final_bound_changed_best() {
+        if fixture_mode("external_cpu::tests::fake_uci_final_bound_changed_best") { fixture_loop(9); }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_prior_exact_matching_best() {
+        if fixture_mode("external_cpu::tests::fake_uci_prior_exact_matching_best") { fixture_loop(10); }
     }
 
     #[cfg(target_os = "linux")]
@@ -2767,6 +3532,46 @@ mod tests {
                 .unwrap()
                 .cleanup_complete
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_exact_iteration_survives_final_bound_without_fabricating_completion() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        for (name, width, expected) in [
+            ("fake_uci_final_bound", 1, true),
+            ("fake_uci_final_bound", 4, true),
+            ("fake_uci_final_bound_changed_best", 1, false),
+            ("fake_uci_final_bound_changed_best", 4, false),
+            ("fake_uci_prior_exact_matching_best", 1, true),
+            ("fake_uci_prior_exact_matching_best", 4, true),
+            ("fake_uci_mixed_multipv", 4, false),
+            ("fake_uci_waits_for_stop", 1, false),
+        ] {
+            let mut checker = cooperative_fixture(name);
+            let control = FixtureControl(rz_runtime::adaptive::ControlMailbox::new(
+                1, rz_runtime::CompletionSignal::default()));
+            let report = checker.analyze_cooperative(
+                &Position::startpos(), None,
+                CpuLimits { max_depth: 8, max_nodes: 100, deadline: Some(Instant::now() + Duration::from_secs(2)) },
+                &AtomicBool::new(false), &control,
+                ExternalSlicePolicy { multipv: width, ..ExternalSlicePolicy::default() },
+            ).unwrap();
+            assert_eq!(report.policy_target_known, expected, "{name} width={width}");
+            if name == "fake_uci_final_bound" {
+                assert_eq!(report.report.bound, ExternalBound::Lower);
+                assert!(report.opinions.iter().all(|opinion| opinion.bound == ExternalBound::ExactReported && opinion.depth == 8));
+            }
+            if name == "fake_uci_prior_exact_matching_best" {
+                assert_eq!(report.report.bound, ExternalBound::Lower);
+                assert!(report.opinions.iter().all(|opinion| opinion.bound == ExternalBound::ExactReported && opinion.depth == 7));
+                assert_eq!(report.opinions[0].pv.first().copied(), report.report.best_move);
+            }
+            if name == "fake_uci_waits_for_stop" {
+                assert_ne!(report.report.completion, ExternalCompletion::BestMove);
+            }
+            checker.shutdown(Instant::now() + Duration::from_secs(2)).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3392,7 +4197,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn fixture_config(mode: &str) -> ExternalCpuConfig {
+    pub(super) fn fixture_config(mode: &str) -> ExternalCpuConfig {
         let program = std::env::current_exe().unwrap();
         let arguments = vec![
             "--exact".into(),
@@ -3812,6 +4617,36 @@ mod tests {
             assert_eq!(partial.completion, ExternalCompletion::Pending);
             assert_eq!(partial.best_move, None);
             assert!(attempt.process.cleanup_complete);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hash_stop_reports_cancel_and_deadline_independently_without_spawning() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let config = fixture_config("fake_uci_normal");
+        for (cancelled, expired, expected) in [
+            (true, false, "hash_cancelled"),
+            (false, true, "hash_deadline_expired"),
+            (true, true, "hash_cancelled_and_deadline_expired"),
+        ] {
+            let deadline = if expired {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(10)
+            };
+            let failure = match process::OwnedProcess::spawn(
+                &config,
+                deadline,
+                &AtomicBool::new(cancelled),
+                None,
+            ) {
+                Ok(_) => panic!("a stopped hash must not spawn the teacher process"),
+                Err(failure) => failure,
+            };
+            assert_eq!(failure.error, error("spawn", expected));
+            assert!(failure.process.cleanup_complete);
+            assert!(failure.process.process_identity.is_none());
         }
     }
 

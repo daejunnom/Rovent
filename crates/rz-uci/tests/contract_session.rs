@@ -5,12 +5,13 @@ use rz_contracts::{
 use rz_search::contract_time::InstantClock;
 use rz_search::driver::StopReason;
 use rz_search::time::TimeBudgetConfig;
-use rz_uci::bridge::BuildSearchSettings;
+use rz_uci::bridge::{BuildSearchSettings, NodeBudgetSemantics};
 use rz_uci::contracts::{ContractSessionOutcome, ContractSessionOwner};
 use rz_uci::{
     CancelReason, Effect, EngineIdentity, Event, ParserLimits, PositionBase, PositionPort,
     PositionSpec, PreparedPosition, SearchCompletion, SearchTicket, Session,
 };
+use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
 const EPOCH: ProcessEpoch = ProcessEpoch(7000);
@@ -165,6 +166,246 @@ fn assert_typed_error(out: &ContractSessionOutcome<Snapshot>, code: ErrorCode) {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "ContractFailure")
+    );
+}
+
+#[test]
+fn default_go_announces_registered_limits_and_stop_uses_restricted_root() {
+    for (command, expected_move) in [("go", "e2e4"), ("go searchmoves d2d4", "d2d4")] {
+        let mut owner = owner(fixture_scope());
+        let mut session = session();
+        let started = line(&mut owner, &mut session, command);
+        assert!(started.session.accepted, "{started:?}");
+        assert_eq!(
+            started.session.protocol,
+            [
+                "info string go uses configured resource wall at most 30000 ms and simulation limit 128"
+            ]
+        );
+        assert!(matches!(
+            started.session.effects.as_slice(),
+            [Effect::Start { .. }]
+        ));
+        let stopped = line(&mut owner, &mut session, "stop");
+        assert_eq!(
+            stopped.session.protocol,
+            [format!("bestmove {expected_move}")]
+        );
+        assert!(owner.active_ticket().is_none());
+        assert!(
+            line(&mut owner, &mut session, "stop")
+                .session
+                .protocol
+                .is_empty()
+        );
+    }
+
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+        .unwrap();
+    let started = line(&mut owner, &mut session, "go searchmoves d2d4");
+    assert!(started.session.accepted, "{started:?}");
+    assert_eq!(
+        started.session.protocol,
+        [
+            "info string go uses configured resource wall at most 30000 ms; other search limits follow the registered engine profile"
+        ]
+    );
+    assert_eq!(
+        line(&mut owner, &mut session, "stop").session.protocol,
+        ["bestmove d2d4"]
+    );
+}
+
+#[test]
+fn rejected_restrictions_and_unregistered_goals_preserve_common_authority_and_budget() {
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    let ticket = begin(&mut owner, &mut session, "go nodes 8 searchmoves e2e4");
+    let scope = owner.scope();
+    let deadline = owner.control().unwrap().deadline;
+    for (command, code) in [
+        ("go nodes 1 searchmoves e2e4 e2e5", "InvalidSearchMoves"),
+        ("go depth 1", "UnsupportedSearchGoal"),
+        ("go mate 1", "UnsupportedSearchGoal"),
+    ] {
+        let out = line(&mut owner, &mut session, command);
+        assert!(!out.session.accepted);
+        assert!(
+            out.session
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == code)
+        );
+        assert!(out.session.effects.is_empty() && out.session.protocol.is_empty());
+        assert!(out.errors.is_empty());
+        assert_scope(owner.scope(), scope);
+        assert_eq!(owner.active_ticket(), Some(&ticket));
+        assert_eq!(owner.control().unwrap().deadline, deadline);
+        assert!(
+            !owner
+                .control()
+                .unwrap()
+                .cancellation
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+    assert_eq!(
+        line(&mut owner, &mut session, "stop").session.protocol,
+        ["bestmove e2e4"]
+    );
+}
+
+#[test]
+fn registered_goal_binding_and_canonical_root_restriction_reach_the_start_effect() {
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    session
+        .set_search_goal_capability(NonZeroU16::new(8))
+        .unwrap();
+    let out = line(
+        &mut owner,
+        &mut session,
+        "go mate 3 depth 6 searchmoves d2d4 e2e4 d2d4",
+    );
+    assert!(out.session.accepted && out.errors.is_empty(), "{out:?}");
+    let [Effect::Start { limits, .. }] = out.session.effects.as_slice() else {
+        panic!(
+            "expected goal-aware Start effect: {:?}",
+            out.session.effects
+        );
+    };
+    assert_eq!(limits.searchmoves, Some(vec!["e2e4".into(), "d2d4".into()]));
+    let binding = owner.active_binding().unwrap();
+    assert_eq!(
+        binding.goal(),
+        rz_contracts::rovent::SearchGoal {
+            depth_plies: NonZeroU16::new(6),
+            mate_moves: NonZeroU16::new(3),
+        }
+    );
+    assert_eq!(
+        binding.budget_kind(),
+        rz_uci::bridge::BudgetKind::ResourceWall
+    );
+    assert_eq!(
+        binding.control().max_simulations,
+        settings().max_simulations
+    );
+    assert_eq!(
+        line(&mut owner, &mut session, "stop").session.protocol,
+        ["bestmove e2e4"]
+    );
+}
+
+#[test]
+fn rovent_position_nodes_preserve_original_values_without_becoming_simulations() {
+    for nodes in [0, 1, u64::MAX] {
+        let mut owner = owner(fixture_scope());
+        let mut session = session();
+        session
+            .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+            .unwrap();
+        session
+            .set_search_goal_capability(NonZeroU16::new(8))
+            .unwrap();
+        let out = line(
+            &mut owner,
+            &mut session,
+            &format!("go nodes {nodes} depth 4 searchmoves d2d4 e2e4 d2d4"),
+        );
+        assert!(out.session.accepted && out.errors.is_empty(), "{out:?}");
+        let [Effect::Start { limits, .. }] = out.session.effects.as_slice() else {
+            panic!(
+                "expected exactly one original Start: {:?}",
+                out.session.effects
+            );
+        };
+        assert_eq!(limits.nodes, Some(nodes));
+        assert_eq!(limits.searchmoves, Some(vec!["e2e4".into(), "d2d4".into()]));
+        let binding = owner.active_binding().unwrap();
+        assert_eq!(
+            binding.control().max_simulations,
+            settings().max_simulations
+        );
+        assert_eq!(binding.goal().depth_plies, NonZeroU16::new(4));
+        assert_eq!(
+            binding.node_budget_semantics(),
+            NodeBudgetSemantics::RoventPositionVisits
+        );
+    }
+}
+
+#[test]
+fn rovent_failed_pure_admission_keeps_prior_ticket_clock_scope_and_cancellation() {
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+        .unwrap();
+    session
+        .set_search_goal_capability(NonZeroU16::new(8))
+        .unwrap();
+    let ticket = begin(&mut owner, &mut session, "go nodes 1 searchmoves e2e4");
+    let scope = owner.scope();
+    let deadline = owner.control().unwrap().deadline;
+    let token = owner.cancellation().unwrap().token();
+    for command in [
+        "go movetime 0",
+        "go depth 9",
+        "go movetime 18446744073709551615",
+    ] {
+        let out = line(&mut owner, &mut session, command);
+        assert!(!out.session.accepted, "{command}: {out:?}");
+        assert!(!out.errors.is_empty(), "{out:?}");
+        assert!(out.session.protocol.is_empty() && out.session.effects.is_empty());
+        assert_eq!(owner.active_ticket(), Some(&ticket));
+        assert_eq!(session.active_ticket(), Some(ticket.clone()));
+        assert_eq!(owner.control().unwrap().deadline, deadline);
+        assert_scope(owner.scope(), scope);
+        assert!(!token.is_canceled());
+    }
+    let failure = ContractError::new(
+        ErrorCode::IdentityMismatch,
+        Stage::Admission,
+        "checked fixture side is unavailable before admission",
+    );
+    let out = owner.handle_line(&mut session, "go nodes 2", |_| Err(failure));
+    assert_typed_error(&out, ErrorCode::IdentityMismatch);
+    assert!(out.session.effects.is_empty() && out.session.protocol.is_empty());
+    assert_eq!(owner.active_ticket(), Some(&ticket));
+    assert_eq!(owner.control().unwrap().deadline, deadline);
+    assert_scope(owner.scope(), scope);
+    assert!(!token.is_canceled());
+}
+
+#[test]
+fn rovent_prepared_time_binding_reads_the_original_snapshot_side_once() {
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+        .unwrap();
+    let calls = std::cell::Cell::new(0);
+    let out = owner.handle_line(
+        &mut session,
+        "go wtime 10000 btime 20000 winc 3 binc 7 nodes 1",
+        |snapshot| {
+            calls.set(calls.get() + 1);
+            checked_side(snapshot)
+        },
+    );
+    assert!(out.session.accepted && out.errors.is_empty(), "{out:?}");
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(
+        out.session.effects.as_slice(),
+        [Effect::Start { .. }]
+    ));
+    assert_eq!(
+        owner.control().unwrap().max_simulations,
+        settings().max_simulations
     );
 }
 

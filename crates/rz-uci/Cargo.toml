@@ -14,6 +14,11 @@ name = "rz-pals-adaptive"
 path = "src/bin/pals-adaptive.rs"
 required-features = ["pals-adaptive", "onnx-cpu"]
 
+[[bin]]
+name = "rz-rovent"
+path = "src/bin/rovent.rs"
+required-features = ["pals-adaptive", "onnx-cpu"]
+
 [[example]]
 name = "search_probe"
 required-features = ["onnx-cpu"]
@@ -38,6 +43,14 @@ required-features = ["pals-adaptive-diagnostics"]
 name = "virtual_review_warm_numeric_capture"
 required-features = ["pals-adaptive", "onnx-cpu", "experimental-io-binding"]
 
+[[example]]
+name = "virtual_review_gpu_inflight_validation"
+required-features = ["pals-adaptive", "onnx-cuda", "experimental-io-binding", "native-validation-diagnostics"]
+
+[[example]]
+name = "rovent_external_probe"
+required-features = ["pals-adaptive"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]
@@ -60,6 +73,7 @@ search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-f
 onnx-cuda = ["onnx-cpu"]
 pals-adaptive = ["dep:rz-experiments", "rz-experiments/pals-content-admission", "search-work-receipts"]
 pals-adaptive-diagnostics = ["pals-adaptive", "onnx-cpu"]
+native-validation-diagnostics = ["pals-adaptive-diagnostics", "rz-eval/native-validation-diagnostics", "rz-search/nnuec-scalar-diagnostics"]
 
 [dependencies]
 rz-search.workspace = true

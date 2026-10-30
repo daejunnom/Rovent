@@ -216,6 +216,7 @@ mod check {
             PalsError::Role(_) => "Role",
             PalsError::Store(_) => "Store",
             PalsError::Review(_) => "Review",
+            PalsError::Rovent(_) => "Rovent",
             PalsError::Capacity => "Capacity",
             PalsError::RoleCallLimit => "RoleCallLimit",
         };

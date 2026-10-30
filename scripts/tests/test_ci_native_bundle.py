@@ -2,19 +2,412 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
+import tarfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ci_native_bundle as bundle
 
 
 class NativeBundleTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'closed-owner ELF cleanup is Linux-only')
+    def test_partial_failure_reclaims_only_verified_restorable_private_copies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private, artifact = root / 'private-elf', root / 'artifact'
+            private.mkdir()
+            artifact.mkdir()
+            binaries = {}
+            expected = {'engine': b'\x7fELFengine', 'metadata': b'\x7fELFmetadata'}
+            filename = 'partial-native-validation-binaries.tar.gz'
+            with tarfile.open(artifact / filename, 'w:gz') as archive:
+                for name, data in expected.items():
+                    (private / name).write_bytes(data)
+                    info = tarfile.TarInfo('bin/' + name)
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+                    binaries[name] = {'pin': {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}
+            (root / 'failure.log').write_bytes(b'failure evidence')
+            receipt = {'status': 'FAILED_NOT_ADMITTED', 'commands': [{'original_tree_cleanup_verified': True}],
+                       'partial_binary_bundle_file': filename,
+                       'partial_binary_bundle': bundle.file_pin(artifact / filename), 'binaries': binaries}
+            journal = bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            self.assertTrue(journal['complete'])
+            self.assertFalse(private.exists())
+            self.assertEqual((root / 'failure.log').read_bytes(), b'failure evidence')
+            self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+            with tarfile.open(artifact / filename, 'r:gz') as archive:
+                self.assertEqual({name: archive.extractfile('bin/' + name).read() for name in expected}, expected)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'closed-owner ELF cleanup is Linux-only')
+    def test_partial_failure_preserves_private_copies_on_unknown_or_bad_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private, artifact = root / 'private-elf', root / 'artifact'
+            private.mkdir()
+            artifact.mkdir()
+            data = b'\x7fELFgood'
+            (private / 'engine').write_bytes(data)
+            filename = 'partial-native-validation-binaries.tar.gz'
+            with tarfile.open(artifact / filename, 'w:gz') as archive:
+                info = tarfile.TarInfo('bin/engine')
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(b'\x7fELFevil'))
+            receipt = {'status': 'FAILED_NOT_ADMITTED', 'commands': [{'original_tree_cleanup_verified': False}],
+                       'partial_binary_bundle_file': filename,
+                       'partial_binary_bundle': bundle.file_pin(artifact / filename),
+                       'binaries': {'engine': {'pin': {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}}}
+            with self.assertRaisesRegex(RuntimeError, 'ClosedPartialProcessTreeRequired'):
+                bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            receipt['commands'][0]['original_tree_cleanup_verified'] = True
+            with self.assertRaisesRegex(RuntimeError, 'PartialBundleMemberDigest'):
+                bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            archive_path = artifact / filename
+            archive_path.write_bytes(archive_path.read_bytes()[:-8])
+            receipt['partial_binary_bundle'] = bundle.file_pin(archive_path)
+            with self.assertRaises((EOFError, OSError)):
+                bundle.cleanup_closed_partial_elf_copies(root, artifact, receipt)
+            self.assertEqual((private / 'engine').read_bytes(), data)
+            self.assertFalse((artifact / 'partial-elf-cleanup.json').exists())
+
+    def test_compressed_artifact_and_uncompressed_payload_have_separate_bounds(self):
+        rows = {str(index): {'pin': {'bytes': size << 20}}
+                for index, size in enumerate((200, 200, 150))}
+        self.assertGreater(bundle.selected_elf_payload(rows), bundle.ARTIFACT_CAP)
+        self.assertLessEqual(bundle.selected_elf_payload(rows), bundle.ELF_PAYLOAD_CAP)
+        for sizes in ((200 << 20,) * 4, (bundle.ELF_CAP + 1,), (True,), (0,)):
+            with self.subTest(sizes=sizes), self.assertRaisesRegex(RuntimeError, 'SelectedELF'):
+                bundle.selected_elf_payload({str(i): {'pin': {'bytes': size}}
+                                             for i, size in enumerate(sizes)})
+
+    def test_compressed_writer_roundtrip_and_exact_byte_accounting(self):
+        payload = b'\0' * (2 << 20)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'synthetic.tar.gz'
+            with path.open('xb') as stream:
+                writer = bundle.BoundedArchiveWriter(stream, 16 << 10)
+                with tarfile.open(fileobj=writer, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+                    member = tarfile.TarInfo('bin/synthetic')
+                    member.size = len(payload)
+                    archive.addfile(member, io.BytesIO(payload))
+                self.assertEqual(writer.written, stream.tell())
+                self.assertLessEqual(writer.written, writer.maximum)
+            with tarfile.open(path, 'r:gz') as archive:
+                self.assertEqual(archive.getnames(), ['bin/synthetic'])
+                self.assertEqual(archive.extractfile('bin/synthetic').read(), payload)
+
+    def test_compressed_writer_refuses_before_crossing_disk_bound(self):
+        payload = b''.join(hashlib.sha256(str(i).encode()).digest() for i in range(2048))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'synthetic-overflow.tar.gz'
+            with path.open('xb') as stream:
+                writer = bundle.BoundedArchiveWriter(stream, 1024)
+                with self.assertRaisesRegex(RuntimeError, 'CompressedArchiveBudget'):
+                    with tarfile.open(fileobj=writer, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+                        member = tarfile.TarInfo('bin/synthetic')
+                        member.size = len(payload)
+                        archive.addfile(member, io.BytesIO(payload))
+                self.assertLessEqual(writer.written, 1024)
+                self.assertEqual(writer.written, stream.tell())
+
+    def test_command_progress_preserves_original_failure_and_tree_closure(self):
+        # No subprocess/ELF runs: exercise the actual log/receipt boundary with
+        # supervisor outcomes, including exit 0 with an unclosed process tree.
+        for code, gone, failure in ((0, True, None),
+                                    (7, True, None),
+                                    (124, True, None),
+                                    (130, True, None),
+                                    (-15, True, None),
+                                    (125, True, 'OriginalWholeBuildDeadline'),
+                                    (0, False, None)):
+            with self.subTest(code=code, gone=gone), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT', 'CARGO_TARGET_DIR')}
+                observed = io.StringIO()
+
+                def supervise(*_args):
+                    os.write(1, b'synthetic command output\n')
+                    return code, gone, failure
+
+                with patch.object(bundle, 'run_group', supervise), patch.object(bundle.sys, 'stderr', observed):
+                    if code == 0 and gone is True and failure is None:
+                        self.assertEqual(build.command('synthetic', ['no-executable'], env),
+                                         b'synthetic command output\n')
+                    elif code == 7:
+                        with self.assertRaises(bundle.CommandExitFailure) as caught:
+                            build.command('synthetic', ['no-executable'], env)
+                        self.assertIs(caught.exception.row, build.commands[0])
+                        self.assertEqual(caught.exception.row['exit_code'], 7)
+                        self.assertEqual(caught.exception.row['stdout_pin']['bytes'],
+                                         len(b'synthetic command output\n'))
+                        self.assertEqual(caught.exception.row['stderr_pin'],
+                                         {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()})
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'CommandOrOriginalTreeClosureFailed:synthetic'):
+                            build.command('synthetic', ['no-executable'], env)
+                events = [json.loads(line) for line in observed.getvalue().splitlines()]
+                self.assertEqual([row['event'] for row in events],
+                                 ['native_bundle_command_start', 'native_bundle_command_terminal'])
+                terminal = events[-1]
+                self.assertEqual(terminal['status'], 'process_and_tree_closed'
+                                 if code == 0 and gone is True and failure is None
+                                 else 'command_or_original_tree_failed')
+                self.assertEqual(terminal['exit_code'], code)
+                self.assertEqual(terminal['original_tree_cleanup_verified'], gone)
+                self.assertEqual(terminal['supervisor_error'], failure)
+                self.assertEqual(build.commands[0]['exit_code'], code)
+                self.assertEqual(build.commands[0]['original_tree_cleanup_verified'], gone)
+
+    def test_closed_target_exit_preserves_empty_stdout_and_builds_next_target(self):
+        specs = (('synthetic', 'bin', 'failed', 'feature'),
+                 ('synthetic', 'bin', 'continued', 'feature'))
+        metadata = {'packages': [{'name': 'synthetic', 'targets': [
+            {'name': name, 'kind': ['bin'], 'required-features': ['feature']} for _, _, name, _ in specs]}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = bundle.Build(root, root, 60)
+            env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                   'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
+            env['CARGO_TARGET_DIR'] = str(root / 'target')
+            calls, events, failures, binaries = [], [], [], {}
+
+            def supervise(wrapper, *_args):
+                name = wrapper[wrapper.index('--bin') + 1]
+                calls.append(name)
+                events.append(('dispatch', name))
+                if name == 'failed':
+                    os.write(2, b'original compiler diagnostic\n')
+                    return 7, True, None
+                os.write(1, b'synthetic compiler report\n')
+                return 0, True, None
+
+            copied = {'private_copy': {'bytes': 13, 'sha256': 'a' * 64}}
+            with patch.object(bundle, 'run_group', supervise), \
+                    patch.object(bundle, 'cargo_artifact', return_value=(root / 'continued', {'target': 'continued'})) as cargo, \
+                    patch.object(bundle, 'copy_cargo_elf', return_value=copied) as copy_elf, \
+                    patch.object(bundle.sys, 'stderr', io.StringIO()):
+                bundle.build_selected_targets(build, cargo='synthetic-cargo', env=env, metadata=metadata,
+                    source=root, private=root / 'private', specs=specs, registered_paths=set(),
+                    binaries=binaries, failures=failures,
+                    failure_check=lambda: events.append(('inputs_checked',)), warm=None)
+            self.assertEqual(calls, ['failed', 'continued'])
+            failed_dispatch = events.index(('dispatch', 'failed'))
+            continued_dispatch = events.index(('dispatch', 'continued'))
+            self.assertIn(('inputs_checked',), events[failed_dispatch + 1:continued_dispatch])
+            self.assertEqual(set(binaries), {'continued'})
+            self.assertTrue(cargo.called)
+            self.assertTrue(all(call.args[4] == specs[1] for call in cargo.call_args_list))
+            self.assertTrue(copy_elf.called)
+            self.assertTrue(all(call.args[:2] == (root / 'continued', root / 'private' / 'continued')
+                                for call in copy_elf.call_args_list))
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0]['target'], list(specs[0]))
+            self.assertEqual(failures[0]['exit_code'], 7)
+            self.assertIs(failures[0]['original_tree_cleanup_verified'], True)
+            self.assertIsNone(failures[0]['supervisor_error'])
+            self.assertEqual(failures[0]['stdout_pin'], {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()})
+            self.assertEqual(failures[0]['stderr_pin'],
+                             {'bytes': len(b'original compiler diagnostic\n'),
+                              'sha256': hashlib.sha256(b'original compiler diagnostic\n').hexdigest()})
+            self.assertEqual((root / 'logs' / 'build-failed.stderr').read_bytes(), b'original compiler diagnostic\n')
+
+    def test_shared_command_failures_do_not_dispatch_later_target(self):
+        specs = (('synthetic', 'bin', 'first', 'feature'), ('synthetic', 'bin', 'later', 'feature'))
+        for result in ((124, True, None), (130, True, None), (-15, True, None),
+                       (0, False, None), (1, True, 'ActualFreeSpaceReserve')):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT', 'CARGO_TARGET_DIR')}
+                failures, binaries, calls = [], {}, []
+
+                def supervise(wrapper, *_args):
+                    calls.append(wrapper[wrapper.index('--bin') + 1])
+                    os.write(2, b'preserved shared failure\n')
+                    return result
+
+                with patch.object(bundle, 'run_group', supervise), \
+                        patch.object(bundle, 'cargo_artifact') as cargo, \
+                        patch.object(bundle.sys, 'stderr', io.StringIO()):
+                    with self.assertRaises(RuntimeError) as caught:
+                        bundle.build_selected_targets(build, cargo='synthetic-cargo', env=env, metadata={},
+                            source=root, private=root / 'private', specs=specs, registered_paths=set(),
+                            binaries=binaries, failures=failures, failure_check=lambda: None, warm=None)
+                self.assertNotIsInstance(caught.exception, bundle.CommandExitFailure)
+                self.assertEqual(calls, ['first'])
+                self.assertEqual((build.commands[0]['exit_code'], build.commands[0]['original_tree_cleanup_verified'],
+                                  build.commands[0]['supervisor_error']), result)
+                self.assertEqual(failures, [])
+                self.assertEqual(binaries, {})
+                cargo.assert_not_called()
+                self.assertEqual((root / 'logs' / 'build-first.stderr').read_bytes(), b'preserved shared failure\n')
+
+    def test_closed_target_failure_does_not_hide_changed_shared_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = bundle.Build(root, root, 60)
+            env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                   'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT', 'CARGO_TARGET_DIR')}
+            failures, binaries = [], {}
+            mutation = RuntimeError('synthetic original source/lock mutation')
+
+            def supervise(*_args):
+                os.write(2, b'original failed compiler\n')
+                return 7, True, None
+
+            def fail_inputs():
+                raise mutation
+
+            with patch.object(bundle, 'run_group', supervise), \
+                    patch.object(bundle, 'cargo_artifact') as cargo, \
+                    patch.object(bundle.sys, 'stderr', io.StringIO()):
+                with self.assertRaises(RuntimeError) as caught:
+                    bundle.build_selected_targets(build, cargo='synthetic-cargo', env=env, metadata={},
+                        source=root, private=root / 'private',
+                        specs=(('synthetic', 'bin', 'first', 'feature'), ('synthetic', 'bin', 'later', 'feature')),
+                        registered_paths=set(), binaries=binaries, failures=failures,
+                        failure_check=fail_inputs, warm=None)
+            self.assertIs(caught.exception, mutation)
+            self.assertEqual(len(build.commands), 1)
+            self.assertEqual(failures[0]['exit_code'], 7)
+            self.assertEqual(binaries, {})
+            cargo.assert_not_called()
+
+    def test_partial_archive_contains_only_verified_successes_under_separate_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact, private = root / 'artifact', root / 'private'
+            artifact.mkdir()
+            private.mkdir()
+            raw = b'synthetic retained bytes, never executed'
+            (private / 'successful').write_bytes(raw)
+            binaries = {'successful': {'pin': bundle.file_pin(private / 'successful')}}
+            filename = 'partial-native-validation-binaries.tar.gz'
+            budgets = []
+            def observe_budget(amount=0):
+                budgets.append((amount, (artifact / filename).exists()))
+            build = SimpleNamespace(budget=observe_budget)
+            receipt = {'status': 'FAILED_NOT_ADMITTED', 'binaries': binaries,
+                       'target_failures': ['synthetic closed compiler failure'],
+                       'metadata_getters': {'getter': {'status': 'blocked_missing_target'}}}
+            bundle.preserve_partial_binary_bundle(build, artifact, private, receipt, filename)
+            path, pin = artifact / filename, receipt['partial_binary_bundle']
+            self.assertTrue(any(amount >= len(raw) and not already_created
+                                for amount, already_created in budgets))
+            self.assertEqual(pin, bundle.file_pin(path))
+            self.assertFalse((artifact / 'native-validation-binaries.tar.gz').exists())
+            with tarfile.open(path, 'r:gz') as archive:
+                self.assertEqual(archive.getnames(), ['bin/successful'])
+                self.assertEqual(archive.extractfile('bin/successful').read(), raw)
+            with patch.object(bundle, 'archive_selected_binaries',
+                              side_effect=AssertionError('existing partial must not be recreated')), \
+                    self.assertRaisesRegex(RuntimeError, 'RequiredCargoTargetsFailed'):
+                bundle.require_native_bundle_verdicts(build, artifact, private, receipt)
+            self.assertEqual(receipt['partial_binary_bundle'], pin)
+            self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+            self.assertNotIn('binary_bundle', receipt)
+            denied = artifact / 'denied-native-validation-binaries.tar.gz'
+            budget_error = RuntimeError('synthetic archive budget rejected')
+            def reject_budget(_amount):
+                raise budget_error
+            with self.assertRaises(RuntimeError) as caught:
+                bundle.archive_selected_binaries(SimpleNamespace(budget=reject_budget),
+                    artifact, private, binaries, denied.name)
+            self.assertIs(caught.exception, budget_error)
+            self.assertFalse(denied.exists())
+            self.assertEqual(bundle.file_pin(path), pin)
+            path.write_bytes(b'changed retained archive')
+            with self.assertRaisesRegex(RuntimeError, 'PreservedPartialBundleChanged'):
+                bundle.preserve_partial_binary_bundle(build, artifact, private, receipt, filename)
+            self.assertEqual(receipt['partial_binary_bundle'], pin)
+
+    def test_cross_source_creation_time_preserves_all_named_file_identity_fields(self):
+        fields = dict(st_dev=7, st_ino=(1 << 100) + 11, st_mode=stat.S_IFREG | 0o666,
+                      st_nlink=1, st_size=40, st_mtime_ns=1000,
+                      st_ctime_ns=2000, st_birthtime_ns=900)
+        opened = SimpleNamespace(**fields)
+        named = SimpleNamespace(**{**fields, 'st_ctime_ns': fields['st_birthtime_ns']})
+        self.assertNotEqual(bundle.identity(opened), bundle.identity(named))
+        self.assertEqual(bundle.identity(opened, creation_time=True),
+                         bundle.identity(named, creation_time=True))
+        with patch.object(bundle.os, 'name', 'nt'):
+            self.assertTrue(bundle.same_file_identity(opened, opened, named))
+        with patch.object(bundle.os, 'name', 'posix'):
+            self.assertFalse(bundle.same_file_identity(opened, opened, named))
+        for field in ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size',
+                      'st_mtime_ns', 'st_birthtime_ns'):
+            with self.subTest(field=field):
+                changed = SimpleNamespace(**{**vars(named), field: getattr(named, field) + 1})
+                self.assertNotEqual(bundle.identity(opened, creation_time=True),
+                                    bundle.identity(changed, creation_time=True))
+
+    def test_same_file_identity_keeps_original_fd_change_time_check(self):
+        fields = dict(st_dev=7, st_ino=11, st_mode=stat.S_IFREG | 0o600,
+                      st_nlink=1, st_size=40, st_mtime_ns=1000,
+                      st_ctime_ns=2000, st_birthtime_ns=900)
+        opened = SimpleNamespace(**fields)
+        changed = SimpleNamespace(**{**fields, 'st_ctime_ns': 2001})
+        self.assertTrue(bundle.same_file_identity(opened, opened, opened))
+        self.assertFalse(bundle.same_file_identity(opened, changed, opened))
+
+    def test_compile_only_cleanup_preserves_published_bundle_and_unique_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / 'artifact'
+            artifact.mkdir()
+            archive = artifact / 'native-validation-binaries.tar.gz'
+            archive.write_bytes(b'synthetic already-verified archive')
+            (artifact / 'only-game.pgn').write_bytes(b'unique-result')
+            (root / 'unclassified-other-data').mkdir()
+            for name in ('target-native', 'private-elf', 'cargo-home', 'logs', 'tmp'):
+                (root / name).mkdir()
+                (root / name / 'owned-copy').write_bytes(b'regenerable')
+            receipt = {'status': 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
+                       'commands': [{'original_tree_cleanup_verified': True}],
+                       'binary_bundle': bundle.file_pin(archive)}
+            journal = bundle.cleanup_compiler_outputs(root, artifact, receipt)
+            self.assertTrue(journal['complete'])
+            self.assertTrue((root / 'logs' / 'owned-copy').exists())
+            self.assertFalse((root / 'private-elf').exists())
+            self.assertFalse((root / 'target-native').exists())
+            self.assertEqual(archive.read_bytes(), b'synthetic already-verified archive')
+            self.assertEqual((artifact / 'only-game.pgn').read_bytes(), b'unique-result')
+            self.assertTrue((root / 'unclassified-other-data').exists())
+
+    def test_uncertain_tree_or_changed_bundle_prevents_all_compiler_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / 'artifact'
+            artifact.mkdir()
+            archive = artifact / 'native-validation-binaries.tar.gz'
+            archive.write_bytes(b'retained')
+            (root / 'target-native').mkdir()
+            receipt = {'status': 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
+                       'commands': [{'original_tree_cleanup_verified': False}],
+                       'binary_bundle': bundle.file_pin(archive)}
+            with self.assertRaisesRegex(RuntimeError, 'VerifiedBundleAndTreeClosure'):
+                bundle.cleanup_compiler_outputs(root, artifact, receipt)
+            receipt['commands'][0]['original_tree_cleanup_verified'] = True
+            archive.write_bytes(b'changed')
+            with self.assertRaisesRegex(RuntimeError, 'VerifiedBundleAndTreeClosure'):
+                bundle.cleanup_compiler_outputs(root, artifact, receipt)
+            self.assertTrue((root / 'target-native').exists())
+            self.assertNotIn('regenerable_cleanup', receipt)
+
     @unittest.skipUnless(sys.platform == 'linux', 'Linux-only bundle FD/ctime custody; no Windows emulation')
     def test_cargo_hardlink_is_copied_into_single_link_custody(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -96,6 +489,45 @@ class NativeBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'CatalogSourceMissing'):
             bundle.component_inventory(catalog, rows)
 
+    def test_selected_component_catalog_is_bounded_without_a_fixed_count(self):
+        row = {'path': 'crates/example/src/lib.rs', 'bytes': 1,
+               'sha256': hashlib.sha256(b'x').hexdigest()}
+        catalog = {'domain': 'rz-pals-source-inventory-v5/1',
+                   'algorithm': 'sha256-domain-u64le;sorted-path-u64le-utf8;size-u64le;sha256-raw32',
+                   'components': {name: [row['path']] for name in bundle.CORE5}}
+        catalog['components'].update({f'extra_{number}': [row['path']] for number in range(21)})
+        result = bundle.component_inventory(catalog, [row], selected_profile=True)
+        self.assertEqual(set(result), set(catalog['components']))
+        with self.assertRaisesRegex(RuntimeError, 'CatalogFraming'):
+            bundle.component_inventory(catalog, [row])  # Full-bundle contract remains fixed.
+        for bad in ([row['path'], row['path']], ['crates/unknown/src/lib.rs']):
+            changed = copy.deepcopy(catalog)
+            changed['components']['model_native'] = bad
+            with self.subTest(paths=bad), self.assertRaisesRegex(RuntimeError, 'CatalogSourceMissing'):
+                bundle.component_inventory(changed, [row], selected_profile=True)
+        changed = copy.deepcopy(catalog)
+        del changed['components'][bundle.CORE5[0]]
+        with self.assertRaisesRegex(RuntimeError, 'Core5Missing'):
+            bundle.component_inventory(changed, [row], selected_profile=True)
+
+    def test_selected_component_names_follow_v5_utf8_text_contract(self):
+        row = {'path': 'crates/example/src/lib.rs', 'bytes': 1,
+               'sha256': hashlib.sha256(b'x').hexdigest()}
+        base = {'domain': 'rz-pals-source-inventory-v5/1',
+                'algorithm': 'sha256-domain-u64le;sorted-path-u64le-utf8;size-u64le;sha256-raw32',
+                'components': {name: [row['path']] for name in bundle.CORE5}}
+        for name in ('new-model', '검토 모델', 'é' * 512, 'a' * 1024):
+            with self.subTest(valid=name[:20]):
+                catalog = copy.deepcopy(base)
+                catalog['components'][name] = [row['path']]
+                self.assertIn(name, bundle.component_inventory(catalog, [row], selected_profile=True))
+        for name in ('', '   ', 'bad\nname', 'bad\x85name', 'é' * 513, 'a' * 1025, '\ud800'):
+            with self.subTest(invalid=repr(name[:20])):
+                catalog = copy.deepcopy(base)
+                catalog['components'][name] = [row['path']]
+                with self.assertRaisesRegex(RuntimeError, 'CatalogSourceMissing'):
+                    bundle.component_inventory(catalog, [row], selected_profile=True)
+
     def test_warm_requires_both_registered_source_and_explicit_exact_feature_target(self):
         name = bundle.WARM[2]
         features = bundle.WARM[3].split(',')
@@ -110,10 +542,10 @@ class NativeBundleTests(unittest.TestCase):
         manifest['example'][0]['required-features'] = ['onnx-cpu']
         self.assertEqual(bundle.warm_spec(manifest, {logical})[1], 'NOT_READY_REQUIRED_FEATURE_OR_SOURCE_CONTRACT')
 
-    def test_actual_cargo_artifact_must_join_source_kind_features_and_separate_slot(self):
+    def test_actual_cargo_artifact_must_join_source_kind_features_and_shared_target_custody(self):
         source = Path('/synthetic-source')
-        target_root = Path('/synthetic-target-diagnostic')
-        spec = bundle.SPECS[-1]
+        target_root = Path('/synthetic-target-native')
+        spec = next(row for row in bundle.SPECS if row[2] == 'pals_continuation_diagnostic')
         logical = 'crates/rz-uci/examples/pals_continuation_diagnostic.rs'
         target = {'name': spec[2], 'kind': ['example'], 'crate_types': ['bin'],
                   'src_path': str(source / logical), 'edition': '2024'}
@@ -144,10 +576,271 @@ class NativeBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'ExactRegisteredCargoTarget'):
             check(messages, set())
 
+    def test_functional_bundle_keeps_legacy_targets_and_requires_exact_six_tools(self):
+        legacy = (
+            ('rz-arena', 'bin', 'rz-pals-g0-bootstrap-numerical', 'pals-collection-onnx,native-cuda'),
+            ('rz-arena', 'bin', 'rz-pals-g0-collection-deployment-numerical', 'pals-collection-onnx,native-cuda'),
+            ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts'),
+            ('rz-uci', 'bin', 'rz-pals-adaptive', 'pals-adaptive,onnx-cuda'),
+            ('rz-uci', 'example', 'pals_rules_descriptor', 'pals-adaptive,onnx-cuda'),
+            ('rz-uci', 'bin', 'rz-rovent', 'pals-adaptive,onnx-cuda'),
+            ('rz-arena', 'bin', 'rz-rovent-trainer', 'pals-collection-onnx,native-cuda'),
+            ('rz-uci', 'example', 'pals_continuation_diagnostic', 'pals-adaptive-diagnostics'),
+        )
+        required = {'rz-rovent-native', 'rz-rovent-collect', 'rz-rovent-utility-trainer',
+                    'rovent_startup_metadata', 'virtual_review_numeric_capture', 'rz-experiments'}
+        legacy_names = {row[2] for row in legacy}
+        self.assertEqual(tuple(row for row in bundle.SPECS if row[2] in legacy_names), legacy)
+        self.assertEqual(len(bundle.SPECS), 13)
+        native = ('rz-arena', 'bin', 'rz-rovent-native',
+                  'pals-collection-onnx,native-cuda,native-validation-diagnostics')
+        self.assertIn(native, bundle.SPECS)
+        self.assertIn(native, bundle.FUNCTIONAL_SPECS)
+        arena = bundle.tomllib.loads((Path(__file__).resolve().parents[2]
+            / 'crates/rz-arena/Cargo.toml').read_text(encoding='utf-8'))
+        enabled, pending = set(), ['native-validation-diagnostics']
+        while pending:
+            feature = pending.pop()
+            if feature not in enabled:
+                enabled.add(feature)
+                pending.extend(arena['features'].get(feature, []))
+        self.assertTrue({'rz-uci/pals-adaptive-diagnostics',
+                         'rz-uci/native-validation-diagnostics'} <= enabled)
+        self.assertEqual(arena['features'].get('default', []), [])
+        self.assertEqual(next(t for t in arena['bin'] if t['name'] == 'rz-rovent-native')
+                         ['required-features'], ['pals-collection-onnx'])
+        regular = tuple((*row[:3], 'pals-collection-onnx,native-cuda')
+                        if row[2] == 'rz-rovent-native' else row for row in bundle.SPECS)
+        with self.assertRaises(RuntimeError):
+            bundle.validate_functional_specs(regular)
+        self.assertEqual({row[2] for row in bundle.FUNCTIONAL_SPECS}, required)
+        self.assertEqual(len(bundle.FUNCTIONAL_SPECS), 6)
+        self.assertEqual(sum(row[2] == 'virtual_review_numeric_capture' for row in bundle.SPECS), 1)
+        self.assertEqual(bundle.WARM, ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
+                                      'pals-adaptive,onnx-cpu,experimental-io-binding'))
+        bundle.validate_functional_specs(bundle.SPECS)
+        bundle.validate_functional_specs(bundle.SPECS + (bundle.WARM,))
+        for original, replacement in (('rz-rovent-native', 'rz-rovent'),
+                                      ('rz-rovent-utility-trainer', 'rz-rovent-trainer')):
+            changed = tuple((row[0], row[1], replacement, row[3]) if row[2] == original else row
+                            for row in bundle.SPECS)
+            with self.subTest(alias=original), self.assertRaises(RuntimeError):
+                bundle.validate_functional_specs(changed)
+        for name in required:
+            for index, replacement in ((1, 'example' if name.startswith('rz-') else 'bin'),
+                                       (3, 'unregistered-features')):
+                changed = tuple(tuple(replacement if cursor == index else part
+                                      for cursor, part in enumerate(row)) if row[2] == name else row
+                                for row in bundle.SPECS)
+                with self.subTest(name=name, field=index), self.assertRaises(RuntimeError):
+                    bundle.validate_functional_specs(changed)
+        with self.assertRaises(RuntimeError):
+            bundle.validate_functional_specs(bundle.SPECS[:-1])
+
+    def test_each_functional_tool_uses_exact_cargo_source_kind_and_feature_admission(self):
+        source = Path('/synthetic-source')
+        target_root = Path('/synthetic-target-functional')
+        paths = {
+            'rz-rovent-native': 'crates/rz-arena/src/bin/rovent-native.rs',
+            'rz-rovent-collect': 'crates/rz-arena/src/bin/rovent-collect.rs',
+            'rz-rovent-utility-trainer': 'crates/rz-arena/src/bin/rovent-utility-trainer.rs',
+            'rovent_startup_metadata': 'crates/rz-uci/examples/rovent_startup_metadata.rs',
+            'virtual_review_numeric_capture': 'crates/rz-eval/examples/virtual_review_numeric_capture.rs',
+            'rz-experiments': 'crates/rz-experiments/src/main.rs',
+        }
+        for spec in bundle.FUNCTIONAL_SPECS:
+            package, kind, name, features = spec
+            logical = paths[name]
+            target = {'name': name, 'kind': [kind], 'crate_types': ['bin'],
+                      'src_path': str(source / logical), 'edition': '2024'}
+            metadata = {'packages': [{'name': package, 'id': 'SYNTHETIC_PACKAGE',
+                                     'manifest_path': str(source / 'crates' / package / 'Cargo.toml'),
+                                     'targets': [target]}]}
+            output = target_root / 'release' / ('examples' if kind == 'example' else '') / name
+            artifact = {'reason': 'compiler-artifact', 'package_id': 'SYNTHETIC_PACKAGE',
+                        'target': copy.deepcopy(target), 'executable': str(output),
+                        'profile': {'test': False}, 'features': features.split(',')}
+            messages = [artifact, {'reason': 'build-finished', 'success': True}]
+            def check(value, actual_metadata=None, registered=None):
+                raw = b'\n'.join(json.dumps(row).encode() for row in value)
+                return bundle.cargo_artifact(raw, metadata if actual_metadata is None else actual_metadata,
+                    source, target_root, spec, {logical} if registered is None else registered)
+            with self.subTest(name=name, case='original'):
+                self.assertEqual(check(messages)[0], output)
+            for label, mutate in (
+                    ('wrong-kind', lambda rows: rows[0]['target'].update(kind=['lib'])),
+                    ('missing-feature', lambda rows: rows[0]['features'].pop()),
+                    ('wrong-package', lambda rows: rows[0].update(package_id='OTHER')),
+                    ('wrong-target-name', lambda rows: rows[0]['target'].update(name='different-tool')),
+                    ('wrong-slot', lambda rows: rows[0].update(executable='/other-target/tool'))):
+                changed = copy.deepcopy(messages)
+                mutate(changed)
+                with self.subTest(name=name, case=label), self.assertRaises(RuntimeError):
+                    check(changed)
+            with self.subTest(name=name, case='unregistered-source'), self.assertRaises(RuntimeError):
+                check(messages, registered=set())
+            foreign_metadata, foreign_messages = copy.deepcopy(metadata), copy.deepcopy(messages)
+            foreign = str(Path('/outside-source/unregistered.rs'))
+            foreign_metadata['packages'][0]['targets'][0]['src_path'] = foreign
+            foreign_messages[0]['target']['src_path'] = foreign
+            with self.subTest(name=name, case='outside-source'), self.assertRaises(RuntimeError):
+                check(foreign_messages, actual_metadata=foreign_metadata)
+
+    def test_independent_metadata_getter_preserves_failed_verdict_and_next_result(self):
+        for name, code, raw, status in (
+                ('closed-exit', 7, b'', 'failed_command'),
+                ('wrong-metadata', 0, b'{"native":false}\n', 'failed_metadata'),
+                ('empty', 0, b'', 'failed_metadata'),
+                ('malformed', 0, b'{"native":\n', 'failed_metadata')):
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                artifact, private = root / 'artifact', root / 'private'
+                artifact.mkdir()
+                private.mkdir()
+                target = private / 'synthetic-getter'
+                target.write_bytes(b'\x7fELF-synthetic-getter-never-executed')
+                binaries = {target.name: {'pin': bundle.file_pin(target)}}
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
+                results, events = {}, []
+
+                def supervise(wrapper, *_args):
+                    argument = wrapper[-1]
+                    events.append(('dispatch', argument))
+                    if argument == '--native':
+                        os.write(1, raw)
+                        os.write(2, b'original getter diagnostic\n')
+                        return code, True, None
+                    self.assertEqual(argument, '--registry')
+                    os.write(1, b'{"registry":"independent"}\n')
+                    return 0, True, None
+
+                common = dict(artifact=artifact, private=private, binaries=binaries, results=results,
+                              target=target.name, env=env,
+                              failure_check=lambda: events.append(('inputs_checked',)))
+                with patch.object(bundle, 'run_group', supervise), \
+                        patch.object(bundle.sys, 'stderr', io.StringIO()):
+                    first = bundle.collect_metadata_getter(build, label='native-source-pins',
+                        arguments=['--native'], validate=lambda value: bundle.metadata_require(
+                            value.get('native') is True, 'SyntheticNativeVerdict'), **common)
+                    second = bundle.collect_metadata_getter(build, label='static-model-registry',
+                        arguments=['--registry'], validate=lambda value: bundle.metadata_require(
+                            value == {'registry': 'independent'}, 'SyntheticRegistryVerdict'), **common)
+                self.assertIsNone(first)
+                self.assertEqual(results['native-source-pins']['status'], status)
+                self.assertEqual(second, {'registry': 'independent'})
+                self.assertEqual(results['static-model-registry']['status'], 'verified')
+                first_dispatch = events.index(('dispatch', '--native'))
+                second_dispatch = events.index(('dispatch', '--registry'))
+                self.assertIn(('inputs_checked',), events[first_dispatch + 1:second_dispatch])
+                self.assertFalse((artifact / 'native-source-pins.json').exists())
+                self.assertEqual(json.loads((artifact / 'static-model-registry.json').read_bytes()), second)
+                self.assertEqual(results['static-model-registry']['metadata_pin'],
+                                 bundle.file_pin(artifact / 'static-model-registry.json'))
+                self.assertEqual(results['native-source-pins']['stdout_pin'],
+                                 {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
+                self.assertEqual((root / 'logs/native-source-pins.stdout').read_bytes(), raw)
+                self.assertEqual((root / 'logs/native-source-pins.stderr').read_bytes(),
+                                 b'original getter diagnostic\n')
+                receipt = {'status': 'FAILED_NOT_ADMITTED', 'binaries': binaries,
+                           'target_failures': [], 'metadata_getters': results}
+                with self.assertRaisesRegex(RuntimeError, 'RequiredStaticMetadataFailed'):
+                    bundle.require_native_bundle_verdicts(build, artifact, private, receipt)
+                partial = artifact / 'partial-native-validation-binaries.tar.gz'
+                self.assertEqual(receipt['partial_binary_bundle'], bundle.file_pin(partial))
+                self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+                self.assertEqual(results['native-source-pins']['status'], status)
+                self.assertNotIn('binary_bundle', receipt)
+                self.assertFalse((artifact / 'native-validation-binaries.tar.gz').exists())
+                with tarfile.open(partial, 'r:gz') as archive:
+                    self.assertEqual(archive.getnames(), ['bin/synthetic-getter'])
+                    self.assertEqual(archive.extractfile('bin/synthetic-getter').read(), target.read_bytes())
+
+    def test_metadata_getter_propagates_shared_input_failure_before_next_dispatch(self):
+        for code in (0, 7):
+            with self.subTest(exit_code=code), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                artifact, private = root / 'artifact', root / 'private'
+                artifact.mkdir()
+                private.mkdir()
+                target = private / 'synthetic-getter'
+                target.write_bytes(b'\x7fELF-synthetic-getter-never-executed')
+                binaries = {target.name: {'pin': bundle.file_pin(target)}}
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
+                results, dispatched = {}, []
+                mutation = RuntimeError('synthetic original shared input changed')
+
+                def check_inputs():
+                    if dispatched:
+                        raise mutation
+
+                def supervise(wrapper, *_args):
+                    dispatched.append(wrapper[-1])
+                    os.write(1, b'{"native":true}\n')
+                    return code, True, None
+
+                common = dict(artifact=artifact, private=private, binaries=binaries, results=results,
+                              target=target.name, env=env, validate=lambda value: None,
+                              failure_check=check_inputs)
+                with patch.object(bundle, 'run_group', supervise), \
+                        patch.object(bundle.sys, 'stderr', io.StringIO()), \
+                        self.assertRaises(RuntimeError) as caught:
+                    bundle.collect_metadata_getter(build, label='native-source-pins',
+                        arguments=['--native'], **common)
+                    bundle.collect_metadata_getter(build, label='static-model-registry',
+                        arguments=['--registry'], **common)
+                self.assertIs(caught.exception, mutation)
+                self.assertNotIn('--registry', dispatched)
+                self.assertNotIn('static-model-registry', results)
+                self.assertNotEqual(results['native-source-pins']['status'], 'blocked_missing_target')
+                self.assertFalse((artifact / 'native-source-pins.json').exists())
+                self.assertEqual((root / 'logs/native-source-pins.stdout').read_bytes(), b'{"native":true}\n')
+
     def test_strict_metadata_rejects_duplicate_keys_and_nonfinite_values(self):
         for raw in (b'{"x":1,"x":2}', b'{"x":NaN}'):
             with self.assertRaises(RuntimeError):
                 bundle.strict_json(raw)
+        fields = ['state', 'history\U0001f642']
+        framed = b''.join(len(raw).to_bytes(8, 'little') + raw
+                          for raw in (field.encode('utf-8') for field in fields))
+        encoder = 'ab' * 32
+        descriptor = {'schema': 'rovezero.pals-rules-descriptor.v3',
+            'rules_input_profile': 'rz-pals-rules-virtual-review-v1',
+            'config': {'profile': 'virtual_review_v1'},
+            'learned_input_compatibility': 'unverified_declaration_only',
+            'bounds': {'max_records': 64, 'max_anchors': 4, 'max_line_plies': 256,
+                       'line_buckets': [8, 16, 32, 64, 128, 256], 'max_candidates': 256,
+                       'token_budgets': [128, 256, 512], 'root_anchor': 0},
+            'semantic_fields': fields, 'rules_input_semantic_sha256': hashlib.sha256(framed).hexdigest(),
+            'rules_encoder_source_sha256': encoder}
+        bundle.validate_rules_descriptor(descriptor, encoder)
+        with self.assertRaisesRegex(bundle.MetadataMismatch, 'StaticRulesDescriptorSourceFraming'):
+            bundle.validate_rules_descriptor(dict(descriptor, rules_input_semantic_sha256='0' * 64), encoder)
+
+    def test_rovent_compile_metadata_cannot_claim_native_execution_or_replace_registered_sources(self):
+        components = {'uci': 'ab' * 32, 'rules': 'cd' * 32}
+        head = '19' * 20
+        value = {'domain': 'rz-rovent-build-capabilities/1', 'source_commit': head,
+                 'source_components': dict(components, rovent_bootstrap='ef' * 32,
+                                           rovent_process_boundary='42' * 32),
+                 'target_os': 'linux', 'target_arch': 'x86_64',
+                 'onnx_cpu_compiled': True, 'onnx_cuda_compiled': True,
+                 'native_runtime_loaded': False, 'native_model_loaded': False,
+                 'neural_execution_observed': False}
+        bundle.validate_rovent_build_metadata(value, head, components)
+        for field in ('native_runtime_loaded', 'native_model_loaded', 'neural_execution_observed'):
+            wrong = copy.deepcopy(value)
+            wrong[field] = True
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, 'StaticRoventBuildMetadata'):
+                bundle.validate_rovent_build_metadata(wrong, head, components)
+        for name in ('uci', 'rules', 'rovent_bootstrap', 'rovent_process_boundary'):
+            wrong = copy.deepcopy(value)
+            wrong['source_components'][name] = 'NOT_A_REGISTERED_DIGEST'
+            with self.subTest(component=name), self.assertRaisesRegex(RuntimeError, 'StaticRoventRegisteredSourceMismatch'):
+                bundle.validate_rovent_build_metadata(wrong, head, components)
 
     def test_registry_public_methods_remain_static_and_source_bound_elsewhere(self):
         registry = {'schema': 'rz-pals-report-model-registry-query/1', 'model_profile': 'virtual_review_v1',
@@ -165,6 +858,269 @@ class NativeBundleTests(unittest.TestCase):
         registry['model_semantic_sha256'] = 'not-an-actual-registry-digest'
         with self.assertRaisesRegex(RuntimeError, 'StaticRegistryGetterOutput'):
             bundle.validate_registry(registry)
+
+
+class RuntimeLoaderBundleTests(unittest.TestCase):
+    """Single-target CI production path with a fake supervisor; no Cargo runs."""
+
+    logical = 'crates/rz-eval/examples/runtime_loader_check.rs'
+    spec = ('rz-eval', 'example', 'runtime_loader_check', 'onnx')
+
+    def metadata(self, source, target_root, required=('onnx',)):
+        target = {'name': self.spec[2], 'kind': ['example'], 'crate_types': ['bin'],
+                  'src_path': str(source / self.logical), 'edition': '2024',
+                  'required-features': list(required)}
+        metadata = {'workspace_root': str(source), 'packages': [{
+            'name': self.spec[0], 'id': 'SYNTHETIC_LOADER_PACKAGE',
+            'manifest_path': str(source / 'crates' / self.spec[0] / 'Cargo.toml'), 'targets': [target]}]}
+        output = target_root / 'release/examples' / self.spec[2]
+        messages = [{'reason': 'compiler-artifact', 'package_id': 'SYNTHETIC_LOADER_PACKAGE',
+                     'target': copy.deepcopy(target), 'executable': str(output),
+                     'profile': {'test': False}, 'features': self.spec[3].split(',')},
+                    {'reason': 'build-finished', 'success': True}]
+        return metadata, messages, output
+
+    def test_loader_cargo_admission_uses_only_its_source_kind_and_features(self):
+        self.assertEqual(bundle.RUNTIME_LOADER_SPEC, self.spec)
+        source, target_root = Path('/synthetic-loader-source'), Path('/synthetic-loader-target')
+        metadata, messages, output = self.metadata(source, target_root)
+
+        def admit(value, registered=None):
+            raw = b'\n'.join(json.dumps(row).encode() for row in value)
+            return bundle.cargo_artifact(raw, metadata, source, target_root, self.spec,
+                                        {self.logical} if registered is None else registered)
+
+        self.assertEqual(admit(messages)[0], output)
+        for label, change in (
+                ('kind', lambda rows: rows[0]['target'].update(kind=['bin'])),
+                ('source', lambda rows: rows[0]['target'].update(src_path=str(source / 'other.rs'))),
+                ('feature', lambda rows: rows[0].update(features=[])),
+                ('default', lambda rows: rows[0]['features'].append('default')),
+                ('release-path', lambda rows: rows[0].update(executable=str(target_root / 'other')))):
+            altered = copy.deepcopy(messages)
+            change(altered)
+            with self.subTest(change=label), self.assertRaises(RuntimeError):
+                admit(altered)
+        with self.assertRaises(RuntimeError):
+            admit(messages, registered=set())
+
+    def run_fixture(self, *, result=(0, True, None), required=('onnx',), profile='runtime-loader-only',
+                    gpu_components=None, gpu_getters=None, partial_custody_error=None):
+        temporary = tempfile.TemporaryDirectory(prefix='ci-runtime-loader-fixture-')
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name).resolve()
+        source, root = base / 'source', base / 'RoveZero' / 'owned'
+        source.mkdir()
+        source_file = source / self.logical
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b'// synthetic source; not compiled\n')
+        (source / 'Cargo.lock').write_bytes(b'synthetic lock\n')
+        (source / 'rust-toolchain.toml').write_text('[toolchain]\nchannel="1.96.0"\n', encoding='utf-8')
+        if gpu_components is not None:
+            inventory = source / 'crates/rz-experiments/src/pals_source_inventory_v5.json'
+            inventory.parent.mkdir(parents=True, exist_ok=True)
+            inventory.write_text('{}', encoding='utf-8')
+        rows = [{'path': self.logical, **bundle.file_pin(source_file)}]
+        controls = {'synthetic_control': {'bytes': 1, 'sha256': 'a' * 64}}
+        metadata, messages, output = self.metadata(source, root / 'target-native', required)
+        head, dispatched = '19' * 20, []
+
+        def supervise(wrapper, cwd, env, seconds, check):
+            argv = wrapper[wrapper.index('--internal-command') + 1:]
+            dispatched.append(list(argv))
+            if argv[1:3] == ['rev-parse', 'HEAD']:
+                raw = (head + '\n').encode()
+            elif argv[1:2] == ['ls-tree']:
+                raw = b'synthetic roster\n'
+            elif argv[1:2] == ['--version']:
+                raw = (Path(argv[0]).name + ' 1.96.0 synthetic\n').encode()
+            elif argv[1:2] == ['metadata']:
+                raw = json.dumps(metadata).encode()
+            elif argv[1:2] == ['build']:
+                self.assertEqual(argv[argv.index('--example') + 1], self.spec[2])
+                self.assertEqual(argv[argv.index('--features') + 1], self.spec[3])
+                if result != (0, True, None):
+                    os.write(2, b'synthetic original loader compiler failure\n')
+                    return result
+                output.parent.mkdir(parents=True)
+                output.write_bytes(b'\x7fELF-synthetic-fixture-never-executed')
+                raw = b'\n'.join(json.dumps(row).encode() for row in messages)
+            else:
+                raise AssertionError('unrelated target/getter dispatched')
+            os.write(1, raw)
+            return 0, True, None
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {'RUNNER_TEMP': str(base), 'GITHUB_OUTPUT': ''}))
+            stack.enter_context(patch.object(bundle.sys, 'platform', 'linux'))
+            stack.enter_context(patch.object(bundle.platform, 'machine', return_value='x86_64'))
+            stack.enter_context(patch.object(bundle.platform, 'libc_ver', return_value=('synthetic', '0')))
+            stack.enter_context(patch.object(bundle.os, 'sched_getaffinity', return_value={0, 1}, create=True))
+            stack.enter_context(patch.object(bundle.os, 'sched_setaffinity', create=True))
+            stack.enter_context(patch.object(bundle.signal, 'signal'))
+            stack.enter_context(patch.object(bundle.shutil, 'which', side_effect=lambda name: '/synthetic/' + name))
+            stack.enter_context(patch.object(bundle, 'source_inventory', return_value=(rows, controls)))
+            stack.enter_context(patch.object(bundle, 'run_group', side_effect=supervise))
+            for name in ('warm_spec', 'validate_functional_specs',
+                         'validate_registry', 'validate_rovent_build_metadata'):
+                stack.enter_context(patch.object(bundle, name,
+                    side_effect=AssertionError('unrelated full-bundle admission requested')))
+            if gpu_components is None:
+                stack.enter_context(patch.object(bundle, 'component_inventory',
+                    side_effect=AssertionError('unrelated full-bundle admission requested')))
+            else:
+                stack.enter_context(patch.object(bundle, 'component_inventory', return_value=gpu_components))
+            if gpu_getters is not None:
+                def fake_getter(build, *, results, label, validate, **_kwargs):
+                    value = gpu_getters[label]
+                    try:
+                        validate(value)
+                    except (bundle.MetadataMismatch, ValueError, UnicodeError) as error:
+                        results[label] = {'status': 'failed_metadata',
+                                          'error': {'type': type(error).__name__, 'message': str(error)}}
+                        return None
+                    results[label] = {'status': 'verified'}
+                    return value
+                stack.enter_context(patch.object(bundle, 'collect_metadata_getter', side_effect=fake_getter))
+                stack.enter_context(patch.object(bundle, 'validate_registry'))
+            if partial_custody_error is not None:
+                stack.enter_context(patch.object(bundle, 'preserve_partial_binary_bundle',
+                                                 side_effect=partial_custody_error))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(patch.object(bundle.sys, 'stderr', io.StringIO()))
+            code = bundle.run(source, root, head, 60, **({} if profile is None else {'profile': profile}))
+        receipt = json.loads((root / 'artifact/build-receipt.json').read_bytes())
+        return code, root, receipt, dispatched
+
+    def test_loader_profile_builds_one_target_without_other_binaries_or_getters(self):
+        code, root, receipt, dispatched = self.run_fixture()
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt['schema'], 'rovezero.ci-runtime-loader-diagnostic/1')
+        self.assertEqual(receipt['status'], bundle.RUNTIME_LOADER_SUCCESS)
+        self.assertEqual(receipt['requested_targets'], [list(self.spec)])
+        self.assertEqual(set(receipt['binaries']), {self.spec[2]})
+        self.assertEqual(receipt['binaries'][self.spec[2]]['cargo_metadata_required_features'], ['onnx'])
+        self.assertEqual(len([row for row in dispatched if row[1:2] == ['build']]), 1)
+        for flag in ('diagnostic_binary_executed', 'runtime_loaded', 'model_loaded',
+                     'session_created', 'full_native_bundle_admitted', 'neural_execution',
+                     'gpu_execution', 'training_execution'):
+            self.assertIs(receipt[flag], False)
+        artifact = root / 'artifact'
+        archive = artifact / 'runtime-loader-diagnostic-binaries.tar.gz'
+        self.assertEqual(receipt['binary_bundle'], bundle.file_pin(archive))
+        self.assertFalse((artifact / 'native-validation-binaries.tar.gz').exists())
+        with tarfile.open(archive, 'r:gz') as packed:
+            self.assertEqual(packed.getnames(), ['bin/runtime_loader_check'])
+        for name in ('compiled-source-inventory.json', 'native-source-pins.json',
+                     'static-model-registry.json', 'rules-descriptor.json'):
+            self.assertFalse((artifact / name).exists())
+        self.assertEqual(json.loads((artifact / 'source-file-pins.json').read_bytes())['schema'],
+                         'rovezero.ci-runtime-loader-source-pins/1')
+        self.assertEqual(json.loads((artifact / 'git-source-provenance.json').read_bytes())['schema'],
+                         'rovezero.ci-runtime-loader-source-provenance/1')
+
+    def test_loader_compiler_failure_preserves_logs_without_admitting_an_archive(self):
+        code, root, receipt, _ = self.run_fixture(result=(7, True, None))
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertEqual(receipt['binaries'], {})
+        self.assertEqual(len(receipt['target_failures']), 1)
+        self.assertEqual(receipt['target_failures'][0]['target'], list(self.spec))
+        self.assertEqual(receipt['target_failures'][0]['exit_code'], 7)
+        self.assertEqual(receipt['target_failures'][0]['stdout_pin'],
+                         {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()})
+        artifact = root / 'artifact'
+        self.assertEqual((artifact / 'command-logs/build-runtime_loader_check.stderr').read_bytes(),
+                         b'synthetic original loader compiler failure\n')
+        self.assertNotIn('binary_bundle', receipt)
+        self.assertNotIn('partial_binary_bundle', receipt)
+        self.assertEqual(list(artifact.glob('*binaries.tar.gz')), [])
+
+    def test_loader_required_feature_mismatch_preserves_failure_not_partial_admission(self):
+        code, root, receipt, _ = self.run_fixture(required=())
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertEqual(receipt['binaries'][self.spec[2]]['cargo_metadata_required_features'], [])
+        self.assertNotIn('binary_bundle', receipt)
+        self.assertNotIn('partial_binary_bundle', receipt)
+        self.assertEqual(list((root / 'artifact').glob('*binaries.tar.gz')), [])
+        self.assertIs(receipt['full_native_bundle_admitted'], False)
+
+    def test_omitted_profile_remains_the_existing_native_bundle_path(self):
+        code, _root, receipt, dispatched = self.run_fixture(profile=None)
+        self.assertEqual(code, 1)  # The synthetic source deliberately has no full catalog.
+        self.assertEqual(receipt['schema'], 'rovezero.ci-cpu-validation-bundle/1')
+        self.assertNotIn('diagnostic_profile', receipt)
+        self.assertFalse(any(row[1:2] == ['build'] for row in dispatched))
+        self.assertNotIn(self.spec, bundle.SPECS)
+        bundle.validate_functional_specs(bundle.SPECS)
+
+    def test_selected_gpu_profiles_do_not_require_unrelated_targets(self):
+        components = {name: hashlib.sha256(name.encode()).hexdigest() for name in bundle.CORE5}
+        for profile, logical in (
+                ('gpu-numeric-only', 'crates/rz-eval/examples/virtual_review_numeric_capture.rs'),
+                ('gpu-inflight-only', 'crates/rz-uci/examples/virtual_review_gpu_inflight_validation.rs')):
+            with self.subTest(profile=profile):
+                self.spec = bundle.GPU_SELECTED_PROFILES[profile][0]
+                self.logical = logical
+                getters = ({'native-source-pins': dict(components), 'static-model-registry': {}}
+                           if profile == 'gpu-numeric-only' else None)
+                code, root, receipt, dispatched = self.run_fixture(
+                    profile=profile, required=tuple(self.spec[3].split(',')),
+                    gpu_components=components, gpu_getters=getters)
+                self.assertEqual(code, 0)
+                self.assertEqual(receipt['requested_targets'], [list(self.spec)])
+                self.assertEqual(set(receipt['binaries']), {self.spec[2]})
+                self.assertEqual(len([row for row in dispatched if row[1:2] == ['build']]), 1)
+                for flag in ('full_native_bundle_admitted', 'gpu_validation_admitted',
+                             'physical_completion_attested', 'neural_execution', 'gpu_execution'):
+                    self.assertIs(receipt[flag], False)
+                pins = json.loads((root / 'artifact/source-file-pins.json').read_bytes())
+                self.assertEqual(pins['source_components'], components)
+                self.assertEqual(receipt['binary_bundle'], bundle.file_pin(
+                    root / 'artifact' / bundle.GPU_SELECTED_PROFILES[profile][2]))
+
+    def test_selected_numeric_rejects_its_own_source_mismatch(self):
+        self.spec = bundle.GPU_NUMERIC_SPEC
+        self.logical = 'crates/rz-eval/examples/virtual_review_numeric_capture.rs'
+        components = {name: hashlib.sha256(name.encode()).hexdigest() for name in bundle.CORE5}
+        wrong = dict(components)
+        wrong[bundle.CORE5[0]] = hashlib.sha256(b'different source').hexdigest()
+        code, root, receipt, _ = self.run_fixture(
+            profile='gpu-numeric-only', required=tuple(self.spec[3].split(',')),
+            gpu_components=components,
+            gpu_getters={'native-source-pins': wrong, 'static-model-registry': {}})
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertFalse(receipt['physical_completion_attested'])
+        self.assertNotIn('binary_bundle', receipt)
+        self.assertEqual(receipt['metadata_getters']['native-source-pins']['status'], 'failed_metadata')
+        self.assertEqual(receipt['selected_getter_failure'], 'SelectedNumericStaticMetadataFailed')
+        partial = root / 'artifact' / receipt['partial_binary_bundle_file']
+        self.assertEqual(receipt['partial_binary_bundle'], bundle.file_pin(partial))
+        with tarfile.open(partial, 'r:gz') as archive:
+            self.assertEqual(archive.getnames(), ['bin/' + self.spec[2]])
+            self.assertEqual(archive.extractfile('bin/' + self.spec[2]).read(),
+                             b'\x7fELF-synthetic-fixture-never-executed')
+
+    def test_selected_numeric_reports_getter_and_custody_failure_separately(self):
+        self.spec = bundle.GPU_NUMERIC_SPEC
+        self.logical = 'crates/rz-eval/examples/virtual_review_numeric_capture.rs'
+        components = {name: hashlib.sha256(name.encode()).hexdigest() for name in bundle.CORE5}
+        wrong = dict(components)
+        wrong[bundle.CORE5[0]] = hashlib.sha256(b'different source').hexdigest()
+        code, _root, receipt, _ = self.run_fixture(
+            profile='gpu-numeric-only', required=tuple(self.spec[3].split(',')),
+            gpu_components=components,
+            gpu_getters={'native-source-pins': wrong, 'static-model-registry': {}},
+            partial_custody_error=OSError('synthetic custody failure'))
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['status'], 'FAILED_NOT_ADMITTED')
+        self.assertEqual(receipt['metadata_getters']['native-source-pins']['status'], 'failed_metadata')
+        self.assertEqual(receipt['selected_getter_failure'], 'SelectedNumericStaticMetadataFailed')
+        self.assertEqual(receipt['partial_custody_error']['type'], 'OSError')
+        self.assertNotIn('partial_binary_bundle', receipt)
+        self.assertNotIn('binary_bundle', receipt)
 
 
 if __name__ == '__main__':

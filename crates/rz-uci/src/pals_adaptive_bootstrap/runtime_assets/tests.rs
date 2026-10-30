@@ -1,5 +1,6 @@
 //! Source-only fixtures; fake library bytes are never dlopened or sent to ORT.
 use super::*;
+use crate::pals_adaptive_startup::PinnedStartupAssetV5;
 use rz_eval::runtime_pin::RuntimeStorageOrigin;
 use rz_experiments::{ArtifactRef, PalsStartupAssetV5};
 use std::{
@@ -10,6 +11,22 @@ use std::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+fn runtime_view(asset: &PinnedStartupAssetV5) -> RuntimeAssetView<'_> {
+    RuntimeAssetView {
+        declaration: v5_declaration(&asset.declaration).unwrap(),
+        file: &asset.file,
+    }
+}
+
+fn v5_plan(
+    backend: PalsModelBackendV3,
+    assets: &[PinnedStartupAssetV5],
+) -> Result<RuntimePlan<'_>, BackendError> {
+    let held: Vec<_> = assets.iter().map(runtime_view).collect();
+    let expected: Vec<_> = held.iter().map(|view| view.declaration).collect();
+    admit_runtime_roster(v5_backend(backend)?, &expected, &held).map(|roster| roster.plan)
+}
 struct Fixture {
     root: PathBuf,
 }
@@ -156,8 +173,8 @@ fn positional_runtime_verification_preserves_the_original_cursor() {
     let fixture = Fixture::new();
     let mut assets = fixture.cpu();
     assets[0].file.seek(SeekFrom::Start(7)).unwrap();
-    verify_descriptor(&assets[0]).unwrap();
-    let plan = RuntimePlan::from_assets(PalsModelBackendV3::OrtCpu, &assets).unwrap();
+    verify_descriptor(&runtime_view(&assets[0])).unwrap();
+    let plan = v5_plan(PalsModelBackendV3::OrtCpu, &assets).unwrap();
     let guards = SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &plan).unwrap();
     guards.verify(&fixture.root).unwrap();
     assert_eq!(assets[0].file.stream_position().unwrap(), 7);
@@ -167,14 +184,16 @@ fn positional_runtime_verification_preserves_the_original_cursor() {
 fn changed_bytes_and_same_bytes_replacement_are_both_rejected() {
     let fixture = Fixture::new();
     let assets = fixture.cpu();
-    let plan = RuntimePlan::from_assets(PalsModelBackendV3::OrtCpu, &assets).unwrap();
+    let plan = v5_plan(PalsModelBackendV3::OrtCpu, &assets).unwrap();
     let guards = SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &plan).unwrap();
     let path = fixture.root.join(&assets[0].declaration.snapshot_path);
     let original = fs::read(&path).unwrap();
     let original_modified = assets[0].file.metadata().unwrap().modified().unwrap();
     fs::write(&path, vec![b'x'; original.len()]).unwrap();
     assert_eq!(
-        verify_descriptor(&assets[0]).unwrap_err().kind,
+        verify_descriptor(&runtime_view(&assets[0]))
+            .unwrap_err()
+            .kind,
         K::IdentityMismatch
     );
     // SHA verification above rejects the same-length corruption independently.
@@ -190,7 +209,7 @@ fn changed_bytes_and_same_bytes_replacement_are_both_rejected() {
     );
 
     fs::write(&path, &original).unwrap();
-    let plan = RuntimePlan::from_assets(PalsModelBackendV3::OrtCpu, &assets).unwrap();
+    let plan = v5_plan(PalsModelBackendV3::OrtCpu, &assets).unwrap();
     let guards = SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &plan).unwrap();
     fs::rename(&path, fixture.root.join("original-retained.bin")).unwrap();
     fs::write(&path, &original).unwrap();
@@ -205,7 +224,7 @@ fn changed_bytes_and_same_bytes_replacement_are_both_rejected() {
 fn linked_snapshot_or_replaced_parent_is_rejected() {
     let fixture = Fixture::new();
     let assets = fixture.cpu();
-    let plan = RuntimePlan::from_assets(PalsModelBackendV3::OrtCpu, &assets).unwrap();
+    let plan = v5_plan(PalsModelBackendV3::OrtCpu, &assets).unwrap();
     let guards = SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &plan).unwrap();
     let path = fixture.root.join(&assets[0].declaration.snapshot_path);
     fs::rename(&path, fixture.root.join("original-retained.bin")).unwrap();
@@ -229,7 +248,7 @@ fn cpu_cache_is_shared_by_content_and_hit_still_checks_the_original() {
     let fixture = Fixture::new();
     let assets = fixture.cpu();
     let cache = RuntimeCache::open(&fixture.root.join("shared-cache")).unwrap();
-    let plan = RuntimePlan::from_assets(PalsModelBackendV3::OrtCpu, &assets).unwrap();
+    let plan = v5_plan(PalsModelBackendV3::OrtCpu, &assets).unwrap();
     let first = pin_plan(
         &cache,
         &fixture.root,
@@ -258,21 +277,21 @@ fn backend_is_explicit_and_cpu_cannot_carry_cuda_assets() {
     let fixture = Fixture::new();
     let assets = fixture.cpu();
     assert!(
-        matches!(RuntimePlan::from_assets(PalsModelBackendV3::DeterministicMock, &assets), Err(e) if e.kind == K::BackendUnavailable)
+        matches!(v5_plan(PalsModelBackendV3::DeterministicMock, &assets), Err(e) if e.kind == K::BackendUnavailable)
     );
     assert!(
-        matches!(RuntimePlan::from_assets(PalsModelBackendV3::RustCpu, &assets), Err(e) if e.kind == K::BackendUnavailable)
+        matches!(v5_plan(PalsModelBackendV3::RustCpu, &assets), Err(e) if e.kind == K::BackendUnavailable)
     );
     let cuda_fixture = Fixture::new();
     let cuda_assets = cuda_fixture.cuda(false);
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCpu, &cuda_assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCpu, &cuda_assets).is_err());
 }
 
 #[test]
 fn cuda_roster_and_aliases_are_preserved_through_content_cache_reuse() {
     let fixture = Fixture::new();
     let assets = fixture.cuda(true);
-    let plan = RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).unwrap();
+    let plan = v5_plan(PalsModelBackendV3::OrtCuda, &assets).unwrap();
     assert_eq!(plan.cuda.as_ref().unwrap().spec.files.len(), 19);
     let cache = RuntimeCache::open(&fixture.root.join("shared-cache")).unwrap();
     let pin = pin_plan(
@@ -300,17 +319,17 @@ fn cuda_missing_extra_wrong_size_sha_and_role_are_rejected() {
     let fixture = Fixture::new();
     let mut assets = fixture.cuda(false);
     assets.pop();
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCuda, &assets).is_err());
 
     let fixture = Fixture::new();
     let mut assets = fixture.cuda(false);
     assets[1].declaration.artifact.bytes += 1;
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCuda, &assets).is_err());
     assets[1].declaration.artifact.bytes -= 1;
     assets[1].declaration.artifact.sha256 = "a".repeat(64);
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCuda, &assets).is_err());
     assets[1].declaration.purpose = Purpose::RuntimeLibrary;
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCuda, &assets).is_err());
 
     let fixture = Fixture::new();
     let mut assets = fixture.cuda(false);
@@ -319,7 +338,7 @@ fn cuda_missing_extra_wrong_size_sha_and_role_are_rejected() {
         Purpose::CudaLibrary,
         b"not in the closed CUDA roster",
     ));
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCuda, &assets).is_err());
 }
 
 #[test]
@@ -327,8 +346,132 @@ fn cuda_sources_cannot_use_an_alias_as_a_regular_pin_or_different_directory() {
     let fixture = Fixture::new();
     let mut assets = fixture.cuda(true);
     assets[1].declaration.snapshot_path = "inputs/runtime/libcudnn.so.9.8.0".into();
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCuda, &assets).is_err());
     assets[1].declaration.snapshot_path =
         "inputs/another/libonnxruntime_providers_shared.so".into();
-    assert!(RuntimePlan::from_assets(PalsModelBackendV3::OrtCuda, &assets).is_err());
+    assert!(v5_plan(PalsModelBackendV3::OrtCuda, &assets).is_err());
+}
+
+#[test]
+fn generic_roster_requires_the_exact_expected_descriptor_declarations() {
+    let fixture = Fixture::new();
+    let assets = fixture.cpu();
+    let view = runtime_view(&assets[0]);
+    let expected = [view.declaration];
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCpu, &expected, &[view]).is_ok());
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCpu, &[], &[view]).is_err());
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCpu, &expected, &[]).is_err());
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCpu, &expected, &[view, view]).is_err());
+
+    let mut changed_artifact = assets[0].declaration.artifact.clone();
+    changed_artifact.source = "https://example.org/another-unexecuted-fixture".into();
+    let other_artifact = RuntimeAssetView {
+        declaration: RuntimeAssetDeclaration {
+            artifact: &changed_artifact,
+            ..view.declaration
+        },
+        ..view
+    };
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCpu, &expected, &[other_artifact]).is_err());
+    let other_path = RuntimeAssetView {
+        declaration: RuntimeAssetDeclaration {
+            snapshot_path: "inputs/runtime/different-core.so",
+            ..view.declaration
+        },
+        ..view
+    };
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCpu, &expected, &[other_path]).is_err());
+    let other_kind = RuntimeAssetView {
+        declaration: RuntimeAssetDeclaration {
+            kind: RuntimeAssetKind::CudaDependency,
+            ..view.declaration
+        },
+        ..view
+    };
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCpu, &expected, &[other_kind]).is_err());
+    assert!(
+        admit_runtime_roster(
+            RuntimeBackend::OrtCpu,
+            &[other_kind.declaration],
+            &[other_kind]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn generic_roster_rejects_duplicate_expected_or_held_cuda_entries() {
+    let fixture = Fixture::new();
+    let assets = fixture.cuda(false);
+    let held: Vec<_> = assets.iter().map(runtime_view).collect();
+    let expected: Vec<_> = held.iter().map(|view| view.declaration).collect();
+    let mut duplicate_expected = expected.clone();
+    duplicate_expected[1] = duplicate_expected[0];
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCuda, &duplicate_expected, &held).is_err());
+    let mut duplicate_held = held.clone();
+    duplicate_held[1] = duplicate_held[0];
+    assert!(admit_runtime_roster(RuntimeBackend::OrtCuda, &expected, &duplicate_held).is_err());
+}
+
+#[test]
+fn generic_roster_preserves_closed_snapshot_names_and_original_file_identity() {
+    let fixture = Fixture::new();
+    let assets = fixture.cpu();
+    let view = runtime_view(&assets[0]);
+    for snapshot_path in [
+        "/inputs/runtime/core.so",
+        "inputs/../runtime/core.so",
+        "runtime/core.so",
+        "inputs/runtime/.env",
+    ] {
+        let invalid_view = RuntimeAssetView {
+            declaration: RuntimeAssetDeclaration {
+                snapshot_path,
+                ..view.declaration
+            },
+            ..view
+        };
+        assert!(
+            admit_runtime_roster(
+                RuntimeBackend::OrtCpu,
+                &[invalid_view.declaration],
+                &[invalid_view],
+            )
+            .is_err()
+        );
+    }
+
+    let other_fixture = Fixture::new();
+    let other_assets = other_fixture.cpu();
+    let foreign_fd = RuntimeAssetView {
+        file: &other_assets[0].file,
+        ..view
+    };
+    // Matching declarations and bytes cannot bind the original source name
+    // to a different inode. Admission never substitutes for the path guard.
+    let roster =
+        admit_runtime_roster(RuntimeBackend::OrtCpu, &[view.declaration], &[foreign_fd]).unwrap();
+    assert!(SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &roster.plan).is_err());
+    let roster =
+        admit_runtime_roster(RuntimeBackend::OrtCpu, &[view.declaration], &[view]).unwrap();
+    assert!(
+        SnapshotGuards::capture(&fixture.root, other_fixture.root_cap(), &roster.plan).is_err()
+    );
+}
+
+#[test]
+fn generic_roster_pin_keeps_the_admitted_descriptors_after_view_vectors_drop() {
+    let fixture = Fixture::new();
+    let mut assets = fixture.cpu();
+    assets[0].file.seek(SeekFrom::Start(7)).unwrap();
+    let roster = {
+        let held: Vec<_> = assets.iter().map(runtime_view).collect();
+        let expected: Vec<_> = held.iter().map(|view| view.declaration).collect();
+        admit_runtime_roster(RuntimeBackend::OrtCpu, &expected, &held).unwrap()
+    };
+    let guards = SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &roster.plan).unwrap();
+    let cache = RuntimeCache::open(&fixture.root.join("shared-cache")).unwrap();
+    let pin = pin_plan(&cache, &fixture.root, &roster.plan, guards).unwrap();
+    assert_eq!(pin.storage().bytes, assets[0].declaration.artifact.bytes);
+    assert_eq!(assets[0].file.stream_position().unwrap(), 7);
 }

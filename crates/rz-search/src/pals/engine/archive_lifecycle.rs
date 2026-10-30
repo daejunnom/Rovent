@@ -7,39 +7,405 @@ use super::super::store::{
 };
 use super::*;
 use crate::cpu_value::CpuTrainingState;
+use rz_contracts::pals::SearchAuthority;
 use std::collections::{BTreeMap, BTreeSet};
 
-const SEARCH_ARCHIVE_IO_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const SEARCH_ARCHIVE_IO_BYTES: u64 = 16 * 1024 * 1024;
 const NODE_METADATA_BYTES: usize = 4096;
 const NODE_METADATA_MAGIC: &[u8; 8] = b"RZENGN01";
+
+struct ArchiveRestorePolicy<'a> {
+    config: &'a PalsSemanticConfig,
+    cpu_value: Option<&'a CpuValueIdentity>,
+    legacy_model_wdl: bool,
+}
+
+struct RestoredEngineMetadata {
+    situations: Vec<(SituationId, SituationId)>,
+    nodes: Vec<EngineArchiveNode>,
+    records: Vec<RoleRecord>,
+}
+
+/// Initial logical game preparation remains in the original Engine, including
+/// an interrupted callback/reset. It is neither a UCI admission nor a fence.
+pub(super) struct UnusedEngineArchiveGamePreparation {
+    seal: super::adaptive_root::UnusedArchiveSetupSeal,
+    scope: SearchAuthority,
+    pub(super) deadline: Instant,
+    model_preflight_completed: bool,
+    pub(super) reset_attempted: bool,
+    pub(super) reset_completed: bool,
+    callback_attempted: bool,
+    callback_completed: bool,
+    pub(super) completed: bool,
+    pub(super) first_error: Option<PalsError>,
+    // Keep the original payload without making read-only semantic receipts
+    // require a Sync panic object. No consumer takes or rewrites the payload.
+    pub(super) panic: Option<std::sync::Mutex<Box<dyn std::any::Any + Send>>>,
+    pub(super) completion_unknown: bool,
+}
+
+/// Bounded observation of the original final checkpoint, never a physical fence
+/// or acceptance/consumption authority. Raw cancelled facts retain their status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdleArchiveCheckpoint {
+    pub hot: crate::pals::store::ArchiveStats,
+    pub records: usize,
+    pub nodes: usize,
+    pub committed_bytes: u64,
+    pub io_bytes: u64,
+    pub owner: ArchiveOwnerSnapshot,
+}
 
 /// The directory/configuration is retained across ucinewgame; each new Store
 /// owns another game directory and any reopen failure remains a typed error.
 #[derive(Default)]
 pub(super) struct EngineArchiveLifecycle {
-    config: Option<ArchiveConfig>,
-    root_capability: Option<ArchiveRootCapability>,
-    reopen_error: Option<StoreError>,
-    deadline: Option<Instant>,
-    remaining_io: u64,
-    retried_allocation: bool,
+    pub(super) unused_engine_game: Option<Box<UnusedEngineArchiveGamePreparation>>,
+    pub(super) config: Option<ArchiveConfig>,
+    pub(super) root_capability: Option<ArchiveRootCapability>,
+    pub(super) reopen_error: Option<StoreError>,
+    pub(super) deadline: Option<Instant>,
+    pub(super) remaining_io: u64,
+    pub(super) retried_allocation: bool,
     last_receipt: Option<EngineArchiveReceipt>,
-    active_search_pins: StorePins,
+    pub(super) active_search_pins: StorePins,
     pub(super) previous_closed_owner: Option<ArchiveOwnerSnapshot>,
-    closed_current_owner: Option<ArchiveOwnerSnapshot>,
+    pub(super) closed_current_owner: Option<ArchiveOwnerSnapshot>,
+}
+
+impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn archive_is_configured(&self) -> bool {
+        self.archive_state.config.is_some()
+    }
+
+    pub(super) fn ensure_archive_admission_open(&self) -> Result<(), PalsError> {
+        if self.archive_state.closed_current_owner.is_some() {
+            return Err(PalsError::Store(StoreError::InvalidConditions(
+                "archive owner admission is closed",
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn last_engine_archive(&self) -> Option<&EngineArchiveReceipt> {
+        self.archive_state.last_receipt.as_ref()
+    }
+
+    pub(super) fn pin_archive_active_record(
+        &mut self,
+        line: LineId,
+        observation: ObservationId,
+    ) -> Result<(), PalsError> {
+        if !self.stores.archive_enabled() {
+            return Ok(());
+        }
+        self.stores.lines.get(line)?;
+        if self.stores.observations.get(observation)?.line != Some(line) {
+            return Err(StoreError::InvalidEvidence("active archive record line").into());
+        }
+        let stats = self.stores.hot_stats();
+        let pins = &mut self.archive_state.active_search_pins;
+        if (!pins.lines.contains(&line) && pins.lines.len() >= stats.lines)
+            || (!pins.observations.contains(&observation)
+                && pins.observations.len() >= stats.observations)
+        {
+            return Err(StoreError::PinSaturated("active archive search handles").into());
+        }
+        pins.lines.insert(line);
+        pins.observations.insert(observation);
+        Ok(())
+    }
+
+    pub(super) fn pin_archive_active_observation(
+        &mut self,
+        observation: ObservationId,
+    ) -> Result<(), PalsError> {
+        if !self.stores.archive_enabled() {
+            return Ok(());
+        }
+        let observed = self.stores.observations.get(observation)?;
+        let lines = [observed.line, observed.cpu_pv];
+        for line in lines.into_iter().flatten() {
+            self.stores.lines.get(line)?;
+        }
+        let stats = self.stores.hot_stats();
+        let pins = &mut self.archive_state.active_search_pins;
+        if !pins.observations.contains(&observation)
+            && pins.observations.len() >= stats.observations
+        {
+            return Err(StoreError::PinSaturated("active archive evidence").into());
+        }
+        pins.observations.insert(observation);
+        for line in lines.into_iter().flatten() {
+            pins.lines.insert(line);
+        }
+        Ok(())
+    }
 }
 
 impl<M: RoleModel> PalsEngine<M> {
+    /// Initial-only same-game binding. The actual caller already holds its
+    /// opaque go and has reset/armed the original CPU mirror. This consumes no
+    /// new root nonce and never changes a game number to make a request fit.
+    pub fn prepare_unused_archive_game(
+        &mut self,
+        scope: SearchAuthority,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        if let Some(original) = &self.semantic.archive_state.unused_engine_game {
+            if original.scope != scope || deadline > original.deadline {
+                return Err(StoreError::StaleConsumer.into());
+            }
+            if let Some(error) = &original.first_error {
+                return Err(error.clone());
+            }
+            if original.completion_unknown {
+                return Err(StoreError::InvalidConditions(
+                    "original unused Engine game completion unknown",
+                )
+                .into());
+            }
+            if original.completed {
+                allocation_controls(Some((deadline, cancel)))?;
+                self.validate_unused_engine_game_contents()?;
+                self.semantic.seal_unused_archive_setup(scope)?;
+                return Ok(());
+            }
+        } else {
+            allocation_controls(Some((deadline, cancel)))?;
+            self.validate_engine_idle_archive_owner()?;
+            self.validate_unused_engine_game_contents()?;
+            if let Some(ready) = self.semantic.adaptive_new_game_scope() {
+                if ready != scope {
+                    return Err(StoreError::StaleConsumer.into());
+                }
+                self.semantic.seal_unused_archive_setup(scope)?;
+                return Ok(());
+            }
+            let seal = self.semantic.seal_unused_engine_game_preparation(scope)?;
+            self.semantic.archive_state.unused_engine_game =
+                Some(Box::new(UnusedEngineArchiveGamePreparation {
+                    seal,
+                    scope,
+                    deadline,
+                    model_preflight_completed: false,
+                    reset_attempted: false,
+                    reset_completed: false,
+                    callback_attempted: false,
+                    callback_completed: false,
+                    completed: false,
+                    first_error: None,
+                    panic: None,
+                    completion_unknown: false,
+                }));
+        }
+        self.semantic
+            .archive_state
+            .unused_engine_game
+            .as_ref()
+            .expect("original initial game")
+            .seal
+            .validate_engine_game_preparation(&self.semantic)?;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), PalsError> {
+                let original = self
+                    .semantic
+                    .archive_state
+                    .unused_engine_game
+                    .as_mut()
+                    .expect("original initial game");
+                let deadline = deadline.min(original.deadline);
+                allocation_controls(Some((deadline, cancel)))?;
+                if !original.model_preflight_completed {
+                    self.semantic.model.preflight_new_game(deadline, cancel)?;
+                    original.model_preflight_completed = true;
+                }
+                if original.reset_attempted && !original.reset_completed {
+                    return Err(StoreError::InvalidConditions(
+                        "original unused Engine reset completion unknown",
+                    )
+                    .into());
+                }
+                if !original.reset_completed {
+                    original.reset_attempted = true;
+                    self.researcher.cpu.new_game(deadline, cancel)?;
+                    original.reset_completed = true;
+                }
+                allocation_controls(Some((deadline, cancel)))?;
+                if original.callback_attempted && !original.callback_completed {
+                    return Err(StoreError::InvalidConditions(
+                        "original unused Engine model callback unknown",
+                    )
+                    .into());
+                }
+                if !original.callback_completed {
+                    original.callback_attempted = true;
+                    self.semantic
+                        .model
+                        .new_game_with_generation(Some(scope.game.0));
+                    original.callback_completed = true;
+                }
+                allocation_controls(Some((deadline, cancel)))?;
+                Ok(())
+            }));
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => {
+                let original = self
+                    .semantic
+                    .archive_state
+                    .unused_engine_game
+                    .as_mut()
+                    .expect("original initial game");
+                original
+                    .panic
+                    .get_or_insert_with(|| std::sync::Mutex::new(payload));
+                original.completion_unknown = true;
+                Err(
+                    StoreError::InvalidConditions("original unused Engine game panic/unknown")
+                        .into(),
+                )
+            }
+        };
+        if let Err(error) = result {
+            let original = self
+                .semantic
+                .archive_state
+                .unused_engine_game
+                .as_mut()
+                .expect("original initial game");
+            return Err(original.first_error.get_or_insert(error).clone());
+        }
+        let completed = (|| {
+            self.validate_engine_idle_checker_namespace()?;
+            self.validate_unused_engine_game_contents()?;
+            self.semantic
+                .archive_state
+                .unused_engine_game
+                .as_ref()
+                .expect("original initial game")
+                .seal
+                .validate_engine_game_preparation(&self.semantic)?;
+            self.semantic.commit_unused_engine_game_preparation(scope)
+        })();
+        let original = self
+            .semantic
+            .archive_state
+            .unused_engine_game
+            .as_mut()
+            .expect("original initial game");
+        if let Err(error) = completed {
+            return Err(original.first_error.get_or_insert(error).clone());
+        }
+        original.completed = true;
+        self.researcher.checker_new_game_pending = false;
+        Ok(())
+    }
+
+    fn validate_unused_engine_game_contents(&self) -> Result<(), PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        self.semantic.stores.validate_unused_archive_setup()?;
+        if !self.semantic.nodes.is_empty()
+            || !self.semantic.records.is_empty()
+            || self.semantic.revision != 0
+            || self.semantic.consumer_id != 0
+            || !self.semantic.repair_queue.is_empty()
+            || !self.semantic.repair_questions.is_empty()
+            || !self.semantic.repair_counts.is_empty()
+            || self.semantic.archive_state.config.is_some()
+            || self.semantic.archive_state.root_capability.is_some()
+            || self.semantic.last_engine_archive().is_some()
+            || self.semantic.review_index.as_ref().is_none_or(|index| {
+                index.active_bundle_count() != 0 || index.indexed_record_count() != 0
+            })
+        {
+            return Err(StoreError::InvalidConditions("initial Engine game must be unused").into());
+        }
+        Ok(())
+    }
+
+    /// Exact full-Engine custody for the explicit native own-R idle adapter.
+    /// Unlike a semantic-only owner it also retains and checks the original
+    /// checker namespace and excludes a held CPU task or deferred replacement.
+    pub(super) fn validate_engine_idle_archive_owner(&self) -> Result<(), PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        if self
+            .semantic
+            .archive_state
+            .unused_engine_game
+            .as_ref()
+            .is_some_and(|original| !original.completed)
+        {
+            return Err(
+                StoreError::InvalidConditions("unused Engine game preparation retained").into(),
+            );
+        }
+        self.validate_engine_idle_checker_namespace()
+    }
+    fn validate_engine_idle_checker_namespace(&self) -> Result<(), PalsError> {
+        self.validate_checker_namespace()?;
+        if !matches!(
+            self.researcher.checker_registered_identity,
+            CheckerIdentity::Owned(_)
+        ) || self.researcher.cpu.identity() != &self.researcher.checker_registered_identity
+            || self.cpu_condition() != self.researcher.cpu_registered_condition
+            || match &self.researcher.checker_registered_identity {
+                CheckerIdentity::Owned(identity) => {
+                    self.researcher.cpu_registered_value.as_ref() != Some(identity)
+                }
+                CheckerIdentity::ExternalUci(_) => true,
+            }
+            || self.deferred_researcher_source.is_some()
+            || self.deferred_researcher_initial.is_some()
+        {
+            return Err(StoreError::InvalidConditions(
+                "original own Engine idle checker namespace",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Invoked once by the retained Engine-idle transition, after the concrete
+    /// caller's real CPU/TT reset and arm. This consumes the existing checker's
+    /// reset delivery; it never clears/rebuilds a peer CPU or manufactures an arm.
+    pub(super) fn preflight_engine_idle_archive_reset(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        // The one caller checked this same owner just before retaining its
+        // reset_attempted marker. The very next operation consumes the arm.
+        self.researcher.cpu.new_game(deadline, cancel)?;
+        self.validate_engine_idle_archive_owner()?;
+        allocation_controls(Some((deadline, cancel)))?;
+        Ok(())
+    }
+
+    /// Only the successfully published new Store reaches this infallible tail.
+    /// Preserve the same per-game cleanup as the existing Engine newgame path;
+    /// all physical checker/CPU owners remain in their original slots.
+    pub(super) fn complete_engine_idle_archive_new_game(&mut self) {
+        self.researcher.checker_new_game_pending = false;
+        self.researcher.external_attempts.clear();
+        self.researcher.last_external_attempt = None;
+        self.last_cpu_checkpoint_cleanup_error = None;
+        self.clear_followup_game();
+    }
+
     /// Explicit opt-in. Paths and the 256MiB/game, 4GiB/global ceilings are
     /// validated by the Store; no game evidence is deleted to satisfy them.
     pub fn enable_archive(&mut self, config: ArchiveConfig) -> Result<(), PalsError> {
-        self.stores
+        self.semantic
+            .stores
             .enable_archive(config.clone())
             .map_err(PalsError::Store)?;
-        self.archive_state.config = Some(config);
-        self.archive_state.root_capability = None;
-        self.archive_state.reopen_error = None;
-        self.archive_state.closed_current_owner = None;
+        self.semantic.archive_state.config = Some(config);
+        self.semantic.archive_state.root_capability = None;
+        self.semantic.archive_state.reopen_error = None;
+        self.semantic.archive_state.closed_current_owner = None;
         Ok(())
     }
 
@@ -50,22 +416,23 @@ impl<M: RoleModel> PalsEngine<M> {
         config: ArchiveConfig,
         capability: ArchiveRootCapability,
     ) -> Result<(), PalsError> {
-        self.stores
+        self.semantic
+            .stores
             .enable_archive_with_capability(config.clone(), capability.clone())
             .map_err(PalsError::Store)?;
-        self.archive_state.config = Some(config);
-        self.archive_state.root_capability = Some(capability);
-        self.archive_state.reopen_error = None;
-        self.archive_state.closed_current_owner = None;
+        self.semantic.archive_state.config = Some(config);
+        self.semantic.archive_state.root_capability = Some(capability);
+        self.semantic.archive_state.reopen_error = None;
+        self.semantic.archive_state.closed_current_owner = None;
         Ok(())
     }
 
     pub fn archive_config(&self) -> Option<&ArchiveConfig> {
-        self.archive_state.config.as_ref()
+        self.semantic.archive_state.config.as_ref()
     }
 
     pub fn archive_enabled(&self) -> bool {
-        self.stores.archive_enabled()
+        self.semantic.stores.archive_enabled()
     }
 
     /// The actual one-shot Store selector, never a manifest/default projection.
@@ -73,17 +440,19 @@ impl<M: RoleModel> PalsEngine<M> {
         &mut self,
         limits: ArchiveRuntimeLimits,
     ) -> Result<(), PalsError> {
-        self.stores
+        self.semantic
+            .stores
             .set_archive_runtime_limits(limits)
             .map_err(PalsError::Store)?;
-        let actual =
-            self.stores
-                .archive_runtime_limits()
-                .copied()
-                .ok_or(StoreError::InvalidConditions(
-                    "archive selector was not installed",
-                ))?;
-        if let Some(config) = &mut self.archive_state.config {
+        let actual = self
+            .semantic
+            .stores
+            .archive_runtime_limits()
+            .copied()
+            .ok_or(StoreError::InvalidConditions(
+                "archive selector was not installed",
+            ))?;
+        if let Some(config) = &mut self.semantic.archive_state.config {
             config.game_bytes = actual.game_bytes_max;
             config.global_bytes = actual.global_bytes_max;
             config.record_bytes = actual.record_payload_bytes_max;
@@ -93,8 +462,9 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     pub fn archive_runtime_limits(&self) -> Option<&ArchiveRuntimeLimits> {
-        self.stores.archive_runtime_limits().or_else(|| {
-            self.archive_state
+        self.semantic.stores.archive_runtime_limits().or_else(|| {
+            self.semantic
+                .archive_state
                 .closed_current_owner
                 .as_ref()
                 .and_then(|owner| owner.runtime_limits.as_ref())
@@ -115,25 +485,21 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
         self.ensure_archive_admission_open()?;
-        observe_selected_archive_usage(&mut self.stores, deadline, cancel)
+        observe_selected_archive_usage(&mut self.semantic.stores, deadline, cancel)
     }
 
     pub(super) fn engine_archive_owner_snapshot(
         &self,
     ) -> Result<Option<ArchiveOwnerSnapshot>, StoreError> {
         Ok(self
+            .semantic
             .stores
             .archive_owner_snapshot()?
-            .or(self.archive_state.closed_current_owner))
+            .or(self.semantic.archive_state.closed_current_owner))
     }
 
     pub(super) fn ensure_archive_admission_open(&self) -> Result<(), PalsError> {
-        if self.archive_state.closed_current_owner.is_some() {
-            return Err(PalsError::Store(StoreError::InvalidConditions(
-                "archive owner admission is closed",
-            )));
-        }
-        Ok(())
+        self.semantic.ensure_archive_admission_open()
     }
 
     /// The Native caller already owns the actual checker/model release fences.
@@ -145,11 +511,12 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<PalsFollowupOwnerSnapshot, PalsError> {
         archive_deadline(deadline)?;
         if let Some(closed) = self
+            .semantic
             .stores
             .close_archive_owner()
             .map_err(PalsError::Store)?
         {
-            self.archive_state.closed_current_owner = Some(closed);
+            self.semantic.archive_state.closed_current_owner = Some(closed);
         }
         archive_deadline(deadline)?;
         Ok(self.followup_owner_snapshot())
@@ -158,27 +525,32 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Bounded receipt of the most recent engine metadata commit, rather than
     /// an unbounded in-memory directory of all historical engine records.
     pub fn last_engine_archive(&self) -> Option<&EngineArchiveReceipt> {
-        self.archive_state.last_receipt.as_ref()
+        self.semantic.last_engine_archive()
     }
 
     pub(super) fn reset_archive_new_game(&mut self) {
-        self.archive_state.deadline = None;
-        self.archive_state.remaining_io = 0;
-        self.archive_state.retried_allocation = false;
-        self.archive_state.last_receipt = None;
-        self.archive_state.active_search_pins = StorePins::default();
-        self.archive_state.reopen_error = if self.stores.archive_enabled() {
+        self.semantic.archive_state.deadline = None;
+        self.semantic.archive_state.remaining_io = 0;
+        self.semantic.archive_state.retried_allocation = false;
+        self.semantic.archive_state.last_receipt = None;
+        self.semantic.archive_state.active_search_pins = StorePins::default();
+        self.semantic.archive_state.reopen_error = if self.semantic.stores.archive_enabled() {
             None
         } else {
-            self.archive_state.config.as_ref().and_then(|config| {
-                match &self.archive_state.root_capability {
-                    Some(capability) => self
-                        .stores
-                        .enable_archive_with_capability(config.clone(), capability.clone()),
-                    None => self.stores.enable_archive(config.clone()),
-                }
-                .err()
-            })
+            self.semantic
+                .archive_state
+                .config
+                .as_ref()
+                .and_then(|config| {
+                    match &self.semantic.archive_state.root_capability {
+                        Some(capability) => self
+                            .semantic
+                            .stores
+                            .enable_archive_with_capability(config.clone(), capability.clone()),
+                        None => self.semantic.stores.enable_archive(config.clone()),
+                    }
+                    .err()
+                })
         };
     }
 
@@ -189,24 +561,27 @@ impl<M: RoleModel> PalsEngine<M> {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
+        self.semantic.ensure_frontier_retired()?;
         archive_controls(deadline, cancel)?;
         let generation = self
+            .semantic
             .game_generation
             .and_then(|value| value.checked_add(1))
             .ok_or(PalsError::Capacity)?;
-        self.model.preflight_new_game(deadline, cancel)?;
+        self.semantic.model.preflight_new_game(deadline, cancel)?;
         archive_controls(deadline, cancel)?;
-        self.cpu.new_game(deadline, cancel)?;
+        self.researcher.cpu.new_game(deadline, cancel)?;
         archive_controls(deadline, cancel)?;
         let config = self
+            .semantic
             .archive_state
             .config
             .as_ref()
             .ok_or(StoreError::ArchiveDisabled)?
             .clone();
         let runtime_limits = self.archive_runtime_limits().copied();
-        let mut next = PalsStores::new(Self::store_limits(&self.config));
-        match &self.archive_state.root_capability {
+        let mut next = PalsStores::new(self.semantic_sequence_config().store_limits());
+        match &self.semantic.archive_state.root_capability {
             Some(capability) => next.enable_archive_with_capability(config, capability.clone()),
             None => next.enable_archive(config),
         }
@@ -217,43 +592,46 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         // A new game owns independent cold handles but consumes the same
         // startup-selected session write allowance under the same archive root.
-        next.inherit_archive_write_budget_from(&self.stores)
+        next.inherit_archive_write_budget_from(&self.semantic.stores)
             .map_err(PalsError::Store)?;
         // Capture the new owner's actual baseline before it becomes visible to
         // Native search observations. Scan failure retains the previous owner.
         observe_selected_archive_usage(&mut next, deadline, cancel)?;
         archive_controls(deadline, cancel)?;
         let closed = self
+            .semantic
             .stores
             .close_archive_owner()
             .map_err(PalsError::Store)?
-            .or(self.archive_state.closed_current_owner);
+            .or(self.semantic.archive_state.closed_current_owner);
         // If cancellation/deadline arrives at the immutable close, the old hot
         // Store and target remain, and the actual closed fact remains observable.
-        self.archive_state.closed_current_owner = closed;
+        self.semantic.archive_state.closed_current_owner = closed;
         archive_controls(deadline, cancel)?;
-        self.stores = next;
-        self.archive_state.previous_closed_owner = closed;
-        self.archive_state.closed_current_owner = None;
-        self.game_generation = Some(generation);
-        self.nodes.clear();
-        self.records.clear();
+        self.semantic.stores = next;
+        self.semantic.archive_state.previous_closed_owner = closed;
+        self.semantic.archive_state.closed_current_owner = None;
+        self.semantic.game_generation = Some(generation);
+        self.semantic.nodes.clear();
+        self.semantic.records.clear();
         self.reset_review_context();
-        self.model.new_game_with_generation(self.game_generation);
-        self.revision = 0;
-        self.checker_new_game_pending = false;
+        self.semantic
+            .model
+            .new_game_with_generation(self.semantic.game_generation);
+        self.semantic.revision = 0;
+        self.researcher.checker_new_game_pending = false;
         self.reset_archive_new_game();
-        self.consumer_id = 0;
-        self.last_search_counters = None;
-        self.last_recheck_observer_error = None;
+        self.semantic.consumer_id = 0;
+        self.semantic.last_search_counters = None;
+        self.semantic.last_recheck_observer_error = None;
         self.last_cpu_checkpoint_cleanup_error = None;
-        self.external_attempts.clear();
-        self.last_external_attempt = None;
-        self.repair_queue.clear();
-        self.repair_questions.clear();
-        self.repair_counts.clear();
+        self.researcher.external_attempts.clear();
+        self.researcher.last_external_attempt = None;
+        self.semantic.repair_queue.clear();
+        self.semantic.repair_questions.clear();
+        self.semantic.repair_counts.clear();
         self.clear_followup_game();
-        self.new_game_transition_error = None;
+        self.semantic.new_game_transition_error = None;
         Ok(())
     }
 
@@ -265,27 +643,31 @@ impl<M: RoleModel> PalsEngine<M> {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
-        if let Some(error) = &self.archive_state.reopen_error {
+        if let Some(error) = &self.semantic.archive_state.reopen_error {
             return Err(PalsError::Store(error.clone()));
         }
-        if !self.stores.archive_enabled() {
+        if !self.semantic.stores.archive_enabled() {
             return Ok(());
         }
         archive_controls(deadline, cancel)?;
-        self.archive_state.deadline = Some(deadline);
-        self.archive_state.remaining_io = SEARCH_ARCHIVE_IO_BYTES;
-        self.archive_state.retried_allocation = false;
-        self.archive_state.active_search_pins = StorePins::default();
-        if self.stores.archive_runtime_limits().is_some() {
+        self.semantic.archive_state.deadline = Some(deadline);
+        self.semantic.archive_state.remaining_io = SEARCH_ARCHIVE_IO_BYTES;
+        self.semantic.archive_state.retried_allocation = false;
+        self.semantic.archive_state.active_search_pins = StorePins::default();
+        if self.semantic.stores.archive_runtime_limits().is_some() {
             let mut budget = self.engine_archive_budget()?;
             let available = budget.max_bytes;
-            let measured = self.stores.measure_archive_usage_with_budget(&mut budget);
+            let measured = self
+                .semantic
+                .stores
+                .measure_archive_usage_with_budget(&mut budget);
             self.charge_engine_archive_io(available.saturating_sub(budget.max_bytes))?;
             measured.map_err(PalsError::Store)?;
             archive_controls(deadline, cancel)?;
         }
         self.retire_stale_archive_checkpoints(position)?;
-        self.stores
+        self.semantic
+            .stores
             .set_archive_pins(self.resident_archive_pins()?)?;
         if self.engine_archive_pressure(position) {
             self.reclaim_archive_for_root(position, deadline, cancel)?;
@@ -301,13 +683,13 @@ impl<M: RoleModel> PalsEngine<M> {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
-        if !self.stores.archive_enabled() {
+        if !self.semantic.stores.archive_enabled() {
             return Err(PalsError::Capacity);
         }
-        if self.archive_state.retried_allocation {
+        if self.semantic.archive_state.retried_allocation {
             return Err(StoreError::PinSaturated("actual root allocation retry exhausted").into());
         }
-        self.archive_state.retried_allocation = true;
+        self.semantic.archive_state.retried_allocation = true;
         self.retire_stale_archive_checkpoints(position)?;
         self.reclaim_archive_for_root(position, deadline, cancel)
     }
@@ -321,22 +703,25 @@ impl<M: RoleModel> PalsEngine<M> {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<usize, PalsError> {
-        if !self.stores.archive_enabled() {
+        if !self.semantic.stores.archive_enabled() {
             return Ok(root);
         }
         archive_controls(deadline, cancel)?;
         let state = self
+            .semantic
             .nodes
             .get(root)
             .ok_or(StoreError::InvalidHandle("engine actual root"))?
             .state;
-        self.stores
+        self.semantic
+            .stores
             .set_archive_pins(self.resident_archive_pins()?)?;
-        let position = self.nodes[root].position.clone();
+        let position = self.semantic.nodes[root].position.clone();
         if self.engine_archive_pressure(&position) {
             self.reclaim_archive_for_root(&position, deadline, cancel)?;
         }
-        self.nodes
+        self.semantic
+            .nodes
             .iter()
             .position(|node| node.state == state)
             .ok_or_else(|| StoreError::ArchiveIntegrity("actual root removed by archive").into())
@@ -348,25 +733,29 @@ impl<M: RoleModel> PalsEngine<M> {
         &mut self,
         index: usize,
     ) -> Result<(), PalsError> {
-        if !self.stores.archive_enabled() {
+        if !self.semantic.stores.archive_enabled() {
             return Ok(());
         }
         let record = self
+            .semantic
             .records
             .get(index)
             .ok_or(StoreError::InvalidHandle("engine obsolete record"))?
             .clone();
         let mut budget = self.engine_archive_budget()?;
         let initial = budget.max_bytes;
-        let result = self.stores.archive_engine_records_with_pins_and_budget(
-            &[record],
-            &[],
-            StorePins::default(),
-            &mut budget,
-        );
+        let result = self
+            .semantic
+            .stores
+            .archive_engine_records_with_pins_and_budget(
+                &[record],
+                &[],
+                StorePins::default(),
+                &mut budget,
+            );
         self.charge_engine_archive_io(initial - budget.max_bytes)?;
         let receipt = result.map_err(PalsError::Store)?;
-        self.archive_state.last_receipt = Some(receipt);
+        self.semantic.archive_state.last_receipt = Some(receipt);
         Ok(())
     }
 
@@ -386,18 +775,21 @@ impl<M: RoleModel> PalsEngine<M> {
         observation: Observation,
         controls: Option<(Instant, &AtomicBool)>,
     ) -> Result<ObservationId, PalsError> {
-        if self.stores.archive_enabled() && observation.external_report.is_some() {
-            self.stores
+        if self.semantic.stores.archive_enabled() && observation.external_report.is_some() {
+            self.semantic
+                .stores
                 .set_archive_pins(self.resident_archive_pins()?)?;
             let mut budget = self.engine_archive_budget()?;
             let initial = budget.max_bytes;
             let result = if controls.is_some_and(|(deadline, cancel)| {
                 cancel.load(Ordering::Acquire) || Instant::now() >= deadline
             }) {
-                self.stores
+                self.semantic
+                    .stores
                     .append_observation_checked_first_with_archive_budget(observation, &mut budget)
             } else {
-                self.stores
+                self.semantic
+                    .stores
                     .append_observation_checked_with_archive_budget_controlled(
                         observation,
                         &mut budget,
@@ -415,6 +807,7 @@ impl<M: RoleModel> PalsEngine<M> {
         } else {
             if controls.is_none() {
                 return self
+                    .semantic
                     .stores
                     .append_observation(observation)
                     .map_err(PalsError::from);
@@ -424,14 +817,14 @@ impl<M: RoleModel> PalsEngine<M> {
             if controls.is_some_and(|(deadline, cancel)| {
                 cancel.load(Ordering::Acquire) || Instant::now() >= deadline
             }) {
-                let result = self.stores.append_observation(observation);
-                return if self.stores.archive_enabled() {
+                let result = self.semantic.stores.append_observation(observation);
+                return if self.semantic.stores.archive_enabled() {
                     result.map_err(PalsError::Store)
                 } else {
                     result.map_err(PalsError::from)
                 };
             }
-            let controls = controls.filter(|_| self.stores.archive_enabled());
+            let controls = controls.filter(|_| self.semantic.stores.archive_enabled());
             let mut pins = StorePins::default();
             pins.states.insert(observation.state);
             pins.lines.extend(observation.line);
@@ -463,8 +856,8 @@ impl<M: RoleModel> PalsEngine<M> {
         incoming: StorePins,
         operation: impl FnOnce(&mut PalsStores) -> Result<T, StoreError>,
     ) -> Result<T, PalsError> {
-        if !self.stores.archive_enabled() {
-            return operation(&mut self.stores).map_err(PalsError::from);
+        if !self.semantic.stores.archive_enabled() {
+            return operation(&mut self.semantic.stores).map_err(PalsError::from);
         }
         let mut pins = self.resident_archive_pins()?;
         pins.states.extend(incoming.states);
@@ -475,6 +868,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let mut budget = self.engine_archive_budget()?;
         let initial = budget.max_bytes;
         let result = self
+            .semantic
             .stores
             .with_archive_allocation(pins, &mut budget, operation);
         let used = initial
@@ -494,24 +888,7 @@ impl<M: RoleModel> PalsEngine<M> {
         line: LineId,
         observation: ObservationId,
     ) -> Result<(), PalsError> {
-        if !self.stores.archive_enabled() {
-            return Ok(());
-        }
-        self.stores.lines.get(line)?;
-        if self.stores.observations.get(observation)?.line != Some(line) {
-            return Err(StoreError::InvalidEvidence("active archive record line").into());
-        }
-        let stats = self.stores.hot_stats();
-        let pins = &mut self.archive_state.active_search_pins;
-        if (!pins.lines.contains(&line) && pins.lines.len() >= stats.lines)
-            || (!pins.observations.contains(&observation)
-                && pins.observations.len() >= stats.observations)
-        {
-            return Err(StoreError::PinSaturated("active archive search handles").into());
-        }
-        pins.lines.insert(line);
-        pins.observations.insert(observation);
-        Ok(())
+        self.semantic.pin_archive_active_record(line, observation)
     }
     /// Raw worker evidence may have a checked PV rather than a public line.
     /// This bounded pin operation performs no archive load, scan or write.
@@ -519,26 +896,7 @@ impl<M: RoleModel> PalsEngine<M> {
         &mut self,
         observation: ObservationId,
     ) -> Result<(), PalsError> {
-        if !self.stores.archive_enabled() {
-            return Ok(());
-        }
-        let observed = self.stores.observations.get(observation)?;
-        let lines = [observed.line, observed.cpu_pv];
-        for line in lines.into_iter().flatten() {
-            self.stores.lines.get(line)?;
-        }
-        let stats = self.stores.hot_stats();
-        let pins = &mut self.archive_state.active_search_pins;
-        if !pins.observations.contains(&observation)
-            && pins.observations.len() >= stats.observations
-        {
-            return Err(StoreError::PinSaturated("active archive evidence").into());
-        }
-        pins.observations.insert(observation);
-        for line in lines.into_iter().flatten() {
-            pins.lines.insert(line);
-        }
-        Ok(())
+        self.semantic.pin_archive_active_observation(observation)
     }
 
     pub(super) fn archive_insert_situation(
@@ -548,11 +906,12 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<SituationId, PalsError> {
         if controls.is_none() {
             return self
+                .semantic
                 .stores
                 .insert_situation(snapshot)
                 .map_err(PalsError::from);
         }
-        let controls = controls.filter(|_| self.stores.archive_enabled());
+        let controls = controls.filter(|_| self.semantic.stores.archive_enabled());
         self.archive_store_allocation(StorePins::default(), |stores| {
             stores.insert_situation_controlled(snapshot, || allocation_controls(controls))
         })
@@ -566,11 +925,12 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<LineId, PalsError> {
         if controls.is_none() {
             return self
+                .semantic
                 .stores
                 .append_line(prefix, movements)
                 .map_err(PalsError::from);
         }
-        let controls = controls.filter(|_| self.stores.archive_enabled());
+        let controls = controls.filter(|_| self.semantic.stores.archive_enabled());
         let mut pins = StorePins::default();
         pins.lines.insert(prefix);
         self.archive_store_allocation(pins, |stores| {
@@ -585,16 +945,17 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
     ) -> Result<LineId, PalsError> {
-        let position = self.nodes[node].position.clone();
+        let position = self.semantic.nodes[node].position.clone();
         if self.stopped(limits, cancel).is_some() {
-            let result = self.stores.append_cpu_pv(&position, movements);
-            return if self.stores.archive_enabled() {
+            let result = self.semantic.stores.append_cpu_pv(&position, movements);
+            return if self.semantic.stores.archive_enabled() {
                 result.map_err(PalsError::Store)
             } else {
                 result.map_err(PalsError::from)
             };
         }
         let controls = self
+            .semantic
             .stores
             .archive_enabled()
             .then_some((limits.deadline, cancel));
@@ -611,15 +972,16 @@ impl<M: RoleModel> PalsEngine<M> {
     ) -> Result<ObservationId, PalsError> {
         if controls.is_none() {
             return self
+                .semantic
                 .stores
                 .append_rules_terminal(position, 0, 0)
                 .map_err(PalsError::from);
         }
-        let controls = controls.filter(|_| self.stores.archive_enabled());
+        let controls = controls.filter(|_| self.semantic.stores.archive_enabled());
         let mut pins = StorePins::default();
         pins.situations.insert(situation);
         pins.states
-            .insert(self.stores.situations.get(situation)?.state);
+            .insert(self.semantic.stores.situations.get(situation)?.state);
         self.archive_store_allocation(pins, |stores| {
             stores
                 .append_rules_terminal_controlled(position, 0, 0, || allocation_controls(controls))
@@ -635,6 +997,7 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
     ) -> Result<TaskAdmission, PalsError> {
         let controls = self
+            .semantic
             .stores
             .archive_enabled()
             .then_some((limits.deadline, cancel));
@@ -670,6 +1033,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 | TaskAdmission::Reuse { execution, .. } => execution,
             };
             let cleanup = self
+                .semantic
                 .stores
                 .tasks
                 .cancel_consumer(execution, consumer_id)
@@ -678,7 +1042,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         admission,
                         TaskAdmission::Start(_) | TaskAdmission::Resume { .. }
                     ) {
-                        self.stores.tasks.fail(execution)
+                        self.semantic.stores.tasks.fail(execution)
                     } else {
                         Ok(())
                     }
@@ -700,6 +1064,7 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
         let controls = self
+            .semantic
             .stores
             .archive_enabled()
             .then_some((limits.deadline, cancel));
@@ -721,6 +1086,7 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
         let controls = self
+            .semantic
             .stores
             .archive_enabled()
             .then_some((limits.deadline, cancel));
@@ -741,6 +1107,7 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
         let controls = self
+            .semantic
             .stores
             .archive_enabled()
             .then_some((limits.deadline, cancel));
@@ -752,6 +1119,265 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn engine_archive_budget(&self) -> Result<ArchiveIoBudget, PalsError> {
+        self.semantic.engine_archive_budget()
+    }
+    pub(super) fn archive_remaining_io(&self) -> u64 {
+        self.semantic.archive_remaining_io()
+    }
+
+    pub(super) fn charge_engine_archive_io(&mut self, bytes: u64) -> Result<(), PalsError> {
+        self.semantic.charge_engine_archive_io(bytes)
+    }
+
+    fn engine_archive_pressure(&self, position: &Position) -> bool {
+        self.semantic
+            .engine_archive_pressure(&self.semantic_sequence_config(), position)
+    }
+
+    fn retire_stale_archive_checkpoints(&mut self, position: &Position) -> Result<(), PalsError> {
+        let current_frontier =
+            self.semantic
+                .archive_reachable_nodes(position, false, &|token| {
+                    self.researcher.cpu.token_is_current(token)
+                })?;
+        let mut live = BTreeSet::new();
+        for (index, node) in self.semantic.nodes.iter_mut().enumerate() {
+            if let Some(token) = &node.resume {
+                if self.researcher.cpu.token_is_current(token)
+                    && (token.is_paused_stack() || current_frontier[index])
+                {
+                    let executions = self
+                        .semantic
+                        .stores
+                        .tasks
+                        .paused_executions_for_state(node.state)?;
+                    // Only the latest accepted token for this exact state can
+                    // own its native traversal. Prior checkpoints remain facts.
+                    if let Some(execution) = executions.into_iter().max() {
+                        live.insert(execution);
+                    }
+                } else {
+                    node.resume = None;
+                }
+            }
+        }
+        self.semantic.stores.tasks.retire_paused_except(&live)?;
+        Ok(())
+    }
+
+    pub(super) fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
+        self.semantic.resident_archive_pins()
+    }
+
+    /// Closing the same bounded resident graph is useful both for the RAM
+    /// frontier and for a self-contained persisted parent topology. Those
+    /// selections have different lifetimes and must never share trim rules.
+    fn reclaim_archive_for_root(
+        &mut self,
+        position: &Position,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        let config = self.semantic_sequence_config();
+        let cpu = &self.researcher.cpu;
+        self.semantic.reclaim_archive_for_root(
+            &config,
+            &StorePins::default(),
+            &|token| cpu.token_is_current(token),
+            position,
+            deadline,
+            cancel,
+        )
+    }
+
+    /// Explicit cold restore. A caller supplies both deadline and aggregate I/O
+    /// bound; the original Store owner/generation and exact history are checked.
+    /// This performs no CPU/model execution and never invents missing evidence.
+    pub fn load_archived_root(
+        &mut self,
+        position: &Position,
+        mut budget: ArchiveIoBudget,
+    ) -> Result<usize, PalsError> {
+        self.load_archived_root_with_budget(position, &mut budget)
+    }
+
+    /// This explicit caller allowance is separate from a search's remaining I/O.
+    /// Selected load limits cap the whole lookup/restore/install operation; both
+    /// Ok and Err return its actual bytes to the caller's unchanged allowance.
+    pub fn load_archived_root_with_budget(
+        &mut self,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<usize, PalsError> {
+        let config = self.semantic_sequence_config();
+        self.semantic.load_archived_root_with_budget(
+            &config,
+            self.researcher.cpu_registered_value.as_ref(),
+            !self.followup_lane && !self.post_repair_recheck.uses_frozen_model_wdl(),
+            position,
+            budget,
+        )
+    }
+
+    #[cfg(test)]
+    fn validate_loaded_node_evidence(&self, node: &Node) -> Result<(), PalsError> {
+        self.semantic.validate_loaded_node_evidence(
+            &ArchiveRestorePolicy {
+                config: &self.semantic_sequence_config(),
+                cpu_value: self.researcher.cpu_registered_value.as_ref(),
+                legacy_model_wdl: !self.followup_lane
+                    && !self.post_repair_recheck.uses_frozen_model_wdl(),
+            },
+            node,
+        )
+    }
+
+    #[cfg(test)]
+    fn archive_reachable_nodes(
+        &self,
+        position: &Position,
+        include_tasks: bool,
+    ) -> Result<Vec<bool>, PalsError> {
+        self.semantic
+            .archive_reachable_nodes(position, include_tasks, &|token| {
+                self.researcher.cpu.token_is_current(token)
+            })
+    }
+}
+
+impl<M: RoleModel> PalsSemanticState<M> {
+    /// The same finite cold-load envelope serves legacy and idle owners.
+    pub(super) fn load_archived_root_with_budget(
+        &mut self,
+        config: &PalsSemanticConfig,
+        cpu_value: Option<&CpuValueIdentity>,
+        legacy_model_wdl: bool,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<usize, PalsError> {
+        self.load_archived_root_if_present_with_budget(
+            config,
+            cpu_value,
+            legacy_model_wdl,
+            position,
+            budget,
+        )?
+        .ok_or_else(|| StoreError::ColdRecord("archived engine root").into())
+    }
+
+    /// Only an exact Store lookup's normal None means an unarchived target.
+    /// A known cold state without its engine metadata, I/O and integrity errors
+    /// remain failures; no failed restoration is relabelled a cache miss.
+    pub(super) fn load_archived_root_if_present_with_budget(
+        &mut self,
+        config: &PalsSemanticConfig,
+        cpu_value: Option<&CpuValueIdentity>,
+        legacy_model_wdl: bool,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<Option<usize>, PalsError> {
+        if budget.max_bytes > SEARCH_ARCHIVE_IO_BYTES {
+            return Err(StoreError::InvalidConditions("engine cold load exceeds 16MiB").into());
+        }
+        let mut work = *budget;
+        if let Some(limits) = self.stores.archive_runtime_limits().or_else(|| {
+            self.archive_state
+                .closed_current_owner
+                .as_ref()
+                .and_then(|owner| owner.runtime_limits.as_ref())
+        }) {
+            work.max_bytes = work.max_bytes.min(limits.load_bytes_max);
+            let selected_deadline = Instant::now()
+                .checked_add(Duration::from_millis(limits.load_deadline_max_ms))
+                .ok_or(StoreError::InvalidConditions("archive load duration"))?;
+            work.deadline = work.deadline.min(selected_deadline);
+        }
+        let available = work.max_bytes;
+        let result = self.load_archived_root_if_present_inner(
+            config,
+            cpu_value,
+            legacy_model_wdl,
+            position,
+            &mut work,
+        );
+        budget.max_bytes = budget
+            .max_bytes
+            .saturating_sub(available.saturating_sub(work.max_bytes));
+        result
+    }
+}
+
+impl<M: RoleModel> PalsSemanticState<M> {
+    /// Persist every remaining original hot fact before a new game can end its
+    /// lifetime. The Store keeps its private raw status/acceptance unchanged and
+    /// the existing durable codec is the sole barrier; no RAM is reclaimed here.
+    pub(super) fn checkpoint_idle_archive_game(
+        &mut self,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<IdleArchiveCheckpoint, PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        archive_deadline(budget.deadline)?;
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(self.nodes.len())
+            .map_err(|_| StoreError::PinSaturated("final engine archive DTO allocation"))?;
+        for node in &self.nodes {
+            archive_deadline(budget.deadline)?;
+            nodes.push(encode_archive_node(node, &self.nodes)?);
+        }
+        let receipt = self.stores.archive_all_hot_engine_records_with_budget(
+            &self.records,
+            &nodes,
+            budget,
+        )?;
+        let observed = IdleArchiveCheckpoint {
+            hot: receipt.archive.before,
+            records: receipt.records,
+            nodes: receipt.nodes,
+            committed_bytes: receipt.archive.committed_bytes,
+            io_bytes: receipt.archive.io_bytes,
+            owner: self
+                .stores
+                .archive_owner_snapshot()?
+                .ok_or(StoreError::ArchiveDisabled)?,
+        };
+        self.archive_state.last_receipt = Some(receipt);
+        Ok(observed)
+    }
+
+    /// All fallible checks and the original model callback precede this call.
+    /// Old hot lifetimes end only after the caller retained the durable final
+    /// checkpoint and the actual old archive close, under its private seal.
+    pub(super) fn publish_idle_archive_game(
+        &mut self,
+        next: SearchAuthority,
+        stores: Box<PalsStores>,
+        previous: ArchiveOwnerSnapshot,
+    ) {
+        self.stores = *stores;
+        self.game_generation = Some(next.game.0);
+        self.nodes.clear();
+        self.records.clear();
+        self.reset_review_context();
+        self.revision = 0;
+        self.consumer_id = 0;
+        self.last_search_counters = None;
+        self.last_recheck_observer_error = None;
+        self.repair_queue.clear();
+        self.repair_questions.clear();
+        self.repair_counts.clear();
+        self.new_game_transition_error = None;
+        self.archive_state.deadline = None;
+        self.archive_state.remaining_io = 0;
+        self.archive_state.retried_allocation = false;
+        self.archive_state.active_search_pins = StorePins::default();
+        self.archive_state.last_receipt = None;
+        self.archive_state.reopen_error = None;
+        self.archive_state.previous_closed_owner = Some(previous);
+        self.archive_state.closed_current_owner = None;
+    }
+
+    pub(super) fn engine_archive_budget(&self) -> Result<ArchiveIoBudget, PalsError> {
         let deadline = self
             .archive_state
             .deadline
@@ -766,6 +1392,7 @@ impl<M: RoleModel> PalsEngine<M> {
             max_bytes: self.archive_state.remaining_io,
         })
     }
+
     pub(super) fn archive_remaining_io(&self) -> u64 {
         self.archive_state.remaining_io
     }
@@ -779,42 +1406,41 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
 
-    fn engine_archive_pressure(&self, position: &Position) -> bool {
+    pub(super) fn engine_archive_pressure(
+        &self,
+        config: &PalsSemanticConfig,
+        position: &Position,
+    ) -> bool {
         let target_state = self.stores.states.find(&position.snapshot());
         self.stores.archive_pressure()
-            || self.nodes.len().saturating_mul(5) >= self.config.max_nodes.saturating_mul(4)
-            || (self.records.len().saturating_mul(5) >= self.config.max_records.saturating_mul(4)
+            || self.nodes.len().saturating_mul(5) >= config.max_nodes.saturating_mul(4)
+            || (self.records.len().saturating_mul(5) >= config.max_records.saturating_mul(4)
                 && self
                     .records
                     .iter()
                     .any(|record| Some(record.origin_state) != target_state))
     }
 
-    fn retire_stale_archive_checkpoints(&mut self, position: &Position) -> Result<(), PalsError> {
-        let current_frontier = self.archive_reachable_nodes(position, false)?;
-        let mut live = BTreeSet::new();
-        for (index, node) in self.nodes.iter_mut().enumerate() {
-            if let Some(token) = &node.resume {
-                if self.cpu.token_is_current(token)
-                    && (token.is_paused_stack() || current_frontier[index])
-                {
-                    let executions = self.stores.tasks.paused_executions_for_state(node.state)?;
-                    // Only the latest accepted token for this exact state can
-                    // own its native traversal. Prior checkpoints remain facts.
-                    if let Some(execution) = executions.into_iter().max() {
-                        live.insert(execution);
-                    }
-                } else {
-                    node.resume = None;
-                }
-            }
-        }
-        self.stores.tasks.retire_paused_except(&live)?;
-        Ok(())
-    }
-
     pub(super) fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
         let mut pins = self.archive_state.active_search_pins.clone();
+        if let Some(custody) = &self.retired_goal_local {
+            custody.validate_owner(&self.stores)?;
+            let protected = custody.protected_pins()?;
+            pins.states.extend(&protected.states);
+            pins.lines.extend(&protected.lines);
+            pins.observations.extend(&protected.observations);
+            pins.situations.extend(&protected.situations);
+            pins.executions.extend(&protected.executions);
+        }
+        if let Some(custody) = &self.retired_profiled_external {
+            custody.validate_owner(&self.stores)?;
+            let protected = custody.protected_pins()?;
+            pins.states.extend(&protected.states);
+            pins.lines.extend(&protected.lines);
+            pins.observations.extend(&protected.observations);
+            pins.situations.extend(&protected.situations);
+            pins.executions.extend(&protected.executions);
+        }
         for node in &self.nodes {
             if !self
                 .stores
@@ -842,10 +1468,11 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(pins)
     }
 
-    fn archive_reachable_nodes(
+    pub(super) fn archive_reachable_nodes(
         &self,
         position: &Position,
         include_tasks: bool,
+        token_is_current: &dyn Fn(&CpuResumeToken) -> bool,
     ) -> Result<Vec<bool>, PalsError> {
         let snapshot = position.snapshot();
         let active_states: BTreeSet<_> = if include_tasks {
@@ -858,17 +1485,18 @@ impl<M: RoleModel> PalsEngine<M> {
             keep[index] = node.position.snapshot().same_state(&snapshot)
                 || active_states.contains(&node.state)
                 || (include_tasks
-                    && node.resume.as_ref().is_some_and(|token| {
-                        token.is_paused_stack() && self.cpu.token_is_current(token)
-                    }));
+                    && node
+                        .resume
+                        .as_ref()
+                        .is_some_and(|token| token.is_paused_stack() && token_is_current(token)));
         }
         self.archive_child_closure(keep)
     }
 
-    /// Closing the same bounded resident graph is useful both for the RAM
-    /// frontier and for a self-contained persisted parent topology. Those
-    /// selections have different lifetimes and must never share trim rules.
-    fn archive_child_closure(&self, mut selected: Vec<bool>) -> Result<Vec<bool>, PalsError> {
+    pub(super) fn archive_child_closure(
+        &self,
+        mut selected: Vec<bool>,
+    ) -> Result<Vec<bool>, PalsError> {
         if selected.len() != self.nodes.len() {
             return Err(StoreError::ArchiveIntegrity("engine closure selection").into());
         }
@@ -895,8 +1523,11 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(selected)
     }
 
-    fn reclaim_archive_for_root(
+    pub(super) fn reclaim_archive_for_root(
         &mut self,
+        config: &PalsSemanticConfig,
+        additional_pins: &StorePins,
+        token_is_current: &dyn Fn(&CpuResumeToken) -> bool,
         position: &Position,
         deadline: Instant,
         cancel: &AtomicBool,
@@ -905,8 +1536,8 @@ impl<M: RoleModel> PalsEngine<M> {
         // Guard every still-resident reference, including immutable raw facts,
         // before producing a DTO. No automatic Store I/O is enabled here.
         self.stores
-            .set_archive_pins(self.resident_archive_pins()?)?;
-        let keep = self.archive_reachable_nodes(position, true)?;
+            .set_archive_pins(self.resident_archive_pins_with(additional_pins)?)?;
+        let keep = self.archive_reachable_nodes(position, true, token_is_current)?;
         let kept_states: BTreeSet<_> = self
             .nodes
             .iter()
@@ -1018,11 +1649,11 @@ impl<M: RoleModel> PalsEngine<M> {
         // Prepare all compaction allocations before the durable barrier.
         let mut next_nodes = Vec::new();
         next_nodes
-            .try_reserve_exact(self.config.max_nodes)
+            .try_reserve_exact(config.max_nodes)
             .map_err(|_| StoreError::PinSaturated("engine compact arena allocation"))?;
         let mut next_records = Vec::new();
         next_records
-            .try_reserve_exact(self.config.max_records)
+            .try_reserve_exact(config.max_records)
             .map_err(|_| StoreError::PinSaturated("engine compact records allocation"))?;
         let mut remap = vec![usize::MAX; self.nodes.len()];
         let mut next = 0;
@@ -1086,7 +1717,7 @@ impl<M: RoleModel> PalsEngine<M> {
             self.stores.tasks.remap_paused_checkpoints(&checkpoints)?;
         }
         self.stores
-            .set_archive_pins(self.resident_archive_pins()?)?;
+            .set_archive_pins(self.resident_archive_pins_with(additional_pins)?)?;
         let mut budget = self.engine_archive_budget()?;
         let initial = budget.max_bytes;
         let result = self.stores.archive_inactive_with_budget(&mut budget);
@@ -1095,56 +1726,23 @@ impl<M: RoleModel> PalsEngine<M> {
         archive_controls(deadline, cancel)
     }
 
-    /// Explicit cold restore. A caller supplies both deadline and aggregate I/O
-    /// bound; the original Store owner/generation and exact history are checked.
-    /// This performs no CPU/model execution and never invents missing evidence.
-    pub fn load_archived_root(
+    fn load_archived_root_if_present_inner(
         &mut self,
-        position: &Position,
-        mut budget: ArchiveIoBudget,
-    ) -> Result<usize, PalsError> {
-        self.load_archived_root_with_budget(position, &mut budget)
-    }
-
-    /// This explicit caller allowance is separate from a search's remaining I/O.
-    /// Selected load limits cap the whole lookup/restore/install operation; both
-    /// Ok and Err return its actual bytes to the caller's unchanged allowance.
-    pub fn load_archived_root_with_budget(
-        &mut self,
+        config: &PalsSemanticConfig,
+        cpu_value: Option<&CpuValueIdentity>,
+        legacy_model_wdl: bool,
         position: &Position,
         budget: &mut ArchiveIoBudget,
-    ) -> Result<usize, PalsError> {
-        if budget.max_bytes > SEARCH_ARCHIVE_IO_BYTES {
-            return Err(StoreError::InvalidConditions("engine cold load exceeds 16MiB").into());
-        }
-        let mut work = *budget;
-        if let Some(limits) = self.archive_runtime_limits() {
-            work.max_bytes = work.max_bytes.min(limits.load_bytes_max);
-            let selected_deadline = Instant::now()
-                .checked_add(Duration::from_millis(limits.load_deadline_max_ms))
-                .ok_or(StoreError::InvalidConditions("archive load duration"))?;
-            work.deadline = work.deadline.min(selected_deadline);
-        }
-        let available = work.max_bytes;
-        let result = self.load_archived_root_inner(position, &mut work);
-        budget.max_bytes = budget
-            .max_bytes
-            .saturating_sub(available.saturating_sub(work.max_bytes));
-        result
-    }
-
-    fn load_archived_root_inner(
-        &mut self,
-        position: &Position,
-        budget: &mut ArchiveIoBudget,
-    ) -> Result<usize, PalsError> {
+    ) -> Result<Option<usize>, PalsError> {
         let snapshot = position.snapshot();
-        let state = self
+        let Some(state) = self
             .stores
             .lookup_cold_state_with_budget(&snapshot, budget)
             .map_err(PalsError::Store)?
-            .ok_or(StoreError::ColdRecord("archived engine root"))?
-            .original_id();
+        else {
+            return Ok(None);
+        };
+        let state = state.original_id();
         let receipt = self
             .stores
             .lookup_engine_node_archive_with_budget(state, budget)
@@ -1158,12 +1756,19 @@ impl<M: RoleModel> PalsEngine<M> {
             .map_err(PalsError::Store)?;
         let pin = loaded.pin;
         let result = self.install_loaded_archive(
+            ArchiveRestorePolicy {
+                config,
+                cpu_value,
+                legacy_model_wdl,
+            },
             state,
             position,
             budget.deadline,
-            loaded.situations,
-            loaded.engine_nodes,
-            loaded.engine_records,
+            RestoredEngineMetadata {
+                situations: loaded.situations,
+                nodes: loaded.engine_nodes,
+                records: loaded.engine_records,
+            },
         );
         let release = self.stores.release_loaded(pin);
         match result {
@@ -1172,20 +1777,25 @@ impl<M: RoleModel> PalsEngine<M> {
                 release.map_err(PalsError::Store)?;
                 self.stores
                     .set_archive_pins(self.resident_archive_pins()?)?;
-                Ok(root)
+                Ok(Some(root))
             }
         }
     }
 
     fn install_loaded_archive(
         &mut self,
+        policy: ArchiveRestorePolicy<'_>,
         root_state: StateId,
         expected: &Position,
         deadline: Instant,
-        situations: Vec<(SituationId, SituationId)>,
-        wires: Vec<EngineArchiveNode>,
-        records: Vec<RoleRecord>,
+        metadata: RestoredEngineMetadata,
     ) -> Result<usize, PalsError> {
+        let config = policy.config;
+        let RestoredEngineMetadata {
+            situations,
+            nodes: wires,
+            records,
+        } = metadata;
         let situation_map: BTreeMap<_, _> = situations.into_iter().collect();
         let mut indices: BTreeMap<_, _> = self
             .nodes
@@ -1201,7 +1811,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .nodes
             .len()
             .checked_add(additions)
-            .is_none_or(|n| n > self.config.max_nodes)
+            .is_none_or(|n| n > config.max_nodes)
         {
             return Err(StoreError::PinSaturated("loaded engine nodes").into());
         }
@@ -1223,7 +1833,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 return Err(StoreError::ArchiveIntegrity("engine restored situation state").into());
             }
             let node = decode_archive_node(wire, position, situation)?;
-            self.validate_loaded_node_evidence(&node)?;
+            self.validate_loaded_node_evidence(&policy, &node)?;
             let index = self.nodes.len() + new_nodes.len();
             indices.insert(wire.state, index);
             new_nodes.push(node);
@@ -1287,7 +1897,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .records
             .len()
             .checked_add(added_records.len())
-            .is_none_or(|n| n > self.config.max_records)
+            .is_none_or(|n| n > config.max_records)
         {
             return Err(StoreError::PinSaturated("loaded engine public records").into());
         }
@@ -1301,13 +1911,17 @@ impl<M: RoleModel> PalsEngine<M> {
         self.nodes.extend(new_nodes);
         self.records.extend(added_records);
         self.records.sort_by_key(|record| record.revision);
-        self.restore_review_context_after_load();
+        self.restore_review_context_after_load(config);
         Ok(root)
     }
 
-    fn validate_loaded_node_evidence(&self, node: &Node) -> Result<(), PalsError> {
+    fn validate_loaded_node_evidence(
+        &self,
+        policy: &ArchiveRestorePolicy<'_>,
+        node: &Node,
+    ) -> Result<(), PalsError> {
         if let Some(evidence) = &node.evidence {
-            if self.cpu_registered_value.as_ref() != Some(&evidence.value_identity) {
+            if policy.cpu_value != Some(&evidence.value_identity) {
                 return Err(StoreError::ArchiveIntegrity("engine restored CPU namespace").into());
             }
             if let Some((observation, execution)) = evidence.provenance {
@@ -1364,7 +1978,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     draw,
                     loss,
                     perspective,
-                } if !self.followup_lane && !self.post_repair_recheck.uses_frozen_model_wdl() => {
+                } if policy.legacy_model_wdl => {
                     // Match the actual legacy publisher gate. This preserves
                     // an old raw reading without adding a revision or minting
                     // a new ContextWdl/frozen comparison proof.
@@ -1384,6 +1998,19 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         Ok(())
     }
+
+    pub(super) fn resident_archive_pins_with(
+        &self,
+        additional: &StorePins,
+    ) -> Result<StorePins, PalsError> {
+        let mut pins = self.resident_archive_pins()?;
+        pins.states.extend(&additional.states);
+        pins.lines.extend(&additional.lines);
+        pins.observations.extend(&additional.observations);
+        pins.situations.extend(&additional.situations);
+        pins.executions.extend(&additional.executions);
+        Ok(pins)
+    }
 }
 
 pub(super) fn allocation_controls(
@@ -1400,7 +2027,7 @@ pub(super) fn allocation_controls(
     Ok(())
 }
 
-fn observe_selected_archive_usage(
+pub(super) fn observe_selected_archive_usage(
     stores: &mut PalsStores,
     deadline: Instant,
     cancel: &AtomicBool,
@@ -1797,6 +2424,7 @@ fn decode_archive_node(
             return Err(StoreError::ArchiveIntegrity("engine CPU Rules-terminal scope").into());
         }
         Some(CpuEvidence {
+            context: None,
             score,
             depth,
             scope,
@@ -1972,7 +2600,7 @@ mod tests {
 
     fn fill_hot(engine: &mut PalsEngine<LegalOrderRoleMock>) {
         let mut fullmove = 1000;
-        while engine.nodes.len() < engine.config.max_nodes {
+        while engine.semantic.nodes.len() < engine.config.max_nodes {
             engine
                 .intern(
                     Position::from_fen(&format!(
@@ -1983,7 +2611,7 @@ mod tests {
                 .unwrap();
             fullmove += 1;
         }
-        assert_eq!(engine.stores.hot_stats().states, 257);
+        assert_eq!(engine.semantic.stores.hot_stats().states, 257);
     }
 
     fn advanced_root() -> Position {
@@ -2068,6 +2696,7 @@ mod tests {
         consumer_id: u64,
     ) -> Observation {
         let node = engine
+            .semantic
             .nodes
             .iter()
             .find(|node| node.position.snapshot().same_state(&position.snapshot()))
@@ -2077,6 +2706,7 @@ mod tests {
         let identity = foreign_identity();
         let condition = "engine-archive-foreign-fixture-conditions/1";
         let TaskAdmission::Start(execution) = engine
+            .semantic
             .stores
             .request_task(
                 TaskKey {
@@ -2098,8 +2728,14 @@ mod tests {
                 TaskConsumer {
                     id: consumer_id,
                     situation,
-                    revision: engine.stores.situations.get(situation).unwrap().revision,
-                    generation: engine.stores.generation(),
+                    revision: engine
+                        .semantic
+                        .stores
+                        .situations
+                        .get(situation)
+                        .unwrap()
+                        .revision,
+                    generation: engine.semantic.stores.generation(),
                     deadline_tick: 100_000,
                 },
                 0,
@@ -2109,7 +2745,11 @@ mod tests {
             panic!("fixture foreign task must be new");
         };
         let movement = position.legal_moves()[0];
-        let pv = engine.stores.append_cpu_pv(position, &[movement]).unwrap();
+        let pv = engine
+            .semantic
+            .stores
+            .append_cpu_pv(position, &[movement])
+            .unwrap();
         let report = ExternalCheckerReport {
             identity: identity.clone(),
             observed_uci: ExternalUciIdentity {
@@ -2176,9 +2816,16 @@ mod tests {
             .search(&old_position, limits(), &AtomicBool::new(false))
             .unwrap();
         assert!(initial.counters.cpu_tasks > 0);
-        let old_root = engine.stores.root().unwrap();
-        let old_state = engine.stores.situations.get(old_root).unwrap().state;
+        let old_root = engine.semantic.stores.root().unwrap();
+        let old_state = engine
+            .semantic
+            .stores
+            .situations
+            .get(old_root)
+            .unwrap()
+            .state;
         let old_records: Vec<_> = engine
+            .semantic
             .records
             .iter()
             .filter(|record| record.origin_state == old_state)
@@ -2200,18 +2847,19 @@ mod tests {
             result.counters.cpu_tasks > 0,
             "a fallback legal move is not new-root investigation"
         );
-        assert!(engine.nodes.len() < 257);
-        let root = engine.stores.root().unwrap();
+        assert!(engine.semantic.nodes.len() < 257);
+        let root = engine.semantic.stores.root().unwrap();
         assert!(
             engine
+                .semantic
                 .stores
                 .states
-                .get(engine.stores.situations.get(root).unwrap().state)
+                .get(engine.semantic.stores.situations.get(root).unwrap().state)
                 .unwrap()
                 .same_state(&next.snapshot())
         );
         assert!(matches!(
-            engine.stores.states.get(old_state),
+            engine.semantic.stores.states.get(old_state),
             Err(StoreError::ColdRecord(_))
         ));
         let budget = ArchiveIoBudget {
@@ -2219,11 +2867,16 @@ mod tests {
             max_bytes: SEARCH_ARCHIVE_IO_BYTES,
         };
         let receipt = engine
+            .semantic
             .stores
             .lookup_engine_archive(old_state, budget)
             .unwrap()
             .unwrap();
-        let (records, nodes, _) = engine.stores.read_engine_archive(&receipt, budget).unwrap();
+        let (records, nodes, _) = engine
+            .semantic
+            .stores
+            .read_engine_archive(&receipt, budget)
+            .unwrap();
         let old_node = nodes.iter().find(|node| node.state == old_state).unwrap();
         assert_eq!(old_node.situation, old_root);
         assert!(!old_node.edges.is_empty());
@@ -2235,14 +2888,14 @@ mod tests {
                 record.supersedes_revision
             ) == relationship));
         }
-        for node in &engine.nodes {
+        for node in &engine.semantic.nodes {
             for edge in &node.edges {
                 let mut replay = node.position.clone();
                 replay.make_move(edge.movement).unwrap();
                 assert!(
                     replay
                         .snapshot()
-                        .same_state(&engine.nodes[edge.child].position.snapshot())
+                        .same_state(&engine.semantic.nodes[edge.child].position.snapshot())
                 );
             }
         }
@@ -2257,16 +2910,17 @@ mod tests {
             .search(&old, limits(), &AtomicBool::new(false))
             .unwrap();
         let state = engine
+            .semantic
             .stores
             .situations
-            .get(engine.stores.root().unwrap())
+            .get(engine.semantic.stores.root().unwrap())
             .unwrap()
             .state;
         fill_hot(&mut engine);
         engine
             .search(&advanced_root(), limits(), &AtomicBool::new(false))
             .unwrap();
-        let resident_before = engine.nodes.len();
+        let resident_before = engine.semantic.nodes.len();
         let insufficient = engine
             .load_archived_root(
                 &old,
@@ -2280,7 +2934,7 @@ mod tests {
             insufficient,
             PalsError::Store(StoreError::ArchiveByteBudget)
         ));
-        assert_eq!(engine.nodes.len(), resident_before);
+        assert_eq!(engine.semantic.nodes.len(), resident_before);
         let root = engine
             .load_archived_root(
                 &old,
@@ -2290,15 +2944,15 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(engine.nodes[root].state, state);
+        assert_eq!(engine.semantic.nodes[root].state, state);
         assert!(
-            engine.nodes[root]
+            engine.semantic.nodes[root]
                 .position
                 .snapshot()
                 .same_state(&old.snapshot())
         );
-        assert!(!engine.nodes[root].edges.is_empty());
-        assert!(engine.nodes.iter().any(|node| {
+        assert!(!engine.semantic.nodes[root].edges.is_empty());
+        assert!(engine.semantic.nodes.iter().any(|node| {
             node.evidence
                 .as_ref()
                 .is_some_and(|evidence| evidence.provenance.is_some())
@@ -2306,6 +2960,7 @@ mod tests {
         // A newer public-record-only receipt must not hide this state's older
         // self-contained topology when the explicit root is restored again.
         let record = engine
+            .semantic
             .records
             .iter()
             .position(|record| record.origin_state == state)
@@ -2321,10 +2976,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(engine.nodes[restored_again].state, state);
+        assert_eq!(engine.semantic.nodes[restored_again].state, state);
         let imported = Position::from_fen(&old.snapshot().to_fen()).unwrap();
         assert!(
-            !engine.nodes[root]
+            !engine.semantic.nodes[root]
                 .position
                 .snapshot()
                 .same_state(&imported.snapshot())
@@ -2332,12 +2987,89 @@ mod tests {
     }
 
     #[test]
+    fn cold_loaded_review_rebases_against_the_same_actual_game_history() {
+        use crate::pals::review_context::{
+            ReviewContextIndex, ReviewIndexLimits, ReviewQuerySequences, ReviewSelectionPolicy,
+        };
+
+        let mut engine = engine()
+            .with_selected_review_context(
+                ReviewSelectionPolicy::default(),
+                ReviewIndexLimits::default(),
+            )
+            .unwrap();
+        engine.enable_archive(archive_config("review-rebase")).unwrap();
+        let start = Position::startpos();
+        engine.search(&start, limits(), &AtomicBool::new(false)).unwrap();
+        let old_root = engine.semantic.stores.root().unwrap();
+        let old_state = engine.semantic.stores.situations.get(old_root).unwrap().state;
+        let old_node = engine.semantic.nodes.iter()
+            .find(|node| node.state == old_state).unwrap();
+        let first = old_node.edges.first().unwrap().movement;
+        let mut current = start.clone();
+        current.make_move(first).unwrap();
+        let reply = current.legal_moves()[0];
+        engine.semantic.revision += 1;
+        let revision = engine.semantic.revision;
+        let record = RoleRecord {
+            revision,
+            parent_revision: None,
+            supersedes_revision: None,
+            origin_state: old_state,
+            kind: RecordKind::Proposal,
+            line: vec![first, reply],
+            value: None,
+            completed_depth: 0,
+            score_scope: None,
+            cpu_observation: None,
+            perspective: start.side_to_move(),
+            critical: false,
+        };
+        // Model an evicted bounded review projection while preserving the
+        // original raw record for the real archive writer.
+        engine.semantic.review_index = Some(ReviewContextIndex::new(ReviewIndexLimits {
+            active_bundles: 1,
+            records_per_bundle: 64,
+        }).unwrap());
+        engine.semantic.review_index.as_mut().unwrap()
+            .publish(&engine.semantic.stores, &record, None).unwrap();
+        assert_eq!(engine.semantic.review_index.as_mut().unwrap().compact(), 1);
+        engine.semantic.review_index = Some(ReviewContextIndex::new(ReviewIndexLimits::default()).unwrap());
+        engine.semantic.records.push(record);
+        fill_hot(&mut engine);
+        engine.search(&current, limits(), &AtomicBool::new(false)).unwrap();
+        assert!(matches!(engine.semantic.stores.states.get(old_state), Err(StoreError::ColdRecord(_))));
+        engine.load_archived_root(&start, ArchiveIoBudget {
+            deadline: Instant::now() + Duration::from_secs(20),
+            max_bytes: SEARCH_ARCHIVE_IO_BYTES,
+        }).unwrap();
+        let index = engine.semantic.review_index.as_mut().unwrap();
+        let bundle = index.bundle_for_revision(revision).unwrap();
+        let root = engine.semantic.stores.root().unwrap();
+        let current_state = engine.semantic.stores.situations.get(root).unwrap().state;
+        assert!(engine.semantic.stores.states.get(current_state).unwrap().same_state(&current.snapshot()));
+        let view = index.select(&engine.semantic.stores, current_state, ReviewQuerySequences {
+            purpose: RoleQueryPurpose::ValueFresh,
+            prefix: &[], proposal: &[], counterexample: None, legal: &[], divergences: &[],
+        }, ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            ..ReviewSelectionPolicy::default()
+        }).unwrap();
+        let selected = view.records_metadata().iter()
+            .position(|metadata| metadata.source_revision == revision).unwrap();
+        assert_eq!(view.records()[selected].line, vec![reply]);
+        assert_eq!(view.records_metadata()[selected].source_line_offset, 1);
+        assert_eq!(view.records_metadata()[selected].original_first_move, Some(first));
+        assert!(view.anchors()[0].snapshot.same_state(&current.snapshot()));
+    }
+
+    #[test]
     fn actual_model_wdl_archive_restores_raw_context_revision_and_rejects_substitution() {
         let previous = engine();
         let mut engine = PalsEngine::new_with_boxed_checker_and_policies(
             previous.config,
-            previous.model,
-            previous.cpu,
+            previous.semantic.model,
+            previous.researcher.cpu,
             ResolverPolicy::ModelWdlRestricted,
             PostRepairRecheckPolicy::Disabled,
         )
@@ -2350,6 +3082,7 @@ mod tests {
         let report = engine.search(&old, limits(), &cancel).unwrap();
         assert!(report.counters.completed_value_calls > 0);
         let published: Vec<_> = engine
+            .semantic
             .nodes
             .iter()
             .filter_map(|node| {
@@ -2378,28 +3111,30 @@ mod tests {
             .unwrap();
         for (state, observation, revision, wdl, digest) in published {
             let index = engine
+                .semantic
                 .nodes
                 .iter()
                 .position(|node| node.state == state)
                 .unwrap();
-            let node = &engine.nodes[index];
+            let node = &engine.semantic.nodes[index];
             assert_eq!(node.model_observation, Some(observation));
             assert_eq!(node.model_value_revision, Some(revision));
             assert_eq!(node.model_value.as_ref().unwrap().wdl, wdl);
             assert_eq!(node.model_value.as_ref().unwrap().input_sha256, digest);
             assert!(
-                matches!(engine.stores.observations.get(observation).unwrap().score,
+                matches!(engine.semantic.stores.observations.get(observation).unwrap().score,
                 RawScore::ContextWdl {context_revision,..} if context_revision == revision)
             );
             engine.validate_loaded_node_evidence(node).unwrap();
-            engine.nodes[index].model_value_revision = Some(revision.checked_add(1).unwrap());
+            engine.semantic.nodes[index].model_value_revision =
+                Some(revision.checked_add(1).unwrap());
             assert!(matches!(
-                engine.validate_loaded_node_evidence(&engine.nodes[index]),
+                engine.validate_loaded_node_evidence(&engine.semantic.nodes[index]),
                 Err(PalsError::Store(StoreError::ArchiveIntegrity(
                     "engine restored model observation"
                 )))
             ));
-            engine.nodes[index].model_value_revision = Some(revision);
+            engine.semantic.nodes[index].model_value_revision = Some(revision);
         }
     }
 
@@ -2425,7 +3160,11 @@ mod tests {
         engine
             .prepare_archive_root(&old, controls.deadline, &cancel)
             .unwrap();
-        engine.stores.focus_actual_moves(old.snapshot()).unwrap();
+        engine
+            .semantic
+            .stores
+            .focus_actual_moves(old.snapshot())
+            .unwrap();
         let root = engine.intern(old.clone()).unwrap();
         engine
             .finish_archive_root(root, controls.deadline, &cancel)
@@ -2436,10 +3175,16 @@ mod tests {
             .unwrap();
         assert_eq!(counters.completed_value_calls, 1);
         assert_eq!(counters.cpu_tasks, 0);
-        let state = engine.nodes[root].state;
-        let observation = engine.nodes[root].model_observation.unwrap();
+        let state = engine.semantic.nodes[root].state;
+        let observation = engine.semantic.nodes[root].model_observation.unwrap();
         assert!(matches!(
-            engine.stores.observations.get(observation).unwrap().score,
+            engine
+                .semantic
+                .stores
+                .observations
+                .get(observation)
+                .unwrap()
+                .score,
             RawScore::Wdl { .. }
         ));
         fill_hot(&mut engine);
@@ -2448,13 +3193,17 @@ mod tests {
         engine
             .prepare_archive_root(&next, controls.deadline, &cancel)
             .unwrap();
-        engine.stores.focus_actual_moves(next.snapshot()).unwrap();
+        engine
+            .semantic
+            .stores
+            .focus_actual_moves(next.snapshot())
+            .unwrap();
         let next_root = engine.intern(next).unwrap();
         engine
             .finish_archive_root(next_root, controls.deadline, &cancel)
             .unwrap();
         assert!(matches!(
-            engine.stores.states.get(state),
+            engine.semantic.stores.states.get(state),
             Err(StoreError::ColdRecord(_))
         ));
         let restored = engine
@@ -2466,17 +3215,26 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(engine.nodes[restored].model_observation, Some(observation));
+        assert_eq!(
+            engine.semantic.nodes[restored].model_observation,
+            Some(observation)
+        );
         engine
-            .validate_loaded_node_evidence(&engine.nodes[restored])
+            .validate_loaded_node_evidence(&engine.semantic.nodes[restored])
             .unwrap();
         assert!(matches!(
-            engine.stores.observations.get(observation).unwrap().score,
+            engine
+                .semantic
+                .stores
+                .observations
+                .get(observation)
+                .unwrap()
+                .score,
             RawScore::Wdl { .. }
         ));
         engine.followup_lane = true;
         assert!(matches!(
-            engine.validate_loaded_node_evidence(&engine.nodes[restored]),
+            engine.validate_loaded_node_evidence(&engine.semantic.nodes[restored]),
             Err(PalsError::Store(StoreError::ArchiveIntegrity(
                 "engine restored model observation"
             )))
@@ -2484,7 +3242,7 @@ mod tests {
         engine.followup_lane = false;
         engine.post_repair_recheck = PostRepairRecheckPolicy::FrozenModelWdlV2;
         assert!(matches!(
-            engine.validate_loaded_node_evidence(&engine.nodes[restored]),
+            engine.validate_loaded_node_evidence(&engine.semantic.nodes[restored]),
             Err(PalsError::Store(StoreError::ArchiveIntegrity(
                 "engine restored model observation"
             )))
@@ -2503,6 +3261,7 @@ mod tests {
         let raw = foreign_observation(&mut engine, &old, 1, 90_001);
         let accepted = engine.append_engine_observation(raw.clone()).unwrap();
         engine
+            .semantic
             .stores
             .complete_task(raw.execution.unwrap(), accepted)
             .unwrap();
@@ -2510,33 +3269,33 @@ mod tests {
         let current = advanced_root();
         engine.search(&current, limits(), &cancel).unwrap();
         assert!(matches!(
-            engine.stores.observations.get(accepted),
+            engine.semantic.stores.observations.get(accepted),
             Err(StoreError::ColdRecord(_))
         ));
 
         let mut incoming = foreign_observation(&mut engine, &current, 1, 90_002);
         let incoming_execution = incoming.execution.unwrap();
-        let before = engine.stores.hot_stats();
-        let available = engine.archive_state.remaining_io;
+        let before = engine.semantic.stores.hot_stats();
+        let available = engine.semantic.archive_state.remaining_io;
         assert!(matches!(
             engine.append_engine_observation(incoming.clone()),
             Err(PalsError::Store(StoreError::InvalidEvidence(
                 "foreign physical request belongs to another archived task"
             )))
         ));
-        assert!(engine.archive_state.remaining_io < available);
-        assert_eq!(engine.stores.hot_stats(), before);
-        engine.archive_state.remaining_io = 1;
+        assert!(engine.semantic.archive_state.remaining_io < available);
+        assert_eq!(engine.semantic.stores.hot_stats(), before);
+        engine.semantic.archive_state.remaining_io = 1;
         incoming.external_report.as_mut().unwrap().request_id = 2;
         assert!(matches!(
             engine.append_engine_observation(incoming.clone()),
             Err(PalsError::Store(StoreError::ArchiveByteBudget))
         ));
-        assert_eq!(engine.stores.hot_stats(), before);
+        assert_eq!(engine.semantic.stores.hot_stats(), before);
 
         // Fault only this test's unique archive directory. Restore it before
         // assertions so a primary failure never destroys retained evidence.
-        engine.archive_state.remaining_io = SEARCH_ARCHIVE_IO_BYTES;
+        engine.semantic.archive_state.remaining_io = SEARCH_ARCHIVE_IO_BYTES;
         let unavailable = root.with_extension("unavailable");
         std::fs::rename(&root, &unavailable).unwrap();
         let failed = engine.append_engine_observation(incoming);
@@ -2545,14 +3304,20 @@ mod tests {
             failed,
             Err(PalsError::Store(StoreError::ArchiveIo { .. }))
         ));
-        assert_eq!(engine.stores.hot_stats(), before);
+        assert_eq!(engine.semantic.stores.hot_stats(), before);
         assert!(matches!(
-            engine.stores.tasks.get(raw.execution.unwrap()),
+            engine.semantic.stores.tasks.get(raw.execution.unwrap()),
             Err(StoreError::ColdRecord(_))
         ));
         engine.resident_archive_pins().unwrap();
         assert_eq!(
-            engine.stores.tasks.get(incoming_execution).unwrap().status,
+            engine
+                .semantic
+                .stores
+                .tasks
+                .get(incoming_execution)
+                .unwrap()
+                .status,
             TaskStatus::InFlight
         );
     }
@@ -2568,16 +3333,17 @@ mod tests {
         let first = engine.search(&a, limits(), &cancel).unwrap();
         assert!(first.counters.cpu_tasks > 0);
         let a_index = engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.position.snapshot().same_state(&a.snapshot()))
             .unwrap();
-        let a_state = engine.nodes[a_index].state;
-        let b_index = engine.nodes[a_index].edges[0].child;
-        let first_move = engine.nodes[a_index].edges[0].movement;
-        let b = engine.nodes[b_index].position.clone();
-        let b_state = engine.nodes[b_index].state;
-        let b_evidence = engine.nodes[b_index]
+        let a_state = engine.semantic.nodes[a_index].state;
+        let b_index = engine.semantic.nodes[a_index].edges[0].child;
+        let first_move = engine.semantic.nodes[a_index].edges[0].movement;
+        let b = engine.semantic.nodes[b_index].position.clone();
+        let b_state = engine.semantic.nodes[b_index].state;
+        let b_evidence = engine.semantic.nodes[b_index]
             .evidence
             .as_ref()
             .map(|evidence| (evidence.scope, evidence.depth, evidence.provenance));
@@ -2589,22 +3355,23 @@ mod tests {
         let second = engine.search(&b, limits(), &cancel).unwrap();
         assert_ne!(second.completion, PalsCompletion::Capacity);
         assert!(matches!(
-            engine.stores.states.get(a_state),
+            engine.semantic.stores.states.get(a_state),
             Err(StoreError::ColdRecord(_))
         ));
         let b_index = engine
+            .semantic
             .nodes
             .iter()
             .position(|node| node.state == b_state)
             .unwrap();
-        let c = engine.nodes[engine.nodes[b_index].edges[0].child]
+        let c = engine.semantic.nodes[engine.semantic.nodes[b_index].edges[0].child]
             .position
             .clone();
         fill_hot(&mut engine);
         let third = engine.search(&c, limits(), &cancel).unwrap();
         assert_ne!(third.completion, PalsCompletion::Capacity);
         assert!(matches!(
-            engine.stores.states.get(b_state),
+            engine.semantic.stores.states.get(b_state),
             Err(StoreError::ColdRecord(_))
         ));
 
@@ -2617,13 +3384,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(engine.nodes[restored].state, a_state);
-        let edge = engine.nodes[restored]
+        assert_eq!(engine.semantic.nodes[restored].state, a_state);
+        let edge = engine.semantic.nodes[restored]
             .edges
             .iter()
             .find(|edge| edge.movement == first_move)
             .unwrap();
-        let restored_b = &engine.nodes[edge.child];
+        let restored_b = &engine.semantic.nodes[edge.child];
         assert_eq!(restored_b.state, b_state);
         assert!(restored_b.position.snapshot().same_state(&b.snapshot()));
         assert_eq!(
@@ -2636,13 +3403,20 @@ mod tests {
         );
         engine.validate_loaded_node_evidence(restored_b).unwrap();
         let descendants = engine.archive_reachable_nodes(&b, false).unwrap();
-        assert!(engine.nodes.iter().enumerate().any(|(index, node)| {
-            descendants[index]
-                && node
-                    .evidence
-                    .as_ref()
-                    .is_some_and(|evidence| evidence.provenance.is_some())
-        }));
+        assert!(
+            engine
+                .semantic
+                .nodes
+                .iter()
+                .enumerate()
+                .any(|(index, node)| {
+                    descendants[index]
+                        && node
+                            .evidence
+                            .as_ref()
+                            .is_some_and(|evidence| evidence.provenance.is_some())
+                })
+        );
     }
 
     #[test]
@@ -2653,7 +3427,12 @@ mod tests {
         config.record_bytes = 4096;
         engine.enable_archive(config).unwrap();
         fill_hot(&mut engine);
-        let states: Vec<_> = engine.nodes.iter().map(|node| node.state).collect();
+        let states: Vec<_> = engine
+            .semantic
+            .nodes
+            .iter()
+            .map(|node| node.state)
+            .collect();
         let error = engine
             .search(&Position::startpos(), limits(), &AtomicBool::new(false))
             .unwrap_err();
@@ -2663,13 +3442,14 @@ mod tests {
         ));
         assert_eq!(
             engine
+                .semantic
                 .nodes
                 .iter()
                 .map(|node| node.state)
                 .collect::<Vec<_>>(),
             states
         );
-        assert_eq!(engine.stores.hot_stats().states, 257);
+        assert_eq!(engine.semantic.stores.hot_stats().states, 257);
         assert!(engine.last_engine_archive().is_none());
     }
 
@@ -2695,7 +3475,7 @@ mod tests {
                     || report.counters.reused_completed_cpu_tasks_consumed > 0
             );
             assert!(engine.retained_situations() <= engine.config.max_nodes);
-            assert!(engine.records.len() <= engine.config.max_records);
+            assert!(engine.semantic.records.len() <= engine.config.max_records);
             saw_archive |= engine.last_engine_archive().is_some();
             let legal = position.legal_moves();
             position
@@ -2705,7 +3485,7 @@ mod tests {
         }
         assert!(played >= 24);
         assert!(saw_archive);
-        assert!(engine.nodes.len() < 257);
+        assert!(engine.semantic.nodes.len() < 257);
     }
 
     #[test]
@@ -2721,8 +3501,11 @@ mod tests {
         let mut writer = engine();
         writer.enable_archive(config.clone()).unwrap();
         let node = writer.intern(Position::startpos()).unwrap();
-        let wire = encode_archive_node_projection(&writer.nodes[node], &writer.nodes).unwrap();
+        let wire =
+            encode_archive_node_projection(&writer.semantic.nodes[node], &writer.semantic.nodes)
+                .unwrap();
         writer
+            .semantic
             .stores
             .archive_engine_records_with_pins_and_budget(
                 &[],
@@ -2737,6 +3520,7 @@ mod tests {
         let before_scan = writer.archive_owner_snapshot().unwrap().unwrap();
         assert!(!before_scan.global_scan_after_last_commit);
         writer
+            .semantic
             .stores
             .measure_archive_usage_with_budget(&mut budget)
             .unwrap();
@@ -2788,8 +3572,8 @@ mod tests {
         assert!(observed.complete);
         assert_eq!(observed.loads_requested, 0);
         assert_eq!(observed.load_bytes_total, 0);
-        assert_eq!(selected.game_generation, Some(0));
-        assert!(selected.nodes.is_empty() && selected.records.is_empty());
+        assert_eq!(selected.semantic.game_generation, Some(0));
+        assert!(selected.semantic.nodes.is_empty() && selected.semantic.records.is_empty());
         // Repeated getters preserve the actual scan without adding another one.
         assert_eq!(selected.archive_owner_snapshot().unwrap(), Some(observed));
 
@@ -2838,14 +3622,14 @@ mod tests {
                 Some(actual_limits.game_bytes_max)
             );
             assert!(old_owner.session_write_bytes_consumed.unwrap() > 0);
-            let old_generation = engine.game_generation;
-            let old_nodes = engine.nodes.len();
-            let old_records = engine.records.len();
+            let old_generation = engine.semantic.game_generation;
+            let old_nodes = engine.semantic.nodes.len();
+            let old_records = engine.semantic.records.len();
             engine.new_game();
             // A void reset has no original controls/fence and keeps the old owner.
-            assert_eq!(engine.game_generation, old_generation);
+            assert_eq!(engine.semantic.game_generation, old_generation);
             assert_eq!(
-                (engine.nodes.len(), engine.records.len()),
+                (engine.semantic.nodes.len(), engine.semantic.records.len()),
                 (old_nodes, old_records)
             );
             assert_eq!(
@@ -2853,7 +3637,7 @@ mod tests {
                 old_owner.owner_id
             );
             assert!(matches!(
-                engine.new_game_transition_error,
+                engine.semantic.new_game_transition_error,
                 Some(PalsError::Store(StoreError::InvalidConditions(_)))
             ));
             if close_before_retry {
@@ -2876,9 +3660,9 @@ mod tests {
                     engine.try_new_game(budget.deadline, &AtomicBool::new(true)),
                     Err(PalsError::Role(RoleError::Canceled))
                 ));
-                assert_eq!(engine.game_generation, old_generation);
+                assert_eq!(engine.semantic.game_generation, old_generation);
                 assert_eq!(
-                    (engine.nodes.len(), engine.records.len()),
+                    (engine.semantic.nodes.len(), engine.semantic.records.len()),
                     (old_nodes, old_records)
                 );
                 assert_eq!(engine.archive_owner_snapshot().unwrap(), Some(closed));
@@ -2927,7 +3711,7 @@ mod tests {
             );
             assert_eq!(new_owner.archive_write_bytes_total, Some(0));
             assert!(matches!(
-                engine.stores.pin_load(&handle, budget),
+                engine.semantic.stores.pin_load(&handle, budget),
                 Err(StoreError::InvalidHandle(_))
             ));
             let report = engine
@@ -2961,7 +3745,7 @@ mod tests {
         let next = engine.archive_owner_snapshot().unwrap().unwrap();
         assert_ne!(first.owner_id, next.owner_id);
         assert_eq!(first.session_write_ledger_id, next.session_write_ledger_id);
-        assert!(engine.archive_state.root_capability.is_some());
+        assert!(engine.semantic.archive_state.root_capability.is_some());
 
         let retained = root.with_file_name(format!(
             "{}-retained",
@@ -2998,23 +3782,27 @@ mod tests {
             .enable_archive(archive_config("owner-close-retains"))
             .unwrap();
         let node = engine.intern(Position::startpos()).unwrap();
-        let state = engine.nodes[node].state;
-        let wire = encode_archive_node_projection(&engine.nodes[node], &engine.nodes).unwrap();
+        let state = engine.semantic.nodes[node].state;
+        let wire =
+            encode_archive_node_projection(&engine.semantic.nodes[node], &engine.semantic.nodes)
+                .unwrap();
         let budget = ArchiveIoBudget {
             deadline: Instant::now() + Duration::from_secs(20),
             max_bytes: SEARCH_ARCHIVE_IO_BYTES,
         };
         let receipt = engine
+            .semantic
             .stores
             .archive_engine_records(&[], &[wire], budget)
             .unwrap();
         let loaded = engine
+            .semantic
             .stores
             .pin_load(&receipt.archive.state_handle(state), budget)
             .unwrap();
         let owner = engine.archive_owner_snapshot().unwrap().unwrap();
-        let generation = engine.game_generation;
-        let situation = engine.nodes[node].situation;
+        let generation = engine.semantic.game_generation;
+        let situation = engine.semantic.nodes[node].situation;
         let error = engine
             .try_new_game(budget.deadline, &AtomicBool::new(false))
             .unwrap_err();
@@ -3022,21 +3810,21 @@ mod tests {
             error,
             PalsError::Store(StoreError::InvalidConditions(_))
         ));
-        assert_eq!(engine.game_generation, generation);
-        assert_eq!(engine.nodes[node].state, state);
-        assert_eq!(engine.nodes[node].situation, situation);
-        assert!(engine.stores.states.get(state).is_ok());
+        assert_eq!(engine.semantic.game_generation, generation);
+        assert_eq!(engine.semantic.nodes[node].state, state);
+        assert_eq!(engine.semantic.nodes[node].situation, situation);
+        assert!(engine.semantic.stores.states.get(state).is_ok());
         assert!(engine.archive_enabled());
         assert_eq!(
             engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
             owner.owner_id
         );
         assert!(engine.followup_owner_snapshot().new_game_error.is_some());
-        engine.stores.release_loaded(loaded.pin).unwrap();
+        engine.semantic.stores.release_loaded(loaded.pin).unwrap();
         engine
             .try_new_game(budget.deadline, &AtomicBool::new(false))
             .unwrap();
-        assert!(engine.nodes.is_empty());
+        assert!(engine.semantic.nodes.is_empty());
         assert!(engine.followup_owner_snapshot().new_game_error.is_none());
         let closed = engine.finish_followup_owners(budget.deadline).unwrap();
         let archived = closed.archive.unwrap().unwrap();
@@ -3068,10 +3856,11 @@ mod tests {
     fn versioned_metadata_roundtrip_preserves_scopes_wdl_revision_and_rejects_corruption() {
         let mut engine = engine();
         let index = engine.intern(Position::startpos()).unwrap();
-        let cpu_identity = engine.cpu_registered_value.clone().unwrap();
-        let model_identity = engine.model.value_identity().unwrap().clone();
-        let node = &mut engine.nodes[index];
+        let cpu_identity = engine.researcher.cpu_registered_value.clone().unwrap();
+        let model_identity = engine.semantic.model.value_identity().unwrap().clone();
+        let node = &mut engine.semantic.nodes[index];
         node.evidence = Some(CpuEvidence {
+            context: None,
             score: 23,
             depth: 0,
             scope: CpuScoreScope::FrontierOnly,
@@ -3087,7 +3876,8 @@ mod tests {
         });
         node.model_observation = Some(ObservationId(11));
         node.model_value_revision = Some(55);
-        let wire = encode_archive_node(&engine.nodes[index], &engine.nodes).unwrap();
+        let wire =
+            encode_archive_node(&engine.semantic.nodes[index], &engine.semantic.nodes).unwrap();
         assert!(wire.metadata.len() <= 4096);
         let restored = decode_archive_node(&wire, Position::startpos(), wire.situation).unwrap();
         assert_eq!(
@@ -3118,7 +3908,7 @@ mod tests {
     #[test]
     fn midsearch_pressure_keeps_pending_terminal_and_engine_indices_without_compaction() {
         let mut engine = engine();
-        engine.stores = PalsStores::new(StoreLimits {
+        engine.semantic.stores = PalsStores::new(StoreLimits {
             states: 4,
             situations: 4,
             line_chunks: 16,
@@ -3135,23 +3925,36 @@ mod tests {
             .prepare_archive_root(&position, requested.deadline, &cancel)
             .unwrap();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
         let root = engine
             .intern_checked(position.clone(), requested, &cancel)
             .unwrap();
-        let resident = (engine.nodes[root].state, engine.nodes[root].situation);
-        let generation = engine.stores.generation();
+        let resident = (
+            engine.semantic.nodes[root].state,
+            engine.semantic.nodes[root].situation,
+        );
+        let generation = engine.semantic.stores.generation();
         let mut inactive = Vec::new();
         for fullmove in [1000, 1001] {
             let situation = engine
+                .semantic
                 .stores
                 .insert_situation(inactive_position(fullmove).snapshot())
                 .unwrap();
-            inactive.push(engine.stores.situations.get(situation).unwrap().state);
+            inactive.push(
+                engine
+                    .semantic
+                    .stores
+                    .situations
+                    .get(situation)
+                    .unwrap()
+                    .state,
+            );
         }
-        assert_eq!(engine.stores.hot_stats().states, 3);
+        assert_eq!(engine.semantic.stores.hot_stats().states, 3);
         let (movement, child) = position
             .legal_moves()
             .into_iter()
@@ -3180,42 +3983,47 @@ mod tests {
             .unwrap();
         assert_eq!(root, 0);
         assert_eq!(terminal, 1);
-        assert_eq!(engine.nodes.len(), 2);
+        assert_eq!(engine.semantic.nodes.len(), 2);
         assert_eq!(
-            (engine.nodes[root].state, engine.nodes[root].situation),
+            (
+                engine.semantic.nodes[root].state,
+                engine.semantic.nodes[root].situation
+            ),
             resident
         );
-        assert_eq!(engine.stores.generation(), generation);
-        assert_eq!(engine.nodes[root].edges[0].child, terminal);
+        assert_eq!(engine.semantic.stores.generation(), generation);
+        assert_eq!(engine.semantic.nodes[root].edges[0].child, terminal);
         assert_eq!(
             engine
+                .semantic
                 .stores
                 .situations
-                .get(engine.nodes[terminal].situation)
+                .get(engine.semantic.nodes[terminal].situation)
                 .unwrap()
                 .state,
-            engine.nodes[terminal].state
+            engine.semantic.nodes[terminal].state
         );
         assert!(
             engine
+                .semantic
                 .stores
                 .states
-                .get(engine.nodes[terminal].state)
+                .get(engine.semantic.nodes[terminal].state)
                 .unwrap()
                 .same_state(&child.snapshot())
         );
-        assert!(engine.nodes[terminal].terminal.is_some());
+        assert!(engine.semantic.nodes[terminal].terminal.is_some());
         assert!(inactive.iter().all(|state| matches!(
-            engine.stores.states.get(*state),
+            engine.semantic.stores.states.get(*state),
             Err(StoreError::ColdRecord("state"))
         )));
-        assert!(engine.archive_state.remaining_io < SEARCH_ARCHIVE_IO_BYTES);
+        assert!(engine.semantic.archive_state.remaining_io < SEARCH_ARCHIVE_IO_BYTES);
         assert!(engine.last_engine_archive().is_none());
     }
     #[test]
     fn midsearch_active_raw_repair_handles_survive_pressure_until_next_root_prepare() {
         let mut engine = engine();
-        engine.stores = PalsStores::new(StoreLimits {
+        engine.semantic.stores = PalsStores::new(StoreLimits {
             states: 8,
             situations: 8,
             line_chunks: 16,
@@ -3232,13 +4040,17 @@ mod tests {
             .prepare_archive_root(&position, requested.deadline, &cancel)
             .unwrap();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
         let root = engine
             .intern_checked(position.clone(), requested, &cancel)
             .unwrap();
-        let resident = (engine.nodes[root].state, engine.nodes[root].situation);
+        let resident = (
+            engine.semantic.nodes[root].state,
+            engine.semantic.nodes[root].situation,
+        );
         let mut held = Vec::new();
         for (kind, moves) in [
             (RecordKind::Proposal, ["d2d4", "d7d5"]),
@@ -3259,40 +4071,52 @@ mod tests {
         let mut inactive_observations = Vec::new();
         for fullmove in 1000..1005 {
             let situation = engine
+                .semantic
                 .stores
                 .insert_situation(inactive_position(fullmove).snapshot())
                 .unwrap();
             let (state, focus) = {
-                let situation = engine.stores.situations.get(situation).unwrap();
+                let situation = engine.semantic.stores.situations.get(situation).unwrap();
                 (situation.state, situation.focus)
             };
             inactive_observations.push(
                 engine
+                    .semantic
                     .stores
                     .append_observation(unknown_observation(state, Some(focus)))
                     .unwrap(),
             );
         }
-        assert_eq!(engine.stores.hot_stats().observations, 8);
+        assert_eq!(engine.semantic.stores.hot_stats().observations, 8);
         engine
             .append_engine_observation_with_controls(
                 unknown_observation(resident.0, None),
                 Some((requested.deadline, &cancel)),
             )
             .unwrap();
-        assert_eq!(engine.nodes.len(), 1);
+        assert_eq!(engine.semantic.nodes.len(), 1);
         assert_eq!(
-            (engine.nodes[root].state, engine.nodes[root].situation),
+            (
+                engine.semantic.nodes[root].state,
+                engine.semantic.nodes[root].situation
+            ),
             resident
         );
         for (line, observation) in held {
-            assert!(!engine.stores.lines.moves(line).unwrap().is_empty());
+            assert!(!engine.semantic.stores.lines.moves(line).unwrap().is_empty());
             assert_eq!(
-                engine.stores.observations.get(observation).unwrap().line,
+                engine
+                    .semantic
+                    .stores
+                    .observations
+                    .get(observation)
+                    .unwrap()
+                    .line,
                 Some(line)
             );
             assert!(
                 engine
+                    .semantic
                     .archive_state
                     .active_search_pins
                     .lines
@@ -3300,6 +4124,7 @@ mod tests {
             );
             assert!(
                 engine
+                    .semantic
                     .archive_state
                     .active_search_pins
                     .observations
@@ -3307,16 +4132,24 @@ mod tests {
             );
         }
         assert!(inactive_observations.iter().all(|observation| matches!(
-            engine.stores.observations.get(*observation),
+            engine.semantic.stores.observations.get(*observation),
             Err(StoreError::ColdRecord("observation"))
         )));
-        assert!(engine.archive_state.remaining_io < SEARCH_ARCHIVE_IO_BYTES);
+        assert!(engine.semantic.archive_state.remaining_io < SEARCH_ARCHIVE_IO_BYTES);
         engine
             .prepare_archive_root(&position, requested.deadline, &cancel)
             .unwrap();
-        assert!(engine.archive_state.active_search_pins.lines.is_empty());
         assert!(
             engine
+                .semantic
+                .archive_state
+                .active_search_pins
+                .lines
+                .is_empty()
+        );
+        assert!(
+            engine
+                .semantic
                 .archive_state
                 .active_search_pins
                 .observations
@@ -3334,26 +4167,27 @@ mod tests {
             .prepare_archive_root(&position, requested.deadline, &cancel)
             .unwrap();
         engine
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
         let root = engine
             .intern_checked(position.clone(), requested, &cancel)
             .unwrap();
-        let remaining = engine.archive_state.remaining_io;
-        let revision = engine.revision;
+        let remaining = engine.semantic.archive_state.remaining_io;
+        let revision = engine.semantic.revision;
         cancel.store(true, Ordering::Release);
         let raw = engine
             .append_engine_observation_with_controls(
-                unknown_observation(engine.nodes[root].state, None),
+                unknown_observation(engine.semantic.nodes[root].state, None),
                 Some((requested.deadline, &cancel)),
             )
             .unwrap();
         assert!(matches!(
-            engine.stores.observations.get(raw).unwrap().score,
+            engine.semantic.stores.observations.get(raw).unwrap().score,
             RawScore::Unknown
         ));
-        assert_eq!(engine.archive_state.remaining_io, remaining);
+        assert_eq!(engine.semantic.archive_state.remaining_io, remaining);
         let movement = BoardMove::from_uci("e2e4").unwrap();
         let mut child = position;
         child.make_move(movement).unwrap();
@@ -3381,10 +4215,10 @@ mod tests {
             ),
             Err(PalsError::Role(RoleError::Canceled))
         ));
-        assert_eq!(engine.nodes.len(), 1);
-        assert!(engine.nodes[root].edges.is_empty());
-        assert!(engine.records.is_empty());
-        assert_eq!(engine.revision, revision);
+        assert_eq!(engine.semantic.nodes.len(), 1);
+        assert!(engine.semantic.nodes[root].edges.is_empty());
+        assert!(engine.semantic.records.is_empty());
+        assert_eq!(engine.semantic.revision, revision);
     }
     #[test]
     fn live_node_pin_saturation_keeps_last_published_legal_move_and_returns_typed_failure() {
@@ -3419,20 +4253,21 @@ mod tests {
             .copied()
             .expect("valid progress before the arena filled");
         assert!(position.legal_moves().contains(&last_valid));
-        assert_eq!(engine.nodes.len(), 3);
+        assert_eq!(engine.semantic.nodes.len(), 3);
         assert!(
-            engine.nodes[0]
+            engine.semantic.nodes[0]
                 .position
                 .snapshot()
                 .same_state(&position.snapshot())
         );
-        for edge in &engine.nodes[0].edges {
-            assert!(edge.child < engine.nodes.len());
+        for edge in &engine.semantic.nodes[0].edges {
+            assert!(edge.child < engine.semantic.nodes.len());
             assert!(
                 engine
+                    .semantic
                     .stores
                     .situations
-                    .get(engine.nodes[edge.child].situation)
+                    .get(engine.semantic.nodes[edge.child].situation)
                     .is_ok()
             );
         }
@@ -3450,6 +4285,7 @@ mod tests {
         let previous = foreign_observation(&mut engine, &old, 10_001, 91_001);
         let observation = engine.append_engine_observation(previous.clone()).unwrap();
         engine
+            .semantic
             .stores
             .complete_task(previous.execution.unwrap(), observation)
             .unwrap();
@@ -3458,14 +4294,19 @@ mod tests {
         let requested = limits();
         engine.search(&position, requested, &cancel).unwrap();
         assert!(matches!(
-            engine.stores.observations.get(observation),
+            engine.semantic.stores.observations.get(observation),
             Err(StoreError::ColdRecord(_))
         ));
         let incoming = foreign_observation(&mut engine, &position, 10_002, 91_002);
         let execution = incoming.execution.unwrap();
-        let available = engine.archive_state.remaining_io;
-        let generation = engine.stores.generation();
-        let states: Vec<_> = engine.nodes.iter().map(|node| node.state).collect();
+        let available = engine.semantic.archive_state.remaining_io;
+        let generation = engine.semantic.stores.generation();
+        let states: Vec<_> = engine
+            .semantic
+            .nodes
+            .iter()
+            .map(|node| node.state)
+            .collect();
         cancel.store(true, Ordering::Release);
         let raw = engine
             .append_engine_observation_with_controls(
@@ -3474,27 +4315,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            engine.stores.observations.get(raw).unwrap().execution,
+            engine
+                .semantic
+                .stores
+                .observations
+                .get(raw)
+                .unwrap()
+                .execution,
             Some(execution)
         );
         assert!(matches!(
-            engine.stores.tasks.get(execution).unwrap().status,
+            engine.semantic.stores.tasks.get(execution).unwrap().status,
             TaskStatus::InFlight
         ));
-        assert!(engine.archive_state.remaining_io < available);
-        assert_eq!(engine.stores.generation(), generation);
+        assert!(engine.semantic.archive_state.remaining_io < available);
+        assert_eq!(engine.semantic.stores.generation(), generation);
         assert_eq!(
             engine
+                .semantic
                 .nodes
                 .iter()
                 .map(|node| node.state)
                 .collect::<Vec<_>>(),
             states
         );
-        let before = engine.stores.hot_stats();
+        let before = engine.semantic.stores.hot_stats();
         let mut rejected = incoming;
         rejected.external_report.as_mut().unwrap().request_id = 10_003;
-        engine.archive_state.deadline = Some(Instant::now());
+        engine.semantic.archive_state.deadline = Some(Instant::now());
         assert!(matches!(
             engine.append_engine_observation_with_controls(
                 rejected,
@@ -3502,9 +4350,9 @@ mod tests {
             ),
             Err(PalsError::Store(StoreError::ArchiveDeadline))
         ));
-        assert_eq!(engine.stores.hot_stats(), before);
+        assert_eq!(engine.semantic.stores.hot_stats(), before);
         assert!(matches!(
-            engine.stores.tasks.get(execution).unwrap().status,
+            engine.semantic.stores.tasks.get(execution).unwrap().status,
             TaskStatus::InFlight
         ));
     }
@@ -3518,11 +4366,18 @@ mod tests {
             for expired in [false, true] {
                 let mut engine = engine();
                 let root = engine.intern(Position::startpos()).unwrap();
-                let state = engine.nodes[root].state;
-                let situation = engine.nodes[root].situation;
-                let generation = engine.stores.generation();
-                let revision = engine.stores.situations.get(situation).unwrap().revision;
-                let own = (kind == "resume").then(|| engine.cpu_registered_value.clone().unwrap());
+                let state = engine.semantic.nodes[root].state;
+                let situation = engine.semantic.nodes[root].situation;
+                let generation = engine.semantic.stores.generation();
+                let revision = engine
+                    .semantic
+                    .stores
+                    .situations
+                    .get(situation)
+                    .unwrap()
+                    .revision;
+                let own = (kind == "resume")
+                    .then(|| engine.researcher.cpu_registered_value.clone().unwrap());
                 let key = TaskKey {
                     state,
                     line: None,
@@ -3551,6 +4406,7 @@ mod tests {
                     deadline_tick: 100_000,
                 };
                 let TaskAdmission::Start(first) = engine
+                    .semantic
                     .stores
                     .request_task(key.clone(), consumer(1), 0)
                     .unwrap()
@@ -3560,19 +4416,30 @@ mod tests {
                 let completed = if kind == "reuse" {
                     let mut raw = unknown_observation(state, None);
                     raw.execution = Some(first);
-                    let observation = engine.stores.append_observation(raw).unwrap();
-                    engine.stores.complete_task(first, observation).unwrap();
+                    let observation = engine.semantic.stores.append_observation(raw).unwrap();
+                    engine
+                        .semantic
+                        .stores
+                        .complete_task(first, observation)
+                        .unwrap();
                     Some(observation)
                 } else {
                     None
                 };
                 if kind == "resume" {
-                    engine.stores.pause_task(first, 17, None).unwrap();
+                    engine.semantic.stores.pause_task(first, 17, None).unwrap();
                 }
                 let (admission, consumer_id) = if kind == "start" {
                     (TaskAdmission::Start(first), 1)
                 } else {
-                    (engine.stores.request_task(key, consumer(2), 0).unwrap(), 2)
+                    (
+                        engine
+                            .semantic
+                            .stores
+                            .request_task(key, consumer(2), 0)
+                            .unwrap(),
+                        2,
+                    )
                 };
                 let execution = match (kind, admission) {
                     ("start", TaskAdmission::Start(execution))
@@ -3613,12 +4480,12 @@ mod tests {
                 match kind {
                     "start" | "resume" => {
                         assert_eq!(
-                            engine.stores.tasks.get(execution).unwrap().status,
+                            engine.semantic.stores.tasks.get(execution).unwrap().status,
                             TaskStatus::Failed
                         );
                         if kind == "resume" {
                             assert_eq!(
-                                engine.stores.tasks.get(first).unwrap().status,
+                                engine.semantic.stores.tasks.get(first).unwrap().status,
                                 TaskStatus::Paused {
                                     checkpoint: 17,
                                     evidence: None
@@ -3629,30 +4496,35 @@ mod tests {
                     "join" | "reuse" => {
                         let observation = if let Some(observation) = completed {
                             assert_eq!(
-                                engine.stores.tasks.get(first).unwrap().status,
+                                engine.semantic.stores.tasks.get(first).unwrap().status,
                                 TaskStatus::Completed(observation)
                             );
                             observation
                         } else {
                             assert_eq!(
-                                engine.stores.tasks.get(first).unwrap().status,
+                                engine.semantic.stores.tasks.get(first).unwrap().status,
                                 TaskStatus::InFlight
                             );
                             let mut raw = unknown_observation(state, None);
                             raw.execution = Some(first);
-                            let observation = engine.stores.append_observation(raw).unwrap();
-                            engine.stores.complete_task(first, observation).unwrap();
+                            let observation =
+                                engine.semantic.stores.append_observation(raw).unwrap();
+                            engine
+                                .semantic
+                                .stores
+                                .complete_task(first, observation)
+                                .unwrap();
                             observation
                         };
                         assert!(matches!(
-                            engine.stores.consume_task(first, consumer_id, 0),
+                            engine.semantic.stores.consume_task(first, consumer_id, 0),
                             Err(StoreError::CancelledConsumer)
                         ));
                         assert_eq!(
-                            engine.stores.consume_task(first, 1, 0).unwrap(),
+                            engine.semantic.stores.consume_task(first, 1, 0).unwrap(),
                             observation
                         );
-                        assert!(engine.stores.observations.get(observation).is_ok());
+                        assert!(engine.semantic.stores.observations.get(observation).is_ok());
                     }
                     _ => unreachable!(),
                 }

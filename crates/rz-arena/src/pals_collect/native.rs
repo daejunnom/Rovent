@@ -667,6 +667,7 @@ fn search_return_result(
                 PalsError::Role(_) => "Role",
                 PalsError::Store(_) => "Store",
                 PalsError::Review(_) => "Review",
+                PalsError::Rovent(_) => "Rovent",
                 PalsError::Capacity => "Capacity",
                 PalsError::RoleCallLimit => "RoleCallLimit",
             };
@@ -727,6 +728,16 @@ fn recheck_observation_json(observation: &Observation) -> serde_json::Value {
             bound,
         } => {
             serde_json::json!({"kind":"ExternalUci","requested_depth":requested_depth,"reported_depth":reported_depth,"seldepth":seldepth,"bound":format!("{:?}",bound)})
+        }
+        EvidenceScope::ProfiledExternalUci {
+            requested,
+            issued,
+            reported_depth,
+            seldepth,
+            bound,
+        } => {
+            serde_json::json!({"kind":"ProfiledExternalUci","requested":requested,"issued":issued,
+                "reported_depth":reported_depth,"seldepth":seldepth,"bound":format!("{:?}",bound)})
         }
         EvidenceScope::Model {
             model,
@@ -2546,6 +2557,21 @@ impl OwnPalsOnnxCollectionDriver {
             ),
         };
         checked_source(&description)?;
+        // Split legacy search helpers are a compiled-source observation too.
+        // A reader must still match an independent closed review profile and
+        // the original build/manifest/binary pins; this fact enrolls nothing.
+        if let Some(facts) = description
+            .native
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            facts.insert(
+                "search_implementation_sha256".into(),
+                serde_json::json!(hex(
+                    rz_search::pals::engine::compiled_search_implementation_sha256()
+                )),
+            );
+        }
         let sink = Arc::new(Mutex::new(Sink {
             context: None,
             source: description.clone(),

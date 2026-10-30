@@ -388,6 +388,12 @@ fn capture_report(
                 "cooperative Yield requires the adaptive Job/Slice receipt",
             ));
         }
+        CpuCompletion::AwaitReciprocal => {
+            return Err(CandidateTaskError::new(
+                "unsupported_completion",
+                "reciprocal CPU wait requires the Rovent question receipt",
+            ));
+        }
         CpuCompletion::QuiescenceLimit => SearchCompletion::QuiescenceLimit,
         CpuCompletion::Terminal(_) => SearchCompletion::RulesTerminal,
     };

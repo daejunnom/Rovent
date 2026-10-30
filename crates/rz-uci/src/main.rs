@@ -1589,7 +1589,7 @@ impl PalsNativeOptions {
             _=>Err("V4 CUDA Warm requires both explicit observation bounds (one lease and positive owned device bytes); bounds are forbidden when the lane is disabled".into()),
         }
     }
-    #[cfg(feature = "onnx-cpu")]
+    #[cfg(all(feature = "onnx-cpu", feature = "experimental-io-binding"))]
     fn warm_observation_limits(
         &self,
     ) -> Option<rz_uci::pals_native::NativeCudaWarmObservationLimits> {

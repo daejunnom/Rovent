@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 pub const SELFPLAY_CLI_DECLARATION_DOMAIN_V3: &str = "rz-pals-selfplay-cli-declaration/1";
 #[cfg(target_os = "linux")]
-const MAX_DECLARATION_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_DECLARATION_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
+pub(super) const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,34 +101,8 @@ impl SelfplayCliDeclarationV3 {
         )?;
         let mut directories = BTreeSet::new();
         for (ordinal, game) in self.games.iter().enumerate() {
-            game.request.validate()?;
-            check(
-                usize::from(game.game_ordinal) == ordinal
-                    && direct_name(&game.private_directory)
-                    && directories.insert(&game.private_directory)
-                    && game.request.bytes <= MAX_REQUEST_BYTES
-                    && game.request.path.split('/').all(nonsecret_name)
-                    && (1..=3_600_000).contains(&game.process.execution_ms)
-                    && (1..=30_000).contains(&game.process.cleanup_ms)
-                    && game.process.max_output_bytes > 0
-                    && game.process.max_output_bytes <= 16 * 1024 * 1024
-                    && (1..=64).contains(&game.process.max_child_processes)
-                    && game.tree.max_total_bytes > 0
-                    && game.tree.max_total_bytes <= self.max_staging_bytes
-                    && game.tree.max_file_bytes > 0
-                    && game.tree.max_file_bytes <= game.tree.max_total_bytes
-                    && (1..=4096).contains(&game.tree.max_files)
-                    && game.tree.max_depth <= 32
-                    && game.raw.max_records > 0
-                    && game.raw.max_records <= GENERATION_MAX_RECORDS
-                    && game.raw.max_evidence > 0
-                    && game.raw.max_evidence <= 1_048_576
-                    && game.raw.max_retained_bytes > 0
-                    && game.raw.max_retained_bytes <= 512 * 1024 * 1024
-                    && game.raw.max_read_bytes > 0
-                    && game.raw.max_read_bytes <= 4 * GENERATION_OUTPUT_CAP,
-                "selfplay CLI ordered, fresh, bounded game declaration",
-            )?;
+            check(directories.insert(&game.private_directory), "selfplay duplicate game directory")?;
+            validate_game_declaration_v3(game, ordinal as u16, self.max_staging_bytes)?;
         }
         self.registered_total_ms()?;
         self.staging_data_ceiling()?;
@@ -280,7 +254,42 @@ pub fn run_selfplay_collect_owned_cli_v3(
     }
 }
 
-fn direct_name(name: &str) -> bool {
+/// Shared bounds for an original game declaration. This does not execute or
+/// confer authority on the declaration.
+pub(super) fn validate_game_declaration_v3(
+    game: &SelfplayCliGameDeclarationV3, ordinal: u16, max_staging_bytes: u64,
+) -> Result<(), ArenaError> {
+    game.request.validate()?;
+    check(
+        game.game_ordinal == ordinal
+            && direct_name(&game.private_directory)
+            && game.request.bytes <= MAX_REQUEST_BYTES
+            && game.request.path.split('/').all(nonsecret_name)
+            && (1..=3_600_000).contains(&game.process.execution_ms)
+            && (1..=30_000).contains(&game.process.cleanup_ms)
+            && game.process.max_output_bytes > 0
+            && game.process.max_output_bytes <= 16 * 1024 * 1024
+            && (1..=64).contains(&game.process.max_child_processes)
+            && game.tree.max_total_bytes > 0
+            && game.tree.max_total_bytes <= max_staging_bytes
+            && game.tree.max_file_bytes > 0
+            && game.tree.max_file_bytes <= game.tree.max_total_bytes
+            && (1..=4096).contains(&game.tree.max_files)
+            && game.tree.max_depth <= 32
+            && game.raw.max_records > 0
+            && game.raw.max_records <= GENERATION_MAX_RECORDS
+            && game.raw.max_evidence > 0
+            && game.raw.max_evidence <= 1_048_576
+            && game.raw.max_retained_bytes > 0
+            && game.raw.max_retained_bytes <= 512 * 1024 * 1024
+            && game.raw.max_read_bytes > 0
+            && game.raw.max_read_bytes <= 4 * GENERATION_OUTPUT_CAP,
+        "selfplay CLI ordered, fresh, bounded game declaration",
+    )?;
+    Ok(())
+}
+
+pub(super) fn direct_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && !name.starts_with('.')
@@ -288,7 +297,7 @@ fn direct_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
-fn nonsecret_name(name: &str) -> bool {
+pub(super) fn nonsecret_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     !lower.starts_with(".env")
         && !lower.ends_with(".key")
@@ -300,7 +309,7 @@ fn nonsecret_name(name: &str) -> bool {
         && !lower.contains("ssh-key")
         && !lower.contains("api-key")
 }
-fn absolute_clean(path: &Path) -> bool {
+pub(super) fn absolute_clean(path: &Path) -> bool {
     path.is_absolute()
         && path.components().count() <= 64
         && path
@@ -314,67 +323,9 @@ fn run_linux(
     declaration_sha256: &str,
     cancel: &AtomicBool,
 ) -> Result<SelfplayCliVerifiedResultV3, SelfplayCliFailureV3> {
-    use cap_fs_ext::DirExt;
-    use rz_uci::pals_adaptive_startup::{PalsStartupOptionsV5, PinnedPalsStartupV5};
-    use std::io::Read;
-    use std::sync::Arc;
-    let registered_started = Instant::now();
-    check(
-        absolute_clean(declaration_path) && generation_sha(declaration_sha256),
-        "selfplay CLI absolute original declaration and SHA-256",
-    )?;
-    let parent = declaration_path
-        .parent()
-        .ok_or_else(|| invalid("selfplay declaration parent"))?;
-    let declaration_owner = open_directory(parent)?;
-    let name = declaration_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| invalid("selfplay declaration filename"))?;
-    check(
-        direct_name(name) && nonsecret_name(name),
-        "selfplay declaration safe non-secret filename",
-    )?;
-    let mut file = open_regular(&declaration_owner, name)?;
-    let length = file
-        .metadata()
-        .map_err(|_| invalid("selfplay declaration metadata"))?
-        .len();
-    check(
-        length > 0 && length <= MAX_DECLARATION_BYTES,
-        "selfplay bounded declaration bytes",
-    )?;
-    let mut bytes = Vec::with_capacity(length as usize);
-    Read::take(&mut file, length + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| invalid("selfplay declaration read"))?;
-    check(
-        bytes.len() as u64 == length
-            && format!("{:x}", sha2::Sha256::digest(&bytes)) == declaration_sha256,
-        "selfplay original declaration hash",
-    )?;
-    let declaration: SelfplayCliDeclarationV3 =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("selfplay declaration schema"))?;
-    declaration.validate()?;
-    let preflight_until = registered_started
-        .checked_add(Duration::from_millis(declaration.preflight_ms))
-        .ok_or_else(|| invalid("selfplay preflight overflow"))?;
-    let publication_until = registered_started
-        .checked_add(Duration::from_millis(declaration.registered_total_ms()?))
-        .ok_or_else(|| invalid("selfplay publication overflow"))?;
-    check_live(preflight_until, cancel)?;
-    let run_root = open_directory(&declaration.run_root)?;
-    let binary_root = open_directory(&declaration.binary_root)?;
-    private_root(&run_root)?;
-    let staging_data_ceiling = declaration.staging_data_ceiling()?;
-    let mut staging = scan_staging(&run_root, staging_data_ceiling, preflight_until, cancel)?;
-    // A metadata scan observes prepared sharing. The CLI does not mount/copy
-    // assets. Unique inodes with writable duplicate aliases are rejected.
-    let binary = declaration
-        .binary
-        .open_verified_at(&binary_root, MAX_BINARY_BYTES)?;
-    check_live(preflight_until, cancel)?;
-    let binary_path = declaration.binary_root.join(&declaration.binary.path);
+    let PreparedSelfplayInputsV3 { declaration, run_root, binary, binary_path,
+        mut staging, staging_data_ceiling, publication_until } =
+        prepare_selfplay_inputs_v3(declaration_path, declaration_sha256, cancel)?;
     let mut collector = GenerationSeriesCollectorV3::new(
         declaration.plan.clone(),
         declaration.run_root.clone(),
@@ -394,128 +345,11 @@ fn run_linux(
     let execution_result = (|| -> Result<(), ArenaError> {
         for game in &declaration.games {
             check_live(publication_until, cancel)?;
-            let started = Instant::now();
-            let execution_deadline = started
-                .checked_add(Duration::from_millis(game.process.execution_ms))
-                .ok_or_else(|| invalid("selfplay game execution overflow"))?;
-            let whole_deadline = execution_deadline
-                .checked_add(Duration::from_millis(game.process.cleanup_ms))
-                .ok_or_else(|| invalid("selfplay game cleanup overflow"))?;
-            check(
-                whole_deadline <= publication_until,
-                "selfplay game must fit original series ceiling",
+            let launch = prepare_game_launch_v3(
+                &declaration.plan, &declaration.run_root, declaration.max_staging_bytes,
+                staging_data_ceiling, game, &run_root, &binary, &declaration.binary, &binary_path, &staging,
+                publication_until, cancel,
             )?;
-            let cwd = run_root
-                .open_dir_nofollow(&game.private_directory)
-                .map_err(|_| invalid("selfplay predeclared private cwd missing or linked"))?;
-            private_root(&cwd)?;
-            let request_file = game.request.open_verified_at(&cwd, MAX_REQUEST_BYTES)?;
-            check_live(execution_deadline, cancel)?;
-            let mut request_bytes = Vec::with_capacity(game.request.bytes as usize);
-            Read::take(request_file, game.request.bytes + 1)
-                .read_to_end(&mut request_bytes)
-                .map_err(|_| invalid("selfplay original game request read"))?;
-            let request: GenerationWholeGameRequestV3 = serde_json::from_slice(&request_bytes)
-                .map_err(|_| invalid("selfplay original game request schema"))?;
-            request.validate()?;
-            for (control, config) in request.controls.iter().zip(&request.startup_configs) {
-                check(
-                    control.config_file.split('/').all(nonsecret_name)
-                        && control.lock_file.split('/').all(nonsecret_name)
-                        && config.assets.iter().all(|asset| {
-                            asset.snapshot_path.split('/').all(nonsecret_name)
-                                && asset.artifact.path.split('/').all(nonsecret_name)
-                        }),
-                    "selfplay startup paths are not secret-shaped",
-                )?;
-            }
-            let requested_plan = serde_json::to_vec(&request.plan)
-                .map_err(|_| invalid("selfplay requested plan serialization"))?;
-            let declared_plan = serde_json::to_vec(&declaration.plan)
-                .map_err(|_| invalid("selfplay declared plan serialization"))?;
-            check(
-                request_bytes.len() as u64 == game.request.bytes
-                    && format!("{:x}", sha2::Sha256::digest(&request_bytes)) == game.request.sha256
-                    && request.original_bytes()? == request_bytes
-                    && request.game_ordinal == game.game_ordinal
-                    && requested_plan == declared_plan,
-                "selfplay original canonical request hash/assignment/plan",
-            )?;
-            let cwd_path = declaration.run_root.join(&game.private_directory);
-            let prepare = |index: usize| {
-                PinnedPalsStartupV5::open(
-                    PalsStartupOptionsV5 {
-                        config_path: cwd_path.join(&request.controls[index].config_file),
-                        lock_path: cwd_path.join(&request.controls[index].lock_file),
-                        config_sha256: request.startup_config_sha256[index].clone(),
-                        metadata_preflight: false,
-                    },
-                    &cwd_path,
-                )
-                .map(Arc::new)
-                .map_err(ArenaError::from)
-            };
-            let pinned = [prepare(0)?, prepare(1)?];
-            check_live(execution_deadline, cancel)?;
-            let current = scan_staging(
-                &cwd,
-                declaration.max_staging_bytes,
-                execution_deadline,
-                cancel,
-            )?;
-            let remaining = declaration
-                .staging_data_ceiling()?
-                .checked_sub(staging.unique_inode_bytes)
-                .ok_or_else(|| invalid("selfplay staging capacity"))?;
-            let watch_ceiling = current
-                .logical_alias_bytes
-                .checked_add(remaining)
-                .ok_or_else(|| invalid("selfplay watch allocation overflow"))?
-                .min(game.tree.max_total_bytes);
-            check(
-                current.logical_alias_bytes < watch_ceiling,
-                "selfplay no declared output headroom",
-            )?;
-            check(
-                current.observed_max_file_bytes <= game.tree.max_file_bytes
-                    && current.unique_regular_files + current.readonly_shared_aliases
-                        <= game.tree.max_files
-                    && current.observed_directories <= game.tree.max_files
-                    && current.observed_max_depth <= game.tree.max_depth,
-                "selfplay prepared cwd must fit original child watch bounds",
-            )?;
-            let launch = GenerationGameProcessLaunchV3 {
-                binary: binary
-                    .try_clone()
-                    .map_err(|_| invalid("selfplay original binary clone"))?,
-                binary_path: binary_path.clone(),
-                binary_pin: declaration.binary.clone(),
-                cwd: cwd.into_std_file(),
-                cwd_path,
-                pinned,
-                request,
-                started,
-                execution_deadline,
-                whole_deadline,
-                limits: ProcessLimits {
-                    wall_ms: game.process.execution_ms,
-                    shutdown_grace_ms: game.process.cleanup_ms,
-                    max_output_bytes: game.process.max_output_bytes,
-                    max_child_processes: game.process.max_child_processes,
-                },
-                watch: OwnedArtifactTreeWatch {
-                    max_total_bytes: watch_ceiling,
-                    max_file_bytes: game.tree.max_file_bytes.min(watch_ceiling),
-                    max_files: game.tree.max_files,
-                    max_depth: game.tree.max_depth,
-                },
-                raw_limits: GenerationGameRawLimitsV3 {
-                    max_records: game.raw.max_records,
-                    max_evidence: game.raw.max_evidence,
-                    max_retained_bytes: game.raw.max_retained_bytes,
-                    max_read_bytes: game.raw.max_read_bytes,
-                },
-            };
             match series.run_next(launch, Some(cancel)) {
                 Ok(verified) => collector.accept(verified, Some(cancel))?,
                 Err(failure) => {
@@ -586,6 +420,231 @@ fn run_linux(
     Ok(SelfplayCliVerifiedResultV3 { status, archive })
 }
 
+/// Original declaration and descriptor preparation for the 128-game series.
+#[cfg(target_os = "linux")]
+pub(super) struct PreparedSelfplayInputsV3 {
+    pub(super) declaration: SelfplayCliDeclarationV3,
+    pub(super) run_root: cap_std::fs::Dir,
+    pub(super) binary: std::fs::File,
+    pub(super) binary_path: PathBuf,
+    pub(super) staging: SelfplayCliStagingObservationV3,
+    pub(super) staging_data_ceiling: u64,
+    pub(super) publication_until: Instant,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn prepare_selfplay_inputs_v3(
+    declaration_path: &Path,
+    declaration_sha256: &str,
+    cancel: &AtomicBool,
+) -> Result<PreparedSelfplayInputsV3, ArenaError> {
+    use std::io::Read;
+    let registered_started = Instant::now();
+    check(
+        absolute_clean(declaration_path) && generation_sha(declaration_sha256),
+        "selfplay CLI absolute original declaration and SHA-256",
+    )?;
+    let parent = declaration_path
+        .parent()
+        .ok_or_else(|| invalid("selfplay declaration parent"))?;
+    let declaration_owner = open_directory(parent)?;
+    let name = declaration_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("selfplay declaration filename"))?;
+    check(
+        direct_name(name) && nonsecret_name(name),
+        "selfplay declaration safe non-secret filename",
+    )?;
+    let mut file = open_regular(&declaration_owner, name)?;
+    let length = file
+        .metadata()
+        .map_err(|_| invalid("selfplay declaration metadata"))?
+        .len();
+    check(
+        length > 0 && length <= MAX_DECLARATION_BYTES,
+        "selfplay bounded declaration bytes",
+    )?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    Read::take(&mut file, length + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid("selfplay declaration read"))?;
+    check(
+        bytes.len() as u64 == length
+            && format!("{:x}", sha2::Sha256::digest(&bytes)) == declaration_sha256,
+        "selfplay original declaration hash",
+    )?;
+    let declaration: SelfplayCliDeclarationV3 =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("selfplay declaration schema"))?;
+    declaration.validate()?;
+    let preflight_until = registered_started
+        .checked_add(Duration::from_millis(declaration.preflight_ms))
+        .ok_or_else(|| invalid("selfplay preflight overflow"))?;
+    let publication_until = registered_started
+        .checked_add(Duration::from_millis(declaration.registered_total_ms()?))
+        .ok_or_else(|| invalid("selfplay publication overflow"))?;
+    check_live(preflight_until, cancel)?;
+    let run_root = open_directory(&declaration.run_root)?;
+    let binary_root = open_directory(&declaration.binary_root)?;
+    private_root(&run_root)?;
+    let staging_data_ceiling = declaration.staging_data_ceiling()?;
+    let staging = scan_staging(&run_root, staging_data_ceiling, preflight_until, cancel)?;
+    // A metadata scan observes prepared sharing. The CLI does not mount/copy
+    // assets. Unique inodes with writable duplicate aliases are rejected.
+    let binary = declaration
+        .binary
+        .open_verified_at(&binary_root, MAX_BINARY_BYTES)?;
+    check_live(preflight_until, cancel)?;
+    let binary_path = declaration.binary_root.join(&declaration.binary.path);
+    Ok(PreparedSelfplayInputsV3 { declaration, run_root, binary, binary_path,
+        staging, staging_data_ceiling, publication_until })
+}
+
+/// Shared original descriptor-bound preparation for either the normal series
+/// or a separately identified one-game diagnostic. This issues no game result.
+#[cfg(target_os = "linux")]
+pub(super) fn prepare_game_launch_v3(
+    plan: &SelfplayCollectionPlanV3,
+    run_root_path: &Path,
+    max_staging_bytes: u64,
+    staging_data_ceiling: u64,
+    game: &SelfplayCliGameDeclarationV3,
+    run_root: &cap_std::fs::Dir,
+    binary: &std::fs::File,
+    binary_pin: &ArtifactRef,
+    binary_path: &Path,
+    staging: &SelfplayCliStagingObservationV3,
+    publication_until: Instant,
+    cancel: &AtomicBool,
+) -> Result<GenerationGameProcessLaunchV3, ArenaError> {
+    use cap_fs_ext::DirExt;
+    use rz_uci::pals_adaptive_startup::{PalsStartupOptionsV5, PinnedPalsStartupV5};
+    use std::io::Read;
+    use std::sync::Arc;
+    let started = Instant::now();
+    let execution_deadline = started
+        .checked_add(Duration::from_millis(game.process.execution_ms))
+        .ok_or_else(|| invalid("selfplay game execution overflow"))?;
+    let whole_deadline = execution_deadline
+        .checked_add(Duration::from_millis(game.process.cleanup_ms))
+        .ok_or_else(|| invalid("selfplay game cleanup overflow"))?;
+    check(
+        whole_deadline <= publication_until,
+        "selfplay game must fit original series ceiling",
+    )?;
+    let cwd = run_root
+        .open_dir_nofollow(&game.private_directory)
+        .map_err(|_| invalid("selfplay predeclared private cwd missing or linked"))?;
+    private_root(&cwd)?;
+    let request_file = game.request.open_verified_at(&cwd, MAX_REQUEST_BYTES)?;
+    check_live(execution_deadline, cancel)?;
+    let mut request_bytes = Vec::with_capacity(game.request.bytes as usize);
+    Read::take(request_file, game.request.bytes + 1)
+        .read_to_end(&mut request_bytes)
+        .map_err(|_| invalid("selfplay original game request read"))?;
+    let request: GenerationWholeGameRequestV3 = serde_json::from_slice(&request_bytes)
+        .map_err(|_| invalid("selfplay original game request schema"))?;
+    request.validate()?;
+    for (control, config) in request.controls.iter().zip(&request.startup_configs) {
+        check(
+            control.config_file.split('/').all(nonsecret_name)
+                && control.lock_file.split('/').all(nonsecret_name)
+                && config.assets.iter().all(|asset| {
+                    asset.snapshot_path.split('/').all(nonsecret_name)
+                        && asset.artifact.path.split('/').all(nonsecret_name)
+                }),
+            "selfplay startup paths are not secret-shaped",
+        )?;
+    }
+    let requested_plan = serde_json::to_vec(&request.plan)
+        .map_err(|_| invalid("selfplay requested plan serialization"))?;
+    let declared_plan = serde_json::to_vec(plan)
+        .map_err(|_| invalid("selfplay declared plan serialization"))?;
+    check(
+        request_bytes.len() as u64 == game.request.bytes
+            && format!("{:x}", sha2::Sha256::digest(&request_bytes)) == game.request.sha256
+            && request.original_bytes()? == request_bytes
+            && request.game_ordinal == game.game_ordinal
+            && requested_plan == declared_plan,
+        "selfplay original canonical request hash/assignment/plan",
+    )?;
+    let cwd_path = run_root_path.join(&game.private_directory);
+    let prepare = |index: usize| {
+        PinnedPalsStartupV5::open(
+            PalsStartupOptionsV5 {
+                config_path: cwd_path.join(&request.controls[index].config_file),
+                lock_path: cwd_path.join(&request.controls[index].lock_file),
+                config_sha256: request.startup_config_sha256[index].clone(),
+                metadata_preflight: false,
+            },
+            &cwd_path,
+        )
+        .map(Arc::new)
+        .map_err(ArenaError::from)
+    };
+    let pinned = [prepare(0)?, prepare(1)?];
+    check_live(execution_deadline, cancel)?;
+    let current = scan_staging(
+        &cwd,
+        max_staging_bytes,
+        execution_deadline,
+        cancel,
+    )?;
+    let remaining = staging_data_ceiling
+        .checked_sub(staging.unique_inode_bytes)
+        .ok_or_else(|| invalid("selfplay staging capacity"))?;
+    let watch_ceiling = current
+        .logical_alias_bytes
+        .checked_add(remaining)
+        .ok_or_else(|| invalid("selfplay watch allocation overflow"))?
+        .min(game.tree.max_total_bytes);
+    check(
+        current.logical_alias_bytes < watch_ceiling,
+        "selfplay no declared output headroom",
+    )?;
+    check(
+        current.observed_max_file_bytes <= game.tree.max_file_bytes
+            && current.unique_regular_files + current.readonly_shared_aliases
+                <= game.tree.max_files
+            && current.observed_directories <= game.tree.max_files
+            && current.observed_max_depth <= game.tree.max_depth,
+        "selfplay prepared cwd must fit original child watch bounds",
+    )?;
+    let launch = GenerationGameProcessLaunchV3 {
+        binary: binary
+            .try_clone()
+            .map_err(|_| invalid("selfplay original binary clone"))?,
+        binary_path: binary_path.to_path_buf(),
+        binary_pin: binary_pin.clone(),
+        cwd: cwd.into_std_file(),
+        cwd_path,
+        pinned,
+        request,
+        started,
+        execution_deadline,
+        whole_deadline,
+        limits: ProcessLimits {
+            wall_ms: game.process.execution_ms,
+            shutdown_grace_ms: game.process.cleanup_ms,
+            max_output_bytes: game.process.max_output_bytes,
+            max_child_processes: game.process.max_child_processes,
+        },
+        watch: OwnedArtifactTreeWatch {
+            max_total_bytes: watch_ceiling,
+            max_file_bytes: game.tree.max_file_bytes.min(watch_ceiling),
+            max_files: game.tree.max_files,
+            max_depth: game.tree.max_depth,
+        },
+        raw_limits: GenerationGameRawLimitsV3 {
+            max_records: game.raw.max_records,
+            max_evidence: game.raw.max_evidence,
+            max_retained_bytes: game.raw.max_retained_bytes,
+            max_read_bytes: game.raw.max_read_bytes,
+        },
+    };
+    Ok(launch)
+}
+
 #[cfg(target_os = "linux")]
 fn preserve_partial_publication(
     collector: &mut GenerationSeriesCollectorV3,
@@ -619,7 +678,7 @@ fn preserve_partial_publication(
 }
 
 #[cfg(target_os = "linux")]
-fn check_live(until: Instant, cancel: &AtomicBool) -> Result<(), ArenaError> {
+pub(super) fn check_live(until: Instant, cancel: &AtomicBool) -> Result<(), ArenaError> {
     check(
         !cancel.load(Ordering::Acquire) && Instant::now() < until,
         "selfplay cancelled or original deadline expired",

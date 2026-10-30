@@ -51,6 +51,15 @@ struct Candidate<C> {
     last_selected: u64,
 }
 
+struct SelectionPlan {
+    pending_index: usize,
+    candidate_index: usize,
+    eligible_candidates: [bool; MAX_READY_JOBS],
+    next_sequence: u64,
+    deficit_after: i64,
+    starvation_age_before: u64,
+}
+
 /// Bounded EDF/dependency preference with per-candidate deficit and aging.
 /// No search data is encoded, no prepared input is copied and no task migrates
 /// here. Only never-started Jobs are eligible for idle-worker assignment; owner-
@@ -182,16 +191,60 @@ impl<J: Eq, C: Clone + Eq, L: Eq> ReadySelector<J, C, L> {
         now: Duration,
         preferred_locality: Option<&L>,
     ) -> Result<Option<ReadySelection<J, C, L>>, RuntimeFault> {
-        let deadline = self
-            .pending
-            .iter()
-            .filter(|entry| {
-                entry.descriptor.dependencies_ready
-                    && entry.descriptor.enqueued_at <= now
-                    && entry.descriptor.hard_deadline > now
-            })
-            .map(|entry| entry.descriptor.hard_deadline)
-            .min();
+        let Some(plan) = self.selection_plan(now, preferred_locality, |_| true)? else {
+            return Ok(None);
+        };
+        for (index, candidate) in self.candidates.iter_mut().enumerate() {
+            if plan.eligible_candidates[index] {
+                candidate.deficit += 1;
+            }
+        }
+        self.candidates[plan.candidate_index].deficit = plan.deficit_after;
+        self.candidates[plan.candidate_index].last_selected = plan.next_sequence;
+        self.selection = plan.next_sequence;
+        Ok(Some(ReadySelection {
+            job: self.pending.swap_remove(plan.pending_index).descriptor,
+            selection_sequence: plan.next_sequence,
+            candidate_deficit_after: plan.deficit_after,
+            starvation_age_before: plan.starvation_age_before,
+        }))
+    }
+    /// Inspect the next matching eligible descriptor without consuming it or
+    /// advancing any admission, selection, deficit or starvation state. The
+    /// predicate is evaluated once per currently eligible job, before choosing
+    /// its deadline tier; an earlier nonmatching job cannot hide a later match.
+    /// This observation is neither a reservation nor permission to dispatch.
+    pub fn peek_matching(
+        &self,
+        now: Duration,
+        preferred_locality: Option<&L>,
+        predicate: impl FnMut(&ReadyJob<J, C, L>) -> bool,
+    ) -> Result<Option<&ReadyJob<J, C, L>>, RuntimeFault> {
+        Ok(self
+            .selection_plan(now, preferred_locality, predicate)?
+            .map(|plan| &self.pending[plan.pending_index].descriptor))
+    }
+    fn selection_plan(
+        &self,
+        now: Duration,
+        preferred_locality: Option<&L>,
+        mut predicate: impl FnMut(&ReadyJob<J, C, L>) -> bool,
+    ) -> Result<Option<SelectionPlan>, RuntimeFault> {
+        let mut matching = [false; MAX_READY_JOBS];
+        let mut deadline = None;
+        for (index, entry) in self.pending.iter().enumerate() {
+            let job = &entry.descriptor;
+            if job.dependencies_ready
+                && job.enqueued_at <= now
+                && job.hard_deadline > now
+                && predicate(job)
+            {
+                matching[index] = true;
+                deadline = Some(deadline.map_or(job.hard_deadline, |old: Duration| {
+                    old.min(job.hard_deadline)
+                }));
+            }
+        }
         let Some(deadline) = deadline else {
             return Ok(None);
         };
@@ -200,8 +253,8 @@ impl<J: Eq, C: Clone + Eq, L: Eq> ReadySelector<J, C, L> {
             .checked_add(1)
             .ok_or(RuntimeFault::ResourceOverflow)?;
         let mut eligible_candidates = [false; MAX_READY_JOBS];
-        for entry in &self.pending {
-            if eligible(&entry.descriptor, now, deadline) {
+        for (index, entry) in self.pending.iter().enumerate() {
+            if matching[index] && eligible(&entry.descriptor, now, deadline) {
                 let index = self
                     .candidates
                     .iter()
@@ -225,7 +278,7 @@ impl<J: Eq, C: Clone + Eq, L: Eq> ReadySelector<J, C, L> {
         }
         let mut selected: Option<(usize, usize)> = None;
         for (index, entry) in self.pending.iter().enumerate() {
-            if !eligible(&entry.descriptor, now, deadline) {
+            if !matching[index] || !eligible(&entry.descriptor, now, deadline) {
                 continue;
             }
             let candidate_index = self
@@ -268,20 +321,13 @@ impl<J: Eq, C: Clone + Eq, L: Eq> ReadySelector<J, C, L> {
             .checked_add(1)
             .and_then(|deficit| deficit.checked_sub(count))
             .ok_or(RuntimeFault::ResourceOverflow)?;
-        let age = next_sequence - self.candidates[candidate_index].last_selected;
-        for (index, candidate) in self.candidates.iter_mut().enumerate() {
-            if eligible_candidates[index] {
-                candidate.deficit += 1;
-            }
-        }
-        self.candidates[candidate_index].deficit = deficit_after;
-        self.candidates[candidate_index].last_selected = next_sequence;
-        self.selection = next_sequence;
-        Ok(Some(ReadySelection {
-            job: self.pending.swap_remove(index).descriptor,
-            selection_sequence: next_sequence,
-            candidate_deficit_after: deficit_after,
-            starvation_age_before: age,
+        Ok(Some(SelectionPlan {
+            pending_index: index,
+            candidate_index,
+            eligible_candidates,
+            next_sequence,
+            deficit_after,
+            starvation_age_before: next_sequence - self.candidates[candidate_index].last_selected,
         }))
     }
 }
@@ -415,5 +461,212 @@ mod tests {
         selector.retire_candidate(&1).unwrap();
         assert_eq!(selector.candidate_count(), 0);
         assert_eq!(selector.remove(&1), Err(RuntimeFault::Stale));
+    }
+
+    #[test]
+    fn repeated_peeks_preserve_queue_and_all_fairness_state() {
+        let mut observed = ReadySelector::new(4).unwrap();
+        let mut control = ReadySelector::new(4).unwrap();
+        for candidate in 1..=4 {
+            let mut descriptor = job(u64::from(candidate), candidate);
+            descriptor.dependency_priority = candidate;
+            observed.admit(descriptor.clone()).unwrap();
+            control.admit(descriptor).unwrap();
+        }
+        for id in 10..50 {
+            let pending_before: Vec<_> = observed
+                .pending
+                .iter()
+                .map(|entry| (entry.descriptor.clone(), entry.admission))
+                .collect();
+            let fairness_before: Vec<_> = observed
+                .candidates
+                .iter()
+                .map(|entry| (entry.id, entry.deficit, entry.last_selected))
+                .collect();
+            let counters_before = (observed.admission, observed.selection, observed.capacity);
+            let first = observed
+                .peek_matching(Duration::ZERO, Some(&1), |_| true)
+                .unwrap()
+                .cloned();
+            for _ in 0..3 {
+                assert_eq!(
+                    observed
+                        .peek_matching(Duration::ZERO, Some(&1), |_| true)
+                        .unwrap(),
+                    first.as_ref()
+                );
+                observed
+                    .peek_matching(Duration::ZERO, None, |job| job.candidate % 2 == 0)
+                    .unwrap();
+            }
+            assert_eq!(
+                observed
+                    .pending
+                    .iter()
+                    .map(|entry| (entry.descriptor.clone(), entry.admission))
+                    .collect::<Vec<_>>(),
+                pending_before
+            );
+            assert_eq!(
+                observed
+                    .candidates
+                    .iter()
+                    .map(|entry| (entry.id, entry.deficit, entry.last_selected))
+                    .collect::<Vec<_>>(),
+                fairness_before
+            );
+            assert_eq!(
+                (observed.admission, observed.selection, observed.capacity),
+                counters_before
+            );
+            let selected = observed.select(Duration::ZERO, Some(&1)).unwrap().unwrap();
+            assert_eq!(Some(&selected.job), first.as_ref());
+            assert_eq!(
+                Some(selected.clone()),
+                control.select(Duration::ZERO, Some(&1)).unwrap()
+            );
+            let mut next = job(id, selected.job.candidate);
+            next.dependency_priority = selected.job.dependency_priority;
+            observed.admit(next.clone()).unwrap();
+            control.admit(next).unwrap();
+        }
+    }
+
+    #[test]
+    fn matching_role_is_filtered_before_earliest_deadline() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Role {
+            Proposer,
+            Critic,
+            Researcher,
+        }
+        let mut selector = ReadySelector::new(4).unwrap();
+        for (id, role, deadline) in [
+            (1, Role::Proposer, 1),
+            (2, Role::Researcher, 2),
+            (3, Role::Critic, 4),
+            (4, Role::Critic, 5),
+        ] {
+            selector
+                .admit(ReadyJob {
+                    job: (id, role),
+                    candidate: id,
+                    locality: id,
+                    hard_deadline: Duration::from_secs(deadline),
+                    enqueued_at: Duration::ZERO,
+                    dependencies_ready: true,
+                    dependency_priority: 0,
+                    service_cost: ReadyServiceCost::Unknown,
+                })
+                .unwrap();
+        }
+        let mut predicate_calls = 0;
+        assert_eq!(
+            selector
+                .peek_matching(Duration::ZERO, Some(&4), |job| {
+                    predicate_calls += 1;
+                    job.job.1 == Role::Critic
+                })
+                .unwrap()
+                .unwrap()
+                .job,
+            (3, Role::Critic)
+        );
+        assert_eq!(predicate_calls, 4);
+        assert_eq!(
+            selector
+                .select(Duration::ZERO, Some(&4))
+                .unwrap()
+                .unwrap()
+                .job
+                .job,
+            (1, Role::Proposer)
+        );
+    }
+
+    #[test]
+    fn peeks_keep_expired_blocked_and_future_jobs_in_the_bounded_queue() {
+        let mut selector = ReadySelector::new(3).unwrap();
+        let mut expired = job(1, 1);
+        expired.hard_deadline = Duration::from_secs(1);
+        selector.admit(expired).unwrap();
+        let mut blocked = job(2, 2);
+        blocked.dependencies_ready = false;
+        selector.admit(blocked).unwrap();
+        let mut future = job(3, 3);
+        future.enqueued_at = Duration::from_secs(2);
+        selector.admit(future).unwrap();
+        let now = Duration::from_secs(1);
+        assert_eq!(selector.peek_matching(now, None, |_| true).unwrap(), None);
+        assert_eq!(selector.len(), 3);
+        assert_eq!(selector.candidate_count(), 3);
+        assert_eq!(selector.admission, 3);
+        assert_eq!(selector.selection, 0);
+        assert_eq!(
+            selector.admit(job(4, 4)).unwrap_err().reason,
+            RuntimeFault::QueueFull
+        );
+        selector.set_dependencies_ready(&2, true).unwrap();
+        assert_eq!(
+            selector
+                .peek_matching(now, None, |job| job.job == 3)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            selector
+                .peek_matching(now, None, |_| true)
+                .unwrap()
+                .unwrap()
+                .job,
+            2
+        );
+        assert_eq!(selector.select(now, None).unwrap().unwrap().job.job, 2);
+        assert_eq!(selector.len(), 2);
+        assert_eq!(
+            selector
+                .peek_matching(Duration::from_secs(2), None, |_| true)
+                .unwrap()
+                .unwrap()
+                .job,
+            3
+        );
+        assert_eq!(selector.len(), 2);
+    }
+
+    #[test]
+    fn peek_overflow_checks_do_not_mutate_selection_state() {
+        let mut selector = ReadySelector::new(1).unwrap();
+        selector.admit(job(1, 1)).unwrap();
+        selector.selection = u64::MAX;
+        assert_eq!(
+            selector.peek_matching(Duration::ZERO, None, |_| true),
+            Err(RuntimeFault::ResourceOverflow)
+        );
+        assert_eq!(
+            selector.select(Duration::ZERO, None),
+            Err(RuntimeFault::ResourceOverflow)
+        );
+        assert_eq!(selector.len(), 1);
+        assert_eq!(selector.selection, u64::MAX);
+        assert_eq!(selector.candidates[0].deficit, 0);
+        assert_eq!(
+            selector
+                .peek_matching(Duration::ZERO, None, |_| false)
+                .unwrap(),
+            None
+        );
+        selector.selection = 0;
+        selector.candidates[0].deficit = i64::MAX - 4;
+        assert_eq!(
+            selector.peek_matching(Duration::ZERO, None, |_| true),
+            Err(RuntimeFault::ResourceOverflow)
+        );
+        assert_eq!(selector.len(), 1);
+        assert_eq!(selector.selection, 0);
+        assert_eq!(selector.admission, 1);
+        assert_eq!(selector.candidates[0].deficit, i64::MAX - 4);
+        assert_eq!(selector.candidates[0].last_selected, 0);
     }
 }

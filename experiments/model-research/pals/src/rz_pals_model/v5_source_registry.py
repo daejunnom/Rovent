@@ -50,7 +50,8 @@ def _read_pin(root, logical, maximum):
         path = path / part
         if stat.S_ISLNK(path.lstat().st_mode):
             raise ValueError("source inventory path contains a symlink")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     descriptor = os.open(path, flags)
     try:
         before = os.fstat(descriptor)

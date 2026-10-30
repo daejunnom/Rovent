@@ -3,7 +3,7 @@
 //! The engine retains its exclusive TT/history owner while this task is paused.
 
 use super::*;
-use crate::cpu_value::{CPU_ACCUMULATOR_WIDTH, CpuAccumulatorUndo};
+use crate::cpu_value::CpuAccumulatorUndo;
 use rz_position::{PieceChange, RuleMoveDelta, UndoToken};
 
 const MAX_FRAMES: usize = MAX_DEPTH as usize + MAX_QUIESCENCE_PLY as usize + 1;
@@ -18,6 +18,7 @@ pub(super) struct PausedTask {
     legal: Vec<BoardMove>,
     work: Position,
     value: Option<CpuAccumulator>,
+    value_retained_bytes: usize,
     frames: Vec<Frame>,
     returned: Option<NodeValue>,
     best: Vec<BoardMove>,
@@ -28,6 +29,15 @@ pub(super) struct PausedTask {
     window: (i32, i32),
     full_window_retry: bool,
     cumulative: CpuWork,
+    reciprocal: Option<ReciprocalTask>,
+}
+
+struct ReciprocalTask {
+    scope: CpuReciprocalScope,
+    hard_deadline: Option<Instant>,
+    issued: u16,
+    next_node: u64,
+    pending: Option<CpuReciprocalRequest>,
 }
 
 impl PausedTask {
@@ -38,6 +48,7 @@ impl PausedTask {
         legal: Vec<BoardMove>,
         limits: CpuLimits,
         resume: Option<&CpuResumeToken>,
+        capture: Option<&crate::cpu_value::nnuec::v2::capture::NnuecActiveCapture>,
     ) -> Result<Self, CpuError> {
         let value = engine
             .evaluator
@@ -46,10 +57,13 @@ impl PausedTask {
         let score = if let Some(token) = resume {
             token.score
         } else {
-            let score = engine
-                .evaluator
-                .score(&value, position)
-                .map_err(CpuError::Value)?;
+            let score = match capture {
+                Some(capture) => engine
+                    .evaluator
+                    .score_with_capture(&value, position, capture),
+                None => engine.evaluator.score(&value, position),
+            }
+            .map_err(CpuError::Value)?;
             if !(-CPU_FRONTIER_SCORE_LIMIT..=CPU_FRONTIER_SCORE_LIMIT).contains(&score) {
                 return Err(CpuError::Value(
                     CpuValueError::ScoreOutsideFrontierNamespace,
@@ -57,6 +71,7 @@ impl PausedTask {
             }
             score
         };
+        let value_retained_bytes = value.retained_bytes();
         let best = resume.map_or_else(
             || legal.first().copied().into_iter().collect(),
             |token| token.pv.clone(),
@@ -74,6 +89,7 @@ impl PausedTask {
             legal,
             work: position.clone(),
             value: Some(value),
+            value_retained_bytes,
             frames,
             returned: None,
             best,
@@ -84,6 +100,7 @@ impl PausedTask {
             window: (-INFINITY, INFINITY),
             full_window_retry: false,
             cumulative: CpuWork::default(),
+            reciprocal: None,
         };
         task.check_memory()?;
         Ok(task)
@@ -106,8 +123,9 @@ impl PausedTask {
                 .retained_history_bytes()
                 .unwrap_or(usize::MAX),
             self.search_conditions.capacity(),
-            2 * CPU_ACCUMULATOR_WIDTH * (4 + 24),
-            std::mem::size_of::<CpuAccumulator>(),
+            self.value
+                .as_ref()
+                .map_or(self.value_retained_bytes, CpuAccumulator::retained_bytes),
             4096, // bounded value namespace/control/Arc and allocator allowance
         ] {
             bytes = bytes.saturating_add(charge);
@@ -117,6 +135,21 @@ impl PausedTask {
         }
         if let Some(value) = &self.returned {
             bytes = bytes.saturating_add(vector_bytes(&value.pv));
+        }
+        if let Some(reciprocal) = &self.reciprocal {
+            bytes = bytes.saturating_add(std::mem::size_of::<ReciprocalTask>());
+            if let Some(pending) = &reciprocal.pending {
+                bytes = bytes
+                    .saturating_add(vector_bytes(&pending.candidates))
+                    .saturating_add(vector_bytes(&pending.relative_prefix))
+                    .saturating_add(
+                        pending
+                            .position
+                            .snapshot()
+                            .retained_history_bytes()
+                            .unwrap_or(usize::MAX),
+                    );
+            }
         }
         bytes
     }
@@ -159,6 +192,102 @@ impl PausedTask {
         self.frames.push(frame);
         self.check_memory()
     }
+
+    fn request_feedback(
+        &mut self,
+        frame: &mut Frame,
+        control: &Control<'_>,
+    ) -> Result<bool, CpuError> {
+        let Some(reciprocal) = self.reciprocal.as_mut() else {
+            return Ok(false);
+        };
+        let total =
+            self.cumulative
+                .nodes
+                .checked_add(control.nodes)
+                .ok_or(CpuError::InvalidLimits(
+                    "reciprocal node observation overflow",
+                ))?;
+        if reciprocal.issued >= reciprocal.scope.max_questions
+            || total >= reciprocal.scope.job.total_native_node_credit
+            || total < reciprocal.next_node
+            || control.cancellation.load(Ordering::Acquire)
+            || control.cooperative.is_some_and(|slice| {
+                let state = slice.mailbox.snapshot();
+                state.is_cancelled() || state.terminal
+            })
+            || control
+                .limits
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            || frame.kind == Kind::Quiescence
+            || frame.reciprocal_queried
+            || !matches!(frame.stage, Stage::Ordering(_))
+            || frame.moves.is_empty()
+        {
+            return Ok(false);
+        }
+        // `frame` is the current popped node. Every retained ancestor must be
+        // waiting on its real active Rules child. The one-use UndoToken's
+        // checked before/after chain attests the job-relative path without
+        // replaying the game, a PV, or another speculative continuation.
+        if self.frames.len() != usize::from(frame.ply) || self.frames.len() >= MAX_FRAMES {
+            return Err(CpuError::ResumeMismatch(
+                "reciprocal ancestor depth mismatch",
+            ));
+        }
+        let mut relative_prefix = Vec::new();
+        relative_prefix
+            .try_reserve_exact(self.frames.len())
+            .map_err(|_| CpuError::Allocation)?;
+        let mut endpoint = self.root.clone();
+        for ancestor in &self.frames {
+            let Stage::Await(active) = &ancestor.stage else {
+                return Err(CpuError::ResumeMismatch(
+                    "reciprocal ancestor is not an active Rules child",
+                ));
+            };
+            let delta = active
+                .undo
+                .as_ref()
+                .ok_or(CpuError::ResumeMismatch(
+                    "reciprocal ancestor lost Rules authority",
+                ))?
+                .delta();
+            if active.mv != delta.mv || delta.before.position_identity() != endpoint {
+                return Err(CpuError::ResumeMismatch(
+                    "reciprocal ancestor Rules chain changed",
+                ));
+            }
+            relative_prefix.push(delta.mv);
+            endpoint = delta.after.position_identity();
+        }
+        if endpoint != self.work.position_identity() {
+            return Err(CpuError::ResumeMismatch(
+                "reciprocal prefix does not end at the saved node",
+            ));
+        }
+        let ordering = std::mem::replace(&mut frame.stage, Stage::Finish);
+        let Stage::Ordering(ordering) = ordering else {
+            unreachable!("checked node ordering");
+        };
+        frame.stage = Stage::AwaitReciprocal(ordering);
+        frame.reciprocal_queried = true;
+        reciprocal.issued += 1;
+        reciprocal.next_node = total.saturating_add(reciprocal.scope.node_interval);
+        reciprocal.pending = Some(CpuReciprocalRequest {
+            seal: Arc::new(()),
+            scope: reciprocal.scope.clone(),
+            position: self.work.clone(),
+            relative_prefix,
+            ply: frame.ply,
+            remaining_depth: frame.depth,
+            ordinal: reciprocal.issued,
+            candidates: frame.moves.clone(),
+        });
+        self.check_memory()?;
+        Ok(true)
+    }
 }
 
 fn vector_bytes<T>(values: &Vec<T>) -> usize {
@@ -196,6 +325,10 @@ pub(super) fn token_is_current(engine: &CpuEngine, token: &CpuResumeToken) -> bo
         && token.search_conditions == engine.search_conditions()
         && task.value_identity == token.value_identity
         && token.value_identity == *engine.value_identity
+        && task
+            .value
+            .as_ref()
+            .is_some_and(|value| engine.evaluator.cache_context(value, &task.work).is_ok())
         && engine.evaluator.identity() == engine.value_identity.as_ref()
         && token.profile == engine.config.profile
         && token.quiescence_ply == engine.config.quiescence_ply
@@ -212,7 +345,7 @@ pub(super) fn run(
     observer: &mut dyn FnMut(CpuIterationProgress),
 ) -> Result<CpuReport, CpuError> {
     run_inner(
-        engine, position, root_moves, limits, cancel, resume, observer, None,
+        engine, position, root_moves, limits, cancel, resume, observer, None, None,
     )
 }
 
@@ -236,6 +369,75 @@ pub(super) fn run_controlled(
         resume,
         observer,
         Some(slice),
+        None,
+    )
+}
+
+pub(super) fn pending_reciprocal_request(engine: &CpuEngine) -> Option<CpuReciprocalRequest> {
+    engine.paused.as_ref()?.reciprocal.as_ref()?.pending.clone()
+}
+
+pub(super) fn validate_reciprocal_resume(
+    engine: &CpuEngine,
+    token: Option<&CpuResumeToken>,
+    scope: &CpuReciprocalScope,
+    reply: Option<&CpuReciprocalReply>,
+) -> Result<(), CpuError> {
+    if let Some(token) = token {
+        if !token_is_current(engine, token) {
+            return Err(CpuError::ResumeMismatch(
+                "reciprocal continuation is stale or foreign",
+            ));
+        }
+        let task = engine.paused.as_ref().expect("current token retains task");
+        let reciprocal = task.reciprocal.as_ref().ok_or(CpuError::ResumeMismatch(
+            "ordinary paused task has no reciprocal scope",
+        ))?;
+        if reciprocal.scope != *scope {
+            return Err(CpuError::ResumeMismatch(
+                "reciprocal job, owner or frozen context changed",
+            ));
+        }
+        match (&reciprocal.pending, reply) {
+            (Some(request), Some(reply)) if request.same_request(&reply.request) => {}
+            (None, None) => {}
+            _ => {
+                return Err(CpuError::ResumeMismatch(
+                    "reciprocal reply is missing, duplicate or foreign",
+                ));
+            }
+        }
+    } else if reply.is_some() || engine.paused.is_some() {
+        return Err(CpuError::ResumeMismatch(
+            "fresh reciprocal job cannot replace a retained owner",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_reciprocal(
+    engine: &mut CpuEngine,
+    position: &Position,
+    root_moves: Option<&[BoardMove]>,
+    limits: CpuLimits,
+    cancel: &AtomicBool,
+    resume: Option<&CpuResumeToken>,
+    observer: &mut dyn FnMut(CpuIterationProgress),
+    slice: &CpuSliceControl,
+    scope: &CpuReciprocalScope,
+    reply: Option<&CpuReciprocalReply>,
+) -> Result<CpuReport, CpuError> {
+    run_inner(
+        engine,
+        position,
+        root_moves,
+        limits,
+        cancel,
+        resume,
+        observer,
+        Some(slice),
+        Some((scope, reply)),
     )
 }
 
@@ -249,6 +451,7 @@ fn run_inner(
     resume: Option<&CpuResumeToken>,
     observer: &mut dyn FnMut(CpuIterationProgress),
     cooperative: Option<&CpuSliceControl>,
+    reciprocal: Option<(&CpuReciprocalScope, Option<&CpuReciprocalReply>)>,
 ) -> Result<CpuReport, CpuError> {
     engine.paused_stack_limit_sealed = true;
     engine.last_attempt_work = Some(CpuWork::default());
@@ -268,13 +471,38 @@ fn run_inner(
         task.search_conditions != engine.search_conditions()
             || task.maximum_bytes != engine.paused_stack_max_bytes
             || task.value_identity != *engine.value_identity
+            || task.value.is_none()
     }) {
         engine.invalidate_paused_stack();
         engine.observe_paused_stack_rejection(resume);
         return Err(CpuError::ResumeMismatch("retained CPU namespace changed"));
     }
+    if let Some(error) = engine.paused.as_ref().and_then(|task| {
+        task.value
+            .as_ref()
+            .and_then(|value| engine.evaluator.cache_context(value, &task.work).err())
+    }) {
+        // Keep the evaluator's exact typed cause. This preflight has not
+        // accepted a new score or work, so it cannot manufacture CpuReport.
+        engine.invalidate_paused_stack();
+        engine.observe_paused_stack_rejection(resume);
+        return Err(CpuError::Value(error));
+    }
     let started = Instant::now();
     if let Some(token) = resume {
+        if engine
+            .paused
+            .as_ref()
+            .is_some_and(|task| task.reciprocal.is_some())
+            && reciprocal.is_none()
+        {
+            if cancel.load(Ordering::Acquire) {
+                engine.invalidate_paused_stack();
+            }
+            return Err(CpuError::ResumeMismatch(
+                "reciprocal task requires its sealed response path",
+            ));
+        }
         if token.root != position.position_identity() {
             if cancel.load(Ordering::Acquire) {
                 engine.invalidate_paused_stack();
@@ -317,6 +545,21 @@ fn run_inner(
             ));
         };
         let token = resume.expect("handle came from token");
+        if let Some((scope, _)) = reciprocal {
+            if retained.reciprocal.as_ref().is_some_and(|task| {
+                task.scope != *scope
+                    || task.hard_deadline != limits.deadline
+                    || retained
+                        .cumulative
+                        .nodes
+                        .checked_add(limits.max_nodes)
+                        .is_none_or(|total| total > scope.job.total_native_node_credit)
+            }) {
+                return Err(CpuError::ResumeMismatch(
+                    "reciprocal original deadline or scope changed",
+                ));
+            }
+        }
         if retained.root != token.root
             || retained.root_moves != token.root_moves
             || retained.completed_depth != token.completed_depth
@@ -380,8 +623,62 @@ fn run_inner(
                 resume: None,
             });
         }
-        PausedTask::new(engine, position, root_moves, legal, limits, resume)?
+        PausedTask::new(
+            engine,
+            position,
+            root_moves,
+            legal,
+            limits,
+            resume,
+            cooperative.and_then(|slice| slice.nnuec_capture.as_ref()),
+        )?
     };
+    if let Some((scope, reply)) = reciprocal {
+        if task.reciprocal.is_none() {
+            if limits.deadline.is_none() || limits.max_nodes > scope.job.total_native_node_credit {
+                return Err(CpuError::InvalidLimits(
+                    "reciprocal execution requires original bounded job",
+                ));
+            }
+            task.reciprocal = Some(ReciprocalTask {
+                scope: scope.clone(),
+                hard_deadline: limits.deadline,
+                issued: 0,
+                next_node: scope.node_interval,
+                pending: None,
+            });
+        }
+        let live = !cancel.load(Ordering::Acquire)
+            && !cooperative.is_some_and(|slice| slice.mailbox.snapshot().is_cancelled())
+            && limits
+                .deadline
+                .is_none_or(|deadline| Instant::now() < deadline);
+        if let Some(reply) = reply.filter(|_| live) {
+            let pending = task
+                .reciprocal
+                .as_mut()
+                .expect("scope installed")
+                .pending
+                .take()
+                .expect("read-only admission checked pending reply");
+            if !Arc::ptr_eq(&pending.seal, &reply.request.seal) {
+                return Err(CpuError::ResumeMismatch(
+                    "reciprocal request authority changed",
+                ));
+            }
+            let frame = task.frames.last_mut().ok_or(CpuError::ResumeMismatch(
+                "reciprocal response has no saved node",
+            ))?;
+            let old = std::mem::replace(&mut frame.stage, Stage::Finish);
+            let Stage::AwaitReciprocal(ordering) = old else {
+                return Err(CpuError::ResumeMismatch(
+                    "reciprocal response has no awaiting stage",
+                ));
+            };
+            frame.feedback_priority = reply.preferred.clone();
+            frame.stage = Stage::Ordering(ordering);
+        }
+    }
     if let Err(error) = task.check_memory() {
         engine.invalidate_paused_stack();
         return Err(error);
@@ -438,22 +735,27 @@ fn run_inner(
             return Err(error);
         }
     };
-    let completion = match result {
-        Ok(()) => CpuCompletion::DepthLimit,
-        Err(Abort::Stop(reason)) => reason,
+    let (completion, value_authority_stopped) = match result {
+        Ok(()) => (CpuCompletion::DepthLimit, false),
+        Err(Abort::Stop(reason)) => (reason, false),
+        Err(Abort::ValueAuthorityStop(reason)) => (reason, true),
         Err(Abort::Error(error)) => {
             engine.invalidate_paused_stack();
             return Err(error);
         }
     };
-    let can_pause = if cooperative.is_some() {
-        completion == CpuCompletion::Yielded
-    } else {
-        matches!(
-            completion,
-            CpuCompletion::NodeLimit | CpuCompletion::Deadline
-        )
-    };
+    let can_pause = !value_authority_stopped
+        && if cooperative.is_some() {
+            matches!(
+                completion,
+                CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+            )
+        } else {
+            matches!(
+                completion,
+                CpuCompletion::NodeLimit | CpuCompletion::Deadline
+            )
+        };
     let mut token = None;
     if can_pause {
         if let Err(error) = task.check_memory() {
@@ -613,9 +915,24 @@ fn drive(
             task.start_iteration(false).map_err(Abort::Error)?;
         }
         let mut frame = task.frames.pop().expect("iteration has a frame");
-        let action = frame.advance(engine, &mut task.work, control, &mut task.returned);
+        let action = frame.advance(
+            engine,
+            &mut task.work,
+            control,
+            &mut task.returned,
+            &task.legal,
+        );
+        task.value_retained_bytes = control.value.retained_bytes();
         match action {
-            Ok(Action::Continue) => task.frames.push(frame),
+            Ok(Action::Continue) => {
+                let awaiting = task
+                    .request_feedback(&mut frame, control)
+                    .map_err(Abort::Error)?;
+                task.frames.push(frame);
+                if awaiting {
+                    return Err(Abort::Stop(CpuCompletion::AwaitReciprocal));
+                }
+            }
             Ok(Action::Push(child)) => {
                 task.frames.push(frame);
                 if task.frames.len() >= MAX_FRAMES {
@@ -645,6 +962,7 @@ enum Kind {
 enum Stage {
     Enter,
     Ordering(OrderingState),
+    AwaitReciprocal(OrderingState),
     Select,
     Await(ActiveMove),
     Finish,
@@ -654,6 +972,7 @@ enum Stage {
 enum ChildPhase {
     Scout,
     Full,
+    RootTieConfirm,
     Quiescence,
 }
 
@@ -677,8 +996,10 @@ struct Frame {
     moves: Vec<BoardMove>,
     cursor: usize,
     best: NodeValue,
-    tt: Option<(u64, PositionIdentity)>,
+    tt: Option<(u64, PositionIdentity, CpuValueCacheContext)>,
     stage: Stage,
+    reciprocal_queried: bool,
+    feedback_priority: Vec<BoardMove>,
 }
 
 // A transient result in the nonrecursive driver. Keeping the child inline
@@ -709,6 +1030,8 @@ impl Frame {
             },
             tt: None,
             stage: Stage::Enter,
+            reciprocal_queried: false,
+            feedback_priority: Vec::new(),
         }
     }
 
@@ -727,10 +1050,19 @@ impl Frame {
     }
 
     fn retained_bytes(&self) -> usize {
-        let own = vector_bytes(&self.moves).saturating_add(vector_bytes(&self.best.pv));
+        let own = vector_bytes(&self.moves)
+            .saturating_add(vector_bytes(&self.best.pv))
+            .saturating_add(vector_bytes(&self.feedback_priority));
         own.saturating_add(match &self.stage {
-            Stage::Ordering(ordering) => ordering.retained_bytes(),
-            Stage::Await(active) => active.undo.as_ref().map_or(0, undo_bytes),
+            Stage::Ordering(ordering) | Stage::AwaitReciprocal(ordering) => {
+                ordering.retained_bytes()
+            }
+            Stage::Await(active) => active.undo.as_ref().map_or(0, undo_bytes).saturating_add(
+                active
+                    .value_undo
+                    .as_ref()
+                    .map_or(0, CpuAccumulatorUndo::retained_bytes),
+            ),
             _ => 0,
         })
     }
@@ -741,18 +1073,32 @@ impl Frame {
         position: &mut Position,
         control: &mut Control<'_>,
         returned: &mut Option<NodeValue>,
+        root_legal: &[BoardMove],
     ) -> Result<Action, Abort> {
         match &mut self.stage {
             Stage::Enter => self.enter(engine, position, control),
             Stage::Ordering(ordering) => {
-                if let Some(moves) =
+                if let Some(mut moves) =
                     ordering.advance(engine, position, &self.moves, self.previous_best, control)?
                 {
+                    // Stable ordering preserves the declared native policy for
+                    // candidates omitted by P/C, without treating logits as a bound.
+                    if !self.feedback_priority.is_empty() {
+                        moves.sort_by_key(|movement| {
+                            self.feedback_priority
+                                .iter()
+                                .position(|candidate| candidate == movement)
+                                .unwrap_or(usize::MAX)
+                        });
+                    }
                     self.moves = moves;
                     self.stage = Stage::Select;
                 }
                 Ok(Action::Continue)
             }
+            Stage::AwaitReciprocal(_) => Err(Abort::Error(CpuError::ResumeMismatch(
+                "awaiting reciprocal node cannot execute without a sealed reply",
+            ))),
             Stage::Select => {
                 if self.cursor >= self.moves.len() {
                     self.stage = Stage::Finish;
@@ -823,6 +1169,26 @@ impl Frame {
                         -self.alpha,
                     )));
                 }
+                // The scout value at alpha can be an upper bound, not an
+                // exact tie. Only re-search an earlier Rules root candidate;
+                // keep the same move/undo and paused owner through that work.
+                if engine.root_tie_policy == CpuRootTiePolicy::RulesOrderConfirmed
+                    && self.kind == Kind::Root
+                    && active.phase == ChildPhase::Scout
+                    && score == self.best.score
+                    && self.alpha == self.best.score
+                    && self.alpha > -INFINITY
+                    && root_move_precedes(root_legal, active.mv, self.best.pv.first().copied())
+                {
+                    active.phase = ChildPhase::RootTieConfirm;
+                    return Ok(Action::Push(Frame::child(
+                        engine,
+                        self.depth - 1,
+                        self.ply + 1,
+                        -self.beta,
+                        1 - self.alpha,
+                    )));
+                }
                 let mv = active.mv;
                 position.unmake(active.undo.take().expect("active move owns Rules undo"))?;
                 engine.evaluator.restore(
@@ -833,7 +1199,11 @@ impl Frame {
                         .expect("active move owns value undo"),
                     position,
                 )?;
-                if score > self.best.score {
+                if score > self.best.score
+                    || (active.phase == ChildPhase::RootTieConfirm
+                        && score == self.best.score
+                        && root_move_precedes(root_legal, mv, self.best.pv.first().copied()))
+                {
                     self.best.score = score;
                     self.best.pv.clear();
                     self.best.pv.push(mv);
@@ -856,7 +1226,7 @@ impl Frame {
             }
             Stage::Finish => {
                 control.check_stop()?;
-                if let Some((hash, identity)) = self.tt.take() {
+                if let Some((hash, identity, value_context)) = self.tt.take() {
                     let bound = if self.best.score <= self.alpha_original {
                         Bound::Upper
                     } else if self.best.score >= self.beta {
@@ -869,6 +1239,7 @@ impl Frame {
                         identity,
                         profile: engine.config.profile,
                         value_identity: Arc::clone(&engine.value_identity),
+                        value_context,
                         depth: self.depth,
                         score: to_tt_score(self.best.score, self.ply),
                         bound,
@@ -905,7 +1276,8 @@ impl Frame {
             if self.kind == Kind::Negamax {
                 let hash = tt_hash(position);
                 let identity = position.position_identity();
-                if let Some(entry) = engine.probe(hash, &identity) {
+                let value_context = engine.evaluator.cache_context(&control.value, position)?;
+                if let Some(entry) = engine.probe(hash, &identity, &value_context) {
                     control.tt_hits += 1;
                     let score = from_tt_score(entry.score, self.ply);
                     if entry.depth == self.depth
@@ -920,7 +1292,7 @@ impl Frame {
                     }
                     self.previous_best = entry.best_move;
                 }
-                self.tt = Some((hash, identity));
+                self.tt = Some((hash, identity, value_context));
             } else {
                 let in_check = position.in_check();
                 if in_check && self.depth == 0 {
@@ -1191,6 +1563,132 @@ mod tests {
     use crate::cpu_value::{CpuFloatCheckpoint, CpuFloatValue};
     use std::sync::atomic::AtomicU64;
 
+    fn pause_at_root_tie(
+        cpu: &mut CpuEngine,
+        position: &Position,
+        moves: &[BoardMove],
+        cancel: &AtomicBool,
+    ) -> (CpuReport, u64) {
+        let mut report = cpu
+            .analyze_root_moves(position, moves, limits(1), cancel)
+            .unwrap();
+        let mut charged = report.nodes;
+        for _ in 0..10_000 {
+            if cpu.paused.as_ref().is_some_and(|task| task.frames.iter().any(|frame| {
+                matches!(&frame.stage, Stage::Await(active) if active.phase == ChildPhase::RootTieConfirm)
+            })) {
+                return (report, charged);
+            }
+            assert!(report.completed_depth < 2, "confirmation was not reached");
+            let token = report.resume.take().expect("original paused owner");
+            report = cpu.resume(position, &token, limits(1), cancel).unwrap();
+            charged += report.nodes;
+        }
+        panic!("bounded work did not reach root tie confirmation");
+    }
+
+    #[test]
+    fn root_tie_confirmation_can_pause_and_resume_the_same_owned_work() {
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let moves = [
+            BoardMove::from_uci("b1c3").unwrap(),
+            BoardMove::from_uci("g1f3").unwrap(),
+        ];
+        let cancel = AtomicBool::new(false);
+        for earlier_is_worse in [false, true] {
+            let mut whole = super::super::tests::root_tie_engine(
+                CpuResumePolicy::PausedStack,
+                earlier_is_worse,
+                0,
+            );
+            let expected = whole
+                .analyze_root_moves(&position, &moves, limits(30_000), &cancel)
+                .unwrap();
+            let mut sliced = super::super::tests::root_tie_engine(
+                CpuResumePolicy::PausedStack,
+                earlier_is_worse,
+                0,
+            );
+            let (mut report, mut charged) =
+                pause_at_root_tie(&mut sliced, &position, &moves, &cancel);
+            for _ in 0..10_000 {
+                if report.completed_depth == 2 {
+                    break;
+                }
+                let token = report.resume.take().expect("original paused owner");
+                report = sliced
+                    .resume(&position, &token, limits(1), &cancel)
+                    .unwrap();
+                charged += report.nodes;
+            }
+            assert_eq!(
+                (
+                    report.completed_depth,
+                    report.score,
+                    report.best_move,
+                    &report.pv
+                ),
+                (
+                    expected.completed_depth,
+                    expected.score,
+                    expected.best_move,
+                    &expected.pv
+                )
+            );
+            assert_eq!(
+                charged, expected.nodes,
+                "resuming must not recharge consumed nodes"
+            );
+            assert!(position.matches_snapshot(&before));
+        }
+    }
+
+    #[test]
+    fn root_tie_confirmation_cancel_and_value_error_discard_only_the_owned_task() {
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let moves = [
+            BoardMove::from_uci("b1c3").unwrap(),
+            BoardMove::from_uci("g1f3").unwrap(),
+        ];
+        for cancel_instead in [false, true] {
+            let cancel = AtomicBool::new(false);
+            let (mut cpu, fail_score) = super::super::tests::root_tie_engine_with_failure();
+            let (mut report, _) = pause_at_root_tie(&mut cpu, &position, &moves, &cancel);
+            let token = report.resume.take().expect("original paused owner");
+            if cancel_instead {
+                cancel.store(true, Ordering::Release);
+                let stopped = cpu
+                    .resume(&position, &token, limits(30_000), &cancel)
+                    .unwrap();
+                assert_eq!(stopped.completion, CpuCompletion::Canceled);
+                assert!(stopped.resume.is_none());
+                cancel.store(false, Ordering::Release);
+            } else {
+                fail_score.store(true, Ordering::Release);
+                assert!(matches!(
+                    cpu.resume(&position, &token, limits(30_000), &cancel),
+                    Err(CpuError::Value(CpuValueError::NonFiniteForward))
+                ));
+                fail_score.store(false, Ordering::Release);
+            }
+            assert!(!cpu.token_is_current(&token));
+            assert!(cpu.paused.is_none());
+            assert!(position.matches_snapshot(&before));
+            // A new task must reconstruct the Rules/value owner; a dropped
+            // in-flight confirmation must not leak its partial state.
+            let fresh = cpu
+                .analyze_root_moves(&position, &moves, limits(30_000), &cancel)
+                .unwrap();
+            assert_eq!(
+                (fresh.completed_depth, fresh.score, fresh.best_move),
+                (2, 0, Some(moves[0]))
+            );
+            assert!(position.matches_snapshot(&before));
+        }
+    }
+
     fn config(tt_entries: usize) -> CpuConfig {
         CpuConfig {
             tt_entries,
@@ -1216,6 +1714,532 @@ mod tests {
             CpuResumePolicy::PausedStack,
         )
         .unwrap()
+    }
+
+    fn reciprocal_fixture(
+        position: &Position,
+    ) -> (CpuReciprocalScope, Arc<CpuControlMailbox>, CpuLimits) {
+        use rz_contracts::pals::SearchAuthority;
+        use rz_contracts::pals_adaptive::{CpuJobEnvelope, CpuJobId, CpuWorkerId, ReviewViewSeal};
+        use rz_contracts::rovent::{
+            ChessPly, QuestionEnvelope, QuestionPurpose, ReciprocalQuestionId, SearchRecipient,
+        };
+        use rz_contracts::{
+            ClockDomain, Deadline, Digest, GameGeneration, MonotonicTick, OwnerId, ProcessEpoch,
+            RootGeneration,
+        };
+        let authority = SearchAuthority {
+            epoch: ProcessEpoch(3),
+            game: GameGeneration(4),
+            root: RootGeneration(5),
+            implementation: Digest([6; 32]),
+        };
+        let anchor = rz_position::contracts::ContractPosition::new(OwnerId(8), position.clone())
+            .export()
+            .unwrap()
+            .snapshot()
+            .identity();
+        let deadline = Deadline {
+            clock: ClockDomain(ProcessEpoch(3)),
+            at: MonotonicTick(u64::MAX),
+        };
+        let parent = QuestionEnvelope {
+            id: ReciprocalQuestionId {
+                authority,
+                sequence: 1,
+            },
+            parent: None,
+            sender: SearchRecipient::Proposer,
+            recipient: SearchRecipient::Researcher,
+            purpose: QuestionPurpose::TacticalReview,
+            anchor,
+            anchor_root_ply: ChessPly(0),
+            original_first_move: None,
+            prefix_digest: Digest([1; 32]),
+            line_digest: None,
+            line_offset: ChessPly(0),
+            question_digest: Digest([2; 32]),
+            view: ReviewViewSeal {
+                authority,
+                view_sequence: 1,
+                context_policy: Digest([3; 32]),
+                view_digest: Digest([4; 32]),
+                root_state: anchor,
+                actual_tokens: 8,
+                selected_records: 1,
+                anchors: 1,
+                length_bucket: 8,
+            },
+            evidence_revision: 1,
+            root_budget: Digest([5; 32]),
+            original_deadline: deadline,
+        };
+        let job = CpuJobEnvelope {
+            id: CpuJobId {
+                authority,
+                sequence: 1,
+            },
+            state_identity: anchor,
+            question: parent.question_digest,
+            root_restriction: Digest([6; 32]),
+            evaluation_namespace: Digest([7; 32]),
+            search_conditions: Digest([8; 32]),
+            total_native_node_credit: 100_000,
+            hard_deadline: deadline,
+        };
+        let owner = CpuWorkerId(0);
+        let mailbox = Arc::new(CpuControlMailbox::new(
+            CpuMailboxScope { job: job.id, owner },
+            rz_runtime::CompletionSignal::default(),
+        ));
+        (
+            CpuReciprocalScope {
+                job,
+                owner,
+                parent,
+                recipient: SearchRecipient::Critic,
+                max_questions: 1,
+                node_interval: 1,
+            },
+            mailbox,
+            CpuLimits {
+                deadline: Some(Instant::now() + Duration::from_secs(60)),
+                ..limits(100_000)
+            },
+        )
+    }
+
+    fn reciprocal_reply(
+        request: &CpuReciprocalRequest,
+        preferred: Vec<BoardMove>,
+    ) -> CpuReciprocalReply {
+        let anchor = rz_position::contracts::ContractPosition::new(
+            rz_contracts::OwnerId(9),
+            request.position().clone(),
+        )
+        .export()
+        .unwrap();
+        let mut question = request.scope().parent;
+        question.parent = Some(question.id);
+        question.id.sequence += u64::from(request.ordinal());
+        question.sender = rz_contracts::rovent::SearchRecipient::Researcher;
+        question.recipient = request.scope().recipient;
+        question.anchor = anchor.snapshot().identity();
+        question.anchor_root_ply.0 += request.ply();
+        question.question_digest = rz_contracts::Digest([9; 32]);
+        CpuReciprocalReply::new(request, question, &anchor, preferred).unwrap()
+    }
+
+    #[test]
+    fn reciprocal_empty_reply_resumes_saved_node_without_replay_or_score_fabrication() {
+        let position = Position::startpos();
+        let (scope, mailbox, bounded) = reciprocal_fixture(&position);
+        let mut baseline = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let expected = baseline
+            .analyze(&position, bounded, &AtomicBool::new(false))
+            .unwrap();
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let first = engine
+            .analyze_controlled_reciprocal(
+                &position,
+                None,
+                bounded,
+                &AtomicBool::new(false),
+                &CpuSliceControl::new(100_000, None, mailbox.clone()).unwrap(),
+                None,
+                &scope,
+                None,
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            first.controlled.report.completion,
+            CpuCompletion::AwaitReciprocal
+        );
+        assert_eq!(first.controlled.report.nodes, 1);
+        assert_eq!(first.controlled.report.completed_depth, 0);
+        assert_eq!(
+            first.controlled.report.score_scope,
+            CpuScoreScope::FrontierOnly
+        );
+        assert_eq!(first.controlled.yield_cause, None);
+        let token = first.controlled.report.resume.unwrap();
+        let request = first.request.unwrap();
+        assert!(request.relative_prefix().is_empty());
+        let reply = reciprocal_reply(&request, Vec::new());
+        let remaining = CpuLimits {
+            max_nodes: bounded.max_nodes - 1,
+            ..bounded
+        };
+        let done = engine
+            .analyze_controlled_reciprocal(
+                &position,
+                None,
+                remaining,
+                &AtomicBool::new(false),
+                &CpuSliceControl::new(100_000, None, mailbox).unwrap(),
+                Some(&token),
+                &scope,
+                Some(&reply),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(done.controlled.report.completion, CpuCompletion::DepthLimit);
+        assert!(done.request.is_none());
+        assert_eq!(
+            first.controlled.report.nodes + done.controlled.report.nodes,
+            expected.nodes
+        );
+        assert_eq!(
+            (
+                done.controlled.report.best_move,
+                done.controlled.report.score,
+                done.controlled.report.pv
+            ),
+            (expected.best_move, expected.score, expected.pv)
+        );
+        assert!(!engine.token_is_current(&token));
+        assert!(
+            engine
+                .validate_reciprocal_resume(Some(&token), &scope, Some(&reply))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reciprocal_response_is_consumed_in_actual_ordering_and_plain_resume_is_rejected() {
+        let position = Position::startpos();
+        let (scope, mailbox, bounded) = reciprocal_fixture(&position);
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let first = engine
+            .analyze_controlled_reciprocal(
+                &position,
+                None,
+                bounded,
+                &AtomicBool::new(false),
+                &CpuSliceControl::new(100_000, None, mailbox.clone()).unwrap(),
+                None,
+                &scope,
+                None,
+                |_| {},
+            )
+            .unwrap();
+        let token = first.controlled.report.resume.unwrap();
+        let request = first.request.unwrap();
+        let preferred = *request.candidates().last().unwrap();
+        let reply = reciprocal_reply(&request, vec![preferred]);
+        assert!(
+            engine
+                .analyze_controlled(
+                    &position,
+                    None,
+                    bounded,
+                    &AtomicBool::new(false),
+                    &CpuSliceControl::new(1, None, mailbox.clone()).unwrap(),
+                    Some(&token),
+                    |_| {}
+                )
+                .is_err()
+        );
+        assert!(engine.token_is_current(&token));
+        let next = engine
+            .analyze_controlled_reciprocal(
+                &position,
+                None,
+                CpuLimits {
+                    max_nodes: bounded.max_nodes - 1,
+                    ..bounded
+                },
+                &AtomicBool::new(false),
+                &CpuSliceControl::new(1, None, mailbox).unwrap(),
+                Some(&token),
+                &scope,
+                Some(&reply),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(next.controlled.report.completion, CpuCompletion::Yielded);
+        assert_eq!(
+            engine.paused.as_ref().unwrap().frames[0].moves[0],
+            preferred
+        );
+        assert!(next.request.is_none());
+        assert_eq!(next.controlled.report.completed_depth, 0);
+        assert_eq!(next.controlled.report.nodes, 1);
+    }
+
+    #[test]
+    fn reciprocal_wrong_owner_context_or_foreign_reply_preserves_live_token() {
+        let position = Position::startpos();
+        let (scope, mailbox, bounded) = reciprocal_fixture(&position);
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let first = engine
+            .analyze_controlled_reciprocal(
+                &position,
+                None,
+                bounded,
+                &AtomicBool::new(false),
+                &CpuSliceControl::new(100_000, None, mailbox.clone()).unwrap(),
+                None,
+                &scope,
+                None,
+                |_| {},
+            )
+            .unwrap();
+        let token = first.controlled.report.resume.unwrap();
+        let request = first.request.unwrap();
+        let reply = reciprocal_reply(&request, Vec::new());
+        assert!(
+            engine
+                .validate_reciprocal_resume(Some(&token), &scope, None)
+                .is_err()
+        );
+        let mut changed = scope.clone();
+        changed.owner.0 += 1;
+        assert!(
+            engine
+                .validate_reciprocal_resume(Some(&token), &changed, Some(&reply))
+                .is_err()
+        );
+        let mut changed = scope.clone();
+        changed.parent.view.view_sequence += 1;
+        assert!(
+            engine
+                .validate_reciprocal_resume(Some(&token), &changed, Some(&reply))
+                .is_err()
+        );
+        let mut foreign = reply.clone();
+        foreign.request.seal = Arc::new(());
+        assert!(
+            engine
+                .validate_reciprocal_resume(Some(&token), &scope, Some(&foreign))
+                .is_err()
+        );
+        let mut wrong_prefix = reply.clone();
+        wrong_prefix
+            .request
+            .relative_prefix
+            .push("e2e4".parse().unwrap());
+        assert!(
+            engine
+                .validate_reciprocal_resume(Some(&token), &scope, Some(&wrong_prefix))
+                .is_err()
+        );
+        assert!(engine.token_is_current(&token));
+        let canceled = engine
+            .analyze_controlled_reciprocal(
+                &position,
+                None,
+                CpuLimits {
+                    max_nodes: bounded.max_nodes - 1,
+                    ..bounded
+                },
+                &AtomicBool::new(true),
+                &CpuSliceControl::new(10, None, mailbox).unwrap(),
+                Some(&token),
+                &scope,
+                Some(&reply),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            canceled.controlled.report.completion,
+            CpuCompletion::Canceled
+        );
+        assert_eq!(canceled.controlled.report.nodes, 0);
+        assert!(canceled.request.is_none());
+        assert!(!engine.token_is_current(&token));
+    }
+
+    #[test]
+    fn reciprocal_nested_anchor_is_actual_rules_state_and_illegal_reply_is_rejected() {
+        let position = Position::startpos();
+        let (mut scope, mailbox, bounded) = reciprocal_fixture(&position);
+        scope.max_questions = 3;
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let mut token = None;
+        let mut reply = None;
+        let mut spent = 0;
+        let mut nested = None;
+        for _ in 0..3 {
+            let next = engine
+                .analyze_controlled_reciprocal(
+                    &position,
+                    None,
+                    CpuLimits {
+                        max_nodes: bounded.max_nodes - spent,
+                        ..bounded
+                    },
+                    &AtomicBool::new(false),
+                    &CpuSliceControl::new(100_000, None, mailbox.clone()).unwrap(),
+                    token.as_ref(),
+                    &scope,
+                    reply.as_ref(),
+                    |_| {},
+                )
+                .unwrap();
+            spent += next.controlled.report.nodes;
+            token = next.controlled.report.resume;
+            let request = next.request.unwrap();
+            reply = Some(reciprocal_reply(&request, Vec::new()));
+            nested = Some(request);
+        }
+        let request = nested.unwrap();
+        assert_eq!(request.ply(), 1);
+        assert_eq!(request.relative_prefix().len(), usize::from(request.ply()));
+        let mut replayed = position.clone();
+        for &movement in request.relative_prefix() {
+            replayed.make_move(movement).unwrap();
+        }
+        assert!(
+            replayed
+                .snapshot()
+                .same_state(&request.position().snapshot())
+        );
+        assert!(
+            !request
+                .position()
+                .snapshot()
+                .same_state(&position.snapshot())
+        );
+        let reply = reciprocal_reply(&request, Vec::new());
+        let root_anchor = rz_position::contracts::ContractPosition::new(
+            rz_contracts::OwnerId(9),
+            position.clone(),
+        )
+        .export()
+        .unwrap();
+        assert!(
+            CpuReciprocalReply::new(&request, reply.question(), &root_anchor, Vec::new()).is_err()
+        );
+        let exact_anchor = rz_position::contracts::ContractPosition::new(
+            rz_contracts::OwnerId(9),
+            request.position().clone(),
+        )
+        .export()
+        .unwrap();
+        let movement = request.candidates()[0];
+        assert!(
+            CpuReciprocalReply::new(
+                &request,
+                reply.question(),
+                &exact_anchor,
+                vec![movement, movement]
+            )
+            .is_err()
+        );
+        engine.clear();
+        assert!(engine.pending_reciprocal_request().is_none());
+    }
+
+    #[test]
+    fn reciprocal_does_not_issue_unresumable_question_after_last_job_node() {
+        let position = Position::startpos();
+        let (mut scope, mailbox, bounded) = reciprocal_fixture(&position);
+        scope.job.total_native_node_credit = 1;
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let done = engine
+            .analyze_controlled_reciprocal(
+                &position,
+                None,
+                CpuLimits {
+                    max_nodes: 1,
+                    ..bounded
+                },
+                &AtomicBool::new(false),
+                &CpuSliceControl::new(1, None, mailbox).unwrap(),
+                None,
+                &scope,
+                None,
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(done.controlled.report.completion, CpuCompletion::NodeLimit);
+        assert_eq!(done.controlled.report.nodes, 1);
+        assert!(done.controlled.report.resume.is_none());
+        assert!(done.request.is_none());
+        assert!(engine.paused_stack_bytes().is_none());
+    }
+
+    #[test]
+    fn reciprocal_prefix_excludes_job_history_and_resumes_without_recharging_that_path() {
+        let mut position = Position::startpos();
+        // Retain four actual history moves without introducing a tactical
+        // checked qsearch frontier into this path-ownership regression.
+        position
+            .apply_uci_moves(&["g1f3", "g8f6", "f3g1", "f6g8"])
+            .unwrap();
+        let original = position.snapshot();
+        let (mut scope, mailbox, bounded) = reciprocal_fixture(&position);
+        scope.parent.anchor_root_ply = rz_contracts::rovent::ChessPly(4);
+        scope.max_questions = 3;
+        let mut baseline = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let expected = baseline
+            .analyze(&position, bounded, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(
+            expected.completion,
+            CpuCompletion::DepthLimit,
+            "the unchanged qsearch profile must complete this quiet baseline fixture"
+        );
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let mut token = None;
+        let mut reply = None;
+        let mut spent = 0;
+        let mut deepest_prefix = Vec::new();
+        for _ in 0..4 {
+            let next = engine
+                .analyze_controlled_reciprocal(
+                    &position,
+                    None,
+                    CpuLimits {
+                        max_nodes: bounded.max_nodes - spent,
+                        ..bounded
+                    },
+                    &AtomicBool::new(false),
+                    &CpuSliceControl::new(100_000, None, mailbox.clone()).unwrap(),
+                    token.as_ref(),
+                    &scope,
+                    reply.as_ref(),
+                    |_| {},
+                )
+                .unwrap();
+            spent += next.controlled.report.nodes;
+            if let Some(request) = next.request {
+                assert_eq!(request.relative_prefix().len(), usize::from(request.ply()));
+                let mut replayed = position.clone();
+                for &movement in request.relative_prefix() {
+                    replayed.make_move(movement).unwrap();
+                }
+                assert!(
+                    replayed
+                        .snapshot()
+                        .same_state(&request.position().snapshot())
+                );
+                assert_eq!(
+                    request.position().known_history_len(),
+                    position.known_history_len() + request.relative_prefix().len()
+                );
+                deepest_prefix = request.relative_prefix().to_vec();
+                token = next.controlled.report.resume;
+                reply = Some(reciprocal_reply(&request, Vec::new()));
+            } else {
+                assert_eq!(next.controlled.report.completion, expected.completion);
+                assert_eq!(spent, expected.nodes);
+                assert_eq!(
+                    (
+                        next.controlled.report.best_move,
+                        next.controlled.report.score,
+                        next.controlled.report.pv
+                    ),
+                    (expected.best_move, expected.score, expected.pv)
+                );
+                assert_eq!(deepest_prefix.len(), 1);
+                assert!(position.snapshot().same_state(&original));
+                return;
+            }
+        }
+        panic!("bounded reciprocal queries failed to complete the original traversal");
     }
 
     #[test]
@@ -1314,6 +2338,7 @@ mod tests {
             None,
             position.ordered_legal_moves().moves().to_vec(),
             limits(1),
+            None,
             None,
         )
         .unwrap();
@@ -2281,6 +3306,7 @@ mod tests {
                 Some(&moves),
                 legal,
                 limits(100_000),
+                None,
                 None,
             )
             .unwrap();

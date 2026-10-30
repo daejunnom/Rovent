@@ -38,7 +38,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.post_repair_recheck != PostRepairRecheckPolicy::IterativeFrozenModelWdlV2 {
             return true;
         }
-        let count = self.repair_counts.entry(movement).or_default();
+        let count = self.semantic.repair_counts.entry(movement).or_default();
         if *count >= MAX_REPAIRS_PER_FIRST {
             return false;
         }
@@ -83,16 +83,18 @@ impl<M: RoleModel> PalsEngine<M> {
             work.repair_record_revision,
             work.repaired.clone(),
         );
-        if !self.repair_questions.insert(question) {
+        if !self.semantic.repair_questions.insert(question) {
             counters.repair_queue_deduplicated += 1;
             return Ok(false);
         }
-        if self.repair_queue.len() >= MAX_PENDING_REPAIRS {
+        if self.semantic.repair_queue.len() >= MAX_PENDING_REPAIRS {
             return Err(PalsError::Capacity);
         }
-        self.repair_queue.push_back(work);
+        self.semantic.repair_queue.push_back(work);
         counters.repair_queue_enqueued += 1;
-        counters.repair_queue_peak = counters.repair_queue_peak.max(self.repair_queue.len());
+        counters.repair_queue_peak = counters
+            .repair_queue_peak
+            .max(self.semantic.repair_queue.len());
         Ok(true)
     }
 
@@ -119,12 +121,13 @@ impl<M: RoleModel> PalsEngine<M> {
                 if !self.held_cpu_repair_priority(root, first, limits)? {
                     break;
                 }
-                self.repair_queue
+                self.semantic
+                    .repair_queue
                     .iter()
                     .position(|work| work.root == root && work.original_first == first)
-                    .and_then(|index| self.repair_queue.remove(index))
+                    .and_then(|index| self.semantic.repair_queue.remove(index))
             } else {
-                self.repair_queue.pop_front()
+                self.semantic.repair_queue.pop_front()
             };
             let Some(work) = next else {
                 break;
@@ -170,7 +173,7 @@ impl<M: RoleModel> PalsEngine<M> {
             else {
                 continue;
             };
-            let revision = self.revision;
+            let revision = self.semantic.revision;
             if counters.accepted_repair_outputs > before {
                 self.observe_accepted_repair(
                     work.root,
@@ -227,7 +230,7 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
     ) -> Result<bool, PalsError> {
-        let record_revision = self.revision;
+        let record_revision = self.semantic.revision;
         let mut observed = IterativeRepairObservation::default();
         let result = self.publish_iterative_repair_impl(
             work,
@@ -243,7 +246,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let comparison = self.observe_frozen_comparison(
             frontier.counter_leaf,
             Some(repaired_leaf),
-            self.nodes[work.root].position.side_to_move(),
+            self.semantic.nodes[work.root].position.side_to_move(),
             observed.comparison_attempted,
             observed.comparable,
             observed.publication,
@@ -273,17 +276,17 @@ impl<M: RoleModel> PalsEngine<M> {
             return Ok(false);
         }
         self.validate_checker_namespace()?;
-        let root = &self.nodes[work.root];
+        let root = &self.semantic.nodes[work.root];
         let root_state = root.state;
         let root_situation = root.situation;
         let root_color = root.position.side_to_move();
-        let generation = self.stores.generation();
-        let current = self.stores.situations.get(root_situation)?;
+        let generation = self.semantic.stores.generation();
+        let current = self.semantic.stores.situations.get(root_situation)?;
         let root_revision = current.revision;
-        if self.stores.root() != Some(root_situation)
+        if self.semantic.stores.root() != Some(root_situation)
             || repaired.first() != Some(&work.original_first)
-            || self.stores.lines.get(repaired_line)?.start_state != root_state
-            || self.stores.lines.moves(repaired_line)? != repaired
+            || self.semantic.stores.lines.get(repaired_line)?.start_state != root_state
+            || self.semantic.stores.lines.moves(repaired_line)? != repaired
             || current
                 .conclusions
                 .get(work.repaired_line)
@@ -294,10 +297,10 @@ impl<M: RoleModel> PalsEngine<M> {
         {
             return Err(StoreError::StaleConsumer.into());
         }
-        let context_revision = self.revision;
+        let context_revision = self.semantic.revision;
         let terminals = (
-            self.nodes[frontier.counter_leaf].terminal,
-            self.nodes[repaired_leaf].terminal,
+            self.semantic.nodes[frontier.counter_leaf].terminal,
+            self.semantic.nodes[repaired_leaf].terminal,
         );
         match terminals {
             (None, None) => {
@@ -311,8 +314,10 @@ impl<M: RoleModel> PalsEngine<M> {
                     cancel,
                     counters,
                 )?;
-                if self.nodes[frontier.counter_leaf].model_value_revision != Some(context_revision)
-                    || self.nodes[repaired_leaf].model_value_revision != Some(context_revision)
+                if self.semantic.nodes[frontier.counter_leaf].model_value_revision
+                    != Some(context_revision)
+                    || self.semantic.nodes[repaired_leaf].model_value_revision
+                        != Some(context_revision)
                 {
                     counters.frozen_wdl_unresolved += 1;
                     return Ok(false);
@@ -327,10 +332,16 @@ impl<M: RoleModel> PalsEngine<M> {
         if self.stopped(limits, cancel).is_some() {
             return Ok(false);
         }
-        if self.revision != context_revision
-            || self.stores.root() != Some(root_situation)
-            || self.stores.generation() != generation
-            || self.stores.situations.get(root_situation)?.revision != root_revision
+        if self.semantic.revision != context_revision
+            || self.semantic.stores.root() != Some(root_situation)
+            || self.semantic.stores.generation() != generation
+            || self
+                .semantic
+                .stores
+                .situations
+                .get(root_situation)?
+                .revision
+                != root_revision
         {
             return Err(StoreError::StaleConsumer.into());
         }
@@ -358,10 +369,10 @@ impl<M: RoleModel> PalsEngine<M> {
             RawScore::ConditionalRepairWdl {
                 expectation: after,
                 perspective: root_color,
-                before: self.nodes[frontier.counter_leaf]
+                before: self.semantic.nodes[frontier.counter_leaf]
                     .model_observation
                     .ok_or(RoleError::Unavailable)?,
-                after: self.nodes[repaired_leaf]
+                after: self.semantic.nodes[repaired_leaf]
                     .model_observation
                     .ok_or(RoleError::Unavailable)?,
                 context_revision,
@@ -374,7 +385,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 source: stable_id(self.search_identity()),
                 epoch: 0,
                 scope: EvidenceScope::Model {
-                    model: stable_id(self.model.identity()),
+                    model: stable_id(self.semantic.model.identity()),
                     encoding: stable_id("pals-frozen-wdl-conditional-repair/2"),
                     input: context_revision,
                 },
@@ -456,13 +467,16 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     pub(super) fn endpoint_expectation(&self, node: usize, root_color: Color) -> Option<f32> {
-        let node = &self.nodes[node];
+        let node = &self.semantic.nodes[node];
         let value = if let Some((_, value)) = node.terminal {
             value.signum() as f32
         } else {
             let output = node.model_value.as_ref()?;
             output
-                .validate(&node.position, self.model_registered_value.as_ref()?)
+                .validate(
+                    &node.position,
+                    self.semantic.model_registered_value.as_ref()?,
+                )
                 .ok()?;
             output.wdl[0] - output.wdl[2]
         };
@@ -487,27 +501,40 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.validate_checker_namespace()?;
         let root = self
+            .semantic
             .nodes
             .get(work.root)
             .ok_or(StoreError::InvalidHandle("WDL root"))?;
         let root_state = root.state;
         let root_situation = root.situation;
         let root_color = root.position.side_to_move();
-        let generation = self.stores.generation();
-        let root_revision = self.stores.situations.get(root_situation)?.revision;
-        if self.stores.root() != Some(root_situation)
+        let generation = self.semantic.stores.generation();
+        let root_revision = self
+            .semantic
+            .stores
+            .situations
+            .get(root_situation)?
+            .revision;
+        if self.semantic.stores.root() != Some(root_situation)
             || work.repaired.first() != Some(&work.original_first)
             || work.attack_ply >= work.repaired.len()
             || work.attack_ply >= work.refutation.len()
             || work.repaired[..=work.attack_ply] != work.refutation[..=work.attack_ply]
-            || self.stores.lines.get(work.repaired_line)?.start_state != root_state
-            || self.stores.lines.moves(work.repaired_line)? != work.repaired
+            || self
+                .semantic
+                .stores
+                .lines
+                .get(work.repaired_line)?
+                .start_state
+                != root_state
+            || self.semantic.stores.lines.moves(work.repaired_line)? != work.repaired
         {
             return Err(
                 StoreError::InvalidEvidence("frozen recheck line authority mismatch").into(),
             );
         }
         let record = self
+            .semantic
             .records
             .iter()
             .find(|record| {
@@ -523,7 +550,7 @@ impl<M: RoleModel> PalsEngine<M> {
         for movement in &work.repaired {
             let parent = *path.last().ok_or(StoreError::InvalidHandle("WDL path"))?;
             path.push(
-                self.nodes[parent]
+                self.semantic.nodes[parent]
                     .edges
                     .iter()
                     .find(|edge| edge.movement == *movement)
@@ -535,12 +562,13 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(StoreError::InvalidEvidence("WDL repaired endpoint mismatch").into());
         }
         let changed = (work.attack_ply + 1..work.repaired.len()).find(|&ply| {
-            self.nodes[path[ply]].position.side_to_move() == root_color
+            self.semantic.nodes[path[ply]].position.side_to_move() == root_color
                 && work.refutation.get(ply) != Some(&work.repaired[ply])
         });
         let Some(anchor_ply) = changed.and_then(|ply| {
-            (ply + 1..work.repaired.len())
-                .find(|&index| self.nodes[path[index]].position.side_to_move() != root_color)
+            (ply + 1..work.repaired.len()).find(|&index| {
+                self.semantic.nodes[path[index]].position.side_to_move() != root_color
+            })
         }) else {
             counters.frozen_wdl_unresolved += 1;
             return Ok(None);
@@ -558,23 +586,24 @@ impl<M: RoleModel> PalsEngine<M> {
             },
         )?;
         let identity = RecheckIdentity {
-            game_generation: self.game_generation.ok_or(PalsError::Capacity)?,
+            game_generation: self.semantic.game_generation.ok_or(PalsError::Capacity)?,
             search_generation: generation,
             root: root_situation,
             root_revision,
             repair_record_revision: work.repair_record_revision,
             repaired_line: work.repaired_line,
         };
-        let root_snapshot = self.nodes[work.root].position.snapshot();
-        let anchor_snapshot = self.nodes[anchor].position.snapshot();
-        let repaired_snapshot = self.nodes[work.repaired_leaf].position.snapshot();
-        let examined: Vec<_> = self.nodes[anchor]
+        let root_snapshot = self.semantic.nodes[work.root].position.snapshot();
+        let anchor_snapshot = self.semantic.nodes[anchor].position.snapshot();
+        let repaired_snapshot = self.semantic.nodes[work.repaired_leaf].position.snapshot();
+        let examined: Vec<_> = self.semantic.nodes[anchor]
             .edges
             .iter()
             .map(|edge| edge.movement)
             .collect();
         let deadline_tick = self.tick_at(limits.deadline);
         let previous = self
+            .semantic
             .stores
             .situations
             .get(root_situation)?
@@ -583,13 +612,13 @@ impl<M: RoleModel> PalsEngine<M> {
             .and_then(|c| c.evidence);
         let mut trace = RecheckProgress::default();
         let mut comparison_attempted = false;
-        let prepared = self.model.recheck_prepared(RecheckPrepared {
+        let prepared = self.semantic.model.recheck_prepared(RecheckPrepared {
             policy: self.post_repair_recheck,
             identity,
             root_state,
             root_snapshot: &root_snapshot,
-            anchor_state: self.nodes[anchor].state,
-            anchor_situation: self.nodes[anchor].situation,
+            anchor_state: self.semantic.nodes[anchor].state,
+            anchor_situation: self.semantic.nodes[anchor].situation,
             anchor_snapshot: &anchor_snapshot,
             anchor_ply,
             examined_responses: &examined,
@@ -598,17 +627,17 @@ impl<M: RoleModel> PalsEngine<M> {
             repaired: &work.repaired,
             refutation: &work.refutation,
             repaired_endpoint: Self::frozen_endpoint(
-                &self.nodes[work.repaired_leaf],
-                &self.stores,
+                &self.semantic.nodes[work.repaired_leaf],
+                &self.semantic.stores,
                 &repaired_snapshot,
-                self.revision,
+                self.semantic.revision,
             ),
             limits,
             deadline_tick,
             cancel,
             config: &self.config,
-            checker_identity: &self.checker_registered_identity,
-            cpu_condition: &self.cpu_registered_condition,
+            checker_identity: &self.researcher.checker_registered_identity,
+            cpu_condition: &self.researcher.cpu_registered_condition,
         });
         let mut new_frontier = None;
         let mut result = if let Err(error) = prepared {
@@ -646,7 +675,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 trace
                     .counterline
                     .extend_from_slice(&work.repaired[..anchor_ply]);
-                let mut state = self.nodes[anchor].position.clone();
+                let mut state = self.semantic.nodes[anchor].position.clone();
                 state.make_move(response)?;
                 let response_node =
                     self.connect_checked(anchor, response, state, counters, limits, cancel)?;
@@ -655,7 +684,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 let mut leaf = response_node;
                 trace.counter_leaf = Some(leaf);
                 while trace.counterline.len() < work.repaired.len()
-                    && self.nodes[leaf].terminal.is_none()
+                    && self.semantic.nodes[leaf].terminal.is_none()
                     && self.stopped(limits, cancel).is_none()
                 {
                     let ranked = self.ranked(
@@ -671,7 +700,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     let Some(movement) = ranked.first().copied() else {
                         break;
                     };
-                    let mut position = self.nodes[leaf].position.clone();
+                    let mut position = self.semantic.nodes[leaf].position.clone();
                     position.make_move(movement)?;
                     leaf =
                         self.connect_checked(leaf, movement, position, counters, limits, cancel)?;
@@ -703,7 +732,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     cancel,
                 )?;
                 self.verify_checked_cpu(leaf, &trace.counterline, limits, cancel, counters)?;
-                let comparison_revision = self.revision;
+                let comparison_revision = self.semantic.revision;
                 comparison_attempted = true;
                 // Both Fresh invocations see exactly the same public-record revision.
                 // They have different target states, not a shared raw input/cache key.
@@ -716,30 +745,38 @@ impl<M: RoleModel> PalsEngine<M> {
                     cancel,
                     counters,
                 )?;
-                if self.revision != comparison_revision
-                    || self.stores.root() != Some(root_situation)
-                    || self.stores.generation() != generation
-                    || self.stores.situations.get(root_situation)?.revision != root_revision
+                if self.semantic.revision != comparison_revision
+                    || self.semantic.stores.root() != Some(root_situation)
+                    || self.semantic.stores.generation() != generation
+                    || self
+                        .semantic
+                        .stores
+                        .situations
+                        .get(root_situation)?
+                        .revision
+                        != root_revision
                 {
                     return Err(StoreError::StaleConsumer.into());
                 }
                 self.validate_checker_namespace()?;
                 trace.comparable = match (
-                    self.nodes[work.repaired_leaf].terminal,
-                    self.nodes[leaf].terminal,
+                    self.semantic.nodes[work.repaired_leaf].terminal,
+                    self.semantic.nodes[leaf].terminal,
                 ) {
                     (Some(_), Some(_)) => true,
                     (None, None) => {
-                        self.nodes[work.repaired_leaf].model_value_revision
+                        self.semantic.nodes[work.repaired_leaf].model_value_revision
                             == Some(comparison_revision)
-                            && self.nodes[leaf].model_value_revision == Some(comparison_revision)
-                            && self.nodes[work.repaired_leaf]
+                            && self.semantic.nodes[leaf].model_value_revision
+                                == Some(comparison_revision)
+                            && self.semantic.nodes[work.repaired_leaf]
                                 .model_value
                                 .as_ref()
-                                .zip(self.nodes[leaf].model_value.as_ref())
+                                .zip(self.semantic.nodes[leaf].model_value.as_ref())
                                 .is_some_and(|(a, b)| {
                                     a.identity == b.identity
-                                        && Some(&a.identity) == self.model_registered_value.as_ref()
+                                        && Some(&a.identity)
+                                            == self.semantic.model_registered_value.as_ref()
                                 })
                     }
                     _ => false,
@@ -793,14 +830,15 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         let counter_snapshot = trace
             .counter_leaf
-            .map(|node| self.nodes[node].position.snapshot());
+            .map(|node| self.semantic.nodes[node].position.snapshot());
         let publication = match trace
             .publication
             .map(|id| -> Result<_, PalsError> {
                 Ok(RecheckPublication {
                     observation_id: id,
-                    observation: self.stores.observations.get(id)?,
+                    observation: self.semantic.stores.observations.get(id)?,
                     conclusion: *self
+                        .semantic
                         .stores
                         .situations
                         .get(root_situation)?
@@ -819,7 +857,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 None
             }
         };
-        let finish = self.model.recheck_finished(RecheckFinished {
+        let finish = self.semantic.model.recheck_finished(RecheckFinished {
             policy: self.post_repair_recheck,
             identity,
             prepared_accepted: trace.prepared_accepted,
@@ -831,14 +869,19 @@ impl<M: RoleModel> PalsEngine<M> {
             full_suffix_replayed: false,
             counterline_completed: trace.counterline_completed,
             repaired_endpoint: Self::frozen_endpoint(
-                &self.nodes[work.repaired_leaf],
-                &self.stores,
+                &self.semantic.nodes[work.repaired_leaf],
+                &self.semantic.stores,
                 &repaired_snapshot,
-                self.revision,
+                self.semantic.revision,
             ),
             counter_endpoint: trace.counter_leaf.zip(counter_snapshot.as_ref()).map(
                 |(node, snapshot)| {
-                    Self::frozen_endpoint(&self.nodes[node], &self.stores, snapshot, self.revision)
+                    Self::frozen_endpoint(
+                        &self.semantic.nodes[node],
+                        &self.semantic.stores,
+                        snapshot,
+                        self.semantic.revision,
+                    )
                 },
             ),
             comparable: trace.comparable,
@@ -850,7 +893,8 @@ impl<M: RoleModel> PalsEngine<M> {
             cancel,
         });
         if let Err(error) = finish {
-            self.last_recheck_observer_error
+            self.semantic
+                .last_recheck_observer_error
                 .get_or_insert_with(|| error.clone());
             if result.is_ok() {
                 result = Err(error.into());
@@ -910,34 +954,34 @@ impl<M: RoleModel> PalsEngine<M> {
         limits: PalsLimits,
         cancel: &AtomicBool,
     ) -> Result<ObservationId, PalsError> {
-        let score = if self.nodes[counter_leaf].terminal.is_some() {
+        let score = if self.semantic.nodes[counter_leaf].terminal.is_some() {
             RawScore::Estimate {
                 value: expectation,
-                perspective: self.nodes[work.root].position.side_to_move(),
+                perspective: self.semantic.nodes[work.root].position.side_to_move(),
             }
         } else {
             RawScore::ConditionalWdl {
                 expectation,
-                perspective: self.nodes[work.root].position.side_to_move(),
-                repaired: self.nodes[work.repaired_leaf]
+                perspective: self.semantic.nodes[work.root].position.side_to_move(),
+                repaired: self.semantic.nodes[work.repaired_leaf]
                     .model_observation
                     .ok_or(RoleError::Unavailable)?,
-                counter: self.nodes[counter_leaf]
+                counter: self.semantic.nodes[counter_leaf]
                     .model_observation
                     .ok_or(RoleError::Unavailable)?,
-                context_revision: self.revision,
+                context_revision: self.semantic.revision,
             }
         };
         self.append_engine_observation_with_controls(
             Observation {
-                state: self.nodes[work.root].state,
+                state: self.semantic.nodes[work.root].state,
                 line: Some(work.repaired_line),
                 source: stable_id(self.search_identity()),
                 epoch: 0,
                 scope: EvidenceScope::Model {
-                    model: stable_id(self.model.identity()),
+                    model: stable_id(self.semantic.model.identity()),
                     encoding: stable_id("pals-frozen-wdl-conditional-line/2"),
-                    input: self.revision,
+                    input: self.semantic.revision,
                 },
                 score,
                 value_identity: None,
@@ -1185,6 +1229,7 @@ mod tests {
         // queue-order check; the selected first still exercises real followups.
         assert!(selected.admit_iterative_repair(work.original_first));
         selected
+            .semantic
             .repair_counts
             .insert(other.original_first, MAX_REPAIRS_PER_FIRST);
         selected
@@ -1199,7 +1244,14 @@ mod tests {
         let held = selected.held_cpu_task.as_ref().unwrap();
         assert!(held.prefix.is_empty());
         let previous = held.execution;
-        let original_key = selected.stores.tasks.get(previous).unwrap().key.clone();
+        let original_key = selected
+            .semantic
+            .stores
+            .tasks
+            .get(previous)
+            .unwrap()
+            .key
+            .clone();
         let mut resumed_before_return = false;
         let mut progress = |_: BoardMove, stores: &PalsStores, _: &[RoleRecord]| {
             resumed_before_return |= (0..stores.tasks.len()).any(|index| {
@@ -1212,11 +1264,12 @@ mod tests {
             .unwrap();
         assert!(resumed_before_return);
         assert_eq!(
-            selected.model.finished_lines.first(),
+            selected.semantic.model.finished_lines.first(),
             Some(&work.repaired_line)
         );
         assert!(
             selected
+                .semantic
                 .model
                 .finished_lines
                 .iter()
@@ -1224,6 +1277,7 @@ mod tests {
         );
         assert_eq!(
             selected
+                .semantic
                 .repair_queue
                 .iter()
                 .map(|work| work.repaired_line)
@@ -1231,7 +1285,7 @@ mod tests {
             pending
         );
         assert!(counters.accepted_repair_outputs > 0);
-        assert!(selected.repair_counts[&work.original_first] <= MAX_REPAIRS_PER_FIRST);
+        assert!(selected.semantic.repair_counts[&work.original_first] <= MAX_REPAIRS_PER_FIRST);
         let enqueued = counters.repair_queue_enqueued;
         let role_calls = counters.role_calls;
         selected
@@ -1240,17 +1294,25 @@ mod tests {
         assert_eq!(counters.repair_queue_deduplicated, 1);
         assert_eq!(counters.repair_queue_enqueued, enqueued);
         assert_eq!(counters.role_calls, role_calls);
-        let before_public_drain = selected.model.finished_lines.len();
+        let before_public_drain = selected.semantic.model.finished_lines.len();
         selected
             .drain_repair_queue(budget, &cancel, &mut counters, &mut |_, _, _| {})
             .unwrap();
         assert_eq!(
-            &selected.model.finished_lines[before_public_drain..],
+            &selected.semantic.model.finished_lines[before_public_drain..],
             &pending
         );
-        assert!(selected.repair_queue.is_empty());
+        assert!(selected.semantic.repair_queue.is_empty());
         assert!(counters.cpu_nodes <= budget.max_cpu_nodes);
-        assert_eq!(selected.cpu.paused_stack_snapshot().unwrap().tokens_peak, 1);
+        assert_eq!(
+            selected
+                .researcher
+                .cpu
+                .paused_stack_snapshot()
+                .unwrap()
+                .tokens_peak,
+            1
+        );
         selected.discard_canceled_cpu_checkpoints().unwrap();
     }
 
@@ -1261,6 +1323,7 @@ mod tests {
         let work = accepted_repair(&mut selected, &mut counters);
         let other = other_first_repair(&mut selected, &mut counters);
         selected
+            .semantic
             .repair_counts
             .insert(work.original_first, MAX_REPAIRS_PER_FIRST);
         let budget = PalsLimits {
@@ -1299,11 +1362,15 @@ mod tests {
                 &mut |_, _, _| {},
             )
             .unwrap();
-        assert_eq!(selected.model.finished_lines, [work.repaired_line]);
-        assert_eq!(selected.repair_queue.len(), 1);
-        assert_eq!(selected.repair_queue[0].repaired_line, pending_line);
-        assert!((0..selected.stores.tasks.len()).any(|index| {
+        assert_eq!(selected.semantic.model.finished_lines, [work.repaired_line]);
+        assert_eq!(selected.semantic.repair_queue.len(), 1);
+        assert_eq!(
+            selected.semantic.repair_queue[0].repaired_line,
+            pending_line
+        );
+        assert!((0..selected.semantic.stores.tasks.len()).any(|index| {
             selected
+                .semantic
                 .stores
                 .tasks
                 .get(ExecutionId(index))
@@ -1329,7 +1396,7 @@ mod tests {
             selected
                 .verify_checked_cpu(work.root, &[], budget, &cancel, &mut counters)
                 .unwrap();
-            let token = selected.nodes[work.root].resume.clone().unwrap();
+            let token = selected.semantic.nodes[work.root].resume.clone().unwrap();
             cancel.store(canceled, Ordering::Release);
             let stopped_budget = if canceled {
                 budget
@@ -1353,20 +1420,20 @@ mod tests {
             selected
                 .drain_repair_queue(stopped_budget, &cancel, &mut counters, &mut |_, _, _| {})
                 .unwrap();
-            assert_eq!(selected.repair_queue.len(), 1);
+            assert_eq!(selected.semantic.repair_queue.len(), 1);
             assert_eq!(counters.repair_queue_deduplicated, 1);
             assert_eq!(counters.cpu_nodes, 8);
             assert_eq!(counters.critic_calls, 0);
-            assert!(selected.cpu.token_is_current(&token));
+            assert!(selected.researcher.cpu.token_is_current(&token));
             selected.discard_canceled_cpu_checkpoints().unwrap();
-            assert!(!selected.cpu.token_is_current(&token));
+            assert!(!selected.researcher.cpu.token_is_current(&token));
             assert!(selected.held_cpu_task.is_none());
             cancel.store(false, Ordering::Release);
             let next = accepted_repair(&mut selected, &mut counters);
             selected
                 .queue_or_recheck_frozen(next, budget, &cancel, &mut counters, &mut |_, _, _| {})
                 .unwrap();
-            assert_eq!(selected.repair_queue.len(), 2);
+            assert_eq!(selected.semantic.repair_queue.len(), 2);
             assert_eq!(counters.critic_calls, 0);
             assert_eq!(counters.cpu_nodes, 8);
         }
@@ -1383,7 +1450,10 @@ mod tests {
         let other = other_first_repair(&mut selected, &mut counters);
         let pending = [work.repaired_line, other.repaired_line];
         for first in [work.original_first, other.original_first] {
-            selected.repair_counts.insert(first, MAX_REPAIRS_PER_FIRST);
+            selected
+                .semantic
+                .repair_counts
+                .insert(first, MAX_REPAIRS_PER_FIRST);
         }
         let cancel = AtomicBool::new(false);
         let budget = limits();
@@ -1394,9 +1464,10 @@ mod tests {
         }
         assert_eq!(selected.cpu_interleave, CpuInterleavePolicy::ReplaceOnFresh);
         assert_eq!(counters.critic_calls, 0);
-        assert!(selected.model.finished_lines.is_empty());
+        assert!(selected.semantic.model.finished_lines.is_empty());
         assert_eq!(
             selected
+                .semantic
                 .repair_queue
                 .iter()
                 .map(|work| work.repaired_line)
@@ -1406,8 +1477,8 @@ mod tests {
         selected
             .drain_repair_queue(budget, &cancel, &mut counters, &mut |_, _, _| {})
             .unwrap();
-        assert_eq!(selected.model.finished_lines, pending);
-        assert!(selected.repair_queue.is_empty());
+        assert_eq!(selected.semantic.model.finished_lines, pending);
+        assert!(selected.semantic.repair_queue.is_empty());
     }
 
     #[test]
@@ -1459,14 +1530,23 @@ mod tests {
                 &mut counters,
             )
             .unwrap();
-        let token = engine.nodes[work.repaired_leaf].resume.clone().unwrap();
-        let (observation, previous) = engine.nodes[work.repaired_leaf]
+        let token = engine.semantic.nodes[work.repaired_leaf]
+            .resume
+            .clone()
+            .unwrap();
+        let (observation, previous) = engine.semantic.nodes[work.repaired_leaf]
             .evidence
             .as_ref()
             .unwrap()
             .provenance
             .unwrap();
-        let raw = engine.stores.observations.get(observation).unwrap().clone();
+        let raw = engine
+            .semantic
+            .stores
+            .observations
+            .get(observation)
+            .unwrap()
+            .clone();
         let root = work.root;
         // A same-node frontier visit is not the actual Repair/C barrier and
         // must neither resume nor charge the held original task early.
@@ -1483,13 +1563,13 @@ mod tests {
         assert_eq!(counters.cpu_nodes, 8);
         assert_eq!(counters.cpu_tasks_requested, requested);
         assert_eq!(engine.held_cpu_task.as_ref().unwrap().execution, previous);
-        assert!(engine.cpu.token_is_current(&token));
+        assert!(engine.researcher.cpu.token_is_current(&token));
         // A different fresh state runs in the real one-shot side owner before
         // C; it cannot invalidate the original task, token, TT or path.
         engine
             .verify_checked_cpu(root, &[], budget, &cancel, &mut counters)
             .unwrap();
-        assert!(engine.cpu.token_is_current(&token));
+        assert!(engine.researcher.cpu.token_is_current(&token));
         assert_eq!(counters.cpu_nodes, 16);
         let mut observed = false;
         engine
@@ -1513,21 +1593,37 @@ mod tests {
         assert_eq!(engine.search_identity(), PALS_CPU_INTERLEAVE_SEARCH_VERSION);
         assert_eq!(counters.cpu_nodes, 32);
         assert_eq!(counters.cpu_tasks_requested, 4);
-        assert!(!engine.cpu.token_is_current(&token));
-        let renewed = engine.nodes[work.repaired_leaf].resume.as_ref().unwrap();
-        assert!(engine.cpu.token_is_current(renewed));
+        assert!(!engine.researcher.cpu.token_is_current(&token));
+        let renewed = engine.semantic.nodes[work.repaired_leaf]
+            .resume
+            .as_ref()
+            .unwrap();
+        assert!(engine.researcher.cpu.token_is_current(renewed));
         assert_eq!(renewed.cumulative_work().unwrap().nodes, 16);
-        assert_eq!(engine.stores.observations.get(observation).unwrap(), &raw);
+        assert_eq!(
+            engine
+                .semantic
+                .stores
+                .observations
+                .get(observation)
+                .unwrap(),
+            &raw
+        );
         let side = engine.cpu_side_scope_snapshot().unwrap();
         assert_eq!((side.attempts, side.work.nodes), (2, 16));
         assert!(side.complete);
-        let owner = engine.cpu.paused_stack_snapshot().unwrap();
+        let owner = engine.researcher.cpu.paused_stack_snapshot().unwrap();
         assert_eq!(owner.tokens_peak, 1);
         assert_eq!(owner.replayed_consumed_work, 0);
         assert_eq!(owner.tokens_resumed, 1);
         engine.discard_canceled_cpu_checkpoints().unwrap();
         assert_eq!(
-            engine.cpu.paused_stack_snapshot().unwrap().tokens_retained,
+            engine
+                .researcher
+                .cpu
+                .paused_stack_snapshot()
+                .unwrap()
+                .tokens_retained,
             0
         );
     }
@@ -1576,7 +1672,10 @@ mod tests {
                 &mut counters,
             )
             .unwrap();
-        let token = engine.nodes[work.repaired_leaf].resume.clone().unwrap();
+        let token = engine.semantic.nodes[work.repaired_leaf]
+            .resume
+            .clone()
+            .unwrap();
         let previous = engine.held_cpu_task.as_ref().unwrap().execution;
         engine
             .verify_checked_cpu(work.root, &[], budget, &cancel, &mut counters)
@@ -1584,10 +1683,15 @@ mod tests {
         engine
             .frozen_recheck_once(&work, budget, &cancel, &mut counters, &mut |_, _, _| {})
             .unwrap();
-        assert!(engine.cpu.token_is_current(&token));
+        assert!(engine.researcher.cpu.token_is_current(&token));
         assert_eq!(engine.held_cpu_task.as_ref().unwrap().execution, previous);
         assert_eq!(
-            engine.cpu.paused_stack_snapshot().unwrap().tokens_resumed,
+            engine
+                .researcher
+                .cpu
+                .paused_stack_snapshot()
+                .unwrap()
+                .tokens_resumed,
             0
         );
         assert_eq!(counters.cpu_nodes, 23);
@@ -1657,6 +1761,7 @@ mod tests {
     ) -> RepairWork {
         let root_position = Position::startpos();
         engine
+            .semantic
             .stores
             .focus_actual_moves(root_position.snapshot())
             .unwrap();
@@ -1666,7 +1771,7 @@ mod tests {
             .unwrap();
         let mut leaf = root;
         for movement in &repaired {
-            let mut state = engine.nodes[leaf].position.clone();
+            let mut state = engine.semantic.nodes[leaf].position.clone();
             state.make_move(*movement).unwrap();
             leaf = engine.connect(leaf, *movement, state, counters).unwrap();
         }
@@ -1679,7 +1784,7 @@ mod tests {
             original_first: repaired[0],
             attack_ply: 1,
             repaired_line,
-            repair_record_revision: engine.revision,
+            repair_record_revision: engine.semantic.revision,
             repaired_leaf: leaf,
             repaired,
             refutation,
@@ -1760,12 +1865,12 @@ mod tests {
         }
         fn queue_state(selected: &PalsEngine<WdlFixture>, first: BoardMove) -> Value {
             json!({
-                "pending": selected.repair_queue.len(),
-                "dedup_questions": selected.repair_questions.len(),
-                "first_move_repairs": selected.repair_counts.get(&first).copied().unwrap_or(0),
-                "record_revision": selected.revision,
-                "records": selected.records.len(),
-                "mock_value_revisions": selected.model.revisions,
+                "pending": selected.semantic.repair_queue.len(),
+                "dedup_questions": selected.semantic.repair_questions.len(),
+                "first_move_repairs": selected.semantic.repair_counts.get(&first).copied().unwrap_or(0),
+                "record_revision": selected.semantic.revision,
+                "records": selected.semantic.records.len(),
+                "mock_value_revisions": selected.semantic.model.revisions,
             })
         }
         fn observed_work(
@@ -1780,9 +1885,9 @@ mod tests {
             counters.repair_queue_peak = 0;
             (
                 counters,
-                selected.model.revisions.clone(),
-                selected.revision,
-                selected.records.len(),
+                selected.semantic.model.revisions.clone(),
+                selected.semantic.revision,
+                selected.semantic.records.len(),
             )
         }
 
@@ -1816,22 +1921,29 @@ mod tests {
             assert_eq!(immediate_work.repaired, bounded_work.repaired);
             assert_eq!(immediate_work.refutation, bounded_work.refutation);
             assert!(
-                immediate.nodes[immediate_work.root]
-                    .position
-                    .snapshot()
-                    .same_state(&bounded.nodes[bounded_work.root].position.snapshot())
-            );
-            assert!(
-                immediate.nodes[immediate_work.repaired_leaf]
+                immediate.semantic.nodes[immediate_work.root]
                     .position
                     .snapshot()
                     .same_state(
-                        &bounded.nodes[bounded_work.repaired_leaf]
+                        &bounded.semantic.nodes[bounded_work.root]
                             .position
                             .snapshot()
                     )
             );
-            assert_eq!(immediate.model.identity, bounded.model.identity);
+            assert!(
+                immediate.semantic.nodes[immediate_work.repaired_leaf]
+                    .position
+                    .snapshot()
+                    .same_state(
+                        &bounded.semantic.nodes[bounded_work.repaired_leaf]
+                            .position
+                            .snapshot()
+                    )
+            );
+            assert_eq!(
+                immediate.semantic.model.identity,
+                bounded.semantic.model.identity
+            );
             assert_eq!(
                 immediate.config.max_role_calls,
                 bounded.config.max_role_calls
@@ -1864,7 +1976,7 @@ mod tests {
                     "attack_ply": work.attack_ply,
                     "repaired": work.repaired.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     "refutation": work.refutation.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    "root_fen": selected.nodes[work.root].position.to_fen(),
+                    "root_fen": selected.semantic.nodes[work.root].position.to_fen(),
                 });
                 let first_move = work.original_first;
                 let first = work.clone();
@@ -1931,12 +2043,14 @@ mod tests {
                     }
                     complete &= outcome.is_ok()
                         && stopped.is_none()
-                        && selected.repair_queue.len() <= MAX_PENDING_REPAIRS
+                        && selected.semantic.repair_queue.len() <= MAX_PENDING_REPAIRS
                         && selected
+                            .semantic
                             .repair_counts
                             .values()
                             .all(|count| *count <= MAX_REPAIRS_PER_FIRST)
                         && selected
+                            .semantic
                             .records
                             .iter()
                             .filter(|record| record.kind == RecordKind::Repair)
@@ -2044,7 +2158,7 @@ mod tests {
             );
             assert_eq!(counters.frozen_wdl_comparisons, 1);
             assert_eq!(counters.supported_refutations, 1);
-            let final_event = selected.model.finished.last().unwrap();
+            let final_event = selected.semantic.model.finished.last().unwrap();
             assert_eq!(
                 final_event.0,
                 RecheckDisposition::ConditionalRefutationPublished
@@ -2052,20 +2166,22 @@ mod tests {
             assert!(final_event.1);
             assert!(final_event.2.is_some());
             assert_eq!(final_event.2, final_event.3);
-            let revisions = &selected.model.revisions;
+            let revisions = &selected.semantic.model.revisions;
             assert_eq!(
                 revisions[revisions.len() - 1],
                 revisions[revisions.len() - 2]
             );
             let conclusion = selected
+                .semantic
                 .stores
                 .situations
-                .get(selected.nodes[work.root].situation)
+                .get(selected.semantic.nodes[work.root].situation)
                 .unwrap()
                 .conclusions
                 .get(work.repaired_line)
                 .unwrap();
             let observation = selected
+                .semantic
                 .stores
                 .observations
                 .get(conclusion.evidence.unwrap())
@@ -2104,7 +2220,7 @@ mod tests {
                 &mut |_, _, _| {},
             )
             .unwrap();
-        assert_eq!(selected.repair_queue.len(), 1);
+        assert_eq!(selected.semantic.repair_queue.len(), 1);
         assert_eq!(counters.repair_queue_deduplicated, 1);
         for _ in 0..MAX_REPAIRS_PER_FIRST {
             assert!(selected.admit_iterative_repair(work.original_first));
@@ -2113,18 +2229,19 @@ mod tests {
         selected
             .drain_repair_queue(budget, &cancel, &mut counters, &mut |_, _, _| {})
             .unwrap();
-        assert!(selected.repair_queue.is_empty());
-        assert_eq!(selected.repair_counts[&work.original_first], 3);
+        assert!(selected.semantic.repair_queue.is_empty());
+        assert_eq!(selected.semantic.repair_counts[&work.original_first], 3);
         assert!(
             selected
+                .semantic
                 .records
                 .iter()
                 .filter(|r| r.kind == RecordKind::Repair)
                 .all(|r| r.line.first() == Some(&work.original_first))
         );
         selected.new_game();
-        assert!(selected.repair_counts.is_empty());
-        assert!(selected.repair_questions.is_empty());
+        assert!(selected.semantic.repair_counts.is_empty());
+        assert!(selected.semantic.repair_questions.is_empty());
     }
     #[test]
     fn endpoint_perspective_and_missing_or_different_revision_never_mint_completion() {
@@ -2134,6 +2251,7 @@ mod tests {
         );
         let position = Position::startpos();
         selected
+            .semantic
             .stores
             .focus_actual_moves(position.snapshot())
             .unwrap();
@@ -2148,10 +2266,10 @@ mod tests {
             selected.endpoint_expectation(root, Color::Black),
             Some(-white)
         );
-        let snapshot = selected.nodes[root].position.snapshot();
+        let snapshot = selected.semantic.nodes[root].position.snapshot();
         let endpoint = PalsEngine::<WdlFixture>::frozen_endpoint(
-            &selected.nodes[root],
-            &selected.stores,
+            &selected.semantic.nodes[root],
+            &selected.semantic.stores,
             &snapshot,
             9999,
         );
@@ -2162,10 +2280,10 @@ mod tests {
                 ..
             }
         ));
-        selected.nodes[root].model_value_revision = Some(9999);
+        selected.semantic.nodes[root].model_value_revision = Some(9999);
         let endpoint = PalsEngine::<WdlFixture>::frozen_endpoint(
-            &selected.nodes[root],
-            &selected.stores,
+            &selected.semantic.nodes[root],
+            &selected.semantic.stores,
             &snapshot,
             9999,
         );
@@ -2173,10 +2291,10 @@ mod tests {
             endpoint.evidence,
             RecheckEndpointEvidence::InvalidProvenance { .. }
         ));
-        selected.nodes[root].model_observation = None;
+        selected.semantic.nodes[root].model_observation = None;
         let endpoint = PalsEngine::<WdlFixture>::frozen_endpoint(
-            &selected.nodes[root],
-            &selected.stores,
+            &selected.semantic.nodes[root],
+            &selected.semantic.stores,
             &snapshot,
             0,
         );
@@ -2210,12 +2328,13 @@ mod tests {
             .unwrap();
         assert!(counters.accepted_repair_outputs > 0);
         assert!(counters.supported_repairs > 0);
-        assert!(selected.repair_counts[&work.original_first] <= MAX_REPAIRS_PER_FIRST);
-        assert!(selected.repair_queue.is_empty());
+        assert!(selected.semantic.repair_counts[&work.original_first] <= MAX_REPAIRS_PER_FIRST);
+        assert!(selected.semantic.repair_queue.is_empty());
         let conclusion = selected
+            .semantic
             .stores
             .situations
-            .get(selected.nodes[work.root].situation)
+            .get(selected.semantic.nodes[work.root].situation)
             .unwrap()
             .conclusions
             .get(work.repaired_line)
@@ -2224,16 +2343,24 @@ mod tests {
             panic!("an accepted new P line must replace its actual conditional refutation");
         };
         assert_eq!(
-            selected.stores.lines.moves(repaired_line).unwrap().first(),
+            selected
+                .semantic
+                .stores
+                .lines
+                .moves(repaired_line)
+                .unwrap()
+                .first(),
             Some(&work.original_first)
         );
         let evidence = selected
+            .semantic
             .stores
             .observations
             .get(conclusion.evidence.unwrap())
             .unwrap();
         assert_eq!(evidence.kind, ObservationKind::Repair);
         let refutation = selected
+            .semantic
             .stores
             .observations
             .get(evidence.supersedes.unwrap())
@@ -2251,7 +2378,7 @@ mod tests {
         };
         for observation in [before, after] {
             assert!(
-                matches!(selected.stores.observations.get(observation).unwrap().score,
+                matches!(selected.semantic.stores.observations.get(observation).unwrap().score,
                 RawScore::ContextWdl { context_revision: actual, .. } if actual == context_revision)
             );
         }
@@ -2274,7 +2401,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .0;
-                question.repair_record_revision = selected.revision;
+                question.repair_record_revision = selected.semantic.revision;
             }
             selected
                 .queue_or_recheck_frozen(
@@ -2286,7 +2413,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(selected.repair_queue.len(), MAX_PENDING_REPAIRS);
+        assert_eq!(selected.semantic.repair_queue.len(), MAX_PENDING_REPAIRS);
         assert_eq!(counters.repair_queue_enqueued, MAX_PENDING_REPAIRS as u64);
         assert_eq!(counters.repair_queue_peak, MAX_PENDING_REPAIRS);
         selected
@@ -2305,7 +2432,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .0;
-        overflow.repair_record_revision = selected.revision;
+        overflow.repair_record_revision = selected.semantic.revision;
         assert!(matches!(
             selected.queue_or_recheck_frozen(
                 overflow,
@@ -2316,10 +2443,10 @@ mod tests {
             ),
             Err(PalsError::Capacity)
         ));
-        assert_eq!(selected.repair_queue.len(), MAX_PENDING_REPAIRS);
+        assert_eq!(selected.semantic.repair_queue.len(), MAX_PENDING_REPAIRS);
         assert_eq!(counters.repair_queue_enqueued, MAX_PENDING_REPAIRS as u64);
         assert_eq!(counters.critic_calls, 0);
-        assert!(selected.repair_counts.is_empty());
+        assert!(selected.semantic.repair_counts.is_empty());
     }
     #[test]
     fn frozen_v2_actual_mixed_rules_and_model_endpoints_remain_unresolved() {
@@ -2339,11 +2466,13 @@ mod tests {
                 };
                 let mut refutation = repaired.clone();
                 refutation[2] = BoardMove::from_uci("g1f3").unwrap();
-                selected.model.replies = Some([counter[3], counter[4], counter[5]]);
+                selected.semantic.model.replies = Some([counter[3], counter[4], counter[5]]);
                 let work =
                     repair_work_for_lines(&mut selected, &mut counters, refutation, repaired);
                 assert_eq!(
-                    selected.nodes[work.repaired_leaf].terminal.is_some(),
+                    selected.semantic.nodes[work.repaired_leaf]
+                        .terminal
+                        .is_some(),
                     repaired_terminal
                 );
                 let frontier = selected
@@ -2358,7 +2487,9 @@ mod tests {
                     .unwrap();
                 assert_eq!(frontier.counterline, counter);
                 assert_eq!(
-                    selected.nodes[frontier.counter_leaf].terminal.is_some(),
+                    selected.semantic.nodes[frontier.counter_leaf]
+                        .terminal
+                        .is_some(),
                     !repaired_terminal
                 );
                 let ongoing_leaf = if repaired_terminal {
@@ -2366,20 +2497,25 @@ mod tests {
                 } else {
                     work.repaired_leaf
                 };
-                assert!(selected.nodes[ongoing_leaf].model_value.is_some());
-                assert!(selected.nodes[ongoing_leaf].model_observation.is_some());
+                assert!(selected.semantic.nodes[ongoing_leaf].model_value.is_some());
+                assert!(
+                    selected.semantic.nodes[ongoing_leaf]
+                        .model_observation
+                        .is_some()
+                );
                 assert!(frontier.publication.is_none());
                 assert_eq!(counters.frozen_wdl_comparisons, 0);
                 assert_eq!(counters.frozen_wdl_unresolved, 1);
                 assert_eq!(counters.supported_refutations, 0);
-                let event = selected.model.finished.last().unwrap();
+                let event = selected.semantic.model.finished.last().unwrap();
                 assert_eq!(event.0, RecheckDisposition::IncomparableEvidence);
                 assert!(!event.1);
                 assert!(
                     selected
+                        .semantic
                         .stores
                         .situations
-                        .get(selected.nodes[work.root].situation)
+                        .get(selected.semantic.nodes[work.root].situation)
                         .unwrap()
                         .conclusions
                         .get(work.repaired_line)

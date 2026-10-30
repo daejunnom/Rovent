@@ -2,9 +2,9 @@
 //! The compact schema is separate from V1/V2's sixteen record/query features.
 #[path = "virtual_selected_input.rs"]
 mod selected_input;
-#[cfg(feature = "onnx-cpu")]
-pub(crate) use selected_input::exact_review_anchor_input;
 pub use selected_input::prepare_selected_virtual_review_input;
+#[cfg(feature = "onnx-cpu")]
+pub use selected_input::{encode_review_divergences, exact_review_anchor_input};
 
 use rz_eval::pals_model::virtual_review::{QUERY_FEATURE_NAMES, RECORD_FEATURE_NAMES};
 #[cfg(feature = "search-work-receipts")]
@@ -221,7 +221,7 @@ pub fn validate_pals_virtual_rules_descriptor_bytes(
         encoder_source_sha256,
     })
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "search-work-receipts"))]
 mod tests {
     use super::*;
     #[cfg(feature = "search-work-receipts")]

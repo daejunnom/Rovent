@@ -2,6 +2,12 @@
 //! Model loading and physical execution remain the injected factory's responsibility.
 
 pub mod diagnostics;
+mod driver_output;
+use driver_output::DriverOutputEnvelope;
+mod driver_start;
+pub(crate) use driver_start::DriverStartSource;
+#[cfg(test)]
+pub(crate) use driver_start::fixture as driver_start_fixture;
 
 use crate::{bridge::BuildSearchSettings, *};
 use rz_contracts as contract;
@@ -245,6 +251,14 @@ impl ProcessClock {
         &self,
         instant: Instant,
     ) -> Result<contract::MonotonicTick, contract::ContractError> {
+        // Windows QPC duration conversion may round a tiny negative delta to
+        // zero. Compare the actual Instants before converting that delta.
+        if instant < self.origin {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "tick predates process clock origin",
+            ));
+        }
         let elapsed = instant.checked_duration_since(self.origin).ok_or_else(|| {
             failure(
                 contract::ErrorCode::InvalidInput,
@@ -592,6 +606,11 @@ pub enum WorkerFailureSource {
     Authority(contract::ContractError),
     Search(Box<rz_search::contracts::ContractSearchFailure>),
     Driver(crate::search_driver::SearchSessionFailure),
+    RejectedDriverReport {
+        error: contract::ContractError,
+        report: Arc<crate::search_driver::SearchSessionReport>,
+        diagnostic_failure: Option<(contract::ContractError, Box<WorkerDiagnosticReceipt>)>,
+    },
     DiagnosticRetention {
         error: contract::ContractError,
         receipt: Box<WorkerDiagnosticReceipt>,
@@ -633,6 +652,19 @@ impl WorkerCompletion {
                 code: error.code.into(),
                 message: error.detail.clone(),
             },
+            WorkerFailureSource::RejectedDriverReport {
+                error,
+                diagnostic_failure,
+                ..
+            } => SearchCompletion::Failed {
+                code: "DriverFinalReport".into(),
+                message: match diagnostic_failure {
+                    Some((diagnostic_error, _)) => {
+                        format!("{error}; original work retention failed: {diagnostic_error}")
+                    }
+                    None => error.to_string(),
+                },
+            },
             WorkerFailureSource::DiagnosticRetention { error, receipt } => {
                 SearchCompletion::Failed {
                     code: "DiagnosticRetentionFailure".into(),
@@ -647,6 +679,7 @@ impl WorkerCompletion {
 #[derive(Debug)]
 pub enum EngineError {
     Contract(contract::ContractError),
+    SearchDriverClose(crate::search_driver::SearchSessionFailure),
     Session(SessionError),
     Transport(Box<ServeError<EngineError>>),
     WorkerPanic,
@@ -673,6 +706,10 @@ struct ActiveBinding {
     ticket: SearchTicket,
     control: SearchControl,
     authority: Option<SearchAuthority>,
+    driver_output: Option<Arc<DriverOutputEnvelope>>,
+    driver_output_until: Option<Instant>,
+    driver_start: Option<Arc<DriverStartSource>>,
+    ponder_clock: Option<crate::rovent_ponder::RoventPonderClockOwner>,
 }
 type FailedPublication = Arc<Mutex<Option<Box<UndeliveredWorkerFailure>>>>;
 struct Worker {
@@ -700,6 +737,7 @@ struct Owner {
     ponder: Option<(crate::contracts::SessionScope, Option<u64>)>,
     held_ponder_bestmove: Option<HeldPonderBestMove>,
     admitted_ponder_report: Option<AdmittedPonderReport>,
+    pending_original_go: Option<(SearchTicket, Arc<crate::parser::GoLimits>)>,
     pending_close: Option<Event>,
     fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
@@ -709,16 +747,25 @@ struct PendingBestMove {
     line: String,
     until: Instant,
     from_driver_report: bool,
+    driver_output: Option<DriverOutputPublication>,
 }
 struct HeldPonderBestMove {
     scope: crate::contracts::SessionScope,
     line: String,
     from_driver_report: bool,
+    driver_output: Option<DriverOutputPublication>,
 }
 struct AdmittedPonderReport {
     ticket: SearchTicket,
     scope: crate::contracts::SessionScope,
     bestmove: String,
+    driver_output: Option<DriverOutputPublication>,
+}
+#[derive(Clone)]
+struct DriverOutputPublication {
+    envelope: Arc<DriverOutputEnvelope>,
+    report: Option<Arc<crate::search_driver::SearchSessionReport>>,
+    until: Instant,
 }
 impl PendingBestMove {
     fn matches_scope(&self, scope: crate::contracts::SessionScope) -> bool {
@@ -726,21 +773,139 @@ impl PendingBestMove {
     }
 }
 impl Owner {
+    #[cfg(test)]
+    fn admitted_ponder_output_for_tests(
+        &self,
+    ) -> Option<(
+        &Arc<DriverOutputEnvelope>,
+        &Arc<crate::search_driver::SearchSessionReport>,
+    )> {
+        let publication = self
+            .admitted_ponder_report
+            .as_ref()
+            .and_then(|report| report.driver_output.as_ref())
+            .or_else(|| {
+                self.held_ponder_bestmove
+                    .as_ref()
+                    .and_then(|held| held.driver_output.as_ref())
+            })?;
+        Some((&publication.envelope, publication.report.as_ref()?))
+    }
+    fn driver_publication_for(
+        &self,
+        ticket: Option<&SearchTicket>,
+    ) -> Result<Option<DriverOutputPublication>, contract::ContractError> {
+        let Some(active) = &self.active else {
+            return Ok(None);
+        };
+        if ticket.is_some_and(|ticket| ticket != &active.ticket) {
+            return Ok(None);
+        }
+        let Some(envelope) = &active.driver_output else {
+            return Ok(None);
+        };
+        let scope = self.session_owner.lifecycle_scope();
+        if envelope.scope() != scope {
+            return Ok(None);
+        }
+        let report = envelope.report_for(&active.ticket, scope)?;
+        let until = active.driver_output_until.ok_or_else(|| {
+            failure(
+                contract::ErrorCode::IdentityMismatch,
+                "actual driver Start has no original output cleanup boundary",
+            )
+        })?;
+        Ok(Some(DriverOutputPublication {
+            envelope: Arc::clone(envelope),
+            report,
+            until,
+        }))
+    }
     fn command_line(
         &mut self,
         session: &mut Session<RulesUciPort>,
         line: &str,
-    ) -> (SessionResult<RulesSearchPosition>, bool) {
-        let parsed = parse(line, session.parser_limits());
+    ) -> (
+        SessionResult<RulesSearchPosition>,
+        bool,
+        Option<DriverOutputPublication>,
+    ) {
+        let dispatched_at = Instant::now();
+        let parsed = crate::parser::parse_with_zero_node_limit(
+            line,
+            session.parser_limits(),
+            match session.node_budget_semantics() {
+                crate::bridge::NodeBudgetSemantics::LegacySimulations => {
+                    crate::parser::ZeroNodeLimit::Reject
+                }
+                crate::bridge::NodeBudgetSemantics::RoventPositionVisits => {
+                    crate::parser::ZeroNodeLimit::Allow
+                }
+            },
+        );
+        // Capture once, before ponder normalization and Rules canonicalization.
+        let original_go = match &parsed {
+            Ok(Command::Go(limits)) => Some(Arc::new(limits.clone())),
+            _ => None,
+        };
+        if let (Some(driver), Some(original_go)) = (&self.driver, &original_go) {
+            if let Err(error) = driver.validate_go(session.snapshot().rules_position(), original_go)
+            {
+                let mut rejected = SessionResult {
+                    accepted: false,
+                    ..SessionResult::default()
+                };
+                rejected.diagnostics.push(Diagnostic {
+                    code: "DriverGoRejected",
+                    message: error.to_string(),
+                });
+                return (rejected, false, None);
+            }
+            if original_go.ponder && driver.supports_ponder_clock() {
+                let mut normal = original_go.as_ref().clone();
+                normal.ponder = false;
+                normal.infinite = false;
+                let side = match session.snapshot().rules_position().side_to_move() {
+                    rz_position::Color::White => crate::bridge::SideToMove::White,
+                    rz_position::Color::Black => crate::bridge::SideToMove::Black,
+                };
+                // The allocation's duration is fixed by the received go. A
+                // future hit cannot make an oversized clock legal; reject it
+                // before the old search is canceled or a new ticket exists.
+                if let Err(error) = crate::bridge::PreparedSearchBinding::prepare(
+                    &normal,
+                    side,
+                    dispatched_at,
+                    self.settings.search,
+                    driver.search_goal_capability(),
+                    crate::bridge::NodeBudgetSemantics::RoventPositionVisits,
+                ) {
+                    let mut rejected = SessionResult {
+                        accepted: false,
+                        ..SessionResult::default()
+                    };
+                    rejected.diagnostics.push(Diagnostic {
+                        code: "PonderClockRejected",
+                        message: error.to_string(),
+                    });
+                    return (rejected, false, None);
+                }
+            }
+        }
         let enabled = matches!(
             session.option_values().get("Ponder"),
             Some(OptionValue::Check(true))
         );
         let mut out = SessionResult::default();
         let mut from_driver_report = false;
+        let mut released_output = None;
         match &parsed {
             Ok(Command::Go(limits)) if limits.ponder => {
-                if !enabled || limits.nodes.is_some_and(|n| n > 4096) {
+                if !enabled
+                    || session.node_budget_semantics()
+                        == crate::bridge::NodeBudgetSemantics::LegacySimulations
+                        && limits.nodes.is_some_and(|n| n > 4096)
+                {
                     out.accepted = false;
                     out.diagnostics.push(Diagnostic {
                         code: "PonderRejected",
@@ -748,21 +913,39 @@ impl Owner {
                             "Ponder must be enabled and the node limit must fit the engine envelope"
                                 .into(),
                     });
-                    return (out, false);
+                    return (out, false, None);
                 }
                 // The opponent's elapsed time is never debited from the supplied own clock.
                 // A finite resource wall and simulation ceiling still bound speculative work.
+                let mut normalized = limits.clone();
+                normalized.ponder = false;
+                normalized.infinite = true;
+                normalized.movetime_ms = None;
+                normalized.white_time_ms = None;
+                normalized.black_time_ms = None;
+                normalized.white_increment_ms = None;
+                normalized.black_increment_ms = None;
+                normalized.moves_to_go = None;
                 append_contract_result(
                     &mut out,
-                    self.session_owner.handle_line(session, "go infinite", |s| {
-                        Ok(s.state.snapshot().side_to_move())
-                    }),
+                    self.session_owner
+                        .handle_normalized_go(session, normalized, |s| {
+                            Ok(s.state.snapshot().side_to_move())
+                        }),
                 );
                 if out.accepted {
                     self.held_ponder_bestmove = None;
                     self.admitted_ponder_report = None;
                     self.ponder = Some((self.session_owner.lifecycle_scope(), limits.nodes));
                 }
+            }
+            Ok(Command::PonderHit)
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.ponder_clock.is_some()) =>
+            {
+                return self.hit_rovent_ponder(session, dispatched_at);
             }
             Ok(Command::PonderHit) => {
                 if !self
@@ -775,7 +958,7 @@ impl Owner {
                         code: "StalePonderHit",
                         message: "no current predicted-root search".into(),
                     });
-                    return (out, false);
+                    return (out, false, None);
                 }
                 self.ponder = None;
                 let ticket = session.active_ticket();
@@ -786,7 +969,8 @@ impl Owner {
                     self.session_owner
                         .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
                 );
-                from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+                (from_driver_report, released_output) =
+                    self.release_ponder_output(ticket.as_ref(), &mut out);
             }
             Ok(Command::SetOption { name, .. })
                 if name.eq_ignore_ascii_case("Ponder")
@@ -806,7 +990,8 @@ impl Owner {
                         .handle_line(session, line, |s| Ok(s.state.snapshot().side_to_move())),
                 );
                 if out.accepted && matches!(parsed, Ok(Command::Stop)) {
-                    from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+                    (from_driver_report, released_output) =
+                        self.release_ponder_output(ticket.as_ref(), &mut out);
                 }
                 if out.accepted
                     && matches!(
@@ -824,17 +1009,136 @@ impl Owner {
                 }
             }
         }
-        (out, from_driver_report)
+        if out.accepted {
+            if let Some(original_go) = original_go {
+                self.pending_original_go = out.effects.iter().find_map(|effect| match effect {
+                    Effect::Start { ticket, .. } => Some((ticket.clone(), original_go.clone())),
+                    _ => None,
+                });
+            }
+        }
+        (out, from_driver_report, released_output)
+    }
+
+    fn hit_rovent_ponder(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        hit_at: Instant,
+    ) -> (
+        SessionResult<RulesSearchPosition>,
+        bool,
+        Option<DriverOutputPublication>,
+    ) {
+        let mut out = SessionResult::default();
+        let current_scope = self.session_owner.lifecycle_scope();
+        let hit = (|| {
+            if !self
+                .ponder
+                .as_ref()
+                .is_some_and(|(scope, _)| *scope == current_scope)
+            {
+                return Err(failure(
+                    contract::ErrorCode::Stale,
+                    "no current actual ponder Start",
+                ));
+            }
+            let active = self.active.as_mut().ok_or_else(|| {
+                failure(contract::ErrorCode::Stale, "actual ponder Start is absent")
+            })?;
+            let original = active.driver_start.as_ref().ok_or_else(|| {
+                failure(
+                    contract::ErrorCode::IdentityMismatch,
+                    "actual ponder source is absent",
+                )
+            })?;
+            let mut normal = original.original_go().as_ref().clone();
+            normal.ponder = false;
+            normal.infinite = false;
+            let side = match session.snapshot().rules_position().side_to_move() {
+                rz_position::Color::White => crate::bridge::SideToMove::White,
+                rz_position::Color::Black => crate::bridge::SideToMove::Black,
+            };
+            let prepared = crate::bridge::PreparedSearchBinding::prepare(
+                &normal,
+                side,
+                hit_at,
+                self.settings.search,
+                self.driver
+                    .as_ref()
+                    .and_then(|driver| driver.search_goal_capability()),
+                crate::bridge::NodeBudgetSemantics::RoventPositionVisits,
+            )
+            .map_err(|_| {
+                failure(
+                    contract::ErrorCode::InvalidInput,
+                    "normal ponder-hit time allocation is invalid",
+                )
+            })?;
+            let disposition = active
+                .ponder_clock
+                .as_mut()
+                .ok_or_else(|| {
+                    failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "actual ponder clock owner is absent",
+                    )
+                })?
+                .hit(
+                    &active.ticket,
+                    current_scope,
+                    hit_at,
+                    &prepared,
+                    Instant::now(),
+                )?;
+            Ok((active.ticket.clone(), disposition))
+        })();
+        let (ticket, disposition) = match hit {
+            Ok(value) => value,
+            Err(error) => {
+                out.accepted = false;
+                out.diagnostics.push(Diagnostic {
+                    code: "PonderHitRejected",
+                    message: error.to_string(),
+                });
+                return (out, false, None);
+            }
+        };
+        self.ponder = None;
+        if session.active_ticket().as_ref() == Some(&ticket) {
+            append_contract_result(
+                &mut out,
+                self.session_owner.release_ponder_hit(session, &ticket),
+            );
+            // A hit cannot reopen the expired original resource wall. Only
+            // this terminal case follows the same ticket's normal stop path.
+            if disposition == crate::rovent_ponder::HitDisposition::NoLiveWork
+                && session.active_ticket().as_ref() == Some(&ticket)
+            {
+                append_contract_result(
+                    &mut out,
+                    self.session_owner
+                        .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
+                );
+            }
+        } else if self.held_ponder_bestmove.is_none() {
+            out.accepted = false;
+            out.diagnostics.push(Diagnostic {
+                code: "StalePonderHit",
+                message: "the original Start has neither live work nor a held result".into(),
+            });
+        }
+        let (reported, publication) = self.release_ponder_output(Some(&ticket), &mut out);
+        (out, reported, publication)
     }
     fn release_ponder_output(
         &mut self,
         ticket: Option<&SearchTicket>,
         out: &mut SessionResult<RulesSearchPosition>,
-    ) -> bool {
+    ) -> (bool, Option<DriverOutputPublication>) {
         // Successful infinite work stays in Session until stop/hit. Only its
         // exact admitted ticket, scope and move can acknowledge that report;
         // a coincident fallback after an earlier stop is not report consumption.
-        let from_passive_report = self.admitted_ponder_report.take().is_some_and(|report| {
+        let passive = self.admitted_ponder_report.take().filter(|report| {
             ticket == Some(&report.ticket)
                 && report.scope == self.session_owner.lifecycle_scope()
                 && out.protocol.iter().any(|line| {
@@ -843,18 +1147,23 @@ impl Owner {
                         == Some(report.bestmove.as_str())
                 })
         });
+        let from_passive_report = passive.is_some();
+        let passive_output = passive.and_then(|report| report.driver_output);
         let Some(held) = self.held_ponder_bestmove.take() else {
-            return from_passive_report;
+            return (from_passive_report, passive_output);
         };
         if held.scope != self.session_owner.lifecycle_scope() {
             out.diagnostics.push(Diagnostic {
                 code: "StalePonderOutput",
                 message: "held predicted-root move has lost its publication authority".into(),
             });
-            return from_passive_report;
+            return (from_passive_report, passive_output);
         }
         out.protocol.push(held.line);
-        held.from_driver_report || from_passive_report
+        (
+            held.from_driver_report || from_passive_report,
+            held.driver_output.or(passive_output),
+        )
     }
     fn annotate_ponder(
         &self,
@@ -907,6 +1216,7 @@ impl Owner {
         session: &Session<RulesUciPort>,
         out: &mut SessionResult<RulesSearchPosition>,
         from_driver_report: bool,
+        driver_output: Option<&DriverOutputPublication>,
     ) {
         if session.is_closed() {
             self.ponder = None;
@@ -932,6 +1242,7 @@ impl Owner {
                     scope: self.session_owner.lifecycle_scope(),
                     line,
                     from_driver_report,
+                    driver_output: driver_output.cloned(),
                 });
             }
         }
@@ -1064,20 +1375,30 @@ impl Owner {
                     .handle_event(session, Event::Complete { ticket, completion }),
             );
             self.annotate_ponder(session, &mut failed);
-            self.hold_ponder_output(session, &mut failed, false);
-            self.defer_bestmove(session, &mut failed, false);
+            self.hold_ponder_output(session, &mut failed, false, None);
+            self.defer_bestmove(session, &mut failed, false, None);
             append_result(&mut out, failed);
         }
-        let (mut next, held_driver_report) = match event {
+        let completed_output = match passive_report.as_ref() {
+            Some((ticket, _)) => match self.driver_publication_for(Some(ticket)) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    self.close_physical_fence(session, &mut out, error.into());
+                    return out;
+                }
+            },
+            None => None,
+        };
+        let (mut next, held_driver_report, held_output) = match event {
             Event::RejectedInput {
                 code: "OwnerWake", ..
-            } => (SessionResult::default(), false),
+            } => (SessionResult::default(), false, None),
             Event::Line(line) => self.command_line(session, &line),
             event => {
                 let next = self.session_owner.handle_event(session, event);
                 let mut out = SessionResult::default();
                 append_contract_result(&mut out, next);
-                (out, false)
+                (out, false, None)
             }
         };
         // Enqueueing is not consumption. A typed failed publication stays with
@@ -1143,6 +1464,7 @@ impl Owner {
         // and replaced with a frozen fallback. Only the actual admitted
         // completion outcome may acknowledge consumption of a CPU report.
         let admitted_driver_report = (from_driver_report && next.accepted) || held_driver_report;
+        let driver_output = held_output.or(completed_output);
         if from_driver_report
             && next.accepted
             && let Some((ticket, bestmove)) = passive_report
@@ -1156,11 +1478,17 @@ impl Owner {
                 ticket,
                 scope: self.session_owner.lifecycle_scope(),
                 bestmove,
+                driver_output: driver_output.clone(),
             });
         }
         self.annotate_ponder(session, &mut next);
-        self.hold_ponder_output(session, &mut next, admitted_driver_report);
-        self.defer_bestmove(session, &mut next, admitted_driver_report);
+        self.hold_ponder_output(
+            session,
+            &mut next,
+            admitted_driver_report,
+            driver_output.as_ref(),
+        );
+        self.defer_bestmove(session, &mut next, admitted_driver_report, driver_output);
         append_result(&mut out, next);
         self.finish_physical_output(session, &mut out);
         if !session.is_closed()
@@ -1184,6 +1512,7 @@ impl Owner {
         session: &mut Session<RulesUciPort>,
         out: &mut SessionResult<RulesSearchPosition>,
         from_driver_report: bool,
+        driver_output: Option<DriverOutputPublication>,
     ) {
         let scope = self.session_owner.lifecycle_scope();
         if session.is_closed()
@@ -1194,7 +1523,22 @@ impl Owner {
         {
             self.pending_bestmove = None;
         }
-        if session.is_closed() || self.workers.is_empty() {
+        if session.is_closed() {
+            return;
+        }
+        let driver_output = match driver_output {
+            Some(publication) => Some(publication),
+            None => match self.driver_publication_for(None) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            },
+        };
+        // A Rules-only bestmove has no actual Start or driver report. Every
+        // actual driver Start uses this publisher even if it was already reaped.
+        if self.workers.is_empty() && driver_output.is_none() {
             return;
         }
         for line in std::mem::take(&mut out.protocol) {
@@ -1214,7 +1558,11 @@ impl Owner {
                 );
                 return;
             }
-            let Some(until) = Instant::now().checked_add(self.settings.shutdown_limit) else {
+            let until = driver_output
+                .as_ref()
+                .map(|output| output.until)
+                .or_else(|| Instant::now().checked_add(self.settings.shutdown_limit));
+            let Some(until) = until else {
                 self.close_physical_fence(
                     session,
                     out,
@@ -1231,6 +1579,7 @@ impl Owner {
                 line,
                 until,
                 from_driver_report,
+                driver_output: driver_output.clone(),
             });
         }
     }
@@ -1253,19 +1602,61 @@ impl Owner {
         }
         if self.workers.is_empty() {
             let pending = self.pending_bestmove.take().unwrap();
+            if pending.scope != self.session_owner.lifecycle_scope() {
+                self.close_physical_fence(
+                    session,
+                    out,
+                    failure(
+                        contract::ErrorCode::Stale,
+                        "actual Start output lost its original lifecycle scope",
+                    )
+                    .into(),
+                );
+                return;
+            }
+            let bestmove = pending
+                .line
+                .strip_prefix("bestmove ")
+                .and_then(|text| text.split_ascii_whitespace().next())
+                .unwrap_or("");
+            let strategy = if let Some(publication) = &pending.driver_output {
+                match (&publication.report, pending.from_driver_report) {
+                    (Some(report), _) => publication.envelope.mate_for(
+                        report,
+                        pending.scope,
+                        bestmove,
+                        pending.from_driver_report,
+                    ),
+                    (None, false) => Ok(None),
+                    (None, true) => Err(failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "reported driver output has no actual Start final report",
+                    )),
+                }
+            } else {
+                Ok(None)
+            };
+            let strategy = match strategy {
+                Ok(strategy) => strategy,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            };
             if let (Some(driver), crate::contracts::SessionScope::Search(authority)) =
                 (&self.driver, pending.scope)
             {
-                let bestmove = pending
-                    .line
-                    .strip_prefix("bestmove ")
-                    .and_then(|text| text.split_ascii_whitespace().next())
-                    .unwrap_or("");
                 if let Err(error) =
                     driver.accept_uci_output(authority, bestmove, pending.from_driver_report)
                 {
                     self.close_physical_fence(session, out, error.into());
                     return;
+                }
+            }
+            if let Some(strategy) = strategy {
+                if let Some(mate) = strategy.conclusion().exact_uci_mate() {
+                    out.protocol
+                        .push(format!("info score mate {mate} pv {bestmove}"));
                 }
             }
             out.protocol.push(pending.line);
@@ -1295,7 +1686,13 @@ impl Owner {
     }
     fn cancel(&self) {
         if let Some(active) = &self.active {
+            // The original Start's optional Collection gate closes before
+            // signaling its physical search cancellation; neither waits.
+            if let Some(start) = &active.driver_start { start.abort_collection(); }
             active.control.cancel();
+            if let Some(clock) = &active.ponder_clock {
+                clock.close();
+            }
             if let Some(authority) = &active.authority {
                 authority.cancel();
             }
@@ -1394,8 +1791,15 @@ impl Owner {
             }
             Effect::Shutdown => self.cancel(),
             Effect::Start {
-                ticket, snapshot, ..
+                ticket,
+                snapshot,
+                limits,
+                ..
             } => {
+                let original_go = self
+                    .pending_original_go
+                    .take()
+                    .and_then(|(original_ticket, go)| (original_ticket == ticket).then_some(go));
                 self.reap()?;
                 if self.workers.len() >= self.settings.max_workers {
                     self.pending_failure(
@@ -1415,7 +1819,12 @@ impl Owner {
                     )
                 })?;
                 if let Some((_, Some(nodes))) = self.ponder {
-                    control.max_simulations = control.max_simulations.min(nodes);
+                    if self.driver.as_ref().is_none_or(|driver| {
+                        driver.node_budget_semantics()
+                            == crate::bridge::NodeBudgetSemantics::LegacySimulations
+                    }) {
+                        control.max_simulations = control.max_simulations.min(nodes);
+                    }
                 }
                 let token = self
                     .session_owner
@@ -1457,17 +1866,97 @@ impl Owner {
                                 "search driver shutdown deadline overflow",
                             )
                         })?;
-                    let context = crate::search_driver::SearchSessionContext {
+                    let mut context = crate::search_driver::SearchSessionContext {
                         authority: search_authority,
+                        original_go,
+                        original_start: None,
+                        effective_clock: None,
+                        original_time_budget: self
+                            .session_owner
+                            .active_binding()
+                            .map(|binding| *binding.budget()),
+                        root_moves: limits
+                            .searchmoves
+                            .as_ref()
+                            .map(|moves| {
+                                moves
+                                    .iter()
+                                    .map(|movement| {
+                                        movement.parse::<BoardMove>().map_err(|_| {
+                                            failure(
+                                                contract::ErrorCode::IdentityMismatch,
+                                                "sealed root move could not be decoded",
+                                            )
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map(Arc::from)
+                            })
+                            .transpose()?,
+                        goal: contract::rovent::SearchGoal {
+                            depth_plies: limits.depth_plies,
+                            mate_moves: limits.mate_moves,
+                        },
+                        requested_nodes: limits.nodes,
                         control: control.clone(),
                         cancellation: token,
                         shutdown_deadline,
                         current: Arc::clone(&self.scope),
                     };
+                    let ponder_clock = if driver.supports_ponder_clock()
+                        && context.original_go.as_ref().is_some_and(|go| go.ponder)
+                    {
+                        let original_budget = context.original_time_budget.ok_or_else(|| {
+                            failure(
+                                contract::ErrorCode::IdentityMismatch,
+                                "actual ponder Start has no original TimeBudget",
+                            )
+                        })?;
+                        let (owner, handle) = crate::rovent_ponder::RoventPonderClockOwner::new(
+                            ticket.clone(),
+                            search_authority,
+                            original_budget,
+                            shutdown_deadline,
+                            &self.clock,
+                        )?;
+                        context.effective_clock = Some(handle);
+                        Some(owner)
+                    } else {
+                        None
+                    };
+                    let original_start = DriverStartSource::from_start(
+                        &ticket,
+                        snapshot.rules_position(),
+                        self.session_owner.active_binding().ok_or_else(|| {
+                            failure(
+                                contract::ErrorCode::IdentityMismatch,
+                                "actual driver Start has no original binding",
+                            )
+                        })?,
+                        &context,
+                        &self.clock,
+                    )?;
+                    context.original_start = Some(Arc::clone(&original_start));
+                    if let Err(error) = self.session_owner.bind_original_start(&ticket, Arc::clone(&original_start)) {
+                        // This optional Collection association is not part of
+                        // driver admission; retain the failure for its later
+                        // binding and leave the existing search path intact.
+                        original_start.mark_collection_owner_binding_failed(error);
+                    }
+                    let driver_output = Arc::new(DriverOutputEnvelope::new(
+                        original_start.ticket().clone(),
+                        search_authority,
+                        snapshot.rules_position(),
+                        context.root_moves.as_deref(),
+                    )?);
                     self.active = Some(ActiveBinding {
                         ticket: ticket.clone(),
                         control,
                         authority: None,
+                        driver_output: Some(Arc::clone(&driver_output)),
+                        driver_output_until: Some(shutdown_deadline),
+                        driver_start: Some(original_start),
+                        ponder_clock,
                     });
                     let driver = Arc::clone(driver);
                     let events = sender.clone();
@@ -1487,13 +1976,42 @@ impl Owner {
                         let completion =
                             match driver.run(snapshot.rules_position(), &context, &mut progress) {
                                 Ok(report) => {
-                                    match retain_diagnostic(
+                                    // Charge/preserve the actual returned work before deciding
+                                    // whether its final move/proof is publishable.
+                                    let work_retention = retain_diagnostic(
                                         &diagnostics,
                                         WorkerDiagnosticReceipt::DriverWork {
                                             kind: driver.kind(),
-                                            work: report.work,
+                                            work: report.work.clone(),
                                         },
-                                    ) {
+                                    );
+                                    let report = match driver_output.record_retaining(report) {
+                                        Ok(report) => report,
+                                        Err((report, error)) => {
+                                            return finish_worker(
+                                                &events,
+                                                ticket,
+                                                WorkerCompletion::failed(
+                                                    WorkerFailureSource::RejectedDriverReport {
+                                                        error,
+                                                        report,
+                                                        diagnostic_failure: work_retention
+                                                            .err()
+                                                            .map(|failure| {
+                                                                (
+                                                                    failure.error,
+                                                                    Box::new(failure.receipt),
+                                                                )
+                                                            }),
+                                                    },
+                                                ),
+                                                &worker_publication,
+                                                None,
+                                                shutdown_limit,
+                                            );
+                                        }
+                                    };
+                                    match work_retention {
                                         Ok(()) => {
                                             let _ = events.try_send(Event::RejectedInput {
                                                 code: "OwnerWake",
@@ -1559,6 +2077,10 @@ impl Owner {
                     ticket: ticket.clone(),
                     control: control.clone(),
                     authority: Some(authority.clone()),
+                    driver_output: None,
+                    driver_output_until: None,
+                    driver_start: None,
+                    ponder_clock: None,
                 });
                 let profile = factory.profile();
                 let config = rz_search::contracts::ContractSearchConfig {
@@ -1576,6 +2098,24 @@ impl Owner {
                     tree_limits: self.settings.tree,
                 };
                 let factory = Arc::clone(factory);
+                let restricted_root_moves = limits
+                    .searchmoves
+                    .as_ref()
+                    .map(|moves| {
+                        moves
+                            .iter()
+                            .map(|movement| {
+                                let movement = movement.parse::<BoardMove>().map_err(|_| {
+                                    failure(
+                                        contract::ErrorCode::IdentityMismatch,
+                                        "sealed PUCT root move could not be decoded",
+                                    )
+                                })?;
+                                contract::Move::try_from(movement)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?;
                 let clock = self.clock.clone();
                 let shutdown_limit = self.settings.shutdown_limit;
                 let self_final_move_policy = self.settings.final_move_policy;
@@ -1613,6 +2153,20 @@ impl Owner {
                                 );
                             }
                         };
+                    if let Some(root_moves) = &restricted_root_moves {
+                        if let Err(error) = search.set_root_moves(root_moves) {
+                            return finish_worker(
+                                &events,
+                                ticket,
+                                WorkerCompletion::failed(WorkerFailureSource::SearchConstructor(
+                                    error,
+                                )),
+                                &worker_publication,
+                                Some(runtime.as_mut()),
+                                shutdown_limit,
+                            );
+                        }
+                    }
                     #[cfg(feature = "experimental-batch")]
                     if let Err(error) = search.set_parallelism(factory.parallelism()) {
                         return finish_worker(
@@ -1987,6 +2541,9 @@ fn append_result<S>(out: &mut SessionResult<S>, next: SessionResult<S>) {
     out.accepted &= next.accepted;
 }
 
+// Preserve the exact rejected receipt on bounded retention failure without a
+// new allocation on that failure path.
+#[allow(clippy::result_large_err)]
 fn consume_pump_diagnostic(
     event: &rz_search::contracts::ContractPumpEvent,
     receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
@@ -2038,6 +2595,9 @@ fn consume_pump_diagnostic(
     retained
 }
 
+// The 32-class owner returns an overflow/poisoned receipt intact; allocating a
+// replacement error must not become a prerequisite for preserving that receipt.
+#[allow(clippy::result_large_err)]
 fn retain_diagnostic(
     receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
     receipt: WorkerDiagnosticReceipt,
@@ -2139,6 +2699,13 @@ pub fn serve<O: Write, D: Write>(
         settings.search,
         settings.max_workers,
     )?;
+    let goal_capability = driver
+        .as_ref()
+        .and_then(|driver| driver.search_goal_capability());
+    let node_budget_semantics = driver.as_ref().map_or(
+        crate::bridge::NodeBudgetSemantics::LegacySimulations,
+        |driver| driver.node_budget_semantics(),
+    );
     let owner = Arc::new(Mutex::new(Owner {
         session_owner,
         active: None,
@@ -2155,6 +2722,7 @@ pub fn serve<O: Write, D: Write>(
         ponder: None,
         held_ponder_bestmove: None,
         admitted_ponder_report: None,
+        pending_original_go: None,
         pending_close: None,
         fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
@@ -2169,6 +2737,12 @@ pub fn serve<O: Write, D: Write>(
         settings.parser,
     )
     .map_err(EngineError::Session)?;
+    session
+        .set_search_goal_capability(goal_capability)
+        .map_err(EngineError::Session)?;
+    session
+        .set_node_budget_semantics(node_budget_semantics)
+        .map_err(EngineError::Session)?;
     let timer_owner = Arc::clone(&owner);
     let timer_events = sender.clone();
     let timer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2225,7 +2799,8 @@ pub fn serve<O: Write, D: Write>(
     if timer.join().is_err() {
         cleanup.push(EngineError::WorkerPanic);
     }
-    if let Some(until) = Instant::now().checked_add(settings.shutdown_limit) {
+    let cleanup_deadline = Instant::now().checked_add(settings.shutdown_limit);
+    if let Some(until) = cleanup_deadline {
         loop {
             let mut owner = match owner.lock() {
                 Ok(owner) => owner,
@@ -2259,8 +2834,12 @@ pub fn serve<O: Write, D: Write>(
             .into(),
         );
     }
+    let mut joined_driver = None;
     match owner.lock() {
         Ok(mut owner) => {
+            if owner.workers.is_empty() {
+                joined_driver = owner.driver.clone();
+            }
             if let Some(error) = owner.fence_failure.take() {
                 cleanup.push(error);
             }
@@ -2283,6 +2862,23 @@ pub fn serve<O: Write, D: Write>(
         }
         Err(_) => {
             cleanup.push(failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned").into())
+        }
+    }
+    // The search thread is joined before its persistent model/search owners
+    // close. Keep the same cleanup deadline; expiry grants no fresh window.
+    // No hook means no additional lifecycle observation for legacy drivers.
+    if let (Some(driver), Some(until)) = (joined_driver, cleanup_deadline) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.finish_session(until)
+        })) {
+            Ok(Ok(Some(crate::search_driver::DriverPhysicalCompletion::Unknown))) => {
+                cleanup.push(EngineError::SearchDriverClose(
+                    crate::search_driver::SearchSessionFailure::physical_completion_unknown(),
+                ));
+            }
+            Ok(Err(error)) => cleanup.push(EngineError::SearchDriverClose(error)),
+            Err(_) => cleanup.push(EngineError::WorkerPanic),
+            Ok(Ok(_)) => {}
         }
     }
     finish_errors(primary, cleanup)
@@ -2312,6 +2908,107 @@ pub fn event_channel() -> (SyncSender<Event>, Receiver<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_clock_rejects_actual_instants_before_origin_even_for_tiny_deltas() {
+        let clock = ProcessClock::new(contract::ProcessEpoch(8123));
+        for delta in [Duration::from_nanos(1), Duration::from_millis(1)] {
+            let before = clock.origin.checked_sub(delta).unwrap();
+            assert!(before < clock.origin);
+            assert_eq!(
+                clock.tick_at(before).unwrap_err().code,
+                contract::ErrorCode::InvalidInput
+            );
+            assert_eq!(
+                clock.deadline(before).unwrap_err().code,
+                contract::ErrorCode::InvalidInput
+            );
+        }
+        assert_eq!(
+            clock.tick_at(clock.origin).unwrap(),
+            contract::MonotonicTick(0)
+        );
+    }
+
+    struct CloseObservedDriver {
+        state: crate::search_driver::DriverPhysicalCompletion,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::search_driver::SearchSessionDriver for CloseObservedDriver {
+        fn kind(&self) -> crate::search_driver::SearchKind {
+            crate::search_driver::SearchKind::Cpu
+        }
+        fn implementation(&self) -> contract::Digest {
+            contract::Digest([77; 32])
+        }
+        fn identity(&self) -> EngineIdentity {
+            EngineIdentity {
+                name: "persistent owner close fixture".into(),
+                author: "test".into(),
+            }
+        }
+        fn finish_session(
+            &self,
+            _: Instant,
+        ) -> Result<
+            Option<crate::search_driver::DriverPhysicalCompletion>,
+            crate::search_driver::SearchSessionFailure,
+        > {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(Some(self.state))
+        }
+        fn run(
+            &self,
+            _: &Position,
+            _: &crate::search_driver::SearchSessionContext,
+            _: &mut dyn FnMut(BoardMove),
+        ) -> Result<
+            crate::search_driver::SearchSessionReport,
+            crate::search_driver::SearchSessionFailure,
+        > {
+            unreachable!("quit without go must not invoke a search")
+        }
+    }
+
+    #[test]
+    fn persistent_driver_close_runs_once_and_unknown_prevents_success() {
+        use crate::search_driver::DriverPhysicalCompletion::{Confirmed, Unknown};
+        for state in [Confirmed, Unknown] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let process = EngineProcess::with_search_driver(
+                Arc::new(CloseObservedDriver {
+                    state,
+                    calls: Arc::clone(&calls),
+                }),
+                Arc::new(OwnerRegistry::default()),
+                ProcessClock::new(contract::ProcessEpoch(78)),
+            );
+            let (sender, events) = event_channel();
+            sender.send(Event::Line("quit".into())).unwrap();
+            let mut protocol = Vec::new();
+            let mut diagnostics = Vec::new();
+            let result = serve(
+                events,
+                sender,
+                &mut protocol,
+                &mut diagnostics,
+                process,
+                EngineSettings::default(),
+            );
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            if state == Confirmed {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("PhysicalCompletionUnknown")
+                );
+            }
+            assert!(!String::from_utf8(protocol).unwrap().contains("bestmove "));
+        }
+    }
 
     struct UnknownPhysicalDriver;
     impl crate::search_driver::SearchSessionDriver for UnknownPhysicalDriver {
@@ -2794,6 +3491,7 @@ mod tests {
             ponder: None,
             held_ponder_bestmove: None,
             admitted_ponder_report: None,
+            pending_original_go: None,
             pending_close: None,
             fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
@@ -2826,6 +3524,70 @@ mod tests {
             )
             .unwrap();
         (owner, session)
+    }
+
+    #[test]
+    fn driver_preadmission_rejection_preserves_the_active_ticket_and_control() {
+        struct RejectGo;
+        impl crate::search_driver::SearchSessionDriver for RejectGo {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Rovent
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([31; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "pure rejection fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn validate_go(
+                &self,
+                _: &Position,
+                _: &crate::parser::GoLimits,
+            ) -> Result<(), contract::ContractError> {
+                Err(contract::ContractError::new(
+                    contract::ErrorCode::InvalidInput,
+                    contract::Stage::Admission,
+                    "exact workload differs",
+                ))
+            }
+            fn run(
+                &self,
+                _: &Position,
+                _: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                panic!("pure rejected go cannot dispatch a worker")
+            }
+        }
+        let (mut owner, mut session) = fixture();
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("go infinite".into()))
+                .accepted
+        );
+        let ticket = session.active_ticket().unwrap();
+        let scope = owner.session_owner.lifecycle_scope();
+        let control = owner.session_owner.control().unwrap().clone();
+        owner.driver = Some(Arc::new(RejectGo));
+        let rejected = owner.handle(&mut session, Event::Line("go nodes 7".into()));
+        assert!(!rejected.accepted);
+        assert!(rejected.effects.is_empty() && rejected.protocol.is_empty());
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "DriverGoRejected"
+                    && d.message.contains("exact workload differs"))
+        );
+        assert_eq!(session.active_ticket(), Some(ticket));
+        assert_eq!(owner.session_owner.lifecycle_scope(), scope);
+        assert!(!control.cancellation.load(Ordering::Acquire));
     }
 
     fn assert_canceled_result_ignored(out: &SessionResult<RulesSearchPosition>) {
@@ -3038,6 +3800,10 @@ mod tests {
             ticket: ticket.clone(),
             control: control.clone(),
             authority: None,
+            driver_output: None,
+            driver_output_until: None,
+            driver_start: None,
+            ponder_clock: None,
         });
         assert_eq!(
             owner.deadline_ticket(None, control.deadline),
@@ -4329,6 +5095,77 @@ mod tests {
         assert!(owner.session_owner.control().unwrap().deadline > Instant::now());
     }
 
+    #[test]
+    fn ponder_normalization_preserves_root_restriction_and_registered_goals() {
+        let (mut owner, mut session) = fixture();
+        session
+            .set_search_goal_capability(std::num::NonZeroU16::new(8))
+            .unwrap();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        let started = owner.handle(
+            &mut session,
+            Event::Line(
+                "go ponder wtime 1000 btime 2000 winc 1 binc 2 movestogo 8 nodes 1 depth 6 mate 3 searchmoves e2e4".into(),
+            ),
+        );
+        assert!(started.accepted, "{:?}", started.diagnostics);
+        let [Effect::Start { limits, .. }] = started.effects.as_slice() else {
+            panic!(
+                "expected one constrained ponder start: {:?}",
+                started.effects
+            );
+        };
+        assert_eq!(limits.searchmoves, Some(vec!["e2e4".into()]));
+        assert_eq!(limits.depth_plies, std::num::NonZeroU16::new(6));
+        assert_eq!(limits.mate_moves, std::num::NonZeroU16::new(3));
+        assert_eq!(limits.nodes, Some(1));
+        assert!(limits.infinite && !limits.ponder);
+        assert_eq!(limits.white_time_ms, None);
+        assert_eq!(limits.black_time_ms, None);
+        assert_eq!(limits.white_increment_ms, None);
+        assert_eq!(limits.black_increment_ms, None);
+        assert_eq!(limits.moves_to_go, None);
+        let (original_ticket, original_go) = owner.pending_original_go.as_ref().unwrap();
+        let Effect::Start { ticket, .. } = &started.effects[0] else {
+            unreachable!();
+        };
+        assert_eq!(original_ticket, ticket);
+        assert!(original_go.ponder && !original_go.infinite);
+        assert_eq!(original_go.white_time_ms, Some(1000));
+        assert_eq!(original_go.black_time_ms, Some(2000));
+        assert_eq!(original_go.white_increment_ms, Some(1));
+        assert_eq!(original_go.black_increment_ms, Some(2));
+        assert_eq!(original_go.moves_to_go, Some(8));
+        assert_eq!(
+            owner.session_owner.active_binding().unwrap().goal(),
+            contract::rovent::SearchGoal {
+                depth_plies: std::num::NonZeroU16::new(6),
+                mate_moves: std::num::NonZeroU16::new(3),
+            }
+        );
+        let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+        let [line] = stopped.protocol.as_slice() else {
+            panic!("expected one constrained bestmove: {:?}", stopped.protocol);
+        };
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        let ["bestmove", "e2e4", "ponder", prediction] = fields.as_slice() else {
+            panic!("enabled Ponder must retain the restricted root move: {line}");
+        };
+        // searchmoves restricts this root's move, not the opponent's reply.
+        let mut child = Position::startpos();
+        child
+            .make_move(BoardMove::from_uci("e2e4").unwrap())
+            .unwrap();
+        assert!(
+            child
+                .legal_moves()
+                .contains(&BoardMove::from_uci(prediction).unwrap())
+        );
+    }
+
     type DriverOutputAcks = Arc<Mutex<Vec<(contract::pals::SearchAuthority, String, bool)>>>;
 
     struct DriverOutputProbe {
@@ -4377,7 +5214,7 @@ mod tests {
         }
     }
 
-    fn search_driver_output_fixture(
+    pub(super) fn search_driver_output_fixture(
         pals: bool,
     ) -> (Owner, Session<RulesUciPort>, DriverOutputAcks) {
         let (mut owner, session) = fixture();
@@ -4429,7 +5266,7 @@ mod tests {
         (owner, session, acknowledgments)
     }
 
-    fn completed_driver_search(
+    pub(super) fn completed_driver_search(
         owner: &mut Owner,
         session: &mut Session<RulesUciPort>,
         ponder: bool,
@@ -4644,6 +5481,10 @@ mod tests {
                 ticket: ticket.clone(),
                 control: owner.session_owner.control().unwrap().clone(),
                 authority: None,
+                driver_output: None,
+                driver_output_until: None,
+                driver_start: None,
+                ponder_clock: None,
             });
             owner.handle(
                 &mut session,
