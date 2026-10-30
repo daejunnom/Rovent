@@ -4589,6 +4589,9 @@ where
                             RolePurpose::Validator => {
                                 self.registry.complete_validator_task(completion)
                             }
+                            RolePurpose::Refinement if self.has_collection_v2() => {
+                                self.registry.complete_reciprocal_role(completion)
+                            }
                             RolePurpose::Refinement => self.registry.complete(completion),
                             RolePurpose::Reciprocal => {
                                 self.registry.complete_reciprocal_role(completion)
@@ -4800,13 +4803,14 @@ where
                         RolePurpose::RootRanking | RolePurpose::Validator
                     );
                     if accepted
-                        && matches!(
+                        && (matches!(
                             self.roles[index].purpose,
                             RolePurpose::Reciprocal
                                 | RolePurpose::RoventRefinement
                                 | RolePurpose::RoventFresh
                                 | RolePurpose::RoventGoalLocal
-                        )
+                        ) || (self.roles[index].purpose == RolePurpose::Refinement
+                            && self.has_collection_v2()))
                     {
                         let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
                             "reciprocal acceptance has no actual native-owner receipt",
@@ -5037,6 +5041,10 @@ where
                 .registry
                 .validate_revoked_reciprocal_native_permit(ticket, permit)
                 .is_ok(),
+            RolePurpose::Refinement if self.has_collection_v2() => self
+                .registry
+                .validate_revoked_reciprocal_native_permit(ticket, permit)
+                .is_ok(),
             RolePurpose::Refinement => false,
         }
     }
@@ -5127,7 +5135,10 @@ where
                         physical,
                     )?;
                     self.driver.role_consumed(&ticket, &input.view)?;
-                    if purpose != RolePurpose::RoventFresh {
+                    if purpose != RolePurpose::RoventFresh
+                        && !(purpose == RolePurpose::Refinement
+                            && self.roles[index].reciprocal_acceptance.is_some())
+                    {
                         self.registry.accept(
                             &ticket,
                             self.clock.domain(),
@@ -5919,13 +5930,14 @@ where
                 return Err(AdaptiveManagerError::Capacity("native ack queue"));
             }
             let permit = if accepted
-                && matches!(
+                && (matches!(
                     self.roles[index].purpose,
                     RolePurpose::Reciprocal
                         | RolePurpose::RoventRefinement
                         | RolePurpose::RoventFresh
                         | RolePurpose::RoventGoalLocal
-                ) {
+                ) || (self.roles[index].purpose == RolePurpose::Refinement
+                    && self.has_collection_v2())) {
                 Some(self.registry.issue_reciprocal_native_acceptance(
                     &ticket,
                     self.clock.domain(),
