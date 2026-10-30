@@ -5,6 +5,7 @@ use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
 use rz_experiments::{
     LockedManifest, MAX_MANIFEST_BYTES, RoventExecutionManifest, RoventExecutionManifestV2,
     RoventExecutionReceipt, RoventInputLock, RoventInputLockV2, RunManifest,
+    PalsRunManifestV5, PalsInputLockV5, PalsAdaptiveStartupConfigV5,
 };
 use std::env;
 use std::ffi::OsString;
@@ -17,7 +18,7 @@ use std::process::ExitCode;
 mod numerical_scope_cli;
 
 const MAX_JSON_BYTES: u64 = MAX_MANIFEST_BYTES as u64;
-const USAGE: &str = "Usage:\n  rz-experiments validate MANIFEST\n  rz-experiments lock MANIFEST OUTPUT\n  rz-experiments verify LOCKED [--artifact-root ROOT --max-artifact-bytes N]\n  rz-experiments rovent-validate MANIFEST\n  rz-experiments rovent-lock MANIFEST OUTPUT\n  rz-experiments rovent-lock-v2 MANIFEST OUTPUT\n  rz-experiments rovent-corpus-lock-v2 INPUT_LOCK REGISTRATION OUTPUT\n  rz-experiments rovent-verify-receipt LOCKED RECEIPT\n  rz-experiments pals-verify-numerical-scope SCOPE --scope-sha256 SHA256 --artifact-root ROOT --max-artifact-bytes N --timeout-ms N\n\nAll successful results retain execution_ready=false. Rovent receipt validation checks saved structure and lock binding, not the truth of owner observations. Numerical-scope verification requires pals-content-admission and only rechecks saved evidence through retained read-only descriptors; it does not execute a model or issue current process/device authority. Its explicit wall-clock guard checks read boundaries and validator entry/return, not hard preemption of an existing hashing/validation call.";
+const USAGE: &str = "Usage:\n  rz-experiments validate MANIFEST\n  rz-experiments lock MANIFEST OUTPUT\n  rz-experiments verify LOCKED [--artifact-root ROOT --max-artifact-bytes N]\n  rz-experiments rovent-validate MANIFEST\n  rz-experiments rovent-lock MANIFEST OUTPUT\n  rz-experiments rovent-lock-v2 MANIFEST OUTPUT\n  rz-experiments rovent-corpus-lock-v2 INPUT_LOCK REGISTRATION OUTPUT\n  rz-experiments rovent-verify-receipt LOCKED RECEIPT\n  rz-experiments pals-lock-v5 MANIFEST OUTPUT\n  rz-experiments pals-validate-startup-v5 INPUT_LOCK CONFIG\n  rz-experiments pals-verify-numerical-scope SCOPE --scope-sha256 SHA256 --artifact-root ROOT --max-artifact-bytes N --timeout-ms N\n\nAll successful results retain execution_ready=false. Rovent receipt validation checks saved structure and lock binding, not the truth of owner observations. PALS V5 locking and startup validation check declarations only, not artifact content or actual runtime. Numerical-scope verification requires pals-content-admission and only rechecks saved evidence through retained read-only descriptors; it does not execute a model or issue current process/device authority. Its explicit wall-clock guard checks read boundaries and validator entry/return, not hard preemption of an existing hashing/validation call.";
 
 enum Command {
     Help,
@@ -48,6 +49,8 @@ enum Command {
         input_lock: PathBuf,
         receipt: PathBuf,
     },
+    PalsLockV5 { input: PathBuf, output: PathBuf },
+    PalsValidateStartupV5 { input_lock: PathBuf, config: PathBuf },
     PalsVerifyNumericalScope(numerical_scope_cli::Request),
 }
 
@@ -93,6 +96,12 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
         Some("rovent-verify-receipt") if args.len() == 3 => Ok(Command::RoventVerifyReceipt {
             input_lock: PathBuf::from(&args[1]),
             receipt: PathBuf::from(&args[2]),
+        }),
+        Some("pals-lock-v5") if args.len() == 3 => Ok(Command::PalsLockV5 {
+            input: PathBuf::from(&args[1]), output: PathBuf::from(&args[2]),
+        }),
+        Some("pals-validate-startup-v5") if args.len() == 3 => Ok(Command::PalsValidateStartupV5 {
+            input_lock: PathBuf::from(&args[1]), config: PathBuf::from(&args[2]),
         }),
         Some("pals-verify-numerical-scope") => {
             numerical_scope_cli::parse(&args).map(Command::PalsVerifyNumericalScope)
@@ -141,6 +150,24 @@ fn parse_verify(args: &[OsString]) -> Result<Command, String> {
 fn execute(command: Command) -> Result<String, String> {
     match command {
         Command::Help => Ok(USAGE.to_string()),
+        Command::PalsLockV5 { input, output } => {
+            let locked = PalsRunManifestV5::from_json(&read_json(&input)?)
+                .and_then(|manifest| manifest.lock())
+                .map_err(|error| error.to_string())?;
+            let json = locked.to_json().map_err(|error| error.to_string())?;
+            if json.len() as u64 > MAX_JSON_BYTES {
+                return Err("PALS V5 locked JSON exceeds the input limit".to_string());
+            }
+            write_new_file(&output, json.as_bytes())?;
+            Ok("PALS V5 declarations locked; artifact_content_verified=false; execution_ready=false".to_string())
+        }
+        Command::PalsValidateStartupV5 { input_lock, config } => {
+            let locked = PalsInputLockV5::from_json(&read_json(&input_lock)?)
+                .map_err(|error| error.to_string())?;
+            PalsAdaptiveStartupConfigV5::from_json(&read_json(&config)?, &locked)
+                .map_err(|error| error.to_string())?;
+            Ok("PALS V5 startup declarations valid; artifact_content_verified=false; execution_ready=false".to_string())
+        }
         Command::Validate(input) => {
             RunManifest::from_json(&read_json(&input)?)
                 .and_then(|manifest| manifest.validate())
