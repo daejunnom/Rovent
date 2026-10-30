@@ -79,6 +79,8 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_v2_first_failure: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_v2_abandon_custody: Vec::with_capacity(limits.role_tickets_max),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_v2_disable_failed: false,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_admission_v2: None,

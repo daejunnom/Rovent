@@ -2233,6 +2233,11 @@ where
     /// diagnostic history rolls over. It is not a native completion result.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_first_failure: Option<AdaptiveCollectionError>,
+    /// Original discarded tickets whose observer cleanup failed. Their native
+    /// discard ACK is confirmed, but their capture remains with the observer
+    /// until this same root's physical fence and settlement.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_v2_abandon_custody: Vec<RoleTicketEnvelope>,
     /// A failed bypass must stop admission; retrying or treating it as a
     /// completed capture could drop the original input owner.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -5389,6 +5394,25 @@ where
             let consumed = self.roles[index].consumption_recorded;
             if let Some(original) = &self.roles[index].goal_local {
                 self.driver.discard_rovent_goal_input(original)?;
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if !consumed {
+                let result = self.collection_observer_v2.as_mut().map(|observer| observer.abandoned(&ticket));
+                if let Some(Err(error)) = result {
+                    // Keep the same ticket even when observer cleanup fails;
+                    // settlement can retry only after the actual root fence.
+                    // Captures are bounded by the original in-flight limit and
+                    // the first failure disables new captured dispatches.
+                    if self.collection_v2_abandon_custody.len() >= self.limits.role_tickets_max {
+                        self.record_failure(error.into());
+                        return Err(AdaptiveManagerError::Capacity("V2 abandoned ticket custody"));
+                    }
+                    self.collection_v2_abandon_custody.try_reserve(1)
+                        .map_err(|_| AdaptiveManagerError::Capacity("V2 abandoned ticket custody"))?;
+                    self.collection_v2_abandon_custody.push(ticket);
+                    self.collection_v2_first_failure.get_or_insert_with(|| error.clone());
+                    self.record_failure(error.into());
+                }
             }
             self.roles.remove(index);
             if !consumed {
@@ -9276,9 +9300,13 @@ where
                             .iter()
                             .filter_map(|held| held.binding.ticket),
                     )
+                    .chain(self.collection_v2_abandon_custody.iter().copied())
                     .collect::<Vec<_>>();
                 let result = observer.settled(&tickets);
                 self.collection_v2_settlement = Some(result.clone());
+                if result.is_ok() {
+                    self.collection_v2_abandon_custody.clear();
+                }
                 if let Err(error) = result {
                     self.record_failure(error.into());
                 }
