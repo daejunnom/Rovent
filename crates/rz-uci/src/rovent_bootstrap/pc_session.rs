@@ -218,11 +218,12 @@ pub struct RoventPcRevokeObservationV2 {
     pub soft_expired: bool,
     pub manager_phase: ManagerPhase,
     pub goal: Option<FrontierGoalStatus>,
-    pub role_calls_spent: u64,
+    pub role_calls_admitted: u64,
     pub role_calls_reserved: u64,
+    pub role_call_limit: u64,
     pub role_call_limit_reached: bool,
     pub manager_failures: usize,
-    pub driver_is_complete: bool,
+    pub driver_complete_at_revoke: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum RoventPcRevokeOriginV2 { LoopCondition, RunEnded }
@@ -2365,11 +2366,12 @@ impl RoventPcSessionDriver {
                                 manager_phase: manager.phase(),
                                 goal: manager.driver().port().rovent_frontier_receipt()
                                     .map(|receipt| receipt.snapshot.goal),
-                                role_calls_spent: manager.role_call_budget_usage().0,
+                                role_calls_admitted: manager.role_call_budget_usage().0,
                                 role_calls_reserved: manager.role_call_budget_usage().1,
+                                role_call_limit: manager.role_call_limit(),
                                 role_call_limit_reached: manager.role_call_limit_reached(),
                                 manager_failures: manager.failures().count(),
-                                driver_is_complete: manager.driver_is_complete(),
+                                driver_complete_at_revoke: manager.driver_is_complete(),
                             };
                             hook.revoke_root_observed(v2_current_admission.as_ref().ok_or(
                                 AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
@@ -2470,11 +2472,12 @@ impl RoventPcSessionDriver {
                         manager_phase: manager.phase(),
                         goal: manager.driver().port().rovent_frontier_receipt()
                             .map(|receipt| receipt.snapshot.goal),
-                        role_calls_spent: manager.role_call_budget_usage().0,
+                        role_calls_admitted: manager.role_call_budget_usage().0,
                         role_calls_reserved: manager.role_call_budget_usage().1,
+                        role_call_limit: manager.role_call_limit(),
                         role_call_limit_reached: manager.role_call_limit_reached(),
                         manager_failures: manager.failures().count(),
-                        driver_is_complete: manager.driver_is_complete(),
+                        driver_complete_at_revoke: manager.driver_is_complete(),
                     };
                     hook.revoke_root_observed(root, observation)
                 }));

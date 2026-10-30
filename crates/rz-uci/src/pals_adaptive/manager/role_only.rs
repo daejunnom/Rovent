@@ -824,8 +824,11 @@ where
         (self.registry.cumulative_observation().admitted,
          self.bindings.iter().filter(|binding| binding.ticket.is_none()).count() as u64)
     }
+    pub fn role_call_limit(&self) -> u64 {
+        self.registration.role_call_limit
+    }
     pub fn role_call_limit_reached(&self) -> bool {
-        self.role_call_budget_usage().0 >= self.registration.role_call_limit
+        self.role_call_budget_usage().0 >= self.role_call_limit()
     }
     pub fn driver_is_complete(&self) -> bool {
         self.driver.is_complete()
