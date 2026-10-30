@@ -1579,6 +1579,20 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         }
         Ok(())
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn collection_v2_observation_complete(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) -> bool {
+        // This only reports that this driver's V-free observation paths can
+        // consume the exact attached admission.  The independent Arena
+        // teacher still reports its own startup and physical retirement.
+        let origin = admission.native_origin();
+        !self.closing
+            && origin.sources().lock().manifest.engine.pc.validator.is_none()
+            && !origin.startup_snapshot().validator_loaded
+            && self.validate_collection_admission_v2(admission).is_ok()
+    }
     fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
         Ok(self
             .port

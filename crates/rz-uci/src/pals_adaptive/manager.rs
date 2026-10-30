@@ -924,7 +924,7 @@ pub trait AdaptiveSearchDriver<Q> {
     /// A driver must not enable V2 observation until all acceptance and
     /// consumption paths and the external teacher lifecycle are wired.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-    fn collection_v2_observation_complete(&self) -> bool {
+    fn collection_v2_observation_complete(&self, _admission: &RoventCollectionRootAdmissionV2) -> bool {
         false
     }
     fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
@@ -2999,7 +2999,7 @@ where
                         "V2 collection observer installation order",
                     ));
                 }
-                if !self.driver.collection_v2_observation_complete() {
+                if !self.driver.collection_v2_observation_complete(&admission) {
                     return Err(AdaptiveManagerError::Invalid(
                         "V2 adaptive collection observation is not fully connected",
                     ));

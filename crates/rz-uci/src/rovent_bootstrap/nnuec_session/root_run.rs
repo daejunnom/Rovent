@@ -994,7 +994,7 @@ impl RoventNnuecSessionDriver {
                         // abort an otherwise valid NNUEC root before search.
                         // The normal no-capture capability proves that no
                         // observer or teacher was started for this admission.
-                        let escrow_error = if !manager.driver().collection_v2_observation_complete() {
+                        let escrow_error = if !manager.driver().collection_v2_observation_complete(&cap) {
                             Some(crate::pals_adaptive::AdaptiveCollectionError::new(
                                 crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
                                 "RoventCollectionObservationIncomplete",
