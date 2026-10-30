@@ -176,14 +176,20 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         }
         _ => return Err("unsupported V2 collection mode".into()),
     };
+    // `run_*` succeeds only after the native completion boundary; `closed_owner`
+    // checks the original joined worker and handoff, and publication is the
+    // actual durable corpus result. Process-tree completion and enforcement
+    // of the native wall deadline remain the external supervisor's evidence.
+    let in_process_complete = accepted && publication == "published" && publication_error.is_none();
     Ok((
         serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
         "input_directory":cli.input, "output_directory":cli.output, "worker_timeout_ms":cli.worker_ms,
         "cleanup_timeout_ms":cli.cleanup_ms, "runner_observation":observation,
         "owner_inspection_available":accepted, "publication":publication, "publication_error":publication_error, "training_executed":false,
         "owner_custody":"process_lifetime_only", "durable_recovery":"unavailable",
-        "native_execution_deadline":"external_supervisor_required", "cli_acceptance":"incomplete"}),
-        false,
+        "native_execution_deadline":"external_supervisor_required",
+        "cli_acceptance":if in_process_complete { "complete_in_process" } else { "incomplete" }}),
+        in_process_complete,
     ))
 }
 
