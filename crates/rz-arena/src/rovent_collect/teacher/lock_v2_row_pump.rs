@@ -45,6 +45,10 @@ pub(crate) enum FailedEvidence {
         id: TeacherJobId,
         completed: CompletedTeacherV2,
     },
+    PendingMismatched {
+        expected: TeacherJobId,
+        completed: CompletedTeacherV2,
+    },
     Completion(CompletedTeacherV2),
     SealRejected {
         cause: TeacherPolicySealFailureV2,
@@ -67,6 +71,7 @@ impl FailedEvidence {
             Self::SubmitPending(_) => "submit_pending".into(),
             Self::Pending { .. } => "pending_original_job".into(),
             Self::PendingCompleted { .. } => "pending_completed".into(),
+            Self::PendingMismatched { .. } => "pending_terminal_identity_mismatch".into(),
             Self::Completion(_) => "completed_unsealed".into(),
             Self::SealRejected { cause, .. } => match cause {
                 TeacherPolicySealFailureV2::Validation(error) => format!("seal_validation: {error}"),
@@ -193,7 +198,11 @@ impl PumpCustodyV2 {
                     };
                     let id = *id;
                     if let HeldPumpStageV2::Failed { evidence, .. } = &mut entry.stage {
-                        *evidence = FailedEvidence::PendingCompleted { id, completed };
+                        *evidence = if completed.dispatch.id() == id {
+                            FailedEvidence::PendingCompleted { id, completed }
+                        } else {
+                            FailedEvidence::PendingMismatched { expected: id, completed }
+                        };
                     }
                     return Ok(true);
                 }
@@ -311,9 +320,11 @@ impl RetiredRowPumpV2 {
     pub(crate) fn poll(
         &mut self,
         session: &mut RoventCollectionTeacherSessionV2,
+        allow_submission: bool,
     ) -> Result<(), ArenaError> {
         session.validate_pump_owner(&self.session_owner)?;
         if self.pending_failure {
+            self.drain_pending_terminal(session)?;
             return Ok(());
         }
         let Some(entry) = self.entries.front_mut() else {
@@ -325,6 +336,7 @@ impl RetiredRowPumpV2 {
             Stage::Queued => match entry.row.submitted_input_seal().teacher_actor_id {
                 None => Stage::Unlabeled,
                 Some(_) if entry.row.record.0.input.legal_moves.is_empty() => Stage::Unlabeled,
+                Some(_) if !allow_submission => Stage::Queued,
                 Some(_) if Instant::now() >= entry.deadline => Stage::Failed {
                     error: invalid("V2 teacher observation deadline expired before submission"),
                     evidence: FailedEvidence::BeforeCompletion,
@@ -436,6 +448,68 @@ impl RetiredRowPumpV2 {
             unchanged => unchanged,
         };
         Ok(())
+    }
+
+    /// During failure/shutdown, retrieve only an already-submitted terminal.
+    /// The same session and permit retain the original dispatch. No row is
+    /// issued, sealed, labelled or made successful by this operation.
+    pub(crate) fn drain_pending_terminal(
+        &mut self,
+        session: &mut RoventCollectionTeacherSessionV2,
+    ) -> Result<bool, ArenaError> {
+        session.validate_pump_owner(&self.session_owner)?;
+        let Some(entry) = self.entries.front_mut() else { return Ok(false); };
+        match &mut entry.stage {
+            Stage::Pending { actor, id } => {
+                let expected = *id;
+                let Some(completed) = session.take_completed_actor(&self.session_owner, actor)? else { return Ok(false); };
+                let matched = completed.dispatch.id() == expected;
+                entry.stage = Stage::Failed {
+                    error: invalid(if matched {
+                        "V2 teacher terminal retained after pump failure"
+                    } else {
+                        "V2 pending teacher dispatch identity mismatch"
+                    }),
+                    evidence: if matched {
+                        FailedEvidence::PendingCompleted { id: expected, completed }
+                    } else {
+                        FailedEvidence::PendingMismatched { expected, completed }
+                    },
+                };
+                Ok(true)
+            }
+            Stage::Failed { evidence: FailedEvidence::Pending { actor, id }, .. } => {
+                let expected = *id;
+                let Some(completed) = session.take_completed_actor(&self.session_owner, actor)? else { return Ok(false); };
+                if let Stage::Failed { evidence, .. } = &mut entry.stage {
+                    *evidence = if completed.dispatch.id() == expected {
+                        FailedEvidence::PendingCompleted { id: expected, completed }
+                    } else {
+                        FailedEvidence::PendingMismatched { expected, completed }
+                    };
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Classify only an unissued front row after the worker observed revoke.
+    /// It remains a failed/partial original row, never a teacher target.
+    pub(crate) fn retire_unissued_after_revoke(&mut self) {
+        if let Some(entry) = self.entries.front_mut() {
+            if matches!(entry.stage, Stage::Queued) {
+                entry.stage = if entry.row.submitted_input_seal().teacher_actor_id.is_none()
+                    || entry.row.record.0.input.legal_moves.is_empty() {
+                    Stage::Unlabeled
+                } else {
+                    Stage::Failed {
+                        error: invalid("V2 teacher request unissued after root revoke"),
+                        evidence: FailedEvidence::BeforeCompletion,
+                    }
+                };
+            }
+        }
     }
 
     /// Prepared targets may be committed by the original producer only after

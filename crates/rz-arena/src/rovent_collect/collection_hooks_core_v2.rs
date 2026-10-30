@@ -391,6 +391,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             pump_sender_failed: false,
             pump_rejected: None,
             pump_failed: false,
+            pending_drain_failed: false,
             admission_receiver,
             handoff_receiver,
             handoff_matches,
@@ -775,6 +776,7 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     pump_sender_failed: bool,
     pump_rejected: Option<Box<(ArenaError, super::RoventRetiredLockV2Record)>>,
     pump_failed: bool,
+    pending_drain_failed: bool,
     admission_receiver: mpsc::Receiver<Arc<AdmissionSlot>>,
     handoff_receiver: mpsc::Receiver<Arc<Mutex<H>>>,
     handoff_matches: HandoffMatches<H>,
@@ -946,7 +948,21 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
 
     fn poll_row_pump(&mut self) {
         let Some((constraint, quantum)) = self.pump_config else { return; };
-        if self.session.is_none() || self.pump_failed || (self.failure.is_some() && self.pump.is_none()) { return; }
+        if self.session.is_none() { return; }
+        if self.pump_failed || self.pump_rejected.is_some() {
+            // A failed pump must not issue or seal any more work, but its
+            // original session still owns any already-submitted terminal.
+            if !self.pending_drain_failed {
+                if let (Some(pump), Some(session)) = (self.pump.as_mut(), self.session.as_mut()) {
+                    if let Err(error) = pump.drain_pending_terminal(session) {
+                        self.pending_drain_failed = true;
+                        self.record_failure(WorkerFailure::RowPump(error));
+                    }
+                }
+            }
+            return;
+        }
+        if self.failure.is_some() && self.pump.is_none() { return; }
         if self.pump.is_none() {
             let session = self.session.as_mut().expect("original teacher session");
             match RetiredRowPumpV2::new(session, 16, constraint, quantum) {
@@ -961,7 +977,8 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         if self.pump_ready.len() < 16 {
             if let Some(item) = pump.take_ready() { self.pump_ready.push_back(item); }
         }
-        if self.pump_ready.len() + pump.len() < 16 {
+        if !self.revoked.load(Ordering::Acquire) && !self.shutdown_requested
+            && self.failure.is_none() && self.pump_ready.len() + pump.len() < 16 {
             match self.owner.take_retired() {
                 Ok(Some(row)) => {
                     if let Err(original) = pump.enqueue(row) {
@@ -976,7 +993,11 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             }
         }
         let session = self.session.as_mut().expect("same original teacher session");
-        if let Err(error) = pump.poll(session) {
+        // This prevents submission after this worker observes closure; it
+        // does not linearize a simultaneous revoke against mailbox admission.
+        let allow_submission = !self.revoked.load(Ordering::Acquire)
+            && !self.shutdown_requested && self.failure.is_none();
+        if let Err(error) = pump.poll(session, allow_submission) {
             self.pump_failed = true;
             self.record_failure(WorkerFailure::RowPump(error));
         }
@@ -993,13 +1014,15 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     }
 
     /// After revocation, transfer only already-ready original rows. This never
-    /// polls the teacher, submits a new job, or turns a queued/late item into
-    /// a completed one. Full keeps the same item in this worker's custody.
+    /// polls the teacher or submits a new job. Queued rows are retained as
+    /// explicitly unissued failures; no target or completion is fabricated.
+    /// Full keeps the same item in this worker's custody.
     fn drain_ready_pump_after_revoke(&mut self) {
         if self.pump_sender_failed { return; }
         let Some(sender) = self.pump_sender.clone() else { return; };
         for _ in 0..16 {
             if self.pump_ready.is_empty() {
+                if let Some(pump) = self.pump.as_mut() { pump.retire_unissued_after_revoke(); }
                 let Some(item) = self.pump.as_mut().and_then(RetiredRowPumpV2::take_ready) else { break; };
                 self.pump_ready.push_back(item);
             }
