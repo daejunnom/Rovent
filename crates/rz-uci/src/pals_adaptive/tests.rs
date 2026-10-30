@@ -1185,6 +1185,8 @@ fn exhausted_root_role_budget_preserves_actual_commit_failure() {
     assert_eq!(manager.counters().unused_role_results, 1);
     assert!(manager.failures().any(|error| matches!(error,
         AdaptiveManagerError::Semantic(message) if message.contains("authored role hot-commit failure"))));
+    assert!(manager.failures().any(|error| matches!(error,
+        AdaptiveManagerError::Semantic(message) if message.contains("retire_role.commit_role"))));
     assert!(manager.roles.is_empty());
     assert_eq!(manager.native_cpu_usage().unwrap(), (0, 0));
 }

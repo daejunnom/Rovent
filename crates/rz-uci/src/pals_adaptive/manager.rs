@@ -5136,7 +5136,8 @@ where
                         "accepted native ack has no output",
                     ))?;
             if let Some(work) = &work {
-                self.utility_begin_commit(work, StepExecution::Role(ticket.id))?;
+                self.utility_begin_commit(work, StepExecution::Role(ticket.id))
+                    .map_err(|error| error.at_semantic_stage("retire_role.utility_begin_commit"))?;
             }
             let utility_work = work.clone();
             let attempted = (|| -> Result<(), AdaptiveManagerError> {
@@ -5146,7 +5147,7 @@ where
                         &ticket,
                         output.proposer_ranking_output(),
                         physical,
-                    )?;
+                    ).map_err(|error| error.at_semantic_stage("retire_role.goal_local"))?;
                 } else if purpose == RolePurpose::Reciprocal {
                     let work = work.ok_or(AdaptiveManagerError::Invalid(
                         "reciprocal role lost its exact child frame",
@@ -5157,7 +5158,7 @@ where
                         &ticket,
                         output.proposer_ranking_output(),
                         physical,
-                    )?;
+                    ).map_err(|error| error.at_semantic_stage("retire_role.reciprocal"))?;
                 } else if let Some(work) = work {
                     if purpose == RolePurpose::RoventFresh {
                         let accepted = self.roles[index].reciprocal_acceptance.as_ref().ok_or(
@@ -5172,15 +5173,16 @@ where
                             physical,
                             self.clock.domain(),
                             self.check_running()?,
-                        )?;
+                        ).map_err(|error| error.at_semantic_stage("retire_role.fresh_accepted"))?;
                     }
                     let committed = self.driver.commit_role(
                         &work,
                         &ticket,
                         output.proposer_ranking_output(),
                         physical,
-                    )?;
-                    self.driver.role_consumed(&ticket, &input.view)?;
+                    ).map_err(|error| error.at_semantic_stage("retire_role.commit_role"))?;
+                    self.driver.role_consumed(&ticket, &input.view)
+                        .map_err(|error| error.at_semantic_stage("retire_role.role_consumed"))?;
                     if purpose != RolePurpose::RoventFresh
                         && !(purpose == RolePurpose::Refinement
                             && self.roles[index].reciprocal_acceptance.is_some())
@@ -5195,8 +5197,10 @@ where
                     if self.has_collection_failure() {
                         return Ok(());
                     }
-                    self.utility_role_at(index, &work, output.proposer_ranking_output())?;
-                    self.resolve(work, StepExecution::Role(ticket.id), committed)?;
+                    self.utility_role_at(index, &work, output.proposer_ranking_output())
+                        .map_err(|error| error.at_semantic_stage("retire_role.utility_role"))?;
+                    self.resolve(work, StepExecution::Role(ticket.id), committed)
+                        .map_err(|error| error.at_semantic_stage("retire_role.resolve"))?;
                 } else if purpose == RolePurpose::RootRanking {
                     let ranking = self.registry.accept_proposer_ranking(
                         &ticket,
@@ -5632,7 +5636,8 @@ where
                 DeferredCommit::ProfiledExternal { binding, packet } => {
                     self.commit_profiled_packet(binding, packet)
                 }
-                DeferredCommit::Role { ticket, accepted } => self.retire_role(*ticket, *accepted),
+                DeferredCommit::Role { ticket, accepted } => self.retire_role(*ticket, *accepted)
+                    .map_err(|error| error.at_semantic_stage("deferred.role")),
                 DeferredCommit::Own { binding, report } => {
                     if self.phase == ManagerPhase::Running {
                         self.commit_own(binding, report)
