@@ -210,13 +210,22 @@ impl RoventNnuecCollectionBridgeV2 {
         if !matches!(self.poll_worker()?, Some(OwnWorkerExitKindV2::Retirement | OwnWorkerExitKindV2::Aggregate)) {
             return Ok(false);
         }
+        self.try_observe_physical_installed()
+    }
+
+    /// Read already joined same-root physical evidence without signalling or
+    /// consuming the original worker, handoff, failure or pending rows.
+    pub(crate) fn try_observe_physical_installed(&self) -> Result<bool, AdaptiveManagerError> {
         let slot = match self.worker.try_lock() {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(AdaptiveManagerError::Invalid("Own worker custody poisoned")),
         };
         let Some(worker) = slot.as_ref() else { return Ok(false); };
-        if worker.handle.is_some() || worker.panic.is_some() { return Ok(false); }
+        if worker.handle.is_some() || worker.panic.is_some()
+            || !matches!(worker.exit.as_ref(), Some(RoventNnuecCollectionWorkerExitV2::RetirementAndHandoffObserved | RoventNnuecCollectionWorkerExitV2::AggregateHandoffObserved)) {
+            return Ok(false);
+        }
         let core = match worker.original.try_lock() {
             Ok(core) => core,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),

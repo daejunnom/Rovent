@@ -688,6 +688,21 @@ impl RoventNnuecCollectionRunV2 {
             None if self.worker_thread_panicked => "outer_panic",
             None => "pending",
         };
+        // This is the primary worker and same-root scope only. The enclosing
+        // process tree, any secondary workers, semantic labels and corpus
+        // publication require their own evidence.
+        let (teacher_scope_physical, teacher_scope_physical_error) =
+            if !self.primary_join_observed() || self.primary_panic_observed() || self.worker_custody_poisoned {
+                ("unknown", None)
+            } else if worker_exit == "no_admission" {
+                ("no_admission_worker_joined", None)
+            } else {
+                match self.bridge.try_observe_physical_installed() {
+                    Ok(true) => ("same_root_aggregate_and_worker_joined", None),
+                    Ok(false) => ("unknown", None),
+                    Err(error) => ("unknown", Some(format!("{error:?}"))),
+                }
+            };
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
             let (pump_unlabeled, pump_prepared, pump_committed, pump_failed) = worker.pump_ready_counts();
@@ -733,7 +748,7 @@ impl RoventNnuecCollectionRunV2 {
             "teacher_worker_returned":self.primary_join_observed(),
             "teacher_worker_exit":worker_exit,
             "teacher_worker_running_or_unknown":!self.worker_not_started && (self.worker_thread.is_some() || self.worker_thread_panicked || self.worker_custody_poisoned
-                || !self.primary_retirement_observed()),
+                || teacher_scope_physical == "unknown"),
             "teacher_worker_thread_panicked":self.primary_panic_observed(),
             "teacher_worker_custody_poisoned":self.worker_custody_poisoned,
             "recovered_handoff_lease_retained":self.recovered_handoff.is_some(),
@@ -791,6 +806,8 @@ impl RoventNnuecCollectionRunV2 {
             "uci_handoff_custody":if self.transferred_handoff.is_some() { "leased_to_run" } else if self.recovered_handoff.is_some() { "recovered_from_escrow" } else { "unknown" },
             "uci_handoff_registry_released":false,
             "uci_handoff_transfer_error":self.handoff_transfer_error.map(|error|format!("{error:?}")),
+            "primary_teacher_scope_physical":teacher_scope_physical,
+            "primary_teacher_scope_physical_error":teacher_scope_physical_error,
             "physical_completion_claimed":false,"corpus_published":self.publisher_status == "published","training_executed":false});
         let serde_json::Value::Object(remaining) = remaining else {
             unreachable!("remaining observation is an object");
