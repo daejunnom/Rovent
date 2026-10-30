@@ -783,21 +783,26 @@ impl RoventPcCollectionRunV2 {
                 Err(error) => json!({"status":"error", "detail":error.to_string()}),
             }
         }).collect();
-        let collection_owner = owner.map(|status| json!({"admitted":status.admitted,"settled":status.settled,
-            "pending":status.pending_count,"retired":status.pending_retired_count,
-            "game_record_limit":status.game_record_limit,"game_retired_total":status.game_retired_total,
-            "game_reserved_slots":status.game_reserved_slots,
-            "pending_disabled_markers":status.pending_disabled_markers,
-            "collection_incomplete_due_to_backpressure":status.collection_disabled_first_ticket.is_some() || !status.prior_disabled_first_tickets.is_empty(),
-            "first_omitted_ticket":status.collection_disabled_first_ticket.as_ref().map(ticket_json),
-            "disable_reason":status.collection_disabled_reason.map(|reason|format!("{reason:?}")),
-            "prior_disabled_first_tickets":status.prior_disabled_first_tickets.iter().map(ticket_json).collect::<Vec<_>>(),
-            "prior_disabled_reasons":status.prior_disabled_reasons.iter().map(|reason|format!("{reason:?}")).collect::<Vec<_>>(),
-            "incomplete_capture":status.incomplete_capture_count,
-            "failed_captures":status.retained_failed_captures,
-            "failed_staged_inputs":status.retained_failed_staged,
-            "failure":status.failure.map(|error|format!("{error:?}")),
-            "callback_lock_failure":status.callback_lock_failure}));
+        let collection_owner = owner.map(|status| {
+            let mut value = json!({"admitted":status.admitted,"settled":status.settled,
+                "pending":status.pending_count,"retired":status.pending_retired_count,
+                "game_record_limit":status.game_record_limit,"retired_outbox_capacity":status.retired_outbox_capacity,
+                "game_retired_total":status.game_retired_total,"game_reserved_slots":status.game_reserved_slots,
+                "pending_disabled_markers":status.pending_disabled_markers,
+                "collection_incomplete_due_to_backpressure":status.collection_disabled_first_ticket.is_some() || !status.prior_disabled_first_tickets.is_empty(),
+                "first_omitted_ticket":status.collection_disabled_first_ticket.as_ref().map(ticket_json),
+                "disable_reason":status.collection_disabled_reason.map(|reason|format!("{reason:?}"))});
+            let rest = json!({
+                "prior_disabled_first_tickets":status.prior_disabled_first_tickets.iter().map(ticket_json).collect::<Vec<_>>(),
+                "prior_disabled_reasons":status.prior_disabled_reasons.iter().map(|reason|format!("{reason:?}")).collect::<Vec<_>>(),
+                "incomplete_capture":status.incomplete_capture_count,"failed_captures":status.retained_failed_captures,
+                "failed_staged_inputs":status.retained_failed_staged,
+                "failure":status.failure.map(|error|format!("{error:?}")),
+                "callback_lock_failure":status.callback_lock_failure});
+            let serde_json::Value::Object(rest) = rest else { unreachable!("owner status is an object"); };
+            value.as_object_mut().expect("owner status is an object").extend(rest);
+            value
+        });
         let mut observation = json!({"schema":"rz-rovent-pc-lock-v2-run-observation/1",
             "native_error":self.native_failure.as_ref().map(|error|error.error.to_string()),
             "native_failure_transferred":self.native_failure_taken,

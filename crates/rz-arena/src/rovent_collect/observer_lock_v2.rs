@@ -22,6 +22,9 @@ use std::{
 };
 
 const CAPACITY: usize = 16;
+// Bound retained rows independently of the game-wide record quota. Channel
+// slots hold the original rows and do not allocate their payloads in advance.
+const MAX_RETIRED_OUTBOX_CAPACITY: usize = 256;
 const RETAINED_ROOT_CAPACITY: usize = 256;
 
 struct Pending {
@@ -61,6 +64,7 @@ pub(crate) enum OwnerInstallReadinessV2 {
 
 struct State {
     game_record_limit: usize,
+    retired_outbox_capacity: usize,
     game_retired_total: usize,
     manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
     producer: Option<RoventCorpusProducerLockV2>,
@@ -208,13 +212,17 @@ impl RoventCollectionOwnerLockV2 {
         )?;
         let (registration, observer, receiver) = rovent_native_capture_channel();
         let registration_for_owner = registration.clone();
-        let (retired_sender, retired_receiver) = mpsc::sync_channel(CAPACITY);
+        // This is a finite custody allowance, not a claim about host memory
+        // usage. It cannot exceed the user's registered game record quota.
+        let retired_outbox_capacity = game_record_limit.min(MAX_RETIRED_OUTBOX_CAPACITY);
+        let (retired_sender, retired_receiver) = mpsc::sync_channel(retired_outbox_capacity);
         let retired_queued = Arc::new(AtomicUsize::new(0));
         Ok((
             Self {
                 game_gate: Arc::new(AtomicU64::new(0)),
                 state: Arc::new(Mutex::new(State {
                     game_record_limit,
+                    retired_outbox_capacity,
                     game_retired_total: 0,
                     manifest,
                     producer: None,
@@ -632,6 +640,7 @@ impl RoventCollectionOwnerLockV2 {
             admitted: state.admitted,
             settled: state.settled,
             game_record_limit: state.game_record_limit,
+            retired_outbox_capacity: state.retired_outbox_capacity,
             game_retired_total: state.game_retired_total,
             game_reserved_slots: state.game_reserved_slots().ok(),
             pending_count: state.pending.len() + state.staged.len(),
@@ -691,6 +700,8 @@ pub struct RoventCollectionOwnerStatusLockV2 {
     pub settled: bool,
     /// Game-owner cap and monotonic retired count; not a publication count.
     pub game_record_limit: usize,
+    /// Maximum original pending/staged/retired rows, not allocated bytes.
+    pub retired_outbox_capacity: usize,
     pub game_retired_total: usize,
     /// Unknown only on arithmetic overflow; never infer zero in that case.
     pub game_reserved_slots: Option<usize>,
@@ -1047,7 +1058,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                 return Ok(AdaptiveCollectionDispatchV2::Busy);
             }
             if !state.staged.contains_key(&ticket.id)
-                && (game_limit_reached || state.outstanding_rows() >= CAPACITY
+                && (game_limit_reached || state.outstanding_rows() >= state.retired_outbox_capacity
                     || state.handled_tickets.len() + state.pending.len()
                         >= rz_experiments::rovent_corpus::MAX_CORPUS_ROWS)
             {
@@ -1058,7 +1069,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                 }
                 let reason = if game_limit_reached {
                     RoventCollectionDisableReasonV2::GameRecordLimit
-                } else if state.outstanding_rows() >= CAPACITY {
+                } else if state.outstanding_rows() >= state.retired_outbox_capacity {
                     RoventCollectionDisableReasonV2::RetiredOutboxFull
                 } else {
                     RoventCollectionDisableReasonV2::TicketEvidenceLimit

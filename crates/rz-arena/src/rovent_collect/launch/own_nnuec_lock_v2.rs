@@ -712,7 +712,7 @@ impl RoventNnuecCollectionRunV2 {
         let owner_value = owner.map(|status| {
             let mut value = json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
-                "game_record_limit":status.game_record_limit,"game_retired_total":status.game_retired_total,
+                "game_record_limit":status.game_record_limit,"retired_outbox_capacity":status.retired_outbox_capacity,"game_retired_total":status.game_retired_total,
                 "game_reserved_slots":status.game_reserved_slots,
                 "collection_incomplete_due_to_backpressure":status.collection_disabled_first_ticket.is_some() || !status.prior_disabled_first_tickets.is_empty(),
                 "first_omitted_ticket":status.collection_disabled_first_ticket.as_ref().map(ticket_json),
