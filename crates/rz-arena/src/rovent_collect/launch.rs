@@ -65,7 +65,8 @@ pub use own_nnuec_lock_v2::{RoventNnuecCollectionRunV2, run_rovent_own_nnuec_col
 #[cfg(feature = "test-fixtures")]
 pub use pc_lock_v2::run_rovent_pc_collection_lock_v2_with_test_owner;
 pub use pc_lock_v2::{RoventPcCollectionRunV2, run_rovent_pc_collection_lock_v2,
-    run_rovent_pc_collection_lock_v2_with_sealed_policy};
+    run_rovent_pc_collection_lock_v2_with_sealed_policy,
+    run_rovent_pc_collection_lock_v2_with_speculative_teacher};
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 

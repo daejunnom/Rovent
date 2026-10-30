@@ -163,8 +163,11 @@ impl RoventCollectionTeacherLifecycleV2 {
             }
             // These immutable snapshots carry the actual Rules history. A
             // matching caller-supplied digest alone is never sufficient.
-            // The caller must reconstruct expected_query from its original
-            // retired row, not from the teacher dispatch itself.
+            // The caller must reconstruct expected_query independently from
+            // its original retired row or its actual native-submitted capture,
+            // never from the teacher dispatch itself. A captured-query claim
+            // is only speculative evidence; a matching accepted/retired row is
+            // still required by the collection producer to attach a target.
             if !dispatch.original_position().same_state(expected_query)
                 || dispatch.original_root_moves() != expected_root_moves
             {

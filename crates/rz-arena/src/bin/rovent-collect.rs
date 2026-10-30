@@ -9,6 +9,7 @@ struct LockV2Cli {
     worker_ms: u64,
     cleanup_ms: u64,
     sealed_teacher_slots: Vec<usize>,
+    speculative_teacher: bool,
     original: Vec<String>,
 }
 
@@ -33,6 +34,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
                     | "--v2-worker-timeout-ms"
                     | "--v2-cleanup-timeout-ms"
                     | "--v2-sealed-teacher-slots"
+                    | "--v2-speculative-teacher"
             ) || value.is_empty()
                 || fields.insert(key.to_owned(), value.to_owned()).is_some()
             {
@@ -73,6 +75,11 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
             slots
         }
     };
+    let speculative_teacher = match fields.remove("--v2-speculative-teacher").as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => return Err("speculative teacher must be true or false".into()),
+    };
     if !input.is_absolute() || !output.is_absolute() || worker_ms == 0 || cleanup_ms < worker_ms {
         return Err(
             "absolute input/output and finite ordered worker/cleanup timeouts required".into(),
@@ -86,6 +93,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
         worker_ms,
         cleanup_ms,
         sealed_teacher_slots,
+        speculative_teacher,
         original,
     }))
 }
@@ -94,7 +102,7 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
 fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std::error::Error>> {
     use rz_arena::rovent_collect::launch::{
         load_rovent_collection_lock_v2_plan, run_rovent_own_nnuec_collection_lock_v2,
-        run_rovent_pc_collection_lock_v2_with_sealed_policy,
+        run_rovent_pc_collection_lock_v2_with_speculative_teacher,
     };
     use std::time::{Duration, Instant};
     let start = Instant::now();
@@ -116,6 +124,8 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         return Err("V2 P/C root capacity must be between 1 and 64".into());
     }
     let publication_timeout_ms = plan.publication_timeout_ms;
+    let speculative_requested = cli.speculative_teacher;
+    let speculative_effective = speculative_requested && cli.mode == "pc";
     let sealed_requested = cli.sealed_teacher_slots.clone();
     let sealed_effective: Vec<_> = sealed_requested.iter().copied()
         .filter(|&index| cli.mode == "pc" && index < plan.teacher_sources.len()).collect();
@@ -123,13 +133,14 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         .filter(|index| !sealed_effective.contains(index)).collect();
     let (observation, accepted, publication, publication_error) = match cli.mode.as_str() {
         "pc" => {
-            let mut run = run_rovent_pc_collection_lock_v2_with_sealed_policy(
+            let mut run = run_rovent_pc_collection_lock_v2_with_speculative_teacher(
                 cli.original,
                 plan,
                 &directory,
                 worker_until,
                 cleanup_until,
                 sealed_effective.clone(),
+                speculative_effective,
             )?;
             while !run.poll_worker() && Instant::now() < cleanup_until {
                 std::thread::sleep(
@@ -208,6 +219,14 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         "owner_custody":"process_lifetime_only", "durable_recovery":"unavailable",
         "native_execution_deadline":"external_supervisor_required",
         "cli_acceptance":if in_process_complete { "complete_in_process" } else { "incomplete" }});
+    if speculative_requested {
+        result.as_object_mut().expect("CLI observation is an object").insert(
+            "speculative_teacher_selection".into(),
+            serde_json::json!({"requested":true,"selected_for_pc":speculative_effective,
+                "status":if speculative_effective { "selected_for_pc" } else { "unsupported_for_own" },
+                "scope":"optional_collection_only"}),
+        );
+    }
     if !sealed_requested.is_empty() {
         result.as_object_mut().expect("CLI observation is an object").insert(
             "sealed_teacher_selection".into(),
@@ -387,6 +406,7 @@ mod v2_cli_tests {
         assert_eq!(result.mode, "pc");
         assert_eq!(result.original, ["--process-epoch=1"]);
         assert!(result.sealed_teacher_slots.is_empty());
+        assert!(!result.speculative_teacher);
         let mut mixed = arguments();
         mixed.push("--collection-plan=inputs/old.json".into());
         assert!(parse_lock_v2(mixed).is_err());
@@ -412,6 +432,21 @@ mod v2_cli_tests {
         assert_eq!(result.original, ["--process-epoch=1"]);
         let mut invalid = arguments();
         invalid.push("--v2-sealed-teacher-slots=0,no".into());
+        assert!(parse_lock_v2(invalid).is_err());
+    }
+
+    #[test]
+    fn speculative_teacher_is_explicit_and_keeps_native_arguments() {
+        let mut selected = arguments();
+        selected.push("--v2-speculative-teacher=true".into());
+        let selected = parse_lock_v2(selected).unwrap().unwrap();
+        assert!(selected.speculative_teacher);
+        assert_eq!(selected.original, ["--process-epoch=1"]);
+        let mut disabled = arguments();
+        disabled.push("--v2-speculative-teacher=false".into());
+        assert!(!parse_lock_v2(disabled).unwrap().unwrap().speculative_teacher);
+        let mut invalid = arguments();
+        invalid.push("--v2-speculative-teacher=yes".into());
         assert!(parse_lock_v2(invalid).is_err());
     }
 

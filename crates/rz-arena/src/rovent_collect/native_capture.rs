@@ -8,7 +8,104 @@ use rz_uci::pals_native::ticketed::{
     VirtualReviewPhysicalInvocationEvidence, VirtualReviewPreparedTicket,
 };
 use std::cell::Cell;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc, atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}};
+use super::producer_v2::SubmittedTeacherQueryV2;
+
+/// A ticket's independent speculative handoff state. It never proves NN
+/// dispatch, acceptance, physical completion, a teacher target or retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpeculativeHandoffV2 { Reserved, Sent, QueueFull, Disconnected, PreparationFailed, OriginalCaptureFailed, Canceled, PreparationFailureDetailUnknown, NotRequired }
+impl SpeculativeHandoffV2 {
+    fn decode(value: u8) -> Self {
+        match value { 1 => Self::Sent, 2 => Self::QueueFull, 3 => Self::Disconnected,
+            4 => Self::PreparationFailed, 5 => Self::OriginalCaptureFailed, 6 => Self::Canceled,
+            7 => Self::PreparationFailureDetailUnknown, 8 => Self::NotRequired, _ => Self::Reserved }
+    }
+}
+struct SpeculativeTicketV2 {
+    ticket: RoleTicketEnvelope,
+    state: AtomicU8,
+    error: Mutex<Option<ArenaError>>,
+    canceled: Arc<AtomicBool>,
+}
+struct SpeculativeRouteV2 {
+    registration_owner: Registrations,
+    installed: AtomicBool,
+    admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    sender: mpsc::SyncSender<SubmittedTeacherQueryV2>,
+    tickets: Mutex<std::collections::HashMap<RequestId, Arc<SpeculativeTicketV2>>>,
+    maximum_tickets: usize,
+    unattributed: AtomicU64,
+    cancel_all: Arc<AtomicBool>,
+    targets_revoked: Arc<AtomicBool>,
+}
+/// Retains each original ticket and its one callback outcome, including
+/// Full/closed. The root worker owns this handle and the matching receiver.
+#[derive(Clone)]
+pub(crate) struct SpeculativeRootV2 { route: Arc<SpeculativeRouteV2> }
+impl SpeculativeRootV2 {
+    pub(crate) fn matches_admission(&self, admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2) -> bool {
+        self.route.admission.same_original_admission(admission)
+    }
+    pub(crate) fn same_original_route(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.route, &other.route)
+    }
+    pub(crate) fn matches_ticket_authority(&self, ticket: &RoleTicketEnvelope) -> bool {
+        ticket.authority == self.route.admission.root_admission().authority()
+    }
+    pub(crate) fn unattributed_count(&self) -> u64 {
+        self.route.unattributed.load(Ordering::Acquire)
+    }
+    /// Request cancellation, not completion. On contention or an unknown
+    /// ticket, close only this root and report unattributed collection state.
+    pub(crate) fn cancel_ticket(&self, ticket: &RoleTicketEnvelope) -> bool {
+        // A delayed discard from a different root cannot cancel this root.
+        if !self.matches_ticket_authority(ticket) { return false; }
+        let found = match self.route.tickets.try_lock() {
+            Ok(tickets) => tickets.get(&ticket.id).filter(|item| item.ticket == *ticket)
+                .map(|item| { item.canceled.store(true, Ordering::Release); }),
+            Err(_) => None,
+        };
+        if found.is_none() {
+            // Publish the conservative target revocation first so closure
+            // is never visible while the join guard still sees it as open.
+            self.route.targets_revoked.store(true, Ordering::Release);
+            self.route.cancel_all.store(true, Ordering::Release);
+            let _ = self.route.unattributed.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                |value| Some(value.saturating_add(1)));
+        }
+        true
+    }
+    pub(crate) fn cancel_all(&self) { self.route.cancel_all.store(true, Ordering::Release); }
+    /// Used only for actual/unknown root abort; target authority is revoked.
+    pub(crate) fn revoke_all_targets(&self) {
+        self.route.targets_revoked.store(true, Ordering::Release);
+        self.route.cancel_all.store(true, Ordering::Release);
+    }
+    pub(crate) fn try_observations(&self) -> Result<Option<Vec<(RoleTicketEnvelope, SpeculativeHandoffV2, Option<String>)>>, ArenaError> {
+        let tickets = match self.route.tickets.try_lock() {
+            Ok(tickets) => tickets,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("speculative ticket custody poisoned")),
+        };
+        let mut observations = Vec::new();
+        observations.try_reserve(tickets.len()).map_err(|_| invalid("speculative observations allocation"))?;
+        for item in tickets.values() {
+            let state = SpeculativeHandoffV2::decode(item.state.load(Ordering::Acquire));
+            let error = if state == SpeculativeHandoffV2::PreparationFailed {
+                match item.error.try_lock() {
+                    Ok(error) => error.as_ref().map(ToString::to_string),
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("speculative error custody poisoned")),
+                }
+            } else { None };
+            observations.push((item.ticket, state, error));
+        }
+        observations.sort_unstable_by_key(|(ticket, _, _)| ticket.id);
+        Ok(Some(observations))
+    }
+}
+
 
 enum RegisteredInputCapture {
     Legacy(RoventInputCaptureReservation),
@@ -17,6 +114,7 @@ enum RegisteredInputCapture {
         ticket: RoleTicketEnvelope,
         reservation: RoventInputCaptureReservationV2,
         admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+        speculative: Option<(Arc<SpeculativeRouteV2>, Arc<SpeculativeTicketV2>)>,
     },
     /// An already-issued ticket dispatched after the root was disabled, but
     /// whose sequence predates the disabled boundary. Exact identity remains
@@ -92,6 +190,8 @@ type CaptureFailure = Arc<Mutex<CaptureFailureState>>;
 pub struct RoventNativeCaptureRegistration {
     registered: Registrations,
     disabled_root: DisabledRoot,
+    speculative_roots: Arc<Mutex<Vec<Arc<SpeculativeRouteV2>>>>,
+    speculative_active: Arc<AtomicUsize>,
 }
 pub struct RoventNativeInputObserver {
     registered: Registrations,
@@ -116,6 +216,7 @@ pub fn rovent_native_capture_channel() -> (
 ) {
     let registered = Arc::new(Mutex::new(BTreeMap::new()));
     let disabled_root = Arc::new(Mutex::new(Vec::new()));
+    let speculative_roots = Arc::new(Mutex::new(Vec::new()));
     let failure = Arc::new(Mutex::new(CaptureFailureState::default()));
     let (sender, receiver) = mpsc::sync_channel(16);
     let (submitted_sender, submitted_receiver) = mpsc::sync_channel(16);
@@ -124,6 +225,8 @@ pub fn rovent_native_capture_channel() -> (
         RoventNativeCaptureRegistration {
             registered: Arc::clone(&registered),
             disabled_root: Arc::clone(&disabled_root),
+            speculative_roots,
+            speculative_active: Arc::new(AtomicUsize::new(0)),
         },
         RoventNativeInputObserver {
             registered,
@@ -147,6 +250,89 @@ impl RoventNativeCaptureRegistration {
     pub(super) fn same_original_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.registered, &other.registered)
             && Arc::ptr_eq(&self.disabled_root, &other.disabled_root)
+            && Arc::ptr_eq(&self.speculative_roots, &other.speculative_roots)
+            && Arc::ptr_eq(&self.speculative_active, &other.speculative_active)
+    }
+    pub(crate) fn owns_route(&self, route: &SpeculativeRootV2) -> bool {
+        Arc::ptr_eq(&self.registered, &route.route.registration_owner)
+            && route.route.installed.load(Ordering::Acquire)
+    }
+    /// Install a dedicated root channel before its first ticket registration.
+    /// None means transient contention; existing routes are never replaced.
+    pub(crate) fn try_install_speculative_root(
+        &self, admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+        channel_capacity: usize, maximum_tickets: usize,
+    ) -> Result<Option<(SpeculativeRootV2, mpsc::Receiver<SubmittedTeacherQueryV2>)>, ArenaError> {
+        check((1..=16).contains(&channel_capacity) && (1..=65_536).contains(&maximum_tickets),
+            "speculative root channel/ticket capacity")?;
+        // Same lock order as ticket registration. A late installation must
+        // never omit already-registered tickets and masquerade as complete.
+        let registered = match self.registered.try_lock() {
+            Ok(registered) => registered,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("capture registrations poisoned")),
+        };
+        check(!registered.values().any(|entry| match entry {
+            RegisteredInputCapture::LockV2 { admission: old, .. }
+            | RegisteredInputCapture::LockV2DisabledPrior { admission: old, .. } => old.same_original_admission(admission),
+            _ => false,
+        }), "speculative root installed after ticket registration")?;
+        let mut routes = match self.speculative_roots.try_lock() {
+            Ok(routes) => routes,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("speculative root custody poisoned")),
+        };
+        check(routes.len() < MAX_RETAINED_DISABLED_ROOTS && !routes.iter().any(|route|
+            route.admission.root_admission().authority() == admission.root_admission().authority()),
+            "speculative root duplicate or retained capacity")?;
+        routes.try_reserve(1).map_err(|_| invalid("speculative root allocation"))?;
+        let (sender, receiver) = mpsc::sync_channel(channel_capacity);
+        let route = Arc::new(SpeculativeRouteV2 { registration_owner: Arc::clone(&self.registered),
+            installed: AtomicBool::new(true), admission: admission.clone(), sender,
+            tickets: Mutex::new(std::collections::HashMap::new()), maximum_tickets,
+            unattributed: AtomicU64::new(0), cancel_all: Arc::new(AtomicBool::new(false)),
+            targets_revoked: Arc::new(AtomicBool::new(false)) });
+        routes.push(Arc::clone(&route));
+        self.speculative_active.fetch_add(1, Ordering::Release);
+        Ok(Some((SpeculativeRootV2 { route }, receiver)))
+    }
+
+    /// Roll back only an unpublished admission slot whose `try_send` failed
+    /// before observer installation. The caller must retain that original
+    /// send failure; this method cannot infer process or physical completion.
+    /// Once any ticket is registered this path must not remove the route.
+    pub(crate) fn try_rollback_unstarted_speculative_root(
+        &self, root: &SpeculativeRootV2,
+    ) -> Result<Option<bool>, ArenaError> {
+        let registered = match self.registered.try_lock() {
+            Ok(registered) => registered,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("capture registrations poisoned")),
+        };
+        let mut routes = match self.speculative_roots.try_lock() {
+            Ok(routes) => routes,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("speculative root custody poisoned")),
+        };
+        let tickets = match root.route.tickets.try_lock() {
+            Ok(tickets) => tickets,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("speculative ticket custody poisoned")),
+        };
+        let admission = &root.route.admission;
+        if !tickets.is_empty() || root.route.unattributed.load(Ordering::Acquire) != 0
+            || registered.values().any(|entry| match entry {
+            RegisteredInputCapture::LockV2 { admission: old, .. }
+            | RegisteredInputCapture::LockV2DisabledPrior { admission: old, .. } => old.same_original_admission(admission),
+            _ => false,
+        }) { return Ok(Some(false)); }
+        let Some(index) = routes.iter().position(|route| Arc::ptr_eq(route, &root.route)) else {
+            return Ok(Some(false));
+        };
+        root.route.installed.store(false, Ordering::Release);
+        routes.remove(index);
+        self.speculative_active.fetch_sub(1, Ordering::AcqRel);
+        Ok(Some(true))
     }
     pub(super) fn try_disabled_root_count(&self) -> Result<Option<usize>, ArenaError> {
         match self.disabled_root.try_lock() {
@@ -347,6 +533,7 @@ impl RoventNativeCaptureRegistration {
         ticket: &RoleTicketEnvelope,
         reservation: RoventInputCaptureReservationV2,
         admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+        speculative_root: Option<&SpeculativeRootV2>,
     ) -> LockV2RegistrationAttempt {
         if let Err(error) = admission.try_validate_ticket(ticket) {
             return if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV2::Busy {
@@ -373,12 +560,48 @@ impl RoventNativeCaptureRegistration {
         ) {
             return LockV2RegistrationAttempt::Failed(error, reservation);
         }
+        // The original registration is held while selecting this exact root.
+        // Ticket outcome has its own preallocated atomic cell, so callback
+        // handoff never locks or waits and cannot lose a Full/closed identity.
+        // The original observer passes its exact root handle. Other active
+        // roots and unrelated route-lock contention cannot taint this ticket.
+        let route = speculative_root.and_then(|root| {
+            if self.owns_route(root) && root.route.admission.same_original_admission(admission) {
+                Some(Arc::clone(&root.route))
+            } else {
+                let _ = root.route.unattributed.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                    |value| Some(value.saturating_add(1)));
+                None
+            }
+        });
+        let speculative = if let Some(route) = route {
+            let item = match route.tickets.try_lock() {
+                Ok(mut tickets) if tickets.len() < route.maximum_tickets
+                    && !tickets.contains_key(&ticket.id) => {
+                    if tickets.try_reserve(1).is_ok() {
+                        let item = Arc::new(SpeculativeTicketV2 { ticket: *ticket, state: AtomicU8::new(0),
+                            error: Mutex::new(None), canceled: Arc::new(AtomicBool::new(false)) });
+                        tickets.insert(ticket.id, Arc::clone(&item));
+                        Some(item)
+                    } else { None }
+                }
+                _ => None,
+            };
+            match item {
+                Some(item) => Some((route, item)),
+                None => {
+                    let _ = route.unattributed.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| Some(value.saturating_add(1)));
+                    None
+                }
+            }
+        } else { None };
         registered.insert(
             ticket.id,
             RegisteredInputCapture::LockV2 {
                 ticket: *ticket,
                 reservation,
                 admission: admission.clone(),
+                speculative,
             },
         );
         LockV2RegistrationAttempt::Ready
@@ -418,7 +641,10 @@ impl RoventNativeCaptureRegistration {
             .and_then(|value| match value {
                 RegisteredInputCapture::Legacy(value) => Some(value.sequence()),
                 RegisteredInputCapture::SubmittedV1(value) => Some(value.sequence()),
-                RegisteredInputCapture::LockV2 { reservation, .. } => Some(reservation.sequence()),
+                RegisteredInputCapture::LockV2 { reservation, speculative, .. } => {
+                    if let Some((_, ticket)) = speculative { ticket.state.store(6, Ordering::Release); }
+                    Some(reservation.sequence())
+                },
                 RegisteredInputCapture::LockV2DisabledPrior { .. } => None,
             }))
     }
@@ -675,6 +901,7 @@ impl RoventNativeInputObserver {
             RegisteredInputCapture::LockV2 {
                 reservation,
                 admission,
+                speculative,
                 ..
             } => {
                 let captured = reservation
@@ -684,14 +911,47 @@ impl RoventNativeInputObserver {
                         &prepared.input,
                         &prepared.identity,
                     )
-                    .map_err(|error| RoleFailure::Backend(error.to_string()))?;
-                let input = RoventCapturedLockInputV2 {
-                    captured,
-                    admission,
-                };
+                    .map_err(|error| {
+                        if let Some((_, ticket)) = speculative.as_ref() {
+                            ticket.state.store(5, Ordering::Release);
+                        }
+                        RoleFailure::Backend(error.to_string())
+                    })?;
+                let teacher_required = captured.speculative_teacher_required();
+                let prepared_speculative = speculative.as_ref().filter(|_| teacher_required).map(|(route, ticket)| {
+                    captured.speculative_teacher_query(admission.clone(), &preparation.view, &prepared.input,
+                        Arc::clone(&ticket.canceled), Arc::clone(&route.cancel_all), Arc::clone(&route.targets_revoked))
+                });
+                let input = RoventCapturedLockInputV2 { captured, admission };
                 match self.lock_v2_sender.try_send(input) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        if let Some((route, ticket)) = speculative {
+                            if !teacher_required {
+                                ticket.state.store(8, Ordering::Release);
+                            } else if let Some(result) = prepared_speculative {
+                                match result {
+                                    Ok(query) => {
+                                        let outcome = match route.sender.try_send(query) {
+                                            Ok(()) => 1,
+                                            Err(mpsc::TrySendError::Full(_)) => 2,
+                                            Err(mpsc::TrySendError::Disconnected(_)) => 3,
+                                        };
+                                        ticket.state.store(outcome, Ordering::Release);
+                                    }
+                                    Err(error) => {
+                                        let recorded = match ticket.error.try_lock() {
+                                            Ok(mut slot) => { *slot = Some(error); true }
+                                            Err(_) => false,
+                                        };
+                                        ticket.state.store(if recorded { 4 } else { 7 }, Ordering::Release);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
                     Err(error) => {
+                        if let Some((_, ticket)) = speculative { ticket.state.store(5, Ordering::Release); }
                         let (cause, input) = send_error(error);
                         self.failed_input = Some(RoventFailedCapturedInput::LockV2(input));
                         Err(VirtualReviewCaptureFailure::Observation(cause))

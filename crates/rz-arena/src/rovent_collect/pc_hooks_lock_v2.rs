@@ -126,6 +126,10 @@ fn handoff_submit(
 }
 
 impl RoventPcCollectionBridgeV2 {
+    /// Optional collection-only feature; must be selected before admission.
+    pub(crate) fn enable_speculative_teacher(&self) -> Result<(), ArenaError> {
+        self.core.enable_speculative()
+    }
     fn defer_proven_unstarted(
         &self,
         port: &mut RoventPcCollectionAdmissionPortV2<'_>,

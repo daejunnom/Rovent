@@ -80,6 +80,18 @@ struct PendingTeacherV2 {
     startup: VerifiedRoventExternalStartup,
     soft_quantum: Duration,
     dispatch: TeacherDispatch,
+    // The same per-job mailbox passed into the physical worker. This owner is
+    // the only control writer; its one cancel uses sequence 1.
+    cancel_control: Box<dyn Fn() -> Result<(), String> + Send>,
+    cancel_requested: bool,
+}
+
+/// This is a logical per-ticket signal only, never a physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TeacherTicketCancelOutcomeV2 {
+    Requested,
+    AlreadyRequested,
+    NotPending,
 }
 
 /// The caller keeps the original row and decides whether to re-observe the
@@ -104,6 +116,8 @@ pub(crate) struct CompletedTeacherV2 {
     pub(crate) soft_quantum: Duration,
     pub(crate) dispatch: TeacherDispatch,
     pub(crate) completion: TeacherCompletion,
+    // Retain even a failed/racing cancel request; it forbids target sealing.
+    pub(crate) cancel_requested: bool,
 }
 
 /// This preserves the originally submitted metadata and the non-cloneable
@@ -117,6 +131,39 @@ pub(crate) struct SealedTeacherPolicyV2 {
     pub(crate) soft_quantum: Duration,
     pub(crate) evidence: RoventTeacherPolicyEvidenceV2,
 }
+
+/// A live-root teacher observation tied to its actual submitted capture.
+/// It becomes a normal sealed row witness only after matching the original
+/// accepted, consumed, physically retired producer row by opaque owner.
+pub(crate) struct SpeculativeSealedTeacherPolicyV2 {
+    capsule: super::super::producer_v2::SubmittedTeacherQueryV2,
+    sealed: SealedTeacherPolicyV2,
+}
+pub(crate) enum SpeculativeTeacherJoinFailureV2 {
+    Validation(ArenaError),
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+impl SpeculativeSealedTeacherPolicyV2 {
+    pub(crate) fn ticket(&self) -> rz_contracts::pals_adaptive::RoleTicketEnvelope {
+        self.capsule.ticket()
+    }
+    pub(crate) fn join_original_row(
+        self,
+        row: &RoventRetiredLockV2Record,
+    ) -> Result<SealedTeacherPolicyV2, Box<(SpeculativeTeacherJoinFailureV2, Self)>> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // A valid live-root seal may join after ordinary root shutdown.
+            // Only abandonment of this exact ticket invalidates that join.
+            check(!self.capsule.is_ticket_canceled(), "V2 speculative teacher input was canceled")?;
+            self.capsule.matches_original_row(row)
+        })) {
+            Ok(Ok(())) => Ok(self.sealed),
+            Ok(Err(error)) => Err(Box::new((SpeculativeTeacherJoinFailureV2::Validation(error), self))),
+            Err(panic) => Err(Box::new((SpeculativeTeacherJoinFailureV2::Panicked(panic), self))),
+        }
+    }
+}
+
 
 /// A panic is a distinct unknown outcome, never a transient Busy retry.
 pub(crate) enum TeacherPolicySealFailureV2 {
@@ -700,6 +747,45 @@ impl RoventCollectionTeacherSessionV2 {
         )?;
         self.require_live_root()?;
         let input = row.submitted_input_seal();
+        self.submit_original_input(input, || row.original_teacher_query_position(), || false, constraint, soft_quantum)
+    }
+
+    /// Submit only the actual native-captured input. The original capsule
+    /// remains with the caller, and this does not prove NN execution,
+    /// acceptance, consumption, retirement, or a target.
+    pub(crate) fn submit_captured_query(
+        &mut self,
+        permit: &TeacherPumpPermitV2,
+        capsule: &super::super::producer_v2::SubmittedTeacherQueryV2,
+        constraint: ExternalGoConstraint,
+        soft_quantum: Duration,
+    ) -> Result<TeacherSubmitOutcomeV2, ArenaError> {
+        self.validate_pump_owner(permit)?;
+        if self.admission_closing {
+            return Err(invalid("V2 teacher session admission is closed"));
+        }
+        let input = capsule.input_seal();
+        check(
+            capsule.admission().same_original_admission(&self.admission)
+                && input.manifest_sha256 == self.lock_manifest_sha256
+                && capsule.has_policy_candidates()
+                && !capsule.is_canceled(),
+            "V2 captured query differs from original root/manifest or has no policy candidates",
+        )?;
+        self.require_live_root()?;
+        self.submit_original_input(input, || capsule.original_teacher_query_position(), || capsule.is_canceled(), constraint, soft_quantum)
+    }
+
+    /// Common dispatch path for a validated original input. Calling this does
+    /// not grant acceptance, retirement, or target authority.
+    fn submit_original_input(
+        &mut self,
+        input: RoventSubmittedInputSeal,
+        make_position: impl FnOnce() -> Result<rz_position::Position, ArenaError>,
+        is_canceled: impl Fn() -> bool,
+        constraint: ExternalGoConstraint,
+        soft_quantum: Duration,
+    ) -> Result<TeacherSubmitOutcomeV2, ArenaError> {
         self.admission
             .validate_ticket(&input.ticket)
             .map_err(|error| invalid(error.to_string()))?;
@@ -707,7 +793,7 @@ impl RoventCollectionTeacherSessionV2 {
             .teacher_actor_id
             .as_deref()
             .ok_or_else(|| invalid("V2 row has no frozen teacher actor"))?;
-        let position = row.original_teacher_query_position()?;
+        let position = make_position()?;
         let root = self.admission.root_admission();
         let actor = self
             .actors
@@ -787,15 +873,18 @@ impl RoventCollectionTeacherSessionV2 {
         // Allocate/copy all receipt metadata before the real worker admission.
         let pending_actor = actor_id.to_owned();
         let pending_registered = registered.clone();
+        check(!is_canceled(), "V2 teacher input canceled before admission")?;
         let input_key = (id.collection_owner, input.ticket.id);
         check(
             self.issued_inputs.len() < MAX_CORPUS_ROWS,
             "V2 teacher input ledger full",
         )?;
-        check(
-            self.issued_inputs.insert(input_key),
-            "V2 teacher input already submitted",
-        )?;
+        let control = owner.worker().control_mailbox(id);
+        check(*control.scope() == id, "V2 teacher cancel mailbox scope mismatch")?;
+        let retained_control = control.clone();
+        let cancel_control: Box<dyn Fn() -> Result<(), String> + Send> = Box::new(move || {
+            retained_control.request_cancel(1).map_err(|error| format!("{error:?}"))
+        });
         let job = TeacherJob {
             id,
             input_scope: scope,
@@ -804,8 +893,10 @@ impl RoventCollectionTeacherSessionV2 {
             constraint,
             original_deadline: input.ticket.original_deadline,
             soft_quantum,
-            control: owner.worker().control_mailbox(id),
+            control,
         };
+        check(!is_canceled(), "V2 teacher input canceled before admission")?;
+        check(self.issued_inputs.insert(input_key), "V2 teacher input already submitted")?;
         let dispatch = match run.lifecycle.submit(job) {
             Ok(dispatch) => dispatch,
             Err(error) => {
@@ -821,8 +912,36 @@ impl RoventCollectionTeacherSessionV2 {
             startup,
             soft_quantum,
             dispatch,
+            cancel_control,
+            cancel_requested: false,
         });
         Ok(TeacherSubmitOutcomeV2::Submitted(id))
+    }
+
+    /// Request cancellation of exactly the pending original ticket. The
+    /// caller must still retrieve its terminal and drain the physical worker.
+    /// A failed or racing request remains marked canceled and cannot be sealed.
+    pub(crate) fn cancel_pending_ticket(
+        &mut self,
+        permit: &TeacherPumpPermitV2,
+        ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+    ) -> Result<TeacherTicketCancelOutcomeV2, ArenaError> {
+        self.validate_pump_owner(permit)?;
+        let mut found = None;
+        for actor in self.actors.values_mut() {
+            let Some(pending) = actor.pending.as_mut() else { continue; };
+            if pending.input.ticket != *ticket { continue; }
+            if found.is_some() {
+                return Err(invalid("V2 teacher ticket has multiple pending actors"));
+            }
+            found = Some(pending);
+        }
+        let Some(pending) = found else { return Ok(TeacherTicketCancelOutcomeV2::NotPending); };
+        if pending.cancel_requested { return Ok(TeacherTicketCancelOutcomeV2::AlreadyRequested); }
+        // Mark before signaling: an error/terminal race never permits sealing.
+        pending.cancel_requested = true;
+        (pending.cancel_control)().map_err(|error| invalid(format!("V2 teacher cancel request: {error}")))?;
+        Ok(TeacherTicketCancelOutcomeV2::Requested)
     }
 
     /// Retrieve only the terminal from the same original actor lifecycle.
@@ -857,6 +976,7 @@ impl RoventCollectionTeacherSessionV2 {
             soft_quantum: pending.soft_quantum,
             dispatch: pending.dispatch,
             completion,
+            cancel_requested: pending.cancel_requested,
         }))
     }
 
@@ -869,6 +989,73 @@ impl RoventCollectionTeacherSessionV2 {
         row: &RoventRetiredLockV2Record,
         completed: CompletedTeacherV2,
     ) -> Result<SealedTeacherPolicyV2, Box<TeacherPolicySealRejectionV2>> {
+        self.seal_original_policy(permit, completed, |session, completed| {
+            let original = row.submitted_input_seal();
+            check(
+                row.admission.same_original_admission(&session.admission)
+                    && row.matches_manifest_owner(&session.lock_manifest)
+                    && row.manifest_sha256 == session.lock_manifest_sha256
+                    && original.ticket == completed.input.ticket
+                    && original.manifest_sha256 == completed.input.manifest_sha256
+                    && original.input_sha256 == completed.input.input_sha256
+                    && original.selected_view_sha256 == completed.input.selected_view_sha256
+                    && original.anchor == completed.input.anchor
+                    && original.role == completed.input.role
+                    && original.teacher_actor_id.as_deref() == Some(completed.actor_id.as_str()),
+                "V2 teacher completed input differs from original retired row",
+            )?;
+            Ok(())
+        }, || Ok(row.original_teacher_query_position()?.snapshot()))
+    }
+
+    /// Seal only an actual teacher completion against the original native
+    /// capture. The result is observation evidence, not a training target; it
+    /// may be joined only to the matching accepted and retired original row.
+    pub(crate) fn seal_captured_completion(
+        &mut self,
+        permit: &TeacherPumpPermitV2,
+        capsule: super::super::producer_v2::SubmittedTeacherQueryV2,
+        completed: CompletedTeacherV2,
+    ) -> Result<SpeculativeSealedTeacherPolicyV2,
+        Box<(super::super::producer_v2::SubmittedTeacherQueryV2, TeacherPolicySealRejectionV2)>> {
+        let result = self.seal_original_policy(permit, completed, |session, completed| {
+            let original = capsule.input_seal();
+            check(
+                capsule.admission().same_original_admission(&session.admission)
+                    && !capsule.is_canceled()
+                    && original.manifest_sha256 == session.lock_manifest_sha256
+                    && original.ticket == completed.input.ticket
+                    && original.manifest_sha256 == completed.input.manifest_sha256
+                    && original.input_sha256 == completed.input.input_sha256
+                    && original.selected_view_sha256 == completed.input.selected_view_sha256
+                    && original.anchor == completed.input.anchor
+                    && original.role == completed.input.role
+                    && original.teacher_actor_id.as_deref() == Some(completed.actor_id.as_str()),
+                "V2 completed teacher input differs from original native capture",
+            )?;
+            Ok(())
+        }, || Ok(capsule.original_teacher_query_position()?.snapshot()));
+        match result {
+            Ok(sealed) => Ok(SpeculativeSealedTeacherPolicyV2 { capsule, sealed }),
+            Err(rejected) => Err(Box::new((capsule, *rejected))),
+        }
+    }
+
+    /// Validate caller's original witness before making the single live-root
+    /// claim. `validate_origin` runs inside the same panic custody boundary.
+    fn seal_original_policy(
+        &mut self,
+        permit: &TeacherPumpPermitV2,
+        completed: CompletedTeacherV2,
+        validate_origin: impl FnOnce(&Self, &CompletedTeacherV2) -> Result<(), ArenaError>,
+        make_query: impl FnOnce() -> Result<rz_position::PositionSnapshot, ArenaError>,
+    ) -> Result<SealedTeacherPolicyV2, Box<TeacherPolicySealRejectionV2>> {
+        if completed.cancel_requested {
+            return Err(Box::new(TeacherPolicySealRejectionV2::Rejected {
+                cause: TeacherPolicySealFailureV2::Validation(invalid("V2 teacher ticket cancel was requested")),
+                completed,
+            }));
+        }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.validate_pump_owner(permit)
         })) {
@@ -888,21 +1075,7 @@ impl RoventCollectionTeacherSessionV2 {
         }
         let validation =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, ArenaError> {
-                let original = row.submitted_input_seal();
-                check(
-                    row.admission.same_original_admission(&self.admission)
-                        && row.matches_manifest_owner(&self.lock_manifest)
-                        && row.manifest_sha256 == self.lock_manifest_sha256
-                        && original.ticket == completed.input.ticket
-                        && original.manifest_sha256 == completed.input.manifest_sha256
-                        && original.input_sha256 == completed.input.input_sha256
-                        && original.selected_view_sha256 == completed.input.selected_view_sha256
-                        && original.anchor == completed.input.anchor
-                        && original.role == completed.input.role
-                        && original.teacher_actor_id.as_deref()
-                            == Some(completed.actor_id.as_str()),
-                    "V2 teacher completed input differs from original retired row",
-                )?;
+                validate_origin(self, &completed)?;
                 let actor = self
                     .actors
                     .get(&completed.actor_id)
@@ -932,7 +1105,7 @@ impl RoventCollectionTeacherSessionV2 {
                         && startup.input_lock_sha256() == completed.startup.input_lock_sha256(),
                     "V2 completed teacher owner/startup differs from original",
                 )?;
-                Ok(row.original_teacher_query_position()?.snapshot())
+                make_query()
             }));
         let query = match validation {
             Ok(Ok(query)) => query,
@@ -974,6 +1147,7 @@ impl RoventCollectionTeacherSessionV2 {
             soft_quantum,
             dispatch,
             completion,
+            cancel_requested,
         } = completed;
         let mut custody = RoventTeacherPolicyCustodyV2::new(dispatch, completion);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1005,6 +1179,7 @@ impl RoventCollectionTeacherSessionV2 {
                             soft_quantum,
                             dispatch,
                             completion,
+                            cancel_requested,
                         },
                     }))
                 }

@@ -101,6 +101,10 @@ fn try_game_install(gate: &AtomicU64) -> Result<GameInstallAttempt<'_>, Adaptive
 struct AdmissionSlot {
     admission: RoventCollectionRootAdmissionV2,
     state: AtomicU8,
+    speculative: Mutex<Option<(super::native_capture::SpeculativeRootV2,
+        mpsc::Receiver<super::producer_v2::SubmittedTeacherQueryV2>)>>,
+    speculative_install_issue: Mutex<Option<String>>,
+    speculative_issue_unknown: AtomicBool,
 }
 
 struct AdmissionReservationGuard(Arc<AdmissionSlot>);
@@ -128,6 +132,7 @@ pub(crate) struct CollectionBridgeCoreV2<H> {
     failed: Arc<AtomicBool>,
     startup: Arc<OnceLock<RoventStartupControl>>,
     startup_registration_started: AtomicBool,
+    speculative_enabled: AtomicBool,
     installed_published: AtomicBool,
     installed_admission: OnceLock<RoventCollectionRootAdmissionV2>,
 }
@@ -379,6 +384,7 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             failed: Arc::clone(&failed),
             startup: Arc::clone(&startup),
             startup_registration_started: AtomicBool::new(false),
+            speculative_enabled: AtomicBool::new(false),
             installed_published: AtomicBool::new(false),
             installed_admission: OnceLock::new(),
         });
@@ -390,6 +396,12 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             pump_sender: None,
             pump_sender_failed: false,
             pump_rejected: None,
+            pump_waiting_row: None,
+            speculative_receiver: None,
+            speculative_route: None,
+            speculative_install_issue: None,
+            speculative_rejected: None,
+            speculative_received: 0,
             pump_failed: false,
             pending_drain_failed: false,
             admission_receiver,
@@ -587,21 +599,91 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         }
         // Reserve the bounded outbox before installing the observer. The
         // consumer cannot use the root until the release-store of INSTALLED.
+        // Route registration is optional and bounded. An unavailable route
+        // affects only its own collection observation, never native search.
+        let (speculative, speculative_install_issue) = if self.speculative_enabled.load(Ordering::Acquire) {
+            match self.owner.try_status() {
+                Ok(Some(status)) => match self.owner.capture_registration().try_install_speculative_root(
+                    &admission, 16, status.game_record_limit.min(65_536)) {
+                    Ok(Some(route)) => (Some(route), None),
+                    Ok(None) => (None, Some("speculative root installation busy".into())),
+                    Err(error) => (None, Some(error.to_string())),
+                },
+                Ok(None) => (None, Some("speculative owner status busy".into())),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else { (None, None) };
         let slot = Arc::new(AdmissionSlot {
             admission: admission.clone(),
             state: AtomicU8::new(RESERVING),
+            speculative: Mutex::new(speculative),
+            speculative_install_issue: Mutex::new(speculative_install_issue),
+            speculative_issue_unknown: AtomicBool::new(false),
         });
         if self.admissions.try_send(Arc::clone(&slot)).is_err() {
+            // The observer install was never invoked and the slot was not
+            // delivered: only this no-start branch may attempt rollback.
+            if let Ok(speculative) = slot.speculative.try_lock() {
+                if let Some((route, _)) = speculative.as_ref() {
+                    let rollback = self.owner.capture_registration().try_rollback_unstarted_speculative_root(route);
+                    if !matches!(rollback, Ok(Some(true))) {
+                        if let Ok(mut issue) = slot.speculative_install_issue.try_lock() {
+                            *issue = Some(format!("speculative pre-start rollback unresolved: {rollback:?}"));
+                        } else { slot.speculative_issue_unknown.store(true, Ordering::Release); }
+                    }
+                }
+            }
             self.close_reserved_before_install();
             return Err(reject(
                 AdaptiveManagerError::Capacity("Collection V2 admission outbox"),
                 admission,
             ));
         }
+        // Bind the exact route before observer installation; a failed optional
+        // bind remains an observation and does not stop native execution.
+        let bind_issue = match slot.speculative.try_lock() {
+            Ok(speculative) => match speculative.as_ref() {
+                Some((route, _)) => match self.owner.try_bind_speculative_root(&admission, route) {
+                    Ok(Some(true)) => None,
+                    Ok(Some(false)) => Some("speculative root binding rejected".to_owned()),
+                    Ok(None) => Some("speculative root binding busy".to_owned()),
+                    Err(error) => Some(error.to_string()),
+                },
+                None => None,
+            },
+            Err(_) => Some("speculative slot unavailable at root binding".to_owned()),
+        };
+        if let Some(issue) = bind_issue {
+            match slot.speculative_install_issue.try_lock() {
+                Ok(mut stored) => *stored = Some(issue),
+                Err(_) => slot.speculative_issue_unknown.store(true, Ordering::Release),
+            }
+        }
         // If installation panics, UCI retains its manager/panic evidence and
         // this guard prevents an unpublished reservation from spinning forever.
         let _reservation = AdmissionReservationGuard(Arc::clone(&slot));
         if self.admission_phase.load(Ordering::Acquire) != ADMISSION_RESERVED {
+            // install() has not been entered: unbind only this exact route and
+            // roll back its empty registration. Unknown leaves it retained.
+            let rollback_issue = match slot.speculative.try_lock() {
+                Ok(speculative) => match speculative.as_ref() {
+                    Some((route, _)) => match self.owner.try_unbind_unstarted_speculative_root(&admission, route) {
+                        Ok(Some(_)) => match self.owner.capture_registration().try_rollback_unstarted_speculative_root(route) {
+                            Ok(Some(true)) => None,
+                            other => Some(format!("speculative route rollback unresolved: {other:?}")),
+                        },
+                        other => Some(format!("speculative owner unbind unresolved: {other:?}")),
+                    },
+                    None => None,
+                },
+                Err(_) => Some("speculative slot unavailable during rollback".to_owned()),
+            };
+            if let Some(issue) = rollback_issue {
+                match slot.speculative_install_issue.try_lock() {
+                    Ok(mut stored) => *stored = Some(issue),
+                    Err(_) => slot.speculative_issue_unknown.store(true, Ordering::Release),
+                }
+            }
             return Err(reject(AdaptiveManagerError::Deadline, admission));
         }
         game_install.enter();
@@ -660,6 +742,13 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         // Teacher failure remains with the worker and invalidates collection,
         // but does not by itself fail an unrelated native search or infer a
         // physical error. Admission of another root is still closed.
+        Ok(())
+    }
+    /// Opt-in before root admission; default path remains unchanged.
+    pub(crate) fn enable_speculative(&self) -> Result<(), ArenaError> {
+        check(self.admission_phase.load(Ordering::Acquire) == ADMISSION_OPEN,
+            "speculative capture must be enabled before admission")?;
+        self.speculative_enabled.store(true, Ordering::Release);
         Ok(())
     }
     pub(crate) fn revoke(&self) {
@@ -775,6 +864,12 @@ pub(crate) struct CollectionWorkerCoreV2<H> {
     pump_sender: Option<mpsc::SyncSender<PumpItemV2>>,
     pump_sender_failed: bool,
     pump_rejected: Option<Box<(ArenaError, super::RoventRetiredLockV2Record)>>,
+    pump_waiting_row: Option<super::RoventRetiredLockV2Record>,
+    speculative_receiver: Option<mpsc::Receiver<super::producer_v2::SubmittedTeacherQueryV2>>,
+    speculative_route: Option<super::native_capture::SpeculativeRootV2>,
+    speculative_install_issue: Option<String>,
+    speculative_rejected: Option<Box<(ArenaError, super::producer_v2::SubmittedTeacherQueryV2)>>,
+    speculative_received: usize,
     pump_failed: bool,
     pending_drain_failed: bool,
     admission_receiver: mpsc::Receiver<Arc<AdmissionSlot>>,
@@ -878,11 +973,33 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     pub(crate) fn has_unpublished_pump_rows(&self) -> bool {
         self.pump.as_ref().is_some_and(|pump| pump.len() != 0)
             || !self.pump_ready.is_empty() || self.pump_rejected.is_some()
+            || self.pump_waiting_row.is_some() || self.speculative_rejected.is_some()
+            || !self.speculative_capture_complete()
+    }
+
+    /// This is only a capture handoff observation. Sent is not teacher
+    /// completion, native consumption, physical completion or publication.
+    pub(crate) fn speculative_capture_complete(&self) -> bool {
+        use super::native_capture::SpeculativeHandoffV2;
+        if self.speculative_install_issue.is_some() { return false; }
+        let Some(route) = self.speculative_route.as_ref() else { return true; };
+        if route.unattributed_count() != 0 { return false; }
+        let Ok(Some(observations)) = route.try_observations() else { return false; };
+        let mut sent = 0usize;
+        for (_, state, _) in observations {
+            match state {
+                SpeculativeHandoffV2::Sent => sent += 1,
+                SpeculativeHandoffV2::NotRequired | SpeculativeHandoffV2::Canceled => {},
+                _ => return false,
+            }
+        }
+        sent == self.speculative_received
     }
 
     pub(crate) fn pending_pump_rows(&self) -> usize {
         self.pump.as_ref().map_or(0, RetiredRowPumpV2::len)
             + self.pump_ready.len() + usize::from(self.pump_rejected.is_some())
+            + usize::from(self.pump_waiting_row.is_some()) + usize::from(self.speculative_rejected.is_some())
     }
 
     pub(crate) fn pump_stage_counts(&self) -> Option<super::teacher::lock_v2_row_pump::PumpStageCountsV2> {
@@ -954,7 +1071,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             // original session still owns any already-submitted terminal.
             if !self.pending_drain_failed {
                 if let (Some(pump), Some(session)) = (self.pump.as_mut(), self.session.as_mut()) {
-                    if let Err(error) = pump.drain_pending_terminal(session) {
+                    let result = pump.poll_captured(session, false)
+                        .and_then(|_| pump.drain_pending_terminal(session).map(|_| ()));
+                    if let Err(error) = result {
                         self.pending_drain_failed = true;
                         self.record_failure(WorkerFailure::RowPump(error));
                     }
@@ -972,24 +1091,42 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         }
         if self.pump_rejected.is_some() { return; }
         let pump = self.pump.as_mut().expect("original session pump");
+        // Read only this root's dedicated capture route, before retired rows.
+        // Full leaves the remaining capsules in the original bounded channel.
+        if self.speculative_rejected.is_none() && pump.captured_len() < 16 {
+            if let Some(receiver) = self.speculative_receiver.as_ref() {
+                match receiver.try_recv() {
+                    Ok(capsule) => {
+                        self.speculative_received = self.speculative_received.saturating_add(1);
+                        if let Err(original) = pump.enqueue_captured(capsule) {
+                            self.speculative_rejected = Some(original);
+                        }
+                    },
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {},
+                }
+            }
+        }
         // The output and input together remain bounded. Never remove a row
         // from its original outbox if this worker cannot retain it.
         if self.pump_ready.len() < 16 {
             if let Some(item) = pump.take_ready() { self.pump_ready.push_back(item); }
         }
-        if !self.revoked.load(Ordering::Acquire) && !self.shutdown_requested
-            && self.failure.is_none() && self.pump_ready.len() + pump.len() < 16 {
-            match self.owner.take_retired() {
-                Ok(Some(row)) => {
-                    if let Err(original) = pump.enqueue(row) {
-                        self.pump_rejected = Some(original);
-                        self.pump_failed = true;
-                        self.record_failure(WorkerFailure::RowPumpInputRejected);
-                        return;
-                    }
+        if !self.revoked.load(Ordering::Acquire) && !self.shutdown_requested && self.failure.is_none() {
+            if self.pump_waiting_row.is_none() && (self.pump_ready.len() + pump.retired_len() < 16 || self.speculative_route.is_some()) {
+                match self.owner.take_retired() {
+                    Ok(Some(row)) => self.pump_waiting_row = Some(row),
+                    Ok(None) => {},
+                    Err(error) => { self.pump_failed = true; self.record_failure(WorkerFailure::RowPump(error)); return; }
                 }
-                Ok(None) => {}
-                Err(error) => { self.pump_failed = true; self.record_failure(WorkerFailure::RowPump(error)); return; }
+            }
+            if self.pump_waiting_row.as_ref().is_some_and(|row| pump.can_enqueue_row(row)) {
+                let row = self.pump_waiting_row.take().expect("waiting row checked");
+                if let Err(original) = pump.enqueue(row) {
+                    self.pump_rejected = Some(original);
+                    self.pump_failed = true;
+                    self.record_failure(WorkerFailure::RowPumpInputRejected);
+                    return;
+                }
             }
         }
         let session = self.session.as_mut().expect("same original teacher session");
@@ -997,6 +1134,21 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         // does not linearize a simultaneous revoke against mailbox admission.
         let allow_submission = !self.revoked.load(Ordering::Acquire)
             && !self.shutdown_requested && self.failure.is_none();
+        if let Err(error) = pump.poll_captured(session, allow_submission) {
+            self.pump_failed = true;
+            self.record_failure(WorkerFailure::RowPump(error));
+            return;
+        }
+        // A terminal already received may be sealed within this same tick;
+        // the actual session still checks the live root and original deadline.
+        if pump.has_captured_completed() && !self.revoked.load(Ordering::Acquire)
+            && !self.shutdown_requested && self.failure.is_none() {
+            if let Err(error) = pump.poll_captured(session, true) {
+                self.pump_failed = true;
+                self.record_failure(WorkerFailure::RowPump(error));
+                return;
+            }
+        }
         let pending_before = pump.front_pending();
         if let Err(error) = pump.poll(session, allow_submission) {
             self.pump_failed = true;
@@ -1122,6 +1274,35 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             }
         }
         let slot = Arc::clone(self.slot.as_ref().expect("admission retained"));
+        if slot.speculative_issue_unknown.load(Ordering::Acquire) {
+            self.speculative_install_issue = Some("speculative bind issue unavailable".into());
+        }
+        if slot.state.load(Ordering::Acquire) == RESERVING { return; }
+        if self.speculative_route.is_none() && self.speculative_receiver.is_none() {
+            match slot.speculative.try_lock() {
+                Ok(mut value) => {
+                    if let Some((route, receiver)) = value.take() {
+                        self.speculative_route = Some(route);
+                        self.speculative_receiver = Some(receiver);
+                    }
+                    if self.speculative_install_issue.is_none() {
+                        match slot.speculative_install_issue.try_lock() {
+                            Ok(issue) => self.speculative_install_issue = issue.clone(),
+                            Err(std::sync::TryLockError::WouldBlock) => return,
+                            Err(std::sync::TryLockError::Poisoned(_)) =>
+                                self.speculative_install_issue = Some("speculative issue state poisoned".into()),
+                        }
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.speculative_install_issue = Some("speculative slot poisoned".into());
+                }
+            }
+        }
+        if self.revoked.load(Ordering::Acquire) {
+            if let Some(route) = self.speculative_route.as_ref() { route.cancel_all(); }
+        }
         match slot.state.load(Ordering::Acquire) {
             RESERVING => return,
             REJECTED => {

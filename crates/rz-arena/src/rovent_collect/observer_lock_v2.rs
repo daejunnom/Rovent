@@ -71,6 +71,8 @@ struct State {
     producer_root: Option<String>,
     prior_producers: Vec<(String, RoventCorpusProducerLockV2)>,
     current_admission: Option<RoventCollectionRootAdmissionV2>,
+    speculative_pending: Vec<(RoventCollectionRootAdmissionV2, super::native_capture::SpeculativeRootV2)>,
+    speculative_current: Option<super::native_capture::SpeculativeRootV2>,
     settled_roots: Vec<RoventCollectionRootAdmissionV2>,
     registration: RoventNativeCaptureRegistration,
     receiver: RoventCapturedInputReceiver,
@@ -110,6 +112,57 @@ pub struct RoventCollectionOwnerLockV2 {
 }
 
 impl RoventCollectionOwnerLockV2 {
+    /// Share the original capture registration; this grants no root or
+    /// completion authority and never fabricates a capture owner.
+    pub(crate) fn capture_registration(&self) -> RoventNativeCaptureRegistration {
+        self.registration.clone()
+    }
+
+    /// Bind a root-specific optional route before observer installation.
+    /// Busy leaves the original owner untouched; the caller records the
+    /// optional collection failure and may continue native execution.
+    pub(crate) fn try_bind_speculative_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+        route: &super::native_capture::SpeculativeRootV2,
+    ) -> Result<Option<bool>, ArenaError> {
+        check(route.matches_admission(admission) && self.registration.owns_route(route),
+            "speculative route root or registration owner mismatch")?;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("collection owner poisoned")),
+        };
+        if let Some((_, existing_route)) = state.speculative_pending.iter().find(|(previous, _)|
+            previous.same_original_admission(admission)) {
+            check(existing_route.same_original_route(route), "different original speculative route")?;
+            return Ok(Some(true));
+        }
+        check(state.speculative_pending.len() < RETAINED_ROOT_CAPACITY, "pending speculative root capacity")?;
+        state.speculative_pending.try_reserve(1).map_err(|_| invalid("pending speculative root allocation"))?;
+        state.speculative_pending.push((admission.clone(), route.clone()));
+        Ok(Some(true))
+    }
+
+    /// Remove only the exact pending route when the caller proves observer
+    /// installation was never invoked. Busy and poison retain the owner.
+    pub(crate) fn try_unbind_unstarted_speculative_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+        route: &super::native_capture::SpeculativeRootV2,
+    ) -> Result<Option<bool>, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("collection owner poisoned")),
+        };
+        if let Some(index) = state.speculative_pending.iter().position(|(original, existing)|
+            original.same_original_admission(admission) && existing.same_original_route(route)) {
+            state.speculative_pending.remove(index);
+            Ok(Some(true))
+        } else { Ok(Some(false)) }
+    }
+
     /// Called with the shared game install guard held, before `port.install`.
     /// The owner and capture registration use only nonblocking lock attempts.
     pub(crate) fn try_install_readiness(
@@ -238,6 +291,8 @@ impl RoventCollectionOwnerLockV2 {
                     producer_root: None,
                     prior_producers: Vec::new(),
                     current_admission: None,
+                    speculative_pending: Vec::new(),
+                    speculative_current: None,
                     settled_roots: Vec::new(),
                     registration,
                     receiver,
@@ -865,6 +920,7 @@ impl State {
         }
         if self.is_disabled_ticket(ticket)? {
             if self.disabled_prior.contains_key(&ticket.id) {
+                if let Some(route) = &self.speculative_current { route.cancel_ticket(ticket); }
                 self.registration.cancel_sequence(ticket.id)?;
             }
             return Ok(());
@@ -883,6 +939,9 @@ impl State {
             pending.ticket == *ticket,
             "lock-v2 ticket differs from original dispatch",
         )?;
+        // A request can be abandoned after speculative teacher admission.
+        // Signal only its original root/ticket; this is not terminal evidence.
+        if let Some(route) = &self.speculative_current { route.cancel_ticket(ticket); }
         if let Some(sequence) = self.registration.cancel_sequence(ticket.id)? {
             self.producer_mut()?.discard_reserved_input(sequence);
         }
@@ -1016,6 +1075,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
             state.producer = Some(producer);
             state.producer_root = Some(admission.raw_sha256().to_owned());
             state.current_admission = Some(admission.clone());
+            state.speculative_current = state.speculative_pending.iter()
+                .position(|(original, _)| original.same_original_admission(&admission))
+                .map(|index| state.speculative_pending.remove(index).1);
             state.handled_tickets.clear();
             if let Some(disabled) = state.disabled.take() {
                 state.prior_disabled.push(disabled);
@@ -1141,6 +1203,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                 ticket,
                 staged.reservation,
                 witness.admission(),
+                state.speculative_current.as_ref(),
             ) {
                 super::native_capture::LockV2RegistrationAttempt::Ready => {
                     state.pending.insert(

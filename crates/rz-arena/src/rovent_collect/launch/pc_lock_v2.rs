@@ -22,6 +22,9 @@ const WORKER_START_FAILED: u8 = 3;
 /// Keeps the original resource, native failure and teacher worker together.
 /// Neither the live readback nor the thread exit establishes publication.
 pub struct RoventPcCollectionRunV2 {
+    speculative_teacher_requested: bool,
+    speculative_teacher_enabled: bool,
+    speculative_teacher_setup_error: Option<String>,
     sealed_teacher_requested: Vec<usize>,
     sealed_teacher_indices: Vec<usize>,
     sealed_teacher_ignored: Vec<(usize, &'static str)>,
@@ -250,7 +253,8 @@ impl RoventPcCollectionRunV2 {
                         Ok(None) => { complete = false; json!({"status":"busy"}) },
                         Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
                     };
-                    secondary_evidence.push(json!({"slot":slot_index,"admission":null,"worker":{"status":"failed_before_start"},"separated":[],"deferred":deferred}));
+                    secondary_evidence.push(json!({"slot":slot_index,"admission":null,"worker":{"status":"failed_before_start"},"separated":[],"deferred":deferred,
+                        "speculative_setup_error":slot.speculative_setup_error}));
                     continue;
                 }
             }
@@ -274,6 +278,7 @@ impl RoventPcCollectionRunV2 {
                 continue;
             }
             let slot = &self.secondary_slots[slot_index - 1];
+            if admission.is_some() && slot.speculative_setup_error.is_some() { complete = false; }
             let revokes = match bridge.try_revoke_observations() {
                 Ok(Some(value)) => {
                     if value.get("omitted").and_then(serde_json::Value::as_u64) != Some(0) { complete = false; }
@@ -335,7 +340,8 @@ impl RoventPcCollectionRunV2 {
                 }
             };
             secondary_evidence.push(json!({"slot":slot_index,"admission":admission,"separated":separated,
-                "separated_status":separated_status,"deferred":deferred,"revokes":revokes,"consumer":consumer,"worker":detail}));
+                "separated_status":separated_status,"deferred":deferred,"revokes":revokes,"consumer":consumer,"worker":detail,
+                "speculative_setup_error":slot.speculative_setup_error}));
         }
         if self.supervisor.is_some() { complete = false; }
         let publication_failure_chars = publication_failure.map(|s| s.chars().count());
@@ -401,6 +407,8 @@ impl RoventPcCollectionRunV2 {
     /// worker, settled handoff and received rows. Failures retain the owner,
     /// consumer and any assembly; they never imply physical completion.
     pub fn publish_single_root(&mut self, until: Instant) -> Result<bool, ArenaError> {
+        check(!self.speculative_teacher_requested || self.speculative_teacher_enabled,
+            "P/C optional speculative teacher setup was unavailable")?;
         use super::own_publisher_v2::{OwnOfferOutcomeV2, OwnPumpPollV2};
         check(self.supervisor.is_none() && self.supervisor_error.is_none(),
             "P/C game supervisor or secondary custody remains unresolved")?;
@@ -557,6 +565,8 @@ impl RoventPcCollectionRunV2 {
                 check(proven_unstarted, "P/C unused secondary slot start or installation is unknown")?;
                 continue;
             }
+            check(slot.speculative_setup_error.is_none(),
+                "P/C secondary optional speculative teacher setup was unavailable")?;
             check(slot.worker_join_observed && slot.consumer_drained_after_join
                 && matches!(slot.worker_exit_kind, Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement))
                 && slot.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C secondary handoff: {e:?}")))?,
@@ -850,6 +860,15 @@ impl RoventPcCollectionRunV2 {
             unreachable!("remaining observation is an object");
         };
         observation.as_object_mut().expect("observation is an object").extend(remaining);
+        if self.speculative_teacher_requested {
+            observation.as_object_mut().expect("P/C observation object").insert(
+                "speculative_teacher".into(), json!({"requested":true,
+                    "enabled":self.speculative_teacher_enabled,
+                    "setup_error":self.speculative_teacher_setup_error,
+                    "secondary_setup_errors":self.secondary_slots.iter().enumerate().filter_map(|(index, slot)|
+                        slot.speculative_setup_error.as_ref().map(|error| json!({"slot":index+1,"error":error}))).collect::<Vec<_>>(),
+                    "status":if self.speculative_teacher_enabled { "configured_before_admission" } else { "setup_unavailable" }}));
+        }
         if !self.sealed_teacher_requested.is_empty() {
             let preparation = match self.sealed_teacher_observations.try_lock() {
                 Ok(value) => value.as_ref().map_or_else(
@@ -1042,6 +1061,7 @@ pub fn run_rovent_pc_collection_lock_v2(
         worker_deadline,
         cleanup_deadline,
         Vec::new(),
+        false,
         |_| Ok(()),
     )
 }
@@ -1058,8 +1078,23 @@ pub fn run_rovent_pc_collection_lock_v2_with_sealed_policy(
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
     run_rovent_pc_collection_lock_v2_inner(
         arguments, plan, input_directory, worker_deadline, cleanup_deadline,
-        sealed_teacher_indices, |_| Ok(()),
+        sealed_teacher_indices, false, |_| Ok(()),
     )
+}
+
+/// Explicit optional teacher speculation for the P-C path. Existing entry
+/// points remain disabled by default; this does not change the V2 lock.
+pub fn run_rovent_pc_collection_lock_v2_with_speculative_teacher(
+    arguments: Vec<String>,
+    plan: RoventCollectionLockV2LaunchPlan,
+    input_directory: &Dir,
+    worker_deadline: Instant,
+    cleanup_deadline: Instant,
+    sealed_teacher_indices: Vec<usize>,
+    speculative_teacher: bool,
+) -> Result<RoventPcCollectionRunV2, ArenaError> {
+    run_rovent_pc_collection_lock_v2_inner(arguments, plan, input_directory, worker_deadline,
+        cleanup_deadline, sealed_teacher_indices, speculative_teacher, |_| Ok(()))
 }
 
 /// Test harness hook: receive the actual owner created by this launch. This
@@ -1080,6 +1115,7 @@ pub fn run_rovent_pc_collection_lock_v2_with_test_owner(
         worker_deadline,
         cleanup_deadline,
         Vec::new(),
+        false,
         on_owner,
     )
 }
@@ -1091,6 +1127,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
     worker_deadline: Instant,
     cleanup_deadline: Instant,
     sealed_teacher_indices: Vec<usize>,
+    speculative_teacher_requested: bool,
     on_owner: impl FnOnce(&RoventCollectionOwnerLockV2) -> Result<(), ArenaError>,
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
     check(
@@ -1123,6 +1160,12 @@ fn run_rovent_pc_collection_lock_v2_inner(
         .collect();
     let (bridge, mut worker) =
         RoventPcCollectionBridgeV2::new(owner.clone(), Arc::clone(&manifest), roster)?;
+    // Optional setup failure only affects collection eligibility, never NN launch.
+    let speculative_teacher_setup_error = if speculative_teacher_requested {
+        bridge.enable_speculative_teacher().err().map(|error| error.to_string())
+    } else { None };
+    let speculative_teacher_enabled = speculative_teacher_requested
+        && speculative_teacher_setup_error.is_none();
     let (pump_consumer, pump_sender) = super::own_publisher_v2::OwnPumpConsumerV2::new(plan.maximum_records as usize);
     worker.configure_row_pump(plan.teacher_constraint, Duration::from_nanos(plan.teacher_soft_quantum_ns))?;
     worker.configure_pump_sender(pump_sender)?;
@@ -1239,7 +1282,7 @@ fn run_rovent_pc_collection_lock_v2_inner(
                 *custody = Some(PcWorkerSupervisorV2::start(
                     supervisor_router, supervisor_owner, supervisor_manifest, roster_identity,
                     supervisor_constraint, supervisor_quantum, supervisor_roots, supervisor_records,
-                    worker_deadline, cleanup_deadline,
+                    speculative_teacher_enabled, worker_deadline, cleanup_deadline,
                 ).map_err(|error| RoventLaunchError { stage: "collection_supervisor_start", detail: error.to_string() })?);
             }
             Ok(())
@@ -1250,6 +1293,9 @@ fn run_rovent_pc_collection_lock_v2_inner(
     stop.store(true, Ordering::Release);
     let pump_thread = pump_thread.lock().map_err(|_| invalid("P/C pump thread custody poisoned"))?.take();
     let mut run = RoventPcCollectionRunV2 {
+        speculative_teacher_requested,
+        speculative_teacher_enabled,
+        speculative_teacher_setup_error,
         sealed_teacher_requested,
         sealed_teacher_indices,
         sealed_teacher_ignored,

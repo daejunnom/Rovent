@@ -22,6 +22,7 @@ pub(crate) struct PcSecondarySlotV2 {
     pub(crate) bridge: Arc<RoventPcCollectionBridgeV2>,
     pub(crate) worker: Arc<Mutex<RoventPcCollectionWorkerV2>>,
     pub(crate) consumer: Arc<OwnPumpConsumerV2>,
+    pub(crate) speculative_setup_error: Option<String>,
     pub(crate) retained_previous_rows: usize,
     pub(crate) published_to_router: bool,
     pub(crate) worker_start: PcSecondaryWorkerStartV2,
@@ -64,6 +65,7 @@ impl PcWorkerSupervisorV2 {
         quantum: Duration,
         maximum_roots: usize,
         maximum_records: usize,
+        speculative_teacher: bool,
         worker_deadline: Instant,
         cleanup_deadline: Instant,
     ) -> Result<Self, ArenaError> {
@@ -97,7 +99,7 @@ impl PcWorkerSupervisorV2 {
                 if let Some(error) = poll_error { guard.error.get_or_insert(error); }
                 if guard.error.is_none() {
                     if let Err(error) = supervisor_step(&mut guard, &router, &owner, &manifest, &roster,
-                        &startup, constraint, quantum, maximum_records, worker_deadline, &thread_stop) {
+                        &startup, constraint, quantum, maximum_records, speculative_teacher, worker_deadline, &thread_stop) {
                         guard.error = Some(error);
                     }
                 }
@@ -222,6 +224,7 @@ fn supervisor_step(
     constraint: ExternalGoConstraint,
     quantum: Duration,
     maximum_records: usize,
+    speculative_teacher: bool,
     deadline: Instant,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), ArenaError> {
@@ -261,6 +264,11 @@ fn supervisor_step(
             actor_id: actor.clone(), source_index: *index, collection_owner: *collection_owner,
         }).collect();
         let (next, mut worker) = RoventPcCollectionBridgeV2::new(owner.clone(), Arc::clone(manifest), entries)?;
+        // An optional failure cannot stop this root's normal native search.
+        // Preserve it on this original secondary slot for publication status.
+        let speculative_setup_error = if speculative_teacher {
+            next.enable_speculative_teacher().err().map(|error| error.to_string())
+        } else { None };
         next.register_startup_control(startup).map_err(|error| invalid(format!("P/C original startup registration: {error:?}")))?;
         let (consumer, sender) = OwnPumpConsumerV2::new(maximum_records);
         worker.configure_row_pump(constraint, quantum)?;
@@ -268,6 +276,7 @@ fn supervisor_step(
         let worker = Arc::new(Mutex::new(worker));
         state.pending = Some(PcSecondarySlotV2 { previous, previous_admission: admission,
             bridge: Arc::clone(&next), worker: Arc::clone(&worker), consumer,
+            speculative_setup_error,
             retained_previous_rows: 0, published_to_router: false,
             worker_start: PcSecondaryWorkerStartV2::StartingUnknown,
             worker_join_observed: false, worker_exit_kind: None,
