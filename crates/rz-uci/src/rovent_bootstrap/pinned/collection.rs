@@ -29,7 +29,7 @@ const ASSET_MAX: u64 = 1 << 30;
 #[cfg(target_os = "linux")]
 const SEALED_TEACHER_TOTAL_MAX: u64 = 256 << 20;
 #[cfg(target_os = "linux")]
-const SEALED_TEACHER_PREPARATION_MAX: Duration = Duration::from_secs(1);
+const SEALED_TEACHER_PREPARATION_MAX: Duration = Duration::from_secs(5);
 
 /// Source preparation evidence, not proof of teacher startup or completion.
 #[derive(Clone, Debug)]
