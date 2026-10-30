@@ -818,6 +818,18 @@ where
     pub fn failures(&self) -> impl Iterator<Item = &AdaptiveManagerError> {
         self.failures.iter()
     }
+    /// Read-only logical admission accounting; this does not count completed
+    /// native evaluations or grant authority to submit new work.
+    pub fn role_call_budget_usage(&self) -> (u64, u64) {
+        (self.registry.cumulative_observation().admitted,
+         self.bindings.iter().filter(|binding| binding.ticket.is_none()).count() as u64)
+    }
+    pub fn role_call_limit_reached(&self) -> bool {
+        self.role_call_budget_usage().0 >= self.registration.role_call_limit
+    }
+    pub fn driver_is_complete(&self) -> bool {
+        self.driver.is_complete()
+    }
     /// Original native observation reports; these are distinct from search
     /// failure and do not imply a physical fence or a successful publication.
     pub fn native_observation_failures(&self) -> &[TicketNativeObservationFailure] {

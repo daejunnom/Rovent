@@ -222,6 +222,7 @@ pub struct RoventPcRevokeObservationV2 {
     pub role_calls_reserved: u64,
     pub role_call_limit_reached: bool,
     pub manager_failures: usize,
+    pub driver_is_complete: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum RoventPcRevokeOriginV2 { LoopCondition, RunEnded }
@@ -2368,6 +2369,7 @@ impl RoventPcSessionDriver {
                                 role_calls_reserved: manager.role_call_budget_usage().1,
                                 role_call_limit_reached: manager.role_call_limit_reached(),
                                 manager_failures: manager.failures().count(),
+                                driver_is_complete: manager.driver_is_complete(),
                             };
                             hook.revoke_root_observed(v2_current_admission.as_ref().ok_or(
                                 AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
@@ -2472,6 +2474,7 @@ impl RoventPcSessionDriver {
                         role_calls_reserved: manager.role_call_budget_usage().1,
                         role_call_limit_reached: manager.role_call_limit_reached(),
                         manager_failures: manager.failures().count(),
+                        driver_is_complete: manager.driver_is_complete(),
                     };
                     hook.revoke_root_observed(root, observation)
                 }));
