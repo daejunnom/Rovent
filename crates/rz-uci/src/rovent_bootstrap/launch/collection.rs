@@ -60,11 +60,11 @@ pub struct SealedTeacherPreparationObservation {
     pub failure: Option<String>,
     pub bytes: Option<u64>,
     pub elapsed_ms: Option<u64>,
-    /// Kept until the caller snapshots the final receipt. It retains the
-    /// sealed file and original FD but grants no process authority.
+    /// Retains only counters until the final receipt snapshot, without
+    /// retaining executable files or granting process authority.
     #[cfg(target_os = "linux")]
     #[serde(skip)]
-    pub(crate) execution_probe: Option<rz_search::external_cpu::VerifiedSealedExecutable>,
+    pub(crate) execution_probe: Option<rz_search::external_cpu::SealedExecutionProbe>,
 }
 
 impl SealedTeacherPreparationObservation {
@@ -232,14 +232,9 @@ pub fn run_pc_collection_v2_with_sealed_policy<'a>(
     observer: Box<dyn VirtualReviewCollectionObserver>,
     hooks: Arc<dyn RoventPcCollectionHooksV2>,
     admit_resource: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
-    mut sealed_teacher_indices: Vec<usize>,
+    sealed_teacher_indices: Vec<usize>,
     sealed_observations: Arc<Mutex<Option<Vec<SealedTeacherPreparationObservation>>>>,
 ) -> Result<(), RoventPcCollectionLaunchFailureV2> {
-    // Invalid optional slots must not block independent NN work. The caller's
-    // registered request remains separate from the actual source observations.
-    sealed_teacher_indices.retain(|index| *index < teacher_selections.len());
-    sealed_teacher_indices.sort_unstable();
-    sealed_teacher_indices.dedup();
     run_collection_v2(
         arguments,
         teacher_selections,

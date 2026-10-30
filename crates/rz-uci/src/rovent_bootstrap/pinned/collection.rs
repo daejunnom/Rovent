@@ -573,14 +573,18 @@ impl RoventCollectionPreloadSources {
         })
     }
 
-    /// The clone shares immutable bytes and execution counters until the
-    /// receipt owner drops it. It does not grant process-start authority.
+    /// Shares execution counters without retaining executable files or
+    /// granting process-start authority.
     #[cfg(target_os = "linux")]
     pub(crate) fn sealed_teacher_execution_probe(
         &self,
         index: usize,
-    ) -> Option<rz_search::external_cpu::VerifiedSealedExecutable> {
-        self.teachers.get(index)?.sealed_executable.clone()
+    ) -> Option<rz_search::external_cpu::SealedExecutionProbe> {
+        self.teachers
+            .get(index)?
+            .sealed_executable
+            .as_ref()
+            .map(|token| token.execution_probe())
     }
 
     /// Duplicate only the original retained descriptors for a root's unique

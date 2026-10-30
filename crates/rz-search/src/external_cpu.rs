@@ -47,6 +47,21 @@ struct SealedExecutionCounters {
     original_fallback_attempted: std::sync::atomic::AtomicU64,
 }
 
+/// Lightweight observation which does not retain the executable or original FD.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct SealedExecutionProbe {
+    counters: Arc<SealedExecutionCounters>,
+}
+
+#[cfg(target_os = "linux")]
+impl SealedExecutionProbe {
+    pub fn execution_observations(&self) -> (u64, u64) {
+        (self.counters.sealed_spawn_returned.load(Ordering::Acquire),
+         self.counters.original_fallback_attempted.load(Ordering::Acquire))
+    }
+}
+
 /// A byte-verified, immutable executable prepared before a search root starts.
 /// The private descriptor and hash remain coupled; constructing this token does
 /// not grant process, root, or completion authority.
@@ -188,6 +203,11 @@ impl VerifiedSealedExecutable {
     pub fn execution_observations(&self) -> (u64, u64) {
         (self.counters.sealed_spawn_returned.load(Ordering::Acquire),
          self.counters.original_fallback_attempted.load(Ordering::Acquire))
+    }
+
+    /// Retain counters without extending the sealed file's memory lifetime.
+    pub fn execution_probe(&self) -> SealedExecutionProbe {
+        SealedExecutionProbe { counters: Arc::clone(&self.counters) }
     }
 }
 
@@ -3008,6 +3028,8 @@ mod tests {
             checks += 1;
             Ok(())
         }).unwrap();
+        let probe = token.execution_probe();
+        let sealed_file = Arc::downgrade(&token.file);
         assert!(checks > 1);
         assert!(token.file.write_at(b"changed", 0).is_err());
         assert!(VerifiedSealedExecutable::prepare(&original, &"0".repeat(64), || Ok(())).is_err());
@@ -3028,6 +3050,11 @@ mod tests {
         assert!(closed.exit_observed && closed.stdout_drained && closed.stderr_drained);
         assert!(closed.cleanup_complete);
         assert_eq!(token.execution_observations(), (1, 0));
+        drop(denied);
+        drop(checker);
+        drop(token);
+        assert!(sealed_file.upgrade().is_none());
+        assert_eq!(probe.execution_observations(), (1, 0));
     }
 
     #[cfg(target_os = "linux")]
