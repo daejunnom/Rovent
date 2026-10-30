@@ -42,7 +42,27 @@ fn run() -> Result<(), String> {
             Path::new(&args[1]), &args[3], decision, until, &cancel, read_bytes,
         ).map_err(|failure| match failure {
             DiagnosticGameFailureV1::Preparation(error) => format!("game preparation: {error}"),
-            DiagnosticGameFailureV1::Game(failure) => format!("game: {}", failure.error),
+            DiagnosticGameFailureV1::Game(failure) => {
+                // Borrow the actual process owner before its failure/drop path:
+                // this projection neither resolves quarantine nor admits a game.
+                let process = failure.process().map(|original| {
+                    let output = original.process();
+                    serde_json::json!({
+                        "receipt": &output.receipt,
+                        "stdout": diagnostic_stream_evidence(&output.stdout),
+                        "stderr": diagnostic_stream_evidence(&output.stderr),
+                        "pending_child_retained": output.pending_child.is_some(),
+                    })
+                });
+                eprintln!("{}", serde_json::json!({
+                    "schema": "rz-pals-diagnostic-game-failure/1",
+                    "error": failure.error.to_string(),
+                    "process": process,
+                    "physical_completion": "not_inferred",
+                    "training_eligible": false,
+                }));
+                format!("game: {}", failure.error)
+            },
             DiagnosticGameFailureV1::RootSelection { error, .. } => format!("actual root selection: {error}"),
         })?;
         let action_until = Instant::now().checked_add(Duration::from_millis(action_ms)).ok_or("action deadline overflow")?;
@@ -76,6 +96,43 @@ fn run() -> Result<(), String> {
     })();
     for id in hooks { signal_hook::low_level::unregister(id); }
     result
+}
+
+/// Preserve the tail as raw bytes, including invalid UTF-8. The original
+/// supervisor's own truncation is described independently by its receipt.
+#[cfg(target_os = "linux")]
+fn diagnostic_stream_evidence(bytes: &[u8]) -> serde_json::Value {
+    const CAP: usize = 64 * 1024;
+    let start = bytes.len().saturating_sub(CAP);
+    serde_json::json!({
+        "original_retained_bytes": bytes.len(),
+        "projection_offset": start,
+        "projection_truncated": start != 0,
+        "tail_bytes": &bytes[start..],
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod diagnostic_failure_tests {
+    use super::diagnostic_stream_evidence;
+
+    #[test]
+    fn failure_stream_projection_is_bounded_and_preserves_raw_tail() {
+        let mut raw = vec![0u8; 64 * 1024 + 3];
+        raw[3] = 0xff;
+        *raw.last_mut().unwrap() = 0xfe;
+        let projected = diagnostic_stream_evidence(&raw);
+        assert_eq!(projected["original_retained_bytes"], raw.len());
+        assert_eq!(projected["projection_offset"], 3);
+        assert_eq!(projected["projection_truncated"], true);
+        let tail = projected["tail_bytes"].as_array().unwrap();
+        assert_eq!(tail.len(), 64 * 1024);
+        assert_eq!(tail[0], 0xff);
+        assert_eq!(tail[tail.len() - 1], 0xfe);
+        let empty = diagnostic_stream_evidence(&[]);
+        assert_eq!(empty["projection_truncated"], false);
+        assert!(empty["tail_bytes"].as_array().unwrap().is_empty());
+    }
 }
 
 /// Readback only; inability to observe it must not change a completed game or
