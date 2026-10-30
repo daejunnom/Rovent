@@ -235,6 +235,14 @@ pub enum AdaptiveManagerError {
         replacement_reserve: usize,
     },
     Invalid(&'static str),
+    /// Two independently reconstructed intervention roots did not seal the
+    /// same target. Neither digest is a live authority or a valid label.
+    InterventionNeutralMismatch {
+        expected: Digest,
+        actual: Digest,
+        reference_matches: bool,
+        model_matches: bool,
+    },
     Semantic(String),
     Capacity(&'static str),
     PhysicalUnknown,

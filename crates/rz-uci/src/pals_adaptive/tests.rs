@@ -1314,6 +1314,29 @@ fn shutdown(manager: &mut Manager, until: Instant) -> AdaptiveShutdownReceipt {
     manager.shutdown_receipt().unwrap()
 }
 
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[test]
+fn neutral_mismatch_keeps_failure_and_closes_original_admission() {
+    let (mut manager, _facts, _root, until) =
+        fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    let expected = Digest([1; 32]);
+    let actual = Digest([2; 32]);
+    assert!(manager.quiesce_neutral_mismatch(
+        AdaptiveManagerError::InterventionNeutralMismatch {
+            expected, actual, reference_matches: false, model_matches: true,
+        },
+    ).unwrap());
+    assert_ne!(manager.phase(), ManagerPhase::Running);
+    assert!(manager.failures().any(|failure| matches!(failure,
+        AdaptiveManagerError::InterventionNeutralMismatch {
+            expected: first, actual: second, reference_matches: false, model_matches: true,
+        } if *first == expected && *second == actual)));
+    // Drain the original mock owners; never fabricate a physical receipt.
+    pump(&mut manager, until, |m| m.phase() == ManagerPhase::Finished);
+    let receipt = manager.shutdown_receipt().unwrap();
+    assert!(receipt.permits_semantic_closure());
+}
+
 /// Wait for an actual owner event without manufacturing a Retired packet or
 /// copying its linear permit. All earlier actual events are processed once.
 fn take_original_native_retirement(

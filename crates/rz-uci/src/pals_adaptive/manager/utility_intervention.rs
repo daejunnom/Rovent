@@ -430,6 +430,11 @@ where
                 return Ok(true);
             }
             Err(error) => {
+                if matches!(error, AdaptiveManagerError::InterventionNeutralMismatch { .. }) {
+                    // Preserve the exact rejected input as historical unbound
+                    // evidence, never as the shared target or a valid label.
+                    state.historical_input = Some(Arc::clone(target.input_capture()));
+                }
                 intervention.rejected_target = Some(target);
                 state.failed = true;
                 return Err(error);

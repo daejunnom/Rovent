@@ -549,6 +549,10 @@ where
                 self.begin_root_quiesce(self.cleanup_until()?)?;
                 return Ok(true);
             }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            Err(error @ AdaptiveManagerError::InterventionNeutralMismatch { .. }) => {
+                return self.quiesce_neutral_mismatch(error);
+            }
             Err(error) => return Err(error),
         };
         // The utility P/C preparation is the same actor's sole request. It
@@ -712,6 +716,22 @@ where
             changed = true;
         }
         Ok(changed)
+    }
+
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(super) fn quiesce_neutral_mismatch(
+        &mut self,
+        error: AdaptiveManagerError,
+    ) -> Result<bool, AdaptiveManagerError> {
+        if !matches!(error, AdaptiveManagerError::InterventionNeutralMismatch { .. }) {
+            return Err(error);
+        }
+        // A non-comparable target is an actual failed trial, not a physical
+        // completion failure. Preserve its cause and rejected owner, then
+        // drain the original actors before attempting any physical proof.
+        self.record_failure(error);
+        self.begin_root_quiesce(self.cleanup_until()?)?;
+        Ok(true)
     }
 
     pub(super) fn start_nnuec_work(

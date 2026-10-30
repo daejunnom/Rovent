@@ -370,12 +370,7 @@ impl<Q> UtilityInterventionTrialAdmission<Q> {
         if let Some((prior, old)) = &state.neutral {
             // Actual source IDs/provenance stay in each trial. The pure Search
             // semantic seal, original bytes and model define common input.
-            if *prior != digest
-                || old["reference_json"] != wire["reference_json"]
-                || old["model_identity"] != wire["model_identity"]
-            {
-                return Err(invalid("intervention neutral target differs across roots"));
-            }
+            compare_neutral_targets(*prior, old, digest, &wire)?;
         } else {
             state.neutral = Some((digest, wire.clone()));
         }
@@ -1261,9 +1256,43 @@ fn same_control(
 ) -> bool {
     left == right && left_baseline == right_baseline
 }
+
+fn compare_neutral_targets(
+    expected: Digest,
+    previous: &Value,
+    actual: Digest,
+    current: &Value,
+) -> Result<(), AdaptiveManagerError> {
+    let reference_matches = previous["reference_json"] == current["reference_json"];
+    let model_matches = previous["model_identity"] == current["model_identity"];
+    if expected != actual || !reference_matches || !model_matches {
+        Err(AdaptiveManagerError::InterventionNeutralMismatch {
+            expected, actual, reference_matches, model_matches,
+        })
+    } else {
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn neutral_mismatch_keeps_both_digests_and_comparison_scope() {
+        let first = Digest([1; 32]);
+        let other = Digest([2; 32]);
+        let original = json!({"reference_json":"original", "model_identity":"model"});
+        assert!(compare_neutral_targets(first, &original, first, &original).is_ok());
+        let changed = json!({"reference_json":"different", "model_identity":"model"});
+        assert!(matches!(compare_neutral_targets(first, &original, other, &changed),
+            Err(AdaptiveManagerError::InterventionNeutralMismatch {
+                expected, actual, reference_matches: false, model_matches: true,
+            }) if expected == first && actual == other));
+        let changed = json!({"reference_json":"original", "model_identity":"other"});
+        assert!(matches!(compare_neutral_targets(first, &original, first, &changed),
+            Err(AdaptiveManagerError::InterventionNeutralMismatch {
+                reference_matches: true, model_matches: false, ..
+            })));
+    }
     #[test]
     fn utility_requires_a_witness_and_does_not_trade_cost_for_more_discovery() {
         let empty = std::collections::BTreeSet::new();
