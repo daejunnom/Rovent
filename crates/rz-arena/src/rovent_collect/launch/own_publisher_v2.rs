@@ -7,6 +7,70 @@ use crate::{ArenaError, rovent_collect::{RoventCollectionOwnerLockV2, RoventCorp
 use rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2;
 use std::{collections::VecDeque, sync::{Arc, Mutex, mpsc::{self, Receiver, SyncSender, TryRecvError}, atomic::{AtomicBool, Ordering}}, thread, time::{Duration, Instant}};
 
+#[derive(serde::Serialize)]
+struct FailureRowProjection<'a, T> { sequence: usize, stage: &'static str, record: &'a T }
+struct FailureRowBuffer(Vec<u8>);
+impl std::io::Write for FailureRowBuffer {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        const LIMIT: usize = rz_experiments::pals_data_v3::GENERATION_MAX_ROW_BYTES + 4096;
+        if self.0.len().checked_add(input.len()).is_none_or(|n| n > LIMIT) {
+            return Err(std::io::Error::other("failure row exceeds original row bound"));
+        }
+        self.0.try_reserve(input.len()).map_err(|_| std::io::Error::other("failure row allocation"))?;
+        self.0.extend_from_slice(input); Ok(input.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+fn encode_failure_row<T: serde::Serialize>(sequence: usize, stage: &'static str, record: &T)
+    -> Result<Vec<u8>, serde_json::Error> {
+    let mut encoded = FailureRowBuffer(Vec::new());
+    serde_json::to_writer(&mut encoded, &FailureRowProjection { sequence, stage, record })?;
+    encoded.0.push(b'\n');
+    Ok(encoded.0)
+}
+
+fn write_failure_row(output: &mut impl std::io::Write, bytes: &[u8], budget: &mut u64)
+    -> std::io::Result<bool> {
+    let size = bytes.len() as u64;
+    if size > *budget { return Ok(false); }
+    output.write_all(bytes)?;
+    *budget -= size;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod failure_stream_tests {
+    use super::*;
+
+    #[test]
+    fn failure_rows_keep_identity_and_order_beyond_old_projection_limit() {
+        let padding = "x".repeat(900_000);
+        let mut stream = Vec::new();
+        for sequence in 0..6 {
+            let record = serde_json::json!({"question_id":format!("question-{sequence}"),"payload":&padding});
+            stream.extend(encode_failure_row(sequence, "prepared", &record).unwrap());
+        }
+        assert!(stream.len() > 4 * 1024 * 1024);
+        for (sequence, line) in stream.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).enumerate() {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(value["sequence"], sequence);
+            assert_eq!(value["stage"], "prepared");
+            assert_eq!(value["record"]["question_id"], format!("question-{sequence}"));
+        }
+        let too_large = "x".repeat(rz_experiments::pals_data_v3::GENERATION_MAX_ROW_BYTES + 8192);
+        assert!(encode_failure_row(0, "failed", &too_large).is_err());
+        let mut output = Vec::new();
+        let mut budget = 3;
+        assert!(!write_failure_row(&mut output, b"abcd", &mut budget).unwrap());
+        assert!(output.is_empty());
+        assert_eq!(budget, 3);
+        assert!(write_failure_row(&mut output, b"abc", &mut budget).unwrap());
+        assert_eq!(output, b"abc");
+        assert_eq!(budget, 0);
+    }
+}
+
 struct State {
     receiver: Receiver<PumpItemV2>,
     items: VecDeque<PumpItemV2>,
@@ -26,6 +90,48 @@ pub(crate) struct OwnPumpConsumerV2 {
 }
 
 impl OwnPumpConsumerV2 {
+    /// Stream original retained row projections without moving their owners.
+    /// Only called after this same receiver's sender has joined. The bytes
+    /// are failure evidence, never a corpus or a reconstructable authority.
+    pub(super) fn try_stream_failure_rows(
+        &self, output: &mut impl std::io::Write, budget: &mut u64, maximum_rows: usize,
+    ) -> Result<Option<serde_json::Value>, ArenaError> {
+        use sha2::{Digest as _, Sha256};
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("failure stream consumer poisoned".into())),
+        };
+        let total = state.items.len().saturating_add(state.failed_items.len())
+            .saturating_add(usize::from(state.overflow_item.is_some()));
+        let mut sha = Sha256::new();
+        let mut bytes = 0u64;
+        let mut rows = 0usize;
+        let mut reason = None;
+        for item in state.items.iter().chain(state.failed_items.iter()).chain(state.overflow_item.iter()) {
+            if rows >= maximum_rows { reason = Some("original_record_limit"); break; }
+            let (stage, row) = match item {
+                PumpItemV2::Unlabeled { row } => ("unlabeled", row),
+                PumpItemV2::Prepared { row, .. } => ("prepared", row),
+                PumpItemV2::Committed { row, .. } => ("committed", row),
+                PumpItemV2::Failed { row, .. } => ("failed", row),
+            };
+            let encoded = match encode_failure_row(rows, stage, &row.record) {
+                Ok(value) => value,
+                Err(_) => { reason = Some("row_encoding_or_original_row_limit"); break; }
+            };
+            let size = encoded.len() as u64;
+            if !write_failure_row(output, &encoded, budget)
+                .map_err(|error| ArenaError::Io(format!("failure stream write: {error}")))? {
+                reason = Some("original_output_byte_limit"); break;
+            }
+            sha.update(&encoded);
+            bytes += size; rows += 1;
+        }
+        Ok(Some(serde_json::json!({"rows":rows,"bytes":bytes,"sha256":format!("{:x}",sha.finalize()),
+            "omitted":total.saturating_sub(rows),"reason":reason,
+            "scope":"retained_consumer_failure_projection_not_original_authority","training_eligible":false})))
+    }
     pub(crate) fn new(maximum: usize) -> (Arc<Self>, SyncSender<PumpItemV2>) {
         let (sender, receiver) = mpsc::sync_channel(16);
         (Arc::new(Self { state: Mutex::new(State { receiver, items: VecDeque::new(), maximum, disconnected: false, teacher_evidence: Vec::new(), commit_failures: Vec::new(), failed_items: Vec::new(), overflow_item: None }) }), sender)
@@ -57,63 +163,6 @@ impl OwnPumpConsumerV2 {
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Own publisher custody poisoned".into())),
         };
         Ok(Some((state.items.len(), state.failed_items.len(), state.teacher_evidence.len(), state.disconnected)))
-    }
-
-    /// Copy diagnostic record projections without consuming the original rows,
-    /// teacher evidence or failure objects. The projection cannot restore
-    /// their in-process authority. Receiver contents must first be drained by
-    /// the caller after the sender stops.
-    pub(crate) fn try_snapshot_retained_rows(
-        &self, maximum_bytes: usize,
-    ) -> Result<Option<(Vec<(&'static str, Vec<u8>)>, usize, Option<String>)>, ArenaError> {
-        use std::io::{self, Write};
-        struct BoundedProjection { bytes: Vec<u8>, limit: usize, limit_reached: bool }
-        impl Write for BoundedProjection {
-            fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-                let Some(next) = self.bytes.len().checked_add(input.len()) else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "projection size overflow"));
-                };
-                if next > self.limit {
-                    self.limit_reached = true;
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "projection capacity reached"));
-                }
-                self.bytes.try_reserve(input.len()).map_err(|_| io::Error::other("projection allocation failed"))?;
-                self.bytes.extend_from_slice(input);
-                Ok(input.len())
-            }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
-        }
-        let state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Own publisher custody poisoned".into())),
-        };
-        let mut projections = Vec::new();
-        let mut total = 0usize;
-        let mut projection_error = None;
-        let mut remaining = state.items.len().saturating_add(state.failed_items.len())
-            .saturating_add(usize::from(state.overflow_item.is_some()));
-        for item in state.items.iter().chain(state.failed_items.iter()).chain(state.overflow_item.iter()) {
-            let (stage, row) = match item {
-                PumpItemV2::Unlabeled { row } => ("unlabeled", row),
-                PumpItemV2::Prepared { row, .. } => ("prepared", row),
-                PumpItemV2::Committed { row, .. } => ("committed", row),
-                PumpItemV2::Failed { row, .. } => ("failed", row),
-            };
-            let mut buffer = BoundedProjection { bytes: Vec::new(), limit: maximum_bytes - total, limit_reached: false };
-            if let Err(error) = serde_json::to_writer(&mut buffer, &row.record) {
-                if !buffer.limit_reached { projection_error = Some(error.to_string()); }
-                break;
-            }
-            if projections.try_reserve(1).is_err() {
-                projection_error = Some("consumer projection allocation failed".into());
-                break;
-            }
-            total += buffer.bytes.len();
-            projections.push((stage, buffer.bytes));
-            remaining -= 1;
-        }
-        Ok(Some((projections, remaining, projection_error)))
     }
 
     /// Describe retained failures without moving their original rows or

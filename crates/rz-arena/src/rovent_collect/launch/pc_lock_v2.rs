@@ -169,6 +169,59 @@ pub struct RoventPcCollectionRunV2 {
 }
 
 impl RoventPcCollectionRunV2 {
+    /// Additional failure-only stream. A completed diagnostic receipt never
+    /// grants corpus, training, or original process authority.
+    fn write_retained_consumer_evidence(&self, parent: &Dir) -> Result<(), ArenaError> {
+        let byte_limit = self.original_lock.try_lock()
+            .map_err(|_| invalid("P/C original lock unavailable for failure stream"))?
+            .as_ref().ok_or_else(|| invalid("P/C original lock absent for failure stream"))?
+            .manifest.output_bytes_max.min(rz_experiments::rovent_corpus::MAX_CORPUS_BYTES);
+        let mut budget = byte_limit;
+        let mut rows_remaining = usize::try_from(self.publication_maximum_records)
+            .map_err(|_| invalid("P/C failure stream record limit overflow"))?;
+        parent.create_dir("consumer-retained-evidence").map_err(io)?;
+        let directory = parent.open_dir_nofollow("consumer-retained-evidence").map_err(io)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true).follow(FollowSymlinks::No);
+        let planned = json!({"schema":"rz-rovent-retained-consumer-failure-evidence/1",
+            "status":"writing","stream_byte_limit":byte_limit,
+            "record_limit":self.publication_maximum_records,"training_eligible":false,
+            "authority":"not_reconstructable","original_owner_retained":true});
+        let mut file = directory.open_with("planned.json", &options).map_err(io)?;
+        serde_json::to_writer(&mut file, &planned).map_err(|error| invalid(error.to_string()))?;
+        file.sync_all().map_err(io)?;
+        let mut streams = Vec::new();
+        let all = std::iter::once((0usize, &self.pump_consumer,
+            self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked))
+            .chain(self.secondary_slots.iter().enumerate().map(|(index, slot)|
+                (index + 1, &slot.consumer, slot.worker_join_observed && slot.consumer_drained_after_join)));
+        for (slot, consumer, joined) in all {
+            if !joined { streams.push(json!({"slot":slot,"status":"sender_not_joined"})); continue; }
+            let name = format!("root-{slot}-consumer.jsonl");
+            let mut file = directory.open_with(&name, &options).map_err(io)?;
+            let result = consumer.try_stream_failure_rows(&mut file, &mut budget, rows_remaining)?;
+            file.sync_all().map_err(io)?;
+            match result {
+                Some(value) => {
+                    let rows = value.get("rows").and_then(serde_json::Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| invalid("P/C failure stream row count unavailable"))?;
+                    rows_remaining = rows_remaining.checked_sub(rows)
+                        .ok_or_else(|| invalid("P/C failure stream row limit exceeded"))?;
+                    streams.push(json!({"slot":slot,"path":name,"status":"observed","detail":value}));
+                }
+                None => streams.push(json!({"slot":slot,"path":name,"status":"consumer_busy"})),
+            }
+        }
+        let receipt = json!({"schema":"rz-rovent-retained-consumer-failure-evidence/1",
+            "status":"diagnostic_only","training_eligible":false,"authority":"not_reconstructable",
+            "stream_byte_limit":byte_limit,"bytes_remaining":budget,"record_limit":self.publication_maximum_records,
+            "streams":streams,"physical_completion":"not_inferred"});
+        let mut file = directory.open_with("receipt.json", &options).map_err(io)?;
+        serde_json::to_writer(&mut file, &receipt).map_err(|error| invalid(error.to_string()))?;
+        file.sync_all().map_err(io)?;
+        Ok(())
+    }
     fn failure_projection(failure: &crate::rovent_collect::collection_hooks_core_v2::WorkerFailure)
         -> (serde_json::Value, bool) {
         let (detail, original_chars, truncated) = failure.diagnostic_projection();
@@ -182,11 +235,8 @@ impl RoventPcCollectionRunV2 {
         consumer: &super::own_publisher_v2::OwnPumpConsumerV2,
         sender_stopped: bool,
         slot_index: usize,
-        raw: &mut Vec<(String, Vec<u8>)>,
-        record_bytes: &mut usize,
     ) -> (serde_json::Value, bool) {
         use super::own_publisher_v2::OwnPumpPollV2;
-        use sha2::{Digest as _, Sha256};
         if !sender_stopped { return (json!({"status":"sender_not_joined"}), false); }
         let mut drained = false;
         let mut problem = None;
@@ -208,30 +258,16 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => return (json!({"status":"busy", "receiver_drained":drained}), false),
             Err(error) => return (json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}), false),
         };
-        let (projections, projected) = match consumer.try_snapshot_retained_rows(4 * 1024 * 1024 - *record_bytes) {
-            Ok(Some((rows, omitted, projection_error))) => {
-                let mut entries = Vec::new();
-                for (index, (stage, bytes)) in rows.into_iter().enumerate() {
-                    *record_bytes += bytes.len();
-                    let name = format!("root-{slot_index}-consumer-{index}.json");
-                    entries.push(json!({"path":&name, "stage":stage, "bytes":bytes.len(),
-                        "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
-                    raw.push((name, bytes));
-                }
-                (json!({"status":if omitted == 0 { "observed" } else { "partial" },
-                    "omitted_rows":omitted, "count_scope":"consumer_custody_only",
-                    "projection_error":projection_error,
-                    "authority":"not_reconstructable", "rows":entries}), omitted == 0)
-            },
-            Ok(None) => (json!({"status":"busy"}), false),
-            Err(error) => (json!({"status":"error", "detail":error.to_string()}), false),
-        };
+        let projections = json!({"status":"separate_failure_stream",
+            "path":format!("consumer-retained-evidence/root-{slot_index}-consumer.jsonl"),
+            "receipt":"consumer-retained-evidence/receipt.json",
+            "authority":"not_reconstructable"});
         let failure_observations = match consumer.try_failure_observations() {
             Ok(Some(value)) => value,
             Ok(None) => json!({"status":"busy"}),
             Err(error) => json!({"status":"error", "detail":error.to_string()}),
         };
-        let complete = drained && problem.is_none() && counts.0 == 0 && counts.1 == 0 && !failures && projected;
+        let complete = drained && problem.is_none() && counts.0 == 0 && counts.1 == 0 && !failures;
         (json!({"status":if complete { "drained_empty" } else { "retained_or_unknown" },
             "receiver_drained":drained, "items":counts.0, "failed_items":counts.1,
             "teacher_evidence":counts.2, "disconnected":counts.3,
@@ -344,7 +380,7 @@ impl RoventPcCollectionRunV2 {
         }
         let (primary_consumer, primary_consumer_complete) = self.failure_consumer_observation(
             &self.pump_consumer, self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked,
-            0, &mut raw, &mut late_bytes,
+            0,
         );
         complete &= primary_consumer_complete;
         match self.bridge.try_revoke_observations() {
@@ -403,7 +439,7 @@ impl RoventPcCollectionRunV2 {
                 Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
             };
             let (consumer, consumer_complete) = self.failure_consumer_observation(&slot.consumer,
-                slot.worker_join_observed && slot.consumer_drained_after_join, slot_index, &mut raw, &mut late_bytes);
+                slot.worker_join_observed && slot.consumer_drained_after_join, slot_index);
             complete &= consumer_complete;
             let deferred = match bridge.try_deferred_observation() {
                 Ok(Some(value)) => json!({"status":"observed","detail":value}),
@@ -511,6 +547,7 @@ impl RoventPcCollectionRunV2 {
         // only receipt.json records completion of all listed writes.
         write_pc_failure_payloads(&directory, &evidence, writer_buffer.map(|(bytes, _)| bytes),
             pending_chunk.map(|packet| packet.bytes.as_slice()), raw)?;
+        self.write_retained_consumer_evidence(&directory)?;
         Ok(complete)
     }
     /// Complete a single-root publication using only the original joined
