@@ -19,6 +19,33 @@ const WORKER_STARTING: u8 = 1;
 const WORKER_STARTED: u8 = 2;
 const WORKER_START_FAILED: u8 = 3;
 
+/// Write only failure-domain payloads, never a corpus publication receipt.
+/// The caller owns the already-created directory and retains source custody.
+fn write_pc_failure_payloads(
+    directory: &Dir, evidence: &[u8], writer_buffer: Option<&[u8]>,
+    pending_chunk: Option<&[u8]>, raw: Vec<(String, Vec<u8>)>,
+) -> Result<(), ArenaError> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true).follow(FollowSymlinks::No);
+    let mut planned = directory.open_with("planned.json", &options).map_err(io)?;
+    planned.write_all(evidence).and_then(|_| planned.sync_all()).map_err(io)?;
+    if let Some(bytes) = writer_buffer {
+        let mut file = directory.open_with("assembly-writer-buffer.jsonl", &options).map_err(io)?;
+        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(io)?;
+    }
+    if let Some(bytes) = pending_chunk {
+        let mut file = directory.open_with("assembly-pending-chunk.bin", &options).map_err(io)?;
+        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(io)?;
+    }
+    for (name, bytes) in raw {
+        let mut file = directory.open_with(name, &options).map_err(io)?;
+        file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(io)?;
+    }
+    let mut file = directory.open_with("receipt.json", &options).map_err(io)?;
+    file.write_all(evidence).and_then(|_| file.sync_all()).map_err(io)?;
+    Ok(())
+}
+
 /// Small failure-only identity index survives the existing large-metadata
 /// fallback. It never reconstructs an original row or grants authority.
 fn compact_failure_identities(primary: &serde_json::Value, secondary: &[serde_json::Value]) -> serde_json::Value {
@@ -51,6 +78,39 @@ fn compact_failure_identities(primary: &serde_json::Value, secondary: &[serde_js
 #[cfg(test)]
 mod failure_identity_tests {
     use super::*;
+
+    #[test]
+    fn failure_writer_bytes_are_exact_and_receipt_requires_all_writes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!("rovent-failure-buffer-{}-{}",
+            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&root).unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let evidence = br#"{"status":"partial","training_eligible":false}"#;
+        let original = b"{\"record\":1}\n{\"record\":2}\n";
+        write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).unwrap();
+        assert_eq!(std::fs::read(root.join("assembly-writer-buffer.jsonl")).unwrap(), original);
+        assert_eq!(std::fs::read(root.join("receipt.json")).unwrap(), evidence);
+        let receipt: serde_json::Value = serde_json::from_slice(evidence).unwrap();
+        assert_eq!(receipt["status"], "partial");
+        assert_eq!(receipt["training_eligible"], false);
+        assert!(!root.join("publication.json").exists());
+        assert!(write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).is_err());
+        for name in ["planned.json", "assembly-writer-buffer.jsonl", "receipt.json"] {
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        // An existing payload makes the write fail after planned.json. It may
+        // not be overwritten or followed by a new completion receipt.
+        std::fs::write(root.join("assembly-writer-buffer.jsonl"), b"original").unwrap();
+        assert!(write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).is_err());
+        assert!(!root.join("receipt.json").exists());
+        assert_eq!(std::fs::read(root.join("assembly-writer-buffer.jsonl")).unwrap(), b"original");
+        std::fs::remove_file(root.join("planned.json")).unwrap();
+        std::fs::remove_file(root.join("assembly-writer-buffer.jsonl")).unwrap();
+        drop(dir);
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn compact_failure_identities_survive_row_projection_limit() {
@@ -243,6 +303,21 @@ impl RoventPcCollectionRunV2 {
                 "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
             raw.push((name, bytes));
         }
+        let writer_buffer = self.publication_assembly.as_ref()
+            .and_then(|assembly| assembly.failure_writer_buffer())
+            .filter(|(bytes, _)| !bytes.is_empty());
+        let writer_buffer_evidence = writer_buffer.map(|(bytes, rows)| json!({
+            "status":"planned_failure_only", "path":"assembly-writer-buffer.jsonl",
+            "bytes":bytes.len(), "rows":rows, "sha256":format!("{:x}", Sha256::digest(bytes)),
+            "authority":"not_reconstructable", "training_eligible":false,
+        }));
+        let pending_chunk = self.publication_assembly.as_ref()
+            .and_then(|assembly| assembly.pending_chunk());
+        let pending_chunk_evidence = pending_chunk.map(|packet| json!({
+            "status":"planned_failure_only", "path":"assembly-pending-chunk.bin",
+            "bytes":packet.bytes.len(), "sha256":format!("{:x}", Sha256::digest(&packet.bytes)),
+            "authority":"not_reconstructable", "training_eligible":false,
+        }));
         let mut assembly_evidence = json!({"status":"not_created"});
         if let Some(assembly) = &self.publication_assembly {
             let pending = assembly.pending_row().map(|row| &row.record);
@@ -259,22 +334,13 @@ impl RoventPcCollectionRunV2 {
                     "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
                 raw.push((name.to_owned(), bytes));
             }
-            let chunk = assembly.pending_chunk().map(|packet| {
-                let bytes = &packet.bytes;
-                if late_bytes.checked_add(bytes.len()).is_some_and(|next| next <= 4 * 1024 * 1024) {
-                    late_bytes += bytes.len();
-                    raw.push(("assembly-pending-chunk.bin".to_owned(), bytes.clone()));
-                    json!({"status":"projected","path":"assembly-pending-chunk.bin",
-                        "bytes":bytes.len(), "sha256":format!("{:x}", Sha256::digest(bytes))})
-                } else { complete = false; json!({"status":"over_limit","bytes":bytes.len()}) }
-            });
-            if !self.pump_published && (assembly.records() != 0 || pending.is_some() || sealed.is_some() || chunk.is_some()) {
+            if !self.pump_published && (assembly.records() != 0 || pending.is_some() || sealed.is_some() || pending_chunk.is_some()) {
                 complete = false;
             }
             assembly_evidence = json!({"status":"retained", "records":assembly.records(),
                 "pending_row":pending.is_some(), "sealed_row":sealed.is_some(), "record_projections":records,
-                "pending_chunk":chunk, "chunk_write_attempted":assembly.chunk_write_attempted(),
-                "writer_buffer":"not_exported"});
+                "pending_chunk":pending_chunk_evidence, "chunk_write_attempted":assembly.chunk_write_attempted(),
+                "writer_buffer":writer_buffer_evidence});
         }
         let (primary_consumer, primary_consumer_complete) = self.failure_consumer_observation(
             &self.pump_consumer, self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked,
@@ -422,7 +488,8 @@ impl RoventPcCollectionRunV2 {
                 "publication_failure_original_chars":publication_failure_chars,
                 "publication_failure_truncated":publication_failure_truncated,
                 "native_failure_present":self.native_failure.is_some(), "resource_failure_present":self.resource_error.is_some(),
-                "failure_identities":failure_identities,
+                "failure_identities":failure_identities,"writer_buffer":writer_buffer_evidence,
+                "pending_chunk":pending_chunk_evidence,
                 "raw_files":raw_index,
                 "detail":"Detailed metadata exceeded 1 MiB; original in-process authority cannot be reconstructed from these files"}))
                 .map_err(|e| invalid(e.to_string()))?;
@@ -440,18 +507,10 @@ impl RoventPcCollectionRunV2 {
         };
         directory.create_dir("pc-failure-evidence").map_err(io)?;
         let directory = directory.open_dir_nofollow("pc-failure-evidence").map_err(io)?;
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true).follow(FollowSymlinks::No);
         // Preserve the planned metadata even if a later raw byte write fails;
         // only receipt.json records completion of all listed writes.
-        let mut planned = directory.open_with("planned.json", &options).map_err(io)?;
-        planned.write_all(&evidence).and_then(|_| planned.sync_all()).map_err(io)?;
-        for (name, bytes) in raw {
-            let mut file = directory.open_with(name, &options).map_err(io)?;
-            file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(io)?;
-        }
-        let mut file = directory.open_with("receipt.json", &options).map_err(io)?;
-        file.write_all(&evidence).and_then(|_| file.sync_all()).map_err(io)?;
+        write_pc_failure_payloads(&directory, &evidence, writer_buffer.map(|(bytes, _)| bytes),
+            pending_chunk.map(|packet| packet.bytes.as_slice()), raw)?;
         Ok(complete)
     }
     /// Complete a single-root publication using only the original joined

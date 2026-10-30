@@ -275,6 +275,11 @@ impl RoventCorpusAssemblyLockV2 {
     pub fn records(&self) -> u64 {
         self.records
     }
+    /// A failure-only view of the original still-buffered writer bytes.
+    /// Absent after finish; never a completed or independently usable corpus.
+    pub(crate) fn failure_writer_buffer(&self) -> Option<(&[u8], u64)> {
+        self.writer.as_ref().map(RoventCorpusWriterLockV2::failure_buffer)
+    }
     pub fn pending_row(&self) -> Option<&RoventRetiredLockV2Record> {
         self.pending.as_ref()
     }

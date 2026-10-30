@@ -30,6 +30,12 @@ pub struct RoventCorpusWriterLockV2 {
 }
 
 impl RoventCorpusWriterLockV2 {
+    /// Borrow the original bounded bytes already appended to this writer.
+    /// Failure-only export cannot restore the original admission owners or
+    /// prove corpus completion, and does not change the writer.
+    pub(crate) fn failure_buffer(&self) -> (&[u8], u64) {
+        (&self.buffer, self.buffer_rows)
+    }
     /// Whether this exact row requires flushing the existing chunk first.
     /// Other validation, duplicate and total quota errors remain append errors.
     pub(crate) fn chunk_flush_required(&self, row: &PublishedRoventLockV2Record) -> Result<bool, ArenaError> {
