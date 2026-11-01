@@ -19,7 +19,6 @@ const NUMERICAL_COMPONENTS: [&str; 5] = [
     "model_reference",
     "model_export",
 ];
-const MANAGED_BYTES: u64 = 18 << 30;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -112,11 +111,6 @@ impl PalsNumericalScopeV5 {
             {
                 return Err(fail("numerical asset has unsafe or ambiguous identity"));
             }
-        }
-        if total > MANAGED_BYTES {
-            return Err(fail(
-                "numerical actual assets exceed the 18GiB managed bound",
-            ));
         }
         for purpose in [
             Purpose::Weights,

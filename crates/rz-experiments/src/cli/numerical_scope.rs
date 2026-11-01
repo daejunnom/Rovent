@@ -5,8 +5,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-const MANAGED_ASSET_BYTES: u64 = 18 << 30;
-
 #[derive(Debug)]
 pub(super) struct Request {
     scope: PathBuf,
@@ -48,9 +46,6 @@ pub(super) fn parse(args: &[OsString]) -> Result<Request, String> {
             }
             Some("--max-artifact-bytes") if bytes.is_none() => {
                 let value = positive(value, "--max-artifact-bytes")?;
-                if value > MANAGED_ASSET_BYTES {
-                    return Err("artifact ceiling exceeds the 18GiB managed asset bound".into());
-                }
                 bytes = Some(value);
             }
             Some("--timeout-ms") if timeout.is_none() => {
@@ -479,6 +474,14 @@ mod tests {
             missing.drain(offset..offset + 2);
             assert!(parse(&missing).is_err());
         }
+    }
+
+    #[test]
+    fn scope_command_accepts_caller_budget_above_legacy_storage_threshold() {
+        let mut args = valid_args();
+        let requested = (18u64 << 30) + 1;
+        args[7] = requested.to_string().into();
+        assert_eq!(parse(&args).unwrap().max_artifact_bytes, requested);
     }
 
     #[test]
