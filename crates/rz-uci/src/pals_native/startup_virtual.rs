@@ -618,7 +618,7 @@ fn parse_loading_profile(value: Option<&str>) -> Result<NativeLoadingProfile, Ba
         )
     })
 }
-fn graph_purpose(role: &str) -> Result<Purpose, BackendError> {
+pub(crate) fn graph_purpose(role: &str) -> Result<Purpose, BackendError> {
     match role {
         "public" => Ok(Purpose::PublicGraph),
         "shared_pc" | "shared_warm" => Ok(Purpose::SharedPcGraph),
@@ -626,7 +626,7 @@ fn graph_purpose(role: &str) -> Result<Purpose, BackendError> {
         _ => Err(fail(K::UnsupportedModel, "unregistered V3 graph role")),
     }
 }
-fn exact_graph_snapshot_join(manifest: &str, graph: &str, file: &str) -> Result<(), BackendError> {
+pub(crate) fn exact_graph_snapshot_join(manifest: &str, graph: &str, file: &str) -> Result<(), BackendError> {
     if !matches!(
         Path::new(file).components().collect::<Vec<_>>().as_slice(),
         [Component::Normal(_)]

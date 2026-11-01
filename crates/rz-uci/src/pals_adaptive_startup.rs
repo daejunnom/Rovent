@@ -17,6 +17,8 @@ use std::{
 
 mod search_settings;
 pub use search_settings::*;
+mod system_v6;
+pub use system_v6::*;
 
 const CONTROL_BYTES_MAX: u64 = 4 * 1024 * 1024;
 const ASSET_BYTES_MAX: u64 = 18 * 1024 * 1024 * 1024;

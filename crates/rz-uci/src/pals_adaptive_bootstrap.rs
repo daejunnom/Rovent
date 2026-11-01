@@ -11,6 +11,7 @@ mod resource_plan;
 mod resource_readback;
 pub mod runtime_assets;
 mod startup_snapshot;
+mod system_v6;
 
 use crate::EngineIdentity;
 use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
@@ -325,6 +326,9 @@ impl Drop for StartupNativeGuard {
 }
 
 pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
+    if arguments.iter().any(|arg| arg.starts_with("--pals-system-startup-")) {
+        return system_v6::run_cli(arguments);
+    }
     if arguments == ["--source-inventory"] {
         let pins = compiled_source_components_v5().map_err(|e| failure("SourceInventory", &e))?;
         let output = serde_json::json!({"domain":"rz-pals-compiled-source-registration-v5/1",
