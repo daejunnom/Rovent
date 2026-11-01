@@ -14,11 +14,14 @@ fn main() {
 
 #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cuda"))]
 mod registration {
+    use rz_contracts::rovent::ExecutionMode;
     use rz_eval::onnx::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
     use rz_experiments::{
         ArtifactRef, NativeRuntimeSourceV6, ROVENT_EXECUTION_V3_DOMAIN,
-        ROVENT_STARTUP_DOCUMENT_V5_DOMAIN, RoventCoordinatorDeclarationV3, RoventEngineDeclaration,
-        RoventExecutionManifestV3, RoventPurpose, RoventResourcePlan, RoventRootTieDeclarationV2,
+        ROVENT_STARTUP_DOCUMENT_V5_DOMAIN, RoventBackend, RoventCoordinatorDeclarationV3,
+        RoventDevice, RoventEngineDeclaration, RoventExecutionManifestV3, RoventExternalProfilePin,
+        RoventModelPin, RoventNnuecPin, RoventPcConfiguration, RoventPurpose, RoventResearcher,
+        RoventResourcePlan, RoventRootTieDeclarationV2, RoventSearchDeclaration,
         RoventStartupDocumentV5, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeLockV6,
         SystemRuntimeSpecV6,
     };
@@ -33,9 +36,10 @@ mod registration {
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
         fs::{self, File, OpenOptions},
         io::{Read, Write},
+        num::NonZeroU16,
         os::unix::fs::MetadataExt,
         path::{Component, Path, PathBuf},
         time::Duration,
@@ -82,6 +86,80 @@ mod registration {
         Strict,
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum ModeInput {
+        HybridPcr,
+        HybridPc,
+        CpuPcr,
+        CpuPc,
+    }
+    impl From<ModeInput> for ExecutionMode {
+        fn from(value: ModeInput) -> Self {
+            match value {
+                ModeInput::HybridPcr => Self::HybridPcr,
+                ModeInput::HybridPc => Self::HybridPc,
+                ModeInput::CpuPcr => Self::CpuPcr,
+                ModeInput::CpuPc => Self::CpuPc,
+            }
+        }
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SearchInput {
+        node_unit: String,
+        requested_nodes: Option<u64>,
+        depth_plies: Option<NonZeroU16>,
+        mate_moves: Option<NonZeroU16>,
+        registered_max_chess_plies: NonZeroU16,
+        searchmoves: Option<Vec<String>>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PcInput {
+        proposer: RoventModelPin,
+        critic: RoventModelPin,
+        validator: Option<RoventModelPin>,
+        backend: RoventBackend,
+        device: RoventDevice,
+        runtime_artifacts: Vec<ArtifactRef>,
+        fp32: bool,
+        tf32: bool,
+        batch_width: u32,
+        ort_intra_threads: Option<u32>,
+        ort_inter_threads: Option<u32>,
+        ort_spinning: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EngineInput {
+        #[serde(deserialize_with = "required_option")]
+        source_commit: Option<String>,
+        source_components: BTreeMap<String, String>,
+        binary: ArtifactRef,
+        mode: ModeInput,
+        pc: PcInput,
+        researcher: Option<RoventResearcher>,
+        teachers: Vec<RoventExternalProfilePin>,
+        nnuec: Option<RoventNnuecPin>,
+        search: SearchInput,
+    }
+    fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Option::<T>::deserialize(deserializer)
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CoordinatorInput {
+        questions_max: u32,
+        ancestor_depth_max: u32,
+        waiting_jobs_max: u32,
+        role_tickets_max: u32,
+        cpu_credit_limit: u64,
+    }
+    #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Request {
         #[serde(default)]
@@ -91,9 +169,9 @@ mod registration {
         position_command: String,
         run_id: String,
         purpose: RoventPurpose,
-        engine: RoventEngineDeclaration<Option<String>>,
+        engine: EngineInput,
         resources: RoventResourcePlan,
-        coordinator: RoventCoordinatorDeclarationV3,
+        coordinator: CoordinatorInput,
         wall_time_max_ms: u64,
         cleanup_max_ms: u64,
         output_bytes_max: u64,
@@ -196,11 +274,8 @@ mod registration {
                 "usage: rovent_system_registration <request.json> <existing-output-root>".into(),
             );
         }
-        let mut req = request(Path::new(&args[1]))?;
-        // Never consume caller-provided digest placeholders as Rules evidence.
+        let req = request(Path::new(&args[1]))?;
         let (state_and_history, rules_profile) = rules_identity(&req.position_command)?;
-        req.engine.search.root_state_and_history_sha256 = state_and_history;
-        req.engine.search.rules_profile_sha256 = rules_profile;
         let output = Path::new(&args[2]);
         if !output.is_absolute() {
             return Err("output root must be absolute".into());
@@ -434,31 +509,72 @@ mod registration {
             .native
             .onnx_system(&req.engine.pc.device, &spec)
             .map_err(|e| format!("native configuration and system selection disagree: {e:?}"))?;
-        // These values are derived from actual captured native bytes and the typed
-        // startup, never carried over from an earlier run or caller placeholders.
-        req.engine.pc.backend_configuration_sha256 =
+        // The request has no slots for derived digests. Construct the real
+        // declarations only after Rules and system/runtime observations exist.
+        let backend_configuration_sha256 =
             hex(
                 &system_configuration_digest_v3(onnx, core.sha256, captured.identity_sha256())
                     .map_err(|e| format!("native configuration identity: {e:?}"))?,
             );
-        req.engine.search.search_configuration_sha256 =
-            hex(&typed
-                .search_configuration_digest()
-                .map_err(|e| format!("search identity: {e:?}"))?);
-        // Policy identity is the digest of this exact typed startup configuration,
-        // computed at registration time rather than copied from any fixture or run.
+        let search_configuration_sha256 = hex(&typed
+            .search_configuration_digest()
+            .map_err(|e| format!("search identity: {e:?}"))?);
         let startup_configuration_sha256 = hex(&typed
             .configuration_digest()
             .map_err(|e| format!("startup identity: {e:?}"))?);
-        req.coordinator.policy_sha256 = startup_configuration_sha256.clone();
+        let pc = req.engine.pc;
+        let search = req.engine.search;
+        let engine = RoventEngineDeclaration {
+            source_commit: req.engine.source_commit,
+            source_components: req.engine.source_components,
+            binary: req.engine.binary,
+            mode: req.engine.mode.into(),
+            pc: RoventPcConfiguration {
+                proposer: pc.proposer,
+                critic: pc.critic,
+                validator: pc.validator,
+                backend: pc.backend,
+                device: pc.device,
+                backend_configuration_sha256,
+                runtime_artifacts: pc.runtime_artifacts,
+                fp32: pc.fp32,
+                tf32: pc.tf32,
+                batch_width: pc.batch_width,
+                ort_intra_threads: pc.ort_intra_threads,
+                ort_inter_threads: pc.ort_inter_threads,
+                ort_spinning: pc.ort_spinning,
+            },
+            researcher: req.engine.researcher,
+            teachers: req.engine.teachers,
+            nnuec: req.engine.nnuec,
+            search: RoventSearchDeclaration {
+                node_unit: search.node_unit,
+                requested_nodes: search.requested_nodes,
+                depth_plies: search.depth_plies,
+                mate_moves: search.mate_moves,
+                registered_max_chess_plies: search.registered_max_chess_plies,
+                searchmoves: search.searchmoves,
+                search_configuration_sha256: search_configuration_sha256.clone(),
+                root_state_and_history_sha256: state_and_history,
+                rules_profile_sha256: rules_profile,
+            },
+        };
+        let coordinator = RoventCoordinatorDeclarationV3 {
+            policy_sha256: startup_configuration_sha256.clone(),
+            questions_max: req.coordinator.questions_max,
+            ancestor_depth_max: req.coordinator.ancestor_depth_max,
+            waiting_jobs_max: req.coordinator.waiting_jobs_max,
+            role_tickets_max: req.coordinator.role_tickets_max,
+            cpu_credit_limit: req.coordinator.cpu_credit_limit,
+        };
         let manifest = RoventExecutionManifestV3 {
             domain: ROVENT_EXECUTION_V3_DOMAIN.into(),
             contract_revision: req.contract_revision,
             run_id: req.run_id,
             purpose: req.purpose,
-            engine: req.engine,
+            engine,
             resources: req.resources,
-            coordinator: req.coordinator,
+            coordinator,
             wall_time_max_ms: req.wall_time_max_ms,
             cleanup_max_ms: req.cleanup_max_ms,
             output_bytes_max: req.output_bytes_max,
@@ -472,9 +588,7 @@ mod registration {
                 license: req.outputs.startup_license,
             },
             startup_configuration_sha256,
-            startup_search_configuration_sha256: hex(&typed
-                .search_configuration_digest()
-                .map_err(|e| format!("search identity: {e:?}"))?),
+            startup_search_configuration_sha256: search_configuration_sha256,
             own_r_root_tie: req.own_r_root_tie,
             system_runtime_lock: sys_lock.clone(),
         };
