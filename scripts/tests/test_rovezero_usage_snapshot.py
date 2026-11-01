@@ -93,6 +93,9 @@ class SnapshotTests(unittest.TestCase):
         stale = usage.read_snapshot(self.path, now=5000, require_root_owner=False)
         self.assertEqual(stale['decision'], 'unknown')
         self.assertEqual(stale['reason'], 'stale_or_future')
+        self.assertEqual(stale['observed_at_utc'], self.value['observed_at_utc'])
+        self.assertEqual(stale['coverage'], self.value['coverage'])
+        self.assertNotIn('allocated_bytes_lower_bound', stale)
 
     @unittest.skipUnless(hasattr(__import__('os'), 'O_NOFOLLOW'), 'Linux nofollow')
     def test_refuses_symlink_and_untrusted_or_invalid_snapshot(self):
@@ -130,6 +133,23 @@ class SnapshotTests(unittest.TestCase):
             usage.warn_cached_total_usage()
         self.assertEqual(sink.getvalue().count('rovezero_storage_total_warning:'), 1)
         self.assertIn('snapshot_unavailable', sink.getvalue())
+        self.assertIn('"observed_at_utc": "unknown"', sink.getvalue())
+        self.assertIn('"age_seconds": "unknown"', sink.getvalue())
+
+    def test_warning_includes_sample_time_scope_and_age(self):
+        usage._last_check = float('-inf')
+        usage._last_warning = None
+        sink = io.StringIO()
+        sample = dict(self.value, scope='linux_only')
+        with mock.patch.object(usage.sys, 'platform', 'linux'), \
+             mock.patch.object(usage, 'read_snapshot', return_value=sample), \
+             mock.patch.object(usage.time, 'time', return_value=1030), \
+             mock.patch.object(usage.sys, 'stderr', sink):
+            usage.warn_cached_total_usage()
+        public = json.loads(sink.getvalue().split(': ', 1)[1])
+        self.assertEqual(public['observed_at_utc'], sample['observed_at_utc'])
+        self.assertEqual(public['scope'], 'linux_only')
+        self.assertEqual(public['age_seconds'], 30)
 
     def test_windows_installed_monitor_reports_cached_combined_total(self):
         usage._last_check = float('-inf')

@@ -70,7 +70,12 @@ def read_snapshot(path=SNAPSHOT, *, now=None, max_age_seconds=MAX_AGE_SECONDS,
             raise ValueError('snapshot_time_without_timezone')
         age = (time.time() if now is None else now) - observed.timestamp()
         if age < -60 or age > max_age_seconds:
-            return {'decision': 'unknown', 'reason': 'stale_or_future', 'age_seconds': int(age)}
+            # Retain when and where the old sample was taken, without
+            # presenting its allocated bytes as a current measurement.
+            return {'decision': 'unknown', 'reason': 'stale_or_future',
+                    'age_seconds': int(age), 'observed_at_utc': value['observed_at_utc'],
+                    'scope': value.get('scope', 'unknown'),
+                    'coverage': value.get('coverage', 'unknown')}
         # A Windows scan can finish after the Linux timer has published its
         # snapshot. Re-read only the tiny, previously configured mirror here;
         # never traverse the storage trees on an engine startup path.
@@ -254,6 +259,17 @@ def warn_cached_total_usage():
                   'allocated_bytes_lower_bound', 'logical_bytes_lower_bound',
                   'threshold_bytes', 'observed_at_utc', 'source_observed_at_utc',
                   'scope', 'windows_source_scope', 'windows_refresh', 'age_seconds') if key in value}
+        public.setdefault('observed_at_utc', 'unknown')
+        public.setdefault('scope', 'unknown')
+        public.setdefault('coverage', 'unknown')
+        if 'age_seconds' not in public:
+            try:
+                observed = datetime.fromisoformat(public['observed_at_utc'])
+                if observed.tzinfo is None:
+                    raise ValueError('snapshot_time_without_timezone')
+                public['age_seconds'] = int(time.time() - observed.timestamp())
+            except (TypeError, ValueError, OverflowError, OSError):
+                public['age_seconds'] = 'unknown'
         if isinstance(value.get('components'), dict):
             public['source_observed_at_utc'] = {
                 name: row.get('observed_at_utc', 'unknown')
