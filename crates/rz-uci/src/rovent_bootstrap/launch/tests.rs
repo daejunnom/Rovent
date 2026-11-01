@@ -162,7 +162,12 @@ fn v1_source_observation_is_explicit_and_does_not_enable_system_receipts() {
 
     let mut observed = arguments();
     observed.push("--source-verification=observe".into());
-    assert!(!Arguments::parse(&observed).unwrap().v1_strict_source().unwrap());
+    assert!(
+        !Arguments::parse(&observed)
+            .unwrap()
+            .v1_strict_source()
+            .unwrap()
+    );
 
     let mut with_system_receipts = observed;
     with_system_receipts.push("--system-runtime-receipt-root=outputs/system".into());

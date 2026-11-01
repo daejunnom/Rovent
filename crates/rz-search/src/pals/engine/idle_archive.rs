@@ -155,8 +155,11 @@ pub struct ArchiveRootPressure {
 
 #[cfg(feature = "archive-origin-diagnostics")]
 fn pin_entries(pins: &StorePins) -> usize {
-    pins.states.len() + pins.lines.len() + pins.observations.len()
-        + pins.situations.len() + pins.executions.len()
+    pins.states.len()
+        + pins.lines.len()
+        + pins.observations.len()
+        + pins.situations.len()
+        + pins.executions.len()
 }
 
 impl<M: RoleModel> ResearcherPreparingOwner<M> {
@@ -574,7 +577,9 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
         #[cfg(feature = "archive-origin-diagnostics")]
-        { self.last_prepare_pressure = None; }
+        {
+            self.last_prepare_pressure = None;
+        }
         self.validate_idle()?;
         allocation_controls(Some((deadline, cancel)))?;
         if !self.archive_enabled() {
@@ -598,8 +603,11 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
         let resident_pins = semantic.resident_archive_pins_with(&pins)?;
         #[cfg(feature = "archive-origin-diagnostics")]
-        let (semantic_nodes, semantic_records, resident_pin_entries) =
-            (semantic.nodes.len(), semantic.records.len(), pin_entries(&resident_pins));
+        let (semantic_nodes, semantic_records, resident_pin_entries) = (
+            semantic.nodes.len(),
+            semantic.records.len(),
+            pin_entries(&resident_pins),
+        );
         semantic.stores.set_archive_pins(resident_pins)?;
         let pressure = semantic.engine_archive_pressure(&config, position);
         #[cfg(feature = "archive-origin-diagnostics")]
@@ -613,7 +621,9 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
             pressure,
         };
         #[cfg(feature = "archive-origin-diagnostics")]
-        { self.last_prepare_pressure = Some(diagnostic); }
+        {
+            self.last_prepare_pressure = Some(diagnostic);
+        }
         if pressure {
             // Idle validation rejects every resume token, active task and view.
             self.semantic_mut().reclaim_archive_for_root(
@@ -1356,19 +1366,32 @@ mod tests {
         let records = owner.semantic().records.len();
         let config = owner.config();
         let hot_before = owner.stores().hot_stats();
-        owner.prepare_root(&position, until, &AtomicBool::new(false)).unwrap();
-        let sample = owner.take_prepare_pressure().expect("observed prepare root");
-        assert_eq!((sample.semantic_nodes, sample.semantic_records), (nodes, records));
-        assert_eq!((sample.semantic_nodes_limit, sample.semantic_records_limit),
-            (config.max_nodes, config.max_records));
+        owner
+            .prepare_root(&position, until, &AtomicBool::new(false))
+            .unwrap();
+        let sample = owner
+            .take_prepare_pressure()
+            .expect("observed prepare root");
+        assert_eq!(
+            (sample.semantic_nodes, sample.semantic_records),
+            (nodes, records)
+        );
+        assert_eq!(
+            (sample.semantic_nodes_limit, sample.semantic_records_limit),
+            (config.max_nodes, config.max_records)
+        );
         assert_eq!(sample.projection_pin_entries, pin_entries(&pins));
         assert_eq!(sample.resident_pin_entries, pin_entries(&resident));
         assert!(!sample.pressure);
         assert_eq!(owner.stores().hot_stats(), hot_before);
         assert!(owner.take_prepare_pressure().is_none());
-        owner.advance_transition(
-            IdleArchiveTransitionKind::Finish, until, &AtomicBool::new(false),
-        ).unwrap();
+        owner
+            .advance_transition(
+                IdleArchiveTransitionKind::Finish,
+                until,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
         assert!(owner.transition_snapshot().unwrap().unwrap().completed);
         scratch.1 = true;
     }

@@ -6,11 +6,11 @@
 
 use crate::asset;
 use crate::error::{BackendError, FailureKind, FailureStage};
-pub use crate::model_adapter::{PhysicalFailure, backend_error};
-use crate::{RawOutput, output};
+pub use crate::model_adapter::{backend_error, PhysicalFailure};
+use crate::{output, RawOutput};
 use rz_contracts::*;
-use rz_encoding::classical::{self, EncodedInput, HistoryFill, INPUT_VALUES, Input};
-use rz_encoding::{POLICY_SIZE, policy};
+use rz_encoding::classical::{self, EncodedInput, HistoryFill, Input, INPUT_VALUES};
+use rz_encoding::{policy, POLICY_SIZE};
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 

@@ -3,8 +3,8 @@
 fn main() -> std::process::ExitCode {
     use rz_arena::rovent_resource_scope::launch::{
         ROVENT_RESOURCE_USAGE, RoventControlledRunFailure, RoventNativeResourceCli,
-        parse_native_resource_cli, run_native_with_resources_versioned, run_native_with_resources_v3,
-        run_native_with_resources_v3_control,
+        parse_native_resource_cli, run_native_with_resources_v3,
+        run_native_with_resources_v3_control, run_native_with_resources_versioned,
     };
     use std::io::Write;
     let result = match parse_native_resource_cli(std::env::args().skip(1).collect()) {

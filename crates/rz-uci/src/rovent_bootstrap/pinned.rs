@@ -530,7 +530,13 @@ impl RoventPinnedNativeSources {
         collection: Arc<RoventCollectionPreloadSources>,
     ) -> Result<Self, BackendError> {
         Self::open_collection_with_source_policy(
-            lock, root, private_root_path, selection, control, collection, true,
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            collection,
+            true,
         )
     }
 
@@ -619,7 +625,13 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
         collection: Arc<RoventCollectionPreloadSources>,
     ) -> Result<Self, BackendError> {
         Self::open_v2_with_collection_source_policy(
-            lock, root, private_root_path, selection, control, collection, true,
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            collection,
+            true,
         )
     }
 

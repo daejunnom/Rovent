@@ -8,7 +8,7 @@
 use crate::rules_projection::ClassicalProjection;
 use crate::{
     error::{BackendError, CauseCode, FailureKind, FailureStage},
-    model_adapter::{AdapterAdmission, ModelAdapter, PhysicalFailure, backend_error},
+    model_adapter::{backend_error, AdapterAdmission, ModelAdapter, PhysicalFailure},
     rules_projection::Lc0ModelAdapter,
     worker::{PhysicalLease, PhysicalPoll, SingleWorker},
 };
@@ -1432,7 +1432,7 @@ fn owner_poison_error() -> ContractError {
 mod tests {
     use super::*;
     use crate::contracts::PreparedBatch;
-    use crate::contracts::{MaiaBinding, encoding_manifest};
+    use crate::contracts::{encoding_manifest, MaiaBinding};
     use rz_encoding::classical::HistoryFill;
 
     fn owner() -> NativeWorkerOwner {
@@ -1576,14 +1576,12 @@ mod tests {
             }
             owner.close_admission(original);
             let poisoned = owner.clone();
-            assert!(
-                std::thread::spawn(move || {
-                    let _state = poisoned.0.state.lock().unwrap();
-                    panic!("injected native owner mutex poison");
-                })
-                .join()
-                .is_err()
-            );
+            assert!(std::thread::spawn(move || {
+                let _state = poisoned.0.state.lock().unwrap();
+                panic!("injected native owner mutex poison");
+            })
+            .join()
+            .is_err());
             let mut batch = owner.try_take_diagnostics(1).unwrap().unwrap();
             assert_eq!(batch.boundary_error, Some(original));
             assert_eq!(batch.poison_error.unwrap().code, ErrorCode::BackendFailure);

@@ -284,7 +284,10 @@ mod registration {
 
         #[test]
         fn inventory_is_optional_cuda_metadata_bound_to_unique_provenance() {
-            assert_eq!(declared_cuda_inventory_digest(None, &[], false).unwrap(), None);
+            assert_eq!(
+                declared_cuda_inventory_digest(None, &[], false).unwrap(),
+                None
+            );
             let item = inventory();
             let digest = declared_cuda_inventory_digest(Some(&item), &[item.clone()], true)
                 .unwrap()
@@ -292,13 +295,19 @@ mod registration {
             assert_eq!(digest, [0x42; 32]);
             assert!(declared_cuda_inventory_digest(Some(&item), &[item.clone()], false).is_err());
             assert!(declared_cuda_inventory_digest(Some(&item), &[], true).is_err());
-            assert!(declared_cuda_inventory_digest(Some(&item), &[item.clone(), item.clone()], true).is_err());
+            assert!(
+                declared_cuda_inventory_digest(Some(&item), &[item.clone(), item.clone()], true)
+                    .is_err()
+            );
             let mut changed = item.clone();
             changed.sha256 = "43".repeat(32);
             assert!(declared_cuda_inventory_digest(Some(&item), &[changed], true).is_err());
             let mut oversized = item;
             oversized.bytes = 4 * 1024 * 1024 + 1;
-            assert!(declared_cuda_inventory_digest(Some(&oversized), &[oversized.clone()], true).is_err());
+            assert!(
+                declared_cuda_inventory_digest(Some(&oversized), &[oversized.clone()], true)
+                    .is_err()
+            );
         }
     }
     /// Use the same bounded parser and Rules primitives as the real UCI
@@ -670,12 +679,13 @@ mod registration {
                     .map_err(|e| {
                         format!("native configuration and system selection disagree: {e:?}")
                     })?;
-                hex(
-                    &system_configuration_digest_v3_with_inventory(
-                        onnx, runtime_binary, identity, inventory_digest,
-                    )
-                        .map_err(|e| format!("native configuration identity: {e:?}"))?,
+                hex(&system_configuration_digest_v3_with_inventory(
+                    onnx,
+                    runtime_binary,
+                    identity,
+                    inventory_digest,
                 )
+                .map_err(|e| format!("native configuration identity: {e:?}"))?)
             }
             (None, None) => {
                 let onnx = native

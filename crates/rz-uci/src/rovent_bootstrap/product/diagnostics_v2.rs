@@ -551,8 +551,14 @@ mod tests {
                 {"operation":"restore_root_if_archived"}
             ]}
         }));
-        assert_eq!(summary["phase_receipts"][0]["root_pressure"]["semantic_nodes"], 3);
-        assert_eq!(summary["phase_receipts"][0]["root_pressure"]["pressure"], false);
+        assert_eq!(
+            summary["phase_receipts"][0]["root_pressure"]["semantic_nodes"],
+            3
+        );
+        assert_eq!(
+            summary["phase_receipts"][0]["root_pressure"]["pressure"],
+            false
+        );
         assert!(summary["phase_receipts"][1].get("root_pressure").is_none());
     }
     impl Write for FailingSink {
