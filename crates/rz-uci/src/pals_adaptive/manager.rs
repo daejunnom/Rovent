@@ -225,15 +225,23 @@ pub struct NativeSessionReleaseObservation {
     source: NativeSessionReleaseSource,
 }
 impl NativeSessionReleaseObservation {
-    pub fn release(&self) -> rz_eval::worker::SessionReleased { self.release }
-    pub fn source(&self) -> NativeSessionReleaseSource { self.source }
+    pub fn release(&self) -> rz_eval::worker::SessionReleased {
+        self.release
+    }
+    pub fn source(&self) -> NativeSessionReleaseSource {
+        self.source
+    }
     pub(super) fn from_report(
         report: &crate::pals_native::ticketed::TicketNativeFinishReport,
         original: bool,
     ) -> Option<Self> {
         report.session_release.map(|release| Self {
             release,
-            source: if original { NativeSessionReleaseSource::OriginalReport } else { NativeSessionReleaseSource::Snapshot },
+            source: if original {
+                NativeSessionReleaseSource::OriginalReport
+            } else {
+                NativeSessionReleaseSource::Snapshot
+            },
         })
     }
 }
@@ -3075,7 +3083,9 @@ where
     pub fn phase(&self) -> ManagerPhase {
         self.phase
     }
-    pub(super) fn native_session_release_observation(&self) -> Option<NativeSessionReleaseObservation> {
+    pub(super) fn native_session_release_observation(
+        &self,
+    ) -> Option<NativeSessionReleaseObservation> {
         if !self.native_joined || self.native_finished != Some(true) {
             return None;
         }
@@ -5368,13 +5378,16 @@ where
                     let mismatch = (requires && snapshot.is_none())
                         || (snapshot.is_none() && transferred.is_some())
                         || (!requires && snapshot.is_some())
-                        || snapshot.as_ref().zip(transferred.as_ref())
+                        || snapshot
+                            .as_ref()
+                            .zip(transferred.as_ref())
                             .is_some_and(|(snapshot, original)| snapshot != original)
-                        || snapshot.as_ref().is_some_and(|report|
-                        report.physical_shutdown_confirmed != physical_shutdown_confirmed
-                    );
-                    let failure = snapshot.as_ref().is_some_and(|report|
-                        report.physical_failure.is_some() || report.semantic_failure.is_some());
+                        || snapshot.as_ref().is_some_and(|report| {
+                            report.physical_shutdown_confirmed != physical_shutdown_confirmed
+                        });
+                    let failure = snapshot.as_ref().is_some_and(|report| {
+                        report.physical_failure.is_some() || report.semantic_failure.is_some()
+                    });
                     if mismatch || failure {
                         self.record_failure(AdaptiveManagerError::NativeShutdown {
                             event_physical_shutdown_confirmed: physical_shutdown_confirmed,

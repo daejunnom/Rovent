@@ -351,7 +351,10 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
     if arguments == ["--pals-system-source-inventory"] {
         return system_v6::source_inventory();
     }
-    if arguments.iter().any(|arg| arg.starts_with("--pals-system-startup-")) {
+    if arguments
+        .iter()
+        .any(|arg| arg.starts_with("--pals-system-startup-"))
+    {
         return system_v6::run_cli(arguments);
     }
     if arguments == ["--source-inventory"] {
@@ -460,9 +463,16 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
             let termination = prepared
                 .observations
                 .publish_termination(receipt, completion.as_ref());
-            if let Err(error) = prepared.observations.publish_session_release_observation(Some(receipt)) {
+            if let Err(error) = prepared
+                .observations
+                .publish_session_release_observation(Some(receipt))
+            {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr().lock(), "pals_v5_session_release_observation_warning {}", failure("SessionReleaseObservation", &error));
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "pals_v5_session_release_observation_warning {}",
+                    failure("SessionReleaseObservation", &error)
+                );
             }
             termination.map_err(|e| failure("TerminationReceipt", &e))?;
         }
@@ -479,9 +489,16 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
                     failure("FailureReceipt", &record_error)
                 );
             }
-            if let Err(record_error) = prepared.observations.publish_session_release_observation(None) {
+            if let Err(record_error) = prepared
+                .observations
+                .publish_session_release_observation(None)
+            {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr().lock(), "pals_v5_session_release_observation_warning {}", failure("SessionReleaseObservation", &record_error));
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "pals_v5_session_release_observation_warning {}",
+                    failure("SessionReleaseObservation", &record_error)
+                );
             }
             return Err(failure("ProcessDrain", error));
         }
@@ -1203,8 +1220,13 @@ fn prepare_actual(
     .map_err(|rejected| {
         let mut error = failure("SessionAdmission", &rejected.failure);
         let cleanup = cleanup_rejected_sources(rejected.sources, startup_until);
-        if !cleanup.physical.is_empty() || !cleanup.semantic.is_empty() || !cleanup.physical_mismatches.is_empty()
-            || !cleanup.finish_reports.is_empty() || cleanup.missing_required_snapshots != 0 || cleanup.missing_original_reports != 0 {
+        if !cleanup.physical.is_empty()
+            || !cleanup.semantic.is_empty()
+            || !cleanup.physical_mismatches.is_empty()
+            || !cleanup.finish_reports.is_empty()
+            || cleanup.missing_required_snapshots != 0
+            || cleanup.missing_original_reports != 0
+        {
             error.cleanup_failures = Some(cleanup);
         }
         error
@@ -1267,7 +1289,10 @@ fn finish_rejected_legacy_factory(
 
 /// Rejected declarations never re-enter session admission. These are the same
 /// owners created at startup, with no accepted jobs and no synthetic work ledger.
-fn cleanup_rejected_sources(mut sources: AdaptiveSessionSources<ActualBackend>, until: Instant) -> NativeCleanupFailures {
+fn cleanup_rejected_sources(
+    mut sources: AdaptiveSessionSources<ActualBackend>,
+    until: Instant,
+) -> NativeCleanupFailures {
     sources.native.begin_shutdown(until);
     if let Some(external) = &sources.external {
         external.worker.request_shutdown(until);
@@ -1285,27 +1310,30 @@ fn cleanup_rejected_sources(mut sources: AdaptiveSessionSources<ActualBackend>, 
                 TicketNativeEvent::Finished {
                     physical_shutdown_confirmed,
                     ..
-                } => {
-                    match sources.native.finish_report_snapshot() {
-                        Some(snapshot) => {
-                            if physical_shutdown_confirmed != snapshot.physical_shutdown_confirmed {
-                                failures.physical_mismatches.push((physical_shutdown_confirmed, snapshot.physical_shutdown_confirmed));
-                            }
-                            physical = Some(physical_shutdown_confirmed && snapshot.physical_shutdown_confirmed);
-                            failures.physical.extend(snapshot.physical_failure);
-                            failures.semantic.extend(snapshot.semantic_failure);
-                            match sources.native.take_finish_report() {
-                                Some(original) => failures.finish_reports.push(original),
-                                None => failures.missing_original_reports += 1,
-                            }
+                } => match sources.native.finish_report_snapshot() {
+                    Some(snapshot) => {
+                        if physical_shutdown_confirmed != snapshot.physical_shutdown_confirmed {
+                            failures.physical_mismatches.push((
+                                physical_shutdown_confirmed,
+                                snapshot.physical_shutdown_confirmed,
+                            ));
                         }
-                        None if sources.native.requires_finish_report() => {
-                            failures.missing_required_snapshots += 1;
-                            physical = Some(false);
+                        physical = Some(
+                            physical_shutdown_confirmed && snapshot.physical_shutdown_confirmed,
+                        );
+                        failures.physical.extend(snapshot.physical_failure);
+                        failures.semantic.extend(snapshot.semantic_failure);
+                        match sources.native.take_finish_report() {
+                            Some(original) => failures.finish_reports.push(original),
+                            None => failures.missing_original_reports += 1,
                         }
-                        None => physical = Some(physical_shutdown_confirmed),
                     }
-                }
+                    None if sources.native.requires_finish_report() => {
+                        failures.missing_required_snapshots += 1;
+                        physical = Some(false);
+                    }
+                    None => physical = Some(physical_shutdown_confirmed),
+                },
                 TicketNativeEvent::Ready { .. } => {}
                 _ => failed = true,
             }

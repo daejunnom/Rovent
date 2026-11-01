@@ -7,9 +7,9 @@ pub use origin::*;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
 mod no_capture_v3;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
-pub use no_capture_v3::RoventNoCaptureRootCapabilityV3;
-#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
 pub(crate) use no_capture_v3::RoventNoCaptureIssueErrorV3;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub use no_capture_v3::RoventNoCaptureRootCapabilityV3;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod versioned;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]

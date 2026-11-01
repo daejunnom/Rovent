@@ -284,14 +284,21 @@ impl V3BeforeNativeRecovered {
 
 #[cfg(target_os = "linux")]
 fn cancel_before_native_physical(factory: &mut super::super::RoventSystemFactoryCustodyV3) -> bool {
+    try_cancel_before_native_physical(factory).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn try_cancel_before_native_physical(
+    factory: &mut super::super::RoventSystemFactoryCustodyV3,
+) -> Result<(), rz_eval::worker::PhysicalReservationCancelError> {
     let Some(reservation) = factory.physical_reservation.take() else {
-        return true;
+        return Ok(());
     };
-    match reservation.cancel_unpublished() {
-        Ok(()) => true,
-        Err(original) => {
+    match reservation.try_cancel_unpublished() {
+        Ok(()) => Ok(()),
+        Err((original, reason)) => {
             factory.physical_reservation = Some(original);
-            false
+            Err(reason)
         }
     }
 }
@@ -310,6 +317,37 @@ pub struct V3FactoryPending {
 
 #[cfg(target_os = "linux")]
 impl V3FactoryPending {
+    /// Inspect the exact retained events without consuming their owners.
+    /// Opaque cells and panic payloads do not become serializable by being
+    /// observed; the caller must preserve this pending value.
+    pub fn events(&self) -> &[V3FactoryOriginalEvent] {
+        &self.events
+    }
+
+    pub fn original_failure(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.original_failure.as_deref()
+    }
+
+    pub fn has_original_context(&self) -> bool {
+        self.context.is_some()
+    }
+
+    pub fn has_recovered_factory(&self) -> bool {
+        self.recovered_factory.is_some()
+    }
+
+    /// None means the factory has not been recovered into this pending value;
+    /// it must not be interpreted as a completed reservation.
+    pub fn physical_reservation_pending(&self) -> Option<bool> {
+        self.recovered_factory
+            .as_ref()
+            .map(|factory| factory.physical_reservation.is_some())
+    }
+
+    pub fn before_native_proven(&self) -> bool {
+        self.before_native
+    }
+
     pub fn into_parts(
         self,
     ) -> (
@@ -333,9 +371,12 @@ impl V3FactoryPending {
 pub enum V3BeforeNativeScopeRecovery {
     Missing,
     Busy,
+    Poisoned,
+    Expired,
     WrongState,
     WrongType,
     Pending(crate::pals_native::ticketed::TicketRecoveryError),
+    PhysicalPending(rz_eval::worker::PhysicalReservationCancelError),
     Panic(Box<dyn std::any::Any + Send>),
     LostRegistration,
     InvariantViolation {
@@ -349,66 +390,83 @@ pub enum V3BeforeNativeScopeRecovery {
 }
 
 #[cfg(target_os = "linux")]
+enum V3BeforeNativeAttemptError {
+    Ticket(crate::pals_native::ticketed::TicketRecoveryError),
+    Physical(rz_eval::worker::PhysicalReservationCancelError),
+}
+
+#[cfg(target_os = "linux")]
+impl From<crate::pals_native::ticketed::TicketRecoveryError> for V3BeforeNativeAttemptError {
+    fn from(error: crate::pals_native::ticketed::TicketRecoveryError) -> Self {
+        Self::Ticket(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl v3_scope::RoventV3ScopeKey {
     pub fn recover_before_native(&self, until: Instant) -> V3BeforeNativeScopeRecovery {
         use crate::pals_native::ticketed::{TicketRecoveryError, TicketRecoveryStatus};
         use v3_scope::V3ScopeRecovery;
-        let result =
-            self.try_recover_original::<V3FactoryPending, (), TicketRecoveryError>(|pending| {
-                if let Some(factory) = pending.recovered_factory.as_mut() {
-                    return if cancel_before_native_physical(factory) {
-                        Ok(())
-                    } else {
-                        Err(TicketRecoveryError::WrongState)
-                    };
-                }
-                let key = pending.key.clone().ok_or(TicketRecoveryError::InvalidKey)?;
-                if !pending.before_native {
-                    // A timeout can precede the worker's final pre-native
-                    // result. Only its original key can later establish it.
-                    if key.status()? != TicketRecoveryStatus::BeforeNative {
-                        return Err(TicketRecoveryError::WrongState);
+        let result = self
+            .try_recover_original_until::<V3FactoryPending, (), V3BeforeNativeAttemptError>(
+                until,
+                |pending| {
+                    if let Some(factory) = pending.recovered_factory.as_mut() {
+                        return try_cancel_before_native_physical(factory)
+                            .map_err(V3BeforeNativeAttemptError::Physical);
                     }
-                    pending.before_native = true;
-                }
-                let original = pending
-                    .original_failure
-                    .as_mut()
-                    .ok_or(TicketRecoveryError::WrongOwnerType)?;
-                if let Some(failure) =
-                    original.downcast_mut::<RoventNativeStartupRejection<AdaptivePortQuestion>>()
-                {
-                    finish_original_before_native(failure, until, &mut pending.events)?;
-                } else if let Some(failure) =
-                    original.downcast_mut::<RoventNativeStartupRejection<PcPortQuestion>>()
-                {
-                    finish_original_before_native(failure, until, &mut pending.events)?;
-                } else {
-                    return Err(TicketRecoveryError::WrongOwnerType);
-                }
-                collect_before_native_events(&key, until, &mut pending.events)?;
-                let factory =
-                    key.take_before_native::<super::super::RoventSystemFactoryCustodyV3>(until)?;
-                // No fallible work after receiving the original factory: put it in
-                // the still-registered slot before issuing the recovery proof.
-                pending.recovered_factory = Some(factory);
-                if cancel_before_native_physical(
-                    pending
-                        .recovered_factory
+                    let key = pending.key.clone().ok_or(TicketRecoveryError::InvalidKey)?;
+                    if !pending.before_native {
+                        // A timeout can precede the worker's final pre-native
+                        // result. Only its original key can later establish it.
+                        if key.status()? != TicketRecoveryStatus::BeforeNative {
+                            return Err(TicketRecoveryError::WrongState.into());
+                        }
+                        pending.before_native = true;
+                    }
+                    let original = pending
+                        .original_failure
                         .as_mut()
-                        .expect("original factory just stored"),
-                ) {
-                    Ok(())
-                } else {
-                    Err(TicketRecoveryError::WrongState)
-                }
-            });
+                        .ok_or(TicketRecoveryError::WrongOwnerType)?;
+                    if let Some(failure) = original
+                        .downcast_mut::<RoventNativeStartupRejection<AdaptivePortQuestion>>()
+                    {
+                        finish_original_before_native(failure, until, &mut pending.events)?;
+                    } else if let Some(failure) =
+                        original.downcast_mut::<RoventNativeStartupRejection<PcPortQuestion>>()
+                    {
+                        finish_original_before_native(failure, until, &mut pending.events)?;
+                    } else {
+                        return Err(TicketRecoveryError::WrongOwnerType.into());
+                    }
+                    collect_before_native_events(&key, until, &mut pending.events)?;
+                    let factory = key
+                        .take_before_native::<super::super::RoventSystemFactoryCustodyV3>(until)?;
+                    // No fallible work after receiving the original factory: put it in
+                    // the still-registered slot before issuing the recovery proof.
+                    pending.recovered_factory = Some(factory);
+                    try_cancel_before_native_physical(
+                        pending
+                            .recovered_factory
+                            .as_mut()
+                            .expect("original factory just stored"),
+                    )
+                    .map_err(V3BeforeNativeAttemptError::Physical)
+                },
+            );
         match result {
             V3ScopeRecovery::Missing => V3BeforeNativeScopeRecovery::Missing,
             V3ScopeRecovery::Busy => V3BeforeNativeScopeRecovery::Busy,
+            V3ScopeRecovery::Poisoned => V3BeforeNativeScopeRecovery::Poisoned,
+            V3ScopeRecovery::Expired => V3BeforeNativeScopeRecovery::Expired,
             V3ScopeRecovery::WrongState => V3BeforeNativeScopeRecovery::WrongState,
             V3ScopeRecovery::WrongType => V3BeforeNativeScopeRecovery::WrongType,
-            V3ScopeRecovery::Pending(error) => V3BeforeNativeScopeRecovery::Pending(error),
+            V3ScopeRecovery::Pending(V3BeforeNativeAttemptError::Ticket(error)) => {
+                V3BeforeNativeScopeRecovery::Pending(error)
+            }
+            V3ScopeRecovery::Pending(V3BeforeNativeAttemptError::Physical(error)) => {
+                V3BeforeNativeScopeRecovery::PhysicalPending(error)
+            }
             V3ScopeRecovery::Panic(payload) => V3BeforeNativeScopeRecovery::Panic(payload),
             V3ScopeRecovery::LostRegistration(()) => V3BeforeNativeScopeRecovery::LostRegistration,
             V3ScopeRecovery::Recovered { original, pins, .. } => {
@@ -1060,12 +1118,22 @@ mod before_native_asset_integration {
                 }
                 other => {
                     let (variant, error) = match &other {
-                        super::super::RoventRetainingLaunchError::Ordinary(error) => ("Ordinary", error),
-                        super::super::RoventRetainingLaunchError::Settled { error, .. } => ("Settled", error),
-                        super::super::RoventRetainingLaunchError::Quarantined { error, .. } => ("Quarantined", error),
-                        super::super::RoventRetainingLaunchError::Unstarted { error, .. } => ("Unstarted", error),
+                        super::super::RoventRetainingLaunchError::Ordinary(error) => {
+                            ("Ordinary", error)
+                        }
+                        super::super::RoventRetainingLaunchError::Settled { error, .. } => {
+                            ("Settled", error)
+                        }
+                        super::super::RoventRetainingLaunchError::Quarantined { error, .. } => {
+                            ("Quarantined", error)
+                        }
+                        super::super::RoventRetainingLaunchError::Unstarted { error, .. } => {
+                            ("Unstarted", error)
+                        }
                     };
-                    panic!("attempt {attempt}: actual V3 factory returned {variant}: {error}; pre-native owner required");
+                    panic!(
+                        "attempt {attempt}: actual V3 factory returned {variant}: {error}; pre-native owner required"
+                    );
                 }
             };
             let mut owner = owner
@@ -1365,7 +1433,8 @@ pub(super) struct OriginalV3Inputs<'a> {
     lock_file: Arc<File>,
     receipt_writer: Option<Arc<SystemReceiptWriter>>,
     control_scope_pin: Option<Box<dyn std::any::Any + Send>>,
-    scope_reserved: Option<Box<dyn FnOnce(&v3_scope::RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
+    scope_reserved:
+        Option<Box<dyn FnOnce(&v3_scope::RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
 }
 
 #[cfg(target_os = "linux")]

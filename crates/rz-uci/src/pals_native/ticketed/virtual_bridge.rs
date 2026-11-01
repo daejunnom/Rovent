@@ -554,19 +554,30 @@ impl NativeVirtualReviewTicketBackend {
         if self.physical_unknown || self.outstanding.is_some() {
             return Err(RoleFailure::PhysicalUnknown);
         }
-        let scoped = matches!(&command,
+        let scoped = matches!(
+            &command,
             VirtualReviewNativeCommand::EvaluateTicketScoped { .. }
         ) || {
             #[cfg(feature = "native-validation-diagnostics")]
-            { matches!(&command, VirtualReviewNativeCommand::EvaluateTicketForValidation { .. }) }
+            {
+                matches!(
+                    &command,
+                    VirtualReviewNativeCommand::EvaluateTicketForValidation { .. }
+                )
+            }
             #[cfg(not(feature = "native-validation-diagnostics"))]
-            { false }
+            {
+                false
+            }
         };
-        self.outstanding = Some(if scoped {
-            self.worker.submit_scoped(command)
-        } else {
-            self.worker.submit(command)
-        }.map_err(backend_failure)?);
+        self.outstanding = Some(
+            if scoped {
+                self.worker.submit_scoped(command)
+            } else {
+                self.worker.submit(command)
+            }
+            .map_err(backend_failure)?,
+        );
         loop {
             match self
                 .outstanding
@@ -774,13 +785,15 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
             #[cfg(feature = "native-validation-diagnostics")]
             let command = if self.validation_trace.is_some() {
                 match command {
-                    VirtualReviewNativeCommand::EvaluateTicketScoped { ticket, execution, invocation } => {
-                        VirtualReviewNativeCommand::EvaluateTicketForValidation {
-                            ticket,
-                            execution,
-                            invocation,
-                        }
-                    }
+                    VirtualReviewNativeCommand::EvaluateTicketScoped {
+                        ticket,
+                        execution,
+                        invocation,
+                    } => VirtualReviewNativeCommand::EvaluateTicketForValidation {
+                        ticket,
+                        execution,
+                        invocation,
+                    },
                     _ => unreachable!("original ticket command"),
                 }
             } else {
@@ -1223,9 +1236,17 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
     }
     fn finish_report(&mut self, until: Instant) -> TicketNativeFinishReport {
         if self.physical_unknown || self.outstanding.is_some() {
-            return TicketNativeFinishReport { physical_shutdown_confirmed: false, physical_failure: Some(RoleFailure::PhysicalUnknown), semantic_failure: self.game_reset_failure.clone(), session_release: None };
+            return TicketNativeFinishReport {
+                physical_shutdown_confirmed: false,
+                physical_failure: Some(RoleFailure::PhysicalUnknown),
+                semantic_failure: self.game_reset_failure.clone(),
+                session_release: None,
+            };
         }
-        let mut semantic_failure = self.game_reset_failure.clone().or_else(|| self.game_reset_failed.then_some(RoleFailure::InvalidOutput));
+        let mut semantic_failure = self
+            .game_reset_failure
+            .clone()
+            .or_else(|| self.game_reset_failed.then_some(RoleFailure::InvalidOutput));
         if semantic_failure.is_none() && self.completed_nn_seen && !self.runtime_audited {
             semantic_failure = if Instant::now() >= until {
                 Some(RoleFailure::Expired)
@@ -1240,13 +1261,18 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 // The actual loaded policy declares this V3 domain. VerifyRuntime
                 // checks dependencies/mappings first; this proof then seals all
                 // registered V3 roles and actual Fresh/seeded-Warm executions.
-                semantic_failure = if Instant::now() >= until { Some(RoleFailure::Expired) } else {
+                semantic_failure = if Instant::now() >= until {
+                    Some(RoleFailure::Expired)
+                } else {
                     match self.execute_command(
                         VirtualReviewNativeCommand::VerifyVirtualCudaPlacement,
                         until,
                     ) {
                         Ok(VirtualReviewNativeResult::VirtualCudaPlacementVerified(witness)) => {
-                            let observed = self.observer.as_mut().map_or(Ok(()), |observer| observer.runtime_audited(&witness));
+                            let observed = self
+                                .observer
+                                .as_mut()
+                                .map_or(Ok(()), |observer| observer.runtime_audited(&witness));
                             #[cfg(feature = "native-validation-diagnostics")]
                             if observed.is_ok() {
                                 if let Some(trace) = &self.validation_trace {
@@ -1264,7 +1290,12 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
             if self.physical_unknown || self.outstanding.is_some() {
                 // Unknown completion still owns native buffers/workspace. A
                 // semantic audit rejection cannot turn quarantine into a fence.
-                return TicketNativeFinishReport { physical_shutdown_confirmed: false, physical_failure: Some(RoleFailure::PhysicalUnknown), semantic_failure, session_release: None };
+                return TicketNativeFinishReport {
+                    physical_shutdown_confirmed: false,
+                    physical_failure: Some(RoleFailure::PhysicalUnknown),
+                    semantic_failure,
+                    session_release: None,
+                };
             }
         }
         // A known audit/collection failure still closes physical admission and
@@ -1275,13 +1306,29 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 Poll::Ready(result) => {
                     let physical_shutdown_confirmed = result.is_ok();
                     let physical_failure = result.err().map(backend_failure);
-                    let session_release = if physical_shutdown_confirmed { self.worker.session_release() } else { None };
-                    return TicketNativeFinishReport { physical_shutdown_confirmed, physical_failure, semantic_failure, session_release };
-                },
+                    let session_release = if physical_shutdown_confirmed {
+                        self.worker.session_release()
+                    } else {
+                        None
+                    };
+                    return TicketNativeFinishReport {
+                        physical_shutdown_confirmed,
+                        physical_failure,
+                        semantic_failure,
+                        session_release,
+                    };
+                }
                 Poll::Pending if Instant::now() < until => {
                     std::thread::sleep(Duration::from_micros(100))
                 }
-                Poll::Pending => return TicketNativeFinishReport { physical_shutdown_confirmed: false, physical_failure: Some(RoleFailure::Expired), semantic_failure, session_release: None },
+                Poll::Pending => {
+                    return TicketNativeFinishReport {
+                        physical_shutdown_confirmed: false,
+                        physical_failure: Some(RoleFailure::Expired),
+                        semantic_failure,
+                        session_release: None,
+                    };
+                }
             }
         }
     }
@@ -2088,7 +2135,10 @@ mod tests {
         let report = backend.finish_report(Instant::now() + Duration::from_secs(2));
         assert!(report.physical_shutdown_confirmed);
         assert!(report.physical_failure.is_none());
-        assert_eq!(report.semantic_failure, Some(backend_failure(mock_audit_failure())));
+        assert_eq!(
+            report.semantic_failure,
+            Some(backend_failure(mock_audit_failure()))
+        );
         assert!(dropped.load(Ordering::Acquire));
         assert!(!backend.runtime_audited);
         assert!(!backend.physical_unknown);

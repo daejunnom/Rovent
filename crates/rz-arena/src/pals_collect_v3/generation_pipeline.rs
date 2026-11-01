@@ -553,15 +553,17 @@ pub fn run_generation_and_evaluation_owned_with_storage_policy_v3(
     let source_root = pipeline.evaluation_launches().source_root().to_owned();
     let output_root = pipeline.evaluation_output_root().to_owned();
     let prefix = pipeline.evaluation_attempt_prefix().to_owned();
-    Ok(crate::pals_adaptive_launch::run_pals_evaluation_series_with_storage_policy_v5(
-        pipeline,
-        launches,
-        &source_root,
-        &output_root,
-        &prefix,
-        &cancel,
-        storage_policy,
-    ))
+    Ok(
+        crate::pals_adaptive_launch::run_pals_evaluation_series_with_storage_policy_v5(
+            pipeline,
+            launches,
+            &source_root,
+            &output_root,
+            &prefix,
+            &cancel,
+            storage_policy,
+        ),
+    )
 }
 
 /// Explicit call only. The caller retains the sole GPU execution ownership;

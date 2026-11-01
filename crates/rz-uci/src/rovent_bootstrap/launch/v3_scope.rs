@@ -44,6 +44,8 @@ pub enum V3ScopeAccess<T> {
 pub(super) enum V3ScopeRecovery<P, E> {
     Missing,
     Busy,
+    Poisoned,
+    Expired,
     WrongState,
     WrongType,
     Pending(E),
@@ -90,6 +92,9 @@ struct SlotState {
     _pins: Vec<Box<dyn Any + Send>>,
     original: Option<Box<dyn Any + Send>>,
     recovery_key: Option<TicketNativeRecoveryKey>,
+    // A successful recovery callback may have performed irreversible work.
+    // Preserve its exact proof if registry commit is temporarily busy.
+    recovery_proof: Option<Box<dyn Any + Send>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,36 +214,86 @@ impl RoventV3ScopeKey {
     /// Internal one-slot transfer. The caller must verify BeforeNative on the
     /// actual ticket owner inside `attempt`; this helper grants no proof by
     /// itself. An unsuccessful attempt leaves the slot and all pins in place.
-    pub(super) fn try_recover_original<T: Any, P, E>(
+    #[cfg(test)]
+    fn try_recover_original<T: Any, P: Any + Send, E>(
         &self,
         attempt: impl FnOnce(&mut T) -> Result<P, E>,
     ) -> V3ScopeRecovery<P, E> {
+        self.try_recover_original_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            attempt,
+        )
+    }
+
+    pub(super) fn try_recover_original_until<T: Any, P: Any + Send, E>(
+        &self,
+        until: std::time::Instant,
+        attempt: impl FnOnce(&mut T) -> Result<P, E>,
+    ) -> V3ScopeRecovery<P, E> {
+        if std::time::Instant::now() >= until {
+            return V3ScopeRecovery::Expired;
+        }
         {
-            let slots = registry().lock().unwrap_or_else(|e| e.into_inner());
+            let slots = match registry().try_lock() {
+                Ok(slots) => slots,
+                Err(std::sync::TryLockError::WouldBlock) => return V3ScopeRecovery::Busy,
+                Err(std::sync::TryLockError::Poisoned(_)) => return V3ScopeRecovery::Poisoned,
+            };
             if !slots.iter().any(|slot| Arc::ptr_eq(slot, &self.0)) {
                 return V3ScopeRecovery::Missing;
             }
         }
         let mut state = match self.0.state.try_lock() {
             Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(_)) => return V3ScopeRecovery::Poisoned,
             Err(std::sync::TryLockError::WouldBlock) => return V3ScopeRecovery::Busy,
         };
         if state.state != V3ScopeState::Parked {
             return V3ScopeRecovery::WrongState;
         }
-        let Some(original) = state.original.as_mut().and_then(|o| o.downcast_mut::<T>()) else {
+        if !state.original.as_ref().is_some_and(|o| o.is::<T>()) {
             return V3ScopeRecovery::WrongType;
-        };
+        }
+        if std::time::Instant::now() >= until {
+            return V3ScopeRecovery::Expired;
+        }
         // Only this slot is locked during external recovery. Other scope
         // observations and independent native attempts do not wait on it.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attempt(original)));
-        let proof = match result {
-            Ok(Ok(proof)) => proof,
-            Ok(Err(error)) => return V3ScopeRecovery::Pending(error),
-            Err(payload) => return V3ScopeRecovery::Panic(payload),
+        let proof = if let Some(proof) = state.recovery_proof.take() {
+            match proof.downcast::<P>() {
+                Ok(proof) => *proof,
+                Err(proof) => {
+                    state.recovery_proof = Some(proof);
+                    return V3ScopeRecovery::WrongType;
+                }
+            }
+        } else {
+            let original = state
+                .original
+                .as_mut()
+                .and_then(|o| o.downcast_mut::<T>())
+                .expect("original type checked while holding the same slot");
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attempt(original))) {
+                Ok(Ok(proof)) => proof,
+                Ok(Err(error)) => return V3ScopeRecovery::Pending(error),
+                Err(payload) => return V3ScopeRecovery::Panic(payload),
+            }
         };
-        let mut slots = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if std::time::Instant::now() >= until {
+            state.recovery_proof = Some(Box::new(proof));
+            return V3ScopeRecovery::Expired;
+        }
+        let mut slots = match registry().try_lock() {
+            Ok(slots) => slots,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                state.recovery_proof = Some(Box::new(proof));
+                return V3ScopeRecovery::Busy;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                state.recovery_proof = Some(Box::new(proof));
+                return V3ScopeRecovery::Poisoned;
+            }
+        };
         let Some(index) = slots.iter().position(|slot| Arc::ptr_eq(slot, &self.0)) else {
             return V3ScopeRecovery::LostRegistration(proof);
         };
@@ -324,6 +379,7 @@ impl ScopeReservation {
                 _pins: vec![pins],
                 original: None,
                 recovery_key: None,
+                recovery_proof: None,
             }),
         });
         slots.push(Arc::clone(&slot));
@@ -405,25 +461,106 @@ mod tests {
     struct Counted(Arc<AtomicUsize>);
 
     #[test]
+    fn recovery_deadline_and_poison_do_not_release_original_owner() {
+        let mut reservation = ScopeReservation::reserve(V3ScopeDomain::Cpu, Box::new(()))
+            .ok()
+            .unwrap();
+        reservation.arm();
+        let key = reservation.park(Box::new(31_u32), None);
+        assert!(matches!(
+            key.try_recover_original_until::<u32, (), ()>(std::time::Instant::now(), |_| {
+                panic!("expired callback must not run")
+            }),
+            V3ScopeRecovery::Expired
+        ));
+        assert_eq!(key.with_original::<u32, _>(|value| *value), Some(31));
+        let slot = Arc::clone(&key.0);
+        let _ = std::thread::spawn(move || {
+            let _guard = slot.state.lock().unwrap();
+            panic!("poison original slot for recovery check");
+        })
+        .join();
+        assert!(matches!(
+            key.try_recover_original::<u32, (), ()>(|_| panic!("poisoned callback must not run")),
+            V3ScopeRecovery::Poisoned
+        ));
+    }
+
+    #[test]
+    fn recovery_commit_busy_retains_original_proof_and_does_not_repeat_callback() {
+        let mut reservation = ScopeReservation::reserve(V3ScopeDomain::Cpu, Box::new(()))
+            .ok()
+            .unwrap();
+        reservation.arm();
+        let key = reservation.park(Box::new(19_u32), None);
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            request_rx.recv().unwrap();
+            let _guard = registry().lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let proof = Arc::new(41_u32);
+        let original_proof = Arc::clone(&proof);
+        assert!(matches!(
+            key.try_recover_original::<u32, Arc<u32>, ()>(|owner| {
+                *owner += 1;
+                request_tx.send(()).unwrap();
+                held_rx.recv().unwrap();
+                Ok(proof)
+            }),
+            V3ScopeRecovery::Busy
+        ));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        match key.try_recover_original::<u32, Arc<u32>, ()>(|_| panic!("callback repeated")) {
+            V3ScopeRecovery::Recovered {
+                proof, original, ..
+            } => {
+                assert!(Arc::ptr_eq(&proof, &original_proof));
+                assert_eq!(*original.downcast::<u32>().ok().unwrap(), 20);
+            }
+            _ => panic!("the same original proof was not committed"),
+        }
+    }
+
+    #[test]
     fn terminal_evidence_belongs_to_original_key_even_after_retirement() {
         let mut first = ScopeReservation::reserve(V3ScopeDomain::Cpu, Box::new(()))
             .ok()
             .unwrap();
         let first_key = first.key().clone();
-        assert_eq!(first_key.terminal_evidence(), V3ScopeTerminalEvidence::Unknown);
+        assert_eq!(
+            first_key.terminal_evidence(),
+            V3ScopeTerminalEvidence::Unknown
+        );
         first.mark_before_native();
         drop(first);
-        assert_eq!(first_key.terminal_evidence(), V3ScopeTerminalEvidence::BeforeNative);
+        assert_eq!(
+            first_key.terminal_evidence(),
+            V3ScopeTerminalEvidence::BeforeNative
+        );
 
         let mut second = ScopeReservation::reserve(V3ScopeDomain::Cpu, Box::new(()))
             .ok()
             .unwrap();
         let second_key = second.key().clone();
-        assert_eq!(second_key.terminal_evidence(), V3ScopeTerminalEvidence::Unknown);
+        assert_eq!(
+            second_key.terminal_evidence(),
+            V3ScopeTerminalEvidence::Unknown
+        );
         second.mark_session_released();
         drop(second);
-        assert_eq!(second_key.terminal_evidence(), V3ScopeTerminalEvidence::SessionReleased);
-        assert_eq!(first_key.terminal_evidence(), V3ScopeTerminalEvidence::BeforeNative);
+        assert_eq!(
+            second_key.terminal_evidence(),
+            V3ScopeTerminalEvidence::SessionReleased
+        );
+        assert_eq!(
+            first_key.terminal_evidence(),
+            V3ScopeTerminalEvidence::BeforeNative
+        );
     }
     impl Drop for Counted {
         fn drop(&mut self) {

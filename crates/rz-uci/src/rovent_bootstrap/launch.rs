@@ -68,10 +68,6 @@ pub mod storage;
 mod v2_external;
 mod v2_rejections;
 mod v3;
-#[cfg(target_os = "linux")]
-pub use v3::v3_scope::{RoventV3ScopeKey, V3NativeReobservation, V3ScopeObservation, V3ScopeState, V3ScopeTerminalEvidence, unresolved_keys};
-#[cfg(target_os = "linux")]
-pub use v3::{V3SettledFactoryOwner, V3FactoryOriginalEvent, V3BeforeNativeRecovered, V3BeforeNativeScopeRecovery, V3FactoryPending, V3ControlDirectory};
 pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
@@ -90,6 +86,16 @@ pub use collection::{
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
 use v2_rejections::{reject_external_pcr_product_v2, reject_own_nnuec_product_v2};
+#[cfg(target_os = "linux")]
+pub use v3::v3_scope::{
+    RoventV3ScopeKey, V3NativeReobservation, V3ScopeObservation, V3ScopeState,
+    V3ScopeTerminalEvidence, unresolved_keys,
+};
+#[cfg(target_os = "linux")]
+pub use v3::{
+    V3BeforeNativeRecovered, V3BeforeNativeScopeRecovery, V3ControlDirectory,
+    V3FactoryOriginalEvent, V3FactoryPending, V3SettledFactoryOwner,
+};
 
 #[derive(Debug)]
 pub struct RoventLaunchError {
@@ -855,9 +861,15 @@ pub fn run_retaining(arguments: Vec<String>) -> Result<(), RoventRetainingLaunch
     match run_inner(arguments, None, None, None, Some(&mut owner)) {
         Ok(()) => Ok(()),
         Err(error) => match owner {
-            Some(RetainedV3Owner::Unstarted(owner)) => Err(RoventRetainingLaunchError::Unstarted { error, owner }),
-            Some(RetainedV3Owner::Settled(owner)) => Err(RoventRetainingLaunchError::Settled { error, owner }),
-            Some(RetainedV3Owner::Quarantined(owner)) => Err(RoventRetainingLaunchError::Quarantined { error, owner }),
+            Some(RetainedV3Owner::Unstarted(owner)) => {
+                Err(RoventRetainingLaunchError::Unstarted { error, owner })
+            }
+            Some(RetainedV3Owner::Settled(owner)) => {
+                Err(RoventRetainingLaunchError::Settled { error, owner })
+            }
+            Some(RetainedV3Owner::Quarantined(owner)) => {
+                Err(RoventRetainingLaunchError::Quarantined { error, owner })
+            }
             None => Err(RoventRetainingLaunchError::Ordinary(error)),
         },
     }
@@ -917,7 +929,9 @@ pub fn run_with_v3_resource_admission<'a>(
             is_installed: None,
             #[cfg(target_os = "linux")]
             scope_reserved: None,
-            callback: Box::new(move |lock, _root, _file, _until, _cleanup, _control, _path| admit_resource(lock)),
+            callback: Box::new(
+                move |lock, _root, _file, _until, _cleanup, _control, _path| admit_resource(lock),
+            ),
         },
     )
 }
@@ -927,15 +941,26 @@ pub fn run_with_v3_resource_admission<'a>(
 #[cfg(target_os = "linux")]
 pub fn run_with_v3_resource_admission_retaining<'a>(
     arguments: Vec<String>,
-    admit_resource: impl FnOnce(&Arc<RoventInputLockV3>, &Dir, &std::fs::File, std::time::Instant) -> Result<(), RoventLaunchError> + 'a,
+    admit_resource: impl FnOnce(
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
 ) -> Result<(), RoventRetainingLaunchError> {
-    run_with_v3_resource_admission_retaining_inner(arguments, ResourceAdmissionV3 {
-        require_control_dir: false,
-        scope_pin: None,
-        is_installed: None,
-        scope_reserved: None,
-        callback: Box::new(move |lock, root, file, until, _cleanup, _control, _path| admit_resource(lock, root, file, until)),
-    })
+    run_with_v3_resource_admission_retaining_inner(
+        arguments,
+        ResourceAdmissionV3 {
+            require_control_dir: false,
+            scope_pin: None,
+            is_installed: None,
+            scope_reserved: None,
+            callback: Box::new(move |lock, root, file, until, _cleanup, _control, _path| {
+                admit_resource(lock, root, file, until)
+            }),
+        },
+    )
 }
 
 /// The caller retains the same write-once control slot on every return path.
@@ -955,15 +980,31 @@ pub enum BeforeControlV3Outcome {
 
 #[cfg(target_os = "linux")]
 pub enum ControlledV3Result<C> {
-    BeforeControl { outcome: BeforeControlV3Outcome },
-    Controlled { original_control: Arc<std::sync::Mutex<C>>, scope_marker: Arc<std::sync::OnceLock<RoventV3ScopeKey>>, outcome: ControlledV3Outcome },
+    BeforeControl {
+        outcome: BeforeControlV3Outcome,
+    },
+    Controlled {
+        original_control: Arc<std::sync::Mutex<C>>,
+        scope_marker: Arc<std::sync::OnceLock<RoventV3ScopeKey>>,
+        outcome: ControlledV3Outcome,
+    },
 }
 
 #[cfg(target_os = "linux")]
 pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'static>(
     arguments: Vec<String>,
     control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
-    admit_resource: impl FnOnce(&Arc<RoventInputLockV3>, &Dir, &std::fs::File, std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>, &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>) -> Result<(), RoventLaunchError> + 'a,
+    admit_resource: impl FnOnce(
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+        std::time::Instant,
+        Option<&Dir>,
+        Option<&std::path::Path>,
+        &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
 ) -> ControlledV3Result<C> {
     let scope_marker = Arc::new(std::sync::OnceLock::new());
     if let Some(original_control) = control.get() {
@@ -984,20 +1025,39 @@ pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'stat
         let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
         let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
             .map_err(|failure| error("Cwd", failure))?;
-        let lock_file = root.open_with(&arguments.input_lock, cap_std::fs::OpenOptions::new().read(true))
-            .map_err(|failure| error("InputLock", failure))?.into_std();
+        let lock_file = root
+            .open_with(
+                &arguments.input_lock,
+                cap_std::fs::OpenOptions::new().read(true),
+            )
+            .map_err(|failure| error("InputLock", failure))?
+            .into_std();
         let bytes = read_bounded(&lock_file, MAX_LOCK_BYTES)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| error("InputLock", "UTF-8 input required"))?;
-        let lock = Arc::new(RoventInputLockV3::from_json(text).map_err(|failure| error("InputLock", failure))?);
+        let text =
+            std::str::from_utf8(&bytes).map_err(|_| error("InputLock", "UTF-8 input required"))?;
+        let lock = Arc::new(
+            RoventInputLockV3::from_json(text).map_err(|failure| error("InputLock", failure))?,
+        );
         let resource = ResourceAdmissionV3 {
             require_control_dir: true,
             scope_pin: Some(Box::new(control)),
             is_installed: Some(Box::new(move || gate_control.get().is_some())),
             scope_reserved: Some(Box::new(move |key| {
-                marker_for_scope.set(key.clone()).map_err(|_| error("ControlAdmission", "scope marker already installed"))
+                marker_for_scope
+                    .set(key.clone())
+                    .map_err(|_| error("ControlAdmission", "scope marker already installed"))
             })),
             callback: Box::new(move |lock, root, file, start, cleanup, dir, path| {
-                admit_resource(lock, root, file, start, cleanup, dir, path, &callback_control)
+                admit_resource(
+                    lock,
+                    root,
+                    file,
+                    start,
+                    cleanup,
+                    dir,
+                    path,
+                    &callback_control,
+                )
             }),
         };
         let original = v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?;
@@ -1005,33 +1065,74 @@ pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'stat
     }));
     let (arguments, original) = match admitted {
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => return match result_control.get() {
-            Some(control) => ControlledV3Result::Controlled { original_control: Arc::clone(control), scope_marker, outcome: ControlledV3Outcome::Returned(Err(RoventRetainingLaunchError::Ordinary(error))) },
-            None => ControlledV3Result::BeforeControl { outcome: BeforeControlV3Outcome::Error(error) },
-        },
-        Err(payload) => return match result_control.get() {
-            Some(control) => ControlledV3Result::Controlled { original_control: Arc::clone(control), scope_marker, outcome: ControlledV3Outcome::Panic(payload) },
-            None => ControlledV3Result::BeforeControl { outcome: BeforeControlV3Outcome::Panic(payload) },
-        },
+        Ok(Err(error)) => {
+            return match result_control.get() {
+                Some(control) => ControlledV3Result::Controlled {
+                    original_control: Arc::clone(control),
+                    scope_marker,
+                    outcome: ControlledV3Outcome::Returned(Err(
+                        RoventRetainingLaunchError::Ordinary(error),
+                    )),
+                },
+                None => ControlledV3Result::BeforeControl {
+                    outcome: BeforeControlV3Outcome::Error(error),
+                },
+            };
+        }
+        Err(payload) => {
+            return match result_control.get() {
+                Some(control) => ControlledV3Result::Controlled {
+                    original_control: Arc::clone(control),
+                    scope_marker,
+                    outcome: ControlledV3Outcome::Panic(payload),
+                },
+                None => ControlledV3Result::BeforeControl {
+                    outcome: BeforeControlV3Outcome::Panic(payload),
+                },
+            };
+        }
     };
     let Some(original_control) = result_control.get().map(Arc::clone) else {
-        return ControlledV3Result::BeforeControl { outcome: BeforeControlV3Outcome::Error(error("ControlAdmission", "control was not installed")) };
+        return ControlledV3Result::BeforeControl {
+            outcome: BeforeControlV3Outcome::Error(error(
+                "ControlAdmission",
+                "control was not installed",
+            )),
+        };
     };
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match v3::run_native_admitted(arguments, original) {
-            Ok(()) => Ok(()),
-            Err(v3::RoventV3LaunchFailure::Ordinary(error)) => Err(RoventRetainingLaunchError::Ordinary(error)),
-            Err(v3::RoventV3LaunchFailure::Unstarted { error, owner }) => Err(RoventRetainingLaunchError::Unstarted { error, owner }),
-            Err(v3::RoventV3LaunchFailure::Settled { error, owner }) => Err(RoventRetainingLaunchError::Settled { error, owner }),
-            Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => Err(RoventRetainingLaunchError::Quarantined { error, owner: RoventQuarantinedLaunchCustody { original: owner } }),
-        }
-    })).map_or_else(ControlledV3Outcome::Panic, ControlledV3Outcome::Returned);
-    ControlledV3Result::Controlled { original_control, scope_marker, outcome }
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || match v3::run_native_admitted(arguments, original) {
+                Ok(()) => Ok(()),
+                Err(v3::RoventV3LaunchFailure::Ordinary(error)) => {
+                    Err(RoventRetainingLaunchError::Ordinary(error))
+                }
+                Err(v3::RoventV3LaunchFailure::Unstarted { error, owner }) => {
+                    Err(RoventRetainingLaunchError::Unstarted { error, owner })
+                }
+                Err(v3::RoventV3LaunchFailure::Settled { error, owner }) => {
+                    Err(RoventRetainingLaunchError::Settled { error, owner })
+                }
+                Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => {
+                    Err(RoventRetainingLaunchError::Quarantined {
+                        error,
+                        owner: RoventQuarantinedLaunchCustody { original: owner },
+                    })
+                }
+            },
+        ))
+        .map_or_else(ControlledV3Outcome::Panic, ControlledV3Outcome::Returned);
+    ControlledV3Result::Controlled {
+        original_control,
+        scope_marker,
+        outcome,
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn run_with_v3_resource_admission_retaining_inner<'a>(
-    arguments: Vec<String>, resource: ResourceAdmissionV3<'a>,
+    arguments: Vec<String>,
+    resource: ResourceAdmissionV3<'a>,
 ) -> Result<(), RoventRetainingLaunchError> {
     if arguments == ["--build-capabilities-json"]
         || arguments == ["--build-system-runtime-capabilities-json"]
@@ -1043,24 +1144,35 @@ fn run_with_v3_resource_admission_retaining_inner<'a>(
     let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
         .map_err(|failure| error("Cwd", failure))?;
     let lock_file = root
-        .open_with(&arguments.input_lock, cap_std::fs::OpenOptions::new().read(true))
+        .open_with(
+            &arguments.input_lock,
+            cap_std::fs::OpenOptions::new().read(true),
+        )
         .map_err(|failure| error("InputLock", failure))?
         .into_std();
     let bytes = read_bounded(&lock_file, MAX_LOCK_BYTES)?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| error("InputLock", "UTF-8 input required"))?;
-    let lock = Arc::new(RoventInputLockV3::from_json(text)
-        .map_err(|failure| error("InputLock", failure))?);
-    match v3::run_native_with_resource_retaining(
-        arguments, lock, root, cwd, lock_file, resource,
-    ) {
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| error("InputLock", "UTF-8 input required"))?;
+    let lock = Arc::new(
+        RoventInputLockV3::from_json(text).map_err(|failure| error("InputLock", failure))?,
+    );
+    match v3::run_native_with_resource_retaining(arguments, lock, root, cwd, lock_file, resource) {
         Ok(()) => Ok(()),
-        Err(v3::RoventV3LaunchFailure::Ordinary(error)) => Err(RoventRetainingLaunchError::Ordinary(error)),
-        Err(v3::RoventV3LaunchFailure::Unstarted { error, owner }) => Err(RoventRetainingLaunchError::Unstarted { error, owner }),
-        Err(v3::RoventV3LaunchFailure::Settled { error, owner }) => Err(RoventRetainingLaunchError::Settled { error, owner }),
-        Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => Err(RoventRetainingLaunchError::Quarantined {
-            error, owner: RoventQuarantinedLaunchCustody { original: owner },
-        }),
+        Err(v3::RoventV3LaunchFailure::Ordinary(error)) => {
+            Err(RoventRetainingLaunchError::Ordinary(error))
+        }
+        Err(v3::RoventV3LaunchFailure::Unstarted { error, owner }) => {
+            Err(RoventRetainingLaunchError::Unstarted { error, owner })
+        }
+        Err(v3::RoventV3LaunchFailure::Settled { error, owner }) => {
+            Err(RoventRetainingLaunchError::Settled { error, owner })
+        }
+        Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => {
+            Err(RoventRetainingLaunchError::Quarantined {
+                error,
+                owner: RoventQuarantinedLaunchCustody { original: owner },
+            })
+        }
     }
 }
 
@@ -1069,8 +1181,20 @@ struct ResourceAdmissionV3<'a> {
     scope_pin: Option<Box<dyn std::any::Any + Send>>,
     is_installed: Option<Box<dyn Fn() -> bool + Send + 'a>>,
     #[cfg(target_os = "linux")]
-    scope_reserved: Option<Box<dyn FnOnce(&RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
-    callback: Box<dyn FnOnce(&Arc<RoventInputLockV3>, &Dir, &std::fs::File, std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>) -> Result<(), RoventLaunchError> + 'a>,
+    scope_reserved:
+        Option<Box<dyn FnOnce(&RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
+    callback: Box<
+        dyn FnOnce(
+                &Arc<RoventInputLockV3>,
+                &Dir,
+                &std::fs::File,
+                std::time::Instant,
+                std::time::Instant,
+                Option<&Dir>,
+                Option<&std::path::Path>,
+            ) -> Result<(), RoventLaunchError>
+            + 'a,
+    >,
 }
 
 /// The parser retains the actual version and never projects a /2 lock to /1.
@@ -1236,7 +1360,9 @@ fn run_inner<'a>(
                         Err(error)
                     }
                     Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => {
-                        *owner_slot = Some(RetainedV3Owner::Quarantined(RoventQuarantinedLaunchCustody { original: owner }));
+                        *owner_slot = Some(RetainedV3Owner::Quarantined(
+                            RoventQuarantinedLaunchCustody { original: owner },
+                        ));
                         Err(error)
                     }
                 };

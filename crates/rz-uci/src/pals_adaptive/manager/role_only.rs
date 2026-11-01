@@ -2541,13 +2541,16 @@ where
                 let mismatch = (requires && snapshot.is_none())
                     || (snapshot.is_none() && transferred.is_some())
                     || (!requires && snapshot.is_some())
-                    || snapshot.as_ref().zip(transferred.as_ref())
+                    || snapshot
+                        .as_ref()
+                        .zip(transferred.as_ref())
                         .is_some_and(|(snapshot, original)| snapshot != original)
-                    || snapshot.as_ref().is_some_and(|report|
-                    report.physical_shutdown_confirmed != physical_shutdown_confirmed
-                );
-                let failure = snapshot.as_ref().is_some_and(|report|
-                    report.physical_failure.is_some() || report.semantic_failure.is_some());
+                    || snapshot.as_ref().is_some_and(|report| {
+                        report.physical_shutdown_confirmed != physical_shutdown_confirmed
+                    });
+                let failure = snapshot.as_ref().is_some_and(|report| {
+                    report.physical_failure.is_some() || report.semantic_failure.is_some()
+                });
                 if mismatch || failure {
                     self.record_failure(AdaptiveManagerError::NativeShutdown {
                         event_physical_shutdown_confirmed: physical_shutdown_confirmed,

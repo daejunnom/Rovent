@@ -3952,12 +3952,20 @@ where
             last_authority,
             native_owner_joined: owners.native_joined,
             native_physical_shutdown_confirmed: owners.native_finished == Some(true),
-            native_session_release: if owners.native_joined && owners.native_finished == Some(true) {
+            native_session_release: if owners.native_joined && owners.native_finished == Some(true)
+            {
                 owners.native_session_release.or_else(|| {
-                    owners.native_finish_report.as_ref()
-                        .and_then(|report| super::NativeSessionReleaseObservation::from_report(report, true))
-                        .or_else(|| owners.native_finish_snapshot.as_ref()
-                            .and_then(|report| super::NativeSessionReleaseObservation::from_report(report, false)))
+                    owners
+                        .native_finish_report
+                        .as_ref()
+                        .and_then(|report| {
+                            super::NativeSessionReleaseObservation::from_report(report, true)
+                        })
+                        .or_else(|| {
+                            owners.native_finish_snapshot.as_ref().and_then(|report| {
+                                super::NativeSessionReleaseObservation::from_report(report, false)
+                            })
+                        })
                 })
             } else {
                 None
@@ -4624,15 +4632,23 @@ mod tests {
             physical_shutdown_confirmed: true,
             physical_failure: None,
             semantic_failure: None,
-            session_release: Some(rz_eval::worker::SessionReleased { completed_synchronous_runs: 0 }),
+            session_release: Some(rz_eval::worker::SessionReleased {
+                completed_synchronous_runs: 0,
+            }),
         };
         let original = NativeSessionReleaseObservation::from_report(&report, true).unwrap();
         let snapshot = NativeSessionReleaseObservation::from_report(&report, false).unwrap();
         assert_eq!(original.release().completed_synchronous_runs, 0);
-        assert_eq!(original.source(), NativeSessionReleaseSource::OriginalReport);
+        assert_eq!(
+            original.source(),
+            NativeSessionReleaseSource::OriginalReport
+        );
         assert_eq!(snapshot.source(), NativeSessionReleaseSource::Snapshot);
         report.session_release = None;
-        assert_eq!(NativeSessionReleaseObservation::from_report(&report, true), None);
+        assert_eq!(
+            NativeSessionReleaseObservation::from_report(&report, true),
+            None
+        );
     }
     #[test]
     fn process_receipt_requires_join_and_physical_finish_independently() {

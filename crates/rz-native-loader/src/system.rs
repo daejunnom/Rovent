@@ -7,7 +7,7 @@
 //! execution, numerical correctness, or safe completion. Those are separate
 //! checks by the backend owner.
 
-use super::{LoadError, LoadErrorKind, claim_native_mode, linux};
+use super::{claim_native_mode, linux, LoadError, LoadErrorKind};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -480,8 +480,12 @@ fn assess_preexisting_maps(
             if linux::is_nvidia_runtime(name) || name.starts_with("libonnxruntime") {
                 let identity = registered.iter().find(|identity| {
                     native_soname_family(name).is_some_and(|family| {
-                        identity.canonical_path.file_name().and_then(|part| part.to_str())
-                            .and_then(native_soname_family) == Some(family)
+                        identity
+                            .canonical_path
+                            .file_name()
+                            .and_then(|part| part.to_str())
+                            .and_then(native_soname_family)
+                            == Some(family)
                     })
                 });
                 if let Some(identity) = identity {
@@ -772,7 +776,10 @@ mod tests {
     fn unavailable_maps_are_unknown_without_masking_observed_conflicts() {
         let unreadable = error(LoadErrorKind::FileAccess, "maps unavailable");
         assert_eq!(assess_preexisting_maps(Err(unreadable), &[]).unwrap(), None);
-        assert_eq!(assess_preexisting_maps(Ok(Vec::new()), &[]).unwrap(), Some(vec![]));
+        assert_eq!(
+            assess_preexisting_maps(Ok(Vec::new()), &[]).unwrap(),
+            Some(vec![])
+        );
         let foreign = linux::MapEntry {
             dev_major: 0,
             dev_minor: 0,
@@ -801,10 +808,14 @@ mod tests {
             LoadErrorKind::ObservationUnavailable
         );
         let mut preexisting = observation(SystemMappingAvailability::Observed);
-        preexisting.preexisting_native_mappings.push("libcudart.so.12".into());
+        preexisting
+            .preexisting_native_mappings
+            .push("libcudart.so.12".into());
         assert!(assess_mapping_observation(preexisting.clone(), false).is_ok());
         assert_eq!(
-            assess_mapping_observation(preexisting, true).unwrap_err().kind,
+            assess_mapping_observation(preexisting, true)
+                .unwrap_err()
+                .kind,
             LoadErrorKind::ForeignMapping
         );
         let mut extra = observation(SystemMappingAvailability::Observed);
@@ -813,13 +824,14 @@ mod tests {
             .push("libcudnn_ops.so.9".into());
         assert!(assess_mapping_observation(extra.clone(), false).is_ok());
         assert_eq!(
-            assess_mapping_observation(extra, true)
-                .unwrap_err()
-                .kind,
+            assess_mapping_observation(extra, true).unwrap_err().kind,
             LoadErrorKind::ForeignMapping
         );
         assert_eq!(native_soname_family("libcudnn.so.9.2"), Some("libcudnn"));
-        assert_ne!(native_soname_family("libcudnn.so.9"), native_soname_family("libcudnn_ops.so.9"));
+        assert_ne!(
+            native_soname_family("libcudnn.so.9"),
+            native_soname_family("libcudnn_ops.so.9")
+        );
     }
 
     #[test]
@@ -849,7 +861,8 @@ mod tests {
         );
         assert_eq!(
             assess_preexisting_maps(Ok(vec![mapping(2)]), &[&identity])
-                .unwrap_err().kind,
+                .unwrap_err()
+                .kind,
             LoadErrorKind::MappingIdentity
         );
     }
@@ -865,14 +878,12 @@ mod tests {
             LoadErrorKind::ObservationUnavailable
         );
         assert!(state.failure.is_none());
-        assert!(
-            apply_observation(
-                &mut state,
-                Ok(observation(SystemMappingAvailability::Observed)),
-                false
-            )
-            .is_ok()
-        );
+        assert!(apply_observation(
+            &mut state,
+            Ok(observation(SystemMappingAvailability::Observed)),
+            false
+        )
+        .is_ok());
         let mut extra = observation(SystemMappingAvailability::Observed);
         extra
             .unregistered_native_mappings
@@ -888,13 +899,18 @@ mod tests {
         let conflict = error(LoadErrorKind::MappingIdentity, "conflicting library");
         assert_eq!(
             apply_observation(&mut state, Err(conflict), false)
-            .unwrap_err()
-            .kind,
+                .unwrap_err()
+                .kind,
             LoadErrorKind::MappingIdentity
         );
         assert_eq!(
-            apply_observation(&mut state, Ok(observation(SystemMappingAvailability::Observed)), false)
-                .unwrap_err().kind,
+            apply_observation(
+                &mut state,
+                Ok(observation(SystemMappingAvailability::Observed)),
+                false
+            )
+            .unwrap_err()
+            .kind,
             LoadErrorKind::MappingIdentity
         );
     }

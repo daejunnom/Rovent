@@ -22,7 +22,9 @@ use rz_runtime::contracts::{ContractClock, ContractSystemClock};
 use std::sync::{Arc, atomic::Ordering};
 
 mod v3;
-pub use v3::{InitialAdmissionOutcomeV3, PreparedSourceV3, RoventRootAdmissionV3, StoppedInitialV3};
+pub use v3::{
+    InitialAdmissionOutcomeV3, PreparedSourceV3, RoventRootAdmissionV3, StoppedInitialV3,
+};
 
 /// A reason observed from the original UCI owner at the live admission gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

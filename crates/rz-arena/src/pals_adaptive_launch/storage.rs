@@ -255,7 +255,10 @@ pub(crate) fn acquire_pals_owned_storage_lease<T>(
     let mut marker_components = Path::new(&marker_artifact.path).components();
     require(
         marker_artifact.bytes <= 4096
-            && matches!(marker_components.next(), Some(std::path::Component::Normal(_)))
+            && matches!(
+                marker_components.next(),
+                Some(std::path::Component::Normal(_))
+            )
             && marker_components.next().is_none(),
         "storage marker must be a bounded file directly inside the owned root",
     )?;
@@ -399,7 +402,11 @@ pub(super) fn acquire_pals_owned_storage_advisory(
 ) -> Result<(PalsOwnedStorageAdvisoryV1, PalsOwnedStorageLeaseV5), ArenaError> {
     plan.validate()?;
     acquire_pals_owned_storage_lease(
-        &plan.marker, &plan.owner_id, "rz-pals-owned-storage-v5/1", "staging_and_cache", root,
+        &plan.marker,
+        &plan.owner_id,
+        "rz-pals-owned-storage-v5/1",
+        "staging_and_cache",
+        root,
         |_directory| Ok(advisory_without_scan(plan)),
     )
 }

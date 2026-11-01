@@ -3,7 +3,7 @@
 
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::task::Poll;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -110,6 +110,13 @@ pub struct PhysicalRecoveryKey {
 pub struct PhysicalRecoveryReservation {
     key: PhysicalRecoveryKey,
     published: bool,
+    canceled: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalReservationCancelError {
+    Busy,
+    Poisoned,
+    NotUnpublishedOrOwnerMismatch,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PhysicalRecoveryObservation {
@@ -121,14 +128,24 @@ pub enum PhysicalRecoveryObservation {
 /// Opaque evidence produced by the original backend after successful
 /// synchronous work. It is not evidence for another owner or for recovery.
 #[derive(Clone, Debug)]
-pub struct SynchronousOwnerProof { owner: Arc<()>, completed_synchronous_runs: u64 }
+pub struct SynchronousOwnerProof {
+    owner: Arc<()>,
+    completed_synchronous_runs: u64,
+}
 impl SynchronousOwnerProof {
-    pub(crate) fn new(owner: Arc<()>, completed_synchronous_runs: u64) -> Self { Self { owner, completed_synchronous_runs } }
+    pub(crate) fn new(owner: Arc<()>, completed_synchronous_runs: u64) -> Self {
+        Self {
+            owner,
+            completed_synchronous_runs,
+        }
+    }
 }
 
 /// Native session release after a successful join; this is not a GPU fence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SessionReleased { pub completed_synchronous_runs: u64 }
+pub struct SessionReleased {
+    pub completed_synchronous_runs: u64,
+}
 
 enum ShutdownEvidence {
     Recovery(PhysicalRecoveryFence),
@@ -204,6 +221,7 @@ impl PhysicalRecoveryReservation {
             Self {
                 key: key.clone(),
                 published: false,
+                canceled: false,
             },
             key,
         ))
@@ -212,16 +230,40 @@ impl PhysicalRecoveryReservation {
     /// independently establish that native entry did not occur: this method
     /// proves neither native non-entry nor GPU completion.
     pub fn cancel_unpublished(self) -> Result<(), Self> {
-        let mut slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
+        self.try_cancel_unpublished().map_err(|(owner, _)| owner)
+    }
+    /// As above, with a typed nonblocking failure and the exact original owner.
+    /// Poison is not treated as authorization to alter registry state.
+    pub fn try_cancel_unpublished(mut self) -> Result<(), (Self, PhysicalReservationCancelError)> {
+        let mut slots = match recovery_slots().try_lock() {
+            Ok(slots) => slots,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err((self, PhysicalReservationCancelError::Busy))
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err((self, PhysicalReservationCancelError::Poisoned))
+            }
+        };
         let matches = !self.published
-            && slots.get(self.key.index).and_then(Option::as_ref).is_some_and(|slot| {
-                Arc::ptr_eq(&slot.identity, &self.key.identity) && slot.control.is_none()
-            });
+            && slots
+                .get(self.key.index)
+                .and_then(Option::as_ref)
+                .is_some_and(|slot| {
+                    Arc::ptr_eq(&slot.identity, &self.key.identity) && slot.control.is_none()
+                });
         if matches {
             slots[self.key.index] = None;
+            self.canceled = true;
         }
         drop(slots);
-        if matches { Ok(()) } else { Err(self) }
+        if matches {
+            Ok(())
+        } else {
+            Err((
+                self,
+                PhysicalReservationCancelError::NotUnpublishedOrOwnerMismatch,
+            ))
+        }
     }
     fn publish(&mut self, control: RecoveryControl) -> Result<(), RecoveryControl> {
         let mut slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
@@ -250,7 +292,7 @@ impl PhysicalRecoveryReservation {
 }
 impl Drop for PhysicalRecoveryReservation {
     fn drop(&mut self) {
-        if !self.published {
+        if !self.published && !self.canceled {
             let mut slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
             if slots
                 .get(self.key.index)
@@ -297,13 +339,16 @@ impl PhysicalRecoveryKey {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|last| {
-                Arc::ptr_eq(&last.request, &proof.request)
-                    && {
-                        #[cfg(feature = "contracts")]
-                        { last.work_scope == proof.work_scope }
-                        #[cfg(not(feature = "contracts"))]
-                        { true }
+                Arc::ptr_eq(&last.request, &proof.request) && {
+                    #[cfg(feature = "contracts")]
+                    {
+                        last.work_scope == proof.work_scope
                     }
+                    #[cfg(not(feature = "contracts"))]
+                    {
+                        true
+                    }
+                }
             });
         matches
     }
@@ -600,8 +645,13 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
     }
     /// Only available after same-owner destruction and successful worker join.
     pub fn session_release(&self) -> Option<SessionReleased> {
-        if !matches!(self.shutdown_result.as_ref(), Some(Ok(()))) { return None; }
-        *self.released_session.lock().unwrap_or_else(|e| e.into_inner())
+        if !matches!(self.shutdown_result.as_ref(), Some(Ok(()))) {
+            return None;
+        }
+        *self
+            .released_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
     /// Transfer the actual caller-owned state only after preserving a recovery
     /// slot for thread creation failure. The shared lock is used for this
@@ -621,7 +671,13 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
         F: FnMut(&mut T, &J) -> PhysicalRun<R> + Send + 'static,
         G: FnMut(&mut T, Instant) -> PhysicalRecoveryFence + Send + 'static,
     {
-        Self::spawn_with_retained_state_inner(original, reservation, None, run, move |owner, until| ShutdownEvidence::Recovery(shutdown_fence(owner, until)))
+        Self::spawn_with_retained_state_inner(
+            original,
+            reservation,
+            None,
+            run,
+            move |owner, until| ShutdownEvidence::Recovery(shutdown_fence(owner, until)),
+        )
     }
 
     /// Register the identity of the same original owner before moving it to
@@ -638,13 +694,26 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
         F: FnMut(&mut T, &J) -> PhysicalRun<R> + Send + 'static,
         G: FnMut(&mut T, Instant) -> Option<SynchronousOwnerProof> + Send + 'static,
     {
-        let owner_identity = original.as_ref().ok_or_else(|| BackendError::new(
-            K::InvalidInput, S::Admission, "missing original physical state",
-        ))?.synchronous_owner_identity();
-        Self::spawn_with_retained_state_inner(original, reservation, Some(owner_identity), run, move |owner, until| match shutdown_fence(owner, until) {
-            Some(proof) => ShutdownEvidence::Session(proof),
-            None => ShutdownEvidence::Recovery(PhysicalRecoveryFence::Unknown),
-        })
+        let owner_identity = original
+            .as_ref()
+            .ok_or_else(|| {
+                BackendError::new(
+                    K::InvalidInput,
+                    S::Admission,
+                    "missing original physical state",
+                )
+            })?
+            .synchronous_owner_identity();
+        Self::spawn_with_retained_state_inner(
+            original,
+            reservation,
+            Some(owner_identity),
+            run,
+            move |owner, until| match shutdown_fence(owner, until) {
+                Some(proof) => ShutdownEvidence::Session(proof),
+                None => ShutdownEvidence::Recovery(PhysicalRecoveryFence::Unknown),
+            },
+        )
     }
 
     fn spawn_with_retained_state_inner<T, F, G>(
@@ -989,7 +1058,11 @@ impl<J: Send + Sync + 'static, R: Send + 'static> SingleWorker<J, R> {
 
     /// A rejection guarantees this input was not handed to native execution.
     pub fn submit(&mut self, input: J) -> Result<PhysicalLease<J, R>, BackendError> {
-        self.submit_inner(input, #[cfg(feature = "contracts")] None)
+        self.submit_inner(
+            input,
+            #[cfg(feature = "contracts")]
+            None,
+        )
     }
 
     /// The original command is the only source of the work scope. The scope
@@ -1312,6 +1385,23 @@ mod tests {
         }
     }
 
+    fn cancel_after_transient_contention(
+        mut owner: PhysicalRecoveryReservation,
+    ) -> Result<(), (PhysicalRecoveryReservation, PhysicalReservationCancelError)> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match owner.try_cancel_unpublished() {
+                Err((returned, PhysicalReservationCancelError::Busy))
+                    if Instant::now() < deadline =>
+                {
+                    owner = returned;
+                    std::thread::yield_now();
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     fn unpublished_reservation_cancel_requires_original_empty_slot() {
         let (reservation, key) = PhysicalRecoveryReservation::reserve().expect("reserve");
@@ -1320,13 +1410,16 @@ mod tests {
             let slot = slots[key.index].as_mut().expect("registered");
             std::mem::replace(&mut slot.identity, Arc::new(()))
         };
-        let reservation = match reservation.cancel_unpublished() {
-            Err(owner) => owner,
+        let reservation = match cancel_after_transient_contention(reservation) {
+            Err((owner, PhysicalReservationCancelError::NotUnpublishedOrOwnerMismatch)) => owner,
+            Err((_, error)) => panic!("unexpected failure: {error:?}"),
             Ok(()) => panic!("different owner was removed"),
         };
         {
             let mut slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
-            let slot = slots[key.index].as_mut().expect("mismatched slot preserved");
+            let slot = slots[key.index]
+                .as_mut()
+                .expect("mismatched slot preserved");
             slot.identity = original_identity;
             let (sender, _receiver) = mpsc::sync_channel(1);
             slot.control = Some(RecoveryControl {
@@ -1337,8 +1430,9 @@ mod tests {
                 confirmation: Arc::new(Mutex::new(None)),
             });
         }
-        let mut reservation = match reservation.cancel_unpublished() {
-            Err(owner) => owner,
+        let mut reservation = match cancel_after_transient_contention(reservation) {
+            Err((owner, PhysicalReservationCancelError::NotUnpublishedOrOwnerMismatch)) => owner,
+            Err((_, error)) => panic!("unexpected failure: {error:?}"),
             Ok(()) => panic!("slot with control was removed"),
         };
         reservation.published = true;
@@ -1346,39 +1440,101 @@ mod tests {
             let mut slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
             slots[key.index].as_mut().expect("registered").control = None;
         }
-        let mut reservation = match reservation.cancel_unpublished() {
-            Err(owner) => owner,
+        let mut reservation = match cancel_after_transient_contention(reservation) {
+            Err((owner, PhysicalReservationCancelError::NotUnpublishedOrOwnerMismatch)) => owner,
+            Err((_, error)) => panic!("unexpected failure: {error:?}"),
             Ok(()) => panic!("published reservation was removed"),
         };
         reservation.published = false;
-        assert!(reservation.cancel_unpublished().is_ok());
+        assert!(cancel_after_transient_contention(reservation).is_ok());
         let slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!slots[key.index].as_ref().is_some_and(|slot| Arc::ptr_eq(&slot.identity, &key.identity)));
+        assert!(!slots[key.index]
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(&slot.identity, &key.identity)));
+    }
+
+    #[test]
+    fn unpublished_cancel_busy_preserves_original_until_retry() {
+        let (reservation, key) = PhysicalRecoveryReservation::reserve().expect("reserve");
+        let slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
+        let (reservation, error) = match reservation.try_cancel_unpublished() {
+            Err(failure) => failure,
+            Ok(()) => panic!("contended registry cannot be modified"),
+        };
+        assert_eq!(error, PhysicalReservationCancelError::Busy);
+        assert!(slots[key.index]
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(&slot.identity, &key.identity)));
+        drop(slots);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut owner = reservation;
+        loop {
+            match owner.try_cancel_unpublished() {
+                Ok(()) => break,
+                Err((returned, PhysicalReservationCancelError::Busy))
+                    if Instant::now() < deadline =>
+                {
+                    owner = returned;
+                    std::thread::yield_now();
+                }
+                Err((_, error)) => panic!("unexpected cancellation failure: {error:?}"),
+            }
+        }
     }
 
     #[cfg(feature = "contracts")]
     fn scoped_ticket() -> rz_contracts::pals_adaptive::RoleTicketEnvelope {
         use rz_contracts::pals::{RepresentationKey, Role, SearchAuthority};
         use rz_contracts::pals_adaptive::{ReviewViewSeal, RoleTicketEnvelope};
-        use rz_contracts::{ClockDomain, Deadline, Digest, GameGeneration, MonotonicTick,
-            OwnerId, PrecisionProfile, ProcessEpoch, RequestId, RootGeneration, StateIdentity,
-            StateRevision};
+        use rz_contracts::{
+            ClockDomain, Deadline, Digest, GameGeneration, MonotonicTick, OwnerId,
+            PrecisionProfile, ProcessEpoch, RequestId, RootGeneration, StateIdentity,
+            StateRevision,
+        };
         let epoch = ProcessEpoch(17);
-        let authority = SearchAuthority { epoch, game: GameGeneration(2), root: RootGeneration(3), implementation: Digest([1; 32]) };
+        let authority = SearchAuthority {
+            epoch,
+            game: GameGeneration(2),
+            root: RootGeneration(3),
+            implementation: Digest([1; 32]),
+        };
         let role = Role::Proposer;
         RoleTicketEnvelope {
-            id: RequestId::new(epoch, 4), authority, question: Digest([2; 32]),
+            id: RequestId::new(epoch, 4),
+            authority,
+            question: Digest([2; 32]),
             view: ReviewViewSeal {
-                authority, view_sequence: 1, context_policy: Digest([3; 32]), view_digest: Digest([4; 32]),
-                root_state: StateIdentity { owner: OwnerId(5), revision: StateRevision(6), semantic: Digest([7; 32]) },
-                actual_tokens: 0, selected_records: 0, anchors: 1, length_bucket: 8,
+                authority,
+                view_sequence: 1,
+                context_policy: Digest([3; 32]),
+                view_digest: Digest([4; 32]),
+                root_state: StateIdentity {
+                    owner: OwnerId(5),
+                    revision: StateRevision(6),
+                    semantic: Digest([7; 32]),
+                },
+                actual_tokens: 0,
+                selected_records: 0,
+                anchors: 1,
+                length_bucket: 8,
             },
             representation: RepresentationKey {
-                input: Digest([8; 32]), history: Digest([9; 32]), candidates: Digest([10; 32]),
-                mask_positions: Digest([11; 32]), model: Digest([12; 32]), encoding: Digest([13; 32]),
-                precision: PrecisionProfile::Fp32, frozen_epoch: 1, record_revision: 1, role,
+                input: Digest([8; 32]),
+                history: Digest([9; 32]),
+                candidates: Digest([10; 32]),
+                mask_positions: Digest([11; 32]),
+                model: Digest([12; 32]),
+                encoding: Digest([13; 32]),
+                precision: PrecisionProfile::Fp32,
+                frozen_epoch: 1,
+                record_revision: 1,
+                role,
             },
-            role, original_deadline: Deadline { clock: ClockDomain(epoch), at: MonotonicTick(1_000_000) },
+            role,
+            original_deadline: Deadline {
+                clock: ClockDomain(epoch),
+                at: MonotonicTick(1_000_000),
+            },
         }
     }
 
@@ -1388,7 +1544,9 @@ mod tests {
         use rz_contracts::{ExecutionId, ProcessEpoch, RootGeneration};
         struct ScopedCommand(PhysicalWorkScope);
         impl PhysicalScopedInput for ScopedCommand {
-            fn physical_work_scope(&self) -> Result<PhysicalWorkScope, BackendError> { Ok(self.0) }
+            fn physical_work_scope(&self) -> Result<PhysicalWorkScope, BackendError> {
+                Ok(self.0)
+            }
         }
         let ticket = scoped_ticket();
         let execution = ExecutionId::new(ticket.id.epoch, 9);
@@ -1396,54 +1554,122 @@ mod tests {
         let mut original = Some(());
         let (mut reservation, key) = PhysicalRecoveryReservation::reserve().unwrap();
         let mut worker = SingleWorker::<ScopedCommand, ()>::spawn_with_retained_state(
-            &mut original, &mut reservation,
-            |_, _| PhysicalRun::Quarantined(BackendError::new(K::BackendFailure, S::Backend, "fixture work unknown")),
+            &mut original,
+            &mut reservation,
+            |_, _| {
+                PhysicalRun::Quarantined(BackendError::new(
+                    K::BackendFailure,
+                    S::Backend,
+                    "fixture work unknown",
+                ))
+            },
             |_, _| PhysicalRecoveryFence::FixtureOwnerCompleted,
-        ).unwrap();
+        )
+        .unwrap();
         let mut invalid_ticket = ticket;
         invalid_ticket.id.epoch = ProcessEpoch(18);
-        assert!(worker.submit_scoped(ScopedCommand(PhysicalWorkScope::Ticket { ticket: invalid_ticket, execution })).is_err());
+        assert!(worker
+            .submit_scoped(ScopedCommand(PhysicalWorkScope::Ticket {
+                ticket: invalid_ticket,
+                execution
+            }))
+            .is_err());
         let mut lease = worker.submit_scoped(ScopedCommand(expected)).unwrap();
         assert_eq!(lease.work_scope(), Some(expected));
         wait_until(|| matches!(lease.poll(), PhysicalPoll::Quarantined));
-        let mut pending = key.begin_reobserve(Instant::now() + Duration::from_secs(2)).unwrap();
-        wait_until(|| matches!(pending.poll(), Poll::Ready(PhysicalRecoveryObservation::Confirmed)));
+        let mut pending = key
+            .begin_reobserve(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        wait_until(|| {
+            matches!(
+                pending.poll(),
+                Poll::Ready(PhysicalRecoveryObservation::Confirmed)
+            )
+        });
         let proof = key.latest_confirmation().expect("actual owner observation");
         assert_eq!(proof.work_scope(), Some(expected));
         assert!(key.confirms_work_scope(&proof, expected));
         let mut other_ticket = ticket;
         other_ticket.id.sequence += 1;
-        assert!(!key.confirms_work_scope(&proof, PhysicalWorkScope::Ticket { ticket: other_ticket, execution }));
-        assert!(!key.confirms_work_scope(&proof, PhysicalWorkScope::Ticket { ticket, execution: ExecutionId::new(ticket.id.epoch, 10) }));
+        assert!(!key.confirms_work_scope(
+            &proof,
+            PhysicalWorkScope::Ticket {
+                ticket: other_ticket,
+                execution
+            }
+        ));
+        assert!(!key.confirms_work_scope(
+            &proof,
+            PhysicalWorkScope::Ticket {
+                ticket,
+                execution: ExecutionId::new(ticket.id.epoch, 10)
+            }
+        ));
         let mut other_root = ticket;
         other_root.authority.root = RootGeneration(99);
         other_root.view.authority = other_root.authority;
-        assert!(!key.confirms_work_scope(&proof, PhysicalWorkScope::Ticket { ticket: other_root, execution }));
-        assert!(!key.confirms_work_scope(&proof, PhysicalWorkScope::Startup { epoch: ticket.id.epoch }));
-        let mut release = key.begin_release(&proof, Instant::now() + Duration::from_secs(2)).unwrap();
-        wait_until(|| matches!(release.poll(), Poll::Ready(PhysicalRecoveryObservation::Confirmed)));
+        assert!(!key.confirms_work_scope(
+            &proof,
+            PhysicalWorkScope::Ticket {
+                ticket: other_root,
+                execution
+            }
+        ));
+        assert!(!key.confirms_work_scope(
+            &proof,
+            PhysicalWorkScope::Startup {
+                epoch: ticket.id.epoch
+            }
+        ));
+        let mut release = key
+            .begin_release(&proof, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        wait_until(|| {
+            matches!(
+                release.poll(),
+                Poll::Ready(PhysicalRecoveryObservation::Confirmed)
+            )
+        });
         wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
     }
 
     #[test]
     fn synchronous_owner_proof_only_confirms_matching_normal_shutdown() {
-      for count in [0, 7] {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let owner = Arc::new(());
-        let mut original = Some(SyncTrackedState { _tracked: TrackedState(Arc::clone(&drops)), identity: Arc::clone(&owner) });
-        let (mut reservation, _) = PhysicalRecoveryReservation::reserve().unwrap();
-        let callback_owner = Arc::clone(&owner);
-        let mut worker = SingleWorker::<u8, u8>::spawn_with_retained_synchronous_owner(
-            &mut original, &mut reservation,
-            |_, input| PhysicalRun::Complete(*input),
-            move |_, _| Some(SynchronousOwnerProof::new(Arc::clone(&callback_owner), count)),
-        ).unwrap();
-        assert!(worker.session_release().is_none());
-        if count != 0 { let mut job = worker.submit(7).unwrap(); wait_until(|| matches!(job.poll(), PhysicalPoll::Ready(7))); }
-        wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
-        assert_eq!(worker.session_release(), Some(SessionReleased { completed_synchronous_runs: count }));
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-      }
+        for count in [0, 7] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let owner = Arc::new(());
+            let mut original = Some(SyncTrackedState {
+                _tracked: TrackedState(Arc::clone(&drops)),
+                identity: Arc::clone(&owner),
+            });
+            let (mut reservation, _) = PhysicalRecoveryReservation::reserve().unwrap();
+            let callback_owner = Arc::clone(&owner);
+            let mut worker = SingleWorker::<u8, u8>::spawn_with_retained_synchronous_owner(
+                &mut original,
+                &mut reservation,
+                |_, input| PhysicalRun::Complete(*input),
+                move |_, _| {
+                    Some(SynchronousOwnerProof::new(
+                        Arc::clone(&callback_owner),
+                        count,
+                    ))
+                },
+            )
+            .unwrap();
+            assert!(worker.session_release().is_none());
+            if count != 0 {
+                let mut job = worker.submit(7).unwrap();
+                wait_until(|| matches!(job.poll(), PhysicalPoll::Ready(7)));
+            }
+            wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
+            assert_eq!(
+                worker.session_release(),
+                Some(SessionReleased {
+                    completed_synchronous_runs: count
+                })
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
@@ -1451,22 +1677,45 @@ mod tests {
         for quarantined in [false, true] {
             let drops = Arc::new(AtomicUsize::new(0));
             let owner = Arc::new(());
-            let mut original = Some(SyncTrackedState { _tracked: TrackedState(Arc::clone(&drops)), identity: Arc::clone(&owner) });
+            let mut original = Some(SyncTrackedState {
+                _tracked: TrackedState(Arc::clone(&drops)),
+                identity: Arc::clone(&owner),
+            });
             let (mut reservation, key) = PhysicalRecoveryReservation::reserve().unwrap();
-            let callback_owner = if quarantined { Arc::clone(&owner) } else { Arc::new(()) };
+            let callback_owner = if quarantined {
+                Arc::clone(&owner)
+            } else {
+                Arc::new(())
+            };
             let fixture_release = Arc::new(AtomicBool::new(false));
             let callback_release = Arc::clone(&fixture_release);
             let mut worker = SingleWorker::<u8, u8>::spawn_with_retained_state_inner(
-                &mut original, &mut reservation, Some(owner),
-                move |_, input| if quarantined {
-                    PhysicalRun::Quarantined(BackendError::new(K::BackendFailure, S::Backend, "fixture"))
-                } else { PhysicalRun::Complete(*input) },
-                move |_, _| if callback_release.load(Ordering::Acquire) {
-                    ShutdownEvidence::Recovery(PhysicalRecoveryFence::FixtureOwnerCompleted)
-                } else {
-                    ShutdownEvidence::Session(SynchronousOwnerProof::new(Arc::clone(&callback_owner), 1))
+                &mut original,
+                &mut reservation,
+                Some(owner),
+                move |_, input| {
+                    if quarantined {
+                        PhysicalRun::Quarantined(BackendError::new(
+                            K::BackendFailure,
+                            S::Backend,
+                            "fixture",
+                        ))
+                    } else {
+                        PhysicalRun::Complete(*input)
+                    }
                 },
-            ).unwrap();
+                move |_, _| {
+                    if callback_release.load(Ordering::Acquire) {
+                        ShutdownEvidence::Recovery(PhysicalRecoveryFence::FixtureOwnerCompleted)
+                    } else {
+                        ShutdownEvidence::Session(SynchronousOwnerProof::new(
+                            Arc::clone(&callback_owner),
+                            1,
+                        ))
+                    }
+                },
+            )
+            .unwrap();
             let mut job = worker.submit(7).unwrap();
             if quarantined {
                 wait_until(|| matches!(job.poll(), PhysicalPoll::Quarantined));
@@ -1476,18 +1725,39 @@ mod tests {
             wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Err(_))));
             assert!(worker.session_release().is_none());
             assert_eq!(drops.load(Ordering::SeqCst), 0);
-            let mut observation = key.begin_reobserve(Instant::now() + Duration::from_secs(2)).unwrap();
-            wait_until(|| matches!(observation.poll(), Poll::Ready(PhysicalRecoveryObservation::Unknown)));
+            let mut observation = key
+                .begin_reobserve(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            wait_until(|| {
+                matches!(
+                    observation.poll(),
+                    Poll::Ready(PhysicalRecoveryObservation::Unknown)
+                )
+            });
             assert!(key.latest_confirmation().is_none());
             assert_eq!(drops.load(Ordering::SeqCst), 0);
             // The positive fixture is test-only; release this exact owner so the
             // test does not leave a worker or recovery slot running.
             fixture_release.store(true, Ordering::Release);
-            let mut observation = key.begin_reobserve(Instant::now() + Duration::from_secs(2)).unwrap();
-            wait_until(|| matches!(observation.poll(), Poll::Ready(PhysicalRecoveryObservation::Confirmed)));
+            let mut observation = key
+                .begin_reobserve(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            wait_until(|| {
+                matches!(
+                    observation.poll(),
+                    Poll::Ready(PhysicalRecoveryObservation::Confirmed)
+                )
+            });
             let proof = key.latest_confirmation().expect("fixture confirmation");
-            let mut release = key.begin_release(&proof, Instant::now() + Duration::from_secs(2)).unwrap();
-            wait_until(|| matches!(release.poll(), Poll::Ready(PhysicalRecoveryObservation::Confirmed)));
+            let mut release = key
+                .begin_release(&proof, Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            wait_until(|| {
+                matches!(
+                    release.poll(),
+                    Poll::Ready(PhysicalRecoveryObservation::Confirmed)
+                )
+            });
             wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
             assert!(worker.session_release().is_none());
             assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -1496,10 +1766,16 @@ mod tests {
 
     #[test]
     fn synchronous_session_release_waits_for_drop_and_join() {
-        struct BlockingDrop { identity: Arc<()>, entered: mpsc::SyncSender<()>, resume: mpsc::Receiver<()> }
+        struct BlockingDrop {
+            identity: Arc<()>,
+            entered: mpsc::SyncSender<()>,
+            resume: mpsc::Receiver<()>,
+        }
         impl synchronous_owner_sealed::Sealed for BlockingDrop {}
         impl SynchronousPhysicalOwner for BlockingDrop {
-            fn synchronous_owner_identity(&self) -> Arc<()> { Arc::clone(&self.identity) }
+            fn synchronous_owner_identity(&self) -> Arc<()> {
+                Arc::clone(&self.identity)
+            }
         }
         impl Drop for BlockingDrop {
             fn drop(&mut self) {
@@ -1510,19 +1786,31 @@ mod tests {
         let identity = Arc::new(());
         let (entered, entered_rx) = mpsc::sync_channel(1);
         let (resume, resume_rx) = mpsc::sync_channel(1);
-        let mut original = Some(BlockingDrop { identity: Arc::clone(&identity), entered, resume: resume_rx });
+        let mut original = Some(BlockingDrop {
+            identity: Arc::clone(&identity),
+            entered,
+            resume: resume_rx,
+        });
         let (mut reservation, _) = PhysicalRecoveryReservation::reserve().unwrap();
-        let mut worker = SingleWorker::<u8,u8>::spawn_with_retained_synchronous_owner(
-            &mut original, &mut reservation, |_, input| PhysicalRun::Complete(*input),
+        let mut worker = SingleWorker::<u8, u8>::spawn_with_retained_synchronous_owner(
+            &mut original,
+            &mut reservation,
+            |_, input| PhysicalRun::Complete(*input),
             move |_, _| Some(SynchronousOwnerProof::new(Arc::clone(&identity), 0)),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(worker.try_shutdown(), Poll::Pending));
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(worker.session_release().is_none());
         assert!(matches!(worker.try_shutdown(), Poll::Pending));
         resume.send(()).unwrap();
         wait_until(|| matches!(worker.try_shutdown(), Poll::Ready(Ok(()))));
-        assert_eq!(worker.session_release(), Some(SessionReleased { completed_synchronous_runs: 0 }));
+        assert_eq!(
+            worker.session_release(),
+            Some(SessionReleased {
+                completed_synchronous_runs: 0
+            })
+        );
     }
 
     #[test]
@@ -1530,25 +1818,43 @@ mod tests {
         struct PanicDrop(Arc<()>);
         impl synchronous_owner_sealed::Sealed for PanicDrop {}
         impl SynchronousPhysicalOwner for PanicDrop {
-            fn synchronous_owner_identity(&self) -> Arc<()> { Arc::clone(&self.0) }
+            fn synchronous_owner_identity(&self) -> Arc<()> {
+                Arc::clone(&self.0)
+            }
         }
-        impl Drop for PanicDrop { fn drop(&mut self) { panic!("fixture drop failure"); } }
+        impl Drop for PanicDrop {
+            fn drop(&mut self) {
+                panic!("fixture drop failure");
+            }
+        }
         let identity = Arc::new(());
         let mut original = Some(PanicDrop(Arc::clone(&identity)));
         let (mut reservation, key) = PhysicalRecoveryReservation::reserve().unwrap();
-        let mut worker = SingleWorker::<u8,u8>::spawn_with_retained_synchronous_owner(
-            &mut original, &mut reservation, |_, input| PhysicalRun::Complete(*input),
+        let mut worker = SingleWorker::<u8, u8>::spawn_with_retained_synchronous_owner(
+            &mut original,
+            &mut reservation,
+            |_, input| PhysicalRun::Complete(*input),
             move |_, _| Some(SynchronousOwnerProof::new(Arc::clone(&identity), 0)),
-        ).unwrap();
+        )
+        .unwrap();
         let _ = worker.try_shutdown();
-        wait_until(|| worker.physical_handle.lock().unwrap().as_ref().is_some_and(JoinHandle::is_finished));
+        wait_until(|| {
+            worker
+                .physical_handle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+        });
         assert!(worker.session_release().is_none());
         // Test-only cleanup: this fixture owns no native data and the exact
         // original worker has terminated; join and free its matching slot.
         let handle = worker.physical_handle.lock().unwrap().take().unwrap();
         assert!(handle.join().is_err());
         let mut slots = recovery_slots().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(slots[key.index].as_ref().is_some_and(|slot| Arc::ptr_eq(&slot.identity, &key.identity)));
+        assert!(slots[key.index]
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(&slot.identity, &key.identity)));
         slots[key.index] = None;
     }
 
@@ -1638,10 +1944,9 @@ mod tests {
             )
         });
         assert!(key.latest_confirmation().is_none());
-        assert!(
-            key.begin_release(&old_proof, Instant::now() + Duration::from_secs(2))
-                .is_err()
-        );
+        assert!(key
+            .begin_release(&old_proof, Instant::now() + Duration::from_secs(2))
+            .is_err());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         fence.store(true, Ordering::Release);
         let mut observation = key

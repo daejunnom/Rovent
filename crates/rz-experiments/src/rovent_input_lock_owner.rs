@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use crate::{
-    ArtifactRef, ManifestError, RoventCoordinatorView, RoventEngineDeclaration,
-    RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventPurpose, RoventResourcePlan,
+    ArtifactRef, ManifestError, RoventCoordinatorView, RoventEngineDeclaration, RoventInputLock,
+    RoventInputLockV2, RoventInputLockV3, RoventPurpose, RoventResourcePlan,
 };
 
 #[derive(Clone, Debug)]

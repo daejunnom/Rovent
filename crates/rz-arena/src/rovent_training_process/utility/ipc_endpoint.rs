@@ -202,13 +202,22 @@ impl OwnedUtilityEndpoint {
             return Err(invalid("original endpoint was not bound"));
         }
         self.check_directory()?;
-        let identity = self.identity.ok_or_else(|| invalid("original bound identity unknown"))?;
-        let inode = self.inode.as_ref().ok_or_else(|| invalid("original bound endpoint FD missing"))?;
+        let identity = self
+            .identity
+            .ok_or_else(|| invalid("original bound identity unknown"))?;
+        let inode = self
+            .inode
+            .as_ref()
+            .ok_or_else(|| invalid("original bound endpoint FD missing"))?;
         if EndpointIdentity::read(
             fstat(inode).map_err(|_| invalid("held endpoint metadata unknown"))?,
             self.directory_identity.uid,
-        )? != identity || self.named_identity()? != identity {
-            return Err(invalid("original endpoint identity changed or is unavailable"));
+        )? != identity
+            || self.named_identity()? != identity
+        {
+            return Err(invalid(
+                "original endpoint identity changed or is unavailable",
+            ));
         }
         Ok(())
     }
@@ -217,8 +226,21 @@ impl OwnedUtilityEndpoint {
     /// FD. The pathname grants no authority: callers must authenticate the
     /// peer, and an unavailable procfs route is not completion evidence.
     pub(crate) fn owner_process_socket_path(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), self.directory.as_raw_fd()))
-            .join(&self.name)
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.directory.as_raw_fd()
+        ))
+        .join(&self.name)
+    }
+
+    /// Duplicate the original held directory only for evidence publication.
+    /// A failed clone does not affect native work or prove owner completion.
+    pub(crate) fn clone_original_directory(&self) -> Result<cap_std::fs::Dir, ArenaError> {
+        self.directory
+            .try_clone()
+            .map(cap_std::fs::Dir::from_std_file)
+            .map_err(|_| invalid("original evidence directory clone unavailable"))
     }
     pub(crate) fn bind(&mut self) -> Result<UtilityListener, ArenaError> {
         if self.attempted || self.cleanup != Cleanup::Armed {
@@ -349,7 +371,9 @@ impl OwnedUtilityEndpoint {
         }
         if Instant::now() >= until {
             self.cleanup = Cleanup::Preserved;
-            return Err(invalid("post-session endpoint cleanup window expired; retained"));
+            return Err(invalid(
+                "post-session endpoint cleanup window expired; retained",
+            ));
         }
         self.until = until;
         self.cleanup()
@@ -447,15 +471,24 @@ mod tests {
         let (mut endpoint, listener) = root.bind();
         drop(listener);
         endpoint.until = Instant::now() - std::time::Duration::from_secs(1);
-        endpoint.cleanup_after_session(Instant::now() + std::time::Duration::from_secs(1)).unwrap();
+        endpoint
+            .cleanup_after_session(Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap();
         assert!(!root.path().exists());
 
         let (mut failed, listener) = root.bind();
         drop(listener);
         failed.until = Instant::now() - std::time::Duration::from_secs(1);
         assert!(failed.cleanup().is_err());
-        assert!(failed.cleanup_after_session(Instant::now() + std::time::Duration::from_secs(1)).is_err());
-        assert!(root.path().exists(), "failed original owner must remain preserved");
+        assert!(
+            failed
+                .cleanup_after_session(Instant::now() + std::time::Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            root.path().exists(),
+            "failed original owner must remain preserved"
+        );
     }
     #[test]
     fn expired_post_session_window_does_not_retry_on_drop() {
@@ -464,7 +497,10 @@ mod tests {
         drop(listener);
         assert!(endpoint.cleanup_after_session(Instant::now()).is_err());
         drop(endpoint);
-        assert!(root.path().exists(), "expired cleanup keeps the original endpoint");
+        assert!(
+            root.path().exists(),
+            "expired cleanup keeps the original endpoint"
+        );
     }
     #[test]
     fn startup_failure_after_bind_drops_listener_before_endpoint_guard() {

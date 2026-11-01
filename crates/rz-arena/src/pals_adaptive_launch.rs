@@ -483,11 +483,13 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV5 {
         self.execution_sha256.as_deref().unwrap_or(&self.sha256)
     }
     fn preparation_policy_envelope(&self) -> Option<crate::NativePreparationPolicyEnvelope> {
-        self.execution_sha256.as_ref().map(|execution_sha256| crate::NativePreparationPolicyEnvelope {
-            domain: "rz-pals-preparation-storage-advisory-v1/1".into(),
-            policy: "advisory".into(),
-            base_launch_sha256: self.sha256.clone(),
-            execution_sha256: execution_sha256.clone(),
+        self.execution_sha256.as_ref().map(|execution_sha256| {
+            crate::NativePreparationPolicyEnvelope {
+                domain: "rz-pals-preparation-storage-advisory-v1/1".into(),
+                policy: "advisory".into(),
+                base_launch_sha256: self.sha256.clone(),
+                execution_sha256: execution_sha256.clone(),
+            }
         })
     }
     fn view(&self) -> NativePairView<'_> {
@@ -618,24 +620,41 @@ pub fn prepare_pals_pair_launch_v5(
     output_root: &Path,
     attempt: &str,
 ) -> Result<NativeLaunchOwner<LockedPalsArenaLaunchV5>, Box<crate::NativePreparationFailure>> {
-    prepare_pals_pair_launch_with_storage_policy(lock, source_root, output_root, attempt, PalsOwnedStoragePolicy::StrictV5)
+    prepare_pals_pair_launch_with_storage_policy(
+        lock,
+        source_root,
+        output_root,
+        attempt,
+        PalsOwnedStoragePolicy::StrictV5,
+    )
 }
 
-fn execution_identity(lock: &LockedPalsArenaLaunchV5, policy: PalsOwnedStoragePolicy) -> Option<String> {
+fn execution_identity(
+    lock: &LockedPalsArenaLaunchV5,
+    policy: PalsOwnedStoragePolicy,
+) -> Option<String> {
     match policy {
         PalsOwnedStoragePolicy::StrictV5 => None,
-        PalsOwnedStoragePolicy::AdvisoryV1 => Some(format!("{:x}", Sha256::digest(
-            format!("rz-pals-storage-policy-advisory-v1/1:{}", lock.sha256).as_bytes()
-        ))),
+        PalsOwnedStoragePolicy::AdvisoryV1 => Some(format!(
+            "{:x}",
+            Sha256::digest(
+                format!("rz-pals-storage-policy-advisory-v1/1:{}", lock.sha256).as_bytes()
+            )
+        )),
     }
 }
 
-fn preparation_policy_envelope(lock: &LockedPalsArenaLaunchV5, policy: PalsOwnedStoragePolicy) -> Option<crate::NativePreparationPolicyEnvelope> {
-    execution_identity(lock, policy).map(|execution_sha256| crate::NativePreparationPolicyEnvelope {
-        domain: "rz-pals-preparation-storage-advisory-v1/1".into(),
-        policy: "advisory".into(),
-        base_launch_sha256: lock.sha256.clone(),
-        execution_sha256,
+fn preparation_policy_envelope(
+    lock: &LockedPalsArenaLaunchV5,
+    policy: PalsOwnedStoragePolicy,
+) -> Option<crate::NativePreparationPolicyEnvelope> {
+    execution_identity(lock, policy).map(|execution_sha256| {
+        crate::NativePreparationPolicyEnvelope {
+            domain: "rz-pals-preparation-storage-advisory-v1/1".into(),
+            policy: "advisory".into(),
+            base_launch_sha256: lock.sha256.clone(),
+            execution_sha256,
+        }
     })
 }
 
@@ -650,14 +669,21 @@ pub fn prepare_pals_pair_launch_with_storage_policy(
     // Storage preflight has a separate API so failure cannot fabricate a child.
     let admission = match policy {
         PalsOwnedStoragePolicy::StrictV5 => acquire_pals_owned_storage_v5(
-            &lock.input.storage, output_root, lock.input.budget.max_artifact_bytes,
-        ).map(|(audit, lease)| (storage::PalsStorageAdmission::Strict(audit), lease)),
+            &lock.input.storage,
+            output_root,
+            lock.input.budget.max_artifact_bytes,
+        )
+        .map(|(audit, lease)| (storage::PalsStorageAdmission::Strict(audit), lease)),
         PalsOwnedStoragePolicy::AdvisoryV1 => {
             #[cfg(target_os = "linux")]
-            { storage::acquire_pals_owned_storage_advisory(&lock.input.storage, output_root)
-                .map(|(audit, lease)| (storage::PalsStorageAdmission::Advisory(audit), lease)) }
+            {
+                storage::acquire_pals_owned_storage_advisory(&lock.input.storage, output_root)
+                    .map(|(audit, lease)| (storage::PalsStorageAdmission::Advisory(audit), lease))
+            }
             #[cfg(not(target_os = "linux"))]
-            { Err(invalid("advisory paired native ownership requires Linux")) }
+            {
+                Err(invalid("advisory paired native ownership requires Linux"))
+            }
         }
     };
     let (storage, lease) = match admission {
@@ -698,7 +724,14 @@ pub fn prepare_pals_pair_launch_after_closed_v5(
     output_root: &Path,
     attempt: &str,
 ) -> Result<NativeLaunchOwner<LockedPalsArenaLaunchV5>, Box<crate::NativePreparationFailure>> {
-    prepare_pals_pair_launch_after_closed_with_storage_policy(lock, previous, source_root, output_root, attempt, PalsOwnedStoragePolicy::StrictV5)
+    prepare_pals_pair_launch_after_closed_with_storage_policy(
+        lock,
+        previous,
+        source_root,
+        output_root,
+        attempt,
+        PalsOwnedStoragePolicy::StrictV5,
+    )
 }
 
 pub fn prepare_pals_pair_launch_after_closed_with_storage_policy(
@@ -725,11 +758,21 @@ pub fn prepare_pals_pair_launch_after_closed_with_storage_policy(
             .ok_or_else(|| invalid("closed original pair lacks a live owned storage guard"))?
             .clone();
         let audit = match policy {
-            PalsOwnedStoragePolicy::StrictV5 => storage::PalsStorageAdmission::Strict(
-                storage::readmit_pals_owned_storage_v5(&lock.input.storage, output_root,
-                    lock.input.budget.max_artifact_bytes, &guard)?),
+            PalsOwnedStoragePolicy::StrictV5 => {
+                storage::PalsStorageAdmission::Strict(storage::readmit_pals_owned_storage_v5(
+                    &lock.input.storage,
+                    output_root,
+                    lock.input.budget.max_artifact_bytes,
+                    &guard,
+                )?)
+            }
             PalsOwnedStoragePolicy::AdvisoryV1 => storage::PalsStorageAdmission::Advisory(
-                storage::readmit_pals_owned_storage_advisory(&lock.input.storage, output_root, &guard)?),
+                storage::readmit_pals_owned_storage_advisory(
+                    &lock.input.storage,
+                    output_root,
+                    &guard,
+                )?,
+            ),
         };
         Ok::<_, ArenaError>((audit, guard))
     })();
@@ -774,7 +817,8 @@ pub fn run_pals_pair_v5(
 ) -> Result<crate::NativePairOutput<LockedPalsArenaLaunchV5>, Box<PalsAdaptivePairFailureV5>> {
     if owner.spec.storage_policy != PalsOwnedStoragePolicy::StrictV5 {
         return Err(Box::new(PalsAdaptivePairFailureV5::Admission {
-            cause: invalid("V5 pair entry requires strict storage policy"), owner,
+            cause: invalid("V5 pair entry requires strict storage policy"),
+            owner,
         }));
     }
     run_pals_pair_with_storage_policy(owner, cancel)
@@ -795,7 +839,9 @@ pub fn run_pals_pair_with_storage_policy(
     let clock = owner.spec.timing.clone();
     let admission = match owner.spec.storage_policy {
         PalsOwnedStoragePolicy::StrictV5 => validate_prepared_pals_launch_v5(&owner).map(|_| ()),
-        PalsOwnedStoragePolicy::AdvisoryV1 => evidence::validate_prepared_pals_launch_advisory(&owner),
+        PalsOwnedStoragePolicy::AdvisoryV1 => {
+            evidence::validate_prepared_pals_launch_advisory(&owner)
+        }
     };
     if let Err(cause) = admission {
         normalized_receipt::finish_pals_run_timing_v5(&clock);

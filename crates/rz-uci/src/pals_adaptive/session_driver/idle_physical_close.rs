@@ -55,19 +55,20 @@ where
             let requires = owners.native.requires_finish_report();
             let snapshot = owners.native_finish_snapshot.as_ref();
             let transferred = owners.native_finish_report.as_ref();
-            let mismatch = owners.native_finished.is_some() && (
-                (requires && snapshot.is_none())
-                || (snapshot.is_none() && transferred.is_some())
-                || (!requires && snapshot.is_some())
-                || snapshot.zip(transferred).is_some_and(|(s, t)| s != t)
-                || snapshot.is_some_and(|report|
-                    owners.native_finished != Some(report.physical_shutdown_confirmed))
-            );
+            let mismatch = owners.native_finished.is_some()
+                && ((requires && snapshot.is_none())
+                    || (snapshot.is_none() && transferred.is_some())
+                    || (!requires && snapshot.is_some())
+                    || snapshot.zip(transferred).is_some_and(|(s, t)| s != t)
+                    || snapshot.is_some_and(|report| {
+                        owners.native_finished != Some(report.physical_shutdown_confirmed)
+                    }));
             if mismatch {
                 return Err(SearchSessionFailure::debug(
                     "NativeShutdownMismatch",
                     &(owners.native_finished, snapshot, transferred),
-                ).unknown_if_unclosed());
+                )
+                .unknown_if_unclosed());
             }
             if !owners.native_joined {
                 owners.native_joined = owners
@@ -133,7 +134,10 @@ where
             }
             if Instant::now() >= until || owners.native_finished == Some(false) {
                 return Err(match &owners.native_finish_snapshot {
-                    Some(report) if report.physical_failure.is_some() || report.semantic_failure.is_some() => {
+                    Some(report)
+                        if report.physical_failure.is_some()
+                            || report.semantic_failure.is_some() =>
+                    {
                         SearchSessionFailure::debug("NativeShutdown", report).unknown_if_unclosed()
                     }
                     _ => SearchSessionFailure::physical_completion_unknown(),

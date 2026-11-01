@@ -6,26 +6,26 @@
 //! logical cancellation or deadline rejection.
 
 use crate::asset::{
-    self, AssetMetadata, AssetProfile, INPUT_NAME, MLH_NAME, MaiaAsset, POLICY_NAME, WDL_NAME,
+    self, AssetMetadata, AssetProfile, MaiaAsset, INPUT_NAME, MLH_NAME, POLICY_NAME, WDL_NAME,
 };
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::runtime_pin::RuntimeLibraryPin;
-use crate::{RawOutput, output};
+use crate::{output, RawOutput};
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
-use rz_encoding::POLICY_SIZE;
 use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
+use rz_encoding::POLICY_SIZE;
 #[cfg(target_os = "linux")]
 pub use rz_native_loader::system::{
     SystemCaptureLimits, SystemLibraryRequest, SystemMappingAvailability, SystemRuntime,
 };
 use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
 pub use rz_native_loader::{
-    NVIDIA_LOAD_ORDER, NativeLoadingProfile, NativeMappingObservation, ORT_LIBRARY_NAMES,
+    NativeLoadingProfile, NativeMappingObservation, NVIDIA_LOAD_ORDER, ORT_LIBRARY_NAMES,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -500,7 +500,10 @@ impl OrtRuntime {
                 // A build commit is an observation, not a compatibility gate.
                 let observation = runtime.observe_mappings().map_err(loader_error)?;
                 if observation.availability == SystemMappingAvailability::Observed
-                    && !observation.mapped_roles.iter().any(|role| role == "ort-core")
+                    && !observation
+                        .mapped_roles
+                        .iter()
+                        .any(|role| role == "ort-core")
                 {
                     return Err(BackendError::new(
                         K::IdentityMismatch,
@@ -772,11 +775,11 @@ fn classify_system_mapping(
     include_runtime: bool,
 ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
     if observation.availability == SystemMappingAvailability::Observed
-            && (!observation
-                .mapped_roles
-                .iter()
-                .any(|role| role == "ort-core")
-                || (include_runtime && !observation.missing_required_roles.is_empty()))
+        && (!observation
+            .mapped_roles
+            .iter()
+            .any(|role| role == "ort-core")
+            || (include_runtime && !observation.missing_required_roles.is_empty()))
     {
         return Err(BackendError::new(
             K::IdentityMismatch,
@@ -873,7 +876,10 @@ mod native_loading_profile_tests {
         let result = with_system_ort_entry(
             None,
             || entered.set(true),
-            |_| { called.set(true); Ok(()) },
+            |_| {
+                called.set(true);
+                Ok(())
+            },
         );
         assert_eq!(result.unwrap_err().kind, K::BackendUnavailable);
         assert!(!entered.get());
@@ -887,8 +893,12 @@ mod native_loading_profile_tests {
         let output = with_system_ort_entry(
             Some("/not-opened-in-this-test"),
             || entered.set(true),
-            |path| { assert!(entered.get()); Ok(path.len()) },
-        ).unwrap();
+            |path| {
+                assert!(entered.get());
+                Ok(path.len())
+            },
+        )
+        .unwrap();
         assert_eq!(output, "/not-opened-in-this-test".len());
     }
 
@@ -900,7 +910,10 @@ mod native_loading_profile_tests {
             let _ = with_system_ort_entry(
                 Some("/not-opened-in-this-test"),
                 || panic!("owner hook failure"),
-                |_| { called.set(true); Ok(()) },
+                |_| {
+                    called.set(true);
+                    Ok(())
+                },
             );
         }));
         assert!(panic.is_err());

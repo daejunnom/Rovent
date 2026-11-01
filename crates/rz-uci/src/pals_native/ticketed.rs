@@ -5,17 +5,20 @@
 #[cfg(feature = "onnx-cpu")]
 #[path = "ticketed/native_bridge.rs"]
 mod native_bridge;
-#[path = "ticketed/service.rs"]
-mod service;
 #[path = "ticketed/recovery.rs"]
 mod recovery;
+#[path = "ticketed/service.rs"]
+mod service;
 #[cfg(feature = "onnx-cpu")]
 #[path = "ticketed/virtual_bridge.rs"]
 mod virtual_bridge;
 #[cfg(feature = "onnx-cpu")]
 pub use native_bridge::*;
+pub use recovery::{
+    TicketNativeRecoveryKey, TicketNativeRecoveryReservation, TicketRecoveryConfirmation,
+    TicketRecoveryError, TicketRecoveryStatus, TicketUndeliveredEvent,
+};
 pub use service::*;
-pub use recovery::{TicketNativeRecoveryKey, TicketNativeRecoveryReservation, TicketRecoveryConfirmation, TicketRecoveryError, TicketRecoveryStatus, TicketUndeliveredEvent};
 #[cfg(feature = "onnx-cpu")]
 pub use virtual_bridge::*;
 

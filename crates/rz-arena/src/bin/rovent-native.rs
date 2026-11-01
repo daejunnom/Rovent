@@ -2,9 +2,9 @@
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 fn main() -> std::process::ExitCode {
     use rz_arena::rovent_resource_scope::launch::{
-        ROVENT_RESOURCE_USAGE, RoventNativeResourceCli, parse_native_resource_cli,
-        run_native_with_resources, run_native_with_resources_v3,
-        run_native_with_resources_v3_control, RoventControlledRunFailure,
+        ROVENT_RESOURCE_USAGE, RoventControlledRunFailure, RoventNativeResourceCli,
+        parse_native_resource_cli, run_native_with_resources, run_native_with_resources_v3,
+        run_native_with_resources_v3_control,
     };
     use std::io::Write;
     let result = match parse_native_resource_cli(std::env::args().skip(1).collect()) {
@@ -32,7 +32,11 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
-        Ok(RoventNativeResourceCli::RunSystemV3 { pin, arguments, custody_control }) => {
+        Ok(RoventNativeResourceCli::RunSystemV3 {
+            pin,
+            arguments,
+            custody_control,
+        }) => {
             if custody_control {
                 match run_native_with_resources_v3_control(pin, arguments) {
                     Ok(receipt) => writeln!(std::io::stderr().lock(), "{}", receipt.observation())

@@ -5,7 +5,9 @@
 //! The actual owners must independently verify executable bytes, peer and
 //! device observations, and retain the original runtime and IPC capabilities.
 
-use crate::{ArtifactRef, ManifestError, NativeRuntimeSourceV6, RoventInputLockV3, decode_json, digest};
+use crate::{
+    ArtifactRef, ManifestError, NativeRuntimeSourceV6, RoventInputLockV3, decode_json, digest,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -22,7 +24,11 @@ fn invalid(reason: &str) -> ManifestError {
 }
 
 fn require(condition: bool, reason: &str) -> Result<(), ManifestError> {
-    if condition { Ok(()) } else { Err(invalid(reason)) }
+    if condition {
+        Ok(())
+    } else {
+        Err(invalid(reason))
+    }
 }
 
 fn identifier(value: &str, max: usize) -> bool {
@@ -30,7 +36,9 @@ fn identifier(value: &str, max: usize) -> bool {
         && value.len() <= max
         && value != "."
         && value != ".."
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
 /// Linux supervisor relative directory name. Hidden directories are allowed;
@@ -42,14 +50,16 @@ fn reservation_directory(value: &str) -> bool {
         && !value.starts_with('/')
         && !value.contains(['\\', ':'])
         && !value.chars().any(char::is_control)
-        && value.split('/').all(|part| {
-            !part.is_empty() && part != "." && part != ".." && part.trim() == part
-        })
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != ".." && part.trim() == part)
 }
 
 fn sha256(value: &str) -> bool {
     value.len() == 64
-        && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         && value.bytes().any(|b| b != b'0')
 }
 
@@ -113,37 +123,58 @@ pub struct RoventSupervisorDeclarationV1 {
 
 impl RoventSupervisorDeclarationV1 {
     pub fn validate(&self) -> Result<(), ManifestError> {
-        require(self.domain == ROVENT_SUPERVISOR_DECLARATION_V1_DOMAIN, "declaration domain mismatch")?;
-        require(identifier(&self.authorization_id, 128) && identifier(&self.owner_id, 128)
-            && identifier(&self.engine_role, 64) && identifier(&self.driver_library_role, 128)
-            && identifier(&self.socket_basename, 80)
-            && identifier(&self.reservation_namespace, 128)
-            && reservation_directory(&self.reservation_root),
-            "invalid bounded identity, socket basename, or relative reservation root")?;
-        require(sha256(&self.input_lock_sha256) && self.process_epoch != 0, "invalid V3 lock digest or process epoch")?;
+        require(
+            self.domain == ROVENT_SUPERVISOR_DECLARATION_V1_DOMAIN,
+            "declaration domain mismatch",
+        )?;
+        require(
+            identifier(&self.authorization_id, 128)
+                && identifier(&self.owner_id, 128)
+                && identifier(&self.engine_role, 64)
+                && identifier(&self.driver_library_role, 128)
+                && identifier(&self.socket_basename, 80)
+                && identifier(&self.reservation_namespace, 128)
+                && reservation_directory(&self.reservation_root),
+            "invalid bounded identity, socket basename, or relative reservation root",
+        )?;
+        require(
+            sha256(&self.input_lock_sha256) && self.process_epoch != 0,
+            "invalid V3 lock digest or process epoch",
+        )?;
         self.supervisor_binary.validate()?;
         self.engine_binary.validate()?;
-        require(self.startup_ms != 0 && self.cleanup_ms != 0
-            && i32::try_from(self.device_ordinal).is_ok()
-            && (1..=4096).contains(&self.max_frame_bytes)
-            && self.max_messages != 0, "invalid finite control limits")
+        require(
+            self.startup_ms != 0
+                && self.cleanup_ms != 0
+                && i32::try_from(self.device_ordinal).is_ok()
+                && (1..=4096).contains(&self.max_frame_bytes)
+                && self.max_messages != 0,
+            "invalid finite control limits",
+        )
     }
 
     pub fn validate_for_v3(&self, v3: &RoventInputLockV3) -> Result<(), ManifestError> {
         self.validate()?;
         v3.validate()?;
-        require(self.input_lock_sha256 == v3.canonical_sha256
-            && self.engine_binary == v3.manifest.engine.binary
-            && self.startup_ms <= v3.manifest.wall_time_max_ms
-            && self.cleanup_ms <= v3.manifest.cleanup_max_ms,
-            "V3 digest, engine declaration, or control budget mismatch")?;
+        require(
+            self.input_lock_sha256 == v3.canonical_sha256
+                && self.engine_binary == v3.manifest.engine.binary
+                && self.startup_ms <= v3.manifest.wall_time_max_ms
+                && self.cleanup_ms <= v3.manifest.cleanup_max_ms,
+            "V3 digest, engine declaration, or control budget mismatch",
+        )?;
         match &v3.manifest.system_runtime_lock.runtime {
             NativeRuntimeSourceV6::SystemCuda(spec) => require(
                 u32::try_from(spec.cuda_device_id).ok() == Some(self.device_ordinal)
-                    && spec.libraries.iter().any(|library| library.role == self.driver_library_role),
+                    && spec
+                        .libraries
+                        .iter()
+                        .any(|library| library.role == self.driver_library_role),
                 "CUDA ordinal or registered driver role differs from the V3 runtime declaration",
             ),
-            NativeRuntimeSourceV6::Cpu => Err(invalid("supervisor /1 requires an explicit system CUDA declaration")),
+            NativeRuntimeSourceV6::Cpu => Err(invalid(
+                "supervisor /1 requires an explicit system CUDA declaration",
+            )),
         }
     }
 
@@ -151,14 +182,22 @@ impl RoventSupervisorDeclarationV1 {
         self.validate()?;
         let value = serde_json::to_value((ROVENT_SUPERVISOR_CANONICAL_V1_DOMAIN, self))
             .map_err(|error| invalid(&format!("canonical value: {error}")))?;
-        let bytes = serde_json::to_vec(&value).map_err(|error| invalid(&format!("canonical bytes: {error}")))?;
-        require(bytes.len() as u64 <= ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES, "canonical declaration exceeds its metadata bound")?;
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|error| invalid(&format!("canonical bytes: {error}")))?;
+        require(
+            bytes.len() as u64 <= ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES,
+            "canonical declaration exceeds its metadata bound",
+        )?;
         Ok(bytes)
     }
 
     pub fn lock(self) -> Result<RoventSupervisorLockV1, ManifestError> {
         let canonical_sha256 = digest(&self.canonical_bytes()?);
-        Ok(RoventSupervisorLockV1 { domain: ROVENT_SUPERVISOR_LOCK_V1_DOMAIN.into(), declaration: self, canonical_sha256 })
+        Ok(RoventSupervisorLockV1 {
+            domain: ROVENT_SUPERVISOR_LOCK_V1_DOMAIN.into(),
+            declaration: self,
+            canonical_sha256,
+        })
     }
 }
 
@@ -172,18 +211,22 @@ pub struct RoventSupervisorLockV1 {
 
 impl RoventSupervisorLockV1 {
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {
-        require(!input.is_empty() && input.len() as u64 <= ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES,
-            "registered lock is empty or exceeds its metadata bound")?;
+        require(
+            !input.is_empty() && input.len() as u64 <= ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES,
+            "registered lock is empty or exceeds its metadata bound",
+        )?;
         let lock: Self = decode_json(input)?;
         lock.validate()?;
         Ok(lock)
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
-        require(self.domain == ROVENT_SUPERVISOR_LOCK_V1_DOMAIN
-            && sha256(&self.canonical_sha256)
-            && digest(&self.declaration.canonical_bytes()?) == self.canonical_sha256,
-            "lock domain or canonical digest mismatch")
+        require(
+            self.domain == ROVENT_SUPERVISOR_LOCK_V1_DOMAIN
+                && sha256(&self.canonical_sha256)
+                && digest(&self.declaration.canonical_bytes()?) == self.canonical_sha256,
+            "lock domain or canonical digest mismatch",
+        )
     }
 
     pub fn validate_for_v3(&self, v3: &RoventInputLockV3) -> Result<(), ManifestError> {
@@ -204,24 +247,47 @@ pub struct RoventSupervisorPinnedLockV1 {
 }
 
 impl RoventSupervisorPinnedLockV1 {
-    pub fn pin_registered_at(root: &cap_std::fs::Dir, artifact: &ArtifactRef, v3: &RoventInputLockV3) -> Result<Self, ManifestError> {
-        require(artifact.bytes <= ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES, "registered lock exceeds its metadata bound")?;
+    pub fn pin_registered_at(
+        root: &cap_std::fs::Dir,
+        artifact: &ArtifactRef,
+        v3: &RoventInputLockV3,
+    ) -> Result<Self, ManifestError> {
+        require(
+            artifact.bytes <= ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES,
+            "registered lock exceeds its metadata bound",
+        )?;
         let mut file = artifact.open_verified_at(root, ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES)?;
         let mut bytes = Vec::new();
-        file.by_ref().take(ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES + 1).read_to_end(&mut bytes)
+        file.by_ref()
+            .take(ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
             .map_err(|error| invalid(&format!("read registered lock: {error}")))?;
-        require(bytes.len() as u64 == artifact.bytes && digest(&bytes) == artifact.sha256,
-            "registered raw lock changed while reading")?;
-        let raw = std::str::from_utf8(&bytes).map_err(|_| invalid("registered lock is not UTF-8"))?;
+        require(
+            bytes.len() as u64 == artifact.bytes && digest(&bytes) == artifact.sha256,
+            "registered raw lock changed while reading",
+        )?;
+        let raw =
+            std::str::from_utf8(&bytes).map_err(|_| invalid("registered lock is not UTF-8"))?;
         let lock = RoventSupervisorLockV1::from_json(raw)?;
         lock.validate_for_v3(v3)?;
-        file.seek(SeekFrom::Start(0)).map_err(|error| invalid(&format!("rewind registered lock: {error}")))?;
-        Ok(Self { file, raw_artifact: artifact.clone(), lock })
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| invalid(&format!("rewind registered lock: {error}")))?;
+        Ok(Self {
+            file,
+            raw_artifact: artifact.clone(),
+            lock,
+        })
     }
 
-    pub fn file(&self) -> &File { &self.file }
-    pub fn raw_artifact(&self) -> &ArtifactRef { &self.raw_artifact }
-    pub fn lock(&self) -> &RoventSupervisorLockV1 { &self.lock }
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+    pub fn raw_artifact(&self) -> &ArtifactRef {
+        &self.raw_artifact
+    }
+    pub fn lock(&self) -> &RoventSupervisorLockV1 {
+        &self.lock
+    }
 }
 
 #[cfg(test)]
@@ -270,22 +336,53 @@ mod tests {
         assert_eq!(RoventSupervisorLockV1::from_json(&wire).unwrap(), lock);
 
         let mut variants = Vec::new();
-        let mut changed = lock.clone(); changed.declaration.authorization_id.push('2'); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.owner_id.push('2'); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.input_lock_sha256 = "d".repeat(64); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.process_epoch += 1; variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.engine_role.push('2'); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.engine_binary.sha256 = "d".repeat(64); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.engine_binary.bytes += 1; variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.supervisor_binary.sha256 = "d".repeat(64); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.socket_basename.push('2'); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.reservation_root.push('2'); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.reservation_namespace.push('2'); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.device_ordinal += 1; variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.driver_library_role.push('2'); variants.push(changed);
-        let mut changed = lock.clone(); changed.declaration.max_frame_bytes -= 1; variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.authorization_id.push('2');
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.owner_id.push('2');
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.input_lock_sha256 = "d".repeat(64);
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.process_epoch += 1;
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.engine_role.push('2');
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.engine_binary.sha256 = "d".repeat(64);
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.engine_binary.bytes += 1;
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.supervisor_binary.sha256 = "d".repeat(64);
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.socket_basename.push('2');
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.reservation_root.push('2');
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.reservation_namespace.push('2');
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.device_ordinal += 1;
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.driver_library_role.push('2');
+        variants.push(changed);
+        let mut changed = lock.clone();
+        changed.declaration.max_frame_bytes -= 1;
+        variants.push(changed);
         for changed in variants {
-            assert!(changed.validate().is_err(), "tampered declaration must not verify against original digest");
+            assert!(
+                changed.validate().is_err(),
+                "tampered declaration must not verify against original digest"
+            );
         }
         let mut changed = lock.clone();
         changed.canonical_sha256 = "e".repeat(64);
@@ -304,34 +401,74 @@ mod tests {
             d.engine_role = bad.into();
             assert!(d.validate().is_err(), "invalid role: {bad:?}");
         }
-        let mut d = declaration(); d.engine_role = "r".repeat(65); assert!(d.validate().is_err());
-        let mut d = declaration(); d.authorization_id = "a".repeat(129); assert!(d.validate().is_err());
-        let mut d = declaration(); d.socket_basename = "s".repeat(81); assert!(d.validate().is_err());
-        let mut d = declaration(); d.input_lock_sha256 = "0".repeat(64); assert!(d.validate().is_err());
-        let mut d = declaration(); d.engine_binary.path = "../engine".into(); assert!(d.validate().is_err());
-        let mut d = declaration(); d.reservation_root = "../other".into(); assert!(d.validate().is_err());
-        let mut d = declaration(); d.reservation_root = "run/.locks".into(); assert!(d.validate().is_ok());
-        let mut d = declaration(); d.reservation_root = "run//other".into(); assert!(d.validate().is_err());
-        let mut d = declaration(); d.reservation_root = "run/../other".into(); assert!(d.validate().is_err());
-        let mut d = declaration(); d.reservation_namespace = "../other".into(); assert!(d.validate().is_err());
-        let mut d = declaration(); d.process_epoch = 0; assert!(d.validate().is_err());
-        let mut d = declaration(); d.device_ordinal = u32::MAX; assert!(d.validate().is_err());
-        let mut d = declaration(); d.max_frame_bytes = 0; assert!(d.validate().is_err());
-        let mut d = declaration(); d.max_frame_bytes = 4_097; assert!(d.validate().is_err());
-        let mut d = declaration(); d.max_messages = 0; assert!(d.validate().is_err());
-        let mut d = declaration(); d.max_messages = u32::MAX; assert!(d.validate().is_ok());
+        let mut d = declaration();
+        d.engine_role = "r".repeat(65);
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.authorization_id = "a".repeat(129);
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.socket_basename = "s".repeat(81);
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.input_lock_sha256 = "0".repeat(64);
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.engine_binary.path = "../engine".into();
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.reservation_root = "../other".into();
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.reservation_root = "run/.locks".into();
+        assert!(d.validate().is_ok());
+        let mut d = declaration();
+        d.reservation_root = "run//other".into();
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.reservation_root = "run/../other".into();
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.reservation_namespace = "../other".into();
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.process_epoch = 0;
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.device_ordinal = u32::MAX;
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.max_frame_bytes = 0;
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.max_frame_bytes = 4_097;
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.max_messages = 0;
+        assert!(d.validate().is_err());
+        let mut d = declaration();
+        d.max_messages = u32::MAX;
+        assert!(d.validate().is_ok());
     }
 
     #[test]
     fn strict_bounded_parser_rejects_duplicate_unknown_and_oversized_json() {
         let lock = declaration().lock().unwrap();
         let wire = serde_json::to_string(&lock).unwrap();
-        let duplicate = wire.replacen("\"authorization_id\":\"approval-1\"", "\"authorization_id\":\"approval-1\",\"authorization_id\":\"approval-1\"", 1);
+        let duplicate = wire.replacen(
+            "\"authorization_id\":\"approval-1\"",
+            "\"authorization_id\":\"approval-1\",\"authorization_id\":\"approval-1\"",
+            1,
+        );
         assert_ne!(duplicate, wire);
         assert!(RoventSupervisorLockV1::from_json(&duplicate).is_err());
         let unknown = wire.replacen("\"domain\":", "\"unexpected\":true,\"domain\":", 1);
         assert!(RoventSupervisorLockV1::from_json(&unknown).is_err());
-        let oversized = format!("{}{}", wire, " ".repeat(ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES as usize));
+        let oversized = format!(
+            "{}{}",
+            wire,
+            " ".repeat(ROVENT_SUPERVISOR_LOCK_V1_MAX_BYTES as usize)
+        );
         assert!(RoventSupervisorLockV1::from_json(&oversized).is_err());
     }
 
@@ -340,12 +477,28 @@ mod tests {
         let original = declaration();
         let value = serde_json::to_value(&original).unwrap();
         let fields = value.as_object().unwrap();
-        let reversed = fields.iter().rev().map(|(key, value)| {
-            format!("{}:{}", serde_json::to_string(key).unwrap(), serde_json::to_string(value).unwrap())
-        }).collect::<Vec<_>>().join(",");
-        let decoded: RoventSupervisorDeclarationV1 = decode_json(&format!("{{{reversed}}}")).unwrap();
+        let reversed = fields
+            .iter()
+            .rev()
+            .map(|(key, value)| {
+                format!(
+                    "{}:{}",
+                    serde_json::to_string(key).unwrap(),
+                    serde_json::to_string(value).unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let decoded: RoventSupervisorDeclarationV1 =
+            decode_json(&format!("{{{reversed}}}")).unwrap();
         assert_eq!(decoded, original);
-        assert_eq!(decoded.canonical_bytes().unwrap(), original.canonical_bytes().unwrap());
-        assert_eq!(decoded.lock().unwrap().canonical_sha256, original.lock().unwrap().canonical_sha256);
+        assert_eq!(
+            decoded.canonical_bytes().unwrap(),
+            original.canonical_bytes().unwrap()
+        );
+        assert_eq!(
+            decoded.lock().unwrap().canonical_sha256,
+            original.lock().unwrap().canonical_sha256
+        );
     }
 }

@@ -19,12 +19,13 @@ mod registration {
     #[cfg(feature = "onnx-cuda")]
     use rz_eval::onnx::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
     use rz_experiments::{
-        ArtifactRef, NativeRuntimeSourceV6, RoventBackend, RoventCoordinatorDeclarationV3,
+        ArtifactRef, NativeRuntimeSourceV6, ROVENT_EXECUTION_V3_DOMAIN,
+        ROVENT_STARTUP_DOCUMENT_V5_DOMAIN, RoventBackend, RoventCoordinatorDeclarationV3,
         RoventDevice, RoventEngineDeclaration, RoventExecutionManifestV3, RoventExternalProfilePin,
         RoventModelPin, RoventNnuecPin, RoventPcConfiguration, RoventPurpose, RoventResearcher,
         RoventResourcePlan, RoventRootTieDeclarationV2, RoventSearchDeclaration,
         RoventStartupDocumentV5, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeLockV6,
-        SystemRuntimeSpecV6, ROVENT_EXECUTION_V3_DOMAIN, ROVENT_STARTUP_DOCUMENT_V5_DOMAIN,
+        SystemRuntimeSpecV6,
     };
     use rz_position::contracts::{profile_digest, rules_snapshot_semantic_digest};
     use rz_position::{BoardMove, Position};
@@ -752,14 +753,21 @@ mod registration {
         if let Some(identity) = system_identity {
             println!(
                 "{{\"status\":\"registered\",\"system_identity\":\"{}\",\"runtime_lock_sha256\":\"{}\",\"execution_lock_sha256\":\"{}\",\"source_commit_observation\":\"{}\",\"source_components_observation\":\"{}\",\"model_source_observation\":\"{}\",\"source_observation_scope\":\"registration_executable_only\",\"native_capture\":true,\"engine_model_asset_bytes_verified\":false,\"provider_ready\":false,\"gpu_inference\":false}}",
-                hex(&identity), sys_lock.canonical_sha256, lock.canonical_sha256,
-                commit_status, component_status, model_source_status
+                hex(&identity),
+                sys_lock.canonical_sha256,
+                lock.canonical_sha256,
+                commit_status,
+                component_status,
+                model_source_status
             );
         } else {
             println!(
                 "{{\"status\":\"registered\",\"system_identity\":null,\"runtime_lock_sha256\":\"{}\",\"execution_lock_sha256\":\"{}\",\"source_commit_observation\":\"{}\",\"source_components_observation\":\"{}\",\"model_source_observation\":\"{}\",\"source_observation_scope\":\"registration_executable_only\",\"native_capture\":false,\"engine_model_asset_bytes_verified\":false,\"provider_ready\":false,\"gpu_inference\":false}}",
-                sys_lock.canonical_sha256, lock.canonical_sha256,
-                commit_status, component_status, model_source_status
+                sys_lock.canonical_sha256,
+                lock.canonical_sha256,
+                commit_status,
+                component_status,
+                model_source_status
             );
         }
         Ok(())

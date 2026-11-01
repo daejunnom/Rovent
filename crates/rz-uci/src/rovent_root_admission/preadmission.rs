@@ -11,7 +11,9 @@ use super::{
 };
 use crate::parser::GoLimits;
 use rz_contracts::{Digest, rovent::SearchGoal};
-use rz_experiments::{RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventSearchDeclaration};
+use rz_experiments::{
+    RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventSearchDeclaration,
+};
 use rz_position::{BoardMove, Position, PositionSnapshot};
 use std::{num::NonZeroU16, sync::Arc};
 

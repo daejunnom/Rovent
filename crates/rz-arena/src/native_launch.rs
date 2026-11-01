@@ -2131,17 +2131,30 @@ pub(crate) mod linux {
             }
             impl sealed::Sealed for PreparationFixture {}
             impl NativeLaunchDeclaration for PreparationFixture {
-                fn input_sha256(&self) -> &str { &self.input }
+                fn input_sha256(&self) -> &str {
+                    &self.input
+                }
                 fn preparation_policy_envelope(&self) -> Option<NativePreparationPolicyEnvelope> {
                     self.policy.clone()
                 }
-                fn view(&self) -> NativePairView<'_> { panic!("rejected basename has no pair") }
-                fn declared_inputs(&self) -> Vec<&ArtifactRef> { Vec::new() }
-                fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError> { Ok(0) }
-                fn engine_view(&self, _: NativeEngineRole) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError> {
+                fn view(&self) -> NativePairView<'_> {
+                    panic!("rejected basename has no pair")
+                }
+                fn declared_inputs(&self) -> Vec<&ArtifactRef> {
+                    Vec::new()
+                }
+                fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError> {
+                    Ok(0)
+                }
+                fn engine_view(
+                    &self,
+                    _: NativeEngineRole,
+                ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError> {
                     panic!("rejected basename has no engine")
                 }
-                fn provider_name(&self) -> &'static str { "fixture" }
+                fn provider_name(&self) -> &'static str {
+                    "fixture"
+                }
             }
             // This explicit legacy representation is the pre-envelope wire
             // format and compares actual serialized bytes, including field order.
@@ -2163,7 +2176,10 @@ pub(crate) mod linux {
             }
             let base_sha = "a".repeat(64);
             let execution_sha = "b".repeat(64);
-            let strict = PreparationFixture { input: base_sha.clone(), policy: None };
+            let strict = PreparationFixture {
+                input: base_sha.clone(),
+                policy: None,
+            };
             let advisory = PreparationFixture {
                 input: execution_sha.clone(),
                 policy: Some(NativePreparationPolicyEnvelope {
@@ -2175,24 +2191,35 @@ pub(crate) mod linux {
             };
             let fail = |fixture: &PreparationFixture| {
                 prepare_native_launch_for(fixture, Path::new("/"), Path::new("/"), "../invalid")
-                    .err().expect("invalid basename cannot start a child")
+                    .err()
+                    .expect("invalid basename cannot start a child")
             };
             let strict_failure = fail(&strict);
             let advisory_failure = fail(&advisory);
-            assert!(!strict_failure.receipt.child_spawned && !advisory_failure.receipt.child_spawned);
+            assert!(
+                !strict_failure.receipt.child_spawned && !advisory_failure.receipt.child_spawned
+            );
             let r = &strict_failure.receipt;
             assert!(r.policy_envelope.is_none());
             let old = LegacyPreparation {
-                receipt_version: r.receipt_version, execution_ready: r.execution_ready,
-                input_sha256: &r.input_sha256, output_directory: &r.output_directory,
+                receipt_version: r.receipt_version,
+                execution_ready: r.execution_ready,
+                input_sha256: &r.input_sha256,
+                output_directory: &r.output_directory,
                 attempt_created: r.attempt_created,
                 attempted_snapshot_relative_paths: &r.attempted_snapshot_relative_paths,
-                completed_snapshots: &r.completed_snapshots, child_spawned: r.child_spawned,
-                writers_closed: r.writers_closed, input_pins_required: r.input_pins_required,
-                original_error: &r.original_error, subsequent_file_owner: &r.subsequent_file_owner,
+                completed_snapshots: &r.completed_snapshots,
+                child_spawned: r.child_spawned,
+                writers_closed: r.writers_closed,
+                input_pins_required: r.input_pins_required,
+                original_error: &r.original_error,
+                subsequent_file_owner: &r.subsequent_file_owner,
                 automatic_retry: r.automatic_retry,
             };
-            assert_eq!(serde_json::to_vec(&r).unwrap(), serde_json::to_vec(&old).unwrap());
+            assert_eq!(
+                serde_json::to_vec(&r).unwrap(),
+                serde_json::to_vec(&old).unwrap()
+            );
             let policy = advisory_failure.receipt.policy_envelope.as_ref().unwrap();
             assert_eq!(policy.domain, "rz-pals-preparation-storage-advisory-v1/1");
             assert_eq!(policy.base_launch_sha256, base_sha);
@@ -2207,15 +2234,24 @@ pub(crate) mod linux {
                 }
             }
             let root = OwnedFixture(std::env::temp_dir().join(format!(
-                "rz-preparation-policy-{}-{}", std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
-            )));
+                    "rz-preparation-policy-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos(),
+                )));
             std::fs::create_dir(&root.0).unwrap();
             let directory = Dir::open_ambient_dir(&root.0, cap_std::ambient_authority()).unwrap();
-            let artifact = save_preparation_failure(Some(&directory), &advisory_failure.receipt, "fixture")
-                .unwrap().expect("fixture directory permits evidence saving");
+            let artifact =
+                save_preparation_failure(Some(&directory), &advisory_failure.receipt, "fixture")
+                    .unwrap()
+                    .expect("fixture directory permits evidence saving");
             let bytes = std::fs::read(root.0.join("native-preparation-failure.v1.json")).unwrap();
-            assert_eq!(bytes, serde_json::to_vec_pretty(&advisory_failure.receipt).unwrap());
+            assert_eq!(
+                bytes,
+                serde_json::to_vec_pretty(&advisory_failure.receipt).unwrap()
+            );
             assert_eq!(artifact.bytes, bytes.len() as u64);
             assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
         }

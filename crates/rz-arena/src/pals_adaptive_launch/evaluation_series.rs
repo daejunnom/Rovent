@@ -581,8 +581,15 @@ pub fn run_pals_evaluation_series_v5(
     attempt_prefix: &str,
     cancel: &AtomicBool,
 ) -> PalsEvaluationSeriesV5 {
-    run_pals_evaluation_series_with_storage_policy_v5(pipeline, launches, source_root, output_root,
-        attempt_prefix, cancel, PalsOwnedStoragePolicy::StrictV5)
+    run_pals_evaluation_series_with_storage_policy_v5(
+        pipeline,
+        launches,
+        source_root,
+        output_root,
+        attempt_prefix,
+        cancel,
+        PalsOwnedStoragePolicy::StrictV5,
+    )
 }
 
 #[cfg(feature = "pals-collection-onnx")]

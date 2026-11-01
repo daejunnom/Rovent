@@ -2,12 +2,32 @@
 //! outside the unwind boundary and owns the same worker and recovery key.
 use super::*;
 
-pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>(
+pub(super) fn run_worker_loop<
+    V: Send + Sync + 'static,
+    Q: Send + 'static,
+    B: TicketNativeBackend<V, Q>,
+>(
     state: &mut WorkerState<V, Q, B>,
     shared: &Arc<Shared>,
     limits: TicketServiceLimits,
 ) -> bool {
-    let WorkerState { backend, held, commands, acks, events, active, active_ack, active_prepared, active_output, active_panics, active_observations, active_ack_result, recovery_commands, recovery_root_fence, .. } = state;
+    let WorkerState {
+        backend,
+        held,
+        commands,
+        acks,
+        events,
+        active,
+        active_ack,
+        active_prepared,
+        active_output,
+        active_panics,
+        active_observations,
+        active_ack_result,
+        recovery_commands,
+        recovery_root_fence,
+        ..
+    } = state;
 
     let clock = backend.clock();
     let (acceptance_issuer, acceptance_verifier) = NativeAcceptanceIssuer::new_pair();
@@ -53,12 +73,16 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
                 active_panics,
                 active_observations,
                 active_ack_result,
-            ) { return false; }
+            ) {
+                return false;
+            }
             if !events.undelivered.borrow().is_empty() {
                 return false;
             }
         }
-        if !retire_canceled_recoverable(held, events, shared) { return false; }
+        if !retire_canceled_recoverable(held, events, shared) {
+            return false;
+        }
         #[cfg(test)]
         {
             let gate = {
@@ -90,16 +114,29 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
             // After this point no producer that observed an open recoverable
             // admission can still enqueue a command or an acknowledgement.
             shared.seal_admission();
-            let report = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.finish_report(until))) {
+            let report = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                backend.finish_report(until)
+            })) {
                 Ok(report) => report,
                 Err(payload) => {
                     active_panics.push(payload);
-                    TicketNativeFinishReport { physical_shutdown_confirmed: false, physical_failure: None, semantic_failure: None, session_release: None }
+                    TicketNativeFinishReport {
+                        physical_shutdown_confirmed: false,
+                        physical_failure: None,
+                        semantic_failure: None,
+                        session_release: None,
+                    }
                 }
             };
             let known = report.physical_shutdown_confirmed;
-            *shared.finish_report_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(report.clone());
-            *shared.finish_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+            *shared
+                .finish_report_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(report.clone());
+            *shared
+                .finish_report
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(report);
             if !known {
                 shared.quarantine.store(true, Ordering::Release);
             } else {
@@ -138,14 +175,20 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
                 })
             })) {
                 Ok(known) => known,
-                Err(payload) => { active_panics.push(payload); false }
+                Err(payload) => {
+                    active_panics.push(payload);
+                    false
+                }
             };
             let physical_known = cleanup_known
                 && match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     backend.quiesce(until)
                 })) {
                     Ok(known) => known,
-                    Err(payload) => { active_panics.push(payload); false }
+                    Err(payload) => {
+                        active_panics.push(payload);
+                        false
+                    }
                 };
             let fence = NativeRootFence {
                 authority,
@@ -167,20 +210,24 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
                 let delivered = match &command {
                     Command::Prepare(id, _, _) => {
                         shared.retire(*id);
-                        events.send(TicketNativeEvent::PreparationFailed {
-                            preparation: *id,
-                            failure: RoleFailure::Canceled,
-                        }).is_ok()
+                        events
+                            .send(TicketNativeEvent::PreparationFailed {
+                                preparation: *id,
+                                failure: RoleFailure::Canceled,
+                            })
+                            .is_ok()
                     }
-                    Command::Execute(id, _, _) => {
-                        events.send(TicketNativeEvent::Rejected {
+                    Command::Execute(id, _, _) => events
+                        .send(TicketNativeEvent::Rejected {
                             preparation: *id,
                             error: TicketServiceError::Closed,
-                        }).is_ok()
-                    }
+                        })
+                        .is_ok(),
                 };
                 if !delivered {
-                    recovery_commands.push(super::super::recovery::TicketUndeliveredEvent::new(TicketPendingCommand::from(command)));
+                    recovery_commands.push(super::super::recovery::TicketUndeliveredEvent::new(
+                        TicketPendingCommand::from(command),
+                    ));
                     // Remaining original commands stay in their channel.
                     break;
                 }
@@ -265,46 +312,61 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
                 };
                 *active_prepared = Some(prepared);
                 let accepted = match active_prepared.as_ref().expect("prepared retained") {
-                    Ok((prepared, representation)) => backend.prepared_host_bytes(prepared)
-                        .checked_add(backend.question_host_bytes(question))
-                        .is_some_and(|bytes| bytes <= limits.prepared_host_bytes_per_ticket)
-                        && representation.role == question.role,
+                    Ok((prepared, representation)) => {
+                        backend
+                            .prepared_host_bytes(prepared)
+                            .checked_add(backend.question_host_bytes(question))
+                            .is_some_and(|bytes| bytes <= limits.prepared_host_bytes_per_ticket)
+                            && representation.role == question.role
+                    }
                     Err(_) => false,
                 };
                 if accepted {
-                        let Command::Prepare(_, question, canceled) = active.take().expect("active retained") else { unreachable!() };
-                        let Ok((prepared, representation)) = active_prepared.take().expect("prepared retained") else { unreachable!() };
-                        let seal = PreparedTicketSeal {
-                            preparation: id,
-                            question: question.question,
-                            view: question.seal,
-                            representation,
-                            role: question.role,
-                            original_deadline: question.deadline,
-                        };
-                        held.insert(
-                            id,
-                            Held {
-                                question,
-                                prepared,
-                                seal,
-                                canceled,
-                                ticket: None,
-                                output: None,
-                                completed: false,
-                                ack_attempted: false,
-                                evidence: None,
-                            },
-                        );
-                        let _ = events.send(TicketNativeEvent::Prepared(seal));
+                    let Command::Prepare(_, question, canceled) =
+                        active.take().expect("active retained")
+                    else {
+                        unreachable!()
+                    };
+                    let Ok((prepared, representation)) =
+                        active_prepared.take().expect("prepared retained")
+                    else {
+                        unreachable!()
+                    };
+                    let seal = PreparedTicketSeal {
+                        preparation: id,
+                        question: question.question,
+                        view: question.seal,
+                        representation,
+                        role: question.role,
+                        original_deadline: question.deadline,
+                    };
+                    held.insert(
+                        id,
+                        Held {
+                            question,
+                            prepared,
+                            seal,
+                            canceled,
+                            ticket: None,
+                            output: None,
+                            completed: false,
+                            ack_attempted: false,
+                            evidence: None,
+                        },
+                    );
+                    let _ = events.send(TicketNativeEvent::Prepared(seal));
                 } else {
-                        let failure = active_prepared.take().expect("prepared retained").err().unwrap_or(RoleFailure::InvalidOutput);
-                        *active = None;
-                        shared.retire(id);
-                        let _ = events.send(TicketNativeEvent::PreparationFailed {
-                            preparation: id,
-                            failure,
-                        });
+                    let failure = active_prepared
+                        .take()
+                        .expect("prepared retained")
+                        .err()
+                        .unwrap_or(RoleFailure::InvalidOutput);
+                    *active = None;
+                    shared.retire(id);
+                    let _ = events.send(TicketNativeEvent::PreparationFailed {
+                        preparation: id,
+                        failure,
+                    });
                 }
             }
             Command::Execute(id, ticket, _) => {
@@ -353,7 +415,10 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
                     }
                     let started_at = Instant::now();
                     service_started = Some(started_at);
-                    if events.send(TicketNativeEvent::OwnerRunStarted { ticket, started_at }).is_err() {
+                    if events
+                        .send(TicketNativeEvent::OwnerRunStarted { ticket, started_at })
+                        .is_err()
+                    {
                         return false;
                     }
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -379,7 +444,10 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
                     }
                 };
                 *active_output = Some(result);
-                let physical = active_output.as_ref().expect("returned result retained").physical;
+                let physical = active_output
+                    .as_ref()
+                    .expect("returned result retained")
+                    .physical;
                 // A pre-run cancellation has no current owner invocation.
                 // An unwound/unknown physical call cannot publish a complete
                 // accounting observation even if its backend retained one.
@@ -397,31 +465,47 @@ pub(super) fn run_worker_loop<V: Send + Sync + 'static, Q: Send + 'static, B: Ti
                     } else {
                         None
                     };
-                let within_budget = match &active_output.as_ref().expect("returned result retained").output {
+                let within_budget = match &active_output
+                    .as_ref()
+                    .expect("returned result retained")
+                    .output
+                {
                     Ok(_) if physical == PhysicalRoleCompletion::Unknown => false,
-                    Ok(output) => backend.output_host_bytes(output) <= limits.output_host_bytes_per_ticket,
+                    Ok(output) => {
+                        backend.output_host_bytes(output) <= limits.output_host_bytes_per_ticket
+                    }
                     Err(_) => true,
                 };
                 let observation_failures = if service_started.is_some() {
-                    if let Err(payload) = collect_observations::<V, Q, B>(backend, active_observations) {
+                    if let Err(payload) =
+                        collect_observations::<V, Q, B>(backend, active_observations)
+                    {
                         active_panics.push(payload);
                         return false;
                     }
                     std::mem::take(active_observations)
-                } else { TicketNativeObservationFailures::default() };
+                } else {
+                    TicketNativeObservationFailures::default()
+                };
                 let mut output = if physical == PhysicalRoleCompletion::Unknown {
                     // Preserve the whole original result, including an Err
                     // cause or oversized native output, in the same owner.
                     Err(RoleFailure::PhysicalUnknown)
-                } else { match active_output.take().expect("returned result retained").output {
-                    Ok(output) if within_budget => {
-                        let output = Arc::new(output);
-                        value.output = Some(Arc::clone(&output));
-                        Ok(output)
+                } else {
+                    match active_output
+                        .take()
+                        .expect("returned result retained")
+                        .output
+                    {
+                        Ok(output) if within_budget => {
+                            let output = Arc::new(output);
+                            value.output = Some(Arc::clone(&output));
+                            Ok(output)
+                        }
+                        Ok(_) => Err(RoleFailure::InvalidOutput),
+                        Err(failure) => Err(failure),
                     }
-                    Ok(_) => Err(RoleFailure::InvalidOutput),
-                    Err(failure) => Err(failure),
-                }};
+                };
                 if physical == PhysicalRoleCompletion::Unknown {
                     output = Err(RoleFailure::PhysicalUnknown);
                 } else if value.canceled.load(Ordering::Acquire)
@@ -480,19 +564,33 @@ fn retire_canceled_recoverable<V, Q, P, O: Send + Sync + 'static>(
     shared: &Shared,
 ) -> bool {
     let mut controls = shared.controls.lock().unwrap_or_else(|e| e.into_inner());
-    let ids: Vec<_> = held.iter().filter_map(|(id, value)| {
-        (value.ticket.is_none() && value.canceled.load(Ordering::Acquire)
-            && controls.get(id).is_none_or(|control| control.queued_executions == 0))
+    let ids: Vec<_> = held
+        .iter()
+        .filter_map(|(id, value)| {
+            (value.ticket.is_none()
+                && value.canceled.load(Ordering::Acquire)
+                && controls
+                    .get(id)
+                    .is_none_or(|control| control.queued_executions == 0))
             .then_some(*id)
-    }).collect();
+        })
+        .collect();
     let mut removed = Vec::with_capacity(ids.len());
     for id in ids {
-        if events.send(TicketNativeEvent::PreparationFailed { preparation: id, failure: RoleFailure::Canceled }).is_err() {
+        if events
+            .send(TicketNativeEvent::PreparationFailed {
+                preparation: id,
+                failure: RoleFailure::Canceled,
+            })
+            .is_err()
+        {
             drop(controls);
             drop(removed);
             return false;
         }
-        if let Some(value) = held.remove(&id) { removed.push(value); }
+        if let Some(value) = held.remove(&id) {
+            removed.push(value);
+        }
         controls.remove(&id);
     }
     drop(controls);
@@ -521,7 +619,9 @@ fn acknowledge_recoverable<V, Q, B: TicketNativeBackend<V, Q>>(
     };
     let rejection = match held.get(&id) {
         None => Some(TicketServiceError::UnknownPreparation),
-        Some(value) if !value.completed || value.ticket != Some(ticket) => Some(TicketServiceError::IdentityMismatch),
+        Some(value) if !value.completed || value.ticket != Some(ticket) => {
+            Some(TicketServiceError::IdentityMismatch)
+        }
         Some(value) if accepted && value.ack_attempted => Some(TicketServiceError::Duplicate),
         _ => None,
     };
@@ -534,7 +634,9 @@ fn acknowledge_recoverable<V, Q, B: TicketNativeBackend<V, Q>>(
         return true;
     }
     let value = held.get_mut(&id).expect("ack checked");
-    if accepted { value.ack_attempted = true; }
+    if accepted {
+        value.ack_attempted = true;
+    }
     let mut backend_called = false;
     let result = if accepted {
         if value.canceled.load(Ordering::Acquire)
@@ -542,12 +644,16 @@ fn acknowledge_recoverable<V, Q, B: TicketNativeBackend<V, Q>>(
             || shared.root_closed.load(Ordering::Acquire)
         {
             Err(RoleFailure::Canceled)
-        } else if ticket.validate(clock.domain(), clock.now(), token_budget).is_err() {
+        } else if ticket
+            .validate(clock.domain(), clock.now(), token_budget)
+            .is_err()
+        {
             Err(RoleFailure::Expired)
         } else if let Some(output) = &value.output {
-            if permit.is_some_and(|permit| permit.ticket() != &ticket
-                || backend.acceptance_output_digest(output) != Some(permit.output_digest()))
-            {
+            if permit.is_some_and(|permit| {
+                permit.ticket() != &ticket
+                    || backend.acceptance_output_digest(output) != Some(permit.output_digest())
+            }) {
                 Err(RoleFailure::InvalidOutput)
             } else {
                 backend_called = true;
@@ -567,8 +673,12 @@ fn acknowledge_recoverable<V, Q, B: TicketNativeBackend<V, Q>>(
             return false;
         }
         std::mem::take(observations)
-    } else { TicketNativeObservationFailures::default() };
-    let result = original_result.take().expect("ack result retained through callbacks");
+    } else {
+        TicketNativeObservationFailures::default()
+    };
+    let result = original_result
+        .take()
+        .expect("ack result retained through callbacks");
     let mut permit = match active.take().expect("ack retained through callbacks") {
         Ack::Accept(_, _, permit) => permit,
         Ack::Discard(_, _) => None,
@@ -579,7 +689,9 @@ fn acknowledge_recoverable<V, Q, B: TicketNativeBackend<V, Q>>(
         accepted: accepted && result.is_ok(),
         native_receipt: if accepted && result.is_ok() {
             permit.take().map(|permit| issuer.issue_success(permit))
-        } else { None },
+        } else {
+            None
+        },
         rejected_permit: permit,
         result,
         observation_failures: failures,
@@ -599,7 +711,9 @@ fn collect_observations<V, Q, B: TicketNativeBackend<V, Q>>(
     original: &mut TicketNativeObservationFailures,
 ) -> Result<(), Box<dyn std::any::Any + Send>> {
     for entry in &mut original.entries {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.take_observation_failure()))? {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.take_observation_failure()
+        }))? {
             Some(failure) => *entry = Some(failure),
             None => break,
         }

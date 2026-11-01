@@ -45,12 +45,12 @@ use rz_eval::asset::parse_sha256;
 use rz_eval::error::{BackendError, FailureKind as K, FailureStage as S};
 use rz_eval::onnx::{NativeLoadingProfile, OrtRuntime, Provider};
 use rz_eval::pals_model::virtual_review;
+#[cfg(target_os = "linux")]
+use rz_eval::pals_onnx::virtual_review::VirtualReviewStartupCustody;
 use rz_eval::pals_onnx::virtual_review::{
     PalsVirtualReviewOnnxBackend, VirtualReviewArtifactKind, VirtualReviewExecutionMode,
     VirtualReviewOwnedSources, VirtualReviewProfileDirectory,
 };
-#[cfg(target_os = "linux")]
-use rz_eval::pals_onnx::virtual_review::VirtualReviewStartupCustody;
 use rz_eval::pals_onnx::{
     PalsAppliedSessionSettings, PalsCudaControlPolicy, PalsOnnxConfig, PalsSessionResidency,
 };
@@ -431,8 +431,11 @@ impl<Q: NativeQuestionProjection> std::fmt::Debug for RoventNativeStartupRejecti
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Started(rejection) => output.debug_tuple("Started").field(rejection).finish(),
-            Self::Unstarted { error, .. } => output.debug_struct("Unstarted")
-                .field("error", error).field("original_owner_retained", &true).finish(),
+            Self::Unstarted { error, .. } => output
+                .debug_struct("Unstarted")
+                .field("error", error)
+                .field("original_owner_retained", &true)
+                .finish(),
         }
     }
 }
@@ -453,7 +456,9 @@ pub struct RoventPreAdmissionCustodyV3 {
 
 #[cfg(target_os = "linux")]
 impl RoventPreAdmissionCustodyV3 {
-    pub fn into_parts(self) -> (
+    pub fn into_parts(
+        self,
+    ) -> (
         Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
         RoventNativeResourcesV3,
         Option<Box<dyn VirtualReviewCollectionObserver>>,
@@ -465,7 +470,9 @@ impl RoventPreAdmissionCustodyV3 {
 #[cfg(target_os = "linux")]
 impl RoventUnstartedNativeCustodyV3 {
     pub fn downcast<T: std::any::Any + Send>(self) -> Result<Box<T>, Self> {
-        self.original.downcast().map_err(|original| Self { original })
+        self.original
+            .downcast()
+            .map_err(|original| Self { original })
     }
 }
 
@@ -934,7 +941,11 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
         return Err(RoventNativeStartupRejectionV3::Unstarted {
             error,
             owner: RoventUnstartedNativeCustodyV3 {
-                original: Box::new(RoventPreAdmissionCustodyV3 { sources, resources, observer }),
+                original: Box::new(RoventPreAdmissionCustodyV3 {
+                    sources,
+                    resources,
+                    observer,
+                }),
             },
         });
     }
@@ -950,12 +961,31 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
     let factory_diagnostic = diagnostic.clone();
     let (native, snapshot) = match resources {
         RoventNativeResourcesV3::Cpu(cpu) => spawn_native_factory(
-            pending_capacity, limits, commands, clock.clone(), &control, &diagnostic,
-            move || load_native(factory_sources, cpu, factory_clock, &factory_control, observer, &factory_diagnostic),
+            pending_capacity,
+            limits,
+            commands,
+            clock.clone(),
+            &control,
+            &diagnostic,
+            move || {
+                load_native(
+                    factory_sources,
+                    cpu,
+                    factory_clock,
+                    &factory_control,
+                    observer,
+                    &factory_diagnostic,
+                )
+            },
         )?,
         RoventNativeResourcesV3::SystemCuda(cuda) => spawn_system_native_factory_v3(
-            factory_sources, cuda, factory_clock, factory_control, observer,
-            &control, &diagnostic,
+            factory_sources,
+            cuda,
+            factory_clock,
+            factory_control,
+            observer,
+            &control,
+            &diagnostic,
         )?,
     };
     let ready_clock_matches = native
@@ -981,7 +1011,8 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
                 ),
                 Some(native),
                 control.cleanup_until,
-            ).into());
+            )
+            .into());
         }
     };
     Ok(PreparedRoventNativeV3 {
@@ -1259,7 +1290,8 @@ fn spawn_system_native_factory_v3<Q: NativeQuestionProjection>(
     let owner = RoventSystemFactoryCustodyV3 {
         sources: Arc::clone(&sources),
         review: VirtualReviewStartupCustody::new(
-            Arc::clone(&sources) as Arc<dyn VirtualReviewOwnedSources>, None,
+            Arc::clone(&sources) as Arc<dyn VirtualReviewOwnedSources>,
+            None,
         ),
         system_owner: None,
         rejected_runtime: None,
@@ -1279,14 +1311,25 @@ fn spawn_system_native_factory_v3<Q: NativeQuestionProjection>(
                 // Both process-local recovery slots exist before the first
                 // native entry. They are not a cross-process device lease.
                 let (reservation, key) = rz_eval::worker::PhysicalRecoveryReservation::reserve()?;
-                factory.bind_inner(&key, factory_clock.domain().0.0)
-                    .map_err(|_| fail(K::ResourceExhausted, "cannot bind original physical recovery owner"))?;
+                factory
+                    .bind_inner(&key, factory_clock.domain().0.0)
+                    .map_err(|_| {
+                        fail(
+                            K::ResourceExhausted,
+                            "cannot bind original physical recovery owner",
+                        )
+                    })?;
                 let (owner, entry) = factory.parts();
                 owner.physical_reservation = Some(reservation);
                 owner.physical_key = Some(key);
                 load_native_system_v3(
-                    sources, resources, factory_clock, &factory_control,
-                    &factory_diagnostic, owner, entry,
+                    sources,
+                    resources,
+                    factory_clock,
+                    &factory_control,
+                    &factory_diagnostic,
+                    owner,
+                    entry,
                 )
             })();
             // Keep the original ticket and observer in the same factory
@@ -1295,13 +1338,19 @@ fn spawn_system_native_factory_v3<Q: NativeQuestionProjection>(
             let observation = loaded.as_ref().cloned().map_err(Clone::clone);
             let _ = sender.send(observation);
             match loaded {
-                Ok(_) => factory.parts().0.ticket.take()
+                Ok(_) => factory
+                    .parts()
+                    .0
+                    .ticket
+                    .take()
                     .map(ProjectedNativeBackend::new)
                     .ok_or(RoleFailure::InvalidOutput),
                 Err(error) => Err(RoleFailure::Backend(error.to_string())),
             }
         },
-        limits, pending, commands,
+        limits,
+        pending,
+        commands,
     )
     .map_err(|failure| RoventNativeStartupRejectionV3::Unstarted {
         error: fail(K::ResourceExhausted, "Rovent native owner spawn failed")
@@ -1471,10 +1520,7 @@ fn load_native_system_v3(
     diagnostic: &NativeStartupDiagnostic,
     custody: &mut RoventSystemFactoryCustodyV3,
     entry: &mut crate::pals_native::ticketed::FactoryNativeEntry,
-) -> Result<
-    RoventNativeStartupSnapshot,
-    BackendError,
-> {
+) -> Result<RoventNativeStartupSnapshot, BackendError> {
     control.check()?;
     sources.validate_lock()?;
     validate_system_native_resources_v3(&sources, &resources)?;
@@ -1484,9 +1530,9 @@ fn load_native_system_v3(
             // initializer fails, times out or unwinds without a Session.
             custody.system_owner = Some(system.clone());
             enter_supervised_system_cuda(|| {
-                let runtime = OrtRuntime::load_system_cuda_with_entry(
-                    system, || entry.mark_native_entered(),
-                )?;
+                let runtime = OrtRuntime::load_system_cuda_with_entry(system, || {
+                    entry.mark_native_entered()
+                })?;
                 // Capture the same runtime before later cancellation/identity
                 // checks can reject a successfully returned initialization.
                 if let Err((error, rejected)) = custody.review.install_runtime(runtime.clone()) {
@@ -1499,7 +1545,11 @@ fn load_native_system_v3(
     })?;
     custody.startup = Some(startup);
     control.check()?;
-    let runtime = custody.startup.as_ref().expect("original startup owned").runtime();
+    let runtime = custody
+        .startup
+        .as_ref()
+        .expect("original startup owned")
+        .runtime();
     let identity = runtime.cuda_runtime_identity().ok_or_else(|| {
         fail(
             K::IdentityMismatch,
@@ -1526,7 +1576,10 @@ fn load_native_system_v3(
         )
     })?;
     control.check()?;
-    let backend = custody.review.backend().ok_or_else(|| fail(K::BackendFailure, "original V3 startup backend missing"))?;
+    let backend = custody
+        .review
+        .backend()
+        .ok_or_else(|| fail(K::BackendFailure, "original V3 startup backend missing"))?;
     if backend.validator_present() != collection
         || backend.approximate_warm_capable()
         || backend.model_epoch() != sources.weights_digest()
@@ -1577,7 +1630,11 @@ fn load_native_system_v3(
             "actual V3 model sessions did not all confirm the selected CUDA provider",
         ));
     }
-    let mapping = custody.startup.as_ref().expect("original startup owned").observe_ready_mappings()?;
+    let mapping = custody
+        .startup
+        .as_ref()
+        .expect("original startup owned")
+        .observe_ready_mappings()?;
     control.check()?;
     let snapshot = RoventNativeStartupSnapshot {
         domain: "rz-rovent-native-system-startup/1",
@@ -1607,7 +1664,12 @@ fn load_native_system_v3(
     };
     let ticket = NativeVirtualReviewTicketBackend::new_with_collection_observer_retained(
         custody.review.backend_slot_mut(),
-        custody.physical_reservation.as_mut().ok_or_else(|| fail(K::ResourceExhausted, "original physical recovery reservation missing"))?,
+        custody.physical_reservation.as_mut().ok_or_else(|| {
+            fail(
+                K::ResourceExhausted,
+                "original physical recovery reservation missing",
+            )
+        })?,
         clock,
         resources.drain_limit,
         &mut custody.observer,

@@ -467,7 +467,10 @@ impl HeldAssets {
                 .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
             let file = parent.open_with(*name, &options)?.into_std();
             let stamp = identity(&file)?;
-            need(stamp.2 == local.bytes, "held prerequisite byte length differs")?;
+            need(
+                stamp.2 == local.bytes,
+                "held prerequisite byte length differs",
+            )?;
             let held = HeldAsset {
                 artifact: declared.artifact.clone(),
                 parent,

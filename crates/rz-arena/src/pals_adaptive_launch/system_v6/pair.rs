@@ -1047,10 +1047,12 @@ mod tests {
         let result = crate::NativeLaunchDeclaration::validate_execution(&locked);
         assert!(result.is_err());
         assert!(crate::NativeProviderDeclaration::requires_physical_lifetime_guard(&locked));
-        assert!(crate::NativeProviderDeclaration::uses_provider_records(
-            &locked,
-            NativeEngineRole::Baseline,
-        )
-        .unwrap());
+        assert!(
+            crate::NativeProviderDeclaration::uses_provider_records(
+                &locked,
+                NativeEngineRole::Baseline,
+            )
+            .unwrap()
+        );
     }
 }

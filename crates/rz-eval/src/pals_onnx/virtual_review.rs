@@ -17,7 +17,7 @@ mod manifest;
 pub mod native_validation_diagnostics;
 mod owned_sources;
 pub use legacy_manifest::{
-    LegacyPalsExportManifestSummary, LegacyPalsGraphPin, validate_pals_legacy_export_manifest,
+    validate_pals_legacy_export_manifest, LegacyPalsExportManifestSummary, LegacyPalsGraphPin,
 };
 pub use owned_sources::{VirtualReviewOwnedSources, VirtualReviewProfileDirectory};
 mod tickets;
@@ -429,15 +429,32 @@ pub enum VirtualReviewNativeCommand {
 impl crate::worker::PhysicalScopedInput for VirtualReviewNativeCommand {
     fn physical_work_scope(&self) -> Result<crate::worker::PhysicalWorkScope, BackendError> {
         let (ticket, execution) = match self {
-            Self::EvaluateTicketScoped { ticket, execution, .. } => (ticket, execution),
+            Self::EvaluateTicketScoped {
+                ticket, execution, ..
+            } => (ticket, execution),
             #[cfg(feature = "native-validation-diagnostics")]
-            Self::EvaluateTicketForValidation { ticket, execution, .. } => (ticket, execution),
-            _ => return Err(fail(K::InvalidInput, S::Admission, "unscoped control or legacy command has no ticket work identity")),
+            Self::EvaluateTicketForValidation {
+                ticket, execution, ..
+            } => (ticket, execution),
+            _ => {
+                return Err(fail(
+                    K::InvalidInput,
+                    S::Admission,
+                    "unscoped control or legacy command has no ticket work identity",
+                ))
+            }
         };
         if ticket.id.epoch != execution.epoch || ticket.authority.epoch != ticket.id.epoch {
-            return Err(fail(K::IdentityMismatch, S::Admission, "ticket and physical execution epochs differ"));
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Admission,
+                "ticket and physical execution epochs differ",
+            ));
         }
-        Ok(crate::worker::PhysicalWorkScope::Ticket { ticket: *ticket, execution: *execution })
+        Ok(crate::worker::PhysicalWorkScope::Ticket {
+            ticket: *ticket,
+            execution: *execution,
+        })
     }
 }
 /// The immutable view's exact history comes from Rules/ticket authority. It is
@@ -685,7 +702,10 @@ impl VirtualReviewStartupCustody {
     /// Install the actual runtime returned by the native loader; this method
     /// does not itself establish whether native initialization completed.
     #[allow(clippy::result_large_err)]
-    pub fn install_runtime(&mut self, runtime: OrtRuntime) -> Result<(), (BackendError, OrtRuntime)> {
+    pub fn install_runtime(
+        &mut self,
+        runtime: OrtRuntime,
+    ) -> Result<(), (BackendError, OrtRuntime)> {
         if self.runtime.is_some() || self.backend.is_some() || self.sessions.len() != 0 {
             return Err((
                 fail(
@@ -719,7 +739,10 @@ struct SynchronousRunTracker {
 }
 impl SynchronousRunTracker {
     fn new() -> Self {
-        Self { clean: true, completed_synchronous_runs: 0 }
+        Self {
+            clean: true,
+            completed_synchronous_runs: 0,
+        }
     }
     fn enter(&mut self) -> bool {
         std::mem::replace(&mut self.clean, false)
@@ -1037,7 +1060,9 @@ impl PalsVirtualReviewOnnxBackend {
         profile_directory: Option<VirtualReviewProfileDirectory>,
     ) -> Result<Self, BackendError> {
         let mut custody = VirtualReviewStartupCustody::new(sources, profile_directory);
-        custody.install_runtime(runtime).map_err(|(error, _)| error)?;
+        custody
+            .install_runtime(runtime)
+            .map_err(|(error, _)| error)?;
         Self::load_sources_into_custody(
             &mut custody,
             expected_sha256,
@@ -1048,7 +1073,11 @@ impl PalsVirtualReviewOnnxBackend {
             &mut || {},
         )?;
         custody.backend.take().ok_or_else(|| {
-            fail(K::BackendFailure, S::Backend, "V3 startup backend is missing")
+            fail(
+                K::BackendFailure,
+                S::Backend,
+                "V3 startup backend is missing",
+            )
         })
     }
 
@@ -1301,21 +1330,35 @@ impl PalsVirtualReviewOnnxBackend {
                     phase_trace.record("session_load_returned_error", role, None);
                     let error = match error {
                         SessionLoadFailure::BeforeProvider(error) => {
-                            custody.session_load_failure = Some(VirtualSessionLoadFailureObservation::BeforeProvider);
+                            custody.session_load_failure =
+                                Some(VirtualSessionLoadFailureObservation::BeforeProvider);
                             error
                         }
-                        SessionLoadFailure::ProviderEntered { error, returned_session } => {
-                            custody.session_load_failure = Some(VirtualSessionLoadFailureObservation::ProviderEntered { returned_session });
+                        SessionLoadFailure::ProviderEntered {
+                            error,
+                            returned_session,
+                        } => {
+                            custody.session_load_failure =
+                                Some(VirtualSessionLoadFailureObservation::ProviderEntered {
+                                    returned_session,
+                                });
                             error
                         }
                     };
                     return Err(error);
                 }
             };
-            let session = slot.as_ref().ok_or_else(|| fail(K::BackendFailure, S::Backend, "V3 session loader returned without the original owner"))?;
+            let session = slot.as_ref().ok_or_else(|| {
+                fail(
+                    K::BackendFailure,
+                    S::Backend,
+                    "V3 session loader returned without the original owner",
+                )
+            })?;
             if let Err(error) = manifest.validate_session(session, graph) {
                 phase_trace.record("session_interface_returned_error", role, None);
-                custody.session_load_failure = Some(VirtualSessionLoadFailureObservation::SessionInterfaceRejected);
+                custody.session_load_failure =
+                    Some(VirtualSessionLoadFailureObservation::SessionInterfaceRejected);
                 return Err(error);
             }
             // Actual Session settings and the existing initialization/interface
@@ -2052,7 +2095,8 @@ impl PalsVirtualReviewOnnxBackend {
             let first_phase_run = self.phase_trace.first_run_entered("public");
             let previously_clean = self.synchronous_runs.enter();
             let result = self.sessions.public.as_mut().expect("public").run(values);
-            self.synchronous_runs.returned(previously_clean, result.is_ok());
+            self.synchronous_runs
+                .returned(previously_clean, result.is_ok());
             self.phase_trace
                 .first_run_returned(first_phase_run, "public", result.is_ok());
             #[cfg(feature = "native-validation-diagnostics")]
@@ -2168,7 +2212,8 @@ impl PalsVirtualReviewOnnxBackend {
             self.sessions.shared_pc.as_mut().expect("P/C")
         };
         let result = session.run(values);
-        self.synchronous_runs.returned(previously_clean, result.is_ok());
+        self.synchronous_runs
+            .returned(previously_clean, result.is_ok());
         self.phase_trace
             .first_run_returned(first_phase_run, phase_role, result.is_ok());
         #[cfg(feature = "native-validation-diagnostics")]
@@ -2236,7 +2281,8 @@ impl PalsVirtualReviewOnnxBackend {
                 self.active.as_ref().expect("input owned"),
                 self.active_memory.as_ref().expect("public pinned"),
             );
-        self.synchronous_runs.returned(previously_clean, result.is_ok());
+        self.synchronous_runs
+            .returned(previously_clean, result.is_ok());
         if let Err(e) = result {
             let error = native(CauseCode::OrtRun, "V3 Warm binding Run/fence failed", e);
             self.quarantine = Some(error.clone());
@@ -2258,113 +2304,109 @@ impl PalsVirtualReviewOnnxBackend {
         &mut self,
         command: &VirtualReviewNativeCommand,
     ) -> PhysicalRun<Result<VirtualReviewNativeResult, BackendError>> {
-            let result = match command {
-                VirtualReviewNativeCommand::Evaluate(invocation) => self
-                    .run(&invocation.input, &invocation.identity)
-                    .map(VirtualReviewNativeResult::Evaluation),
-                VirtualReviewNativeCommand::EvaluateTicket { ticket, invocation }
-                | VirtualReviewNativeCommand::EvaluateTicketScoped { ticket, invocation, .. } => {
-                    let before = self.stats.clone();
-                    let outcome = self.run_for_ticket(ticket, invocation);
-                    let evidence = PalsNNInputEvidence::between(
-                        &before,
-                        &self.stats,
-                        self.quarantine.is_none(),
-                    );
-                    let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
-                        &before,
-                        &self.stats,
-                        invocation.input.role,
-                        self.quarantine.is_none(),
-                    );
-                    Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
-                        outcome,
-                        actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
-                        complete: evidence.complete,
-                        owner_accounting,
-                    })
-                }
-                #[cfg(feature = "native-validation-diagnostics")]
-                VirtualReviewNativeCommand::EvaluateTicketForValidation {
-                    ticket,
-                    execution,
-                    invocation,
-                } => {
-                    let _validation_ticket = self
-                        .validation_trace
-                        .as_ref()
-                        .map(|trace| trace.enter_ticket(*ticket, *execution));
-                    let before = self.stats.clone();
-                    let outcome = self.run_for_ticket(ticket, invocation);
-                    let evidence = PalsNNInputEvidence::between(
-                        &before,
-                        &self.stats,
-                        self.quarantine.is_none(),
-                    );
-                    let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
-                        &before,
-                        &self.stats,
-                        invocation.input.role,
-                        self.quarantine.is_none(),
-                    );
-                    Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
-                        outcome,
-                        actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
-                        complete: evidence.complete,
-                        owner_accounting,
-                    })
-                }
-                VirtualReviewNativeCommand::AcceptTicket {
-                    ticket,
-                    invocation,
-                    completion,
-                } => self
-                    .accept_completed_ticket(ticket, invocation, completion)
-                    .map(|()| VirtualReviewNativeResult::TicketAccepted),
-                VirtualReviewNativeCommand::DiscardTicket(ticket) => self
-                    .discard_completed_ticket(ticket)
-                    .map(|()| VirtualReviewNativeResult::TicketDiscarded),
-                VirtualReviewNativeCommand::QuiesceRoot => {
-                    self.quiesce_root()
-                        .map(|()| VirtualReviewNativeResult::RootQuiesced {
-                            game_generation: self.generation,
-                        })
-                }
-                VirtualReviewNativeCommand::ResetTo(generation) => {
-                    self.reset_to(*generation)
-                        .map(|()| VirtualReviewNativeResult::ResetTo {
-                            game_generation: *generation,
-                        })
-                }
-                VirtualReviewNativeCommand::NewGame => {
-                    self.new_game().map(|()| VirtualReviewNativeResult::NewGame)
-                }
-                VirtualReviewNativeCommand::SnapshotStats => {
-                    self.snapshot_stats().map(VirtualReviewNativeResult::Stats)
-                }
-                VirtualReviewNativeCommand::SnapshotOwner => self
-                    .idle()
-                    .map(|()| VirtualReviewNativeResult::Owner(self.owner_snapshot())),
-                VirtualReviewNativeCommand::VerifyRuntime => self
-                    .verify_runtime()
-                    .map(|()| VirtualReviewNativeResult::RuntimeVerified),
-                VirtualReviewNativeCommand::VerifyCudaPlacement => self
-                    .verify_cuda_placement()
-                    .map(|w| VirtualReviewNativeResult::CudaPlacementVerified(Box::new(w))),
-                VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => self
-                    .verify_virtual_cuda_placement()
-                    .map(|w| VirtualReviewNativeResult::VirtualCudaPlacementVerified(Box::new(w))),
-                #[cfg(target_os = "linux")]
-                VirtualReviewNativeCommand::VerifySystemVirtualCudaPlacement => {
-                    self.verify_system_virtual_cuda_placement().map(|w| {
-                        VirtualReviewNativeResult::SystemVirtualCudaPlacementVerified(Box::new(w))
-                    })
-                }
-            };
-            match &self.quarantine {
-                Some(cause) => PhysicalRun::Quarantined(cause.clone()),
-                None => PhysicalRun::Complete(result),
+        let result = match command {
+            VirtualReviewNativeCommand::Evaluate(invocation) => self
+                .run(&invocation.input, &invocation.identity)
+                .map(VirtualReviewNativeResult::Evaluation),
+            VirtualReviewNativeCommand::EvaluateTicket { ticket, invocation }
+            | VirtualReviewNativeCommand::EvaluateTicketScoped {
+                ticket, invocation, ..
+            } => {
+                let before = self.stats.clone();
+                let outcome = self.run_for_ticket(ticket, invocation);
+                let evidence =
+                    PalsNNInputEvidence::between(&before, &self.stats, self.quarantine.is_none());
+                let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
+                    &before,
+                    &self.stats,
+                    invocation.input.role,
+                    self.quarantine.is_none(),
+                );
+                Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
+                    outcome,
+                    actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
+                    complete: evidence.complete,
+                    owner_accounting,
+                })
             }
+            #[cfg(feature = "native-validation-diagnostics")]
+            VirtualReviewNativeCommand::EvaluateTicketForValidation {
+                ticket,
+                execution,
+                invocation,
+            } => {
+                let _validation_ticket = self
+                    .validation_trace
+                    .as_ref()
+                    .map(|trace| trace.enter_ticket(*ticket, *execution));
+                let before = self.stats.clone();
+                let outcome = self.run_for_ticket(ticket, invocation);
+                let evidence =
+                    PalsNNInputEvidence::between(&before, &self.stats, self.quarantine.is_none());
+                let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
+                    &before,
+                    &self.stats,
+                    invocation.input.role,
+                    self.quarantine.is_none(),
+                );
+                Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
+                    outcome,
+                    actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
+                    complete: evidence.complete,
+                    owner_accounting,
+                })
+            }
+            VirtualReviewNativeCommand::AcceptTicket {
+                ticket,
+                invocation,
+                completion,
+            } => self
+                .accept_completed_ticket(ticket, invocation, completion)
+                .map(|()| VirtualReviewNativeResult::TicketAccepted),
+            VirtualReviewNativeCommand::DiscardTicket(ticket) => self
+                .discard_completed_ticket(ticket)
+                .map(|()| VirtualReviewNativeResult::TicketDiscarded),
+            VirtualReviewNativeCommand::QuiesceRoot => {
+                self.quiesce_root()
+                    .map(|()| VirtualReviewNativeResult::RootQuiesced {
+                        game_generation: self.generation,
+                    })
+            }
+            VirtualReviewNativeCommand::ResetTo(generation) => {
+                self.reset_to(*generation)
+                    .map(|()| VirtualReviewNativeResult::ResetTo {
+                        game_generation: *generation,
+                    })
+            }
+            VirtualReviewNativeCommand::NewGame => {
+                self.new_game().map(|()| VirtualReviewNativeResult::NewGame)
+            }
+            VirtualReviewNativeCommand::SnapshotStats => {
+                self.snapshot_stats().map(VirtualReviewNativeResult::Stats)
+            }
+            VirtualReviewNativeCommand::SnapshotOwner => self
+                .idle()
+                .map(|()| VirtualReviewNativeResult::Owner(self.owner_snapshot())),
+            VirtualReviewNativeCommand::VerifyRuntime => self
+                .verify_runtime()
+                .map(|()| VirtualReviewNativeResult::RuntimeVerified),
+            VirtualReviewNativeCommand::VerifyCudaPlacement => self
+                .verify_cuda_placement()
+                .map(|w| VirtualReviewNativeResult::CudaPlacementVerified(Box::new(w))),
+            VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => self
+                .verify_virtual_cuda_placement()
+                .map(|w| VirtualReviewNativeResult::VirtualCudaPlacementVerified(Box::new(w))),
+            #[cfg(target_os = "linux")]
+            VirtualReviewNativeCommand::VerifySystemVirtualCudaPlacement => {
+                self.verify_system_virtual_cuda_placement().map(|w| {
+                    VirtualReviewNativeResult::SystemVirtualCudaPlacementVerified(Box::new(w))
+                })
+            }
+        };
+        match &self.quarantine {
+            Some(cause) => PhysicalRun::Quarantined(cause.clone()),
+            None => PhysicalRun::Complete(result),
+        }
     }
     pub fn into_worker(
         mut self,
@@ -2639,8 +2681,8 @@ mod tests {
     use super::*;
     use crate::pals_model::PalsCandidateToken;
     use model::{
-        INPUT_SCHEMA, ReviewAnchorInput, ReviewQueryInput, ReviewQueryPurpose, ReviewRecordInput,
-        ReviewRecordKind,
+        ReviewAnchorInput, ReviewQueryInput, ReviewQueryPurpose, ReviewRecordInput,
+        ReviewRecordKind, INPUT_SCHEMA,
     };
     #[test]
     fn synchronous_tracker_requires_only_entered_runs_to_complete() {
@@ -2846,15 +2888,13 @@ mod tests {
         assert_eq!(actual.validator_nn_runs_attempted(), 1);
         assert_eq!(actual.validator_nn_runs_failed_known(), 1);
         assert_eq!(actual.validator_nn_runs_completed(), 0);
-        assert!(
-            VirtualReviewTicketOwnerAccounting::between(
-                &before,
-                &failed,
-                PalsRole::Validator,
-                false,
-            )
-            .is_none()
-        );
+        assert!(VirtualReviewTicketOwnerAccounting::between(
+            &before,
+            &failed,
+            PalsRole::Validator,
+            false,
+        )
+        .is_none());
     }
     #[test]
     fn ticket_accounting_public_only_failure_never_counts_a_validator_role_call() {
@@ -2879,15 +2919,13 @@ mod tests {
         assert_eq!(actual.validator_nn_runs_attempted(), 0);
         assert_eq!(actual.validator_nn_runs_completed(), 0);
         assert_eq!(actual.validator_nn_runs_failed_known(), 0);
-        assert!(
-            VirtualReviewTicketOwnerAccounting::between(
-                &before,
-                &failed,
-                PalsRole::Validator,
-                false,
-            )
-            .is_none()
-        );
+        assert!(VirtualReviewTicketOwnerAccounting::between(
+            &before,
+            &failed,
+            PalsRole::Validator,
+            false,
+        )
+        .is_none());
     }
     #[test]
     fn ticket_accounting_rejects_decreasing_saturated_inconsistent_and_mixed_counters() {
@@ -2895,48 +2933,40 @@ mod tests {
         let mut changed = before.clone();
         changed.admitted_role_requests = 1;
         changed.role_nn_runs_completed = 1;
-        assert!(
-            VirtualReviewTicketOwnerAccounting::between(
-                &before,
-                &changed,
-                PalsRole::Validator,
-                true,
-            )
-            .is_none()
-        );
+        assert!(VirtualReviewTicketOwnerAccounting::between(
+            &before,
+            &changed,
+            PalsRole::Validator,
+            true,
+        )
+        .is_none());
         changed = before.clone();
         changed.admitted_role_requests = u64::MAX;
-        assert!(
-            VirtualReviewTicketOwnerAccounting::between(
-                &before,
-                &changed,
-                PalsRole::Validator,
-                true,
-            )
-            .is_none()
-        );
+        assert!(VirtualReviewTicketOwnerAccounting::between(
+            &before,
+            &changed,
+            PalsRole::Validator,
+            true,
+        )
+        .is_none());
         changed = before.clone();
         changed.admitted_role_requests = 1;
-        assert!(
-            VirtualReviewTicketOwnerAccounting::between(
-                &changed,
-                &before,
-                PalsRole::Validator,
-                true,
-            )
-            .is_none()
-        );
+        assert!(VirtualReviewTicketOwnerAccounting::between(
+            &changed,
+            &before,
+            PalsRole::Validator,
+            true,
+        )
+        .is_none());
         changed.admitted_role_requests = 2;
         changed.public_cache_hits = 2;
-        assert!(
-            VirtualReviewTicketOwnerAccounting::between(
-                &before,
-                &changed,
-                PalsRole::Validator,
-                true,
-            )
-            .is_none()
-        );
+        assert!(VirtualReviewTicketOwnerAccounting::between(
+            &before,
+            &changed,
+            PalsRole::Validator,
+            true,
+        )
+        .is_none());
     }
     fn input() -> PalsVirtualReviewInput {
         let movement = PalsCandidateToken {

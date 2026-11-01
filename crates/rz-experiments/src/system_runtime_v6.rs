@@ -584,13 +584,15 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("unregistered_native_mappings");
-        assert!(SystemRuntimeReceiptV6::from_json(
-            &serde_json::to_string(&missing).unwrap(),
-            &lock,
-            7,
-            1
-        )
-        .is_err());
+        assert!(
+            SystemRuntimeReceiptV6::from_json(
+                &serde_json::to_string(&missing).unwrap(),
+                &lock,
+                7,
+                1
+            )
+            .is_err()
+        );
         receipt.physical_completion = PhysicalCompletionV6::Confirmed {
             completion_id: "fence".into(),
         };
@@ -624,9 +626,9 @@ mod tests {
         };
         assert!(receipt.validate_success(&lock, 7, 1).is_ok());
         let bytes = receipt.canonical_bytes(&lock, 7, 1).unwrap();
-        let decoded = SystemRuntimeReceiptV6::from_json(
-            std::str::from_utf8(&bytes).unwrap(), &lock, 7, 1,
-        ).unwrap();
+        let decoded =
+            SystemRuntimeReceiptV6::from_json(std::str::from_utf8(&bytes).unwrap(), &lock, 7, 1)
+                .unwrap();
         assert_eq!(decoded.unregistered_native_mappings, None);
     }
 

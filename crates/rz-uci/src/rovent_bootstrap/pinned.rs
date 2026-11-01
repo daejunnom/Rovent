@@ -777,7 +777,9 @@ impl RoventPinnedNativeSources<RoventInputLockV3> {
     pub(crate) fn load_system_cuda_with(
         &self,
         control: &RoventStartupControl,
-        load: impl FnOnce(&rz_eval::onnx::SystemRuntime) -> Result<rz_eval::onnx::OrtRuntime, BackendError>,
+        load: impl FnOnce(
+            &rz_eval::onnx::SystemRuntime,
+        ) -> Result<rz_eval::onnx::OrtRuntime, BackendError>,
     ) -> Result<
         crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup,
         BackendError,
@@ -785,7 +787,10 @@ impl RoventPinnedNativeSources<RoventInputLockV3> {
         self.validate_lock()?;
         control.check()?;
         if !self.admits_original_startup_control(control) {
-            return Err(fail(K::IdentityMismatch, "system CUDA startup control differs from original owner"));
+            return Err(fail(
+                K::IdentityMismatch,
+                "system CUDA startup control differs from original owner",
+            ));
         }
         crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup::capture_and_load_until_with(
             &self.lock.manifest.system_runtime_lock, control.until, control.cancellation.as_ref(), load,

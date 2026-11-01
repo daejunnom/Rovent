@@ -149,7 +149,10 @@ fn native_snapshot_uses_new_inode_preserves_prior_attempt_and_fails_closed_on_pi
     fs::hard_link(source.join("input-1"), source.join("source-hardlink")).unwrap();
     let owner = prepare_native_launch(&spec, &source, &output, "attempt-one").unwrap();
     assert!(output.join("unrelated-prior-link").is_symlink());
-    assert_eq!(fs::metadata(&prior_history).unwrap().len(), prior_logical_bytes);
+    assert_eq!(
+        fs::metadata(&prior_history).unwrap().len(),
+        prior_logical_bytes
+    );
     for (relative, expected_mode) in [
         ("attempt-one", 0o700),
         ("attempt-one/inputs", 0o500),

@@ -267,7 +267,10 @@ where
     fn finish(&mut self, until: Instant) -> bool {
         self.backend.finish(until)
     }
-    fn finish_report(&mut self, until: Instant) -> crate::pals_native::ticketed::TicketNativeFinishReport {
+    fn finish_report(
+        &mut self,
+        until: Instant,
+    ) -> crate::pals_native::ticketed::TicketNativeFinishReport {
         self.backend.finish_report(until)
     }
     fn recovery_owner(&self) -> Option<rz_eval::worker::PhysicalRecoveryKey> {

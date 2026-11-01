@@ -71,9 +71,14 @@ pub struct FactoryStartupCustody<C> {
     recovery_key: super::recovery::TicketNativeRecoveryKey,
 }
 impl<C> FactoryStartupCustody<C> {
-    pub fn bind_inner(&mut self, key: &rz_eval::worker::PhysicalRecoveryKey, epoch: u64)
-        -> Result<(), super::recovery::TicketRecoveryError> {
-        if self.entry.entered { return Err(super::recovery::TicketRecoveryError::WrongState); }
+    pub fn bind_inner(
+        &mut self,
+        key: &rz_eval::worker::PhysicalRecoveryKey,
+        epoch: u64,
+    ) -> Result<(), super::recovery::TicketRecoveryError> {
+        if self.entry.entered {
+            return Err(super::recovery::TicketRecoveryError::WrongState);
+        }
         self.recovery_key.bind_inner_before_native(key, epoch)
     }
     pub fn parts(&mut self) -> (&mut C, &mut FactoryNativeEntry) {
@@ -87,8 +92,11 @@ pub trait FactoryStartupRecovery: Send + 'static {
     fn reobserve(&mut self, _: Instant) -> Result<TicketNativeRecoveryProbe, RoleFailure> {
         Ok(TicketNativeRecoveryProbe::Unknown)
     }
-    fn release(&mut self, _: &rz_eval::worker::PhysicalRecoveryConfirmation, _: Instant)
-        -> Result<TicketNativeRelease, RoleFailure> {
+    fn release(
+        &mut self,
+        _: &rz_eval::worker::PhysicalRecoveryConfirmation,
+        _: Instant,
+    ) -> Result<TicketNativeRelease, RoleFailure> {
         Ok(TicketNativeRelease::Unknown)
     }
 }
@@ -395,7 +403,10 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
     }
     /// Observe the same quarantined owner. Unsupported or timed-out fence
     /// providers must return false; this cannot manufacture a completion.
-    fn reobserve_quarantined(&mut self, _: Instant) -> Result<TicketNativeRecoveryProbe, RoleFailure> {
+    fn reobserve_quarantined(
+        &mut self,
+        _: Instant,
+    ) -> Result<TicketNativeRecoveryProbe, RoleFailure> {
         Ok(TicketNativeRecoveryProbe::Unknown)
     }
     fn recovery_owner(&self) -> Option<rz_eval::worker::PhysicalRecoveryKey> {
@@ -408,8 +419,11 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
     }
     /// Release is a separate operation using the same original proof. A
     /// backend lacking this path must remain Unknown instead of dropping state.
-    fn release_quarantined(&mut self, _: &rz_eval::worker::PhysicalRecoveryConfirmation, _: Instant)
-        -> Result<TicketNativeRelease, RoleFailure> {
+    fn release_quarantined(
+        &mut self,
+        _: &rz_eval::worker::PhysicalRecoveryConfirmation,
+        _: Instant,
+    ) -> Result<TicketNativeRelease, RoleFailure> {
         Ok(TicketNativeRelease::Unknown)
     }
     /// True requires the actual physical fence and worker join, not a timeout.
@@ -622,10 +636,15 @@ pub struct TicketRetainedFactoryState<C> {
 }
 impl TicketPendingAcknowledgement {
     pub fn ticket(&self) -> &RoleTicketEnvelope {
-        match &self.original { Ack::Accept(_, ticket, _) | Ack::Discard(_, ticket) => ticket }
+        match &self.original {
+            Ack::Accept(_, ticket, _) | Ack::Discard(_, ticket) => ticket,
+        }
     }
     pub fn into_permit(self) -> Option<NativeAcceptancePermit> {
-        match self.original { Ack::Accept(_, _, permit) => permit, Ack::Discard(_, _) => None }
+        match self.original {
+            Ack::Accept(_, _, permit) => permit,
+            Ack::Discard(_, _) => None,
+        }
     }
 }
 struct PreparationControl {
@@ -691,10 +710,16 @@ pub(super) struct Shared {
 }
 impl Shared {
     pub(super) fn take_finish_report(&self) -> Option<TicketNativeFinishReport> {
-        self.finish_report.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.finish_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
     pub(super) fn has_finish_report(&self) -> bool {
-        self.finish_report.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.finish_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
     fn seal_admission(&self) {
         let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
@@ -702,10 +727,16 @@ impl Shared {
     }
     #[cfg(test)]
     fn wait_admission_test(&self) {
-        let gate = self.admission_test.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let gate = self
+            .admission_test
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(gate) = gate {
             let _ = gate.entered.send(());
-            let _ = gate.release.recv_timeout(gate.until.saturating_duration_since(Instant::now()));
+            let _ = gate
+                .release
+                .recv_timeout(gate.until.saturating_duration_since(Instant::now()));
         }
     }
     pub(super) fn recovery_dequeued(&self) {
@@ -730,15 +761,14 @@ struct EventPublisher<O> {
 impl<O: Send + Sync + 'static> EventPublisher<O> {
     // SendError returns the original terminal/ack event, including any owned
     // permit, instead of replacing failed delivery with a smaller error token.
-    fn send(
-        &self,
-        event: TicketNativeEvent<O>,
-    ) -> Result<(), ()> {
+    fn send(&self, event: TicketNativeEvent<O>) -> Result<(), ()> {
         self.shared.pending_reports.fetch_add(1, Ordering::AcqRel);
         let sent = if self.recoverable {
             self.sender.try_send(event)
         } else {
-            self.sender.send(event).map_err(|mpsc::SendError(event)| mpsc::TrySendError::Disconnected(event))
+            self.sender
+                .send(event)
+                .map_err(|mpsc::SendError(event)| mpsc::TrySendError::Disconnected(event))
         };
         let result = match sent {
             Ok(()) => Ok(()),
@@ -747,7 +777,9 @@ impl<O: Send + Sync + 'static> EventPublisher<O> {
                 self.shared.closed.store(true, Ordering::Release);
                 // The original event stays in the same worker state. This
                 // allocates only if the bounded preallocated reserve is used.
-                self.undelivered.borrow_mut().push(super::recovery::TicketUndeliveredEvent::new(event));
+                self.undelivered
+                    .borrow_mut()
+                    .push(super::recovery::TicketUndeliveredEvent::new(event));
                 Err(())
             }
         };
@@ -773,7 +805,10 @@ impl<O> OwnerEvents<O> {
     fn try_recv(&self) -> Result<TicketNativeEvent<O>, mpsc::TryRecvError> {
         match self {
             Self::Legacy(receiver) => receiver.try_recv(),
-            Self::Recoverable(receiver) => receiver.lock().unwrap_or_else(|e| e.into_inner()).try_recv(),
+            Self::Recoverable(receiver) => receiver
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_recv(),
         }
     }
 }
@@ -832,16 +867,33 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
             || limits.prepared_host_bytes_per_ticket == 0
             || limits.output_host_bytes_per_ticket == 0
         {
-            return Err(FactoryStartupSpawnRejection { error: TicketServiceError::Capacity, owner, recovery_key: None, unstarted_thread: None });
+            return Err(FactoryStartupSpawnRejection {
+                error: TicketServiceError::Capacity,
+                owner,
+                recovery_key: None,
+                unstarted_thread: None,
+            });
         }
         let (reservation, key) = match super::recovery::TicketNativeRecoveryReservation::reserve() {
             Ok(value) => value,
-            Err(_) => return Err(FactoryStartupSpawnRejection { error: TicketServiceError::Capacity, owner, recovery_key: None, unstarted_thread: None }),
+            Err(_) => {
+                return Err(FactoryStartupSpawnRejection {
+                    error: TicketServiceError::Capacity,
+                    owner,
+                    recovery_key: None,
+                    unstarted_thread: None,
+                });
+            }
         };
         let join = Arc::new(super::recovery::TicketOwnerJoin::new());
         if reservation.attach(Arc::clone(&join)).is_err() {
             let _ = reservation.cancel_unstarted();
-            return Err(FactoryStartupSpawnRejection { error: TicketServiceError::WorkerGone, owner, recovery_key: None, unstarted_thread: None });
+            return Err(FactoryStartupSpawnRejection {
+                error: TicketServiceError::WorkerGone,
+                owner,
+                recovery_key: None,
+                unstarted_thread: None,
+            });
         }
         let (commands, command_receiver) = mpsc::sync_channel(command_capacity);
         let (acknowledgements, ack_receiver) = mpsc::sync_channel(pending_capacity);
@@ -849,194 +901,424 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         let shared = Arc::new(Shared {
             #[cfg(feature = "native-validation-diagnostics")]
             validation_trace: std::sync::OnceLock::new(),
-            controls: Mutex::new(BTreeMap::new()), admission: Mutex::new(()), pending_capacity, command_capacity,
-            closed: AtomicBool::new(false), root_closed: AtomicBool::new(false),
-            quarantine: AtomicBool::new(false), factory_status: AtomicU8::new(0),
-            shutdown_until: Mutex::new(None), root_authority: Mutex::new(None),
-            root_quiesce: Mutex::new(None), root_fence: Mutex::new(None),
-            ready_clock: Mutex::new(None), acceptance_verifier: Mutex::new(None),
-            pending_reports: AtomicUsize::new(0), finish_report: Mutex::new(None), finish_report_snapshot: Mutex::new(None), requires_finish_report: true, signal: CompletionSignal::default(),
+            controls: Mutex::new(BTreeMap::new()),
+            admission: Mutex::new(()),
+            pending_capacity,
+            command_capacity,
+            closed: AtomicBool::new(false),
+            root_closed: AtomicBool::new(false),
+            quarantine: AtomicBool::new(false),
+            factory_status: AtomicU8::new(0),
+            shutdown_until: Mutex::new(None),
+            root_authority: Mutex::new(None),
+            root_quiesce: Mutex::new(None),
+            root_fence: Mutex::new(None),
+            ready_clock: Mutex::new(None),
+            acceptance_verifier: Mutex::new(None),
+            pending_reports: AtomicUsize::new(0),
+            finish_report: Mutex::new(None),
+            finish_report_snapshot: Mutex::new(None),
+            requires_finish_report: true,
+            signal: CompletionSignal::default(),
             ready_cpu: Mutex::new(None),
-            #[cfg(test)] cancellation_scan_test: Mutex::new(CancellationScanTestState::default()),
-            #[cfg(test)] admission_test: Mutex::new(None),
+            #[cfg(test)]
+            cancellation_scan_test: Mutex::new(CancellationScanTestState::default()),
+            #[cfg(test)]
+            admission_test: Mutex::new(None),
         });
         let events = Arc::new(Mutex::new(events));
-        if key.install_shared_receiver(&events, Arc::clone(&shared)).is_err() {
+        if key
+            .install_shared_receiver(&events, Arc::clone(&shared))
+            .is_err()
+        {
             let _ = reservation.cancel_spawn_failure();
-            return Err(FactoryStartupSpawnRejection { error: TicketServiceError::WorkerGone, owner, recovery_key: None, unstarted_thread: None });
+            return Err(FactoryStartupSpawnRejection {
+                error: TicketServiceError::WorkerGone,
+                owner,
+                recovery_key: None,
+                unstarted_thread: None,
+            });
         }
-        let publisher = EventPublisher { sender: event_sender, shared: Arc::clone(&shared), undelivered: RefCell::new(Vec::with_capacity(EVENTS)), recoverable: true };
+        let publisher = EventPublisher {
+            sender: event_sender,
+            shared: Arc::clone(&shared),
+            undelivered: RefCell::new(Vec::with_capacity(EVENTS)),
+            recoverable: true,
+        };
         let worker_shared = Arc::clone(&shared);
         let worker_key = key.clone();
         let transfer = Arc::new(Mutex::new(Some((owner, reservation))));
         let worker_transfer = Arc::clone(&transfer);
         let (start, started) = mpsc::sync_channel::<()>(1);
-        let spawned = thread::Builder::new().name("pals-native-ticket-owner".into()).spawn(move || {
-            if started.recv().is_err() { return; }
-            let Some((owner, mut reservation)) = worker_transfer.lock().unwrap_or_else(|e| e.into_inner()).take() else { return; };
-            let mut custody = FactoryStartupCustody { owner, entry: FactoryNativeEntry { entered: false }, recovery_key: worker_key };
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(&mut custody)));
-            match result {
-                Ok(Ok(backend)) => {
-                    worker_shared.factory_status.store(1, Ordering::Release);
-                    let mut state = WorkerState {
-                        backend, held: BTreeMap::new(), commands: command_receiver, acks: ack_receiver,
-                        events: publisher, active: None, active_ack: None, active_prepared: None, active_output: None, active_panics: Vec::with_capacity(4), active_observations: TicketNativeObservationFailures::default(), active_ack_result: None, recovery_acks: Vec::with_capacity(pending_capacity), recovery_commands: Vec::with_capacity(command_capacity), recovery_root_fence: None,
-                    };
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recoverable::run_worker_loop(&mut state, &worker_shared, limits)));
-                    let (finished, panicked) = match result {
-                        Ok(finished) => (finished, false),
-                        Err(payload) => { state.active_panics.push(payload); (false, true) }
-                    };
-                    worker_shared.seal_admission();
-                    if finished && state.events.undelivered.borrow().is_empty()
-                        && state.held.is_empty() && state.active.is_none() && state.active_ack.is_none()
-                        && state.recovery_commands.iter().all(|item| !item.is_pending())
-                        && state.recovery_acks.iter().all(|item| !item.is_pending())
-                        && state.active_prepared.is_none() && state.active_output.is_none()
-                        && state.active_panics.is_empty() && state.active_observations.is_empty()
-                        && state.active_ack_result.is_none() && state.recovery_root_fence.is_none() {
-                        let _ = reservation.finish_clean();
-                        return;
-                    }
-                    worker_shared.quarantine.store(!finished, Ordering::Release);
-                    for cancel in worker_shared.controls.lock().unwrap_or_else(|e| e.into_inner()).values() { cancel.canceled.store(true, Ordering::Release); }
-                    if panicked {
-                        let _ = state.events.send(TicketNativeEvent::Finished { physical_shutdown_confirmed: false });
-                    }
-                    worker_shared.signal.notify();
-                    // Bind only the actual outstanding physical lease, the
-                    // currently retained Execute command and its original
-                    // held ticket. Different/missing scopes remain Unknown.
-                    if let (Some(Command::Execute(id, active_ticket, _)), Some(inner), Some(work)) = (
-                        state.active.as_ref(), state.backend.recovery_owner(), state.backend.recovery_work_scope(),
-                    ) {
-                        if let rz_eval::worker::PhysicalWorkScope::Ticket { ticket, .. } = work {
-                            if ticket == *active_ticket && state.held.get(id).is_some_and(|held| held.ticket == Some(ticket)) {
-                                let _ = reservation.bind_active_work(&inner, work);
+        let spawned = thread::Builder::new()
+            .name("pals-native-ticket-owner".into())
+            .spawn(move || {
+                if started.recv().is_err() {
+                    return;
+                }
+                let Some((owner, mut reservation)) = worker_transfer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                else {
+                    return;
+                };
+                let mut custody = FactoryStartupCustody {
+                    owner,
+                    entry: FactoryNativeEntry { entered: false },
+                    recovery_key: worker_key,
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    factory(&mut custody)
+                }));
+                match result {
+                    Ok(Ok(backend)) => {
+                        worker_shared.factory_status.store(1, Ordering::Release);
+                        let mut state = WorkerState {
+                            backend,
+                            held: BTreeMap::new(),
+                            commands: command_receiver,
+                            acks: ack_receiver,
+                            events: publisher,
+                            active: None,
+                            active_ack: None,
+                            active_prepared: None,
+                            active_output: None,
+                            active_panics: Vec::with_capacity(4),
+                            active_observations: TicketNativeObservationFailures::default(),
+                            active_ack_result: None,
+                            recovery_acks: Vec::with_capacity(pending_capacity),
+                            recovery_commands: Vec::with_capacity(command_capacity),
+                            recovery_root_fence: None,
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            recoverable::run_worker_loop(&mut state, &worker_shared, limits)
+                        }));
+                        let (finished, panicked) = match result {
+                            Ok(finished) => (finished, false),
+                            Err(payload) => {
+                                state.active_panics.push(payload);
+                                (false, true)
                             }
+                        };
+                        worker_shared.seal_admission();
+                        if finished
+                            && state.events.undelivered.borrow().is_empty()
+                            && state.held.is_empty()
+                            && state.active.is_none()
+                            && state.active_ack.is_none()
+                            && state
+                                .recovery_commands
+                                .iter()
+                                .all(|item| !item.is_pending())
+                            && state.recovery_acks.iter().all(|item| !item.is_pending())
+                            && state.active_prepared.is_none()
+                            && state.active_output.is_none()
+                            && state.active_panics.is_empty()
+                            && state.active_observations.is_empty()
+                            && state.active_ack_result.is_none()
+                            && state.recovery_root_fence.is_none()
+                        {
+                            let _ = reservation.finish_clean();
+                            return;
                         }
-                    }
-                    let WorkerState { backend, events, held, commands, active, active_ack, acks,
-                        recovery_acks, recovery_commands, active_prepared, active_output, active_panics,
-                        active_observations, active_ack_result, recovery_root_fence } = &mut state;
-                    let mut retained_state: Option<super::recovery::TicketUndeliveredEvent> = None;
-                    reservation.park(finished, |op| match op {
-                        super::recovery::TicketRecoveryOperation::Observe(until) => super::recovery::TicketRecoveryOperationResult::Observe(backend.reobserve_quarantined(until).unwrap_or(TicketNativeRecoveryProbe::Unknown)),
-                        super::recovery::TicketRecoveryOperation::Release(proof, until) => super::recovery::TicketRecoveryOperationResult::Release(backend.release_quarantined(proof, until).unwrap_or(TicketNativeRelease::Unknown)),
-                        super::recovery::TicketRecoveryOperation::TakeAck => {
-                            if let Some(original) = recovery_acks.iter().find(|item| item.is_pending()).cloned() {
-                                super::recovery::TicketRecoveryOperationResult::Ack(Some(original))
-                            } else {
-                                let ack = active_ack.take().or_else(|| acks.try_recv().ok());
-                                let original = ack.map(|original| super::recovery::TicketUndeliveredEvent::new(TicketPendingAcknowledgement { original }));
-                                if let Some(original) = &original { recovery_acks.push(original.clone()); }
-                                super::recovery::TicketRecoveryOperationResult::Ack(original)
-                            }
+                        worker_shared.quarantine.store(!finished, Ordering::Release);
+                        for cancel in worker_shared
+                            .controls
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .values()
+                        {
+                            cancel.canceled.store(true, Ordering::Release);
                         }
-                        super::recovery::TicketRecoveryOperation::TakeState { .. } => {
-                            if retained_state.is_none() {
-                                let (_sender, empty) = mpsc::channel();
-                                let retained = TicketRetainedOwnerState {
-                                    held: std::mem::take(held),
-                                    active_command: active.take().map(Into::into),
-                                    queued_commands: std::mem::replace(commands, empty),
-                                    original_command_handles: std::mem::take(recovery_commands),
-                                    active_prepared: active_prepared.take(),
-                                    active_output: active_output.take(),
-                                    panic_payloads: std::mem::take(active_panics),
-                                    observations: std::mem::take(active_observations),
-                                    active_ack_result: active_ack_result.take(),
-                                    original_root_fence: recovery_root_fence.take(),
-                                };
-                                retained_state = Some(super::recovery::TicketUndeliveredEvent::new(retained));
-                            }
-                            super::recovery::TicketRecoveryOperationResult::State(retained_state.clone())
+                        if panicked {
+                            let _ = state.events.send(TicketNativeEvent::Finished {
+                                physical_shutdown_confirmed: false,
+                            });
                         }
-                        super::recovery::TicketRecoveryOperation::CanRelease => {
-                            if active_ack.is_none() && recovery_acks.iter().all(|item| !item.is_pending()) {
-                                if let Ok(original) = acks.try_recv() {
-                                    recovery_acks.push(super::recovery::TicketUndeliveredEvent::new(TicketPendingAcknowledgement { original }));
+                        worker_shared.signal.notify();
+                        // Bind only the actual outstanding physical lease, the
+                        // currently retained Execute command and its original
+                        // held ticket. Different/missing scopes remain Unknown.
+                        if let (
+                            Some(Command::Execute(id, active_ticket, _)),
+                            Some(inner),
+                            Some(work),
+                        ) = (
+                            state.active.as_ref(),
+                            state.backend.recovery_owner(),
+                            state.backend.recovery_work_scope(),
+                        ) {
+                            if let rz_eval::worker::PhysicalWorkScope::Ticket { ticket, .. } = work
+                            {
+                                if ticket == *active_ticket
+                                    && state
+                                        .held
+                                        .get(id)
+                                        .is_some_and(|held| held.ticket == Some(ticket))
+                                {
+                                    let _ = reservation.bind_active_work(&inner, work);
                                 }
                             }
-                            super::recovery::TicketRecoveryOperationResult::CanRelease(
-                                active_ack.is_none() && recovery_acks.iter().all(|item| !item.is_pending())
-                                    && retained_state.as_ref().is_some_and(|state| !state.is_pending())
-                            )
                         }
-                    }, &events.undelivered);
-                }
-                result => {
-                    let cause = match result {
-                        Ok(Err(cause)) => cause,
-                        Err(payload) => {
-                            publisher.undelivered.borrow_mut().push(super::recovery::TicketUndeliveredEvent::new(payload));
-                            RoleFailure::Backend("native startup factory panicked".into())
-                        },
-                        Ok(Ok(_)) => unreachable!(),
-                    };
-                    let entered = custody.entry.entered();
-                    worker_shared.seal_admission();
-                    worker_shared.factory_status.store(if entered { 3 } else { 2 }, Ordering::Release);
-                    let _ = publisher.send(TicketNativeEvent::StartupFailed(cause));
-                    if !entered {
-                        let events = publisher.undelivered.into_inner();
-                        if let Err((_owner, _events)) = reservation.before_native(custody.owner, events) {
-                            // Registry identity corruption cannot authorize dropping
-                            // the original owner. Keep it on this live thread.
-                            loop { thread::park(); }
-                        }
-                        return;
+                        let WorkerState {
+                            backend,
+                            events,
+                            held,
+                            commands,
+                            active,
+                            active_ack,
+                            acks,
+                            recovery_acks,
+                            recovery_commands,
+                            active_prepared,
+                            active_output,
+                            active_panics,
+                            active_observations,
+                            active_ack_result,
+                            recovery_root_fence,
+                        } = &mut state;
+                        let mut retained_state: Option<super::recovery::TicketUndeliveredEvent> =
+                            None;
+                        reservation.park(
+                            finished,
+                            |op| match op {
+                                super::recovery::TicketRecoveryOperation::Observe(until) => {
+                                    super::recovery::TicketRecoveryOperationResult::Observe(
+                                        backend
+                                            .reobserve_quarantined(until)
+                                            .unwrap_or(TicketNativeRecoveryProbe::Unknown),
+                                    )
+                                }
+                                super::recovery::TicketRecoveryOperation::Release(proof, until) => {
+                                    super::recovery::TicketRecoveryOperationResult::Release(
+                                        backend
+                                            .release_quarantined(proof, until)
+                                            .unwrap_or(TicketNativeRelease::Unknown),
+                                    )
+                                }
+                                super::recovery::TicketRecoveryOperation::TakeAck => {
+                                    if let Some(original) =
+                                        recovery_acks.iter().find(|item| item.is_pending()).cloned()
+                                    {
+                                        super::recovery::TicketRecoveryOperationResult::Ack(Some(
+                                            original,
+                                        ))
+                                    } else {
+                                        let ack =
+                                            active_ack.take().or_else(|| acks.try_recv().ok());
+                                        let original = ack.map(|original| {
+                                            super::recovery::TicketUndeliveredEvent::new(
+                                                TicketPendingAcknowledgement { original },
+                                            )
+                                        });
+                                        if let Some(original) = &original {
+                                            recovery_acks.push(original.clone());
+                                        }
+                                        super::recovery::TicketRecoveryOperationResult::Ack(
+                                            original,
+                                        )
+                                    }
+                                }
+                                super::recovery::TicketRecoveryOperation::TakeState { .. } => {
+                                    if retained_state.is_none() {
+                                        let (_sender, empty) = mpsc::channel();
+                                        let retained = TicketRetainedOwnerState {
+                                            held: std::mem::take(held),
+                                            active_command: active.take().map(Into::into),
+                                            queued_commands: std::mem::replace(commands, empty),
+                                            original_command_handles: std::mem::take(
+                                                recovery_commands,
+                                            ),
+                                            active_prepared: active_prepared.take(),
+                                            active_output: active_output.take(),
+                                            panic_payloads: std::mem::take(active_panics),
+                                            observations: std::mem::take(active_observations),
+                                            active_ack_result: active_ack_result.take(),
+                                            original_root_fence: recovery_root_fence.take(),
+                                        };
+                                        retained_state = Some(
+                                            super::recovery::TicketUndeliveredEvent::new(retained),
+                                        );
+                                    }
+                                    super::recovery::TicketRecoveryOperationResult::State(
+                                        retained_state.clone(),
+                                    )
+                                }
+                                super::recovery::TicketRecoveryOperation::CanRelease => {
+                                    if active_ack.is_none()
+                                        && recovery_acks.iter().all(|item| !item.is_pending())
+                                    {
+                                        if let Ok(original) = acks.try_recv() {
+                                            recovery_acks.push(
+                                                super::recovery::TicketUndeliveredEvent::new(
+                                                    TicketPendingAcknowledgement { original },
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    super::recovery::TicketRecoveryOperationResult::CanRelease(
+                                        active_ack.is_none()
+                                            && recovery_acks.iter().all(|item| !item.is_pending())
+                                            && retained_state
+                                                .as_ref()
+                                                .is_some_and(|state| !state.is_pending()),
+                                    )
+                                }
+                            },
+                            &events.undelivered,
+                        );
                     }
-                    worker_shared.quarantine.store(true, Ordering::Release);
-                    let _ = publisher.send(TicketNativeEvent::Finished { physical_shutdown_confirmed: false });
-                    worker_shared.signal.notify();
-                    let mut owner = Some(custody.owner);
-                    let mut retained_factory: Option<super::recovery::TicketUndeliveredEvent> = None;
-                    reservation.park(false, |op| match op {
-                        super::recovery::TicketRecoveryOperation::Observe(until) => super::recovery::TicketRecoveryOperationResult::Observe(owner.as_mut().and_then(|owner| owner.reobserve(until).ok()).unwrap_or(TicketNativeRecoveryProbe::Unknown)),
-                        super::recovery::TicketRecoveryOperation::Release(proof, until) => super::recovery::TicketRecoveryOperationResult::Release(owner.as_mut().and_then(|owner| owner.release(proof, until).ok()).unwrap_or(TicketNativeRelease::Unknown)),
-                        super::recovery::TicketRecoveryOperation::TakeAck => super::recovery::TicketRecoveryOperationResult::Ack(None),
-                        super::recovery::TicketRecoveryOperation::TakeState { inner_released } => {
-                            if inner_released && retained_factory.is_none() {
-                                if let Some(owner) = owner.take() {
-                                    retained_factory = Some(super::recovery::TicketUndeliveredEvent::new(TicketRetainedFactoryState { owner }));
+                    result => {
+                        let cause = match result {
+                            Ok(Err(cause)) => cause,
+                            Err(payload) => {
+                                publisher
+                                    .undelivered
+                                    .borrow_mut()
+                                    .push(super::recovery::TicketUndeliveredEvent::new(payload));
+                                RoleFailure::Backend("native startup factory panicked".into())
+                            }
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                        let entered = custody.entry.entered();
+                        worker_shared.seal_admission();
+                        worker_shared
+                            .factory_status
+                            .store(if entered { 3 } else { 2 }, Ordering::Release);
+                        let _ = publisher.send(TicketNativeEvent::StartupFailed(cause));
+                        if !entered {
+                            let events = publisher.undelivered.into_inner();
+                            if let Err((_owner, _events)) =
+                                reservation.before_native(custody.owner, events)
+                            {
+                                // Registry identity corruption cannot authorize dropping
+                                // the original owner. Keep it on this live thread.
+                                loop {
+                                    thread::park();
                                 }
                             }
-                            super::recovery::TicketRecoveryOperationResult::State(retained_factory.clone())
-                        },
-                        super::recovery::TicketRecoveryOperation::CanRelease => super::recovery::TicketRecoveryOperationResult::CanRelease(retained_factory.as_ref().is_some_and(|state| !state.is_pending())),
-                    }, &publisher.undelivered);
+                            return;
+                        }
+                        worker_shared.quarantine.store(true, Ordering::Release);
+                        let _ = publisher.send(TicketNativeEvent::Finished {
+                            physical_shutdown_confirmed: false,
+                        });
+                        worker_shared.signal.notify();
+                        let mut owner = Some(custody.owner);
+                        let mut retained_factory: Option<super::recovery::TicketUndeliveredEvent> =
+                            None;
+                        reservation.park(
+                            false,
+                            |op| match op {
+                                super::recovery::TicketRecoveryOperation::Observe(until) => {
+                                    super::recovery::TicketRecoveryOperationResult::Observe(
+                                        owner
+                                            .as_mut()
+                                            .and_then(|owner| owner.reobserve(until).ok())
+                                            .unwrap_or(TicketNativeRecoveryProbe::Unknown),
+                                    )
+                                }
+                                super::recovery::TicketRecoveryOperation::Release(proof, until) => {
+                                    super::recovery::TicketRecoveryOperationResult::Release(
+                                        owner
+                                            .as_mut()
+                                            .and_then(|owner| owner.release(proof, until).ok())
+                                            .unwrap_or(TicketNativeRelease::Unknown),
+                                    )
+                                }
+                                super::recovery::TicketRecoveryOperation::TakeAck => {
+                                    super::recovery::TicketRecoveryOperationResult::Ack(None)
+                                }
+                                super::recovery::TicketRecoveryOperation::TakeState {
+                                    inner_released,
+                                } => {
+                                    if inner_released && retained_factory.is_none() {
+                                        if let Some(owner) = owner.take() {
+                                            retained_factory =
+                                                Some(super::recovery::TicketUndeliveredEvent::new(
+                                                    TicketRetainedFactoryState { owner },
+                                                ));
+                                        }
+                                    }
+                                    super::recovery::TicketRecoveryOperationResult::State(
+                                        retained_factory.clone(),
+                                    )
+                                }
+                                super::recovery::TicketRecoveryOperation::CanRelease => {
+                                    super::recovery::TicketRecoveryOperationResult::CanRelease(
+                                        retained_factory
+                                            .as_ref()
+                                            .is_some_and(|state| !state.is_pending()),
+                                    )
+                                }
+                            },
+                            &publisher.undelivered,
+                        );
+                    }
                 }
-            }
-        });
+            });
         let handle = match spawned {
             Ok(handle) => handle,
             Err(_) => {
-                let (owner, reservation) = transfer.lock().unwrap_or_else(|e| e.into_inner()).take().expect("unstarted transfer retains original owner");
+                let (owner, reservation) = transfer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .expect("unstarted transfer retains original owner");
                 let _ = reservation.cancel_spawn_failure();
-                return Err(FactoryStartupSpawnRejection { error: TicketServiceError::WorkerGone, owner, recovery_key: None, unstarted_thread: None });
+                return Err(FactoryStartupSpawnRejection {
+                    error: TicketServiceError::WorkerGone,
+                    owner,
+                    recovery_key: None,
+                    unstarted_thread: None,
+                });
             }
         };
         if let Err(handle) = join.install(handle) {
             drop(start);
-            let (owner, reservation) = transfer.lock().unwrap_or_else(|e| e.into_inner()).take().expect("unstarted transfer retains original owner");
+            let (owner, reservation) = transfer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .expect("unstarted transfer retains original owner");
             reservation.mark_start_not_delivered();
             key.release_shared_receiver();
-            return Err(FactoryStartupSpawnRejection { error: TicketServiceError::WorkerGone, owner, recovery_key: Some(key), unstarted_thread: Some(handle) });
+            return Err(FactoryStartupSpawnRejection {
+                error: TicketServiceError::WorkerGone,
+                owner,
+                recovery_key: Some(key),
+                unstarted_thread: Some(handle),
+            });
         }
         // The worker cannot access the native factory until the original join
         // handle is installed in both service and recovery registry.
         if start.send(()).is_err() {
             // The token was not delivered, so the factory could not run. Keep
             // its actual join handle in the registry without blocking here.
-            let (owner, reservation) = transfer.lock().unwrap_or_else(|e| e.into_inner()).take()
+            let (owner, reservation) = transfer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
                 .expect("failed start retains original owner");
             reservation.mark_start_not_delivered();
             key.release_shared_receiver();
-            return Err(FactoryStartupSpawnRejection { error: TicketServiceError::WorkerGone, owner, recovery_key: Some(key), unstarted_thread: None });
+            return Err(FactoryStartupSpawnRejection {
+                error: TicketServiceError::WorkerGone,
+                owner,
+                recovery_key: Some(key),
+                unstarted_thread: None,
+            });
         }
-        Ok(Self { commands, acknowledgements, events: Some(OwnerEvents::Recoverable(events)), shared, thread: OwnerThread::Recoverable(join), recovery_key: Some(key), next_preparation: 1 })
+        Ok(Self {
+            commands,
+            acknowledgements,
+            events: Some(OwnerEvents::Recoverable(events)),
+            shared,
+            thread: OwnerThread::Recoverable(join),
+            recovery_key: Some(key),
+            next_preparation: 1,
+        })
     }
 
     fn spawn_bounded(
@@ -1094,8 +1376,15 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
             .spawn(move || match factory() {
                 Ok(backend) => {
                     thread_shared.factory_status.store(1, Ordering::Release);
-                    worker(backend, receiver, ack_receiver, event_sender, thread_shared, limits)
-                },
+                    worker(
+                        backend,
+                        receiver,
+                        ack_receiver,
+                        event_sender,
+                        thread_shared,
+                        limits,
+                    )
+                }
                 Err(failure) => {
                     thread_shared.factory_status.store(4, Ordering::Release);
                     thread_shared.closed.store(true, Ordering::Release);
@@ -1154,8 +1443,14 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         &mut self,
         question: TicketPreparation<V, Q>,
     ) -> Result<PreparationId, (TicketServiceError, TicketPreparation<V, Q>)> {
-        let _admission = self.recovery_key.as_ref().map(|_| self.shared.admission.lock().unwrap_or_else(|e| e.into_inner()));
-        if self.recovery_key.is_some() && self.startup_status() != NativeFactoryStartupStatus::Ready {
+        let _admission = self.recovery_key.as_ref().map(|_| {
+            self.shared
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
+        if self.recovery_key.is_some() && self.startup_status() != NativeFactoryStartupStatus::Ready
+        {
             return Err((TicketServiceError::Closed, question));
         }
         if self.shared.closed.load(Ordering::Acquire)
@@ -1227,7 +1522,12 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         preparation: PreparationId,
         ticket: RoleTicketEnvelope,
     ) -> Result<Instant, TicketServiceError> {
-        let _admission = self.recovery_key.as_ref().map(|_| self.shared.admission.lock().unwrap_or_else(|e| e.into_inner()));
+        let _admission = self.recovery_key.as_ref().map(|_| {
+            self.shared
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         if self.shared.closed.load(Ordering::Acquire)
             || self.shared.root_closed.load(Ordering::Acquire)
         {
@@ -1297,7 +1597,12 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
     /// Revoke old-root authority before selecting another fixed root. RequestId
     /// issuance is not reset. No token or running frame moves between owners.
     pub fn replace_root(&self, authority: SearchAuthority) -> Result<(), TicketServiceError> {
-        let _admission = self.recovery_key.as_ref().map(|_| self.shared.admission.lock().unwrap_or_else(|e| e.into_inner()));
+        let _admission = self.recovery_key.as_ref().map(|_| {
+            self.shared
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(TicketServiceError::Closed);
         }
@@ -1359,7 +1664,12 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         preparation: PreparationId,
         ticket: RoleTicketEnvelope,
     ) -> Result<(), TicketServiceError> {
-        let _admission = self.recovery_key.as_ref().map(|_| self.shared.admission.lock().unwrap_or_else(|e| e.into_inner()));
+        let _admission = self.recovery_key.as_ref().map(|_| {
+            self.shared
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         if self.shared.closed.load(Ordering::Acquire)
             || self.shared.root_closed.load(Ordering::Acquire)
         {
@@ -1386,7 +1696,12 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         if permit.ticket() != &ticket {
             return Err((TicketServiceError::IdentityMismatch, permit));
         }
-        let _admission = self.recovery_key.as_ref().map(|_| self.shared.admission.lock().unwrap_or_else(|e| e.into_inner()));
+        let _admission = self.recovery_key.as_ref().map(|_| {
+            self.shared
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         if self.shared.closed.load(Ordering::Acquire)
             || self.shared.root_closed.load(Ordering::Acquire)
         {
@@ -1426,8 +1741,16 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         preparation: PreparationId,
         ticket: RoleTicketEnvelope,
     ) -> Result<(), TicketServiceError> {
-        let _admission = self.recovery_key.as_ref().map(|_| self.shared.admission.lock().unwrap_or_else(|e| e.into_inner()));
-        if self.recovery_key.is_some() && (self.shared.closed.load(Ordering::Acquire) || self.shared.root_closed.load(Ordering::Acquire)) {
+        let _admission = self.recovery_key.as_ref().map(|_| {
+            self.shared
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
+        if self.recovery_key.is_some()
+            && (self.shared.closed.load(Ordering::Acquire)
+                || self.shared.root_closed.load(Ordering::Acquire))
+        {
             return Err(TicketServiceError::Closed);
         }
         if !self.shared.reports_available() {
@@ -1447,7 +1770,11 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
 
     /// Stable diagnostic copy; remains available after the original transfer.
     pub fn finish_report_snapshot(&self) -> Option<TicketNativeFinishReport> {
-        self.shared.finish_report_snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.shared
+            .finish_report_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// An observed finish without a snapshot is an error only for this path.
@@ -1595,7 +1922,12 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
     /// Root stop is independent of process shutdown. It closes admission and
     /// revokes all questions through the control mailbox, even at queue pressure.
     pub fn begin_root_quiesce(&self, until: Instant) -> Result<(), TicketServiceError> {
-        let _admission = self.recovery_key.as_ref().map(|_| self.shared.admission.lock().unwrap_or_else(|e| e.into_inner()));
+        let _admission = self.recovery_key.as_ref().map(|_| {
+            self.shared
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(TicketServiceError::Closed);
         }
@@ -1654,15 +1986,21 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
     pub fn try_join(&mut self) -> Result<bool, TicketServiceError> {
         match &mut self.thread {
             OwnerThread::Legacy(thread) => {
-                if thread.as_ref().is_some_and(|thread| !thread.is_finished()) { return Ok(false); }
+                if thread.as_ref().is_some_and(|thread| !thread.is_finished()) {
+                    return Ok(false);
+                }
                 if let Some(thread) = thread.take() {
                     thread.join().map_err(|_| TicketServiceError::WorkerGone)?;
                     #[cfg(feature = "native-validation-diagnostics")]
-                    if let Some(trace) = self.shared.validation_trace.get() { trace.joined(); }
+                    if let Some(trace) = self.shared.validation_trace.get() {
+                        trace.joined();
+                    }
                 }
                 Ok(true)
             }
-            OwnerThread::Recoverable(thread) => thread.try_join().map_err(|_| TicketServiceError::WorkerGone),
+            OwnerThread::Recoverable(thread) => thread
+                .try_join()
+                .map_err(|_| TicketServiceError::WorkerGone),
         }
     }
 }
@@ -1729,9 +2067,17 @@ pub struct TicketRetainedPreparation<V, Q, P, O> {
 }
 impl<V, Q, P, O> From<Held<V, Q, P, O>> for TicketRetainedPreparation<V, Q, P, O> {
     fn from(held: Held<V, Q, P, O>) -> Self {
-        Self { question: held.question, prepared: held.prepared, seal: held.seal,
-            canceled: held.canceled, ticket: held.ticket, output: held.output,
-            completed: held.completed, ack_attempted: held.ack_attempted, evidence: held.evidence }
+        Self {
+            question: held.question,
+            prepared: held.prepared,
+            seal: held.seal,
+            canceled: held.canceled,
+            ticket: held.ticket,
+            output: held.output,
+            completed: held.completed,
+            ack_attempted: held.ack_attempted,
+            evidence: held.evidence,
+        }
     }
 }
 
@@ -1750,7 +2096,9 @@ pub struct TicketRetainedOwnerState<V, Q, P, O> {
     pub original_root_fence: Option<NativeRootFence>,
 }
 impl<V, Q, P, O> TicketRetainedOwnerState<V, Q, P, O> {
-    pub fn pop_preparation(&mut self) -> Option<(PreparationId, TicketRetainedPreparation<V, Q, P, O>)> {
+    pub fn pop_preparation(
+        &mut self,
+    ) -> Option<(PreparationId, TicketRetainedPreparation<V, Q, P, O>)> {
         self.held.pop_first().map(|(id, held)| (id, held.into()))
     }
     pub fn pop_queued_command(&mut self) -> Option<TicketPendingCommand<V, Q>> {

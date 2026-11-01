@@ -809,8 +809,10 @@ impl PalsAdaptiveObservationBridgeV5 {
         finish: Option<&AdaptiveSessionProcessReceipt>,
     ) -> Result<ArtifactRef, ManifestError> {
         if let Some(receipt) = finish {
-            need(receipt.epoch().0 == self.snapshot.process_epoch(),
-                "session release observation belongs to another process epoch")?;
+            need(
+                receipt.epoch().0 == self.snapshot.process_epoch(),
+                "session release observation belongs to another process epoch",
+            )?;
         }
         let provider = match self.pinned.config.endpoint.model.backend {
             PalsModelBackendV3::OrtCpu => "CPUExecutionProvider",
@@ -824,7 +826,9 @@ impl PalsAdaptiveObservationBridgeV5 {
                 "zero_run":observation.release().completed_synchronous_runs == 0,
                 "observation_source":format!("{:?}", observation.source()),
             }),
-            None => serde_json::json!({"status":"unknown", "completed_synchronous_runs":null, "zero_run":null, "observation_source":null}),
+            None => {
+                serde_json::json!({"status":"unknown", "completed_synchronous_runs":null, "zero_run":null, "observation_source":null})
+            }
         };
         let record = serde_json::json!({
             "domain":"rz-pals-session-release-observation/1",
@@ -842,7 +846,9 @@ impl PalsAdaptiveObservationBridgeV5 {
             "completed_nn_inputs":"unknown",
             "scope":"original process-local owner observation; not external device identity or performance evidence"
         });
-        self.writer.lock().map_err(|_| fail("evidence writer poisoned"))?
+        self.writer
+            .lock()
+            .map_err(|_| fail("evidence writer poisoned"))?
             .write_json(OutputKind::SessionReleaseObservation, &record)
     }
 

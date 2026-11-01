@@ -78,13 +78,14 @@ fn run()
         } else {
             rz_arena::pals_adaptive_launch::PalsOwnedStoragePolicy::StrictV5
         };
-        let result = rz_arena::pals_collect_v3::run_generation_and_evaluation_owned_with_storage_policy_v3(
-            Path::new(&arguments[2]),
-            &arguments[4],
-            Arc::clone(&cancel),
-            storage_policy,
-        )
-        .map_err(Into::into);
+        let result =
+            rz_arena::pals_collect_v3::run_generation_and_evaluation_owned_with_storage_policy_v3(
+                Path::new(&arguments[2]),
+                &arguments[4],
+                Arc::clone(&cancel),
+                storage_policy,
+            )
+            .map_err(Into::into);
 
         for id in hooks {
             signal_hook::low_level::unregister(id);

@@ -1619,10 +1619,13 @@ mod linux {
                 "1000-2000 r-xp 0 08:03 19 /private native/libcudart.so.12\n",
                 "1000-2000 r-xp 0 08:02 19 /ambient/libcudnn.so.8\n",
             ] {
-                assert!(
-                    audit_entries(&expected(), 1, &parse_maps(line.as_bytes()).unwrap(), false)
-                        .is_err()
-                );
+                assert!(audit_entries(
+                    &expected(),
+                    1,
+                    &parse_maps(line.as_bytes()).unwrap(),
+                    false
+                )
+                .is_err());
             }
             assert_eq!(
                 audit_entries(&expected(), 1, &[], false).unwrap_err().kind,
@@ -1708,10 +1711,13 @@ mod linux {
         fn exact_name_does_not_admit_invented_hash_or_size() {
             let accepted = TRUSTED_NATIVE_PROFILE[0];
             let path = Path::new("/private native/libcudart.so.12");
-            assert!(
-                validate_declaration(path, accepted.bytes, accepted.digest, &NVIDIA_LOAD_ORDER)
-                    .is_ok()
-            );
+            assert!(validate_declaration(
+                path,
+                accepted.bytes,
+                accepted.digest,
+                &NVIDIA_LOAD_ORDER
+            )
+            .is_ok());
             for (bytes, digest) in [
                 (accepted.bytes, [0; 32]),
                 (accepted.bytes + 1, accepted.digest),
