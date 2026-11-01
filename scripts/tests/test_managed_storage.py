@@ -296,7 +296,6 @@ class StorageTests(unittest.TestCase):
              patch.object(run_managed, "canonical_root", return_value=self.root), \
              patch.object(run_managed.shutil, "which", return_value=sys.executable), \
              patch.object(run_managed, "sample_output_budget", side_effect=[0, 0]) as sample, \
-             patch.object(run_managed, "tree_size", return_value=0), \
              patch.object(run_managed, "run_group", side_effect=supervise) as dispatch, \
              patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
              patch.object(sys, "stderr", io.StringIO()):
@@ -305,64 +304,55 @@ class StorageTests(unittest.TestCase):
         dispatch.assert_called_once()
         manager.finish.assert_called_once_with(exit_code=0, tree_gone=True, supervisor_error=None)
 
-    def test_live_build_aggregate_threshold_warns_without_stopping_child(self):
+    def test_cached_storage_warning_does_not_replace_live_output_budget(self):
         import run_managed
+        import rovezero_usage_snapshot
         manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
                                   finish=Mock(return_value={}), root=self.root,
                                   source=self.source, total_limit=4096,
                                   _identity=lambda: {"token": "current"})
-        clock = [0.0]
-
-        def size(*_args, **_kwargs):
-            clock[0] += 8  # A slow scan must not shorten the next interval.
-            return 8192
-
         def supervise(_command, _source, _environment, _timeout, check_budget):
-            for observed in (59, 60, 127, 128):
-                clock[0] = observed
+            for _ in range(4):
                 check_budget()
             return 0, True, None
         with patch.object(run_managed, "ManagedBuild", return_value=manager), \
              patch.object(run_managed, "canonical_root", return_value=self.root), \
              patch.object(run_managed.shutil, "which", return_value=sys.executable), \
-             patch.object(run_managed.time, "monotonic", side_effect=lambda: clock[0]), \
              patch.object(run_managed, "sample_output_budget", return_value=0) as sample, \
-             patch.object(run_managed, "tree_size", side_effect=size) as scan, \
-             patch.object(run_managed, "warn_output_threshold") as warning, \
+             patch.object(rovezero_usage_snapshot, "warn_cached_total_usage",
+                          side_effect=OSError("advisory cache unavailable")) as warning, \
+             patch.object(rovezero_usage_snapshot, "claim_total_usage_maintenance", return_value=False), \
              patch.object(run_managed, "run_group", side_effect=supervise), \
              patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
              patch.object(sys, "stderr", io.StringIO()):
             self.assertEqual(run_managed.main(), 0)
-        self.assertEqual(scan.call_count, 2)
-        self.assertEqual(warning.call_count, 2)
-        warning.assert_called_with(8192, 4096, scope="managed_build_catalog", observed_bytes=8192)
+        self.assertEqual(warning.call_count, 4)
         self.assertEqual(sample.call_count, 5)  # pre-dispatch and all four live checks
         manager.finish.assert_called_once_with(exit_code=0, tree_gone=True, supervisor_error=None)
 
-    def test_live_build_tree_failure_is_not_hidden_at_the_scheduled_scan(self):
+    def test_live_owned_output_budget_failure_still_stops_child(self):
         import run_managed
+        import rovezero_usage_snapshot
         manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
                                   finish=Mock(return_value={}), root=self.root,
                                   source=self.source, total_limit=4096,
                                   _identity=lambda: {"token": "current"})
-        clock = [0.0]
         def supervise(_command, _source, _environment, _timeout, check_budget):
-            clock[0] = 60
-            with self.assertRaisesRegex(StorageError, "build path identity"):
+            with self.assertRaisesRegex(StorageError, "owned output budget"):
                 check_budget()
-            return 125, True, "build path identity"
+            return 125, True, "owned output budget"
         with patch.object(run_managed, "ManagedBuild", return_value=manager), \
              patch.object(run_managed, "canonical_root", return_value=self.root), \
              patch.object(run_managed.shutil, "which", return_value=sys.executable), \
-             patch.object(run_managed.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(run_managed, "sample_output_budget", return_value=0) as sample, \
-             patch.object(run_managed, "tree_size", side_effect=StorageError("build path identity")), \
+             patch.object(run_managed, "sample_output_budget",
+                          side_effect=[0, StorageError("owned output budget")]) as sample, \
+             patch.object(rovezero_usage_snapshot, "claim_total_usage_maintenance", return_value=False), \
              patch.object(run_managed, "run_group", side_effect=supervise), \
              patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
              patch.object(sys, "stderr", io.StringIO()):
             self.assertEqual(run_managed.main(), 125)
         self.assertEqual(sample.call_count, 2)
-        manager.finish.assert_called_once_with(exit_code=125, tree_gone=True, supervisor_error="build path identity")
+        manager.finish.assert_called_once_with(exit_code=125, tree_gone=True, supervisor_error="owned output budget")
 
     def test_predispatch_corrupt_foreign_catalog_keeps_evidence_and_closes_own_build(self):
         import run_managed

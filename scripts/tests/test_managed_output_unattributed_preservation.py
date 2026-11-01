@@ -582,7 +582,6 @@ class DefaultBranchTests(unittest.TestCase):
         with patch.object(run_managed, "ManagedBuild", return_value=manager), \
              patch.object(run_managed, "canonical_root", return_value=Path.cwd()), \
              patch.object(run_managed.shutil, "which", return_value=sys.executable), \
-             patch.object(run_managed, "tree_size", return_value=0), \
              patch.object(run_managed, "sample_output_budget", side_effect=sample) as original_sampler, \
              patch.object(run_managed, "run_group", side_effect=supervisor), \
              patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
