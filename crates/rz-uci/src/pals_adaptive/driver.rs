@@ -1993,7 +1993,8 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         output: &RoleOutput,
         physical: Option<TicketExecutionEvidence>,
     ) -> Result<CheckedStep<AdaptivePortQuestion>, AdaptiveManagerError> {
-        let guard = self.action_before(work, StepExecution::Role(ticket.id))?;
+        let guard = self.action_before(work, StepExecution::Role(ticket.id))
+            .map_err(|error| error.at_semantic_stage("driver.commit_role.action_before"))?;
         let physical = physical.map(|evidence| AdaptivePortRoleEvidence {
             execution: evidence.execution,
             completed_nn_inputs: evidence.completed_nn_inputs,
@@ -2003,14 +2004,18 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         let step = self
             .hot()?
             .commit_role(work, ticket, output, physical)
-            .map_err(semantic)?;
+            .map_err(semantic)
+            .map_err(|error| error.at_semantic_stage("driver.commit_role.search_commit"))?;
         // Selection of the next immutable view follows consumption of the
         // exact view submitted for this accepted native ticket.
         self.hot()?
             .role_consumed(ticket, &work.input.view)
-            .map_err(semantic)?;
-        self.action_after(work, guard)?;
-        let materialized = self.hot()?.materialize_step(step).map_err(semantic)?;
+            .map_err(semantic)
+            .map_err(|error| error.at_semantic_stage("driver.commit_role.view_consume"))?;
+        self.action_after(work, guard)
+            .map_err(|error| error.at_semantic_stage("driver.commit_role.action_after"))?;
+        let materialized = self.hot()?.materialize_step(step).map_err(semantic)
+            .map_err(|error| error.at_semantic_stage("driver.commit_role.materialize"))?;
         Ok(checked(materialized))
     }
     fn role_consumed(

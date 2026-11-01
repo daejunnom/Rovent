@@ -254,7 +254,7 @@ impl AdaptiveManagerError {
     /// Preserve the original semantic cause while identifying the manager
     /// boundary that received it. Typed capacity, cancellation, and physical
     /// errors must retain their original variants and handling.
-    fn at_semantic_stage(self, stage: &'static str) -> Self {
+    pub(super) fn at_semantic_stage(self, stage: &'static str) -> Self {
         match self {
             Self::Semantic(cause) => Self::Semantic(format!("{stage}: {cause}")),
             other => other,
@@ -268,6 +268,11 @@ fn semantic_stage_preserves_original_cause_and_typed_failures() {
         .at_semantic_stage("deliver_roles");
     assert!(matches!(observed, AdaptiveManagerError::Semantic(cause)
         if cause == "deliver_roles: PALS: Role(InvalidOutput)"));
+    let nested = AdaptiveManagerError::Semantic("PALS: Role(InvalidOutput)".into())
+        .at_semantic_stage("driver.commit_role.materialize")
+        .at_semantic_stage("retire_role.commit_role");
+    assert!(matches!(nested, AdaptiveManagerError::Semantic(cause)
+        if cause == "retire_role.commit_role: driver.commit_role.materialize: PALS: Role(InvalidOutput)"));
     assert!(matches!(AdaptiveManagerError::PhysicalUnknown.at_semantic_stage("deliver_roles"),
         AdaptiveManagerError::PhysicalUnknown));
     assert!(matches!(AdaptiveManagerError::AdmissionClosed.at_semantic_stage("schedule"),
