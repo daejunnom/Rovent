@@ -688,7 +688,6 @@ fn run_native_inner<'a>(
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
-                    let failure = reject_factory(failure, control.cleanup_until, &diagnostic);
                     let unknown = runtime_receipt(&lock, arguments.process_epoch, None);
                     write_receipt(
                         receipt_writer.as_ref(),
@@ -696,6 +695,7 @@ fn run_native_inner<'a>(
                         &lock,
                         &unknown,
                     );
+                    let failure = reject_factory(failure, control.cleanup_until, &diagnostic);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-termination.v6.json",
@@ -758,7 +758,6 @@ fn run_native_inner<'a>(
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
-                    let failure = reject_factory(failure, control.cleanup_until, &diagnostic);
                     let unknown = runtime_receipt(&lock, arguments.process_epoch, None);
                     write_receipt(
                         receipt_writer.as_ref(),
@@ -766,6 +765,7 @@ fn run_native_inner<'a>(
                         &lock,
                         &unknown,
                     );
+                    let failure = reject_factory(failure, control.cleanup_until, &diagnostic);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-termination.v6.json",
@@ -860,7 +860,6 @@ fn run_native_inner<'a>(
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
-                    let failure = reject_factory(failure, control.cleanup_until, &diagnostic);
                     let unknown = runtime_receipt(&lock, arguments.process_epoch, None);
                     write_receipt(
                         receipt_writer.as_ref(),
@@ -868,6 +867,7 @@ fn run_native_inner<'a>(
                         &lock,
                         &unknown,
                     );
+                    let failure = reject_factory(failure, control.cleanup_until, &diagnostic);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-termination.v6.json",

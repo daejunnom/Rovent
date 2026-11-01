@@ -2141,6 +2141,9 @@ fn reject_factory<Q: NativeQuestionProjection>(
     diagnostic: &NativeStartupDiagnostic,
 ) -> RoventLaunchError {
     let detail = error("NativeStartup", &failure.error);
+    // Report the original failure before draining. A failed factory may have
+    // touched native resources, so this message does not claim completion.
+    eprintln!("native startup failure before cleanup: {detail}");
     if failure.native.as_mut().is_some_and(|native| {
         diagnostic.emit(
             NativeStartupDiagnosticStage::FactoryDrain,
