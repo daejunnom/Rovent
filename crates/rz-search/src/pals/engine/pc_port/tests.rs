@@ -1065,8 +1065,15 @@ fn idle_archive_worker_keeps_actual_pc_projection_and_restores_original_relation
     assert_eq!(port.owner.stores().review_pin_count().unwrap(), pins_before);
     assert!(input.view.validates(port.owner.stores()));
     assert_eq!(
-        port.owner.records().iter().map(record_identity).collect::<Vec<_>>(),
-        records_before.iter().map(record_identity).collect::<Vec<_>>()
+        port.owner
+            .records()
+            .iter()
+            .map(record_identity)
+            .collect::<Vec<_>>(),
+        records_before
+            .iter()
+            .map(record_identity)
+            .collect::<Vec<_>>()
     );
     assert!(original_owner.matches(port.owner.stores()));
     port.owner.config.max_records = previous_limit;
