@@ -190,6 +190,9 @@ impl PinnedPalsSystemStartupV6 {
         let relative = relative_control_path(&lock_path, private_cwd)?;
         let root = Dir::open_ambient_dir(private_cwd, cap_std::ambient_authority())
             .map_err(|_| invalid("cannot pin system startup root"))?;
+        // Bind the original root before reading even the lock. Repeat after
+        // decoding so a rename during the control read cannot go unnoticed.
+        verify_root_identity(&root, private_cwd)?;
         let bytes = read_control(&root, &relative)?;
         check_window(until, cancelled)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| invalid("system lock is not UTF-8"))?;

@@ -326,6 +326,9 @@ impl Drop for StartupNativeGuard {
 }
 
 pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
+    if arguments == ["--pals-system-source-inventory"] {
+        return system_v6::source_inventory();
+    }
     if arguments.iter().any(|arg| arg.starts_with("--pals-system-startup-")) {
         return system_v6::run_cli(arguments);
     }

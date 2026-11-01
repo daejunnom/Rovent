@@ -2,6 +2,44 @@
 use super::*;
 use crate::pals_adaptive_startup::{PalsSystemStartupOptionsV6, PinnedPalsSystemStartupV6};
 
+/// This executes before any lock, source asset, runtime or model is opened.
+/// The response is an observation of this binary, not external provenance.
+pub(super) fn source_inventory() -> Result<(), AdaptiveBootstrapError> {
+    use crate::pals_adaptive_startup::{
+        PALS_SYSTEM_V6_SOURCE_COMPONENT, compiled_pals_system_v6_source_digest,
+    };
+    let mut components = compiled_source_components_v5()
+        .map_err(|error| failure("SystemV6SourceInventory", &error))?;
+    components.insert(
+        PALS_SYSTEM_V6_SOURCE_COMPONENT.to_owned(),
+        compiled_pals_system_v6_source_digest(),
+    );
+    let raw_commit = env!("RZ_PALS_COMPILED_SOURCE_COMMIT");
+    let commit = (raw_commit.len() == 40
+        && raw_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && raw_commit.bytes().any(|byte| byte != b'0'))
+    .then_some(raw_commit);
+    let output = serde_json::json!({
+        "domain": "rz-pals-system-compiled-source-v6/1",
+        "source_commit": commit,
+        "source_commit_observation": if commit.is_some() { "declared_by_build" } else { "unknown" },
+        "source_components": components,
+        "source_component_scope": "v5-registry-plus-pals-system-v6-boundary",
+        "mapped_binary_verified": false,
+        "provider_initialized": false,
+        "neural_execution": false,
+        "training_execution": false
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&output)
+            .map_err(|error| failure("SystemV6SourceInventory", &error))?
+    );
+    Ok(())
+}
+
 pub(super) fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
     let started = Instant::now();
     let options = PalsSystemStartupOptionsV6::parse(&arguments)
