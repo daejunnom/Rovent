@@ -978,7 +978,7 @@ fn observe_completed_exact_rank_set(
     let (sequence, selected) = checker.cooperative_exact_latest.as_ref()?;
     if *sequence == 0
         || selected.len() != width
-        || !selected.first().is_some_and(|first| first.depth > 0)
+        || selected.first().is_none_or(|first| first.depth == 0)
         || !selected.iter().enumerate().all(|(index, opinion)| {
             opinion.rank == index as u16 + 1
                 && opinion.depth == selected[0].depth

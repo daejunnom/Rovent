@@ -263,6 +263,7 @@ impl<M: RoleModel> PalsSemanticState<M> {
     /// Cohort-only variant, selected before a Ready question is sealed. Before
     /// seven observations exist the ordinary prelude continues; the cohort
     /// admission must separately require a CPU7-tagged view.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_cohort_cpu7_review_view(
         &mut self,
         config: &PalsSemanticConfig,
