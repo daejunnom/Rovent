@@ -1589,7 +1589,7 @@ impl RoventPcSessionDriver {
     }
 
     /// Consume the original V2 Ready/source/process owners as one unit.
-    /// This path supports only roles-only, archive-off execution.
+    /// This roles-only path starts archive-off; explicit storage may be attached before the first go.
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     pub fn new_v2(
         prepared: PreparedRoventNativeV2<PcPortQuestion>,
