@@ -49,6 +49,8 @@ fn run() -> Result<(), String> {
                     let output = original.process();
                     serde_json::json!({
                         "receipt": &output.receipt,
+                        "original_transport": original.observation(),
+                        "transport_complete": original.transport_complete(),
                         "stdout": diagnostic_stream_evidence(&output.stdout),
                         "stderr": diagnostic_stream_evidence(&output.stderr),
                         "pending_child_retained": output.pending_child.is_some(),
