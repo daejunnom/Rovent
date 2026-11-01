@@ -338,6 +338,7 @@ pub struct RoventNativeResourceRunFailure {
     control_panic_may_be_native: bool,
     control_scope_marker: Option<Arc<OnceLock<rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey>>>,
     pre_native_admission: Option<PreNativeAdmissionEvidence>,
+    factory_pre_native: Option<FactoryPreNativeEvidence>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,6 +358,20 @@ struct PreNativeAdmissionEvidence {
     process_generation: u64,
     reason: &'static str,
     native_scope_started: bool,
+}
+
+/// The original V3 factory returned its own unstarted custody after the
+/// resource scope was entered. This says nothing about device-wide activity,
+/// process exit, or any other owner's physical completion.
+#[derive(Clone, Debug, serde::Serialize)]
+struct FactoryPreNativeEvidence {
+    schema: &'static str,
+    process_id: u32,
+    process_generation: u64,
+    input_lock_sha256: String,
+    resource_scope_started: bool,
+    native_entry: &'static str,
+    physical_completion: &'static str,
 }
 
 /// The actual native/cgroup failure and the exact endpoint created for the
@@ -715,6 +730,9 @@ impl RoventNativeResourceRunFailure {
             if let Some(evidence) = self.pre_native_admission {
                 observation["pre_native_admission"] = json!(evidence);
             }
+            if let Some(evidence) = &self.factory_pre_native {
+                observation["factory_pre_native"] = json!(evidence);
+            }
             return observation;
         }
         json!({"schema":"rz-rovent-native-resource-run-failure/1","error":self.detail,
@@ -803,6 +821,39 @@ pub(crate) struct NativeResourceCustody {
     finished_attempted: bool,
 }
 impl NativeResourceCustody {
+    fn factory_rejection_before_native(
+        &self,
+        epoch: u64,
+        native_error: &rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError,
+        scope: Option<&rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey>,
+        control_panicked: bool,
+    ) -> Option<FactoryPreNativeEvidence> {
+        use rz_uci::rovent_bootstrap::launch::{
+            RoventRetainingLaunchError, V3ScopeTerminalEvidence,
+        };
+        if control_panicked
+            || !self.system_v3
+            || !matches!(native_error, RoventRetainingLaunchError::Unstarted { .. })
+            || self.bound_control.is_none()
+            || !matches!(
+                scope?.terminal_evidence(),
+                V3ScopeTerminalEvidence::BeforeNative
+            )
+        {
+            return None;
+        }
+        let scope = self.original_v3_scope().ok()?;
+        Some(FactoryPreNativeEvidence {
+            schema: "rz-rovent-factory-pre-native-observation/1",
+            process_id: std::process::id(),
+            process_generation: epoch,
+            input_lock_sha256: scope.input_lock().canonical_sha256.clone(),
+            resource_scope_started: true,
+            native_entry: "not_entered_by_original_factory",
+            physical_completion: "not_inferred",
+        })
+    }
+
     fn provenance_rejection_before_scope(
         &self,
         epoch: u64,
@@ -1480,6 +1531,7 @@ fn run_native_with_resources_inner(
         control_panic_may_be_native: false,
         control_scope_marker: None,
         pre_native_admission: None,
+        factory_pre_native: None,
     })?;
     let custody = Arc::new(Mutex::new(state));
     let callback_v1 = Arc::clone(&custody);
@@ -1529,6 +1581,7 @@ fn run_native_with_resources_inner(
         control_panic_may_be_native: false,
         control_scope_marker: None,
         pre_native_admission: None,
+        factory_pre_native: None,
     };
     if let Err(error) = result {
         let detail = match &finish {
@@ -1624,6 +1677,7 @@ fn run_native_with_resources_v3_inner(
         control_panic_may_be_native: false,
         control_scope_marker: None,
         pre_native_admission: None,
+        factory_pre_native: None,
     })?;
     state.system_v3 = true;
     let custody = Arc::new(Mutex::new(state));
@@ -1637,6 +1691,7 @@ fn run_native_with_resources_v3_inner(
         control_panic_may_be_native: false,
         control_scope_marker: None,
         pre_native_admission: None,
+        factory_pre_native: None,
     };
     let epoch = {
         let state = custody
@@ -1872,6 +1927,16 @@ fn run_native_with_resources_v3_inner(
                 control_panic.is_some(),
             )
         });
+        let factory_pre_native = custody.try_lock().ok().and_then(|state| {
+            state.factory_rejection_before_native(
+                epoch,
+                &native_error,
+                control_scope_marker
+                    .as_ref()
+                    .and_then(|marker| marker.get()),
+                control_panic.is_some(),
+            )
+        });
         let error = match &native_error {
             RoventRetainingLaunchError::Ordinary(error)
             | RoventRetainingLaunchError::Unstarted { error, .. }
@@ -1886,6 +1951,7 @@ fn run_native_with_resources_v3_inner(
         };
         let mut retained = failure(detail);
         retained.pre_native_admission = pre_native_admission;
+        retained.factory_pre_native = factory_pre_native;
         retained.native_failure = Some(native_error);
         retained.control_panic = control_panic;
         retained.control_panic_may_be_native = control_panic_may_be_native;
@@ -2160,6 +2226,7 @@ mod tests {
             control_panic_may_be_native: false,
             control_scope_marker: None,
             pre_native_admission: None,
+            factory_pre_native: None,
         };
         assert!(failure.observation().get("pre_native_admission").is_none());
         failure.pre_native_admission = Some(evidence);
