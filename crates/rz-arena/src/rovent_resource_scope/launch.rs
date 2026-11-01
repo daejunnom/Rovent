@@ -1787,6 +1787,14 @@ mod tests {
         owner.admission_checkpoint_v3 = AdmissionCheckpointV3::ProvenanceRejected;
         owner.delegated = None;
         assert!(owner.provenance_rejection_before_scope(37, true, &original_error, false).is_none());
+        let mut failure = RoventNativeResourceRunFailure {
+            detail: "original error".into(), custody: None, system_v3: true,
+            native_failure: None, native_recovery_attempts: Vec::new(), control_panic: None,
+            control_panic_may_be_native: false, control_scope_marker: None, pre_native_admission: None,
+        };
+        assert!(failure.observation().get("pre_native_admission").is_none());
+        failure.pre_native_admission = Some(evidence);
+        assert_eq!(failure.observation()["pre_native_admission"]["process_generation"], 37);
     }
 
     #[test]
