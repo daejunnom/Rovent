@@ -234,6 +234,29 @@ pub struct RoventPcCollectionRunV2 {
 }
 
 impl RoventPcCollectionRunV2 {
+    /// Transfer bounded local diagnostics only after each original worker has
+    /// exited. Unknown roots remain unknown and confer no completion rights.
+    #[cfg(feature = "experimental-teacher-exact-observation")]
+    pub fn take_exact_teacher_diagnostics(&mut self) -> serde_json::Value {
+        let mut roots = Vec::new();
+        let primary = if self.worker_exit.is_some() && !self.worker_thread_panicked {
+            self.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
+        } else { None };
+        roots.push(json!({"root_index":0,"diagnostic":primary,
+            "status":if primary.is_some() {"observed"} else {"unknown"}}));
+        for (index, slot) in self.secondary_slots.iter().enumerate() {
+            let value = if slot.worker_join_observed && !matches!(slot.worker_exit_kind,
+                Some(PcWorkerExitKindV2::CaughtPanic | PcWorkerExitKindV2::OuterPanic)) {
+                slot.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
+            } else { None };
+            roots.push(json!({"root_index":index + 1,"diagnostic":value,
+                "status":if value.is_some() {"observed"} else {"unknown"}}));
+        }
+        json!({"schema":"rz-rovent-teacher-exact-diagnostic-receipt/1",
+            "scope":"local_observation_only","training_eligible":false,
+            "publication_authority":false,"physical_completion":"not_attested",
+            "supervisor_pending":self.supervisor.is_some(),"roots":roots})
+    }
     /// Additional failure-only stream. A completed diagnostic receipt never
     /// grants corpus, training, or original process authority.
     fn write_retained_consumer_evidence(&self, parent: &Dir) -> Result<(), ArenaError> {

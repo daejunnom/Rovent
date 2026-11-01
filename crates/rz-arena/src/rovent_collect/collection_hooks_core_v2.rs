@@ -1301,6 +1301,16 @@ pub(crate) enum PumpSendOutcomeV2 {
 }
 
 impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
+    /// Move only the bounded optional diagnostic, never original owner or
+    /// worker completion authority. Caller must establish worker termination.
+    #[cfg(feature = "experimental-teacher-exact-observation")]
+    pub(crate) fn take_exact_diagnostics(&mut self) -> serde_json::Value {
+        self.pump.as_mut().map_or_else(
+            || serde_json::json!({"status":"unknown","reason":"original_pump_unavailable"}),
+            RetiredRowPumpV2::take_exact_diagnostics,
+        )
+    }
+
     /// Install before the worker starts; P-C keeps its existing channel path.
     pub(crate) fn configure_handoff_recovery(
         &mut self,

@@ -260,6 +260,101 @@ pub(crate) struct RetiredRowPumpV2 {
     clock_origin: Instant,
     clock_domain: rz_contracts::ClockDomain,
     observation_deadline: Instant,
+    #[cfg(feature = "experimental-teacher-exact-observation")]
+    exact_diagnostics: ExactDiagnosticRing,
+}
+
+/// Optional local diagnostics only. Neither a successful projection nor a
+/// failed/omitted observation changes a row, target, or physical authority.
+#[cfg(feature = "experimental-teacher-exact-observation")]
+#[derive(Default)]
+struct ExactDiagnosticRing {
+    enabled: bool,
+    entries: Vec<serde_json::Value>,
+    bytes: usize,
+    attempted: u64,
+    unknown: u64,
+    omitted: u64,
+    elapsed_ns: u64,
+    transferred: bool,
+}
+
+#[cfg(feature = "experimental-teacher-exact-observation")]
+impl ExactDiagnosticRing {
+    const MAX_ENTRIES: usize = 32;
+    const MAX_BYTES: usize = 128 * 1024;
+
+    fn observe(&mut self, row: &RoventRetiredLockV2Record, sealed: &SealedTeacherPolicyV2) {
+        let id = row.ticket().id;
+        self.capture(Some((id.epoch.0, id.sequence)), ||
+            super::exact_observation_v2::project_original_exact_observation_v2(row, sealed));
+    }
+
+    fn capture<F>(&mut self, ticket: Option<(u64, u64)>, project: F)
+    where
+        F: FnOnce() -> Result<rz_experiments::pals_data_v3::teacher_exact_rank::TeacherExactRankObservation, ArenaError>,
+    {
+        if !self.enabled {
+            return;
+        }
+        self.attempted = self.attempted.saturating_add(1);
+        if self.entries.len() >= Self::MAX_ENTRIES || self.bytes >= Self::MAX_BYTES {
+            self.omitted = self.omitted.saturating_add(1);
+            self.unknown = self.unknown.saturating_add(1);
+            return;
+        }
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(project));
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed);
+        let (status, observation, detail) = match result {
+            Ok(Ok(value)) => ("observed", Some(value), None),
+            Ok(Err(error)) => {
+                self.unknown = self.unknown.saturating_add(1);
+                ("unknown", None, Some(error.to_string().chars().take(512).collect::<String>()))
+            }
+            Err(_) => {
+                self.unknown = self.unknown.saturating_add(1);
+                ("unknown", None, Some("diagnostic_projection_panicked".to_owned()))
+            }
+        };
+        let entry = serde_json::json!({"status":status,"observation":observation,"detail":detail,"ticket":ticket,
+            "elapsed_ns":elapsed,"scope":"same_sealed_owner_diagnostic_only",
+            "training_eligible":false,"publication_authority":false,"physical_completion":"not_attested"});
+        match serde_json::to_vec(&entry) {
+            Ok(encoded) if self.bytes.saturating_add(encoded.len()) <= Self::MAX_BYTES => {
+                self.bytes += encoded.len();
+                self.entries.push(entry);
+            }
+            _ => {
+                self.omitted = self.omitted.saturating_add(1);
+                if status == "observed" {
+                    self.unknown = self.unknown.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn take(&mut self) -> serde_json::Value {
+        if self.transferred {
+            return serde_json::json!({"schema":"rz-rovent-teacher-exact-diagnostic/1",
+                "status":"already_transferred","scope":"observation_only",
+                "training_eligible":false,"publication_authority":false,
+                "physical_completion":"not_attested"});
+        }
+        self.transferred = true;
+        let output = serde_json::json!({"schema":"rz-rovent-teacher-exact-diagnostic/1",
+            "status":"transferred","enabled":self.enabled,"attempted":self.attempted,"unknown":self.unknown,
+            "omitted":self.omitted,"elapsed_ns":self.elapsed_ns,"recorded_bytes":self.bytes,
+            "scope":"observation_only","training_eligible":false,"publication_authority":false,
+            "physical_completion":"not_attested","entries":std::mem::take(&mut self.entries)});
+        self.bytes = 0;
+        self.attempted = 0;
+        self.unknown = 0;
+        self.omitted = 0;
+        self.elapsed_ns = 0;
+        output
+    }
 }
 
 pub(crate) enum PumpItemV2 {
@@ -312,9 +407,17 @@ pub(crate) struct PumpCustodyV2 {
     pub(crate) permit: TeacherPumpPermitV2,
     pub(crate) entries: Vec<HeldPumpEntryV2>,
     captured: VecDeque<CapturedEntry>,
+    #[cfg(feature = "experimental-teacher-exact-observation")]
+    exact_diagnostics: ExactDiagnosticRing,
 }
 
 impl PumpCustodyV2 {
+    /// Transfer only local diagnostic values; no owner or physical authority.
+    #[cfg(feature = "experimental-teacher-exact-observation")]
+    #[allow(dead_code)]
+    pub(crate) fn take_exact_diagnostics(&mut self) -> serde_json::Value {
+        self.exact_diagnostics.take()
+    }
     /// Collect a late terminal from the same session without sealing or
     /// labeling it. The caller still must shut down and physically drain the
     /// original worker. A missing terminal is not a completed operation.
@@ -409,6 +512,14 @@ impl PumpCustodyV2 {
 }
 
 impl RetiredRowPumpV2 {
+    /// Explicitly drain diagnostic observations to the original owner. A
+    /// caller must store them separately from the corpus or success receipt.
+    #[cfg(feature = "experimental-teacher-exact-observation")]
+    #[allow(dead_code)]
+    pub(crate) fn take_exact_diagnostics(&mut self) -> serde_json::Value {
+        self.exact_diagnostics.take()
+    }
+
     pub(crate) fn new(
         session: &mut RoventCollectionTeacherSessionV2,
         capacity: usize,
@@ -449,6 +560,12 @@ impl RetiredRowPumpV2 {
             clock_origin,
             clock_domain,
             observation_deadline,
+            #[cfg(feature = "experimental-teacher-exact-observation")]
+            exact_diagnostics: ExactDiagnosticRing {
+                enabled: std::env::var_os("RZ_TEACHER_EXACT_DIAGNOSTICS")
+                    .as_deref() == Some(std::ffi::OsStr::new("1")),
+                ..ExactDiagnosticRing::default()
+            },
         })
     }
 
@@ -816,7 +933,10 @@ impl RetiredRowPumpV2 {
                     },
                 }
             }
-            Stage::Sealed(sealed) => match prepare_teacher_policy_lock_v2(&entry.row, sealed) {
+            Stage::Sealed(sealed) => {
+                #[cfg(feature = "experimental-teacher-exact-observation")]
+                self.exact_diagnostics.observe(&entry.row, &sealed);
+                match prepare_teacher_policy_lock_v2(&entry.row, sealed) {
                 Ok(prepared) => Stage::Prepared(prepared),
                 Err(rejected) => {
                     let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 {
@@ -831,6 +951,7 @@ impl RetiredRowPumpV2 {
                         FailedEvidence::Sealed(sealed)
                     };
                     Stage::Failed { error, evidence }
+                }
                 }
             },
             unchanged => unchanged,
@@ -1068,7 +1189,10 @@ impl RetiredRowPumpV2 {
             CapturedStage::Sealed(sealed) if entry.row.is_some() => {
                 let row = entry.row.as_ref().expect("original retired row checked");
                 match sealed.join_original_row(row) {
-                    Ok(sealed) => match prepare_teacher_policy_lock_v2(row, sealed) {
+                    Ok(sealed) => {
+                        #[cfg(feature = "experimental-teacher-exact-observation")]
+                        self.exact_diagnostics.observe(row, &sealed);
+                        match prepare_teacher_policy_lock_v2(row, sealed) {
                         Ok(prepared) => CapturedStage::Prepared(prepared),
                         Err(rejected) => {
                             let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 {
@@ -1086,6 +1210,7 @@ impl RetiredRowPumpV2 {
                                     None => FailedEvidence::Sealed(sealed),
                                 },
                             }
+                        }
                         }
                     },
                     Err(rejected) => {
@@ -1320,6 +1445,35 @@ impl RetiredRowPumpV2 {
             permit: self.session_owner,
             entries,
             captured: self.captured,
+            #[cfg(feature = "experimental-teacher-exact-observation")]
+            exact_diagnostics: self.exact_diagnostics,
         }
+    }
+}
+
+#[cfg(all(test, feature = "experimental-teacher-exact-observation"))]
+mod exact_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn optional_diagnostic_keeps_failures_and_overflow_unknown() {
+        let mut ring = ExactDiagnosticRing::default();
+        ring.capture(None, || panic!("disabled diagnostic must not execute"));
+        assert_eq!(ring.attempted, 0);
+        ring.enabled = true;
+        ring.capture(Some((1, 2)), || panic!("diagnostic panic"));
+        for _ in 1..=ExactDiagnosticRing::MAX_ENTRIES {
+            ring.capture(Some((1, 3)), || Err(invalid("original diagnostic unavailable")));
+        }
+        let receipt = ring.take();
+        assert_eq!(receipt["attempted"], 33);
+        assert_eq!(receipt["unknown"], 33);
+        assert_eq!(receipt["omitted"], 1);
+        assert_eq!(receipt["entries"].as_array().unwrap().len(), 32);
+        assert_eq!(receipt["training_eligible"], false);
+        assert_eq!(receipt["physical_completion"], "not_attested");
+        assert_eq!(ring.attempted, 0);
+        assert!(ring.entries.is_empty());
+        assert_eq!(ring.take()["status"], "already_transferred");
     }
 }

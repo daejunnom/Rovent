@@ -89,6 +89,30 @@ pub struct RoventNnuecCollectionRunV2 {
 }
 
 impl RoventNnuecCollectionRunV2 {
+    /// Transfer only bounded diagnostic projections from the original joined
+    /// workers. This does not certify owner, publication, or physical state.
+    #[cfg(feature = "experimental-teacher-exact-observation")]
+    pub fn take_exact_teacher_diagnostics(&mut self) -> serde_json::Value {
+        let mut roots = Vec::new();
+        let primary = if self.primary_join_observed() && !self.primary_panic_observed()
+            && !self.worker_custody_poisoned {
+            self.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
+        } else { None };
+        roots.push(json!({"root_index":0,"diagnostic":primary,
+            "status":if primary.is_some() {"observed"} else {"unknown"}}));
+        for (index, slot) in self.secondary_slots.iter().enumerate() {
+            let value = if slot.worker_join_observed
+                && !matches!(slot.worker_exit_kind, Some(OwnWorkerExitKindV2::Panicked)) {
+                slot.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
+            } else { None };
+            roots.push(json!({"root_index":index + 1,"diagnostic":value,
+                "status":if value.is_some() {"observed"} else {"unknown"}}));
+        }
+        json!({"schema":"rz-rovent-teacher-exact-diagnostic-receipt/1",
+            "scope":"local_observation_only","training_eligible":false,
+            "publication_authority":false,"physical_completion":"not_attested",
+            "supervisor_pending":self.supervisor.is_some(),"roots":roots})
+    }
     fn primary_join_observed(&self) -> bool {
         self.worker_exit.is_some() || self.bridge_worker_exit.is_some()
     }
