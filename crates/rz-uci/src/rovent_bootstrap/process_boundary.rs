@@ -1106,12 +1106,28 @@ fn verify_actual_process_observation(
     #[cfg(target_os = "linux")]
     {
         let root_identity = verify_private_cwd(private_cwd, original_root)?;
-        let binary_identity = verify_binary_descriptor(binary, original_binary, control)?;
-        let executable = ExecutableIdentityV1::observe().map_err(|error| ProcessBoundaryError {
-            kind: ProcessBoundaryFailure::MappedExecutable,
-            stage: "actual mapped executable observation",
-            io_kind: error.io_kind,
-        })?;
+        let is_v3 = matches!(source_profile, SourceProfile::SystemV3(_));
+        let binary_identity = verify_binary_descriptor(binary, original_binary, control, is_v3)?;
+        let observed = if is_v3 {
+            ExecutableIdentityV1::observe_exact_with_control(binary.bytes, || {
+                check_control(control).is_ok()
+            })
+        } else {
+            ExecutableIdentityV1::observe()
+        };
+        let executable = match observed {
+            Ok(executable) => executable,
+            Err(error) => {
+                // Preserve original cancellation/deadline failures instead of
+                // misreporting an interrupted read as an identity mismatch.
+                check_control(control)?;
+                return Err(ProcessBoundaryError {
+                    kind: ProcessBoundaryFailure::MappedExecutable,
+                    stage: "actual mapped executable observation",
+                    io_kind: error.io_kind,
+                });
+            }
+        };
         check_control(control)?;
         verify_mapped_executable(binary, &executable)?;
         require(
@@ -1248,6 +1264,7 @@ fn verify_binary_descriptor(
     artifact: &ArtifactRef,
     file: &File,
     control: &RoventStartupControl,
+    v3_exact_budget: bool,
 ) -> Result<DescriptorIdentity, ProcessBoundaryError> {
     check_control(control)?;
     artifact.validate().map_err(|_| {
@@ -1258,7 +1275,9 @@ fn verify_binary_descriptor(
     })?;
     let before = descriptor_identity(file)?;
     require(
-        before.bytes == artifact.bytes && (1..=MAX_EXECUTABLE_BYTES).contains(&before.bytes),
+        before.bytes == artifact.bytes
+            && before.bytes != 0
+            && (v3_exact_budget || before.bytes <= MAX_EXECUTABLE_BYTES),
         ProcessBoundaryFailure::BinaryDescriptor,
         "original binary exceeds its exact bounded declaration",
     )?;

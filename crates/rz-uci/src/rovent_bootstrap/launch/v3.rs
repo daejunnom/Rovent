@@ -92,6 +92,57 @@ fn direct_selection(
     })
 }
 
+/// Pin the declared original executable beneath the already-owned root.
+/// Hashing and mapped-executable identity are performed by the V3 process
+/// boundary under the same original cancellation and startup deadline.
+#[cfg(target_os = "linux")]
+fn open_original_binary_v3(root: &Dir, artifact: &ArtifactRef) -> Result<File, RoventLaunchError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::OpenOptionsExt;
+    artifact
+        .validate()
+        .map_err(|failure| error("Binary", failure))?;
+    let parts: Vec<_> = artifact.path.split('/').collect();
+    let (filename, parents) = parts
+        .split_last()
+        .ok_or_else(|| error("Binary", "empty binary path"))?;
+    let mut scoped = root
+        .try_clone()
+        .map_err(|failure| error("Binary", failure))?;
+    for parent in parents {
+        scoped = scoped
+            .open_dir_nofollow(parent)
+            .map_err(|failure| error("Binary", failure))?;
+    }
+    let before = scoped
+        .symlink_metadata(filename)
+        .map_err(|failure| error("Binary", failure))?;
+    if !before.is_file() {
+        return Err(error(
+            "Binary",
+            "original executable must be a regular file",
+        ));
+    }
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
+    let file = scoped
+        .open_with(filename, &options)
+        .map_err(|failure| error("Binary", failure))?;
+    let metadata = file
+        .metadata()
+        .map_err(|failure| error("Binary", failure))?;
+    if !metadata.is_file() || metadata.len() != artifact.bytes || artifact.bytes == 0 {
+        return Err(error(
+            "Binary",
+            "original executable length or file type differs from declaration",
+        ));
+    }
+    Ok(file.into_std())
+}
+
 #[cfg(target_os = "linux")]
 struct SystemReceiptWriter {
     directory: Dir,
@@ -263,11 +314,12 @@ fn admit_original<'a>(
         cancellation: Arc::new(AtomicBool::new(false)),
     };
     let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
-    let binary = lock
-        .manifest
-        .engine
-        .binary
-        .open_verified_at(&root, 128 << 20)
+    control
+        .check()
+        .map_err(|failure| error("Binary", failure))?;
+    let binary = open_original_binary_v3(&root, &lock.manifest.engine.binary)?;
+    control
+        .check()
         .map_err(|failure| error("Binary", failure))?;
     let source_policy = if arguments.strict_source.unwrap_or(false) {
         SourceEvidencePolicy::StrictReproducibility

@@ -79,6 +79,29 @@ pub struct ExecutableIdentityV1 {
 }
 impl ExecutableIdentityV1 {
     pub fn observe() -> Result<Self, ProcessReceiptError> {
+        Self::observe_with_budget(MAX_EXECUTABLE_BYTES, false, || true)
+    }
+
+    /// V3 binds the mapped executable's complete bytes to its original
+    /// ArtifactRef and original startup control rather than a global ceiling.
+    /// The callback is checked between reads; a single OS read is not preempted.
+    pub(crate) fn observe_exact_with_control(
+        declared_bytes: u64,
+        control_active: impl FnMut() -> bool,
+    ) -> Result<Self, ProcessReceiptError> {
+        Self::observe_with_budget(declared_bytes, true, control_active)
+    }
+
+    fn observe_with_budget(
+        max_bytes: u64,
+        exact: bool,
+        mut control_active: impl FnMut() -> bool,
+    ) -> Result<Self, ProcessReceiptError> {
+        if max_bytes == 0 {
+            return Err(ProcessReceiptError::boundary(
+                "executable identity byte budget is empty",
+            ));
+        }
         #[cfg(target_os = "linux")]
         let (file, source) = (
             File::open("/proc/self/exe"),
@@ -95,6 +118,11 @@ impl ExecutableIdentityV1 {
         let mut hash = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
+            if !control_active() {
+                return Err(ProcessReceiptError::boundary(
+                    "executable identity control expired or cancelled",
+                ));
+            }
             let count = file
                 .read(&mut buffer)
                 .map_err(|error| ProcessReceiptError::io("read executable", error))?;
@@ -103,7 +131,7 @@ impl ExecutableIdentityV1 {
             }
             bytes = bytes
                 .checked_add(count as u64)
-                .filter(|count| *count <= MAX_EXECUTABLE_BYTES)
+                .filter(|count| *count <= max_bytes)
                 .ok_or_else(|| {
                     ProcessReceiptError::boundary("executable identity byte budget exceeded")
                 })?;
@@ -112,6 +140,16 @@ impl ExecutableIdentityV1 {
         if bytes == 0 {
             return Err(ProcessReceiptError::boundary(
                 "executable identity is empty",
+            ));
+        }
+        if exact && bytes != max_bytes {
+            return Err(ProcessReceiptError::boundary(
+                "executable identity differs from declared length",
+            ));
+        }
+        if !control_active() {
+            return Err(ProcessReceiptError::boundary(
+                "executable identity control expired or cancelled",
             ));
         }
         Ok(Self {

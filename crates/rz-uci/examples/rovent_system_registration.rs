@@ -71,9 +71,18 @@ mod registration {
         startup_source: String,
         startup_license: String,
     }
+    #[derive(Clone, Copy, Default, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum SourceVerification {
+        #[default]
+        Observe,
+        Strict,
+    }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Request {
+        #[serde(default)]
+        source_verification: SourceVerification,
         contract_revision: String,
         run_id: String,
         purpose: RoventPurpose,
@@ -191,8 +200,7 @@ mod registration {
         {
             return Err("capture budgets must be nonzero".into());
         }
-        let actual_components = compiled_process_source_components_v3()
-            .map_err(|e| format!("compiled source inventory: {e:?}"))?;
+        let actual_components = compiled_process_source_components_v3();
         let mut required = vec![
             "rules",
             "store",
@@ -220,24 +228,61 @@ mod registration {
         if req.engine.nnuec.is_some() && !required.contains(&"cpu_search") {
             required.push("cpu_search");
         }
-        if required
-            .iter()
-            .any(|name| !req.engine.source_components.contains_key(*name))
-            || req.engine.source_components.len() > 64
-            || req
-                .engine
-                .source_components
+        // These observations concern this registration executable's embedded
+        // source, not the separately registered target binary or model bytes.
+        // Keep caller declarations unchanged even if evidence is unavailable.
+        let component_status = match &actual_components {
+            Err(_) => "unknown",
+            Ok(actual)
+                if required
+                    .iter()
+                    .all(|name| req.engine.source_components.contains_key(*name))
+                    && req.engine.source_components.len() <= 64
+                    && req
+                        .engine
+                        .source_components
+                        .iter()
+                        .all(|(k, v)| actual.get(k) == Some(v)) =>
+            {
+                "verified"
+            }
+            Ok(_) => "mismatch",
+        };
+        let model_source_status = match &actual_components {
+            Err(_) => "unknown",
+            Ok(actual)
+                if actual.get("model_native_v3")
+                    == Some(&req.engine.pc.proposer.implementation_sha256)
+                    && req.engine.source_components.get("model_native_v3")
+                        == Some(&req.engine.pc.proposer.implementation_sha256) =>
+            {
+                "verified"
+            }
+            Ok(_) => "mismatch",
+        };
+        let compiled_commit = env!("RZ_PALS_COMPILED_SOURCE_COMMIT");
+        let commit_status = if compiled_commit == "unregistered" {
+            "unknown"
+        } else if compiled_commit == req.engine.source_commit {
+            "verified"
+        } else {
+            "mismatch"
+        };
+        if matches!(req.source_verification, SourceVerification::Strict)
+            && [component_status, model_source_status, commit_status]
                 .iter()
-                .any(|(k, v)| actual_components.get(k) != Some(v))
+                .any(|status| *status != "verified")
         {
-            return Err("required source pins missing or different from registration executable's embedded sources".into());
+            return Err(format!(
+                "strict source evidence differs or is unavailable: commit={commit_status}, components={component_status}, model={model_source_status}"
+            ));
         }
-        if req.engine.source_components.get("model_native_v3")
-            != Some(&req.engine.pc.proposer.implementation_sha256)
+        if [component_status, model_source_status, commit_status]
+            .iter()
+            .any(|status| *status != "verified")
         {
-            return Err(
-                "model native source pin differs from explicitly registered model implementation"
-                    .into(),
+            eprintln!(
+                "source provenance warning (registration executable only): commit={commit_status}, components={component_status}, model={model_source_status}"
             );
         }
         // The current native Collection export contains one shared checkpoint
@@ -455,10 +500,13 @@ mod registration {
             }
         }
         println!(
-            "{{\"status\":\"registered\",\"system_identity\":\"{}\",\"runtime_lock_sha256\":\"{}\",\"execution_lock_sha256\":\"{}\",\"native_capture\":true,\"engine_model_asset_bytes_verified\":false,\"provider_ready\":false,\"gpu_inference\":false}}",
+            "{{\"status\":\"registered\",\"system_identity\":\"{}\",\"runtime_lock_sha256\":\"{}\",\"execution_lock_sha256\":\"{}\",\"source_commit_observation\":\"{}\",\"source_components_observation\":\"{}\",\"model_source_observation\":\"{}\",\"source_observation_scope\":\"registration_executable_only\",\"native_capture\":true,\"engine_model_asset_bytes_verified\":false,\"provider_ready\":false,\"gpu_inference\":false}}",
             hex(&captured.identity_sha256()),
             sys_lock.canonical_sha256,
-            lock.canonical_sha256
+            lock.canonical_sha256,
+            commit_status,
+            component_status,
+            model_source_status
         );
         Ok(())
     }
