@@ -92,6 +92,50 @@ fn arguments() -> Vec<String> {
 }
 
 #[test]
+fn direct_control_inventory_is_optional_and_requires_direct_assets() {
+    let mut direct = arguments();
+    direct.retain(|arg| !arg.starts_with("--native-assets="));
+    direct.extend(
+        [
+            "--native-export=inputs/export.json",
+            "--native-rules=inputs/rules.json",
+            "--native-public-graph=inputs/public.onnx",
+            "--native-shared-pc-graph=inputs/shared.onnx",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    assert!(
+        Arguments::parse(&direct)
+            .unwrap()
+            .direct_native_assets
+            .unwrap()
+            .cuda_control_inventory
+            .is_none()
+    );
+
+    let mut with_inventory = direct.clone();
+    with_inventory.push("--native-cuda-control-inventory=inputs/control.json".into());
+    assert_eq!(
+        Arguments::parse(&with_inventory)
+            .unwrap()
+            .direct_native_assets
+            .unwrap()
+            .cuda_control_inventory
+            .as_deref(),
+        Some("inputs/control.json")
+    );
+    with_inventory.push("--native-cuda-control-inventory=inputs/other.json".into());
+    assert!(Arguments::parse(&with_inventory).is_err());
+
+    direct.push("--native-cuda-control-inventory=../control.json".into());
+    assert!(Arguments::parse(&direct).is_err());
+    let mut index_selection = arguments();
+    index_selection.push("--native-cuda-control-inventory=inputs/control.json".into());
+    assert!(Arguments::parse(&index_selection).is_err());
+}
+
+#[test]
 fn v2_source_verification_is_strict_unless_explicitly_observed() {
     let default = Arguments::parse(&arguments()).unwrap();
     assert!(default.v2_strict_source());

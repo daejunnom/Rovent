@@ -152,6 +152,7 @@ struct DirectNativeAssets {
     rules: String,
     public_graph: String,
     shared_pc_graph: String,
+    cuda_control_inventory: Option<String>,
     validator_graph: Option<String>,
     public_graph_name: Option<String>,
     shared_pc_graph_name: Option<String>,
@@ -178,6 +179,7 @@ impl Arguments {
         let mut direct_rules = None;
         let mut direct_public = None;
         let mut direct_shared_pc = None;
+        let mut direct_cuda_control_inventory = None;
         let mut direct_validator = None;
         let mut direct_public_name = None;
         let mut direct_shared_pc_name = None;
@@ -220,6 +222,9 @@ impl Arguments {
                 }
                 "--native-shared-pc-graph" if direct_shared_pc.is_none() => {
                     direct_shared_pc = Some(private_path(value)?)
+                }
+                "--native-cuda-control-inventory" if direct_cuda_control_inventory.is_none() => {
+                    direct_cuda_control_inventory = Some(private_path(value)?)
                 }
                 "--native-validator-graph" if direct_validator.is_none() => {
                     direct_validator = Some(private_path(value)?)
@@ -391,6 +396,7 @@ impl Arguments {
             (None, None, None, None)
                 if direct_public_name.is_none()
                     && direct_shared_pc_name.is_none()
+                    && direct_cuda_control_inventory.is_none()
                     && direct_validator.is_none()
                     && direct_validator_name.is_none() =>
             {
@@ -402,6 +408,7 @@ impl Arguments {
                     rules,
                     public_graph,
                     shared_pc_graph,
+                    cuda_control_inventory: direct_cuda_control_inventory,
                     validator_graph: direct_validator,
                     public_graph_name: direct_public_name,
                     shared_pc_graph_name: direct_shared_pc_name,

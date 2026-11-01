@@ -1291,6 +1291,14 @@ fn direct_selection(
     lock: &RoventInputLockV3,
     selection: &DirectNativeAssets,
 ) -> Result<RoventNativeAssetSelection, RoventLaunchError> {
+    if selection.cuda_control_inventory.is_some()
+        && !matches!(
+            &lock.manifest.system_runtime_lock.runtime,
+            NativeRuntimeSourceV6::SystemCuda(_)
+        )
+    {
+        return Err(error("Assets", "CUDA control inventory requires system CUDA"));
+    }
     let original = |path: &str| -> Result<ArtifactRef, RoventLaunchError> {
         let mut matches = lock
             .manifest
@@ -1359,7 +1367,11 @@ fn direct_selection(
         export_manifest: original(&selection.export)?,
         rules_descriptor: original(&selection.rules)?,
         graphs,
-        cuda_control_inventory: None,
+        cuda_control_inventory: selection
+            .cuda_control_inventory
+            .as_deref()
+            .map(original)
+            .transpose()?,
         runtime_bundle_manifest: None,
     })
 }
