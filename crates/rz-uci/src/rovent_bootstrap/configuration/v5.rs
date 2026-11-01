@@ -268,7 +268,9 @@ mod tests {
     use super::*;
     use crate::rovent_bootstrap::configuration::{CuDnnSearch, NativeConfiguration};
     use rz_eval::onnx::Provider;
-    use rz_experiments::{RoventDevice, SystemLibrarySpecV6, SystemPlatformV6};
+    use rz_experiments::{
+        RoventDevice, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeSpecV6,
+    };
 
     fn spec(arena: u64) -> SystemRuntimeSpecV6 {
         let libraries = ["ort-core", "ort-provider-cuda"]

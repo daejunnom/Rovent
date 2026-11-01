@@ -121,12 +121,22 @@ pub fn pals_virtual_rules_descriptor() -> serde_json::Value {
 /// the currently compiled encoder declaration and never reads files or loads
 /// a model. A descriptor proves source identity, not learned compatibility.
 #[cfg(feature = "search-work-receipts")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RulesEncoderSourceEvidence {
+    Verified,
+    Mismatch,
+}
+
+#[cfg(feature = "search-work-receipts")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VirtualRulesDescriptorSummary {
     descriptor_sha256: [u8; 32],
     pub config: PalsModelConfig,
     pub semantic_sha256: [u8; 32],
+    /// Source SHA actually declared in the descriptor/export.
     pub encoder_source_sha256: [u8; 32],
+    pub compiled_encoder_source_sha256: [u8; 32],
+    pub encoder_source_evidence: RulesEncoderSourceEvidence,
 }
 #[cfg(feature = "search-work-receipts")]
 impl VirtualRulesDescriptorSummary {
@@ -170,6 +180,23 @@ struct VirtualRulesDescriptorBounds {
 pub fn validate_pals_virtual_rules_descriptor_bytes(
     bytes: &[u8],
 ) -> Result<VirtualRulesDescriptorSummary, rz_eval::error::BackendError> {
+    validate_virtual_rules_descriptor(bytes, true)
+}
+
+/// V3 functional observation only; descriptor/export identity and all input
+/// semantics remain mandatory, while source drift is recorded, not approved.
+#[cfg(feature = "search-work-receipts")]
+pub fn observe_pals_virtual_rules_descriptor_bytes(
+    bytes: &[u8],
+) -> Result<VirtualRulesDescriptorSummary, rz_eval::error::BackendError> {
+    validate_virtual_rules_descriptor(bytes, false)
+}
+
+#[cfg(feature = "search-work-receipts")]
+fn validate_virtual_rules_descriptor(
+    bytes: &[u8],
+    strict_source: bool,
+) -> Result<VirtualRulesDescriptorSummary, rz_eval::error::BackendError> {
     use rz_eval::error::{BackendError, FailureKind, FailureStage};
     let fail = |detail| {
         BackendError::new(
@@ -186,7 +213,14 @@ pub fn validate_pals_virtual_rules_descriptor_bytes(
     let d: VirtualRulesDescriptorDocument = serde_json::from_slice(bytes)
         .map_err(|_| fail("cannot decode strict V3 Rules descriptor"))?;
     let semantic_sha256 = pals_virtual_rules_semantic_digest();
-    let encoder_source_sha256 = pals_virtual_rules_source_digest();
+    let compiled_encoder_source_sha256 = pals_virtual_rules_source_digest();
+    let encoder_source_sha256 = rz_eval::asset::parse_sha256(&d.rules_encoder_source_sha256)
+        .map_err(|_| fail("V3 Rules descriptor source SHA is invalid"))?;
+    let encoder_source_evidence = if encoder_source_sha256 == compiled_encoder_source_sha256 {
+        RulesEncoderSourceEvidence::Verified
+    } else {
+        RulesEncoderSourceEvidence::Mismatch
+    };
     let expected_fields = pals_virtual_rules_semantic_fields().collect::<Vec<_>>();
     if d.schema != "rovezero.pals-rules-descriptor.v3"
         || d.rules_input_profile != PALS_VIRTUAL_RULES_ENCODING
@@ -207,7 +241,7 @@ pub fn validate_pals_virtual_rules_descriptor_bytes(
         || d.semantic_fields != expected_fields
         || d.semantic_digest_algorithm != "sha256_u64le_length_prefixed_utf8_fields"
         || d.rules_input_semantic_sha256 != hex(semantic_sha256)
-        || d.rules_encoder_source_sha256 != hex(encoder_source_sha256)
+        || (strict_source && encoder_source_evidence == RulesEncoderSourceEvidence::Mismatch)
         || d.learned_input_compatibility != "unverified_declaration_only"
     {
         return Err(fail(
@@ -219,11 +253,43 @@ pub fn validate_pals_virtual_rules_descriptor_bytes(
         config: d.config,
         semantic_sha256,
         encoder_source_sha256,
+        compiled_encoder_source_sha256,
+        encoder_source_evidence,
     })
 }
 #[cfg(all(test, feature = "search-work-receipts"))]
 mod tests {
     use super::*;
+    #[test]
+    fn observational_source_drift_preserves_declaration_and_semantic_checks() {
+        let mut descriptor = pals_virtual_rules_descriptor();
+        let actual = pals_virtual_rules_source_digest();
+        let mut declared = actual;
+        declared[0] ^= 1;
+        descriptor["rules_encoder_source_sha256"] = serde_json::json!(hex(declared));
+        let bytes = serde_json::to_vec(&descriptor).unwrap();
+        assert!(validate_pals_virtual_rules_descriptor_bytes(&bytes).is_err());
+        let result = observe_pals_virtual_rules_descriptor_bytes(&bytes).unwrap();
+        assert_eq!(
+            result.encoder_source_evidence,
+            RulesEncoderSourceEvidence::Mismatch
+        );
+        assert_eq!(result.encoder_source_sha256, declared);
+        assert_eq!(result.compiled_encoder_source_sha256, actual);
+        descriptor["rules_input_semantic_sha256"] = serde_json::json!("00".repeat(32));
+        assert!(
+            observe_pals_virtual_rules_descriptor_bytes(&serde_json::to_vec(&descriptor).unwrap())
+                .is_err()
+        );
+        descriptor["rules_input_semantic_sha256"] =
+            serde_json::json!(hex(pals_virtual_rules_semantic_digest()));
+        descriptor["rules_encoder_source_sha256"] = serde_json::json!("not-a-digest");
+        assert!(
+            observe_pals_virtual_rules_descriptor_bytes(&serde_json::to_vec(&descriptor).unwrap())
+                .is_err()
+        );
+    }
+
     #[cfg(feature = "search-work-receipts")]
     #[test]
     fn v3_descriptor_has_eight_axes_and_its_own_source_and_semantic_domains() {

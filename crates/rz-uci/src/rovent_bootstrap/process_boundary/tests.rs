@@ -652,19 +652,19 @@ mod linux {
         let bytes = b"unexecuted original binary fixture";
         let (artifact, mut file) = fixture.binary(bytes);
         file.seek(SeekFrom::Start(7)).unwrap();
-        verify_binary_descriptor(&artifact, &file, &control()).unwrap();
+        verify_binary_descriptor(&artifact, &file, &control(), false).unwrap();
         assert_eq!(file.stream_position().unwrap(), 7);
         let mut too_big = artifact.clone();
         too_big.bytes = MAX_EXECUTABLE_BYTES + 1;
         assert_eq!(
-            verify_binary_descriptor(&too_big, &file, &control())
+            verify_binary_descriptor(&too_big, &file, &control(), false)
                 .unwrap_err()
                 .kind,
             ProcessBoundaryFailure::BinaryDescriptor
         );
         fs::write(fixture.root.join("binary"), vec![b'x'; bytes.len()]).unwrap();
         assert_eq!(
-            verify_binary_descriptor(&artifact, &file, &control())
+            verify_binary_descriptor(&artifact, &file, &control(), false)
                 .unwrap_err()
                 .kind,
             ProcessBoundaryFailure::BinaryDescriptor
@@ -679,7 +679,7 @@ mod linux {
         let control = control();
         control.cancellation.store(true, Ordering::Release);
         assert_eq!(
-            verify_binary_descriptor(&artifact, &file, &control)
+            verify_binary_descriptor(&artifact, &file, &control, false)
                 .unwrap_err()
                 .kind,
             ProcessBoundaryFailure::Cancelled

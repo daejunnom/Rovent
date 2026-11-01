@@ -10,7 +10,10 @@ use crate::pals_adaptive_bootstrap::runtime_assets::{
     RuntimeAssetDeclaration, RuntimeAssetKind, RuntimeAssetView, RuntimeBackend,
     admit_runtime_roster, pin_retained_runtime,
 };
-use crate::pals_native::virtual_encoding::validate_pals_virtual_rules_descriptor_bytes;
+use crate::pals_native::virtual_encoding::{
+    RulesEncoderSourceEvidence, observe_pals_virtual_rules_descriptor_bytes,
+    validate_pals_virtual_rules_descriptor_bytes,
+};
 use cap_std::fs::Dir;
 use rz_contracts::Digest;
 use rz_eval::asset::parse_sha256;
@@ -465,6 +468,7 @@ pub struct RoventPinnedNativeSources<L = RoventInputLock> {
     original_v2_control: Option<RoventStartupControl>,
     topology: RoventStartupTopology,
     source_evidence: NativeSourceEvidence,
+    strict_source: bool,
     _root: Dir,
     private_root_path: PathBuf,
     configuration_blob: PinnedBlob,
@@ -998,6 +1002,7 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
             original_v2_control,
             topology,
             source_evidence,
+            strict_source,
             _root: root,
             private_root_path,
             configuration_blob,
@@ -1014,8 +1019,23 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
             collection,
         };
         owner.validate_lock()?;
+        if !strict_source
+            && owner.rules_encoder_source_evidence()? == RulesEncoderSourceEvidence::Mismatch
+        {
+            eprintln!(
+                "Rules encoder source provenance warning: mismatch; numeric and learned compatibility unverified"
+            );
+        }
         control.check()?;
         Ok(owner)
+    }
+    /// Compares actual descriptor-declared encoder SHA with compiled source;
+    /// it does not prove input equivalence or learned-model compatibility.
+    pub fn rules_encoder_source_evidence(
+        &self,
+    ) -> Result<RulesEncoderSourceEvidence, BackendError> {
+        let bytes = read_blob(&self.rules, 64 << 10)?;
+        Ok(observe_pals_virtual_rules_descriptor_bytes(&bytes)?.encoder_source_evidence)
     }
     pub fn lock(&self) -> &L {
         &self.lock
@@ -1188,7 +1208,11 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
             VirtualReviewArtifactKind::Fresh,
         )?;
         let rules_raw = read_blob(&self.rules, 64 << 10)?;
-        let rules = validate_pals_virtual_rules_descriptor_bytes(&rules_raw)?;
+        let rules = if self.strict_source {
+            validate_pals_virtual_rules_descriptor_bytes(&rules_raw)?
+        } else {
+            observe_pals_virtual_rules_descriptor_bytes(&rules_raw)?
+        };
         let model = &self.lock.engine().pc.proposer;
         if summary.checkpoint_sha256 != self.weights_digest()
             || summary.validator_present
