@@ -909,7 +909,7 @@ impl ExternalSelectionWire {
 /// The caller passes only process arguments. No account, token or external
 /// credential file is inspected by this native UCI entry.
 pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, None, None, None)
+    run_inner(arguments, None, None, None, None, None, None)
 }
 
 /// A V3 pre-native failure returns its exact original owner to the process
@@ -992,7 +992,7 @@ type V3OwnerSlot<'a> = Option<&'a mut ()>;
 #[cfg(target_os = "linux")]
 pub fn run_retaining(arguments: Vec<String>) -> Result<(), RoventRetainingLaunchError> {
     let mut owner = None;
-    match run_inner(arguments, None, None, None, Some(&mut owner)) {
+    match run_inner(arguments, None, None, None, None, Some(&mut owner), None) {
         Ok(()) => Ok(()),
         Err(error) => match owner {
             Some(RetainedV3Owner::Unstarted(owner)) => {
@@ -1016,11 +1016,25 @@ pub fn run_with_resource_admission<'a>(
     arguments: Vec<String>,
     admit_resource: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, Some(Box::new(admit_resource)), None, None)
+    run_inner(arguments, None, Some(Box::new(admit_resource)), None, None, None, None)
 }
 
 type ResourceAdmission<'a> =
     Box<dyn FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a>;
+
+type ResourceAdmissionV2<'a> =
+    Box<dyn FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a>;
+
+/// Admit the original V1 or V2 lock without projecting between versions.
+/// Only the callback matching the parsed lock can run, before native startup.
+pub fn run_with_resource_admission_v1_v2<'a>(
+    arguments: Vec<String>,
+    admit_v1: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
+    admit_v2: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
+    on_v2_selected: impl FnOnce() + 'a,
+) -> Result<(), RoventLaunchError> {
+    run_inner(arguments, None, Some(Box::new(admit_v1)), Some(Box::new(admit_v2)), None, None, Some(Box::new(on_v2_selected)))
+}
 
 /// V3 uses its original lock and a distinct callback, never a V1/V2 projection.
 /// The caller retains its OS resource owner and failure custody for the whole
@@ -1420,8 +1434,10 @@ fn run_inner<'a>(
     arguments: Vec<String>,
     collection: Option<CollectionLaunch<'a>>,
     resource_admission: Option<ResourceAdmission<'a>>,
+    resource_admission_v2: Option<ResourceAdmissionV2<'a>>,
     product_runner: Option<ProductRunner<'a>>,
     v3_owner_slot: V3OwnerSlot<'_>,
+    on_v2_selected: Option<Box<dyn FnOnce() + 'a>>,
 ) -> Result<(), RoventLaunchError> {
     if arguments == ["--build-system-runtime-capabilities-json"] {
         let sources = super::process_boundary::compiled_process_source_components_v3()
@@ -1485,6 +1501,9 @@ fn run_inner<'a>(
     let lock = match parse_launch_lock(&lock_bytes)? {
         LaunchInputLock::V1(lock) => lock,
         LaunchInputLock::V2(lock) => {
+            if let Some(selected) = on_v2_selected {
+                selected();
+            }
             if arguments.system_runtime_receipt_root.is_some() {
                 return Err(error(
                     "InputLockUnsupportedV2",
@@ -1494,7 +1513,7 @@ fn run_inner<'a>(
             if teacher_selections.is_some()
                 || collection_observer.is_some()
                 || collection_assemble.is_some()
-                || resource_admission.is_some()
+                || (resource_admission.is_some() && resource_admission_v2.is_none())
                 || product_runner.is_some()
             {
                 return Err(error(
@@ -1502,13 +1521,14 @@ fn run_inner<'a>(
                     "V1-only launch callbacks cannot consume /2",
                 ));
             }
-            return run_v2_native(arguments, lock, root, cwd, lock_file, None);
+            return run_v2_native(arguments, lock, root, cwd, lock_file, None, resource_admission_v2);
         }
         LaunchInputLock::V3(lock) => {
             if teacher_selections.is_some()
                 || collection_observer.is_some()
                 || collection_assemble.is_some()
                 || resource_admission.is_some()
+                || resource_admission_v2.is_some()
                 || product_runner.is_some()
             {
                 return Err(error(
@@ -2057,7 +2077,7 @@ fn run_pc_collection_v2_inner<'a>(
             ));
         }
     };
-    run_v2_native(arguments, lock, root, cwd, lock_file, Some(collection))
+    run_v2_native(arguments, lock, root, cwd, lock_file, Some(collection), None)
 }
 
 /// /2 products retain their original process, selected files and lock through
@@ -2069,6 +2089,7 @@ fn run_v2_native<'a>(
     cwd: PathBuf,
     lock_file: File,
     collection: Option<CollectionLaunchV2<'a>>,
+    mut product_resource: Option<ResourceAdmissionV2<'a>>,
 ) -> Result<(), RoventLaunchError> {
     if arguments.direct_native_assets.is_some()
         || arguments.system_runtime_receipt_root.is_some()
@@ -2170,6 +2191,21 @@ fn run_v2_native<'a>(
     let view = boundary
         .startup_view()
         .map_err(|failure| error("ProcessBoundary", failure))?;
+    // For product launches, enter the original resource scope before any
+    // storage owner or native worker can be created. Collection keeps its
+    // existing typed ordering and cannot provide this product callback.
+    if collection.is_some() && product_resource.is_some() {
+        return Err(error("ResourceAdmission", "duplicate V2 resource callbacks"));
+    }
+    if let Some(resource) = product_resource.take() {
+        control
+            .check()
+            .map_err(|failure| error("ResourceAdmission", failure))?;
+        resource(&lock)?;
+        control
+            .check()
+            .map_err(|failure| error("ResourceAdmission", failure))?;
+    }
     let mut pending_storage = prepare_launch_storage_v2(
         arguments.storage.as_ref(),
         &boundary,

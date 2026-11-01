@@ -4,7 +4,9 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use rz_experiments::NativeRuntimeSourceV6;
-use rz_uci::rovent_bootstrap::launch::{RoventLaunchError, run_with_resource_admission};
+use rz_uci::rovent_bootstrap::launch::{
+    RoventLaunchError, run_with_resource_admission, run_with_resource_admission_v1_v2,
+};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -213,6 +215,37 @@ impl RoventNativeResourceRunReceipt {
                 .as_ref()
                 .is_some_and(|scope| scope.matches_input_lock(lock))
         })
+    }
+}
+
+/// Versioned product receipt: V2 diagnostic persistence may be unavailable
+/// even when the original resource policy was admitted and the product ran.
+pub struct RoventNativeResourceRunReceiptV2 {
+    pub admission: Option<RoventResourceObservation>,
+    pub finished_live: Option<RoventResourceObservation>,
+    custody: Arc<Mutex<NativeResourceCustody>>,
+}
+pub enum RoventNativeResourceRunReceiptVersioned {
+    V1(RoventNativeResourceRunReceipt),
+    V2(RoventNativeResourceRunReceiptV2),
+}
+impl RoventNativeResourceRunReceiptVersioned {
+    pub fn observation(&self) -> Value {
+        match self {
+            Self::V1(receipt) => receipt.observation(),
+            Self::V2(receipt) => match receipt.custody.lock() {
+                Ok(state) => json!({"schema":"rz-rovent-native-resource-run/2",
+                    "admission":receipt.admission,"finished_live":receipt.finished_live,
+                    "admission_evidence_error":state.admission_evidence_error,
+                    "finished_evidence_error":state.finished_evidence_error,
+                    "finished_policy_observation_error":state.finished_live_error,
+                    "evidence_directory":state.plan.evidence_directory,
+                    "original_resource_owner_retained":true,
+                    "controlled_comparison_accepted":false,"training_executed":false}),
+                Err(_) => json!({"schema":"rz-rovent-native-resource-run/2",
+                    "resource_state_poisoned":true,"original_resource_owner_retained":true}),
+            },
+        }
     }
 }
 
@@ -657,6 +690,45 @@ impl RoventNativeResourceRunFailure {
             "finished_live":held.as_ref().and_then(|state|state.finished_live.as_ref()),
             "finished_live_error":held.as_ref().and_then(|state|state.finished_live_error.as_ref()),
             "automatic_cleanup":false,"training_executed":false})
+    }
+}
+
+pub enum RoventNativeResourceRunFailureVersioned {
+    V1(RoventNativeResourceRunFailure),
+    V2(RoventNativeResourceRunFailure),
+}
+impl RoventNativeResourceRunFailureVersioned {
+    pub fn observation(&self) -> Value {
+        match self {
+            Self::V1(failure) => failure.observation(),
+            Self::V2(failure) => {
+                let mut poisoned = false;
+                let held = failure.custody.as_ref().map(|custody| match custody.lock() {
+                    Ok(owner) => owner,
+                    Err(error) => { poisoned = true; error.into_inner() }
+                });
+                json!({"schema":"rz-rovent-native-resource-run-failure/2",
+                    "error":failure.detail,
+                    "original_custody_retained":failure.custody.is_some(),
+                    "resource_state_poisoned":poisoned,
+                    "resource_admission_not_started":if poisoned { None } else { held.as_ref().map(|state|state.no_admission_started()) },
+                    "evidence_directory":held.as_ref().map(|state|&state.plan.evidence_directory),
+                    "resource_failure":held.as_ref().and_then(|state|state.failure_v2.as_ref().map(|failure|failure.observation())),
+                    "admission":held.as_ref().and_then(|state|state.admission.as_ref()),
+                    "admission_evidence_error":held.as_ref().and_then(|state|state.admission_evidence_error.as_ref()),
+                    "finished_live":held.as_ref().and_then(|state|state.finished_live.as_ref()),
+                    "finished_evidence_error":held.as_ref().and_then(|state|state.finished_evidence_error.as_ref()),
+                    "finished_policy_observation_error":held.as_ref().and_then(|state|state.finished_live_error.as_ref()),
+                    "automatic_cleanup":false,"training_executed":false})
+            }
+        }
+    }
+}
+impl std::fmt::Display for RoventNativeResourceRunFailureVersioned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V1(error) | Self::V2(error) => std::fmt::Display::fmt(error, formatter),
+        }
     }
 }
 
@@ -1226,6 +1298,34 @@ pub fn run_native_with_resources(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeResourceRunReceipt, RoventNativeResourceRunFailure> {
+    match run_native_with_resources_inner(pin, arguments, None)? {
+        RoventNativeResourceRunReceiptVersioned::V1(receipt) => Ok(receipt),
+        RoventNativeResourceRunReceiptVersioned::V2(_) => {
+            unreachable!("V1-only resource callback cannot admit a V2 lock")
+        }
+    }
+}
+
+/// Native product entry with separately typed V1 and V2 resource admission.
+pub fn run_native_with_resources_versioned(
+    pin: RoventNativeResourcePlanPin,
+    arguments: Vec<String>,
+) -> Result<RoventNativeResourceRunReceiptVersioned, RoventNativeResourceRunFailureVersioned> {
+    let selected_v2 = std::cell::Cell::new(false);
+    run_native_with_resources_inner(pin, arguments, Some(&selected_v2)).map_err(|failure| {
+        if selected_v2.get() {
+            RoventNativeResourceRunFailureVersioned::V2(failure)
+        } else {
+            RoventNativeResourceRunFailureVersioned::V1(failure)
+        }
+    })
+}
+
+fn run_native_with_resources_inner(
+    pin: RoventNativeResourcePlanPin,
+    arguments: Vec<String>,
+    selected_v2: Option<&std::cell::Cell<bool>>,
+) -> Result<RoventNativeResourceRunReceiptVersioned, RoventNativeResourceRunFailure> {
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
         let root = Dir::open_ambient_dir(
@@ -1247,9 +1347,10 @@ pub fn run_native_with_resources(
         pre_native_admission: None,
     })?;
     let custody = Arc::new(Mutex::new(state));
-    let callback = Arc::clone(&custody);
-    let result = run_with_resource_admission(arguments, move |lock| {
-        callback
+    let callback_v1 = Arc::clone(&custody);
+    let callback_v2 = Arc::clone(&custody);
+    let admit_v1 = move |lock: &Arc<RoventInputLock>| {
+        callback_v1
             .lock()
             .map_err(|_| RoventLaunchError {
                 stage: "ResourceAdmission",
@@ -1260,7 +1361,25 @@ pub fn run_native_with_resources(
                 stage: "ResourceAdmission",
                 detail: error.to_string(),
             })
-    });
+    };
+    let admit_v2 = move |lock: &Arc<RoventInputLockV2>| {
+        callback_v2
+            .lock()
+            .map_err(|_| RoventLaunchError {
+                stage: "ResourceAdmission",
+                detail: "original resource owner poisoned".into(),
+            })?
+            .admit_v2(lock)
+            .map_err(|error| RoventLaunchError {
+                stage: "ResourceAdmission",
+                detail: error.to_string(),
+            })
+    };
+    let result = if let Some(selected) = selected_v2 {
+        run_with_resource_admission_v1_v2(arguments, admit_v1, admit_v2, move || selected.set(true))
+    } else {
+        run_with_resource_admission(arguments, admit_v1)
+    };
     let finish = custody
         .lock()
         .map_err(|_| invalid("original resource owner poisoned"))
@@ -1289,20 +1408,22 @@ pub fn run_native_with_resources(
     let state = custody
         .lock()
         .map_err(|_| failure("original resource owner poisoned".into()))?;
-    let admission = state
-        .admission
-        .clone()
-        .ok_or_else(|| failure("actual resource admission did not run".into()))?;
-    let finished_live = state
-        .finished_live
-        .clone()
-        .ok_or_else(|| failure("actual finished resource snapshot missing".into()))?;
+    let admission = state.admission.clone();
+    let finished_live = state.finished_live.clone();
+    if state.admission_v2_succeeded {
+        drop(state);
+        return Ok(RoventNativeResourceRunReceiptVersioned::V2(
+            RoventNativeResourceRunReceiptV2 { admission, finished_live, custody },
+        ));
+    }
+    let admission = admission.ok_or_else(|| failure("actual resource admission did not run".into()))?;
+    let finished_live = finished_live.ok_or_else(|| failure("actual finished resource snapshot missing".into()))?;
     drop(state);
-    Ok(RoventNativeResourceRunReceipt {
+    Ok(RoventNativeResourceRunReceiptVersioned::V1(RoventNativeResourceRunReceipt {
         admission,
         finished_live,
         custody,
-    })
+    }))
 }
 
 /// Explicit /3 system CUDA launch under its original resource owner. It uses

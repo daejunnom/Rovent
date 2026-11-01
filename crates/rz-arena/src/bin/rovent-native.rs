@@ -3,7 +3,7 @@
 fn main() -> std::process::ExitCode {
     use rz_arena::rovent_resource_scope::launch::{
         ROVENT_RESOURCE_USAGE, RoventControlledRunFailure, RoventNativeResourceCli,
-        parse_native_resource_cli, run_native_with_resources, run_native_with_resources_v3,
+        parse_native_resource_cli, run_native_with_resources_versioned, run_native_with_resources_v3,
         run_native_with_resources_v3_control,
     };
     use std::io::Write;
@@ -23,7 +23,7 @@ fn main() -> std::process::ExitCode {
             .map_err(|error| error.to_string())
         }
         Ok(RoventNativeResourceCli::Run { pin, arguments }) => {
-            match run_native_with_resources(pin, arguments) {
+            match run_native_with_resources_versioned(pin, arguments) {
                 Ok(receipt) => writeln!(std::io::stderr().lock(), "{}", receipt.observation())
                     .map_err(|error| error.to_string()),
                 Err(failure) => {
