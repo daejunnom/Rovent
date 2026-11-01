@@ -33,6 +33,9 @@ struct PreflightWireV6 {
     mapped_executable_bytes: u64,
     source_commit_observation: SourceObservation,
     source_components_observation: SourceObservation,
+    source_components_scope: String,
+    system_v6_source_observation: SourceObservation,
+    system_v6_source_scope: String,
     assets_held: usize,
     sessions_created: u64,
     provider_initialized: bool,
@@ -145,7 +148,8 @@ pub(super) fn validate_preflight_record(
     let config = &lock.config;
     let source_matches = config.source_policy != PalsSystemSourcePolicyV6::Strict
         || (record.source_commit_observation == SourceObservation::Verified
-            && record.source_components_observation == SourceObservation::Verified);
+            && record.source_components_observation == SourceObservation::Verified
+            && record.system_v6_source_observation == SourceObservation::Verified);
     if record.domain != "rz-pals-system-preflight-v6/1"
         || record.lock_sha256 != lock.canonical_sha256
         || record.system_runtime_lock_sha256 != config.system_runtime_lock.canonical_sha256
@@ -154,6 +158,8 @@ pub(super) fn validate_preflight_record(
         || record.process_generation != config.process_generation
         || record.mapped_executable_sha256 != config.endpoint.binary.sha256
         || record.mapped_executable_bytes != config.endpoint.binary.bytes
+        || record.source_components_scope != "declared-v5-registry-subset"
+        || record.system_v6_source_scope != "rz-pals-system-v6-boundary-source/1"
         || record.assets_held != config.assets.len()
         || record.sessions_created != 0
         || record.provider_initialized
@@ -161,8 +167,13 @@ pub(super) fn validate_preflight_record(
         || record.physical_completion != "not_applicable_no_gpu_execution"
         || (config.endpoint.source_commit.is_none()
             && record.source_commit_observation != SourceObservation::Unknown)
-        || (config.source_components.is_empty()
+        || (!config
+            .source_components
+            .keys()
+            .any(|key| key != "pals_system_v6")
             && record.source_components_observation != SourceObservation::Unknown)
+        || (!config.source_components.contains_key("pals_system_v6")
+            && record.system_v6_source_observation != SourceObservation::Unknown)
         || !source_matches
     {
         return Err(invalid(

@@ -696,6 +696,9 @@ mod tests {
             "mapped_executable_bytes": config.endpoint.binary.bytes,
             "source_commit_observation": "unknown",
             "source_components_observation": "unknown",
+            "source_components_scope": "declared-v5-registry-subset",
+            "system_v6_source_observation": "unknown",
+            "system_v6_source_scope": "rz-pals-system-v6-boundary-source/1",
             "assets_held": config.assets.len(),
             "sessions_created": 0,
             "provider_initialized": false,
@@ -739,11 +742,95 @@ mod tests {
         assert_eq!(raw, serde_json::to_vec(&wire).unwrap());
         assert_eq!(wire["source_commit_observation"], "unknown");
         assert_eq!(wire["source_components_observation"], "unknown");
+        assert_eq!(wire["system_v6_source_observation"], "unknown");
+        for field in [
+            "source_components_scope",
+            "system_v6_source_observation",
+            "system_v6_source_scope",
+        ] {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                validate_preflight_record(original, 11, &serde_json::to_vec(&missing).unwrap())
+                    .is_err()
+            );
+        }
+        for field in ["source_components_scope", "system_v6_source_scope"] {
+            let mut forged_scope = wire.clone();
+            forged_scope[field] = serde_json::json!("different_scope");
+            assert!(
+                validate_preflight_record(
+                    original,
+                    11,
+                    &serde_json::to_vec(&forged_scope).unwrap()
+                )
+                .is_err()
+            );
+        }
+        let mut forged_boundary = wire.clone();
+        forged_boundary["system_v6_source_observation"] = serde_json::json!("verified");
+        assert!(
+            validate_preflight_record(original, 11, &serde_json::to_vec(&forged_boundary).unwrap())
+                .is_err()
+        );
         let mut forged = wire;
         forged["source_commit_observation"] = serde_json::json!("verified");
         assert!(
             validate_preflight_record(original, 11, &serde_json::to_vec(&forged).unwrap()).is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preflight_source_scopes_are_independent_in_observe_and_strict_modes() {
+        use super::super::preflight::validate_preflight_record;
+        let pair = fixture();
+        let mut config = pair.endpoints[0].startup_lock.config.clone();
+        config
+            .source_components
+            .insert("pals_system_v6".into(), "a".repeat(64));
+        let observe = PalsSystemStartupLockV6::new(config.clone()).unwrap();
+        let mut wire = preflight_wire(&observe, 11);
+        wire["system_v6_source_observation"] = serde_json::json!("verified");
+        assert!(
+            validate_preflight_record(&observe, 11, &serde_json::to_vec(&wire).unwrap()).is_ok()
+        );
+        wire["source_components_observation"] = serde_json::json!("verified");
+        assert!(
+            validate_preflight_record(&observe, 11, &serde_json::to_vec(&wire).unwrap()).is_err()
+        );
+
+        config.source_policy = PalsSystemSourcePolicyV6::Strict;
+        config.endpoint.source_commit = Some("b".repeat(40));
+        config
+            .source_components
+            .insert("v5_test_component".into(), "c".repeat(64));
+        let strict = PalsSystemStartupLockV6::new(config).unwrap();
+        let mut wire = preflight_wire(&strict, 11);
+        for field in [
+            "source_commit_observation",
+            "source_components_observation",
+            "system_v6_source_observation",
+        ] {
+            wire[field] = serde_json::json!("verified");
+        }
+        assert!(
+            validate_preflight_record(&strict, 11, &serde_json::to_vec(&wire).unwrap()).is_ok()
+        );
+        for field in [
+            "source_commit_observation",
+            "source_components_observation",
+            "system_v6_source_observation",
+        ] {
+            for status in ["unknown", "mismatch"] {
+                let mut bad = wire.clone();
+                bad[field] = serde_json::json!(status);
+                assert!(
+                    validate_preflight_record(&strict, 11, &serde_json::to_vec(&bad).unwrap())
+                        .is_err()
+                );
+            }
+        }
     }
     #[test]
     fn environment_rejects_loader_injection_and_unbound_device_visibility() {
