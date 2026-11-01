@@ -347,11 +347,11 @@ def initialize_checkpoint(directory, seed, profile=DEFAULT_INIT_PROFILE):
     return metadata
 
 
-def load_checkpoint(path):
+def load_checkpoint(path, metadata_path=None):
     import torch
     from .model import PalsModel
     path = Path(path).resolve()
-    metadata_path = path.with_name("checkpoint.json")
+    metadata_path = path.with_name("checkpoint.json") if metadata_path is None else Path(metadata_path).resolve()
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if metadata.get("schema") not in (SCHEMA, MODEL_SEMANTICS_V2, MODEL_SEMANTICS_V3) or metadata.get("checkpoint_sha256") != digest_file(path):
         raise ValueError("checkpoint identity mismatch")

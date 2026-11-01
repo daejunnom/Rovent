@@ -364,7 +364,7 @@ def _digest_asset(path, deadline):
     return digest.hexdigest()
 
 
-def _verify_model_checkpoint(model, checkpoint_path, expected_sha256, deadline, torch):
+def _verify_model_checkpoint(model, checkpoint_path, expected_sha256, deadline, torch, *, require_pt_suffix=True):
     """Same private file descriptor for pin/decode/pin; never mutate caller.
 
     A full generation checkpoint can include V and optimizer state. Such state
@@ -373,7 +373,7 @@ def _verify_model_checkpoint(model, checkpoint_path, expected_sha256, deadline, 
     This verifies mathematical weight identity, not training eligibility.
     """
     path = Path(checkpoint_path).expanduser()
-    if path.suffix != ".pt" or path.is_symlink():
+    if (require_pt_suffix and path.suffix != ".pt") or path.is_symlink():
         raise ValueError("owned regular .pt checkpoint required")
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 2 * 1024 ** 3:
