@@ -479,6 +479,12 @@ fn role_only_native_two_pending_keep_their_original_views_and_return_no_research
     assert_eq!(facts.accepted.lock().unwrap().len(), 2);
     assert_eq!(receipt.counters.submitted_role_tickets, 2);
     assert_eq!(receipt.counters.consumed_role_outputs, 2);
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    {
+        let roles = manager.role_consumption();
+        assert_eq!((roles.proposer_outputs, roles.critic_outputs), (1, 1));
+        assert!(roles.complete);
+    }
     assert_eq!(receipt.counters.cpu_slice_receipts, 0);
     assert_eq!(receipt.counters.validator_ticket_admissions, 0);
     assert!(!manager.driver().revoked);
@@ -725,6 +731,12 @@ fn role_only_consume_error_with_positive_readback_is_not_discarded_twice() {
     )));
     assert_eq!(facts.accepted.lock().unwrap().len(), 1);
     assert_eq!(receipt.counters.consumed_role_outputs, 1);
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    {
+        let roles = manager.role_consumption();
+        assert_eq!((roles.proposer_outputs, roles.critic_outputs), (1, 0));
+        assert!(roles.complete);
+    }
     assert_eq!(*events.lock().unwrap(), ["accepted", "settled"]);
     let driver = finish_role_only_test_native(manager, &facts);
     assert_eq!(driver.consumed.len(), 1);
@@ -758,6 +770,8 @@ fn role_only_unknown_consumption_is_retained_without_duplicate_discard() {
             assert!(receipt.retained_outputs > 0);
             assert_eq!(receipt.counters.consumed_role_outputs, 0);
             assert_eq!(receipt.counters.unused_role_results, 0);
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            assert!(!manager.role_consumption().complete);
             break;
         }
         assert!(Instant::now() < cleanup_until);
@@ -805,6 +819,12 @@ fn role_only_driver_deadline_after_admission_abandons_without_consumption() {
     );
     assert_eq!(facts.accepted.lock().unwrap().len(), 1);
     assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    {
+        let roles = manager.role_consumption();
+        assert_eq!((roles.proposer_outputs, roles.critic_outputs), (0, 0));
+        assert!(roles.complete);
+    }
     assert_eq!(
         *events.lock().unwrap(),
         ["accepted", "abandoned", "settled"]

@@ -3585,6 +3585,8 @@ impl RoventPcSessionDriver {
         // Verify the manager and the original driver/actor receipt while the
         // same Frontier still owns its original budget and Rules identity.
         // Retiring it first would destroy the basis for shared cache closure.
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        let roles = manager.role_consumption();
         let sources = match manager.into_sources() {
             Ok(sources) => sources,
             Err((retained, error)) => {
@@ -3781,6 +3783,16 @@ impl RoventPcSessionDriver {
                 "RoventPcRootRestriction",
                 "actual result escaped original root restriction",
             ));
+        }
+        // Optional successful-root observation: no row means unobserved, not
+        // zero. This is not evidence of NN execution or physical completion.
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        {
+            let line = format!(
+                "SearchRoleConsumption: consumed_proposer_outputs={}; consumed_critic_outputs={}; consumption_observation_complete={}\n",
+                roles.proposer_outputs, roles.critic_outputs, roles.complete
+            );
+            super::product::diagnostics_v2::try_emit_diagnostic_line(&line);
         }
         Ok(SearchSessionReport {
             best_move: result.best_move,

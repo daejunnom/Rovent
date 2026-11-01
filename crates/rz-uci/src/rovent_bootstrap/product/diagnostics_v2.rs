@@ -133,6 +133,24 @@ fn same_stderr_pipe(_: &ObservationSink) -> bool {
     false
 }
 
+/// Best-effort optional diagnostic. Never change the original stderr flags or
+/// wait for a full pipe. An absent row means unobserved; it cannot establish
+/// failure, root completion, or physical lifetime. The role consumer emits
+/// only after its successful closure condition.
+#[cfg(feature = "pals-adaptive-diagnostics")]
+pub(in crate::rovent_bootstrap) fn try_emit_diagnostic_line(line: &str) {
+    if !line.ends_with('\n') || line.len() > MAX_ROW_BYTES {
+        return;
+    }
+    let Some(mut sink) = nonblocking_stderr_pipe() else {
+        return;
+    };
+    if !same_stderr_pipe(&sink) {
+        return;
+    }
+    let _ = sink.file.write_all(line.as_bytes());
+}
+
 impl<T> ObservedV2<T> {
     pub(in crate::rovent_bootstrap) fn new(inner: T, input_lock_sha256: String) -> Self {
         let sink = nonblocking_stderr_pipe();

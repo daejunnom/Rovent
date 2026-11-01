@@ -261,6 +261,48 @@ where
     pub sources: RoleOnlyManagerSources<Q, B, D>,
 }
 
+/// Actual Search consumption of settled P/C role outputs. These counts are
+/// not backend invocation counts or completed neural-network input counts.
+#[cfg(feature = "pals-adaptive-diagnostics")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoleConsumptionObservation {
+    pub proposer_outputs: u64,
+    pub critic_outputs: u64,
+    /// False means at least one consumed output could not be attributed or
+    /// represented; the known counts are then lower bounds.
+    pub complete: bool,
+}
+
+#[cfg(feature = "pals-adaptive-diagnostics")]
+impl Default for RoleConsumptionObservation {
+    fn default() -> Self {
+        Self {
+            proposer_outputs: 0,
+            critic_outputs: 0,
+            complete: true,
+        }
+    }
+}
+
+#[cfg(feature = "pals-adaptive-diagnostics")]
+impl RoleConsumptionObservation {
+    fn record(&mut self, role: Role) {
+        let count = match role {
+            Role::Proposer => &mut self.proposer_outputs,
+            Role::Critic => &mut self.critic_outputs,
+            _ => {
+                self.complete = false;
+                return;
+            }
+        };
+        if let Some(next) = count.checked_add(1) {
+            *count = next;
+        } else {
+            self.complete = false;
+        }
+    }
+}
+
 /// Separate receipt domain; zero R work is a structural absence, not a copy of
 /// an internal PALS ledger or a four-session legacy acceptance condition.
 #[derive(Clone, Debug)]
@@ -360,6 +402,8 @@ where
     cleanup_boundary: Option<CleanupBoundary>,
     effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
     counters: AdaptiveManagerCounters,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    role_consumption: RoleConsumptionObservation,
     canceled_acceptance_acks: u64,
     expired_acceptance_acks: u64,
     accounting: AdaptiveNativeAccountingSnapshot,
@@ -475,6 +519,8 @@ where
             cleanup_boundary: None,
             effective_clock: None,
             counters: AdaptiveManagerCounters::default(),
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            role_consumption: RoleConsumptionObservation::default(),
             canceled_acceptance_acks: 0,
             expired_acceptance_acks: 0,
             accounting: AdaptiveNativeAccountingSnapshot::default(),
@@ -503,6 +549,14 @@ where
     }
     pub fn driver(&self) -> &D {
         &self.driver
+    }
+    /// Current root-local Search consumption snapshot. `complete` only means
+    /// attribution is complete so far; it does not certify root completion,
+    /// backend execution, or physical lifetime. Published rows are limited to
+    /// successful closure, and an absent row means unobserved.
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub fn role_consumption(&self) -> RoleConsumptionObservation {
+        self.role_consumption
     }
     pub fn driver_mut(&mut self) -> &mut D {
         &mut self.driver
@@ -1893,6 +1947,10 @@ where
                             Ok(consumed) => consumed,
                             Err(readback) => {
                                 self.bindings[index].consumption_unknown = true;
+                                #[cfg(feature = "pals-adaptive-diagnostics")]
+                                {
+                                    self.role_consumption.complete = false;
+                                }
                                 self.record_failure(readback);
                                 false
                             }
@@ -2008,9 +2066,20 @@ where
         // shutdown path discard or count this result as unused.
         self.bindings[index].consumption_recorded = true;
         let binding = &self.bindings[index];
-        let ticket = binding
-            .ticket
-            .ok_or(AdaptiveManagerError::Invalid("P/C consumed ticket missing"))?;
+        let ticket = match binding.ticket {
+            Some(ticket) => ticket,
+            None => {
+                #[cfg(feature = "pals-adaptive-diagnostics")]
+                {
+                    self.role_consumption.complete = false;
+                }
+                return Err(AdaptiveManagerError::Invalid("P/C consumed ticket missing"));
+            }
+        };
+        // The driver already committed consumption. Record its original role
+        // before subsequent accounting can fail, and never infer an NN run.
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        self.role_consumption.record(ticket.role);
         let mut counters = self.counters;
         let mut accounting = self.accounting;
         counters.consumed_role_outputs =
