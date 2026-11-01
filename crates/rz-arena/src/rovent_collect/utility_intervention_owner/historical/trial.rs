@@ -327,7 +327,16 @@ pub(super) fn verify_trial(
         )?;
     }
     if !wire["historical_unbound_input"].is_null() {
-        verify_unbound(&wire["historical_unbound_input"], neutral.as_ref(), arm)?;
+        verify_unbound(
+            &wire["historical_unbound_input"],
+            neutral.as_ref(),
+            arm,
+            &wire,
+            source_offer,
+            model,
+            root_rules,
+            profile.target_record,
+        )?;
     }
     if !wire["unresolved_source"].is_null() {
         let unresolved = &wire["unresolved_source"];
@@ -414,6 +423,11 @@ fn verify_unbound(
     value: &Value,
     neutral: Option<&context::Neutral>,
     arm: &Value,
+    wire: &Value,
+    source_offer: &Value,
+    model: &v2::Model,
+    root: &Position,
+    target_record: u16,
 ) -> Result<(), ArenaError> {
     fields(
         value,
@@ -429,7 +443,17 @@ fn verify_unbound(
             "materialized_inside_complete_scope",
         ],
     )?;
-    let n = neutral.ok_or_else(|| error("/2 unbound history missing original neutral"))?;
+    let Some(n) = neutral else {
+        // Rejected pre-bind input is evidence of this trial's failed capture,
+        // not a new neutral target, arm, valid pair or training authority.
+        verify_rejected_unbound_gate(value, wire, arm)?;
+        let weights = model
+            .identity()
+            .weights_sha256
+            .as_deref()
+            .ok_or_else(|| error("/2 unbound model weights identity"))?;
+        return verify_rejected_unbound(value, source_offer, weights, root, target_record);
+    };
     ensure(
         value["materialized_inside_complete_scope"] == false
             && string(value, "reference_json")? == n.input.reference_json
@@ -455,4 +479,212 @@ fn verify_unbound(
         neutral_source || arm_source,
         "/2 unbound original capture provenance",
     )
+}
+
+fn verify_rejected_unbound_gate(
+    value: &Value,
+    wire: &Value,
+    arm: &Value,
+) -> Result<(), ArenaError> {
+    ensure(
+        !boolean(wire, "resolved")?
+            && !boolean(wire, "comparable")?
+            && wire["neutral_target"].is_null()
+            && arm.is_null()
+            && wire["neutral_target_sha256"].is_null()
+            && wire["materialized_json"].is_null()
+            && wire["materialized_sha256"].is_null()
+            && mask(&wire["target_known_mask"])? == [false; 7]
+            && value["materialized_inside_complete_scope"] == false,
+        "/2 rejected unbound input must remain unresolved",
+    )
+}
+
+/// Check only what the rejected wire actually carries. In particular the
+/// source offer binds the submitted view seals, not an independently replayed
+/// record ancestry or a completed neutral target.
+fn verify_rejected_unbound(
+    value: &Value,
+    source_offer: &Value,
+    weights: &str,
+    root: &Position,
+    target_record: u16,
+) -> Result<(), ArenaError> {
+    use rz_search::cpu_value::nnuec::rules;
+    let raw = string(value, "reference_json")?;
+    ensure(
+        raw.len() <= v2::utility_capture::MAX_INPUT_BYTES,
+        "/2 unbound input bound",
+    )?;
+    let reference: v2::utility::Reference = decode(raw.as_bytes())?;
+    ensure(
+        reference.schema == v2::utility::INPUT_SCHEMA
+            && reference.base_input.schema == v2::INPUT_SCHEMA
+            && reference.base_input.board_features == rules::reference_board_features(root)
+            && reference.base_input.side_to_move
+                == if root.side_to_move() == rz_position::Color::White {
+                    "white"
+                } else {
+                    "black"
+                }
+            && same(
+                &reference.base_input.local_line,
+                &rules::reference_line_from_rules(root, &[]).map_err(error)?,
+            )?,
+        "/2 unbound root numerical input",
+    )?;
+    let ids = &reference.target_ids;
+    let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+    ensure(
+        !ids.is_empty()
+            && ids.len() <= 64
+            && unique.len() == ids.len()
+            && reference.base_input.context_lines.len() as u64
+                == number(&source_offer["view"], "selected_records")?
+            && reference
+                .base_input
+                .context_lines
+                .iter()
+                .enumerate()
+                .all(|(index, line)| line.id == index as u64)
+            && ids.contains(&u64::from(target_record))
+            && ids.iter().all(|id| {
+                usize::try_from(*id)
+                    .is_ok_and(|index| index < reference.base_input.context_lines.len())
+            })
+            && same(&value["target_record_ids"], ids)?,
+        "/2 unbound target indices",
+    )?;
+    let context = v2::context_sha256(
+        &reference.base_input.context_lines,
+        &reference.base_input.context_edges,
+    )
+    .map_err(error)?;
+    let mut input = Sha256::new();
+    input.update(v2::utility_capture::INPUT_CAPTURE_DOMAIN.as_bytes());
+    input.update([0]);
+    input.update(weights.as_bytes());
+    input.update([0]);
+    input.update((raw.len() as u64).to_le_bytes());
+    input.update(raw.as_bytes());
+    let mut target = Sha256::new();
+    target.update(v2::utility_capture::TARGET_CAPTURE_DOMAIN.as_bytes());
+    target.update([0]);
+    target.update(context.as_bytes());
+    target.update([0]);
+    target.update((ids.len() as u32).to_le_bytes());
+    for id in ids {
+        target.update(id.to_le_bytes());
+    }
+    let target = format!("{:x}", target.finalize());
+    let view = hash_field(value, "original_view_sha256")?;
+    let full_view = hash_field(value, "original_full_view_sha256")?;
+    let mut submission = Sha256::new();
+    submission.update(v2::utility_capture::SUBMISSION_TARGET_CAPTURE_DOMAIN.as_bytes());
+    submission.update([0]);
+    submission.update(hash32(view)?.0);
+    submission.update(target.as_bytes());
+    ensure(
+        hash_field(value, "input_sha256")? == format!("{:x}", input.finalize())
+            && hash_field(value, "context_sha256")? == context
+            && hash_field(value, "target_sha256")? == target
+            && hash_field(value, "submission_target_sha256")?
+                == format!("{:x}", submission.finalize())
+            && source_offer["view"]["view_digest"] == view
+            && source_offer["full_view_sha256"] == full_view,
+        "/2 rejected input integrity and original source offer",
+    )
+}
+
+#[cfg(test)]
+mod rejected_input_tests {
+    use super::*;
+    use rz_search::cpu_value::nnuec::rules;
+    use serde_json::json;
+
+    #[test]
+    fn rejected_original_input_stays_scoped_and_unknown() {
+        let root = Position::startpos();
+        let line = rules::reference_line_from_rules(
+            &root,
+            &[rz_position::BoardMove::from_uci("e2e4").unwrap()],
+        )
+        .unwrap();
+        let reference = v2::utility::Reference {
+            schema: v2::utility::INPUT_SCHEMA.into(),
+            base_input: v2::ReferenceInput {
+                schema: v2::INPUT_SCHEMA.into(),
+                board_features: rules::reference_board_features(&root),
+                side_to_move: "white".into(),
+                context_lines: vec![v2::ReferenceLineV2 {
+                    id: 0,
+                    kind: 0,
+                    original_first_move: line.moves.first().copied(),
+                    anchor_features: line.anchor_features.clone(),
+                    perspective: line.perspective.clone(),
+                    moves: line.moves.clone(),
+                }],
+                context_edges: vec![],
+                local_line: rules::reference_line_from_rules(&root, &[]).unwrap(),
+            },
+            target_ids: vec![0],
+        };
+        let raw = serde_json::to_string(&reference).unwrap();
+        let weights = "registered-test-model-weights";
+        let context = v2::context_sha256(
+            &reference.base_input.context_lines,
+            &reference.base_input.context_edges,
+        )
+        .unwrap();
+        let mut input = Sha256::new();
+        input.update(v2::utility_capture::INPUT_CAPTURE_DOMAIN.as_bytes());
+        input.update([0]);
+        input.update(weights.as_bytes());
+        input.update([0]);
+        input.update((raw.len() as u64).to_le_bytes());
+        input.update(raw.as_bytes());
+        let mut target = Sha256::new();
+        target.update(v2::utility_capture::TARGET_CAPTURE_DOMAIN.as_bytes());
+        target.update([0]);
+        target.update(context.as_bytes());
+        target.update([0]);
+        target.update(1u32.to_le_bytes());
+        target.update(0u64.to_le_bytes());
+        let target = format!("{:x}", target.finalize());
+        let view = "11".repeat(32);
+        let full = "22".repeat(32);
+        let mut submission = Sha256::new();
+        submission.update(v2::utility_capture::SUBMISSION_TARGET_CAPTURE_DOMAIN.as_bytes());
+        submission.update([0]);
+        submission.update(hash32(&view).unwrap().0);
+        submission.update(target.as_bytes());
+        let value = json!({"reference_json": raw, "input_sha256": format!("{:x}", input.finalize()),
+            "target_sha256": target, "submission_target_sha256": format!("{:x}", submission.finalize()),
+            "context_sha256": context, "target_record_ids": [0], "original_view_sha256": view,
+            "original_full_view_sha256": full, "materialized_inside_complete_scope": false});
+        let offer =
+            json!({"view":{"view_digest":view,"selected_records":1},"full_view_sha256":full});
+        let wire = json!({"resolved":false,"comparable":false,"neutral_target":null,
+            "neutral_target_sha256":null,"materialized_json":null,"materialized_sha256":null,
+            "target_known_mask":[false,false,false,false,false,false,false]});
+        assert!(verify_rejected_unbound_gate(&value, &wire, &Value::Null).is_ok());
+        assert!(verify_rejected_unbound(&value, &offer, weights, &root, 0).is_ok());
+        let mut corrupt = value.clone();
+        corrupt["input_sha256"] = json!("00".repeat(32));
+        assert!(verify_rejected_unbound(&corrupt, &offer, weights, &root, 0).is_err());
+        let other_offer = json!({"view":{"view_digest":"33".repeat(32),"selected_records":1},"full_view_sha256":full});
+        assert!(verify_rejected_unbound(&value, &other_offer, weights, &root, 0).is_err());
+        let mut wrong_count = offer.clone();
+        wrong_count["view"]["selected_records"] = json!(2);
+        assert!(verify_rejected_unbound(&value, &wrong_count, weights, &root, 0).is_err());
+        assert!(verify_rejected_unbound(&value, &offer, weights, &root, 1).is_err());
+        assert!(verify_rejected_unbound(&value, &offer, "other-model", &root, 0).is_err());
+        let mut promoted = wire.clone();
+        promoted["resolved"] = json!(true);
+        assert!(verify_rejected_unbound_gate(&value, &promoted, &Value::Null).is_err());
+        promoted = wire.clone();
+        promoted["target_known_mask"][4] = json!(true);
+        assert!(verify_rejected_unbound_gate(&value, &promoted, &Value::Null).is_err());
+        assert!(verify_rejected_unbound_gate(&value, &wire, &json!({})).is_err());
+    }
 }
