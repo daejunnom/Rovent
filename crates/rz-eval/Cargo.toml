@@ -65,6 +65,10 @@ name = "runtime_loader_check"
 required-features = ["onnx"]
 
 [[example]]
+name = "system_cuda_smoke"
+required-features = ["onnx"]
+
+[[example]]
 name = "virtual_review_numeric_capture"
 required-features = ["onnx", "contracts"]
 

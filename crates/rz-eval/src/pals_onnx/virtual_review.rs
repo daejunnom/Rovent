@@ -414,6 +414,9 @@ pub enum VirtualReviewNativeCommand {
     VerifyRuntime,
     VerifyCudaPlacement,
     VerifyVirtualCudaPlacement,
+    /// System CUDA uses a separate witness; historical bundle evidence is not reused.
+    #[cfg(target_os = "linux")]
+    VerifySystemVirtualCudaPlacement,
 }
 /// The immutable view's exact history comes from Rules/ticket authority. It is
 /// deliberately outside numerical model features and must not be synthesized
@@ -567,6 +570,8 @@ pub enum VirtualReviewNativeResult {
     RuntimeVerified,
     CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
     VirtualCudaPlacementVerified(Box<VirtualReviewCudaPlacementWitness>),
+    #[cfg(target_os = "linux")]
+    SystemVirtualCudaPlacementVerified(Box<SystemVirtualReviewCudaPlacementWitness>),
 }
 
 /// V3 evidence is owned separately from the legacy P/C-only witness domain.
@@ -582,6 +587,8 @@ struct VirtualControlAudit {
     validator_seen: bool,
     warm_seed_seen: bool,
     witness: Option<VirtualReviewCudaPlacementWitness>,
+    #[cfg(target_os = "linux")]
+    system_witness: Option<SystemVirtualReviewCudaPlacementWitness>,
     rejected: Option<BackendError>,
 }
 
@@ -800,7 +807,7 @@ impl PalsVirtualReviewOnnxBackend {
                 "owned V3 control requires explicit CUDA and host public memory",
             ));
         }
-        config.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
+        config.validate_for_runtime(&runtime, control.is_some())?;
         let audit = control
             .map(|(policy, path)| {
                 Ok::<_, BackendError>((policy, cuda_control::owned_profile_root(&path)?))
@@ -848,7 +855,7 @@ impl PalsVirtualReviewOnnxBackend {
                 "owned V3 profile capability requires explicit CUDA and host public memory",
             ));
         }
-        config.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
+        config.validate_for_runtime(&runtime, control.is_some())?;
         let (audit, profile_directory) = match control {
             Some((policy, directory)) => {
                 directory.validate_live()?;
@@ -881,7 +888,7 @@ impl PalsVirtualReviewOnnxBackend {
     ) -> Result<Self, BackendError> {
         let mut phase_trace = VirtualReviewPhaseTrace::new(config.provider);
         phase_trace.record("backend_load_entered", "other", None);
-        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        config.validate_for_runtime(&runtime, audit.is_some())?;
         #[cfg(not(feature = "experimental-io-binding"))]
         if warm && matches!(config.provider, Provider::Cuda { .. }) {
             return Err(fail(
@@ -958,12 +965,12 @@ impl PalsVirtualReviewOnnxBackend {
         let seeds = tickets::TicketSeeds::new()?;
         let epoch = manifest.epoch()?;
         let rules_semantics = parse_sha256(&manifest.rules_input_semantic_sha256)?;
-        match (config.provider, runtime.bundle_digest()) {
+        match (config.provider, runtime.cuda_runtime_identity()) {
             (Provider::Cpu, Some(_)) | (Provider::Cuda { .. }, None) => {
                 return Err(fail(
                     K::IdentityMismatch,
                     S::Backend,
-                    "selected-review provider and native bundle differ",
+                    "selected-review provider and native runtime identity differ",
                 ));
             }
             (Provider::Cuda { .. }, Some(_)) => runtime.verify_cuda_dependencies()?,
@@ -1083,6 +1090,8 @@ impl PalsVirtualReviewOnnxBackend {
                 validator_seen: false,
                 warm_seed_seen: false,
                 witness: None,
+                #[cfg(target_os = "linux")]
+                system_witness: None,
                 rejected: None,
             }),
             quarantine: None,
@@ -1365,6 +1374,18 @@ impl PalsVirtualReviewOnnxBackend {
         &mut self,
     ) -> Result<VirtualReviewCudaPlacementWitness, BackendError> {
         self.idle()?;
+        if self
+            .runtime
+            .as_ref()
+            .expect("runtime owned")
+            .is_system_cuda()
+        {
+            return Err(fail(
+                K::UnsupportedModel,
+                S::Backend,
+                "system CUDA requires the separate system placement witness",
+            ));
+        }
         self.verify_runtime()?;
         let audit = self.audit.as_mut().ok_or_else(|| {
             fail(
@@ -1438,6 +1459,101 @@ impl PalsVirtualReviewOnnxBackend {
             }
         }
     }
+
+    /// A separate witness for a system-owned runtime. The physical worker must
+    /// be idle; this profile/mapping witness does not infer physical completion.
+    #[cfg(target_os = "linux")]
+    pub fn verify_system_virtual_cuda_placement(
+        &mut self,
+    ) -> Result<SystemVirtualReviewCudaPlacementWitness, BackendError> {
+        self.idle()?;
+        let runtime = self.runtime.as_ref().expect("runtime owned");
+        if !runtime.is_system_cuda() {
+            return Err(fail(
+                K::UnsupportedModel,
+                S::Backend,
+                "system placement witness requires a system CUDA runtime",
+            ));
+        }
+        let device_id = match self.config.provider {
+            Provider::Cuda { device_id, .. } => device_id,
+            Provider::Cpu => {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "system CUDA witness requires the declared CUDA provider",
+                ))
+            }
+        };
+        let audit = self.audit.as_ref().ok_or_else(|| {
+            fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "system V3 has no explicit CUDA control policy",
+            )
+        })?;
+        if let Some(cause) = &audit.rejected {
+            return Err(cause.clone());
+        }
+        if let Some(witness) = &audit.system_witness {
+            return Ok(witness.clone());
+        }
+        if !audit.proposer_seen
+            || !audit.critic_seen
+            || (self.validator.is_some() && !audit.validator_seen)
+            || (self.warm && !audit.warm_seed_seen)
+        {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "system V3 placement lacks validated execution for every registered private role",
+            ));
+        }
+        self.verify_runtime()?;
+        let audit = self.audit.as_mut().expect("control policy checked");
+        let checked = (|| {
+            let finish = |session: &mut Session, role: &str| {
+                if let Some(directory) = &audit.profile_directory {
+                    audit
+                        .policy
+                        .finish_virtual_profile_owned(session, directory, role)
+                } else {
+                    audit
+                        .policy
+                        .finish_virtual_profile(session, &audit.profile_root, role)
+                }
+            };
+            let public = finish(self.public.as_mut().expect("public"), "public")?;
+            let private_role = if self.warm {
+                "shared_warm"
+            } else {
+                "shared_pc"
+            };
+            let pc = finish(self.shared_pc.as_mut().expect("P/C"), private_role)?;
+            let mut profiles =
+                BTreeMap::from([("public".into(), public), (private_role.into(), pc)]);
+            if let Some(validator) = &mut self.validator {
+                profiles.insert("validator".into(), finish(validator, "validator")?);
+            }
+            audit.policy.verify_system_virtual_profiles(
+                &profiles,
+                audit.initialization.to_vec(),
+                runtime,
+                device_id,
+            )
+        })();
+        match checked {
+            Ok(witness) => {
+                audit.system_witness = Some(witness.clone());
+                Ok(witness)
+            }
+            Err(error) => {
+                audit.rejected = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
     pub fn validate_identity(
         &self,
         identity: &ReviewExecutionIdentity,
@@ -1917,6 +2033,12 @@ impl PalsVirtualReviewOnnxBackend {
                 VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => self
                     .verify_virtual_cuda_placement()
                     .map(|w| VirtualReviewNativeResult::VirtualCudaPlacementVerified(Box::new(w))),
+                #[cfg(target_os = "linux")]
+                VirtualReviewNativeCommand::VerifySystemVirtualCudaPlacement => {
+                    self.verify_system_virtual_cuda_placement().map(|w| {
+                        VirtualReviewNativeResult::SystemVirtualCudaPlacementVerified(Box::new(w))
+                    })
+                }
             };
             match &self.quarantine {
                 Some(cause) => PhysicalRun::Quarantined(cause.clone()),
@@ -1931,14 +2053,39 @@ fn execution_backend_digest(
     control: Option<[u8; 32]>,
     warm: bool,
 ) -> [u8; 32] {
-    virtual_review_backend_digest_from_metadata(
+    let legacy_digest = virtual_review_backend_digest_from_metadata(
         runtime.binary_digest(),
         runtime.native_loading_profile_digest(),
         runtime.bundle_digest(),
         config,
         control,
         warm,
-    )
+    );
+    if runtime.is_system_cuda() {
+        // System identity is not a legacy bundle digest. Preserve the old
+        // metadata codec and place system executions in a separate cache domain.
+        virtual_review_system_backend_digest_from_legacy(
+            legacy_digest,
+            runtime
+                .cuda_runtime_identity()
+                .expect("system runtime identity"),
+        )
+    } else {
+        legacy_digest
+    }
+}
+
+/// Domain-separate a system-CUDA backend from historical bundle backends.
+/// This pure codec never validates or loads the named system runtime.
+pub fn virtual_review_system_backend_digest_from_legacy(
+    legacy_digest: [u8; 32],
+    system_runtime_identity: [u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"rz-pals-virtual-review-system-cuda-backend/1");
+    digest.update(legacy_digest);
+    digest.update(system_runtime_identity);
+    digest.finalize().into()
 }
 
 /// Predict the unchanged backend identity from explicitly registered inputs.
@@ -2208,6 +2355,27 @@ mod tests {
         ] {
             assert_ne!(changed, expected);
         }
+    }
+    #[test]
+    fn system_runtime_identity_uses_a_distinct_backend_cache_domain() {
+        let legacy = virtual_review_backend_digest_from_metadata(
+            [7; 32],
+            None,
+            None,
+            PalsOnnxConfig::cpu(),
+            None,
+            false,
+        );
+        let system = virtual_review_system_backend_digest_from_legacy(legacy, [1; 32]);
+        assert_ne!(system, legacy);
+        assert_ne!(
+            system,
+            virtual_review_system_backend_digest_from_legacy(legacy, [2; 32])
+        );
+        assert_ne!(
+            system,
+            virtual_review_system_backend_digest_from_legacy([9; 32], [1; 32])
+        );
     }
     fn accounting_stats() -> PalsBackendStats {
         PalsBackendStats {

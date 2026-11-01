@@ -39,6 +39,8 @@ mod device_pages_plan;
 mod public_pages;
 pub mod virtual_review;
 mod warm;
+#[cfg(target_os = "linux")]
+pub use cuda_control::SystemVirtualReviewCudaPlacementWitness;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
     PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness, VirtualReviewControlLayout,
@@ -918,6 +920,10 @@ impl PalsOnnxConfig {
         }
     }
     fn validate(&self) -> Result<(), BackendError> {
+        self.validate_with_system_cuda(false)
+    }
+
+    fn validate_with_system_cuda(&self, system_cuda: bool) -> Result<(), BackendError> {
         if !(1..=2).contains(&self.intra_threads) {
             return Err(fail(
                 K::InvalidInput,
@@ -930,7 +936,10 @@ impl PalsOnnxConfig {
             arena_bytes,
         } = self.provider
         {
-            if device_id < 0 || arena_bytes == 0 || arena_bytes > 6 * 1024 * 1024 * 1024 {
+            if device_id < 0
+                || arena_bytes == 0
+                || (!system_cuda && arena_bytes > 6 * 1024 * 1024 * 1024)
+            {
                 return Err(fail(
                     K::InvalidInput,
                     S::Admission,
@@ -969,6 +978,41 @@ impl PalsOnnxConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Validate an explicitly selected system-CUDA configuration. The arena
+    /// limit is still the caller's registered positive `usize`; unlike the
+    /// historical local profile it is not capped to one GPU's 6 GiB VRAM.
+    /// This preflight does not inspect the device or establish availability.
+    pub fn validate_system_execution_selection(self) -> Result<(), BackendError> {
+        self.validate_with_system_cuda(true)?;
+        if !matches!(self.provider, Provider::Cuda { .. }) {
+            return Err(fail(
+                K::InvalidInput,
+                S::Admission,
+                "system CUDA selection requires an explicit CUDA provider",
+            ));
+        }
+        if self.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "system CUDA does not support experimental cuDNN control profiles",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_runtime(
+        self,
+        runtime: &OrtRuntime,
+        explicit_control: bool,
+    ) -> Result<(), BackendError> {
+        if runtime.is_system_cuda() {
+            self.validate_system_execution_selection()
+        } else {
+            self.validate_execution_selection(runtime.native_loading_profile(), explicit_control)
+        }
     }
     /// Pure preflight for callers before runtime/model I/O. The loader repeats
     /// this with the actual retained runtime profile before reading the model.
@@ -2810,7 +2854,7 @@ impl PalsOnnxBackend {
         profile: &virtual_review::VirtualReviewProfileDirectory,
     ) -> Result<Self, BackendError> {
         if config.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
-            config.validate_execution_selection(runtime.native_loading_profile(), true)?;
+            config.validate_for_runtime(&runtime, true)?;
         }
         if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
             return Err(fail(
@@ -2849,7 +2893,7 @@ impl PalsOnnxBackend {
         profile_root: &Path,
     ) -> Result<Self, BackendError> {
         if config.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
-            config.validate_execution_selection(runtime.native_loading_profile(), true)?;
+            config.validate_for_runtime(&runtime, true)?;
         }
         if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
             return Err(fail(
@@ -2874,7 +2918,7 @@ impl PalsOnnxBackend {
         config: PalsOnnxConfig,
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
-        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        config.validate_for_runtime(&runtime, audit.is_some())?;
         if !path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -2892,7 +2936,7 @@ impl PalsOnnxBackend {
         config: PalsOnnxConfig,
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
     ) -> Result<Self, BackendError> {
-        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        config.validate_for_runtime(&runtime, audit.is_some())?;
         let bytes = sources.read_manifest(MAX_MANIFEST_BYTES)?;
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(fail(
@@ -2924,12 +2968,12 @@ impl PalsOnnxBackend {
             .as_deref()
             .map(parse_sha256)
             .transpose()?;
-        match (config.provider, runtime.bundle_digest()) {
+        match (config.provider, runtime.cuda_runtime_identity()) {
             (Provider::Cpu, Some(_)) | (Provider::Cuda { .. }, None) => {
                 return Err(fail(
                     K::IdentityMismatch,
                     S::Backend,
-                    "PALS provider and verified native runtime bundle differ",
+                    "PALS provider and verified native runtime identity differ",
                 ));
             }
             (Provider::Cuda { .. }, Some(_)) => {
@@ -3175,11 +3219,11 @@ impl PalsOnnxBackend {
             game_generation: self.game_generation,
             domain: DevicePageDomain::Cuda {
                 device_id,
-                runtime_sha256: self.runtime.bundle_digest().ok_or_else(|| {
+                runtime_sha256: self.runtime.cuda_runtime_identity().ok_or_else(|| {
                     fail(
                         K::IdentityMismatch,
                         S::Admission,
-                        "resident PALS pages require the actual CUDA runtime bundle identity",
+                        "resident PALS pages require the actual CUDA runtime identity",
                     )
                 })?,
             },
@@ -5320,6 +5364,48 @@ mod tests {
         validate_native_loading_path(shim, cuda, true).unwrap();
         cuda.device_public_memory = true;
         assert!(validate_native_loading_path(shim, cuda, true).is_err());
+    }
+
+    #[test]
+    fn system_cuda_selection_preserves_legacy_limits_and_rejects_unsupported_modes() {
+        let mut config = PalsOnnxConfig::cpu();
+        assert!(config.validate_system_execution_selection().is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 256 * 1024 * 1024,
+        };
+        config.validate_system_execution_selection().unwrap();
+        config.intra_threads = 0;
+        assert!(config.validate_system_execution_selection().is_err());
+        config.intra_threads = 2;
+        config.provider = Provider::Cuda {
+            device_id: -1,
+            arena_bytes: 1,
+        };
+        assert!(config.validate_system_execution_selection().is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 0,
+        };
+        assert!(config.validate_system_execution_selection().is_err());
+        config.provider = Provider::Cuda {
+            device_id: 0,
+            arena_bytes: 256 * 1024 * 1024,
+        };
+        config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefault;
+        assert!(config.validate_system_execution_selection().is_err());
+        config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm;
+        assert!(config.validate_system_execution_selection().is_err());
+        #[cfg(target_pointer_width = "64")]
+        {
+            config.cudnn_conv_search = PalsCuDnnConvSearch::LegacyImplicitExhaustive;
+            config.provider = Provider::Cuda {
+                device_id: 0,
+                arena_bytes: 7 * 1024 * 1024 * 1024,
+            };
+            config.validate_system_execution_selection().unwrap();
+            assert!(config.validate_execution_selection(None, false).is_err());
+        }
     }
 
     #[test]

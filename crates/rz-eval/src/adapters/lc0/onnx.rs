@@ -19,6 +19,8 @@ use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
 use rz_encoding::POLICY_SIZE;
+#[cfg(target_os = "linux")]
+pub use rz_native_loader::system::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
 use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
 pub use rz_native_loader::{
     NativeLoadingProfile, NativeMappingObservation, NVIDIA_LOAD_ORDER, ORT_LIBRARY_NAMES,
@@ -121,19 +123,73 @@ pub fn declared_backend_identity(
 
 #[derive(Clone)]
 pub struct OrtRuntime {
-    pin: RuntimeLibraryPin,
+    owner: RuntimeOwner,
     build_info: String,
     cuda_libraries: Option<ProcessLibrarySet>,
     ort_libraries: Option<Arc<Vec<rz_native_loader::OwnedLibrary>>>,
     loading_profile: Option<NativeLoadingProfile>,
 }
 
+#[derive(Clone)]
+enum RuntimeOwner {
+    Copy(RuntimeLibraryPin),
+    #[cfg(target_os = "linux")]
+    System {
+        runtime: SystemRuntime,
+        core_digest: [u8; 32],
+    },
+}
+
+impl RuntimeOwner {
+    fn same_copy(&self, pin: &RuntimeLibraryPin) -> bool {
+        match self {
+            Self::Copy(current) => {
+                current.path() == pin.path()
+                    && current.binary_digest() == pin.binary_digest()
+                    && current.bundle_digest() == pin.bundle_digest()
+            }
+            #[cfg(target_os = "linux")]
+            Self::System { .. } => false,
+        }
+    }
+
+    fn binary_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Copy(pin) => pin.binary_digest(),
+            #[cfg(target_os = "linux")]
+            Self::System { core_digest, .. } => *core_digest,
+        }
+    }
+
+    fn legacy_bundle_digest(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Copy(pin) => pin.bundle_digest(),
+            #[cfg(target_os = "linux")]
+            Self::System { .. } => None,
+        }
+    }
+
+    fn same_owner(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Copy(left), Self::Copy(right)) => {
+                self.same_copy(right) && right.path() == left.path()
+            }
+            #[cfg(target_os = "linux")]
+            (Self::System { runtime: left, .. }, Self::System { runtime: right, .. }) => {
+                left.identity_sha256() == right.identity_sha256()
+            }
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for OrtRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OrtRuntime")
-            .field("pin", &self.pin)
+            .field("runtime_binary_digest", &self.owner.binary_digest())
             .field("build_info", &self.build_info)
-            .field("cuda_bundle", &self.pin.bundle_digest())
+            .field("cuda_bundle", &self.owner.legacy_bundle_digest())
             .field("native_loading_profile", &self.loading_profile)
             .finish()
     }
@@ -142,7 +198,7 @@ impl std::fmt::Debug for OrtRuntime {
 struct RuntimeLatch {
     // ORT may retain the native library even if later initialization fails.
     // Preserve its bootstrap capability on both success and latched failure.
-    pin: RuntimeLibraryPin,
+    owner: RuntimeOwner,
     loading_profile: Option<NativeLoadingProfile>,
     result: Result<OrtRuntime, BackendError>,
 }
@@ -180,10 +236,7 @@ impl OrtRuntime {
             unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
         })?;
         if let Some(latch) = guard.as_mut() {
-            if latch.pin.path() != pin.path()
-                || latch.pin.binary_digest() != pin.binary_digest()
-                || latch.pin.bundle_digest() != pin.bundle_digest()
-            {
+            if !latch.owner.same_copy(pin) {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
                     S::Backend,
@@ -202,9 +255,7 @@ impl OrtRuntime {
                 return Err(latch.result.as_ref().unwrap_err().clone());
             }
             let runtime = latch.result.as_ref().map_err(Clone::clone)?;
-            return if runtime.pin.binary_digest() == pin.binary_digest()
-                && runtime.pin.bundle_digest() == pin.bundle_digest()
-            {
+            return if runtime.owner.same_copy(pin) {
                 let runtime = runtime.clone();
                 drop(guard);
                 if runtime.bundle_digest().is_some() {
@@ -291,7 +342,7 @@ impl OrtRuntime {
                 ));
             }
             Ok(Self {
-                pin: pin.clone(),
+                owner: RuntimeOwner::Copy(pin.clone()),
                 build_info: info.to_owned(),
                 cuda_libraries,
                 ort_libraries,
@@ -310,22 +361,176 @@ impl OrtRuntime {
             Err(error)
         });
         *guard = Some(RuntimeLatch {
-            pin: pin.clone(),
+            owner: RuntimeOwner::Copy(pin.clone()),
             loading_profile,
             result: result.clone(),
         });
         result
     }
 
+    /// Initialize ORT from an explicitly captured system installation without
+    /// copying CUDA or ORT files into an engine-owned runtime directory.
+    ///
+    /// `ort-core` and `ort-provider-cuda` must be declared and required. The
+    /// provider and GPU are not considered operational until session creation,
+    /// a real CUDA Run and the existing physical-completion checks succeed.
+    /// ORT is loaded by its captured canonical system path so provider discovery
+    /// can use that installation's layout. A concurrent package replacement
+    /// can race native loading: the origin audit detects a mismatched mapping
+    /// afterwards but cannot undo native constructors that have already run.
+    /// Provider readiness and physical completion require separate real checks.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda(runtime: &SystemRuntime) -> Result<Self, BackendError> {
+        let unavailable = || {
+            BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "system ORT initialization failed; install compatible native dependencies",
+            )
+        };
+        let libraries = runtime.libraries();
+        let core = libraries
+            .iter()
+            .find(|item| item.role == "ort-core" && item.required_mapping)
+            .ok_or_else(|| {
+                BackendError::new(
+                    K::InvalidInput,
+                    S::Admission,
+                    "system CUDA requires a required ort-core role",
+                )
+            })?;
+        if !libraries
+            .iter()
+            .any(|item| item.role == "ort-provider-cuda" && item.required_mapping)
+        {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "system CUDA requires a required ort-provider-cuda role",
+            ));
+        }
+        let owner = RuntimeOwner::System {
+            runtime: runtime.clone(),
+            core_digest: core.sha256,
+        };
+        let mut guard = RUNTIME.lock().map_err(|error| {
+            unavailable().with_external_cause(CauseCode::RuntimeInitialize, &error)
+        })?;
+        if let Some(latch) = guard.as_ref() {
+            if !latch.owner.same_owner(&owner) || latch.loading_profile.is_some() {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "ORT process runtime owner cannot be changed",
+                ));
+            }
+            let result = latch.result.clone();
+            drop(guard);
+            let loaded = result?;
+            loaded.verify_cuda_mappings(false)?;
+            return Ok(loaded);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let path = core.canonical_path.to_str().ok_or_else(unavailable)?;
+            if !ort::init_from(path)
+                .with_name("RoveZero-C-system")
+                .commit()
+                .map_err(|error| {
+                    unavailable().with_ort_cause(CauseCode::RuntimeInitialize, error)
+                })?
+            {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "ORT was initialized outside bootstrap",
+                ));
+            }
+            let info = ort::info();
+            // ort's dynamic initialization must acquire its required C API;
+            // a build commit string is an observation, not a compatibility gate.
+            let observation = runtime.observe_mappings().map_err(loader_error)?;
+            if !observation
+                .mapped_roles
+                .iter()
+                .any(|role| role == "ort-core")
+                || !observation.unregistered_native_mappings.is_empty()
+            {
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "system ORT core mapping does not match the captured runtime",
+                ));
+            }
+            Ok(Self {
+                owner: owner.clone(),
+                build_info: info.to_owned(),
+                cuda_libraries: None,
+                ort_libraries: None,
+                loading_profile: None,
+            })
+        }))
+        .unwrap_or_else(|payload| {
+            let error = if let Some(message) = payload.downcast_ref::<&str>() {
+                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                unavailable().with_external_cause(CauseCode::RuntimePanic, message)
+            } else {
+                unavailable().with_external_cause(
+                    CauseCode::RuntimePanic,
+                    &"non-string native initialization panic",
+                )
+            };
+            Err(error)
+        });
+        *guard = Some(RuntimeLatch {
+            owner,
+            loading_profile: None,
+            result: result.clone(),
+        });
+        result
+    }
+
     pub fn binary_digest(&self) -> [u8; 32] {
-        self.pin.binary_digest()
+        self.owner.binary_digest()
     }
     pub fn build_info(&self) -> &str {
         &self.build_info
     }
 
     pub fn bundle_digest(&self) -> Option<[u8; 32]> {
-        self.pin.bundle_digest()
+        self.owner.legacy_bundle_digest()
+    }
+
+    /// Actual CUDA runtime identity; system identity is never presented as a
+    /// historical bundle digest. This value alone does not prove a GPU Run.
+    pub fn cuda_runtime_identity(&self) -> Option<[u8; 32]> {
+        match &self.owner {
+            RuntimeOwner::Copy(pin) => pin.bundle_digest(),
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { runtime, .. } => Some(runtime.identity_sha256()),
+        }
+    }
+
+    pub fn is_cuda(&self) -> bool {
+        self.cuda_runtime_identity().is_some()
+    }
+
+    pub fn is_system_cuda(&self) -> bool {
+        match &self.owner {
+            RuntimeOwner::Copy(_) => false,
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { .. } => true,
+        }
+    }
+
+    /// Access the same pinned owner for the new system-specific observation
+    /// schema. Mapping observation remains separate from GPU completion.
+    #[cfg(target_os = "linux")]
+    pub fn system_runtime(&self) -> Option<&SystemRuntime> {
+        match &self.owner {
+            RuntimeOwner::System { runtime, .. } => Some(runtime),
+            RuntimeOwner::Copy(_) => None,
+        }
     }
 
     pub fn native_loading_profile(&self) -> Option<NativeLoadingProfile> {
@@ -351,12 +556,20 @@ impl OrtRuntime {
     /// Canonical descriptors of the actually retained runtime bundle. This is
     /// loaded pin metadata, not an unchecked bootstrap JSON declaration.
     pub fn bundle_files(&self) -> Option<&[crate::runtime_pin::RuntimeBundleFile]> {
-        self.pin.bundle_files()
+        match &self.owner {
+            RuntimeOwner::Copy(pin) => pin.bundle_files(),
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { .. } => None,
+        }
     }
 
     /// Registered manifest semantics of the retained pins, including aliases.
     pub fn bundle_spec(&self) -> Option<crate::runtime_pin::CudaRuntimeBundleSpec> {
-        self.pin.bundle_spec()
+        match &self.owner {
+            RuntimeOwner::Copy(pin) => pin.bundle_spec(),
+            #[cfg(target_os = "linux")]
+            RuntimeOwner::System { .. } => None,
+        }
     }
 
     /// Audit the explicitly preloaded NVIDIA dependencies before constructing a
@@ -395,9 +608,7 @@ impl OrtRuntime {
             .with_external_cause(CauseCode::RuntimeInitialize, &error)
         })?;
         if let Some(latch) = guard.as_ref() {
-            if latch.pin.path() != self.pin.path()
-                || latch.pin.bundle_digest() != self.pin.bundle_digest()
-                || latch.loading_profile != self.loading_profile
+            if !latch.owner.same_owner(&self.owner) || latch.loading_profile != self.loading_profile
             {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
@@ -406,6 +617,48 @@ impl OrtRuntime {
                 ));
             }
             latch.result.as_ref().map_err(Clone::clone)?;
+        }
+        #[cfg(target_os = "linux")]
+        if let RuntimeOwner::System { runtime, .. } = &self.owner {
+            // The legacy observation schema describes the fixed bundle and
+            // cannot truthfully represent a system installation.
+            if observe {
+                return Err(BackendError::new(
+                    K::UnsupportedModel,
+                    S::Backend,
+                    "legacy CUDA bundle observation does not represent system runtime mappings",
+                ));
+            }
+            let result = if include_runtime {
+                runtime.verify_mappings()
+            } else {
+                runtime.observe_mappings()
+            }
+            .map_err(loader_error)
+            .and_then(|observation| {
+                if !observation.unregistered_native_mappings.is_empty()
+                    || !observation
+                        .mapped_roles
+                        .iter()
+                        .any(|role| role == "ort-core")
+                {
+                    Err(BackendError::new(
+                        K::IdentityMismatch,
+                        S::Backend,
+                        "system runtime core or registered mappings differ",
+                    ))
+                } else {
+                    Ok(None)
+                }
+            });
+            if let Err(failure) = &result {
+                if let Some(latch) = guard.as_mut() {
+                    if latch.owner.same_owner(&self.owner) && latch.result.is_ok() {
+                        latch.result = Err(failure.clone());
+                    }
+                }
+            }
+            return result;
         }
         let libraries = self.cuda_libraries.as_ref().ok_or_else(|| {
             BackendError::new(
@@ -443,8 +696,7 @@ impl OrtRuntime {
             // An origin audit cannot be retried into success with the same
             // process-global ORT session. Keep the first typed source and pins.
             if let Some(latch) = guard.as_mut() {
-                if latch.pin.path() == self.pin.path()
-                    && latch.pin.bundle_digest() == self.pin.bundle_digest()
+                if latch.owner.same_owner(&self.owner)
                     && latch.loading_profile == self.loading_profile
                     && latch.result.is_ok()
                 {
@@ -892,10 +1144,10 @@ impl OnnxBackend {
                 "model storage and explicit ORT mode differ",
             ));
         }
-        match (config.provider, runtime.bundle_digest()) {
+        match (config.provider, runtime.cuda_runtime_identity()) {
             (Provider::Cuda { .. }, None) => {
                 return Err(BackendError::new(K::IdentityMismatch, S::Backend,
-                    "CUDA requires the complete pinned runtime bundle; single-library pin is CPU only"));
+                    "CUDA requires an explicitly captured CUDA runtime; CPU-only pin is not sufficient"));
             }
             (Provider::Cpu, Some(_)) => {
                 return Err(BackendError::new(
@@ -1087,6 +1339,16 @@ impl OnnxBackend {
             runtime.bundle_digest(),
             &config,
         );
+        if runtime.is_system_cuda() {
+            let mut identified = b"rz-maia-system-runtime-backend-v1\0".to_vec();
+            identified.extend_from_slice(&identity);
+            identified.extend_from_slice(
+                &runtime
+                    .cuda_runtime_identity()
+                    .expect("system CUDA identity"),
+            );
+            identity = asset::sha256(&identified);
+        }
         if let Some(digest) = derived_manifest {
             let mut identified = b"rz-derived-ort-backend-v1\0".to_vec();
             identified.extend_from_slice(&identity);
@@ -1244,6 +1506,15 @@ impl OnnxBackend {
         self.cuda_runtime
             .as_ref()
             .and_then(OrtRuntime::bundle_digest)
+    }
+
+    /// System-runtime identity, separate from historical bundled identity.
+    /// This is not a provider-ready or physical-completion witness.
+    pub fn system_cuda_runtime_identity(&self) -> Option<[u8; 32]> {
+        self.cuda_runtime
+            .as_ref()
+            .filter(|runtime| runtime.is_system_cuda())
+            .and_then(OrtRuntime::cuda_runtime_identity)
     }
 
     /// Re-audits the complete CUDA bundle owned by this loaded session. An

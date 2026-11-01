@@ -67,6 +67,42 @@ pub struct VirtualReviewCudaPlacementWitness {
     pub warm_seed_identity_kernels: usize,
     pub category_provenance: String,
 }
+
+/// The system-runtime domain deliberately has no legacy bundle field.  This
+/// proves only the supplied placement profiles and current process mappings;
+/// GPU physical completion remains the native worker owner's responsibility.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SystemVirtualReviewCudaPlacementWitness {
+    pub schema: &'static str,
+    pub inventory_sha256: [u8; 32],
+    pub manifest_sha256: [u8; 32],
+    pub ort_sha256: [u8; 32],
+    pub system_runtime_identity_sha256: [u8; 32],
+    pub declared_device_id: i32,
+    pub mapped_roles: Vec<String>,
+    pub missing_optional_roles: Vec<String>,
+    pub layout: String,
+    pub artifact_kind: String,
+    pub optimization: PalsGraphOptimization,
+    pub initialization: Vec<PalsGraphPlacement>,
+    pub kernels: BTreeMap<String, PalsKernelWitness>,
+    pub validator_private_kernels: usize,
+    pub validator_task_head_kernels: usize,
+    pub warm_seed_identity_kernels: usize,
+    pub physical_completion: &'static str,
+    pub category_provenance: String,
+}
+
+struct VerifiedVirtualProfiles {
+    layout: String,
+    artifact_kind: String,
+    initialization: Vec<PalsGraphPlacement>,
+    kernels: BTreeMap<String, PalsKernelWitness>,
+    validator_private_kernels: usize,
+    validator_task_head_kernels: usize,
+    warm_seed_identity_kernels: usize,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InventoryV3 {
@@ -321,6 +357,80 @@ impl PalsCudaControlPolicy {
         runtime: [u8; 32],
         bundle: [u8; 32],
     ) -> Result<VirtualReviewCudaPlacementWitness, BackendError> {
+        let verified = self.verify_virtual_profiles_common(profiles, placements)?;
+        Ok(VirtualReviewCudaPlacementWitness {
+            schema: WITNESS_SCHEMA.into(),
+            inventory_sha256: self.inventory,
+            manifest_sha256: self.manifest,
+            runtime_sha256: runtime,
+            runtime_bundle_sha256: bundle,
+            layout: verified.layout,
+            artifact_kind: verified.artifact_kind,
+            optimization: PalsGraphOptimization::Disable,
+            initialization: verified.initialization,
+            kernels: verified.kernels,
+            validator_private_kernels: verified.validator_private_kernels,
+            validator_task_head_kernels: verified.validator_task_head_kernels,
+            warm_seed_identity_kernels: verified.warm_seed_identity_kernels,
+            category_provenance: "rc10-category-unavailable-id-location-message-used".into(),
+        })
+    }
+
+    /// System-library evidence has a distinct domain and never masquerades as
+    /// the historical nineteen-file bundle. The caller must use profiles from
+    /// its actual owned sessions and separately establish physical completion.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_system_virtual_profiles(
+        &self,
+        profiles: &BTreeMap<String, Vec<u8>>,
+        placements: Vec<PalsGraphPlacement>,
+        runtime: &OrtRuntime,
+        declared_device_id: i32,
+    ) -> Result<SystemVirtualReviewCudaPlacementWitness, BackendError> {
+        if declared_device_id < 0 {
+            return Err(policy_error("system CUDA declared device is invalid"));
+        }
+        let system = runtime
+            .system_runtime()
+            .ok_or_else(|| policy_error("system CUDA placement requires a system runtime owner"))?;
+        let observed = system.verify_mappings().map_err(|cause| {
+            policy_error("system CUDA runtime mappings could not be verified")
+                .with_external_cause(CauseCode::RuntimeLibraryLoad, &cause)
+        })?;
+        if observed.identity_sha256 != system.identity_sha256()
+            || !observed.missing_required_roles.is_empty()
+            || !observed.unregistered_native_mappings.is_empty()
+        {
+            return Err(policy_error("system CUDA mapping identity differs"));
+        }
+        let verified = self.verify_virtual_profiles_common(profiles, placements)?;
+        Ok(SystemVirtualReviewCudaPlacementWitness {
+            schema: "rovezero.pals-virtual-system-cuda-placement.v1",
+            inventory_sha256: self.inventory,
+            manifest_sha256: self.manifest,
+            ort_sha256: runtime.binary_digest(),
+            system_runtime_identity_sha256: observed.identity_sha256,
+            declared_device_id,
+            mapped_roles: observed.mapped_roles,
+            missing_optional_roles: observed.missing_optional_roles,
+            layout: verified.layout,
+            artifact_kind: verified.artifact_kind,
+            optimization: PalsGraphOptimization::Disable,
+            initialization: verified.initialization,
+            kernels: verified.kernels,
+            validator_private_kernels: verified.validator_private_kernels,
+            validator_task_head_kernels: verified.validator_task_head_kernels,
+            warm_seed_identity_kernels: verified.warm_seed_identity_kernels,
+            physical_completion: "not_inferred",
+            category_provenance: "rc10-category-unavailable-id-location-message-used".into(),
+        })
+    }
+
+    fn verify_virtual_profiles_common(
+        &self,
+        profiles: &BTreeMap<String, Vec<u8>>,
+        placements: Vec<PalsGraphPlacement>,
+    ) -> Result<VerifiedVirtualProfiles, BackendError> {
         let layout = self
             .virtual_layout
             .as_ref()
@@ -422,21 +532,14 @@ impl PalsCudaControlPolicy {
         } else {
             0
         };
-        Ok(VirtualReviewCudaPlacementWitness {
-            schema: WITNESS_SCHEMA.into(),
-            inventory_sha256: self.inventory,
-            manifest_sha256: self.manifest,
-            runtime_sha256: runtime,
-            runtime_bundle_sha256: bundle,
+        Ok(VerifiedVirtualProfiles {
             layout: layout.layout_name().into(),
             artifact_kind: layout.artifact_kind().into(),
-            optimization: PalsGraphOptimization::Disable,
             initialization: placements,
             kernels,
             validator_private_kernels,
             validator_task_head_kernels,
             warm_seed_identity_kernels,
-            category_provenance: "rc10-category-unavailable-id-location-message-used".into(),
         })
     }
     pub(crate) fn finish_virtual_profile(

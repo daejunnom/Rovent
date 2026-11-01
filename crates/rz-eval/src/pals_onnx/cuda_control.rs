@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 mod virtual_review;
+#[cfg(target_os = "linux")]
+pub use virtual_review::SystemVirtualReviewCudaPlacementWitness;
 pub use virtual_review::{VirtualReviewControlLayout, VirtualReviewCudaPlacementWitness};
 
 const POLICY_SCHEMA: &str = "rovezero.pals-cuda-metadata-control.v2";
