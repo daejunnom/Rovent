@@ -75,6 +75,63 @@ pub(crate) enum FailedEvidence {
 }
 
 impl FailedEvidence {
+    /// Read only the same sealed owner retained after target preparation
+    /// failed. This projection grants no target or physical-completion proof.
+    pub(crate) fn sealed_observation(&self) -> Option<serde_json::Value> {
+        let sealed = match self {
+            Self::Sealed(sealed) => sealed,
+            Self::Captured { failure, .. } => return failure.sealed_observation(),
+            _ => return None,
+        };
+        let dispatch = sealed.evidence.dispatch();
+        let completion = sealed.evidence.completion();
+        let process = completion.process_identity().map(|identity| {
+            serde_json::json!({"pid":identity.pid, "process_group":identity.process_group,
+                "proc_start_ticks":identity.proc_start_ticks})
+        });
+        let attempt = completion
+            .attempt()
+            .and_then(|attempt| attempt.external.as_ref());
+        let result = completion.result().as_ref().ok().map(|outcome| {
+            let opinions = outcome
+                .opinions
+                .iter()
+                .take(4)
+                .map(|opinion| {
+                    let pv = opinion
+                        .pv
+                        .iter()
+                        .take(16)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    serde_json::json!({"rank":opinion.rank,"depth":opinion.depth,
+                    "bound":format!("{:?}", opinion.bound),"pv":pv,
+                    "pv_moves":opinion.pv.len(),"pv_omitted":opinion.pv.len().saturating_sub(16)})
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({"request_id":outcome.report.raw.request_id,
+                "completion":format!("{:?}", outcome.report.raw.completion),
+                "bestmove":outcome.report.raw.best_move.map(|movement| movement.to_string()),
+                "requested_multipv":outcome.requested_multipv,
+                "conditional_policy_target_known":outcome.conditional_policy_target_known,
+                "opinions":opinions,"opinions_total":outcome.opinions.len(),
+                "opinions_omitted":outcome.opinions.len().saturating_sub(4)})
+        });
+        let submitted = dispatch.id();
+        let returned = completion.id();
+        Some(
+            serde_json::json!({"scope":"original_sealed_failure_diagnostic_only",
+            "dispatch":{"collection_owner":submitted.collection_owner,"sequence":submitted.sequence},
+            "completion":{"collection_owner":returned.collection_owner,"sequence":returned.sequence},
+            "dispatch_identity_matches":completion.matches_dispatch_identity(dispatch),
+            "process":process,"result":result,
+            "attempt_request_id":attempt.map(|value| value.request_id),
+            "attempt_stdout_bytes_observed":attempt.map(|value| value.process.stdout_bytes),
+            "previous_completed_exact_iteration":"unknown",
+            "physical_completion":"not_inferred"}),
+        )
+    }
+
     /// Only explicit physical-unknown, poison, mismatch and panic evidence
     /// blocks route cleanup; a known semantic failure is still retained.
     pub(crate) fn has_uncertain_cleanup(&self) -> bool {

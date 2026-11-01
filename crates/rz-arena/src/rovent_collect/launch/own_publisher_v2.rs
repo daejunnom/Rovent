@@ -338,6 +338,7 @@ impl OwnPumpConsumerV2 {
                 if entries.len() < 32 {
                     entries.push(serde_json::json!({"error":describe(error.to_string()),
                         "evidence":describe(evidence.diagnostic()),
+                        "sealed_observation":evidence.sealed_observation(),
                         "original_question_id":row.record.0.input.question_id,
                         "original_job_id":row.record.0.input.job_id,
                         "original_slice_id":row.record.0.input.slice_id}));
