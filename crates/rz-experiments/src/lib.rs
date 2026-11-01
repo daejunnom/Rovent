@@ -20,6 +20,7 @@ mod pals_startup_v5;
 mod system_runtime_v6;
 pub mod rovent_corpus;
 pub mod rovent_corpus_lock_v2;
+pub mod rovent_corpus_lock_v3;
 pub mod rovent_corpus_v2;
 mod rovent_input_lock_owner;
 mod rovent_manifest;

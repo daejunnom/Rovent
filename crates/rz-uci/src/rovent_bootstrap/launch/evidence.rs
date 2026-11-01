@@ -4,11 +4,18 @@
 //! 소유권으로 Product에 이동하고 원 등록 FD는 serve 종료까지 별도로 보존한다.
 //! 기본 경로 생성, native 실행, 질문 또는 과거 실행 권한 발급은 하지 않는다.
 
-use super::super::{RoventStartupControl, process_boundary::VerifiedOwnedRoventProcessBoundaryV2};
+use super::super::{
+    RoventStartupControl,
+    process_boundary::{
+        VerifiedOwnedRoventProcessBoundaryV2, VerifiedOwnedRoventProcessBoundaryV3,
+    },
+};
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use rz_contracts::Digest;
-use rz_experiments::{ArtifactRef, ManifestError, RoventInputLock, RoventInputLockV2};
+use rz_experiments::{
+    ArtifactRef, ManifestError, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
+};
 use rz_search::pals::engine::adaptive_port::profiled_retirement_archive::{
     ProfiledRetirementSinkAdmissionError, ProfiledRetirementSinkRegistration,
     RegisteredProfiledRetirementSink,
@@ -43,10 +50,15 @@ pub struct LaunchRetirementRegistrationCustody {
     artifact: ArtifactRef,
     registration: ProfiledRetirementSinkRegistration,
     _file: File,
-    // The original V2 process boundary owns the exact lock, directory FD and
+    // The original process boundary owns the exact lock, directory FD and
     // startup control. Keep it alongside the registration until retirement
     // evidence is released, including on physical-completion quarantine.
-    original_process_v2: Option<Arc<VerifiedOwnedRoventProcessBoundaryV2>>,
+    original_process: Option<RetirementOriginalProcess>,
+}
+
+enum RetirementOriginalProcess {
+    V2(Arc<VerifiedOwnedRoventProcessBoundaryV2>),
+    V3(Arc<VerifiedOwnedRoventProcessBoundaryV3>),
 }
 
 /// 플랫폼 미지원과 실제 입력·I/O·sink admission 오류를 구분해 보존한다.
@@ -160,19 +172,63 @@ impl LaunchRetirementEvidence {
             process.private_cwd(),
             control.until,
             control.cancellation.as_ref(),
-            Some(Arc::clone(&process)),
+            Some(RetirementOriginalProcess::V2(Arc::clone(&process))),
+        )
+    }
+
+    /// Admit with the actual /3 process owner and original startup control.
+    /// The same registered sink owns the original descriptor through teardown.
+    pub(super) fn open_v3(
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        registration_snapshot_path: &str,
+        managed_root: &Path,
+        control: &RoventStartupControl,
+    ) -> Result<Self, LaunchRetirementEvidenceError> {
+        if !cfg!(target_os = "linux") {
+            return Err(LaunchRetirementEvidenceError::UnsupportedDurablePlatform);
+        }
+        check(control.until, control.cancellation.as_ref())?;
+        if !process.matches_startup_control(control) {
+            return Err(LaunchRetirementEvidenceError::Invalid(
+                "V3 retirement startup control differs from original process",
+            ));
+        }
+        let lock = process.input_lock();
+        lock.validate()
+            .map_err(LaunchRetirementEvidenceError::Input)?;
+        Self::open_original(
+            &lock.canonical_sha256,
+            &lock.manifest.provenance,
+            process.original_root(),
+            registration_snapshot_path,
+            managed_root,
+            process.private_cwd(),
+            control.until,
+            control.cancellation.as_ref(),
+            Some(RetirementOriginalProcess::V3(Arc::clone(&process))),
         )
     }
 
     pub(crate) fn original_lock_owner_v2(&self) -> Option<&Arc<RoventInputLockV2>> {
-        self.registration
-            .original_process_v2
-            .as_ref()
-            .map(|owner| owner.input_lock())
+        self.original_process_v2().map(|owner| owner.input_lock())
     }
 
     pub(crate) fn original_process_v2(&self) -> Option<&Arc<VerifiedOwnedRoventProcessBoundaryV2>> {
-        self.registration.original_process_v2.as_ref()
+        match self.registration.original_process.as_ref() {
+            Some(RetirementOriginalProcess::V2(owner)) => Some(owner),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn original_lock_owner_v3(&self) -> Option<&Arc<RoventInputLockV3>> {
+        self.original_process_v3().map(|owner| owner.input_lock())
+    }
+
+    pub(crate) fn original_process_v3(&self) -> Option<&Arc<VerifiedOwnedRoventProcessBoundaryV3>> {
+        match self.registration.original_process.as_ref() {
+            Some(RetirementOriginalProcess::V3(owner)) => Some(owner),
+            _ => None,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -185,7 +241,7 @@ impl LaunchRetirementEvidence {
         protected_execution_root: &Path,
         admission_scan_deadline: Instant,
         cancel: &AtomicBool,
-        original_process_v2: Option<Arc<VerifiedOwnedRoventProcessBoundaryV2>>,
+        original_process: Option<RetirementOriginalProcess>,
     ) -> Result<Self, LaunchRetirementEvidenceError> {
         if !cfg!(target_os = "linux") {
             return Err(LaunchRetirementEvidenceError::UnsupportedDurablePlatform);
@@ -244,7 +300,7 @@ impl LaunchRetirementEvidence {
                 artifact: artifact.clone(),
                 registration: source_registration,
                 _file: file,
-                original_process_v2,
+                original_process,
             }),
         })
     }

@@ -171,7 +171,7 @@ where
                                 }
                                 held.binding.consumption_recorded = true;
                                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                                if let Err(error) = collection::notify_adaptive_consumed_v2(
+                                if let Err(error) = collection::notify_adaptive_consumed_versioned(
                                     &mut self.collection_observer_v2,
                                     self.collection_admission_v2.as_ref(),
                                     self.native.native_acceptance_verifier().as_ref(),
@@ -321,7 +321,7 @@ where
                 held.binding.consumption_recorded = true;
                 self.record_role_consumption(source, held.binding.physical)?;
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                if let Err(error) = collection::notify_adaptive_consumed_v2(
+                if let Err(error) = collection::notify_adaptive_consumed_versioned(
                     &mut self.collection_observer_v2,
                     self.collection_admission_v2.as_ref(),
                     self.native.native_acceptance_verifier().as_ref(),
@@ -527,7 +527,7 @@ where
                 // Record that actual consumption once, using the original
                 // accepted proof and retained output just as on the peer path.
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                if let Err(error) = collection::notify_adaptive_consumed_v2(
+                if let Err(error) = collection::notify_adaptive_consumed_versioned(
                     &mut self.collection_observer_v2,
                     self.collection_admission_v2.as_ref(),
                     self.native.native_acceptance_verifier().as_ref(),

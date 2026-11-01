@@ -327,7 +327,10 @@ pub struct SystemRuntimeReceiptV6 {
     #[serde(deserialize_with = "explicit_optional")]
     pub observed_identity_sha256: Option<String>,
     pub observed_libraries: Vec<SystemLibraryObservationV6>,
-    pub unregistered_native_mappings: Vec<String>,
+    /// None means the mappings could not be observed; Some(empty) is an
+    /// observed empty set, not a substitute for a failed observation.
+    #[serde(deserialize_with = "explicit_optional")]
+    pub unregistered_native_mappings: Option<Vec<String>>,
     pub provider_ready: ProviderReadinessV6,
     pub physical_completion: PhysicalCompletionV6,
 }
@@ -374,7 +377,10 @@ impl SystemRuntimeReceiptV6 {
                 .as_ref()
                 .is_some_and(|s| !digest_string(s))
             || self.observed_libraries.len() > 128
-            || self.unregistered_native_mappings.len() > 128
+            || self
+                .unregistered_native_mappings
+                .as_ref()
+                .is_some_and(|mappings| mappings.len() > 128)
         {
             return Err(invalid(
                 "runtime receipt is not bound to the registered child",
@@ -405,7 +411,10 @@ impl SystemRuntimeReceiptV6 {
                 self.physical_completion,
                 PhysicalCompletionV6::Confirmed { .. }
             )
-            || !self.unregistered_native_mappings.is_empty()
+            || self
+                .unregistered_native_mappings
+                .as_ref()
+                .is_none_or(|mappings| !mappings.is_empty())
         {
             return Err(invalid(
                 "runtime readiness or physical completion is unconfirmed",
@@ -555,7 +564,7 @@ mod tests {
             process_generation: 1,
             observed_identity_sha256: Some(spec.system_identity_sha256.clone()),
             observed_libraries: observations(&spec),
-            unregistered_native_mappings: vec![],
+            unregistered_native_mappings: Some(vec![]),
             provider_ready: ProviderReadinessV6::Ready,
             physical_completion: PhysicalCompletionV6::Unknown,
         };
@@ -567,13 +576,29 @@ mod tests {
             SystemRuntimeReceiptV6::from_json(std::str::from_utf8(&bytes).unwrap(), &lock, 7, 1)
                 .unwrap()
         );
+        let mut missing: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("unregistered_native_mappings");
+        assert!(SystemRuntimeReceiptV6::from_json(
+            &serde_json::to_string(&missing).unwrap(),
+            &lock,
+            7,
+            1
+        )
+        .is_err());
         receipt.physical_completion = PhysicalCompletionV6::Confirmed {
             completion_id: "fence".into(),
         };
         assert!(receipt.validate_success(&lock, 7, 1).is_ok());
         assert!(receipt.validate_success(&lock, 8, 1).is_err());
+        receipt.unregistered_native_mappings = None;
+        assert!(receipt.validate_against(&lock, 7, 1).is_ok());
+        assert!(receipt.validate_success(&lock, 7, 1).is_err());
         receipt
             .unregistered_native_mappings
+            .get_or_insert_default()
             .push("foreign.so".into());
         assert!(receipt.validate_success(&lock, 7, 1).is_err());
     }

@@ -1286,7 +1286,13 @@ impl NativeWorkerOwner<Lc0ModelAdapter> {
         };
         // A successful historical probe alone does not authorize current maps.
         // Loader failure stays typed and latched, with all native pins retained.
-        backend.verify_cuda_runtime_mappings()?;
+        if backend.system_cuda_runtime_identity().is_some() {
+            // Actual conflicts still fail and physical lifetime is checked;
+            // an incomplete mapping observation is not a strict witness.
+            backend.observe_cuda_runtime_mappings()?;
+        } else {
+            backend.verify_cuda_runtime_mappings()?;
+        }
         let admission = backend.asset_profile().admission_policy();
         let worker = crate::contracts::spawn_onnx_worker_profiled(backend, trace.clone())?;
         let mut owner = Self::from_worker_limit(

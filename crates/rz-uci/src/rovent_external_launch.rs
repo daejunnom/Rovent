@@ -56,6 +56,16 @@ pub use collection_teacher::{
     TeacherRecoveryKeyV2, bind_collection_teacher_actor_v2, spawn_bound_collection_teacher_v2,
     verify_collection_teacher_pin,
 };
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub use collection_teacher::{
+    BoundCollectionTeacherActorV3, BoundTeacherSpawnCauseV3, BoundTeacherSpawnFailureV3,
+    RoventCollectionTeacherLifecycleV3, RoventCollectionTeacherPhysicalOwnerV3,
+    RoventTeacherNoChildRetirementTokenV3, RoventTeacherRetiredActorV3,
+    RoventTeacherRetirementTokenV3, RoventTeacherScopeAggregateAckV3,
+    RoventTeacherScopeAggregateFailureV3, RoventTeacherWorkerTerminalTokenV3,
+    TeacherActorBindingErrorV3, TeacherRecoveryCustodianV3, TeacherRecoveryKeyV3,
+    bind_collection_teacher_actor_v3, spawn_bound_collection_teacher_v3,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -176,11 +186,6 @@ impl PreparedRoventExternalLaunch {
         slot: RoventExternalSlot,
         profile_bytes: &[u8],
     ) -> Result<Self, CheckerError> {
-        if slot != RoventExternalSlot::Researcher {
-            return Err(CheckerError::Unsupported(
-                "external /3 teacher ownership is not implemented",
-            ));
-        }
         lock.validate()
             .map_err(|_| invalid("invalid Rovent input lock"))?;
         let mut launch = Self::from_validated_fields(

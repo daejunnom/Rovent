@@ -166,6 +166,14 @@ impl PreparedSourceV3 {
 }
 
 impl RoventRootAdmissionV3 {
+    pub(crate) fn claim_teacher_scope_once(&self) -> bool {
+        self.core
+            .context
+            .original_start
+            .as_ref()
+            .is_some_and(|start| start.claim_teacher_scope_once())
+    }
+
     pub fn owner(&self) -> &rz_experiments::RoventOriginalInputLock {
         &self.owner
     }

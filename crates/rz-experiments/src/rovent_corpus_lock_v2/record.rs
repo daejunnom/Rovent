@@ -32,7 +32,10 @@ fn require(condition: bool, detail: &'static str) -> Result<(), ManifestError> {
 // Registration is a declaration, not a live teacher observation. Still, a
 // teacher named by the corpus must be one of the frozen profiles in the same
 // execution lock. Options/assets need the independently verified profile.
-fn teacher_is_locked(teacher: &RoventTeacherPin, roster: &[RoventExternalProfilePin]) -> bool {
+pub(crate) fn teacher_is_locked(
+    teacher: &RoventTeacherPin,
+    roster: &[RoventExternalProfilePin],
+) -> bool {
     roster.iter().any(|pin| {
         pin.purpose == RoventExternalPurpose::Teacher
             && pin.source_commit == teacher.source_commit

@@ -54,22 +54,39 @@ fn direct_selection(
             artifact: original(path)?,
         })
     };
+    let mut graphs = vec![
+        graph(
+            "public",
+            &selection.public_graph,
+            &selection.public_graph_name,
+        )?,
+        graph(
+            "shared_pc",
+            &selection.shared_pc_graph,
+            &selection.shared_pc_graph_name,
+        )?,
+    ];
+    match (
+        lock.manifest.purpose == rz_experiments::RoventPurpose::Collection,
+        &selection.validator_graph,
+    ) {
+        (true, Some(path)) => {
+            graphs.push(graph("validator", path, &selection.validator_graph_name)?)
+        }
+        (false, None) => {}
+        (true, None) => return Err(error("Assets", "V3 Collection requires a validator graph")),
+        (false, Some(_)) => {
+            return Err(error(
+                "Assets",
+                "validator graph is restricted to V3 Collection",
+            ));
+        }
+    }
     Ok(RoventNativeAssetSelection {
         startup_configuration: lock.manifest.startup_document.clone(),
         export_manifest: original(&selection.export)?,
         rules_descriptor: original(&selection.rules)?,
-        graphs: vec![
-            graph(
-                "public",
-                &selection.public_graph,
-                &selection.public_graph_name,
-            )?,
-            graph(
-                "shared_pc",
-                &selection.shared_pc_graph,
-                &selection.shared_pc_graph_name,
-            )?,
-        ],
+        graphs,
         cuda_control_inventory: None,
         runtime_bundle_manifest: None,
     })
@@ -162,7 +179,8 @@ fn runtime_receipt(
         observed_libraries: observation
             .map(|value| value.libraries.clone())
             .unwrap_or_default(),
-        unregistered_native_mappings: Vec::new(),
+        unregistered_native_mappings: observation
+            .and_then(|value| value.unregistered_native_mappings.clone()),
         // Provider setup is observed independently of mapping and inference.
         provider_ready: if observation.is_some_and(|value| value.provider_ready) {
             ProviderReadinessV6::Ready
@@ -201,13 +219,10 @@ fn admit_original<'a>(
         || arguments.lifecycle_diagnostics
         || arguments.lifecycle_diagnostics_v2
         || arguments.initial_stop_source_diagnostics
-        || arguments.external_r_sources.is_some()
-        || arguments.retirement_sink.is_some()
-        || arguments.evidence_root.is_some()
     {
         return Err(error(
             "InputLockUnsupportedV3",
-            "selected legacy storage, external, or diagnostic owner is not connected to /3",
+            "selected legacy storage or diagnostic owner is not connected to /3",
         ));
     }
     if !matches!(
@@ -312,7 +327,14 @@ fn admit_original<'a>(
         let selection_file = selected[0]
             .open_verified_at(root, MAX_SELECTION_BYTES)
             .map_err(|failure| error("Assets", failure))?;
-        let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
+        let selection = SelectionWire::parse_with_graph_count(
+            &read_bounded(&selection_file, MAX_SELECTION_BYTES)?,
+            if lock.manifest.purpose == rz_experiments::RoventPurpose::Collection {
+                3
+            } else {
+                2
+            },
+        )?;
         (selection, Some(selection_file))
     };
     let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
@@ -435,8 +457,8 @@ fn run_native_inner<'a>(
         lock_file,
         receipt_writer,
     } = original;
-    // Each selected product receives its own original V3 owner. External and
-    // Collection paths still require their own V3 owners and are rejected.
+    // Each selected product receives its own original V3 owner. Collection
+    // still requires its own V3 owner and remains separate.
     let nnuec_selection = match (
         sources.topology(),
         sources.configuration().fields().execution,
@@ -466,6 +488,11 @@ fn run_native_inner<'a>(
             },
             NativeNnuecSelection::OwnResearcher,
         ) => NativeNnuecSelection::OwnResearcher,
+        (
+            super::super::RoventStartupTopology::ExternalResearcher,
+            ExecutionConfiguration::ExternalResearcher { .. },
+            NativeNnuecSelection::Absent,
+        ) => NativeNnuecSelection::Absent,
         _ => {
             return Err(error(
                 "InputLockUnsupportedV3",
@@ -482,17 +509,96 @@ fn run_native_inner<'a>(
         Pc,
         PcShared(LoadedRoventNnuecSource<RoventInputLockV3>),
         OwnPcr(LoadedRoventNnuecSource<RoventInputLockV3>),
+        External(
+            RoventPinnedExternalRSource<RoventInputLockV3>,
+            LaunchRetirementEvidence,
+        ),
     }
-    let product = match nnuec_selection {
-        NativeNnuecSelection::Absent => ProductChoice::Pc,
-        NativeNnuecSelection::SharedPc => ProductChoice::PcShared(
+    let (external_source, external_selection_file, retirement_evidence) = match (
+        sources.configuration().fields().execution,
+        arguments.external_r_sources.as_deref(),
+        arguments.retirement_sink.as_deref(),
+        arguments.evidence_root.as_deref(),
+    ) {
+        (
+            ExecutionConfiguration::ExternalResearcher { .. },
+            Some(path),
+            Some(registration),
+            Some(root),
+        ) => {
+            sources
+                .configuration()
+                .external_question_limit()
+                .map_err(|failure| error("ExternalQuestionPolicy", failure))?
+                .ok_or_else(|| {
+                    error("ExternalQuestionPolicy", "explicit external query required")
+                })?;
+            let mut matching = lock
+                .manifest
+                .provenance
+                .iter()
+                .filter(|artifact| artifact.path == path);
+            let artifact = matching.next().ok_or_else(|| {
+                error(
+                    "ExternalSources",
+                    "selection is absent from original provenance",
+                )
+            })?;
+            if matching.next().is_some() {
+                return Err(error(
+                    "ExternalSources",
+                    "selection is not a unique original provenance artifact",
+                ));
+            }
+            let mapping = artifact
+                .open_verified_at(boundary.original_root(), MAX_SELECTION_BYTES)
+                .map_err(|failure| error("ExternalSources", failure))?;
+            let selected =
+                ExternalSelectionWire::parse(&read_bounded(&mapping, MAX_SELECTION_BYTES)?)?;
+            let source = RoventPinnedExternalRSource::open(&sources, &selected, &control)
+                .map_err(|failure| error("ExternalSources", failure))?;
+            let evidence = LaunchRetirementEvidence::open_v3(
+                Arc::clone(&boundary),
+                registration,
+                root,
+                &control,
+            )
+            .map_err(|failure| error("RetirementEvidence", failure))?;
+            (Some(source), Some(mapping), Some(evidence))
+        }
+        (ExecutionConfiguration::ExternalResearcher { .. }, _, _, _) => {
+            return Err(error(
+                "ExternalSources",
+                "external researcher requires --external-r-sources, --retirement-sink and --evidence-root",
+            ));
+        }
+        (_, None, None, None) => (None, None, None),
+        _ => {
+            return Err(error(
+                "ExternalSources",
+                "external source and retirement arguments require the external researcher",
+            ));
+        }
+    };
+    let product = match (nnuec_selection, external_source, retirement_evidence) {
+        (NativeNnuecSelection::Absent, Some(external), Some(evidence)) => {
+            ProductChoice::External(external, evidence)
+        }
+        (NativeNnuecSelection::Absent, None, None) => ProductChoice::Pc,
+        (NativeNnuecSelection::SharedPc, None, None) => ProductChoice::PcShared(
             LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
                 .map_err(|failure| error("NnuecSource", failure))?,
         ),
-        NativeNnuecSelection::OwnResearcher => ProductChoice::OwnPcr(
+        (NativeNnuecSelection::OwnResearcher, None, None) => ProductChoice::OwnPcr(
             LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
                 .map_err(|failure| error("NnuecSource", failure))?,
         ),
+        _ => {
+            return Err(error(
+                "ExternalSources",
+                "incompatible product and external owners",
+            ));
+        }
     };
     let system = match &lock.manifest.system_runtime_lock.runtime {
         NativeRuntimeSourceV6::SystemCuda(system) => system,
@@ -591,11 +697,108 @@ fn run_native_inner<'a>(
             let completion = driver.physical_close_observation();
             (Arc::new(driver), completion, observation)
         }
+        ProductChoice::External(external, evidence) => {
+            let prepared = match super::super::prepare_native_v3::<AdaptivePortQuestion>(
+                Arc::clone(&sources),
+                resources,
+                clock.runtime_clock(),
+                control.clone(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    let failure = reject_factory(failure, control.cleanup_until, &diagnostic);
+                    let unknown = runtime_receipt(&lock, arguments.process_epoch, None);
+                    write_receipt(
+                        receipt_writer.as_ref(),
+                        "system-runtime-startup.v6.json",
+                        &lock,
+                        &unknown,
+                    );
+                    write_receipt(
+                        receipt_writer.as_ref(),
+                        "system-runtime-termination.v6.json",
+                        &lock,
+                        &unknown,
+                    );
+                    if failure.stage == "PhysicalCompletionUnknown" {
+                        std::mem::forget((
+                            boundary,
+                            sources,
+                            selection_file,
+                            external_selection_file,
+                            lock_file,
+                            external,
+                            evidence,
+                        ));
+                    }
+                    return Err(failure);
+                }
+            };
+            let observation = prepared.snapshot().system_runtime.clone();
+            let startup = runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+            write_receipt(
+                receipt_writer.as_ref(),
+                "system-runtime-startup.v6.json",
+                &lock,
+                &startup,
+            );
+            let driver = match super::super::product::RoventExternalPcrProductDriverV3::external_pcr(
+                prepared,
+                external,
+                evidence,
+                Arc::clone(&boundary),
+                clock.clone(),
+                Arc::clone(&owners),
+                identity,
+                arguments.root_policy,
+            ) {
+                Ok(driver) => driver,
+                Err(mut failure) => {
+                    use super::super::external_session::RoventExternalProductStartupOwnersV3;
+                    use super::super::product::RoventExternalPcrV3RejectedOwners;
+                    let detail = error("ProductAssembly", &failure.failure);
+                    let unknown =
+                        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+                    write_receipt(
+                        receipt_writer.as_ref(),
+                        "system-runtime-termination.v6.json",
+                        &lock,
+                        &unknown,
+                    );
+                    let confirmed = match &mut failure.owners {
+                        RoventExternalPcrV3RejectedOwners::Preflight { prepared, .. } => drain_native(&mut prepared.service, control.cleanup_until),
+                        RoventExternalPcrV3RejectedOwners::Session { rejected, .. } => match &mut rejected.owners {
+                            RoventExternalProductStartupOwnersV3::Prepared { prepared, .. }
+                            | RoventExternalProductStartupOwnersV3::SourcePreparation { prepared, .. }
+                            | RoventExternalProductStartupOwnersV3::PreparedSource { prepared, .. } => drain_native(&mut prepared.service, control.cleanup_until),
+                            RoventExternalProductStartupOwnersV3::Session(rejected) => drain_native(&mut rejected.sources.native, control.cleanup_until),
+                            RoventExternalProductStartupOwnersV3::Driver(driver) => driver.finish_session(control.cleanup_until).is_ok_and(|completion| completion == Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)),
+                        },
+                    };
+                    if !confirmed {
+                        std::mem::forget((
+                            failure,
+                            boundary,
+                            sources,
+                            selection_file,
+                            external_selection_file,
+                            lock_file,
+                        ));
+                        return Err(error("PhysicalCompletionUnknown", detail));
+                    }
+                    return Err(detail);
+                }
+            };
+            let completion = driver.physical_close_observation();
+            (Arc::new(driver), completion, observation)
+        }
         pc_product @ (ProductChoice::Pc | ProductChoice::PcShared(_)) => {
             let shared_loaded = match pc_product {
                 ProductChoice::Pc => None,
                 ProductChoice::PcShared(loaded) => Some(loaded),
-                ProductChoice::OwnPcr(_) => unreachable!("matched P/C product"),
+                ProductChoice::OwnPcr(_) | ProductChoice::External(_, _) => {
+                    unreachable!("matched P/C product")
+                }
             };
             let prepared = match super::super::prepare_native_v3::<PcPortQuestion>(
                 Arc::clone(&sources),
@@ -710,7 +913,13 @@ fn run_native_inner<'a>(
         &termination,
     );
     if !physical_confirmed {
-        std::mem::forget((boundary, sources, selection_file, lock_file));
+        std::mem::forget((
+            boundary,
+            sources,
+            selection_file,
+            external_selection_file,
+            lock_file,
+        ));
         return Err(error(
             "PhysicalCompletionUnknown",
             match result {

@@ -27,10 +27,36 @@ use quarantine_v2::TeacherRecoveryReservationV2;
 pub use quarantine_v2::{TeacherRecoveryCustodianV2, TeacherRecoveryKeyV2};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod actor_binding_v2;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+mod actor_binding_v3;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+mod physical_worker_v3;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+mod quarantine_v3;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+mod scope_aggregate_v3;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use actor_binding_v2::{
     BoundCollectionTeacherActorV2, TeacherActorBindingErrorV2, bind_collection_teacher_actor_v2,
     verify_collection_teacher_pin,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub use actor_binding_v3::{
+    BoundCollectionTeacherActorV3, TeacherActorBindingErrorV3, bind_collection_teacher_actor_v3,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub use physical_worker_v3::{
+    BoundTeacherSpawnCauseV3, BoundTeacherSpawnFailureV3, RoventCollectionTeacherLifecycleV3,
+    RoventCollectionTeacherPhysicalOwnerV3, RoventTeacherNoChildRetirementTokenV3,
+    RoventTeacherRetirementTokenV3, RoventTeacherWorkerTerminalTokenV3,
+    spawn_bound_collection_teacher_v3,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub use quarantine_v3::{TeacherRecoveryCustodianV3, TeacherRecoveryKeyV3};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub use scope_aggregate_v3::{
+    RoventTeacherRetiredActorV3, RoventTeacherScopeAggregateAckV3,
+    RoventTeacherScopeAggregateFailureV3,
 };
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod policy_seal_v2;
@@ -131,6 +157,9 @@ impl PreparedRoventExternalLaunch {
         // to a different owner's /1 root using digest equality alone.
         if self.original_lock_owner_v2().is_some() {
             return Err(invalid("collection teacher /2 requires a /2 root owner"));
+        }
+        if self.original_lock_owner_v3().is_some() {
+            return Err(invalid("collection teacher /3 requires a /3 root owner"));
         }
         if cancel.load(Ordering::Acquire) || Instant::now() >= startup_deadline {
             return Err(invalid("collection teacher startup canceled/expired"));

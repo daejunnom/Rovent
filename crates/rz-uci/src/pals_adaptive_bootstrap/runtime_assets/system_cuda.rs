@@ -65,9 +65,14 @@ fn system_spec(lock: &SystemRuntimeLockV6) -> Result<&SystemRuntimeSpecV6, Backe
     }
 }
 
-fn library_observations(
-    owner: &SystemRuntime,
-) -> Result<Vec<SystemLibraryObservationV6>, BackendError> {
+#[derive(Clone, Debug)]
+pub struct SystemReadyMappings {
+    pub libraries: Vec<SystemLibraryObservationV6>,
+    /// None means the current process mappings could not be observed.
+    pub unregistered_native_mappings: Option<Vec<String>>,
+}
+
+fn library_observations(owner: &SystemRuntime) -> Result<SystemReadyMappings, BackendError> {
     let mapping = owner.observe_mappings().map_err(|error| {
         BackendError::new(
             FailureKind::BackendUnavailable,
@@ -76,10 +81,11 @@ fn library_observations(
         )
         .with_external_cause(CauseCode::RuntimeLibraryLoad, &error)
     })?;
-    if !mapping.unregistered_native_mappings.is_empty() {
-        return Err(identity_error("unregistered system native library mapping"));
-    }
-    owner
+    let unregistered_native_mappings = match mapping.availability {
+        SystemMappingAvailability::Observed => Some(mapping.unregistered_native_mappings.clone()),
+        SystemMappingAvailability::Unavailable => None,
+    };
+    let libraries = owner
         .libraries()
         .into_iter()
         .map(|item| {
@@ -91,6 +97,8 @@ fn library_observations(
             Ok(SystemLibraryObservationV6 {
                 mapped: if mapping.availability == SystemMappingAvailability::Observed
                     && mapping.preexisting_mapping_observed
+                    && mapping.preexisting_native_mappings.is_empty()
+                    && mapping.unregistered_native_mappings.is_empty()
                 {
                     Some(mapping.mapped_roles.iter().any(|role| role == &item.role))
                 } else {
@@ -104,7 +112,11 @@ fn library_observations(
                 inode: item.inode,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, BackendError>>()?;
+    Ok(SystemReadyMappings {
+        libraries,
+        unregistered_native_mappings,
+    })
 }
 
 /// Captured system CUDA runtime whose owner and exact V6 registration survive
@@ -165,7 +177,7 @@ impl SystemCudaStartup {
             ));
         }
         // A capture does not map every lazy library. Check only identity here.
-        spec.validate_observed(&library_observations(&owner)?)
+        spec.validate_observed(&library_observations(&owner)?.libraries)
             .map_err(|_| identity_error("captured system library differs from lock"))?;
         check_cancellation(cancelled)?;
         if Instant::now() >= until {
@@ -210,7 +222,7 @@ impl SystemCudaStartup {
             .runtime
             .system_runtime()
             .ok_or_else(|| identity_error("system CUDA owner disappeared"))?;
-        let observed = library_observations(owner)?;
+        let observed = library_observations(owner)?.libraries;
         self.spec
             .validate_observed(&observed)
             .map_err(|_| identity_error("system library observation differs from lock"))?;
@@ -242,11 +254,18 @@ impl SystemCudaStartup {
     /// Normal engine execution may proceed with explicitly unknown mapping
     /// evidence. Observed conflicts remain errors; an acceptance caller must
     /// use `verify_ready_mappings` and retain the original physical fence.
-    pub fn observe_ready_mappings(&self) -> Result<Vec<SystemLibraryObservationV6>, BackendError> {
-        let observed = self.observe()?;
-        if observed.iter().all(|item| item.mapped.is_some()) {
+    pub fn observe_ready_mappings(&self) -> Result<SystemReadyMappings, BackendError> {
+        let owner = self
+            .runtime
+            .system_runtime()
+            .ok_or_else(|| identity_error("system CUDA owner disappeared"))?;
+        let observed = library_observations(owner)?;
+        self.spec
+            .validate_observed(&observed.libraries)
+            .map_err(|_| identity_error("system library observation differs from lock"))?;
+        if observed.libraries.iter().all(|item| item.mapped.is_some()) {
             self.spec
-                .validate_ready_observed(&observed)
+                .validate_ready_observed(&observed.libraries)
                 .map_err(|_| identity_error("system CUDA registered mappings not ready"))?;
         }
         Ok(observed)

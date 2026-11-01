@@ -240,6 +240,27 @@ mod registration {
                     .into(),
             );
         }
+        // The current native Collection export contains one shared checkpoint
+        // for P/C/V. The validator graph is still independently selected and
+        // its actual bytes are verified by the original V3 native owner.
+        match (req.purpose, req.engine.pc.validator.as_ref()) {
+            (RoventPurpose::Collection, Some(validator)) => {
+                let model = &req.engine.pc.proposer;
+                if validator.weights != model.weights
+                    || validator.provenance != model.provenance
+                    || validator.semantics != model.semantics
+                    || validator.encoding != model.encoding
+                    || validator.implementation_sha256 != model.implementation_sha256
+                {
+                    return Err("validator model differs from shared Collection export".into());
+                }
+            }
+            (RoventPurpose::Collection, None) => {
+                return Err("Collection requires an explicit validator model pin".into());
+            }
+            (_, Some(_)) => return Err("V-free execution cannot declare a validator model".into()),
+            (_, None) => {}
+        }
         let requests: Vec<SystemLibraryRequest> = r
             .libraries
             .iter()

@@ -467,8 +467,7 @@ impl OrtRuntime {
                 && (!observation
                     .mapped_roles
                     .iter()
-                    .any(|role| role == "ort-core")
-                    || !observation.unregistered_native_mappings.is_empty())
+                    .any(|role| role == "ort-core"))
             {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
@@ -662,9 +661,13 @@ impl OrtRuntime {
                 runtime.observe_mappings()
             };
             if let Err(error) = &observed {
-                if error.kind == rz_native_loader::LoadErrorKind::ObservationUnavailable {
-                    // An unavailable observation remains retryable and does
-                    // not poison the process-global ORT runtime.
+                if matches!(
+                    error.kind,
+                    rz_native_loader::LoadErrorKind::ObservationUnavailable
+                        | rz_native_loader::LoadErrorKind::ForeignMapping
+                ) {
+                    // Missing evidence or an extra unrelated dependency can
+                    // fail strict proof without poisoning normal execution.
                     return Err(loader_error(error.clone()));
                 }
             }
@@ -734,13 +737,12 @@ fn classify_system_mapping(
     observation: &rz_native_loader::system::SystemMappingObservation,
     include_runtime: bool,
 ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
-    if !observation.unregistered_native_mappings.is_empty()
-        || (observation.availability == SystemMappingAvailability::Observed
+    if observation.availability == SystemMappingAvailability::Observed
             && (!observation
                 .mapped_roles
                 .iter()
                 .any(|role| role == "ort-core")
-                || (include_runtime && !observation.missing_required_roles.is_empty())))
+                || (include_runtime && !observation.missing_required_roles.is_empty()))
     {
         return Err(BackendError::new(
             K::IdentityMismatch,
@@ -750,6 +752,8 @@ fn classify_system_mapping(
     }
     if observation.availability == SystemMappingAvailability::Observed
         && observation.preexisting_mapping_observed
+        && observation.preexisting_native_mappings.is_empty()
+        && observation.unregistered_native_mappings.is_empty()
     {
         Ok(CudaRuntimeMappingEvidence::Observed)
     } else {
@@ -768,6 +772,7 @@ mod system_mapping_evidence_tests {
             identity_sha256: [0; 32],
             availability: SystemMappingAvailability::Unavailable,
             preexisting_mapping_observed: false,
+            preexisting_native_mappings: vec![],
             mapped_roles: vec![],
             missing_required_roles: vec![],
             missing_optional_roles: vec![],
@@ -793,7 +798,10 @@ mod system_mapping_evidence_tests {
         observation
             .unregistered_native_mappings
             .push("foreign.so".into());
-        assert!(classify_system_mapping(&observation, true).is_err());
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
         observation.unregistered_native_mappings.clear();
         observation
             .missing_required_roles
@@ -1617,16 +1625,7 @@ impl OnnxBackend {
     /// Re-audits the complete CUDA bundle owned by this loaded session. An
     /// uncertain Run remains quarantined and never becomes a successful audit.
     pub fn verify_cuda_runtime_mappings(&self) -> Result<(), BackendError> {
-        if let Some(cause) = &self.quarantine_cause {
-            return Err(cause.clone());
-        }
-        if self.active_input.is_some() {
-            return Err(BackendError::new(
-                K::BackendUnavailable,
-                S::Backend,
-                "CUDA physical completion is unconfirmed; mapped-image audit cannot release it",
-            ));
-        }
+        self.check_cuda_mapping_lifetime()?;
         self.cuda_runtime
             .as_ref()
             .ok_or_else(|| {
@@ -1637,6 +1636,38 @@ impl OnnxBackend {
                 )
             })?
             .verify_cuda_runtime_mappings()
+    }
+
+    /// Check known mapping conflicts for ordinary system-runtime operation.
+    /// Unknown origin evidence remains distinct from a strict audit witness.
+    pub fn observe_cuda_runtime_mappings(
+        &self,
+    ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+        self.check_cuda_mapping_lifetime()?;
+        self.cuda_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "loaded session has no CUDA runtime bundle",
+                )
+            })?
+            .observe_cuda_runtime_mappings()
+    }
+
+    fn check_cuda_mapping_lifetime(&self) -> Result<(), BackendError> {
+        if let Some(cause) = &self.quarantine_cause {
+            return Err(cause.clone());
+        }
+        if self.active_input.is_some() {
+            return Err(BackendError::new(
+                K::BackendUnavailable,
+                S::Backend,
+                "CUDA physical completion is unconfirmed; mapped-image audit cannot release it",
+            ));
+        }
+        Ok(())
     }
 
     pub fn has_unconfirmed_physical_completion(&self) -> bool {

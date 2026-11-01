@@ -73,6 +73,9 @@ pub struct SystemMappingObservation {
     /// Whether the pre-capture mapping state was actually observed. A later
     /// successful read cannot retroactively establish that earlier observation.
     pub preexisting_mapping_observed: bool,
+    /// Native images seen before capture. Even an exact file match does not
+    /// prove that this owner controlled the earlier load or its lifetime.
+    pub preexisting_native_mappings: Vec<String>,
     pub mapped_roles: Vec<String>,
     pub missing_required_roles: Vec<String>,
     pub missing_optional_roles: Vec<String>,
@@ -93,6 +96,7 @@ struct Inner {
     identity_sha256: [u8; 32],
     libraries: Vec<LibraryPin>,
     preexisting_mapping_observed: bool,
+    preexisting_native_mappings: Vec<String>,
 }
 
 #[derive(Default)]
@@ -261,15 +265,19 @@ impl SystemRuntime {
                 inner: Arc::clone(existing),
             });
         }
-        // Existing native images cannot be attributed retrospectively to this
-        // new owner. Driver images such as libcuda remain OS-owned.
-        let preexisting_mapping_observed = assess_preexisting_maps(linux::read_maps())?;
+        // An already mapped exact file is not owned retrospectively by this
+        // token. Preserve that distinction without blocking ordinary use.
+        let identities: Vec<_> = libraries.iter().map(|pin| &pin.identity).collect();
+        let preexisting = assess_preexisting_maps(linux::read_maps(), &identities)?;
+        let preexisting_mapping_observed = preexisting.is_some();
+        let preexisting_native_mappings = preexisting.unwrap_or_default();
         check_deadline(deadline)?;
         claim_native_mode(2)?;
         let inner = Arc::new(Inner {
             identity_sha256,
             libraries,
             preexisting_mapping_observed,
+            preexisting_native_mappings,
         });
         guard.owner = Some(Arc::clone(&inner));
         Ok(Self { inner })
@@ -343,6 +351,7 @@ impl SystemRuntime {
                     identity_sha256: self.inner.identity_sha256,
                     availability: SystemMappingAvailability::Unavailable,
                     preexisting_mapping_observed: self.inner.preexisting_mapping_observed,
+                    preexisting_native_mappings: self.inner.preexisting_native_mappings.clone(),
                     mapped_roles: Vec::new(),
                     missing_required_roles: Vec::new(),
                     missing_optional_roles: Vec::new(),
@@ -378,6 +387,24 @@ impl SystemRuntime {
                 .and_then(|s| s.to_str())
             {
                 if linux::is_nvidia_runtime(name) || name.starts_with("libonnxruntime") {
+                    // An additional version of a registered SONAME family is
+                    // an identity conflict, not a harmless lazy dependency.
+                    let family = native_soname_family(name);
+                    if family.is_some_and(|family| {
+                        self.inner.libraries.iter().any(|pin| {
+                            pin.identity
+                                .canonical_path
+                                .file_name()
+                                .and_then(|part| part.to_str())
+                                .and_then(native_soname_family)
+                                == Some(family)
+                        })
+                    }) {
+                        return Err(error(
+                            LoadErrorKind::MappingIdentity,
+                            "a different image of a registered system library is mapped",
+                        ));
+                    }
                     unregistered.insert(name.to_owned());
                 }
             }
@@ -398,6 +425,7 @@ impl SystemRuntime {
             identity_sha256: self.inner.identity_sha256,
             availability: SystemMappingAvailability::Observed,
             preexisting_mapping_observed: self.inner.preexisting_mapping_observed,
+            preexisting_native_mappings: self.inner.preexisting_native_mappings.clone(),
             mapped_roles: matched.into_iter().collect(),
             missing_required_roles,
             missing_optional_roles,
@@ -421,7 +449,10 @@ fn apply_observation(
     if let Err(failure) = &result {
         // A transient unavailable observation must not poison a live
         // runtime; conflicts and identity failures remain latched.
-        if failure.kind != LoadErrorKind::ObservationUnavailable {
+        if !matches!(
+            failure.kind,
+            LoadErrorKind::ObservationUnavailable | LoadErrorKind::ForeignMapping
+        ) {
             state.failure = Some(failure.clone());
         }
     }
@@ -430,13 +461,15 @@ fn apply_observation(
 
 fn assess_preexisting_maps(
     maps: Result<Vec<linux::MapEntry>, LoadError>,
-) -> Result<bool, LoadError> {
+    registered: &[&SystemLibraryIdentity],
+) -> Result<Option<Vec<String>>, LoadError> {
     let maps = match maps {
         Ok(maps) => maps,
         // No conclusion about pre-existing mappings can be drawn from an
         // unavailable or malformed process-map observation.
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
+    let mut existing = BTreeSet::new();
     for mapping in maps {
         if let Some(name) = mapping
             .path
@@ -445,26 +478,48 @@ fn assess_preexisting_maps(
             .and_then(|s| s.to_str())
         {
             if linux::is_nvidia_runtime(name) || name.starts_with("libonnxruntime") {
-                return Err(error(
-                    LoadErrorKind::ForeignMapping,
-                    "native runtime was mapped before system capture",
-                ));
+                let identity = registered.iter().find(|identity| {
+                    native_soname_family(name).is_some_and(|family| {
+                        identity.canonical_path.file_name().and_then(|part| part.to_str())
+                            .and_then(native_soname_family) == Some(family)
+                    })
+                });
+                if let Some(identity) = identity {
+                    let (major, minor) = linux::device_parts(identity.device);
+                    if (mapping.dev_major, mapping.dev_minor, mapping.inode)
+                        != (major, minor, identity.inode)
+                        || mapping.deleted
+                        || mapping.path.as_deref() != Some(identity.canonical_path.as_path())
+                    {
+                        return Err(error(
+                            LoadErrorKind::MappingIdentity,
+                            "preexisting registered system library identity differs",
+                        ));
+                    }
+                }
+                existing.insert(name.to_owned());
             }
         }
     }
-    Ok(true)
+    Ok(Some(existing.into_iter().collect()))
 }
 
 fn assess_mapping_observation(
     observation: SystemMappingObservation,
     strict: bool,
 ) -> Result<SystemMappingObservation, LoadError> {
-    // Actual conflicts remain errors even when the pre-capture state was
-    // unavailable. Strict acceptance also requires all evidence to exist.
-    if !observation.unregistered_native_mappings.is_empty() {
+    // Extra unrelated system dependencies are recorded for normal execution;
+    // exact reproducibility requires an explicitly closed mapping inventory.
+    if strict && !observation.unregistered_native_mappings.is_empty() {
         return Err(error(
             LoadErrorKind::ForeignMapping,
             "an unregistered system native library is mapped",
+        ));
+    }
+    if strict && !observation.preexisting_native_mappings.is_empty() {
+        return Err(error(
+            LoadErrorKind::ForeignMapping,
+            "native library ownership before capture cannot be established",
         ));
     }
     if strict
@@ -483,6 +538,14 @@ fn assess_mapping_observation(
         ));
     }
     Ok(observation)
+}
+
+fn native_soname_family(name: &str) -> Option<&str> {
+    let (family, suffix) = name.split_once(".so")?;
+    if family.is_empty() || !(suffix.is_empty() || suffix.starts_with('.')) {
+        return None;
+    }
+    Some(family)
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), LoadError> {
@@ -695,6 +758,7 @@ mod tests {
             identity_sha256: [0; 32],
             availability,
             preexisting_mapping_observed: true,
+            preexisting_native_mappings: Vec::new(),
             mapped_roles: vec!["ort-core".into()],
             missing_required_roles: Vec::new(),
             missing_optional_roles: Vec::new(),
@@ -707,8 +771,8 @@ mod tests {
     #[test]
     fn unavailable_maps_are_unknown_without_masking_observed_conflicts() {
         let unreadable = error(LoadErrorKind::FileAccess, "maps unavailable");
-        assert!(!assess_preexisting_maps(Err(unreadable)).unwrap());
-        assert!(assess_preexisting_maps(Ok(Vec::new())).unwrap());
+        assert_eq!(assess_preexisting_maps(Err(unreadable), &[]).unwrap(), None);
+        assert_eq!(assess_preexisting_maps(Ok(Vec::new()), &[]).unwrap(), Some(vec![]));
         let foreign = linux::MapEntry {
             dev_major: 0,
             dev_minor: 0,
@@ -717,8 +781,8 @@ mod tests {
             deleted: false,
         };
         assert_eq!(
-            assess_preexisting_maps(Ok(vec![foreign])).unwrap_err().kind,
-            LoadErrorKind::ForeignMapping
+            assess_preexisting_maps(Ok(vec![foreign]), &[]).unwrap(),
+            Some(vec!["libcudart.so.12".to_owned()])
         );
 
         let unknown = observation(SystemMappingAvailability::Unavailable);
@@ -736,15 +800,57 @@ mod tests {
                 .kind,
             LoadErrorKind::ObservationUnavailable
         );
-        let mut conflict = observation(SystemMappingAvailability::Observed);
-        conflict
-            .unregistered_native_mappings
-            .push("libcudart.so.12".into());
+        let mut preexisting = observation(SystemMappingAvailability::Observed);
+        preexisting.preexisting_native_mappings.push("libcudart.so.12".into());
+        assert!(assess_mapping_observation(preexisting.clone(), false).is_ok());
         assert_eq!(
-            assess_mapping_observation(conflict, false)
+            assess_mapping_observation(preexisting, true).unwrap_err().kind,
+            LoadErrorKind::ForeignMapping
+        );
+        let mut extra = observation(SystemMappingAvailability::Observed);
+        extra
+            .unregistered_native_mappings
+            .push("libcudnn_ops.so.9".into());
+        assert!(assess_mapping_observation(extra.clone(), false).is_ok());
+        assert_eq!(
+            assess_mapping_observation(extra, true)
                 .unwrap_err()
                 .kind,
             LoadErrorKind::ForeignMapping
+        );
+        assert_eq!(native_soname_family("libcudnn.so.9.2"), Some("libcudnn"));
+        assert_ne!(native_soname_family("libcudnn.so.9"), native_soname_family("libcudnn_ops.so.9"));
+    }
+
+    #[test]
+    fn preexisting_exact_image_is_observed_but_other_image_conflicts() {
+        let identity = SystemLibraryIdentity {
+            role: "cuda".into(),
+            canonical_path: "/usr/lib/libcudart.so.12".into(),
+            sha256: [0; 32],
+            bytes: 1,
+            device: 0,
+            inode: 1,
+            elf_class: 2,
+            elf_machine: 62,
+            required_mapping: true,
+            first_capture_elapsed_ns: 0,
+        };
+        let mapping = |inode| linux::MapEntry {
+            dev_major: 0,
+            dev_minor: 0,
+            inode,
+            path: Some("/usr/lib/libcudart.so.12".into()),
+            deleted: false,
+        };
+        assert_eq!(
+            assess_preexisting_maps(Ok(vec![mapping(1)]), &[&identity]).unwrap(),
+            Some(vec!["libcudart.so.12".to_owned()])
+        );
+        assert_eq!(
+            assess_preexisting_maps(Ok(vec![mapping(2)]), &[&identity])
+                .unwrap_err().kind,
+            LoadErrorKind::MappingIdentity
         );
     }
 
@@ -767,25 +873,29 @@ mod tests {
             )
             .is_ok()
         );
-        let mut conflict = observation(SystemMappingAvailability::Observed);
-        conflict
+        let mut extra = observation(SystemMappingAvailability::Observed);
+        extra
             .unregistered_native_mappings
-            .push("libcudart.so.12".into());
+            .push("libcudnn_ops.so.9".into());
+        assert!(apply_observation(&mut state, Ok(extra.clone()), false).is_ok());
         assert_eq!(
-            apply_observation(&mut state, Ok(conflict), false)
+            apply_observation(&mut state, Ok(extra), true)
                 .unwrap_err()
                 .kind,
             LoadErrorKind::ForeignMapping
         );
+        assert!(state.failure.is_none());
+        let conflict = error(LoadErrorKind::MappingIdentity, "conflicting library");
         assert_eq!(
-            apply_observation(
-                &mut state,
-                Ok(observation(SystemMappingAvailability::Observed)),
-                false
-            )
+            apply_observation(&mut state, Err(conflict), false)
             .unwrap_err()
             .kind,
-            LoadErrorKind::ForeignMapping
+            LoadErrorKind::MappingIdentity
+        );
+        assert_eq!(
+            apply_observation(&mut state, Ok(observation(SystemMappingAvailability::Observed)), false)
+                .unwrap_err().kind,
+            LoadErrorKind::MappingIdentity
         );
     }
 

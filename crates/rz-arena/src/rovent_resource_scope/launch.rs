@@ -694,7 +694,10 @@ fn verify_system_v3_child_receipts(
         || startup.physical_completion != PhysicalCompletionV6::Unknown
         || startup.observed_identity_sha256.as_deref()
             != Some(system.system_identity_sha256.as_str())
-        || !startup.unregistered_native_mappings.is_empty()
+        || !startup
+            .unregistered_native_mappings
+            .as_ref()
+            .is_some_and(Vec::is_empty)
     {
         return Err(invalid(
             "V3 startup system runtime observation is incomplete",

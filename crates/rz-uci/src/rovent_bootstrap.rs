@@ -317,6 +317,8 @@ pub struct RoventSystemNativeResourcesV3 {
 pub struct RoventSystemReadyObservationV3 {
     pub runtime_identity: Digest,
     pub libraries: Vec<SystemLibraryObservationV6>,
+    /// None denotes unavailable mapping observation, not an empty list.
+    pub unregistered_native_mappings: Option<Vec<String>>,
     /// True only after every actual model session accepted CUDA registration,
     /// reported the provider available, and completed session construction.
     /// This does not attest a GPU inference or its physical completion.
@@ -699,6 +701,11 @@ pub struct PreparedRoventNativeV3<Q: NativeQuestionProjection = AdaptivePortQues
 }
 
 impl<Q: NativeQuestionProjection> PreparedRoventNativeV3<Q> {
+    /// Borrow the original worker; this issues no new authority or ownership.
+    pub(crate) fn collection_ready_service(&self) -> &RoventNativeService<Q> {
+        &self.service
+    }
+
     pub fn snapshot(&self) -> &RoventNativeStartupSnapshot {
         &self.snapshot
     }
@@ -728,11 +735,36 @@ pub fn prepare_native_v3<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejection<Q>> {
+    prepare_native_v3_inner(sources, resources, clock, control, None)
+}
+
+/// Prepare the single original /3 Collection worker with its input observer.
+/// The caller must retain custody of that observer and recover it only after
+/// physical completion, worker join and any teacher settlement are verified.
+/// Ready does not establish root, teacher, publication or completion authority.
+#[cfg(target_os = "linux")]
+pub fn prepare_native_v3_collection<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    resources: RoventSystemNativeResourcesV3,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejection<Q>> {
+    prepare_native_v3_inner(sources, resources, clock, control, Some(observer))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    resources: RoventSystemNativeResourcesV3,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejection<Q>> {
     let admission = || -> Result<(), BackendError> {
         control.check()?;
         sources.validate_lock()?;
         if !sources.admits_original_startup_control(&control)
-            || sources.collection_preload_sources().is_some()
             || clock.domain().0.0 == 0
             || control.cleanup_until < control.until
             || control
@@ -744,6 +776,25 @@ pub fn prepare_native_v3<Q: NativeQuestionProjection>(
                 K::IdentityMismatch,
                 "V3 startup owner or deadline differs",
             ));
+        }
+        match (observer.is_some(), sources.collection_preload_sources()) {
+            (true, Some(_))
+                if sources.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection =>
+            {
+                sources.verify_collection_v3_origin()?;
+            }
+            (false, None)
+                if matches!(
+                    sources.lock().manifest.purpose,
+                    rz_experiments::RoventPurpose::Validation
+                        | rz_experiments::RoventPurpose::Deployment
+                ) => {}
+            _ => {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    "V3 Collection preload and input observer differ",
+                ));
+            }
         }
         validate_system_native_resources_v3(&sources, &resources)
     };
@@ -774,6 +825,7 @@ pub fn prepare_native_v3<Q: NativeQuestionProjection>(
                 resources,
                 factory_clock,
                 &factory_control,
+                observer,
                 &factory_diagnostic,
             )
         },
@@ -1113,6 +1165,7 @@ fn load_native_system_v3(
     resources: RoventSystemNativeResourcesV3,
     clock: ContractSystemClock,
     control: &RoventStartupControl,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
     diagnostic: &NativeStartupDiagnostic,
 ) -> Result<
     (
@@ -1137,25 +1190,34 @@ fn load_native_system_v3(
     })?;
     let config_digest =
         system_configuration_digest_v3(resources.configuration, runtime.binary_digest(), identity)?;
+    let collection = sources.lock().manifest.purpose == RoventPurpose::Collection;
+    let execution_mode = if collection {
+        VirtualReviewExecutionMode::Collection
+    } else {
+        VirtualReviewExecutionMode::Deployment
+    };
     let backend = diagnostic.trace(NativeStartupDiagnosticStage::ModelSessions, || {
         PalsVirtualReviewOnnxBackend::load_owned_sources_with_profile(
             sources.clone() as Arc<dyn VirtualReviewOwnedSources>,
             &sources.export_digest_text(),
             runtime,
             resources.configuration,
-            VirtualReviewExecutionMode::Deployment,
+            execution_mode,
             VirtualReviewArtifactKind::Fresh,
             None,
         )
     })?;
     control.check()?;
-    if backend.validator_present()
+    if backend.validator_present() != collection
         || backend.approximate_warm_capable()
         || backend.model_epoch() != sources.weights_digest()
         || backend.rules_input_semantic_digest()
             != crate::pals_native::virtual_encoding::pals_virtual_rules_semantic_digest()
     {
-        return Err(fail(K::IdentityMismatch, "loaded V3 P/C namespace differs"));
+        return Err(fail(
+            K::IdentityMismatch,
+            "loaded V3 role set or model namespace differs",
+        ));
     }
     let session_settings = backend.applied_session_settings();
     let residency = backend.residency();
@@ -1196,7 +1258,7 @@ fn load_native_system_v3(
             "actual V3 model sessions did not all confirm the selected CUDA provider",
         ));
     }
-    let libraries = startup.observe_ready_mappings()?;
+    let mapping = startup.observe_ready_mappings()?;
     control.check()?;
     let snapshot = RoventNativeStartupSnapshot {
         domain: "rz-rovent-native-system-startup/1",
@@ -1212,13 +1274,14 @@ fn load_native_system_v3(
         native_configuration: Digest(config_digest),
         system_runtime: Some(RoventSystemReadyObservationV3 {
             runtime_identity: Digest(identity),
-            libraries,
+            libraries: mapping.libraries,
+            unregistered_native_mappings: mapping.unregistered_native_mappings,
             provider_ready: true,
             session_settings,
         }),
         startup_configuration: Digest(sources.configuration().configuration_digest()?),
         search_configuration: Digest(sources.configuration().search_configuration_digest()?),
-        validator_loaded: false,
+        validator_loaded: backend.validator_present(),
         physical_workers_created: 1,
         session_residency: backend.residency().clone(),
         neural_service_executed: false,
@@ -1227,7 +1290,7 @@ fn load_native_system_v3(
         backend,
         clock,
         resources.drain_limit,
-        None,
+        observer,
     )
     .map_err(|_| {
         fail(
@@ -1587,8 +1650,28 @@ fn admitted_native_topology_fields(
     coordinator: &RoventCoordinatorDeclaration,
     explicit_purpose: bool,
 ) -> Result<RoventStartupTopology, BackendError> {
+    admitted_native_topology_fields_v3(engine, coordinator, explicit_purpose, false)
+}
+
+/// V3 Collection uses the same model/export for all three role graphs.
+/// Historical V1/V2 admission keeps the original validator-free condition.
+fn admitted_native_topology_fields_v3(
+    engine: &RoventEngineDeclaration,
+    coordinator: &RoventCoordinatorDeclaration,
+    explicit_purpose: bool,
+    collection: bool,
+) -> Result<RoventStartupTopology, BackendError> {
     if !explicit_purpose
-        || engine.pc.validator.is_some()
+        || if collection {
+            !engine.pc.validator.as_ref().is_some_and(|validator| {
+                validator.semantics == engine.pc.proposer.semantics
+                    && validator.encoding == engine.pc.proposer.encoding
+                    && validator.weights.sha256 == engine.pc.proposer.weights.sha256
+                    && validator.weights.bytes == engine.pc.proposer.weights.bytes
+            })
+        } else {
+            engine.pc.validator.is_some()
+        }
         || !matches!(
             engine.pc.backend,
             RoventBackend::OrtCpu | RoventBackend::OrtCuda
@@ -1600,7 +1683,11 @@ fn admitted_native_topology_fields(
     {
         return Err(fail(
             K::UnsupportedModel,
-            "this native constructor requires explicit V-free P/C use",
+            if collection {
+                "V3 Collection requires compatible semantics and shared P/C/V weights"
+            } else {
+                "this native constructor requires explicit V-free P/C use"
+            },
         ));
     }
     if engine.pc.proposer != engine.pc.critic

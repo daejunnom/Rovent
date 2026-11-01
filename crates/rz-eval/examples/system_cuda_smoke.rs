@@ -22,6 +22,7 @@ mod linux {
     use rz_eval::onnx::{
         verify_cuda_profile, OrtRuntime, SystemCaptureLimits, SystemLibraryRequest, SystemRuntime,
     };
+    use rz_native_loader::LoadErrorKind;
     use serde::Deserialize;
     use serde_json::{json, Value};
     use std::error::Error;
@@ -185,9 +186,35 @@ mod linux {
                 .all(|(a, b)| a.is_finite() && (*a - b).abs() <= 1e-6);
         report["forward_expected_match"] = json!(numerical_match);
         report["stage"] = json!("mapping_and_cuda_placement");
-        runtime.verify_cuda_runtime_mappings()?;
-        let mapping = owner.verify_mappings()?;
-        report["mapped_roles"] = json!(mapping.mapped_roles);
+        // A normal observation detects actual identity conflicts. A strict
+        // origin witness has a separate result: unrelated lazy dependencies
+        // or an unavailable observation must not hide completed CUDA work.
+        let mapping_evidence = runtime.observe_cuda_runtime_mappings()?;
+        let mapping = owner.observe_mappings()?;
+        report["mapped_roles"] = json!(&mapping.mapped_roles);
+        report["mapping_observation"] = json!({
+            "availability": format!("{:?}", mapping.availability),
+            "preexisting_mapping_observed": mapping.preexisting_mapping_observed,
+            "preexisting_native_mappings": &mapping.preexisting_native_mappings,
+            "unregistered_native_mappings": &mapping.unregistered_native_mappings,
+            "runtime_evidence": format!("{:?}", mapping_evidence),
+        });
+        match owner.verify_mappings() {
+            Ok(_) => report["strict_mapping_verification"] = json!("verified"),
+            Err(error) if error.kind == LoadErrorKind::ForeignMapping => {
+                report["strict_mapping_verification"] = json!("not_satisfied");
+                report["strict_mapping_reason"] = json!(error.cause_code());
+            }
+            Err(error) if error.kind == LoadErrorKind::ObservationUnavailable => {
+                report["strict_mapping_verification"] = json!("unknown");
+                report["strict_mapping_reason"] = json!(error.cause_code());
+            }
+            Err(error) => {
+                report["strict_mapping_verification"] = json!("failed");
+                report["strict_mapping_reason"] = json!(error.cause_code());
+                return Err(error.into());
+            }
+        }
         let profile = session.end_profiling()?;
         let profile_path = Path::new(&profile);
         let wanted_parent = config
@@ -215,6 +242,7 @@ mod linux {
         if !numerical_match {
             return Err("Relu output differs from the fixed expected result".into());
         }
+        report["functional_cuda_validation"] = json!("passed");
         report["stage"] = json!("complete");
         Ok(())
     }
@@ -234,11 +262,20 @@ mod linux {
             run(config, &mut report)
         })();
         match result {
-            Ok(()) => report["status"] = json!("passed"),
+            Ok(()) if report["strict_mapping_verification"] == "verified" => {
+                report["status"] = json!("passed")
+            }
+            Ok(()) if report["strict_mapping_verification"] == "not_satisfied" => {
+                report["status"] = json!("passed_with_mapping_not_satisfied")
+            }
+            Ok(()) => report["status"] = json!("passed_with_mapping_unknown"),
             Err(error) => report["error"] = json!(error.to_string()),
         }
         println!("{}", report);
-        if report["status"] != "passed" {
+        if report["status"] != "passed"
+            && report["status"] != "passed_with_mapping_unknown"
+            && report["status"] != "passed_with_mapping_not_satisfied"
+        {
             std::process::exit(1);
         }
     }

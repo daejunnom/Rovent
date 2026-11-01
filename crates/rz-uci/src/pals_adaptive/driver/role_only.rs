@@ -292,6 +292,61 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
         }
         Ok(())
     }
+
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    fn validate_collection_admission_v3(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .rovent_frontier()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "P/C V3 collection has no actual attached frontier",
+            ))?;
+        admission.validate_frontier(frontier)?;
+        let registered = frontier.registration();
+        let root = admission.root_admission();
+        // This can run while the manager owns another lock. Keep contention
+        // distinguishable from an actually revoked or expired root.
+        if !root
+            .original_context()
+            .try_accepts()
+            .map_err(AdaptiveManagerError::Contract)?
+        {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
+        let namespace = admission
+            .native_origin()
+            .startup_snapshot()
+            .model_namespace()
+            .map_err(|_| AdaptiveManagerError::Invalid("V3 original Ready namespace"))?;
+        if root.authority() != self.port.authority()
+            || root.authority() != registered.authority
+            || root.hard_deadline() != registered.original_deadline
+            || root.goal() != registered.goal
+            || root.requested_nodes() != registered.nodes
+            || admission.root_budget() != registered.root_budget
+            || admission.selective_policy() != registered.selective_policy
+            || admission
+                .native_origin()
+                .sources()
+                .lock()
+                .manifest
+                .engine
+                .mode
+                != registered.mode
+            || registered.model_namespace.as_ref() != &namespace
+            || !Arc::ptr_eq(admission.rules(), &self.original_rules)
+            || !Arc::ptr_eq(admission.rules(), &registered.root_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &registered.root_moves)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C V3 collection is outside its actual frontier owner",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "onnx-cpu")]

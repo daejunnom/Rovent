@@ -22,6 +22,11 @@ use crate::pals_adaptive::{
     RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2, RoventNativeCollectionOrigin,
     RoventNativeCollectionOriginV2,
 };
+#[cfg(target_os = "linux")]
+use crate::pals_adaptive::{
+    AdaptiveCollectionObserverBoxV3, RoleOnlyCollectionV3Rejection,
+    RoventCollectionRootAdmissionV3, RoventNativeCollectionOriginV3,
+};
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
     InitialAdmissionOutcome, InitialAdmissionOutcomeV2, InitialAdmissionOutcomeV3,
@@ -487,48 +492,143 @@ pub(crate) fn attach_pc_v2_collection_observer(
     selective_policy: Digest,
     observer: AdaptiveCollectionObserverBoxV2<PcPortQuestion, VirtualReviewTicketOutput>,
 ) -> Result<(), RoventPcV2ObserverAttachRejection> {
-    let admission = catch_unwind(AssertUnwindSafe(|| {
-        match manager.driver().port().rovent_frontier() {
-            Some(frontier) => RoventCollectionRootAdmissionV2::from_attached_frontier(
+    attach_pc_collection_observer(
+        manager,
+        root,
+        observer,
+        |frontier, root| {
+            RoventCollectionRootAdmissionV2::from_attached_frontier(
                 origin,
                 frontier,
-                Arc::clone(&root),
+                Arc::clone(root),
                 root_budget,
                 selective_policy,
             )
-            .map_err(AdaptiveManagerError::from),
-            None => Err(AdaptiveManagerError::Invalid(
-                "P/C V2 collection has no actual attached frontier",
-            )),
+            .map_err(AdaptiveManagerError::from)
+        },
+        |manager, admission, observer| {
+            manager
+                .install_collection_observer_v2(admission, observer)
+                .map_err(RoventPcV2ObserverAttachRejection::Manager)
+        },
+        |error, status, root, observer, panic_payload| {
+            RoventPcV2ObserverAttachRejection::BeforeAdmission {
+                error,
+                status,
+                root,
+                observer,
+                panic_payload,
+            }
+        },
+        "P/C V2 collection has no actual attached frontier",
+        "P/C V2 collection frontier admission panicked",
+    )
+}
+
+/// Shared attachment mechanism retains the exact versioned root and observer
+/// on rejection or panic; only a real manager install can transfer ownership.
+#[allow(clippy::too_many_arguments)]
+fn attach_pc_collection_observer<A, R, O, E>(
+    manager: &mut RoventPcSessionManager,
+    root: Arc<R>,
+    observer: O,
+    admit: impl FnOnce(
+        &rz_search::pals::rovent_frontier::RoventFrontier,
+        &Arc<R>,
+    ) -> Result<A, AdaptiveManagerError>,
+    install: impl FnOnce(&mut RoventPcSessionManager, A, O) -> Result<(), E>,
+    reject: impl FnOnce(
+        AdaptiveManagerError,
+        RoventPcV2FrontierAdmissionStatus,
+        Arc<R>,
+        O,
+        Option<Box<dyn Any + Send>>,
+    ) -> E,
+    absent: &'static str,
+    panicked: &'static str,
+) -> Result<(), E> {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        match manager.driver().port().rovent_frontier() {
+            Some(frontier) => admit(frontier, &root),
+            None => Err(AdaptiveManagerError::Invalid(absent)),
         }
     }));
-    let admission = match admission {
-        Ok(Ok(admission)) => admission,
-        Ok(Err(error)) => {
-            return Err(RoventPcV2ObserverAttachRejection::BeforeAdmission {
-                error,
-                status: RoventPcV2FrontierAdmissionStatus::Rejected,
-                root,
-                observer,
-                panic_payload: None,
-            });
-        }
-        Err(payload) => {
-            return Err(RoventPcV2ObserverAttachRejection::BeforeAdmission {
-                error: AdaptiveManagerError::Invalid(
-                    "P/C V2 collection frontier admission panicked",
-                ),
-                status: RoventPcV2FrontierAdmissionStatus::Panicked,
-                root,
-                observer,
-                panic_payload: Some(payload),
-            });
-        }
-    };
-    manager
-        .install_collection_observer_v2(admission, observer)
-        .map_err(RoventPcV2ObserverAttachRejection::Manager)
+    match result {
+        Ok(Ok(admission)) => install(manager, admission, observer),
+        Ok(Err(error)) => Err(reject(
+            error,
+            RoventPcV2FrontierAdmissionStatus::Rejected,
+            root,
+            observer,
+            None,
+        )),
+        Err(payload) => Err(reject(
+            AdaptiveManagerError::Invalid(panicked),
+            RoventPcV2FrontierAdmissionStatus::Panicked,
+            root,
+            observer,
+            Some(payload),
+        )),
+    }
 }
+
+/// Failure retains the actual /3 root and observer; it is not evidence of a
+/// native fence, teacher retirement, data publication, or semantic success.
+#[cfg(target_os = "linux")]
+pub(crate) enum RoventPcV3ObserverAttachRejection {
+    BeforeAdmission {
+        error: AdaptiveManagerError,
+        status: RoventPcV2FrontierAdmissionStatus,
+        root: Arc<RoventRootAdmissionV3>,
+        observer: AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+        panic_payload: Option<Box<dyn Any + Send>>,
+    },
+    Manager(RoleOnlyCollectionV3Rejection<PcPortQuestion, VirtualReviewTicketOutput>),
+}
+
+/// Attach a real V3 observer to the current Frontier; no V2 projection is made.
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_pc_v3_collection_observer(
+    manager: &mut RoventPcSessionManager,
+    origin: &RoventNativeCollectionOriginV3,
+    root: Arc<RoventRootAdmissionV3>,
+    root_budget: Digest,
+    selective_policy: Digest,
+    observer: AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+) -> Result<(), RoventPcV3ObserverAttachRejection> {
+    attach_pc_collection_observer(
+        manager,
+        root,
+        observer,
+        |frontier, root| {
+            RoventCollectionRootAdmissionV3::from_attached_frontier(
+                origin,
+                frontier,
+                Arc::clone(root),
+                root_budget,
+                selective_policy,
+            )
+            .map_err(AdaptiveManagerError::from)
+        },
+        |manager, admission, observer| {
+            manager
+                .install_collection_observer_v3(admission, observer)
+                .map_err(RoventPcV3ObserverAttachRejection::Manager)
+        },
+        |error, status, root, observer, panic_payload| {
+            RoventPcV3ObserverAttachRejection::BeforeAdmission {
+                error,
+                status,
+                root,
+                observer,
+                panic_payload,
+            }
+        },
+        "P/C V3 collection has no actual attached frontier",
+        "P/C V3 collection frontier admission panicked",
+    )
+}
+
 #[derive(Default)]
 pub struct RoventPcCollectionHooks {
     pub root_admission: Option<RoventPcAdmissionObserver>,

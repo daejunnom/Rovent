@@ -171,6 +171,11 @@ pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
     fn system_runtime_lock(&self) -> Option<&SystemRuntimeLockV6> {
         None
     }
+    /// Legacy V1/V2 preserve their V-free export contract. Only an original
+    /// V3 Collection lock selects the native Collection graph capability.
+    fn virtual_review_mode(&self) -> VirtualReviewExecutionMode {
+        VirtualReviewExecutionMode::Deployment
+    }
     fn bootstrap_source_identity(&self) -> Result<(&'static str, [u8; 32]), BackendError> {
         Ok(("rovent_bootstrap", compiled_bootstrap_source_digest()))
     }
@@ -339,6 +344,13 @@ impl NativeInputLock for RoventInputLockV2 {
 
 impl native_lock_sealed::Sealed for RoventInputLockV3 {}
 impl NativeInputLock for RoventInputLockV3 {
+    fn virtual_review_mode(&self) -> VirtualReviewExecutionMode {
+        if self.manifest.purpose == rz_experiments::RoventPurpose::Collection {
+            VirtualReviewExecutionMode::Collection
+        } else {
+            VirtualReviewExecutionMode::Deployment
+        }
+    }
     fn model_source_identity(&self) -> Result<(&'static str, String), BackendError> {
         let digest =
             super::source_inventory_v3::compiled_system_model_native_digest_v3().map_err(|_| {
@@ -409,10 +421,11 @@ impl NativeInputLock for RoventInputLockV3 {
                     && original.teacher_count() == self.manifest.engine.teachers.len()
             }
         };
-        super::admitted_native_topology_fields(
+        super::admitted_native_topology_fields_v3(
             &self.manifest.engine,
             &self.manifest.coordinator,
             explicit_purpose,
+            self.manifest.purpose == rz_experiments::RoventPurpose::Collection,
         )
     }
     fn admit_configuration(
@@ -802,13 +815,37 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
                 "original private root path must be absolute",
             ));
         }
-        if selection.graphs.len() != 2 {
+        let collection_graphs =
+            lock.virtual_review_mode() == VirtualReviewExecutionMode::Collection;
+        let expected_graphs = if collection_graphs { 3 } else { 2 };
+        if selection.graphs.len() != expected_graphs {
             return Err(fail(
                 K::UnsupportedModel,
-                "Fresh V-free native startup needs exactly two original graphs",
+                "Fresh native startup graph count differs from its execution purpose",
             ));
         }
         let model = &lock.engine().pc.proposer;
+        if collection_graphs {
+            let validator = lock.engine().pc.validator.as_ref().ok_or_else(|| {
+                fail(
+                    K::IdentityMismatch,
+                    "V3 Collection requires the original validator model pin",
+                )
+            })?;
+            // A single export owns P/C/V and therefore the pinned checkpoint.
+            // Do not accept a separate V checkpoint while loading this export.
+            if validator.weights != model.weights
+                || validator.provenance != model.provenance
+                || validator.semantics != model.semantics
+                || validator.encoding != model.encoding
+                || validator.implementation_sha256 != model.implementation_sha256
+            {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    "validator pin differs from shared export model",
+                ));
+            }
+        }
         let source_evidence = if strict_source {
             // Preserve historical V1/V2 error ordering and error types.
             let (source_key, source_digest) = lock.bootstrap_source_identity()?;
@@ -882,7 +919,8 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
         let mut graphs = Vec::new();
         let mut roles = BTreeSet::new();
         for graph in selection.graphs {
-            if !matches!(graph.role.as_str(), "public" | "shared_pc")
+            if !(matches!(graph.role.as_str(), "public" | "shared_pc")
+                || (collection_graphs && graph.role == "validator"))
                 || !roles.insert(graph.role.clone())
                 || !basename(&graph.registered_file)
             {
@@ -1142,7 +1180,7 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
         let raw = read_blob(&self.export, 256 << 10)?;
         let summary = validate_virtual_review_export_manifest_kind(
             &raw,
-            VirtualReviewExecutionMode::Deployment,
+            self.lock.virtual_review_mode(),
             VirtualReviewArtifactKind::Fresh,
         )?;
         let rules_raw = read_blob(&self.rules, 64 << 10)?;
@@ -1150,6 +1188,7 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
         let model = &self.lock.engine().pc.proposer;
         if summary.checkpoint_sha256 != self.weights_digest()
             || summary.validator_present
+                != (self.lock.virtual_review_mode() == VirtualReviewExecutionMode::Collection)
             || summary.model_semantics != model.semantics
             || summary.encoding_schema != model.encoding
             || summary.graphs.len() != self.graphs.len()

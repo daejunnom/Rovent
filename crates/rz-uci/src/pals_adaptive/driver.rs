@@ -1606,6 +1606,60 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         }
         Ok(())
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    fn validate_collection_admission_v3(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .as_ref()
+            .and_then(|port| port.rovent_frontier())
+            .ok_or(AdaptiveManagerError::Invalid(
+                "V3 collection requires the actual attached Rovent frontier",
+            ))?;
+        admission.validate_frontier(frontier)?;
+        let original = frontier.registration();
+        let root = admission.root_admission();
+        // The manager may hold an owner lock here; contention is not a
+        // canceled root and must not block while waiting for UCI.
+        if !root
+            .original_context()
+            .try_accepts()
+            .map_err(AdaptiveManagerError::Contract)?
+        {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
+        let namespace = admission
+            .native_origin()
+            .startup_snapshot()
+            .model_namespace()
+            .map_err(|_| AdaptiveManagerError::Invalid("V3 original Ready namespace"))?;
+        if root.authority() != self.authority
+            || root.authority() != original.authority
+            || root.hard_deadline() != original.original_deadline
+            || root.goal() != original.goal
+            || root.requested_nodes() != original.nodes
+            || admission.root_budget() != original.root_budget
+            || admission.selective_policy() != original.selective_policy
+            || admission
+                .native_origin()
+                .sources()
+                .lock()
+                .manifest
+                .engine
+                .mode
+                != original.mode
+            || original.model_namespace.as_ref() != &namespace
+            || !Arc::ptr_eq(admission.rules(), &original.root_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &original.root_moves)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "V3 collection cap differs from the actual PCR registration",
+            ));
+        }
+        Ok(())
+    }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn collection_v2_observation_complete(
         &self,

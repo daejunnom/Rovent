@@ -1148,9 +1148,15 @@ mod publication_v2;
 pub use publication_v2::{ROVENT_CORPUS_PUBLICATION_V2, RoventCorpusPublicationV2};
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod publication_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod publication_lock_v3;
 mod submitted_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod submitted_lock_v3;
 mod submitted_v3;
 pub use submitted_lock_v2::{PublishedRoventLockV2Record, RoventRetiredLockV2Record};
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub use submitted_lock_v3::PublishedRoventLockV3Record;
 pub use submitted_v3::{
     PublishedRoventRecordV2, RoventRetiredRecordV2, RoventSubmittedRecordMetadata,
     RoventSubmittedReviewEvidence, capture_rovent_submitted_input,
@@ -1166,6 +1172,10 @@ pub use writer_v2::{FinishedRoventCorpusV2, RoventCorpusWriterV2};
 mod writer_lock_v2;
 #[cfg(target_os = "linux")]
 pub use writer_lock_v2::{FinishedRoventCorpusLockV2, RoventCorpusWriterLockV2};
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod writer_lock_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub use writer_lock_v3::{FinishedRoventCorpusLockV3, RoventCorpusWriterLockV3};
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod publication_caller_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]

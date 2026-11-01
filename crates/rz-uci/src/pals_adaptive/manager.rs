@@ -997,6 +997,26 @@ pub trait AdaptiveSearchDriver<Q> {
     ) -> bool {
         false
     }
+    /// Validate the original /3 root and its actual frontier; implementations
+    /// which have not connected that owner must reject the admission.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    fn validate_collection_admission_v3(
+        &self,
+        _: &RoventCollectionRootAdmissionV3,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual V3 collection frontier",
+        ))
+    }
+    /// A /3 observer may be installed only when its actual acceptance and
+    /// search-consumption paths are connected to this same root.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    fn collection_v3_observation_complete(
+        &self,
+        _admission: &RoventCollectionRootAdmissionV3,
+    ) -> bool {
+        false
+    }
     fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
         Ok(None)
     }
@@ -2274,6 +2294,17 @@ pub(crate) struct AdaptiveCollectionV2Rejection<Q, O> {
     pub panic_payload: Option<Box<dyn std::any::Any + Send>>,
 }
 
+/// A rejected /3 admission returns the original owner and observer. A
+/// callback may already have run; its status is never a completion proof.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub(crate) struct AdaptiveCollectionV3Rejection<Q, O> {
+    pub error: AdaptiveManagerError,
+    pub admission: RoventCollectionRootAdmissionV3,
+    pub observer: AdaptiveCollectionObserverBoxV3<Q, O>,
+    pub observer_status: AdaptiveCollectionV2ObserverStatus,
+    pub panic_payload: Option<Box<dyn std::any::Any + Send>>,
+}
+
 /// The actual single writer owns native service handles and private CPU workers.
 /// tick is bounded and nonblocking. It does not execute inference/search or join
 /// a live worker. Two pending role questions retain independent submitted views.
@@ -2294,7 +2325,7 @@ where
     collection_observer: Option<AdaptiveCollectionObserverBox<Q, B::Output>>,
     collection_admission: Option<RoventCollectionRootAdmission>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-    collection_observer_v2: Option<AdaptiveCollectionObserverBoxV2<Q, B::Output>>,
+    collection_observer_v2: Option<collection::VersionedCollectionObserver<Q, B::Output>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_disabled: bool,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -2317,7 +2348,7 @@ where
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_disable_failed: bool,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-    collection_admission_v2: Option<RoventCollectionRootAdmissionV2>,
+    collection_admission_v2: Option<collection::VersionedCollectionAdmission>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_settlement: Option<Result<(), AdaptiveCollectionError>>,
     cpu_semantic: Option<cpu_semantic::CpuSemanticState<Q>>,
@@ -3019,7 +3050,9 @@ where
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub(crate) fn collection_root_admission_v2(&self) -> Option<&RoventCollectionRootAdmissionV2> {
-        self.collection_admission_v2.as_ref()
+        self.collection_admission_v2
+            .as_ref()
+            .and_then(|owner| owner.v2())
     }
 
     /// Issue the original no-capture scope only before any root role/observer
@@ -3059,6 +3092,145 @@ where
                 collection::RoventNoCaptureIssueErrorV2::Rejected(error) => error.into(),
             },
         )
+    }
+
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    pub(crate) fn collection_root_admission_v3(&self) -> Option<&RoventCollectionRootAdmissionV3> {
+        self.collection_admission_v2
+            .as_ref()
+            .and_then(|owner| owner.v3())
+    }
+
+    /// The bypass remains tied to the actual /3 root and worker; it does not
+    /// certify observer settlement, teacher retirement, or physical closure.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    pub(crate) fn no_capture_root_v3(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<collection::RoventNoCaptureRootCapabilityV3, AdaptiveManagerError> {
+        if self.root_started
+            || !self.roles.is_empty()
+            || self.phase != ManagerPhase::Running
+            || self.collection_observer_v2.is_some()
+            || self.collection_admission_v2.is_some()
+            || self.collection_observer.is_some()
+            || self.collection_admission.is_some()
+            || admission.root_admission().authority() != self.registration.authority
+            || admission.root_admission().hard_deadline() != self.deadline
+            || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "V3 no-capture root scope or admission order",
+            ));
+        }
+        self.driver.validate_collection_admission_v3(admission)?;
+        let verifier =
+            self.native
+                .native_acceptance_verifier()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "V3 no-capture native verifier unavailable",
+                ))?;
+        collection::RoventNoCaptureRootCapabilityV3::new(admission.clone(), verifier).map_err(
+            |error| match error {
+                collection::RoventNoCaptureIssueErrorV3::Busy(_) => {
+                    AdaptiveManagerError::AuxiliaryPending
+                }
+                collection::RoventNoCaptureIssueErrorV3::Rejected(error) => error.into(),
+            },
+        )
+    }
+
+    /// Install only an actual /3 observer whose driver supports all native
+    /// acceptance and search-consumption observations for the same root.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    pub(crate) fn install_collection_observer_v3(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV3,
+        mut observer: AdaptiveCollectionObserverBoxV3<Q, B::Output>,
+    ) -> Result<(), AdaptiveCollectionV3Rejection<Q, B::Output>> {
+        let mut observer_called = false;
+        let mut observer_succeeded = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), AdaptiveManagerError> {
+                if self.root_started
+                    || !self.roles.is_empty()
+                    || self.phase != ManagerPhase::Running
+                    || self.collection_observer.is_some()
+                    || self.collection_admission.is_some()
+                    || self.collection_observer_v2.is_some()
+                    || self.collection_admission_v2.is_some()
+                {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "V3 collection observer installation order",
+                    ));
+                }
+                if !self.driver.collection_v3_observation_complete(&admission) {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "V3 adaptive collection observation is not fully connected",
+                    ));
+                }
+                let root = admission.root_admission();
+                if root.authority() != self.registration.authority
+                    || root.hard_deadline() != self.deadline
+                    || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+                {
+                    return Err(AdaptiveManagerError::Invalid("V3 collection root scope"));
+                }
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("V3 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v3(&admission)?;
+                observer_called = true;
+                observer.admitted(&admission)?;
+                observer_succeeded = true;
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("V3 original native verifier absent"),
+                )?;
+                admission.validate_native_owner(&verifier)?;
+                self.driver.validate_collection_admission_v3(&admission)?;
+                self.check_running()?;
+                Ok(())
+            },
+        ));
+        let rejected = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some((
+                error,
+                if observer_succeeded {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionSucceededRecheckFailed
+                } else if observer_called {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionFailed
+                } else {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionNotCalled
+                },
+                None,
+            )),
+            Err(payload) => Some((
+                AdaptiveManagerError::Invalid("adaptive V3 collection admission panicked"),
+                if observer_succeeded {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionSucceededRecheckPanicked
+                } else if observer_called {
+                    AdaptiveCollectionV2ObserverStatus::AdmissionPanicked
+                } else {
+                    AdaptiveCollectionV2ObserverStatus::ManagerValidationPanicked
+                },
+                Some(payload),
+            )),
+        };
+        if let Some((error, observer_status, panic_payload)) = rejected {
+            return Err(AdaptiveCollectionV3Rejection {
+                error,
+                admission,
+                observer,
+                observer_status,
+                panic_payload,
+            });
+        }
+        self.collection_admission_v2 =
+            Some(collection::VersionedCollectionAdmission::V3(admission));
+        self.collection_observer_v2 = Some(collection::VersionedCollectionObserver::V3(observer));
+        Ok(())
     }
 
     /// Install an observation-only V2 owner at the actual attached root.
@@ -3150,8 +3322,9 @@ where
                 panic_payload,
             });
         }
-        self.collection_admission_v2 = Some(admission);
-        self.collection_observer_v2 = Some(observer);
+        self.collection_admission_v2 =
+            Some(collection::VersionedCollectionAdmission::V2(admission));
+        self.collection_observer_v2 = Some(collection::VersionedCollectionObserver::V2(observer));
         Ok(())
     }
 
@@ -3177,6 +3350,17 @@ where
                 "V2 collection owner mismatch",
             ));
         }
+        if !matches!(
+            self.collection_admission_v2.as_ref(),
+            Some(collection::VersionedCollectionAdmission::V2(_))
+        ) || !matches!(
+            self.collection_observer_v2.as_ref(),
+            Some(collection::VersionedCollectionObserver::V2(_))
+        ) {
+            return Err(AdaptiveManagerError::Invalid(
+                "V2 collection owner version mismatch",
+            ));
+        }
         let receipt = self.shutdown_receipt()?;
         if self.phase != ManagerPhase::Finished
             || self.collection_v2_settlement.is_none()
@@ -3185,17 +3369,94 @@ where
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }
         Ok(Some((
-            self.collection_admission_v2
+            match self
+                .collection_admission_v2
                 .take()
-                .expect("checked admission"),
-            self.collection_observer_v2
+                .expect("checked admission")
+            {
+                collection::VersionedCollectionAdmission::V2(owner) => owner,
+                #[cfg(target_os = "linux")]
+                collection::VersionedCollectionAdmission::V3(_) => {
+                    unreachable!("checked V2 admission")
+                }
+            },
+            match self
+                .collection_observer_v2
                 .take()
-                .expect("checked observer"),
+                .expect("checked observer")
+            {
+                collection::VersionedCollectionObserver::V2(owner) => owner,
+                #[cfg(target_os = "linux")]
+                collection::VersionedCollectionObserver::V3(_) => {
+                    unreachable!("checked V2 observer")
+                }
+            },
             self.collection_v2_settlement
                 .take()
                 .expect("checked settlement"),
         )))
     }
+    /// Return the original /3 owner only after the same physical fence and
+    /// attempted settlement. Teacher retirement remains a separate outcome.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    pub(crate) fn take_collection_observer_v3(
+        &mut self,
+    ) -> Result<
+        Option<(
+            RoventCollectionRootAdmissionV3,
+            AdaptiveCollectionObserverBoxV3<Q, B::Output>,
+            Result<(), AdaptiveCollectionError>,
+        )>,
+        AdaptiveManagerError,
+    > {
+        if self.collection_observer_v2.is_none() && self.collection_admission_v2.is_none() {
+            return Ok(None);
+        }
+        if !matches!(
+            self.collection_admission_v2.as_ref(),
+            Some(collection::VersionedCollectionAdmission::V3(_))
+        ) || !matches!(
+            self.collection_observer_v2.as_ref(),
+            Some(collection::VersionedCollectionObserver::V3(_))
+        ) {
+            return Err(AdaptiveManagerError::Invalid(
+                "V3 collection owner mismatch",
+            ));
+        }
+        let receipt = self.shutdown_receipt()?;
+        if self.phase != ManagerPhase::Finished
+            || self.collection_v2_settlement.is_none()
+            || !(receipt.permits_root_reuse() || receipt.permits_archive_close())
+        {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        Ok(Some((
+            match self
+                .collection_admission_v2
+                .take()
+                .expect("checked admission")
+            {
+                collection::VersionedCollectionAdmission::V3(owner) => owner,
+                collection::VersionedCollectionAdmission::V2(_) => {
+                    unreachable!("checked V3 admission")
+                }
+            },
+            match self
+                .collection_observer_v2
+                .take()
+                .expect("checked observer")
+            {
+                collection::VersionedCollectionObserver::V3(owner) => owner,
+                collection::VersionedCollectionObserver::V2(_) => {
+                    unreachable!("checked V3 observer")
+                }
+            },
+            self.collection_v2_settlement
+                .take()
+                .expect("checked settlement"),
+        )))
+    }
+
     /// 실제 수집을 요청한 caller만 root 시작 전에 설치한다. 기존 dispatch
     /// observer와 native owner 입력 observer는 별도 원 소유 경계로 유지한다.
     pub fn set_collection_observer(
@@ -3262,8 +3523,22 @@ where
     fn collection_failure_is_independent(&self) -> bool {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
-            self.collection_observer_v2.is_some()
-                && self.collection_admission_v2.is_some()
+            let matching_owner = match (
+                self.collection_observer_v2.as_ref(),
+                self.collection_admission_v2.as_ref(),
+            ) {
+                (
+                    Some(collection::VersionedCollectionObserver::V2(_)),
+                    Some(collection::VersionedCollectionAdmission::V2(_)),
+                ) => true,
+                #[cfg(target_os = "linux")]
+                (
+                    Some(collection::VersionedCollectionObserver::V3(_)),
+                    Some(collection::VersionedCollectionAdmission::V3(_)),
+                ) => true,
+                _ => false,
+            };
+            matching_owner
                 && self.collection_observer.is_none()
                 && !self.collection_v2_disable_failed
         }
@@ -4361,7 +4636,7 @@ where
                     )
                 })
                 .and_then(|(admission, verifier)| {
-                    collection::RoventCollectionNativeEventWitnessV2::new(
+                    collection::VersionedCollectionNativeEventWitness::new(
                         admission, verifier, &event,
                     )
                 })
@@ -4961,7 +5236,7 @@ where
                                                     )
                                                 })
                                                 .and_then(|verifier| {
-                                                    RoventCollectionAcceptedWitnessV2::new(
+                                                    collection::VersionedCollectionAcceptedWitness::new(
                                                         admission, verifier, proof, raw,
                                                     )
                                                 })
@@ -5319,7 +5594,7 @@ where
                                         &ticket,
                                         output.proposer_ranking_output(),
                                     )?;
-                                    RoventRootRankingAcceptanceV2::from_current_ranking(
+                                    collection::VersionedRootRankingAcceptance::from_current_ranking(
                                         &ranking, admission,
                                     )
                                 })
@@ -5563,7 +5838,7 @@ where
             self.roles[index].delivered.as_ref(),
         ) {
             let verifier = self.native.native_acceptance_verifier();
-            let observed = collection::notify_adaptive_consumed_v2(
+            let observed = collection::notify_adaptive_consumed_versioned(
                 &mut self.collection_observer_v2,
                 self.collection_admission_v2.as_ref(),
                 verifier.as_ref(),
@@ -5840,7 +6115,7 @@ where
                                     "MissingV2Admission",
                                     "V2 observer lost its original admission or native verifier",
                                 ))?;
-                            let witness = match collection::RoventCollectionDispatchWitnessV2::try_new(
+                            let witness = match collection::VersionedCollectionDispatchWitness::try_new(
                                 admission, verifier, &ticket,
                             ) {
                                 Ok(witness) => witness,
@@ -5900,7 +6175,7 @@ where
                                     v2_capture_possible = true;
                                     self.collection_v2_first_failure = Some(original.clone());
                                     collection_errors.push(original.clone());
-                                    let witness = match collection::RoventCollectionDispatchWitnessV2::try_new(
+                                    let witness = match collection::VersionedCollectionDispatchWitness::try_new(
                                         admission, verifier, &ticket,
                                     ) {
                                         Ok(witness) => witness,

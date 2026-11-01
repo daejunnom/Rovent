@@ -137,8 +137,10 @@ struct DirectNativeAssets {
     rules: String,
     public_graph: String,
     shared_pc_graph: String,
+    validator_graph: Option<String>,
     public_graph_name: Option<String>,
     shared_pc_graph_name: Option<String>,
+    validator_graph_name: Option<String>,
 }
 
 /// A complete explicit selection, not an archive-on default. The private
@@ -161,8 +163,10 @@ impl Arguments {
         let mut direct_rules = None;
         let mut direct_public = None;
         let mut direct_shared_pc = None;
+        let mut direct_validator = None;
         let mut direct_public_name = None;
         let mut direct_shared_pc_name = None;
+        let mut direct_validator_name = None;
         let mut external_r_sources = None;
         let mut retirement_sink = None;
         let mut evidence_root = None;
@@ -201,6 +205,12 @@ impl Arguments {
                 }
                 "--native-shared-pc-graph" if direct_shared_pc.is_none() => {
                     direct_shared_pc = Some(private_path(value)?)
+                }
+                "--native-validator-graph" if direct_validator.is_none() => {
+                    direct_validator = Some(private_path(value)?)
+                }
+                "--native-validator-graph-name" if direct_validator_name.is_none() => {
+                    direct_validator_name = Some(native_basename(value)?)
                 }
                 "--native-public-graph-name" if direct_public_name.is_none() => {
                     direct_public_name = Some(native_basename(value)?)
@@ -364,7 +374,10 @@ impl Arguments {
             direct_shared_pc,
         ) {
             (None, None, None, None)
-                if direct_public_name.is_none() && direct_shared_pc_name.is_none() =>
+                if direct_public_name.is_none()
+                    && direct_shared_pc_name.is_none()
+                    && direct_validator.is_none()
+                    && direct_validator_name.is_none() =>
             {
                 None
             }
@@ -374,8 +387,10 @@ impl Arguments {
                     rules,
                     public_graph,
                     shared_pc_graph,
+                    validator_graph: direct_validator,
                     public_graph_name: direct_public_name,
                     shared_pc_graph_name: direct_shared_pc_name,
+                    validator_graph_name: direct_validator_name,
                 })
             }
             _ => {
@@ -385,6 +400,14 @@ impl Arguments {
                 ));
             }
         };
+        if direct_native_assets.as_ref().is_some_and(|selection| {
+            selection.validator_graph.is_none() && selection.validator_graph_name.is_some()
+        }) {
+            return Err(error(
+                "Arguments",
+                "validator graph name requires its graph path",
+            ));
+        }
         if native_assets.is_some() == direct_native_assets.is_some() {
             return Err(error(
                 "Arguments",
@@ -683,9 +706,15 @@ struct GraphWire {
 }
 impl SelectionWire {
     fn parse(bytes: &[u8]) -> Result<RoventNativeAssetSelection, RoventLaunchError> {
+        Self::parse_with_graph_count(bytes, 2)
+    }
+    fn parse_with_graph_count(
+        bytes: &[u8],
+        graph_count: usize,
+    ) -> Result<RoventNativeAssetSelection, RoventLaunchError> {
         let wire: Self = serde_json::from_slice(bytes)
             .map_err(|_| error("Assets", "strict native asset selection JSON"))?;
-        if wire.domain != SELECTION_DOMAIN || wire.graphs.len() != 2 {
+        if wire.domain != SELECTION_DOMAIN || wire.graphs.len() != graph_count {
             return Err(error(
                 "Assets",
                 "native selection domain or graph cardinality",
