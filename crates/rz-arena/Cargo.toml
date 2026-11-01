@@ -15,6 +15,8 @@ pals-collection = ["dep:rz-uci"]
 pals-collection-onnx = ["pals-collection", "rz-uci/onnx-cpu", "rz-uci/pals-adaptive", "rz-experiments/pals-content-admission"]
 native-cuda = ["dep:rz-uci", "rz-uci/onnx-cuda", "rz-experiments/pals-content-admission"]
 native-validation-diagnostics = ["rz-uci/pals-adaptive-diagnostics", "rz-uci/native-validation-diagnostics"]
+# Explicit opt-in; the native observer still requires lifecycle diagnostics.
+archive-origin-diagnostics = ["rz-uci/archive-origin-diagnostics"]
 native-cuda-batch = ["native-cuda", "rz-uci/experimental-batch", "rz-eval/experimental-batch"]
 pals-followup-cuda-warm = ["native-cuda", "rz-uci/experimental-io-binding", "rz-eval/experimental-io-binding"]
 

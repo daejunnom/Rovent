@@ -74,6 +74,8 @@ onnx-cuda = ["onnx-cpu"]
 pals-adaptive = ["dep:rz-experiments", "rz-experiments/pals-content-admission", "search-work-receipts"]
 pals-adaptive-diagnostics = ["pals-adaptive", "onnx-cpu"]
 native-validation-diagnostics = ["pals-adaptive-diagnostics", "rz-eval/native-validation-diagnostics", "rz-search/nnuec-scalar-diagnostics"]
+# Optional bounded archive-to-submitted-view diagnostics; not a receipt.
+archive-origin-diagnostics = ["native-validation-diagnostics", "rz-search/archive-origin-diagnostics"]
 
 [dependencies]
 rz-search.workspace = true
