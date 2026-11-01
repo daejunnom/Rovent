@@ -22,6 +22,76 @@ pub const ROVENT_UTILITY_COMPARISON_COST_SCOPE: &str = "cohort_route_with_bounde
 pub const MAX_ROVENT_UTILITY_COHORT_BYTES: usize = 64 << 10;
 pub const MAX_ROVENT_UTILITY_COHORT_WINDOW_NS: u64 = 86_400_000_000_000;
 
+/// Independent diagnostic registration. It does not change /2 canonical
+/// bytes or grant evidence/publication authority.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventCpu7CaptureRegistrationV1 {
+    pub domain: String,
+    pub cohort_canonical_sha256: String,
+    pub max_observations: usize,
+    pub max_line_chunks: usize,
+    pub max_states: usize,
+    pub max_owned_bytes: usize,
+    pub max_retained_history_bytes: usize,
+    pub max_duration_ns: u64,
+}
+impl RoventCpu7CaptureRegistrationV1 {
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        require(
+            input.len() <= MAX_ROVENT_UTILITY_COHORT_BYTES,
+            "capture registration exceeds 64 KiB",
+        )?;
+        let value: Self = decode_json(input)?;
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        require(
+            self.domain == "rz-rovent-cpu7-capture-registration/1",
+            "invalid capture registration domain",
+        )?;
+        require(
+            self.cohort_canonical_sha256.len() == 64
+                && self
+                    .cohort_canonical_sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "invalid cohort digest",
+        )?;
+        require(
+            (7..=64).contains(&self.max_observations)
+                && self.max_line_chunks <= 4096
+                && (1..=4096).contains(&self.max_states),
+            "capture record limits invalid",
+        )?;
+        require(
+            (1..=16 * 1024 * 1024).contains(&self.max_owned_bytes)
+                && (1..=64 * 1024 * 1024).contains(&self.max_retained_history_bytes),
+            "capture memory limits invalid",
+        )?;
+        require(
+            (1..=1_000_000_000).contains(&self.max_duration_ns),
+            "capture duration invalid",
+        )
+    }
+    pub fn validate_cohort(
+        &self,
+        cohort: &RoventUtilityInterventionCohortV2,
+    ) -> Result<(), ManifestError> {
+        self.validate()?;
+        require(
+            cohort.policy == RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
+                && cohort.input.usage == RoventUtilityCohortUsage::ValidationOnly,
+            "capture requires validation-only CPU7",
+        )?;
+        require(
+            self.cohort_canonical_sha256 == cohort.canonical_sha256()?,
+            "capture cohort digest differs",
+        )
+    }
+}
+
 /// This first opt-in profile is CPU only. It does not enable a GPU path or
 /// alter the meaning of the existing four-mode execution declaration.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

@@ -9,6 +9,24 @@ use rz_search::pals::engine::adaptive_port::utility_route::{
     UtilityRouteRecipient,
 };
 
+impl rz_search::pals::review_context::cpu7_capture::CaptureScope
+    for crate::rovent_root_admission::RoventRootAdmission
+{
+    fn check_scope(
+        &self,
+    ) -> Result<(), rz_search::pals::review_context::cpu7_capture::CaptureUnavailable> {
+        use rz_search::pals::review_context::cpu7_capture::CaptureUnavailable;
+        match self.original_context().try_accepts() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CaptureUnavailable::ScopeRevoked),
+            Err(error) if error.code == rz_contracts::ErrorCode::ResourceExhausted => {
+                Err(CaptureUnavailable::ScopeBusy)
+            }
+            Err(_) => Err(CaptureUnavailable::ScopeUnavailable),
+        }
+    }
+}
+
 pub trait UtilityInterventionSourceObserver<Q>: Send {
     fn source(
         &mut self,
@@ -143,6 +161,22 @@ where
             Box<dyn UtilityInterventionSourceObserver<Q>>,
         ),
     > {
+        self.set_utility_intervention_source_observer_with_capture(profile, None, observer)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn set_utility_intervention_source_observer_with_capture(
+        &mut self,
+        profile: &rz_experiments::rovent_utility_cohort::RoventUtilityInterventionCohortV2,
+        capture: Option<&rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistrationV1>,
+        observer: Box<dyn UtilityInterventionSourceObserver<Q>>,
+    ) -> Result<
+        (),
+        (
+            AdaptiveManagerError,
+            Box<dyn UtilityInterventionSourceObserver<Q>>,
+        ),
+    > {
         let cpu7 = matches!(
             profile.policy,
             rz_experiments::rovent_utility_cohort::RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
@@ -219,42 +253,50 @@ where
             ))
         })();
         match checked {
-            Ok((profile, prelude_cutoff, maximum_cleanup)) => {
+            Ok((profile_digest, prelude_cutoff, maximum_cleanup)) => {
                 if cpu7 {
                     if let Err(error) = self.driver.enable_cohort_cpu7() {
                         return Err((error, observer));
                     }
                     if let Some(admission) = self.collection_admission.as_ref() {
                         use rz_search::pals::review_context::cpu7_capture::{
-                            CaptureUnavailable, RootCaptureGrant,
+                            CaptureScope, RootCaptureGrant,
                         };
                         let root = Arc::clone(admission.root_admission());
                         let original = root.original_context();
                         let cancel = Arc::clone(&original.control.cancellation);
                         let root_deadline = original.control.deadline;
-                        let scope = Arc::new(move || match root.original_context().try_accepts() {
-                            Ok(true) => Ok(()),
-                            Ok(false) => Err(CaptureUnavailable::ScopeRevoked),
-                            Err(error)
-                                if error.code == rz_contracts::ErrorCode::ResourceExhausted =>
-                            {
-                                Err(CaptureUnavailable::ScopeBusy)
-                            }
-                            Err(_) => Err(CaptureUnavailable::ScopeUnavailable),
-                        });
+                        // Reuse the admission's existing Arc allocation; the
+                        // missing-registration path allocates no diagnostic Arc.
+                        let scope: Arc<dyn CaptureScope> = root;
                         // Existing /2 has no registered capture resource budget.
                         // Preserve normal search and report this view unavailable.
-                        let grant = RootCaptureGrant::unverified_diagnostic(
+                        let mut grant = RootCaptureGrant::unverified_diagnostic(
                             cancel,
                             root_deadline,
                             prelude_cutoff.min(root_deadline),
                             scope,
                         );
+                        if let Some(registration) =
+                            capture.filter(|value| value.validate_cohort(profile).is_ok())
+                        {
+                            grant = grant.with_diagnostic_limits(
+                                rz_search::pals::review_context::cpu7_capture::CaptureLimits {
+                                    max_observations: registration.max_observations,
+                                    max_line_chunks: registration.max_line_chunks,
+                                    max_states: registration.max_states,
+                                    max_owned_bytes: registration.max_owned_bytes,
+                                    max_retained_history_bytes: registration
+                                        .max_retained_history_bytes,
+                                },
+                                Duration::from_nanos(registration.max_duration_ns),
+                            );
+                        }
                         self.driver.install_cpu7_capture_grant(grant);
                     }
                 }
                 self.utility_intervention = Some(UtilityInterventionState::awaiting_source(
-                    profile,
+                    profile_digest,
                     prelude_cutoff,
                     maximum_cleanup,
                     observer,

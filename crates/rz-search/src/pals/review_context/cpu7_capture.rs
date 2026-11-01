@@ -33,31 +33,46 @@ pub struct CaptureControl<'a> {
 /// Opaque diagnostic control carrier. Construction alone is not proof of an
 /// original root: the Search port also compares its preparing-handoff owner,
 /// and the UCI caller must supply the original admission's scope check.
+pub trait CaptureScope: Send + Sync {
+    fn check_scope(&self) -> Result<(), CaptureUnavailable>;
+}
 pub struct RootCaptureGrant {
     canceled: Arc<AtomicBool>,
     root_deadline: Instant,
     capture_deadline: Instant,
-    scope_check: Arc<dyn Fn() -> Result<(), CaptureUnavailable> + Send + Sync>,
+    scope_check: Arc<dyn CaptureScope>,
+    registered: Option<(CaptureLimits, std::time::Duration, Arc<AtomicBool>)>,
 }
 impl RootCaptureGrant {
     pub fn unverified_diagnostic(
         canceled: Arc<AtomicBool>,
         root_deadline: Instant,
         capture_deadline: Instant,
-        scope_check: Arc<dyn Fn() -> Result<(), CaptureUnavailable> + Send + Sync>,
+        scope_check: Arc<dyn CaptureScope>,
     ) -> Self {
         Self {
             canceled,
             root_deadline,
             capture_deadline,
             scope_check,
+            registered: None,
         }
+    }
+    /// Diagnostic caps are checked by the UCI owner against its independent
+    /// registration. This method itself does not confer provenance authority.
+    pub fn with_diagnostic_limits(
+        mut self,
+        limits: CaptureLimits,
+        duration: std::time::Duration,
+    ) -> Self {
+        self.registered = Some((limits, duration, Arc::new(AtomicBool::new(false))));
+        self
     }
     pub(crate) fn control<'a>(
         &'a self,
         original_cancel: Option<&Arc<AtomicBool>>,
         original_deadline: Instant,
-    ) -> Result<CaptureControl<'a>, CaptureUnavailable> {
+    ) -> Result<CapturePermit<'a>, CaptureUnavailable> {
         let original = original_cancel.ok_or(CaptureUnavailable::MissingOriginalControl)?;
         if !Arc::ptr_eq(original, &self.canceled)
             || self.root_deadline != original_deadline
@@ -71,10 +86,39 @@ impl RootCaptureGrant {
         if Instant::now() >= self.capture_deadline {
             return Err(CaptureUnavailable::Deadline);
         }
-        (self.scope_check)()?;
-        // The existing cohort profile has no registered capture budget. Do
-        // not accept caller-provided numbers as an invented registration.
-        Err(CaptureUnavailable::MissingRegisteredLimits)
+        self.scope_check.check_scope()?;
+        let (limits, duration, occupied) = self
+            .registered
+            .as_ref()
+            .ok_or(CaptureUnavailable::MissingRegisteredLimits)?;
+        let deadline = Instant::now()
+            .checked_add(*duration)
+            .ok_or(CaptureUnavailable::InvalidLimits)?
+            .min(self.capture_deadline);
+        occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CaptureUnavailable::CaptureBusy)?;
+        Ok(CapturePermit {
+            control: CaptureControl {
+                deadline,
+                canceled: &self.canceled,
+                limits: *limits,
+            },
+            scope_check: self.scope_check.as_ref(),
+            reservation: CaptureReservation(Arc::clone(occupied)),
+        })
+    }
+}
+pub(crate) struct CapturePermit<'a> {
+    control: CaptureControl<'a>,
+    scope_check: &'a dyn CaptureScope,
+    reservation: CaptureReservation,
+}
+#[derive(Debug)]
+struct CaptureReservation(Arc<AtomicBool>);
+impl Drop for CaptureReservation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +129,7 @@ pub enum CaptureUnavailable {
     ScopeBusy,
     ScopeRevoked,
     ScopeUnavailable,
+    CaptureBusy,
     InvalidLimits,
     Canceled,
     Deadline,
@@ -108,6 +153,7 @@ pub struct SelectedCpuRawCapture {
     lines: Vec<(LineId, LineChunk)>,
     requested_owned_bytes: usize,
     retained_history_bytes: usize,
+    _reservation: Option<CaptureReservation>,
 }
 impl SelectedCpuRawCapture {
     pub fn original_bundle(&self) -> &CohortCpu7OriginalBundle {
@@ -137,10 +183,20 @@ struct BudgetWriter<'a> {
     bytes: Vec<u8>,
     charged: usize,
     control: &'a CaptureControl<'a>,
+    scope_check: Option<&'a dyn CaptureScope>,
     error: Option<CaptureUnavailable>,
 }
 impl BudgetWriter<'_> {
     fn check(&self) -> Result<(), CaptureUnavailable> {
+        if self.control.canceled.load(Ordering::Acquire) {
+            return Err(CaptureUnavailable::Canceled);
+        }
+        if Instant::now() >= self.control.deadline {
+            return Err(CaptureUnavailable::Deadline);
+        }
+        if let Some(check) = self.scope_check {
+            check.check_scope()?;
+        }
         if self.control.canceled.load(Ordering::Acquire) {
             return Err(CaptureUnavailable::Canceled);
         }
@@ -563,6 +619,35 @@ pub(super) fn capture_selected_cpu_raw(
     stores: &PalsStores,
     control: Option<&CaptureControl<'_>>,
 ) -> Result<SelectedCpuRawCapture, CaptureUnavailable> {
+    capture_selected_cpu_raw_inner(view, stores, control, None, None)
+}
+
+pub(super) fn capture_selected_cpu_raw_permitted(
+    view: &ReviewView,
+    stores: &PalsStores,
+    permit: CapturePermit<'_>,
+) -> Result<SelectedCpuRawCapture, CaptureUnavailable> {
+    let CapturePermit {
+        control,
+        scope_check,
+        reservation,
+    } = permit;
+    capture_selected_cpu_raw_inner(
+        view,
+        stores,
+        Some(&control),
+        Some(scope_check),
+        Some(reservation),
+    )
+}
+
+fn capture_selected_cpu_raw_inner<'a>(
+    view: &ReviewView,
+    stores: &PalsStores,
+    control: Option<&'a CaptureControl<'a>>,
+    scope_check: Option<&'a dyn CaptureScope>,
+    reservation: Option<CaptureReservation>,
+) -> Result<SelectedCpuRawCapture, CaptureUnavailable> {
     let control = control.ok_or(CaptureUnavailable::MissingOriginalControl)?;
     let limits = control.limits;
     if !(7..=64).contains(&limits.max_observations)
@@ -586,6 +671,7 @@ pub(super) fn capture_selected_cpu_raw(
         bytes: Vec::new(),
         charged: 0,
         control,
+        scope_check,
         error: None,
     };
     out.check()?;
@@ -746,5 +832,6 @@ pub(super) fn capture_selected_cpu_raw(
         lines,
         requested_owned_bytes: out.charged,
         retained_history_bytes: history_charge,
+        _reservation: reservation,
     })
 }

@@ -80,6 +80,9 @@ pub struct RoventUtilityInterventionLaunchPlan {
     /// 원 수집 계보/teacher source/R capture 한도와 별도 output root.
     pub collection_plan: RoventPublicationFile,
     pub cohort_profile: RoventPublicationFile,
+    /// Separate optional diagnostic input; absent in the original launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu7_capture_registration: Option<RoventPublicationFile>,
     /// 각 새 Product의 명시 fresh cgroup/evidence 경로. 자동 이름 추정은 없다.
     pub trial_resource_plans: Vec<RoventPublicationFile>,
     pub process_epoch_base: u64,
@@ -164,6 +167,9 @@ impl RoventUtilityInterventionLaunchFailure {
 
 struct CohortCaller {
     profile: RoventUtilityInterventionCohortV2,
+    cpu7_capture_registration:
+        Option<rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistrationV1>,
+    cpu7_capture_registration_status: Option<(&'static str, RoventPublicationFile)>,
     plan: RoventCollectionLaunchPlan,
     manifest: RoventCorpusManifestV2,
     r_manifest: RoventRReadoutManifest,
@@ -341,13 +347,17 @@ impl CohortCaller {
             let prefix = super::cohort_driver::bounded_error(error);
             json!({"utf8_prefix":prefix,"utf8_bytes":error.len(),"truncated":prefix.len()!=error.len()})
         });
-        let raw = serde_json::to_vec(&json!({
+        let mut diagnostic = json!({
             "schema":"rz-rovent-utility-intervention-diagnostics/1",
             "scope":"bounded_original_finite_observations_not_training_or_physical_proof",
             "cohort_profile_raw_sha256":hex(Digest(Sha256::digest(&self.profile_bytes).into())),
             "original_launch_error":original_launch_error,"trials":trials,
             "training_executed":false,"physical_completion_attested":false,"performance_evidence":false
-        })).map_err(|error|invalid(error.to_string()))?;
+        });
+        if let Some((status, pin)) = &self.cpu7_capture_registration_status {
+            diagnostic["cpu7_capture_registration"] = json!({"status":status,"input":pin});
+        }
+        let raw = serde_json::to_vec(&diagnostic).map_err(|error| invalid(error.to_string()))?;
         check(
             raw.len() <= 4 << 20,
             "bounded finite diagnostic sidecar exceeded",
@@ -665,6 +675,22 @@ pub fn run_rovent_utility_intervention(
         let profile = RoventUtilityInterventionCohortV2::from_json(
             std::str::from_utf8(&profile_bytes).map_err(|_| invalid("cohort profile UTF8"))?,
         )?;
+        // This optional diagnostic must never block a valid original cohort.
+        // Unreadable, malformed or mismatched registration stays unavailable.
+        let (cpu7_capture_registration, cpu7_capture_registration_status) = match request.cpu7_capture_registration.as_ref() {
+            None => (None, None),
+            Some(pin) => {
+                let (registration, status) = match read_pin(input, pin, 64 << 10) {
+                    Err(_) => (None, "input_unavailable"),
+                    Ok(bytes) => match std::str::from_utf8(&bytes).ok().and_then(|text| rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistrationV1::from_json(text).ok()) {
+                        None => (None, "invalid_registration"),
+                        Some(value) if value.validate_cohort(&profile).is_err() => (None, "cohort_mismatch"),
+                        Some(value) => (Some(value), "registered"),
+                    }
+                };
+                (registration, Some((status, pin.clone())))
+            }
+        };
         check(request.target_record == profile.target_record,
             "intervention launch target differs from original /2 profile")?;
         let profile_window = profile.total_window_ns()?;
@@ -752,6 +778,8 @@ pub fn run_rovent_utility_intervention(
         let writer = RoventUtilityInterventionTrialWriter::new(directory.try_clone().map_err(io)?);
         Ok(CohortCaller {
             profile,
+            cpu7_capture_registration,
+            cpu7_capture_registration_status,
             profile_bytes,
             plan,
             manifest,
@@ -946,13 +974,14 @@ fn run_trial(
     let resource = Arc::clone(trial);
     let assemble = Arc::clone(shared);
     let assembled_trial = Arc::clone(trial);
-    let (teachers, profile, manifest, plan, limits, sequence, position) = {
+    let (teachers, profile, cpu7_capture_registration, manifest, plan, limits, sequence, position) = {
         let state = shared
             .lock()
             .map_err(|_| invalid("cohort owner poisoned"))?;
         (
             state.plan.teacher_sources.clone(),
             state.profile.clone(),
+            state.cpu7_capture_registration.clone(),
             state.r_manifest.clone(),
             state.plan.clone(),
             state.limits,
@@ -1088,7 +1117,11 @@ fn run_trial(
                         shared: Arc::downgrade(&ready_owner),
                         loaded: Arc::clone(source),
                     });
-                    match manager.set_utility_intervention_source_observer(&profile, observer) {
+                    match manager.set_utility_intervention_source_observer_with_capture(
+                        &profile,
+                        cpu7_capture_registration.as_ref(),
+                        observer,
+                    ) {
                         Ok(()) => Ok(()),
                         Err((error, observer)) => {
                             if let Ok(mut trial) = admitted.lock() {

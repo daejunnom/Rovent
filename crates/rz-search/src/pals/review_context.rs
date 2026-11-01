@@ -258,10 +258,10 @@ impl ReviewView {
     pub(in crate::pals) fn capture_cpu7_on_original_view(
         &mut self,
         stores: &PalsStores,
-        control: Result<cpu7_capture::CaptureControl<'_>, cpu7_capture::CaptureUnavailable>,
+        control: Result<cpu7_capture::CapturePermit<'_>, cpu7_capture::CaptureUnavailable>,
     ) {
         self.cpu7_raw_capture = Some(control.and_then(|control| {
-            cpu7_capture::capture_selected_cpu_raw(self, stores, Some(&control))
+            cpu7_capture::capture_selected_cpu_raw_permitted(self, stores, control)
         }));
     }
     pub fn sequence(&self) -> u64 {
