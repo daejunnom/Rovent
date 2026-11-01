@@ -458,6 +458,25 @@ pub struct ProcessOutput {
     pub pending_child: Option<std::process::Child>,
 }
 
+/// Original supervisor-owned child slot. For guarded launches the child is
+/// installed here immediately after spawn and borrowed by the supervisor;
+/// an error or unwind before `ProcessOutput` cannot drop that handle.
+#[derive(Default)]
+pub(crate) struct SpawnCustody {
+    child: Option<std::process::Child>,
+    pub(crate) pending: AtomicBool,
+    pub(crate) last_spawn_pid: Option<u32>,
+}
+
+impl SpawnCustody {
+    pub(crate) fn child(&self) -> Option<&std::process::Child> {
+        self.child.as_ref()
+    }
+    pub(crate) fn take_child(&mut self) -> Option<std::process::Child> {
+        self.child.take()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArtifactWatch {
     /// Supported files are direct children of the pinned working directory.
@@ -803,6 +822,30 @@ pub(crate) fn supervise_tree_observed(
     watch: &OwnedArtifactTreeWatch,
     stdout_observer: Option<StdoutObserver<'_>>,
 ) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed_with_spawn(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        None,
+    )
+}
+
+/// `spawned` is set only after the original child has actually been created.
+/// It is a lifetime observation, never evidence of GPU execution or completion.
+pub(crate) fn supervise_tree_observed_with_spawn(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&mut SpawnCustody>,
+) -> Result<ProcessOutput, ArenaError> {
     limits.validate()?;
     watch.validate()?;
     #[cfg(target_os = "linux")]
@@ -827,12 +870,15 @@ pub(crate) fn supervise_tree_observed(
             cancel,
             Some(linux::ArtifactObservation::Tree(watch)),
             stdout_observer,
-            linux::InvocationIo::default(),
+            linux::InvocationIo {
+                spawned,
+                ..Default::default()
+            },
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel, stdout_observer);
+        let _ = (program, args, directory, cancel, stdout_observer, spawned);
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
         ))
@@ -849,6 +895,23 @@ pub fn supervise_protocol_in_directory(
     cancel: Option<&AtomicBool>,
     watch: &OwnedArtifactTreeWatch,
     commands: &[u8],
+) -> Result<ProcessOutput, ArenaError> {
+    supervise_protocol_in_directory_with_spawn(
+        program, args, directory, limits, cancel, watch, commands, None,
+    )
+}
+
+/// As above, but lets the original owner observe a successful spawn even if
+/// subsequent process supervision fails before a `ProcessOutput` is returned.
+pub(crate) fn supervise_protocol_in_directory_with_spawn(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    commands: &[u8],
+    spawned: Option<&mut SpawnCustody>,
 ) -> Result<ProcessOutput, ArenaError> {
     limits.validate()?;
     watch.validate()?;
@@ -881,13 +944,14 @@ pub fn supervise_protocol_in_directory(
             None,
             linux::InvocationIo {
                 commands: Some(commands),
+                spawned,
                 ..Default::default()
             },
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel, commands);
+        let _ = (program, args, directory, cancel, commands, spawned);
         Err(ArenaError::Invalid(
             "native UCI preflight requires Linux".into(),
         ))
@@ -1117,6 +1181,7 @@ fn supervise_original_input(
                 observation: Some(&mut observation),
                 verify_loaded,
                 numerical_environment,
+                spawned: None,
             },
         )?;
         let returned = Instant::now();
@@ -1174,6 +1239,7 @@ mod linux {
         pub observation: Option<&'b mut OriginalProcessObservation>,
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
         pub numerical_environment: Option<OriginalNumericalEnvironment>,
+        pub spawned: Option<&'v mut SpawnCustody>,
     }
 
     #[derive(Clone, Copy)]
@@ -1235,7 +1301,15 @@ mod linux {
             mut observation,
             mut verify_loaded,
             numerical_environment,
+            spawned,
         } = io;
+        let mut local_custody = SpawnCustody::default();
+        let custody = spawned.unwrap_or(&mut local_custody);
+        if custody.child.is_some() || custody.pending.load(Ordering::Acquire) {
+            return Err(ArenaError::Invalid(
+                "process original child custody is still pending".into(),
+            ));
+        }
         if let Some(window) = original {
             window.check_before_spawn(limits)?;
         }
@@ -1263,7 +1337,7 @@ mod linux {
             .ok_or_else(|| ArenaError::Budget("process monotonic deadline overflow".into()))?;
         let executable = format!("/proc/self/fd/{}", program.as_raw_fd());
         let pinned_cwd = format!("/proc/self/fd/{}", cwd_file.as_raw_fd());
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .args(args)
             .current_dir(pinned_cwd)
             .env_clear()
@@ -1286,7 +1360,21 @@ mod linux {
             .process_group(0)
             .spawn()
             .map_err(|error| ArenaError::Io(format!("process.spawn:{:?}", error.kind())))?;
-        let pid = child.id();
+        custody.child = Some(child);
+        custody.pending.store(true, Ordering::Release);
+        let (pid, mut stdin, mut stdout, mut stderr) = {
+            let child = custody
+                .child
+                .as_mut()
+                .expect("just installed original child");
+            (
+                child.id(),
+                child.stdin.take(),
+                child.stdout.take(),
+                child.stderr.take(),
+            )
+        };
+        custody.last_spawn_pid = Some(pid);
         crate::emit_native_phase("runner_spawned");
         let group = Pid::from_raw(
             i32::try_from(pid).map_err(|_| ArenaError::Io("process.pid_out_of_range".into()))?,
@@ -1310,10 +1398,7 @@ mod linux {
             artifact_limit_enforcement: watch.map(ArtifactObservation::enforcement),
             errors: Vec::new(),
         };
-        let mut stdin = child.stdin.take();
         let mut input_offset = 0;
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
         let pipe_setup = stdout
             .as_ref()
             .ok_or(Errno::EBADF)
@@ -1624,8 +1709,11 @@ mod linux {
                 stop = Some(ProcessStop::IoFailure);
             }
         }
-        let pending_child = finish_child(
-            child,
+        let retain_child = finish_child_in_place(
+            custody
+                .child
+                .as_mut()
+                .expect("original child remains in custody"),
             &mut receipt,
             &mut stop,
             leader_done,
@@ -1638,7 +1726,7 @@ mod linux {
             cleanup_started,
             cleanup_finished,
             ownership_lost,
-            pending_child.is_some(),
+            retain_child,
         );
         receipt.stop = stop.unwrap_or(ProcessStop::Exited);
         receipt.elapsed_ns = u64::try_from(started.elapsed().as_nanos())
@@ -1654,6 +1742,13 @@ mod linux {
             o.ownership_lost = ownership_lost;
             o.loaded_image_progress = loaded_image_progress;
         }
+        // This is the only transfer from the original supervisor slot to its
+        // output. All preceding errors and unwinds leave the Child in custody.
+        let child = custody
+            .child
+            .take()
+            .expect("original child remains in custody");
+        let pending_child = retain_child.then_some(child);
         Ok(ProcessOutput {
             receipt,
             stdout: out,
@@ -1707,6 +1802,7 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
     fn finish_child(
         mut child: std::process::Child,
         receipt: &mut ProcessReceipt,
@@ -1715,6 +1811,25 @@ mod linux {
         ownership_lost: bool,
         preserve_unverified: bool,
     ) -> Option<std::process::Child> {
+        finish_child_in_place(
+            &mut child,
+            receipt,
+            stop,
+            leader_done,
+            ownership_lost,
+            preserve_unverified,
+        )
+        .then_some(child)
+    }
+
+    fn finish_child_in_place(
+        child: &mut std::process::Child,
+        receipt: &mut ProcessReceipt,
+        stop: &mut Option<ProcessStop>,
+        leader_done: bool,
+        ownership_lost: bool,
+        preserve_unverified: bool,
+    ) -> bool {
         if preserve_unverified && ownership_lost {
             // Preserve the original handle and evidence, not numeric PID
             // authority: a foreign/automatic reaper may already have freed it.
@@ -1739,7 +1854,7 @@ mod linux {
                         receipt.group_cleanup = CleanupStatus::Unverified;
                         *stop = Some(ProcessStop::IoFailure);
                         evidence(receipt, "process.ownership_lost");
-                        return Some(child);
+                        return true;
                     }
                 }
             }
@@ -1748,7 +1863,7 @@ mod linux {
             // not a claim that a foreign reaper left the child unreaped.
             evidence(receipt, "process.leader_unreaped");
         }
-        retain_child.then_some(child)
+        retain_child
     }
 
     fn loaded_image_observation_pending(code: &str) -> bool {
@@ -2383,6 +2498,79 @@ mod linux {
                 max_output_bytes: 256 * 1024,
                 max_child_processes: 1,
             }
+        }
+
+        #[test]
+        fn original_owner_observes_spawn_only_after_real_child_creation() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/cat").unwrap();
+            let watch = original_watch();
+            let mut spawned = SpawnCustody::default();
+            let cancel = AtomicBool::new(true);
+            let before = crate::process::supervise_tree_observed_with_spawn(
+                &program,
+                &[],
+                &cwd,
+                original_limits(),
+                Some(&cancel),
+                &watch,
+                None,
+                Some(&mut spawned),
+            );
+            assert!(before.is_err());
+            assert!(!spawned.pending.load(Ordering::Acquire));
+            assert!(spawned.child().is_none());
+
+            cancel.store(false, Ordering::Release);
+            let result = crate::process::supervise_tree_observed_with_spawn(
+                &program,
+                &[],
+                &cwd,
+                original_limits(),
+                Some(&cancel),
+                &watch,
+                None,
+                Some(&mut spawned),
+            )
+            .unwrap();
+            assert!(spawned.pending.load(Ordering::Acquire));
+            assert_eq!(spawned.last_spawn_pid, Some(result.receipt.pid));
+            assert!(spawned.child().is_none());
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(result.pending_child.is_none());
+        }
+
+        #[test]
+        fn guarded_spawn_unwind_keeps_the_original_child_handle() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/echo").unwrap();
+            let watch = original_watch();
+            let mut custody = SpawnCustody::default();
+            let mut observer = |_: &[u8]| panic!("test observer interrupted supervisor");
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = crate::process::supervise_tree_observed_with_spawn(
+                    &program,
+                    &[OsString::from("probe")],
+                    &cwd,
+                    original_limits(),
+                    None,
+                    &watch,
+                    Some(&mut observer),
+                    Some(&mut custody),
+                );
+            }));
+            assert!(interrupted.is_err());
+            assert!(custody.pending.load(Ordering::Acquire));
+            let mut child = custody
+                .take_child()
+                .expect("original child must remain owned");
+            assert_eq!(custody.last_spawn_pid, Some(child.id()));
+            // This test starts only /bin/echo, with no descendants. Reap this
+            // exact Child; never signal or wait using a numeric PID.
+            let _ = child.kill();
+            child.wait().expect("test-owned child must be reaped");
         }
 
         struct OriginalTestDirectory(std::path::PathBuf);

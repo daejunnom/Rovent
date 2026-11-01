@@ -12,7 +12,7 @@ use std::{
     fmt,
     sync::{
         Mutex, TryLockError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -118,6 +118,42 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     }
     fn expected_provider_sessions(&self) -> usize {
         4
+    }
+    /// Opt-in only: this provider can launch work whose physical completion
+    /// cannot be inferred from OS process-group cleanup. Historical providers
+    /// retain their original behavior until they explicitly implement this.
+    fn requires_physical_lifetime_guard(&self) -> bool {
+        false
+    }
+    /// Verify the actual supervisor-owned preflight child has not created a
+    /// GPU session. An argument or a child-reported flag alone is insufficient.
+    #[cfg(target_os = "linux")]
+    fn verify_preflight_no_gpu(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+        _probe: NativePreflightProbe,
+        _process: &ProcessOutput,
+        _runtime_directory: &cap_std::fs::Dir,
+        _inputs: &NativeProviderInputContext<'_>,
+    ) -> Result<(), ArenaError> {
+        Err(ArenaError::Invalid(
+            "guarded preflight GPU lifetime is unknown".into(),
+        ))
+    }
+    /// Independently verify physical completion from the original supervised
+    /// process, role-bound sessions and pinned inputs. This must not depend on
+    /// unrelated PGN, logging or model-output acceptance succeeding.
+    #[cfg(target_os = "linux")]
+    fn verify_pair_physical_completion(
+        &self,
+        _process: &ProcessOutput,
+        _baseline_runtime: &cap_std::fs::Dir,
+        _candidate_runtime: &cap_std::fs::Dir,
+        _inputs: &NativeProviderInputContext<'_>,
+    ) -> Result<(), ArenaError> {
+        Err(ArenaError::Invalid(
+            "guarded pair GPU lifetime is unknown".into(),
+        ))
     }
     fn uses_provider_records(
         &self,
@@ -250,6 +286,12 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePreflightProbe {
+    Identification,
+    Readiness,
+}
 impl NativeProviderDeclaration for rz_experiments::LockedIntegrationPairSpecV1 {
     type Audit = NativeProviderSessionAudit;
     fn scope(&self) -> &'static str {
@@ -303,6 +345,8 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub snapshot_cache_hints: Vec<SnapshotCacheHint>,
     pub artifacts: Vec<rz_experiments::ArtifactRef>,
     pub provider_sessions: Vec<A>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_lifetime_error: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub external_preflight: Vec<crate::ExternalUciPreflight>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -391,28 +435,486 @@ struct NativeRunBundle<S: NativeProviderDeclaration> {
     receipt: Option<NativePairReceipt<S::Audit>>,
     receipt_artifact: Option<rz_experiments::ArtifactRef>,
     original_error: Option<String>,
+    guarded_preflight_failures: Vec<String>,
+    probe_evidence: Option<GuardedProbeReservation>,
+    /// Set by the original process owner immediately after actual spawn and
+    /// cleared only by the matching physical/no-GPU evidence verifier.
+    spawn_custody: crate::process::SpawnCustody,
+    physical_guard_required: bool,
 }
+
+/// Original probe output retained after a storage failure.  Taking this value
+/// transfers evidence custody to the caller; it is not a GPU reservation.
+pub struct GuardedPreflightEvidence {
+    pub run_id: u64,
+    pub input_sha256: String,
+    pub role: &'static str,
+    pub probe: &'static str,
+    pub declared_output_limit_bytes: u64,
+    pub observed_retained_output_bytes: u64,
+    pub interrupted_by_unwind: bool,
+    pub original_error: Option<String>,
+    pub failures: Vec<String>,
+    pub process: ProcessOutput,
+    /// Original generic pair receipt, if one was constructed before failure.
+    pub pair_receipt: Option<Box<dyn std::any::Any + Send>>,
+}
+impl fmt::Debug for GuardedPreflightEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuardedPreflightEvidence")
+            .field("run_id", &self.run_id)
+            .field("role", &self.role)
+            .field("probe", &self.probe)
+            .field("pair_receipt_retained", &self.pair_receipt.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+enum GuardedEvidenceSlot {
+    Retained(GuardedPreflightEvidence),
+}
+struct GuardedEvidenceEntry {
+    run_id: u64,
+    role: &'static str,
+    probe: &'static str,
+    retained_payload_bytes: u64,
+    slot: GuardedEvidenceSlot,
+}
+/// Bounded process-local evidence capacity; this is not a GPU or VRAM limit.
+const GUARDED_EVIDENCE_CAPACITY: usize = 16;
+const GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+static GUARDED_EVIDENCE_SLOTS: Mutex<Vec<GuardedEvidenceEntry>> = Mutex::new(Vec::new());
+static GUARDED_EVIDENCE_NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+static GUARDED_EVIDENCE_FALLBACK_LOST: AtomicU64 = AtomicU64::new(0);
+static GUARDED_EVIDENCE_LOSSES: Mutex<[Option<GuardedEvidenceLoss>; GUARDED_EVIDENCE_CAPACITY]> =
+    Mutex::new([const { None }; GUARDED_EVIDENCE_CAPACITY]);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GuardedEvidenceLoss {
+    pub run_id: u64,
+    pub input_sha256: String,
+    pub role: &'static str,
+    pub probe: &'static str,
+    pub observed_retained_output_bytes: u64,
+    pub reason: GuardedEvidenceFallbackError,
+    pub interrupted_by_unwind: bool,
+}
+
+/// Recent bounded observations. The separate lost counter includes entries
+/// that have rolled off and is unrelated to GPU or storage admission.
+pub fn guarded_evidence_recent_losses() -> Vec<GuardedEvidenceLoss> {
+    GUARDED_EVIDENCE_LOSSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+fn retain_guarded_evidence(
+    evidence: GuardedPreflightEvidence,
+) -> Result<(), (GuardedEvidenceFallbackError, GuardedPreflightEvidence)> {
+    let mut slots = GUARDED_EVIDENCE_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if slots.iter().any(|e| {
+        e.run_id == evidence.run_id && e.role == evidence.role && e.probe == evidence.probe
+    }) {
+        return Err((GuardedEvidenceFallbackError::ScopeInUse, evidence));
+    }
+    if slots.len() >= GUARDED_EVIDENCE_CAPACITY {
+        return Err((GuardedEvidenceFallbackError::TotalSlotsExhausted, evidence));
+    }
+    let total = slots
+        .iter()
+        .try_fold(0u64, |sum, e| sum.checked_add(e.retained_payload_bytes))
+        .and_then(|sum| sum.checked_add(evidence.observed_retained_output_bytes));
+    if total.is_none_or(|sum| sum > GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES) {
+        return Err((
+            GuardedEvidenceFallbackError::TotalPayloadCapacityExhausted,
+            evidence,
+        ));
+    }
+    slots.push(GuardedEvidenceEntry {
+        run_id: evidence.run_id,
+        role: evidence.role,
+        probe: evidence.probe,
+        retained_payload_bytes: evidence.observed_retained_output_bytes,
+        slot: GuardedEvidenceSlot::Retained(evidence),
+    });
+    Ok(())
+}
+
+/// Count of dropped fallback evidence when callers did not take it and the
+/// bounded in-memory fallback could not accept it; not a GPU failure count.
+pub fn guarded_evidence_fallback_lost_count() -> u64 {
+    GUARDED_EVIDENCE_FALLBACK_LOST.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardedEvidenceFallbackError {
+    ScopeInUse,
+    TotalSlotsExhausted,
+    TotalPayloadCapacityExhausted,
+}
+impl fmt::Display for GuardedEvidenceFallbackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ScopeInUse => "guarded_evidence_scope_in_use",
+            Self::TotalSlotsExhausted => "guarded_evidence_total_slots_exhausted",
+            Self::TotalPayloadCapacityExhausted => {
+                "guarded_evidence_total_payload_capacity_exhausted"
+            }
+        })
+    }
+}
+
+struct GuardedProbeReservation {
+    run_id: u64,
+    input_sha256: String,
+    role: &'static str,
+    probe: &'static str,
+    output_limit_bytes: u64,
+    persistence_failed: bool,
+    process_available: bool,
+}
+
+impl GuardedProbeReservation {
+    fn acquire(
+        run_id: u64,
+        input_sha256: String,
+        role: &'static str,
+        probe: &'static str,
+        output_limit_bytes: u64,
+    ) -> Self {
+        Self {
+            run_id,
+            input_sha256,
+            role,
+            probe,
+            output_limit_bytes,
+            // Until every write succeeds, unwind must preserve the original.
+            persistence_failed: true,
+            process_available: false,
+        }
+    }
+}
+
+/// Returns owned output for caller-directed recovery. A reservation in use is
+/// not disturbed. No process or GPU resource owner is included.
+pub fn take_guarded_preflight_evidence(
+    run_id: u64,
+    role: &str,
+    probe: &str,
+) -> Option<GuardedPreflightEvidence> {
+    let mut slots = GUARDED_EVIDENCE_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let index = slots.iter().position(|e| {
+        e.run_id == run_id
+            && e.role == role
+            && e.probe == probe
+            && matches!(e.slot, GuardedEvidenceSlot::Retained(_))
+    })?;
+    let GuardedEvidenceSlot::Retained(evidence) = slots.remove(index).slot;
+    Some(evidence)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GuardedPreflightEvidenceStatus {
+    Retained {
+        run_id: u64,
+        input_sha256: String,
+        role: &'static str,
+        probe: &'static str,
+        declared_output_limit_bytes: u64,
+        observed_retained_output_bytes: u64,
+        interrupted_by_unwind: bool,
+        failures: Vec<String>,
+    },
+}
+
+/// Payload bytes are observed retained stream lengths, not process RSS.
+pub fn guarded_preflight_evidence_status() -> (usize, u64, Vec<GuardedPreflightEvidenceStatus>) {
+    let slots = GUARDED_EVIDENCE_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let statuses = slots
+        .iter()
+        .map(|entry| match &entry.slot {
+            GuardedEvidenceSlot::Retained(e) => GuardedPreflightEvidenceStatus::Retained {
+                run_id: e.run_id,
+                input_sha256: e.input_sha256.clone(),
+                role: e.role,
+                probe: e.probe,
+                declared_output_limit_bytes: e.declared_output_limit_bytes,
+                observed_retained_output_bytes: e.observed_retained_output_bytes,
+                interrupted_by_unwind: e.interrupted_by_unwind,
+                failures: e.failures.clone(),
+            },
+        })
+        .collect();
+    (
+        GUARDED_EVIDENCE_CAPACITY,
+        GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES,
+        statuses,
+    )
+}
+
 impl<S: NativeProviderDeclaration> NativeRunBundle<S> {
     fn unresolved(&self) -> bool {
-        self.process.as_ref().is_some_and(|p| {
-            p.receipt.group_cleanup != CleanupStatus::Gone || p.pending_child.is_some()
+        (self.physical_guard_required
+            && (self.spawn_custody.pending.load(Ordering::Acquire)
+                || self.spawn_custody.child().is_some()))
+            || self.process.as_ref().is_some_and(|p| {
+                p.receipt.group_cleanup != CleanupStatus::Gone || p.pending_child.is_some()
+            })
+    }
+    fn take_evidence(&mut self) -> Option<GuardedPreflightEvidence> {
+        if self.unresolved()
+            || !self
+                .probe_evidence
+                .as_ref()
+                .is_some_and(|r| r.persistence_failed && r.process_available)
+        {
+            return None;
+        }
+        let reservation = self.probe_evidence.take()?;
+        let process = self.process.take()?;
+        let observed = u64::try_from(process.stdout.len().saturating_add(process.stderr.len()))
+            .unwrap_or(u64::MAX);
+        Some(GuardedPreflightEvidence {
+            run_id: reservation.run_id,
+            input_sha256: reservation.input_sha256,
+            role: reservation.role,
+            probe: reservation.probe,
+            declared_output_limit_bytes: reservation.output_limit_bytes,
+            observed_retained_output_bytes: observed,
+            interrupted_by_unwind: std::thread::panicking(),
+            original_error: self.original_error.take(),
+            failures: std::mem::take(&mut self.guarded_preflight_failures),
+            process,
+            pair_receipt: self
+                .receipt
+                .take()
+                .map(|r| Box::new(r) as Box<dyn std::any::Any + Send>),
         })
+    }
+}
+
+#[cfg(test)]
+mod physical_guard_tests {
+    use super::*;
+
+    #[test]
+    fn guarded_spawn_without_process_output_stays_unresolved() {
+        // No owner is constructed in this state-only test. Clear the pending
+        // flag before Drop so the normal quarantine invariant is untouched.
+        let bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: None,
+            receipt: None,
+            receipt_artifact: None,
+            original_error: None,
+            guarded_preflight_failures: Vec::new(),
+            probe_evidence: None,
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: true,
+        };
+        assert!(!bundle.unresolved()); // no child was spawned
+        bundle.spawn_custody.pending.store(true, Ordering::Release);
+        assert!(bundle.unresolved()); // spawn returned, output still absent
+        bundle.spawn_custody.pending.store(false, Ordering::Release);
+        assert!(!bundle.unresolved()); // caller recorded independent proof
+    }
+
+    #[test]
+    fn historical_unprotected_provider_does_not_inherit_new_gate() {
+        let bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: None,
+            receipt: None,
+            receipt_artifact: None,
+            original_error: None,
+            guarded_preflight_failures: Vec::new(),
+            probe_evidence: None,
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: false,
+        };
+        bundle.spawn_custody.pending.store(true, Ordering::Release);
+        assert!(!bundle.unresolved());
+    }
+
+    #[test]
+    fn previous_probe_is_not_relabelled_as_current_even_with_reused_pid() {
+        assert!(guarded_process_is_previous(true, true, Some(41), Some(41)));
+        assert!(guarded_process_is_previous(true, false, Some(42), Some(41)));
+        assert!(!guarded_process_is_previous(
+            true,
+            false,
+            Some(42),
+            Some(42)
+        ));
+        assert!(!guarded_process_is_previous(
+            false,
+            true,
+            Some(41),
+            Some(41)
+        ));
+    }
+
+    #[test]
+    fn failed_probe_storage_retains_original_streams_without_gpu_quarantine() {
+        let mut reservation = GuardedProbeReservation::acquire(
+            u64::MAX,
+            "input".into(),
+            "candidate",
+            "readiness",
+            256 * 1024,
+        );
+        let independent = GuardedProbeReservation::acquire(
+            u64::MAX - 1,
+            "other".into(),
+            "baseline",
+            "identification",
+            256 * 1024,
+        );
+        assert_eq!(independent.output_limit_bytes, 256 * 1024);
+        let large = GuardedProbeReservation::acquire(
+            u64::MAX - 2,
+            "other".into(),
+            "pair",
+            "runner",
+            GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES + 1,
+        );
+        assert!(large.output_limit_bytes > GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES);
+        reservation.persistence_failed = true;
+        reservation.process_available = true;
+        let process = ProcessOutput {
+            receipt: crate::ProcessReceipt {
+                supervisor_version: 1,
+                pid: 17,
+                elapsed_ns: 0,
+                cleanup_elapsed_ns: None,
+                cleanup_timing_unavailable_reason: None,
+                stop: crate::ProcessStop::Exited,
+                exit_code: Some(0),
+                exit_signal: None,
+                group_cleanup: CleanupStatus::Gone,
+                stdout_bytes: 3,
+                stderr_bytes: 2,
+                observed_output_bytes: 5,
+                descendant_cleanup_required: false,
+                child_limit_enforcement: "test".into(),
+                watched_artifact_bytes: None,
+                artifact_limit_enforcement: None,
+                errors: Vec::new(),
+            },
+            stdout: b"out".to_vec(),
+            stderr: b"er".to_vec(),
+            pending_child: None,
+        };
+        let bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: Some(process),
+            receipt: None,
+            receipt_artifact: None,
+            original_error: None,
+            guarded_preflight_failures: vec!["storage failed".into()],
+            probe_evidence: Some(reservation),
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: true,
+        };
+        assert!(!bundle.unresolved());
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _bundle = bundle;
+            panic!("simulated guarded probe persistence panic");
+        }));
+        assert!(unwind.is_err());
+        let evidence = take_guarded_preflight_evidence(u64::MAX, "candidate", "readiness")
+            .expect("raw evidence retained");
+        assert_eq!(evidence.process.stdout, b"out");
+        assert_eq!(evidence.process.stderr, b"er");
+        assert_eq!(evidence.observed_retained_output_bytes, 5);
+        assert!(evidence.interrupted_by_unwind);
+        assert_eq!(evidence.failures, ["storage failed"]);
+        assert!(!guarded_preflight_evidence_status().2.iter().any(|e| matches!(e, GuardedPreflightEvidenceStatus::Retained { run_id, .. } if *run_id == u64::MAX)));
+        let mut next = GuardedProbeReservation::acquire(
+            u64::MAX - 3,
+            "input".into(),
+            "pair",
+            "runner",
+            GUARDED_EVIDENCE_PAYLOAD_LIMIT_BYTES + 1,
+        );
+        next.process_available = true;
+        let mut bundle = NativeRunBundle::<rz_experiments::LockedIntegrationPairSpecV1> {
+            owner: None,
+            process: Some(evidence.process),
+            receipt: None,
+            receipt_artifact: None,
+            original_error: Some("save failed".into()),
+            guarded_preflight_failures: Vec::new(),
+            probe_evidence: Some(next),
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_guard_required: true,
+        };
+        let caller_owned = bundle
+            .take_evidence()
+            .expect("caller can recover without fallback capacity");
+        assert_eq!(caller_owned.process.stdout, b"out");
+        assert_eq!(caller_owned.original_error.as_deref(), Some("save failed"));
     }
 }
 impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
     fn drop(&mut self) {
+        // A successful physical fence does not imply the raw output was saved.
+        // Retain only the evidence here, so its recovery never owns a GPU or
+        // keeps the native admission lease alive.
         if !self.unresolved() {
+            if let Some(evidence) = self.take_evidence() {
+                if let Err((error, evidence)) = retain_guarded_evidence(evidence) {
+                    let count = GUARDED_EVIDENCE_FALLBACK_LOST.fetch_add(1, Ordering::Relaxed);
+                    let mut losses = GUARDED_EVIDENCE_LOSSES
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let index = (count % GUARDED_EVIDENCE_CAPACITY as u64) as usize;
+                    losses[index] = Some(GuardedEvidenceLoss {
+                        run_id: evidence.run_id,
+                        input_sha256: evidence.input_sha256,
+                        role: evidence.role,
+                        probe: evidence.probe,
+                        observed_retained_output_bytes: evidence.observed_retained_output_bytes,
+                        reason: error,
+                        interrupted_by_unwind: evidence.interrupted_by_unwind,
+                    });
+                    drop(losses);
+                }
+            }
             return;
         }
         crate::native_launch::close_native_admission();
+        let physical_lifetime_unknown = self.physical_guard_required
+            && (self.spawn_custody.pending.load(Ordering::Acquire)
+                || self.spawn_custody.child().is_some());
         let retained = Box::new(RetainedNativeScope {
             _owner: Box::new(self.owner.take().expect("native bundle owns its lease")),
-            process: self
-                .process
-                .take()
-                .expect("unresolved bundle owns process evidence"),
+            process: self.process.take(),
+            spawned_child: self.spawn_custody.take_child(),
+            last_spawn_pid: self.spawn_custody.last_spawn_pid,
+            physical_lifetime_unknown,
             receipt: self.receipt.take().map(|r| Box::new(r) as Box<dyn Send>),
             original_error: self.original_error.take(),
+            guarded_preflight_failures: std::mem::take(&mut self.guarded_preflight_failures),
+            interrupted_by_unwind: std::thread::panicking(),
+            guarded_probe_scope: self.probe_evidence.as_ref().map(|p| GuardedProbeScope {
+                run_id: p.run_id,
+                input_sha256: p.input_sha256.clone(),
+                role: p.role,
+                probe: p.probe,
+            }),
         });
         // The active lease forbids a second unresolved bundle. Do not abort the
         // parent: abort would not ensure its runner/process group is terminated.
@@ -429,9 +931,23 @@ impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
 }
 struct RetainedNativeScope {
     _owner: Box<dyn Send>,
-    process: ProcessOutput,
+    process: Option<ProcessOutput>,
+    spawned_child: Option<std::process::Child>,
+    last_spawn_pid: Option<u32>,
+    physical_lifetime_unknown: bool,
     receipt: Option<Box<dyn Send>>,
     original_error: Option<String>,
+    guarded_preflight_failures: Vec<String>,
+    interrupted_by_unwind: bool,
+    guarded_probe_scope: Option<GuardedProbeScope>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GuardedProbeScope {
+    pub run_id: u64,
+    pub input_sha256: String,
+    pub role: &'static str,
+    pub probe: &'static str,
 }
 static QUARANTINE: Mutex<Option<Box<RetainedNativeScope>>> = Mutex::new(None);
 static QUARANTINE_FALLBACK: AtomicBool = AtomicBool::new(false);
@@ -456,6 +972,37 @@ pub struct NativeQuarantineStatus {
     pub pending_leader_handle: Option<bool>,
     pub receipt_retained: bool,
     pub original_error_retained: bool,
+    /// Separate from process-group state; absent for historical providers and
+    /// never a claim that their physical GPU completion was observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_physical_lifetime_unknown: Option<bool>,
+    /// An observed PID is not authority to signal or reap by number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_last_spawn_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_original_spawn_handle_retained: Option<bool>,
+    /// Prior probe evidence is not attributed to a later spawned child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_previous_probe_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guarded_preflight_failures: Vec<String>,
+    /// The child started but its local pipe buffers did not become a complete
+    /// ProcessOutput. The original child handle may still be retained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_spawn_raw_evidence_incomplete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_probe_scope: Option<GuardedProbeScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarded_interrupted_by_unwind: Option<bool>,
+}
+
+fn guarded_process_is_previous(
+    physical_unknown: bool,
+    current_child_held: bool,
+    current_pid: Option<u32>,
+    process_pid: Option<u32>,
+) -> bool {
+    physical_unknown && process_pid.is_some() && (current_child_held || process_pid != current_pid)
 }
 /// Passive, nonblocking observation only. No numeric-PID signal, wait/reap,
 /// release, deletion, retry or reopening of native admission is provided.
@@ -469,14 +1016,60 @@ pub fn native_quarantine_status() -> NativeQuarantineStatus {
         pending_leader_handle: None,
         receipt_retained: false,
         original_error_retained: false,
+        guarded_physical_lifetime_unknown: None,
+        guarded_last_spawn_pid: None,
+        guarded_original_spawn_handle_retained: None,
+        guarded_previous_probe_pid: None,
+        guarded_preflight_failures: Vec::new(),
+        guarded_spawn_raw_evidence_incomplete: None,
+        guarded_probe_scope: None,
+        guarded_interrupted_by_unwind: None,
     };
     let read = |slot: &Option<Box<RetainedNativeScope>>, status: &mut NativeQuarantineStatus| {
         status.slot_observed = true;
         if let Some(scope) = slot {
-            status.process_id = Some(scope.process.receipt.pid);
-            status.pending_leader_handle = Some(scope.process.pending_child.is_some());
+            let current_pid = scope
+                .spawned_child
+                .as_ref()
+                .map(std::process::Child::id)
+                .or(scope.last_spawn_pid);
+            let previous_process = guarded_process_is_previous(
+                scope.physical_lifetime_unknown,
+                scope.spawned_child.is_some(),
+                current_pid,
+                scope.process.as_ref().map(|process| process.receipt.pid),
+            );
+            if previous_process {
+                status.guarded_previous_probe_pid =
+                    scope.process.as_ref().map(|process| process.receipt.pid);
+            } else {
+                status.process_id = scope.process.as_ref().map(|process| process.receipt.pid);
+                status.pending_leader_handle = scope
+                    .process
+                    .as_ref()
+                    .map(|process| process.pending_child.is_some());
+            }
             status.receipt_retained = scope.receipt.is_some();
             status.original_error_retained = scope.original_error.is_some();
+            status.guarded_preflight_failures = scope.guarded_preflight_failures.clone();
+            status.guarded_probe_scope = scope.guarded_probe_scope.clone();
+            if scope.physical_lifetime_unknown {
+                status.guarded_interrupted_by_unwind = Some(scope.interrupted_by_unwind);
+            }
+            if scope.physical_lifetime_unknown {
+                status.guarded_physical_lifetime_unknown = Some(true);
+                status.guarded_spawn_raw_evidence_incomplete = Some(
+                    scope.spawned_child.is_some() || previous_process || scope.process.is_none(),
+                );
+                status.guarded_last_spawn_pid = current_pid;
+                status.guarded_original_spawn_handle_retained = Some(
+                    scope.spawned_child.is_some()
+                        || scope.process.as_ref().is_some_and(|process| {
+                            Some(process.receipt.pid) == current_pid
+                                && process.pending_child.is_some()
+                        }),
+                );
+            }
         }
     };
     match QUARANTINE.try_lock() {
@@ -526,7 +1119,8 @@ impl<S: NativeProviderDeclaration> NativePairOutput<S> {
             )
         }) && self.bundle.receipt_artifact.as_ref()
             == Some(&self.receipt_artifact);
-        let closed = projections_match
+        let closed = !self.bundle.unresolved()
+            && projections_match
             && original.is_some_and(|receipt| {
                 receipt.integration_checks_passed
                     && receipt.cleanup_verified
@@ -644,6 +1238,11 @@ pub struct NativePairFailure<
     bundle: NativeRunBundle<S>,
 }
 impl<S: NativeProviderDeclaration> NativePairFailure<S> {
+    /// Transfer original output and receipt when physical completion is known.
+    /// The caller becomes responsible for durable storage of the returned data.
+    pub fn take_guarded_evidence(&mut self) -> Option<GuardedPreflightEvidence> {
+        self.bundle.take_evidence()
+    }
     pub fn process(&self) -> Option<&ProcessOutput> {
         self.bundle.process.as_ref()
     }
@@ -683,12 +1282,19 @@ pub(crate) fn run_native_pair_for<S: NativeProviderDeclaration>(
     owner: NativeLaunchOwner<S>,
     cancel: Option<&AtomicBool>,
 ) -> Result<NativePairOutput<S>, Box<NativePairFailure<S>>> {
+    // Existing V1/V5 and Rovent V3 declarations keep their established
+    // behavior. PALS V6 must explicitly opt in before its launch guard opens.
+    let physical_guard_required = owner.spec.requires_physical_lifetime_guard();
     let mut bundle = NativeRunBundle {
         owner: Some(owner),
         process: None,
         receipt: None,
         receipt_artifact: None,
         original_error: None,
+        guarded_preflight_failures: Vec::new(),
+        probe_evidence: None,
+        spawn_custody: crate::process::SpawnCustody::default(),
+        physical_guard_required,
     };
     #[cfg(target_os = "linux")]
     let result = linux::run(&mut bundle, cancel);
@@ -1141,9 +1747,152 @@ pub(crate) mod linux {
             .collect();
         assert!(validate_preflight_provider_evidence(&excessive).is_err());
     }
+    fn owned_role_runtime_directory<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        index: usize,
+    ) -> Result<cap_std::fs::Dir, ArenaError> {
+        use cap_fs_ext::DirExt;
+        use std::os::unix::fs::MetadataExt;
+        let name = match index {
+            0 => "baseline-runtime",
+            1 => "candidate-runtime",
+            _ => return Err(invalid("guarded role index is invalid")),
+        };
+        let pinned = owner.snapshot._runtime_root_pins[index]
+            .try_clone()
+            .map_err(|_| invalid("cannot clone owned role runtime pin"))?;
+        let held = pinned
+            .metadata()
+            .map_err(|_| invalid("owned role runtime pin unavailable"))?;
+        let named = owner
+            .snapshot
+            .directory
+            .open_dir_nofollow(name)
+            .map_err(|_| invalid("named role runtime directory unavailable"))?
+            .into_std_file()
+            .metadata()
+            .map_err(|_| invalid("named role runtime metadata unavailable"))?;
+        if !held.is_dir()
+            || !named.is_dir()
+            || (held.dev(), held.ino()) != (named.dev(), named.ino())
+        {
+            return Err(invalid(
+                "role runtime name differs from its original owned pin",
+            ));
+        }
+        Ok(cap_std::fs::Dir::from_std_file(pinned))
+    }
+
+    fn verify_guarded_preflight<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        process: &ProcessOutput,
+        role: NativeEngineRole,
+        probe: NativePreflightProbe,
+        pending: &AtomicBool,
+        required: bool,
+    ) -> Result<(), ArenaError> {
+        if !required {
+            return Ok(());
+        }
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+        verify_provider_input_names(owner)?;
+        let index = if role == NativeEngineRole::Baseline {
+            0
+        } else {
+            1
+        };
+        let directory = match &owner.snapshot.preflight_runtime_roots[index] {
+            Some(root) => root
+                .directory
+                .try_clone()
+                .map_err(|_| invalid("guarded preflight runtime directory unavailable"))?,
+            None => owned_role_runtime_directory(owner, index)?,
+        };
+        let pins = provider_input_views(owner);
+        let inputs = NativeProviderInputContext {
+            directory: &owner.snapshot.input_directory,
+            pins: &pins,
+        };
+        owner
+            .spec
+            .verify_preflight_no_gpu(role, probe, process, &directory, &inputs)?;
+        verify_provider_input_names(owner)?;
+        if owner.snapshot.preflight_runtime_roots[index].is_none() {
+            owned_role_runtime_directory(owner, index)?;
+        }
+        crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot)?;
+        pending.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn verify_guarded_pair<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        process: &ProcessOutput,
+        pending: &AtomicBool,
+        required: bool,
+    ) -> Result<(), ArenaError> {
+        if !required {
+            return Ok(());
+        }
+        verify_provider_input_names(owner)?;
+        let baseline = owned_role_runtime_directory(owner, 0)?;
+        let candidate = owned_role_runtime_directory(owner, 1)?;
+        let pins = provider_input_views(owner);
+        let inputs = NativeProviderInputContext {
+            directory: &owner.snapshot.input_directory,
+            pins: &pins,
+        };
+        owner
+            .spec
+            .verify_pair_physical_completion(process, &baseline, &candidate, &inputs)?;
+        verify_provider_input_names(owner)?;
+        owned_role_runtime_directory(owner, 0)?;
+        owned_role_runtime_directory(owner, 1)?;
+        pending.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn persist_guarded_probe<S: NativeProviderDeclaration>(
+        owner: &NativeLaunchOwner<S>,
+        process: &ProcessOutput,
+        tag: &str,
+        stage: &str,
+    ) -> Vec<ArenaError> {
+        let mut failures = Vec::new();
+        // Attempt each independent byte stream even if a previous write fails.
+        for (suffix, bytes) in [
+            ("stdout.log", &process.stdout),
+            ("stderr.log", &process.stderr),
+        ] {
+            if let Err(error) = put(
+                owner,
+                &format!("external-{tag}-{stage}.{suffix}"),
+                bytes,
+                256 * 1024,
+            ) {
+                failures.push(error);
+            }
+        }
+        match serde_json::to_vec_pretty(&process.receipt) {
+            Ok(bytes) => {
+                if let Err(error) = put(
+                    owner,
+                    &format!("external-{tag}-{stage}-process.v2.json"),
+                    &bytes,
+                    64 * 1024,
+                ) {
+                    failures.push(error);
+                }
+            }
+            Err(_) => failures.push(invalid("preflight process receipt encoding failed")),
+        }
+        failures
+    }
+
     fn preflight_endpoints<S: NativeProviderDeclaration>(
         bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
+        run_id: Option<u64>,
     ) -> Result<(Vec<crate::ExternalUciPreflight>, Vec<ArtifactRef>), ArenaError> {
         let mut receipts = Vec::new();
         let mut provider_artifacts = Vec::new();
@@ -1215,7 +1964,20 @@ pub(crate) mod linux {
                 max_child_processes: owner.spec.view().budget.max_child_processes,
             };
             preflight_runtime_totals(owner)?;
-            let process = crate::supervise_protocol_in_directory(
+            let tag = match role {
+                NativeEngineRole::Baseline => "baseline",
+                NativeEngineRole::Candidate => "candidate",
+            };
+            if bundle.physical_guard_required {
+                bundle.probe_evidence = Some(GuardedProbeReservation::acquire(
+                    run_id.expect("guarded run has evidence identity"),
+                    owner.spec.input_sha256().to_string(),
+                    tag,
+                    "identification",
+                    limits.max_output_bytes,
+                ));
+            }
+            let process = crate::process::supervise_protocol_in_directory_with_spawn(
                 &launch.program.file,
                 &launch.arguments,
                 &owner.snapshot.cwd,
@@ -1223,37 +1985,79 @@ pub(crate) mod linux {
                 cancel,
                 &owner.snapshot.watch,
                 b"uci\nquit\n",
+                if bundle.physical_guard_required {
+                    Some(&mut bundle.spawn_custody)
+                } else {
+                    None
+                },
             )?;
             bundle.process = Some(process);
+            if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                reservation.process_available = true;
+            }
             let process = bundle.process.as_ref().expect("probe process retained");
             let root_recheck =
                 crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
-            let tag = match role {
-                NativeEngineRole::Baseline => "baseline",
-                NativeEngineRole::Candidate => "candidate",
-            };
-            put(
-                owner,
-                &format!("external-{tag}-identification.stdout.log"),
-                &process.stdout,
-                256 * 1024,
-            )?;
-            put(
-                owner,
-                &format!("external-{tag}-identification.stderr.log"),
-                &process.stderr,
-                256 * 1024,
-            )?;
             // Save the actual bounded process receipt before the success
             // gate. Failure evidence changes no cleanup/admission requirement.
             let identification_process = process.receipt.clone();
-            put(
-                owner,
-                &format!("external-{tag}-identification-process.v2.json"),
-                &serde_json::to_vec_pretty(&process.receipt)
-                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
-                64 * 1024,
-            )?;
+            let root_recheck = if bundle.physical_guard_required {
+                let physical = if root_recheck.is_ok() {
+                    verify_guarded_preflight(
+                        owner,
+                        process,
+                        role,
+                        NativePreflightProbe::Identification,
+                        &bundle.spawn_custody.pending,
+                        true,
+                    )
+                } else {
+                    Err(invalid("guarded preflight root binding was not verified"))
+                };
+                let mut persistence = persist_guarded_probe(owner, process, tag, "identification");
+                if let Err(error) = &physical {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("identification physical: {error}"));
+                }
+                for error in &persistence {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("identification persistence: {error}"));
+                }
+                if persistence.is_empty() && physical.is_ok() && root_recheck.is_ok() {
+                    bundle.probe_evidence.take();
+                } else if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                    reservation.persistence_failed = !persistence.is_empty();
+                }
+                root_recheck?;
+                physical?;
+                if !persistence.is_empty() {
+                    return Err(persistence.remove(0));
+                }
+                Ok(())
+            } else {
+                put(
+                    owner,
+                    &format!("external-{tag}-identification.stdout.log"),
+                    &process.stdout,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-identification.stderr.log"),
+                    &process.stderr,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-identification-process.v2.json"),
+                    &serde_json::to_vec_pretty(&process.receipt)
+                        .map_err(|_| invalid("preflight process receipt encoding failed"))?,
+                    64 * 1024,
+                )?;
+                root_recheck
+            };
             let clean = |p: &ProcessOutput| {
                 p.receipt.stop == ProcessStop::Exited
                     && p.receipt.exit_code == Some(0)
@@ -1277,7 +2081,16 @@ pub(crate) mod linux {
                 owner.spec.original_wall_deadline()?,
                 std::time::Instant::now(),
             )?;
-            let process = crate::supervise_protocol_in_directory(
+            if bundle.physical_guard_required {
+                bundle.probe_evidence = Some(GuardedProbeReservation::acquire(
+                    run_id.expect("guarded run has evidence identity"),
+                    owner.spec.input_sha256().to_string(),
+                    tag,
+                    "readiness",
+                    limits.max_output_bytes,
+                ));
+            }
+            let process = crate::process::supervise_protocol_in_directory_with_spawn(
                 &launch.program.file,
                 &launch.arguments,
                 &owner.snapshot.cwd,
@@ -1285,30 +2098,76 @@ pub(crate) mod linux {
                 cancel,
                 &owner.snapshot.watch,
                 &commands,
+                if bundle.physical_guard_required {
+                    Some(&mut bundle.spawn_custody)
+                } else {
+                    None
+                },
             )?;
             bundle.process = Some(process);
+            if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                reservation.process_available = true;
+            }
             let process = bundle.process.as_ref().expect("readiness process retained");
             let root_recheck =
                 crate::native_launch::linux::verify_preflight_runtime_roots(&owner.snapshot);
-            put(
-                owner,
-                &format!("external-{tag}-readiness.stdout.log"),
-                &process.stdout,
-                256 * 1024,
-            )?;
-            put(
-                owner,
-                &format!("external-{tag}-readiness.stderr.log"),
-                &process.stderr,
-                256 * 1024,
-            )?;
-            put(
-                owner,
-                &format!("external-{tag}-readiness-process.v2.json"),
-                &serde_json::to_vec_pretty(&process.receipt)
-                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
-                64 * 1024,
-            )?;
+            let root_recheck = if bundle.physical_guard_required {
+                let physical = if root_recheck.is_ok() {
+                    verify_guarded_preflight(
+                        owner,
+                        process,
+                        role,
+                        NativePreflightProbe::Readiness,
+                        &bundle.spawn_custody.pending,
+                        true,
+                    )
+                } else {
+                    Err(invalid("guarded preflight root binding was not verified"))
+                };
+                let mut persistence = persist_guarded_probe(owner, process, tag, "readiness");
+                if let Err(error) = &physical {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("readiness physical: {error}"));
+                }
+                for error in &persistence {
+                    bundle
+                        .guarded_preflight_failures
+                        .push(format!("readiness persistence: {error}"));
+                }
+                if persistence.is_empty() && physical.is_ok() && root_recheck.is_ok() {
+                    bundle.probe_evidence.take();
+                } else if let Some(reservation) = bundle.probe_evidence.as_mut() {
+                    reservation.persistence_failed = !persistence.is_empty();
+                }
+                root_recheck?;
+                physical?;
+                if !persistence.is_empty() {
+                    return Err(persistence.remove(0));
+                }
+                Ok(())
+            } else {
+                put(
+                    owner,
+                    &format!("external-{tag}-readiness.stdout.log"),
+                    &process.stdout,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-readiness.stderr.log"),
+                    &process.stderr,
+                    256 * 1024,
+                )?;
+                put(
+                    owner,
+                    &format!("external-{tag}-readiness-process.v2.json"),
+                    &serde_json::to_vec_pretty(&process.receipt)
+                        .map_err(|_| invalid("preflight process receipt encoding failed"))?,
+                    64 * 1024,
+                )?;
+                root_recheck
+            };
             if !clean(process) {
                 return Err(invalid(
                     "external readiness/stop/quit failed process/cleanup gate",
@@ -1442,6 +2301,15 @@ pub(crate) mod linux {
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let run_started = std::time::Instant::now();
+        let run_id = if bundle.physical_guard_required {
+            Some(
+                GUARDED_EVIDENCE_NEXT_RUN
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                    .map_err(|_| ArenaError::Budget("guarded_evidence_run_id_exhausted".into()))?,
+            )
+        } else {
+            None
+        };
         {
             let owner = bundle.owner.as_mut().expect("prepared native owner");
             owner.snapshot.limits.wall_ms = clamp_original_wall(
@@ -1456,7 +2324,8 @@ pub(crate) mod linux {
             .expect("prepared native owner")
             .spec
             .validate_runtime_admission()?;
-        let (external_preflight, preflight_artifacts) = preflight_endpoints(bundle, cancel)?;
+        let (external_preflight, preflight_artifacts) =
+            preflight_endpoints(bundle, cancel, run_id)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -1499,7 +2368,16 @@ pub(crate) mod linux {
             owner.spec.original_wall_deadline()?,
             std::time::Instant::now(),
         )?;
-        let process = crate::process::supervise_tree_observed(
+        if bundle.physical_guard_required {
+            bundle.probe_evidence = Some(GuardedProbeReservation::acquire(
+                run_id.expect("guarded run has evidence identity"),
+                owner.spec.input_sha256().to_string(),
+                "pair",
+                "runner",
+                limits.max_output_bytes,
+            ));
+        }
+        let process = crate::process::supervise_tree_observed_with_spawn(
             &if let Some(execution) = owner.spec.match_execution() {
                 crate::native_launch::linux::pin(&s.pins, &execution.executor)?
             } else {
@@ -1512,10 +2390,18 @@ pub(crate) mod linux {
             cancel,
             &s.watch,
             Some(&mut on_stdout),
+            if bundle.physical_guard_required {
+                Some(&mut bundle.spawn_custody)
+            } else {
+                None
+            },
         )?;
         crate::native_diagnostics::finish_logs();
         crate::emit_native_phase("runner_supervision_finished");
         bundle.process = Some(process);
+        if let Some(reservation) = bundle.probe_evidence.as_mut() {
+            reservation.process_available = true;
+        }
         let owner = bundle
             .owner
             .as_ref()
@@ -1524,6 +2410,17 @@ pub(crate) mod linux {
             .process
             .as_ref()
             .expect("native process output retained after spawn");
+        // This independent evidence path runs even when the game fails for an
+        // unrelated reason. Failure here preserves physical ownership but does
+        // not prevent other available failure/PGN diagnostics being recorded.
+        let physical_lifetime_error = verify_guarded_pair(
+            owner,
+            process,
+            &bundle.spawn_custody.pending,
+            bundle.physical_guard_required,
+        )
+        .err()
+        .map(|error| error.to_string());
         let completed = process.receipt.stop == ProcessStop::Exited
             && process.receipt.exit_code == Some(0)
             && process.receipt.group_cleanup == CleanupStatus::Gone
@@ -1546,6 +2443,7 @@ pub(crate) mod linux {
             snapshot_cache_hints: cache_hints,
             artifacts: preflight_artifacts,
             provider_sessions: Vec::new(),
+            physical_lifetime_error,
             external_preflight,
             external_execution: Vec::new(),
             environments: [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
@@ -1727,6 +2625,7 @@ pub(crate) mod linux {
                 Err(error) => receipt.failure_audit_error = Some(error.to_string()),
             }
         }
+        receipt.unresolved_owner_retained = bundle.unresolved();
         bundle.receipt = Some(receipt.clone());
         crate::emit_native_phase("postlaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -1762,6 +2661,7 @@ pub(crate) mod linux {
             );
         }
         receipt.integration_checks_passed = completed
+            && !bundle.unresolved()
             && receipt.pgn_audit.is_some()
             && receipt.provider_audit_error.is_none()
             && receipt.external_audit_error.is_none()
@@ -1808,15 +2708,23 @@ pub(crate) mod linux {
             owner.spec.pair_metadata_cap(),
         )?;
         bundle.receipt_artifact = Some(artifact.clone());
+        if let Some(reservation) = bundle.probe_evidence.as_mut() {
+            reservation.persistence_failed = false;
+        }
+        if !bundle.unresolved() {
+            bundle.probe_evidence.take();
+        }
         crate::emit_native_phase("receipt_saved");
         // Keep receipts/PGN first. Process exit alone grants no NN-drain claim.
         // Each accepted provider session includes its matched physical drain.
-        if crate::native_retention::eligible_expected(
-            owner.spec.expected_provider_sessions(),
-            receipt.cleanup_verified,
-            receipt.provider_audit_error.is_none(),
-            receipt.provider_sessions.len(),
-        ) {
+        if !bundle.unresolved()
+            && crate::native_retention::eligible_expected(
+                owner.spec.expected_provider_sessions(),
+                receipt.cleanup_verified,
+                receipt.provider_audit_error.is_none(),
+                receipt.provider_sessions.len(),
+            )
+        {
             crate::native_retention::retire(
                 &mut bundle
                     .owner
