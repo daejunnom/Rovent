@@ -167,6 +167,7 @@ mod native_lock_sealed {
 
 #[doc(hidden)]
 pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
+    type SourceCommit;
     fn validate_original(&self) -> Result<(), rz_experiments::ManifestError>;
     fn system_runtime_lock(&self) -> Option<&SystemRuntimeLockV6> {
         None
@@ -194,7 +195,7 @@ pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
         })?;
         Ok(("model_native", digest.clone()))
     }
-    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration;
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration<Self::SourceCommit>;
     fn provenance(&self) -> &[ArtifactRef];
     fn canonical_sha256(&self) -> &str;
     fn cleanup_max_ms(&self) -> u64;
@@ -216,10 +217,11 @@ pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
 
 impl native_lock_sealed::Sealed for RoventInputLock {}
 impl NativeInputLock for RoventInputLock {
+    type SourceCommit = String;
     fn validate_original(&self) -> Result<(), rz_experiments::ManifestError> {
         self.validate()
     }
-    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration<Self::SourceCommit> {
         &self.manifest.engine
     }
     fn provenance(&self) -> &[ArtifactRef] {
@@ -269,10 +271,11 @@ impl NativeInputLock for RoventInputLock {
 
 impl native_lock_sealed::Sealed for RoventInputLockV2 {}
 impl NativeInputLock for RoventInputLockV2 {
+    type SourceCommit = String;
     fn validate_original(&self) -> Result<(), rz_experiments::ManifestError> {
         self.validate()
     }
-    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration<Self::SourceCommit> {
         &self.manifest.engine
     }
     fn provenance(&self) -> &[ArtifactRef] {
@@ -344,6 +347,7 @@ impl NativeInputLock for RoventInputLockV2 {
 
 impl native_lock_sealed::Sealed for RoventInputLockV3 {}
 impl NativeInputLock for RoventInputLockV3 {
+    type SourceCommit = Option<String>;
     fn virtual_review_mode(&self) -> VirtualReviewExecutionMode {
         if self.manifest.purpose == rz_experiments::RoventPurpose::Collection {
             VirtualReviewExecutionMode::Collection
@@ -380,7 +384,7 @@ impl NativeInputLock for RoventInputLockV3 {
             NativeRuntimeSourceV6::Cpu => None,
         }
     }
-    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration<Self::SourceCommit> {
         &self.manifest.engine
     }
     fn provenance(&self) -> &[ArtifactRef] {
@@ -423,7 +427,7 @@ impl NativeInputLock for RoventInputLockV3 {
         };
         super::admitted_native_topology_fields_v3(
             &self.manifest.engine,
-            &self.manifest.coordinator,
+            self.manifest.coordinator.view(),
             explicit_purpose,
             self.manifest.purpose == rz_experiments::RoventPurpose::Collection,
         )

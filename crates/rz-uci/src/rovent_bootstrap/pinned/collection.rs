@@ -11,7 +11,7 @@ use cap_std::fs::Dir;
 use rz_contracts::Digest;
 use rz_eval::error::{BackendError, FailureKind as K};
 use rz_experiments::{
-    ArtifactRef, RoventEngineDeclaration, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
+    ArtifactRef, RoventExternalProfilePin, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
     RoventPurpose,
 };
 use serde::{Deserialize, Serialize};
@@ -94,11 +94,11 @@ impl CollectionInputLock {
             Self::V3(lock) => lock.manifest.purpose,
         }
     }
-    fn engine(&self) -> &RoventEngineDeclaration {
+    fn teachers(&self) -> &[RoventExternalProfilePin] {
         match self {
-            Self::V1(lock) => &lock.manifest.engine,
-            Self::V2(lock) => &lock.manifest.engine,
-            Self::V3(lock) => &lock.manifest.engine,
+            Self::V1(lock) => &lock.manifest.engine.teachers,
+            Self::V2(lock) => &lock.manifest.engine.teachers,
+            Self::V3(lock) => &lock.manifest.engine.teachers,
         }
     }
     fn provenance(&self) -> &[ArtifactRef] {
@@ -349,9 +349,9 @@ impl RoventCollectionPreloadSources {
         let startup_control_v2 = retain_origin.then(|| control.clone());
         let private_root_path_v2 = retain_origin.then(|| private_root_path.to_owned());
         if lock.purpose() != RoventPurpose::Collection
-            || lock.engine().teachers.is_empty()
-            || lock.engine().teachers.len() > 16
-            || selections.len() != lock.engine().teachers.len()
+            || lock.teachers().is_empty()
+            || lock.teachers().len() > 16
+            || selections.len() != lock.teachers().len()
             || !private_root_path.is_absolute()
         {
             return Err(invalid(
@@ -388,7 +388,7 @@ impl RoventCollectionPreloadSources {
         #[cfg(target_os = "linux")]
         let mut sealed_copy_deadline: Option<Instant> = None;
         for (index, selection) in selections.into_iter().enumerate() {
-            let pin = &lock.engine().teachers[index];
+            let pin = &lock.teachers()[index];
             if selection.index != index
                 || !rz_experiments::pals_private_snapshot_path_v5(&pin.profile.path)
                 || !rz_experiments::pals_private_snapshot_path_v5(&pin.binary.path)

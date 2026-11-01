@@ -144,10 +144,17 @@ pub struct RoventExternalSessionSource<L: SessionExternalLock = RoventInputLock>
 pub trait SessionExternalLock:
     Sized + ExternalNativeInputLock + ExternalManagerLock<Custody = RoventExternalRSourceCustody<Self>>
 {
+    const ROOT_BUDGET_LATE_BOUND: bool;
 }
-impl SessionExternalLock for RoventInputLock {}
-impl SessionExternalLock for RoventInputLockV2 {}
-impl SessionExternalLock for RoventInputLockV3 {}
+impl SessionExternalLock for RoventInputLock {
+    const ROOT_BUDGET_LATE_BOUND: bool = false;
+}
+impl SessionExternalLock for RoventInputLockV2 {
+    const ROOT_BUDGET_LATE_BOUND: bool = false;
+}
+impl SessionExternalLock for RoventInputLockV3 {
+    const ROOT_BUDGET_LATE_BOUND: bool = true;
+}
 
 impl<L: SessionExternalLock> RoventExternalSessionSource<L> {
     // A rejected preparation returns its original source/FD custody without
@@ -217,17 +224,25 @@ impl<L: SessionExternalLock> RoventExternalSessionSource<L> {
 
     pub(super) fn validate_declaration<B>(
         &self,
-        profile: &RoventPcrSessionProfile,
+        profile: &SessionPcrProfile,
         sources: &AdaptiveSessionSources<B>,
     ) -> Result<(), SearchSessionFailure>
     where
         B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     {
+        let budget_valid = match profile {
+            SessionPcrProfile::Fixed(profile) if !L::ROOT_BUDGET_LATE_BOUND => {
+                profile.reciprocal.mode == profile.mode
+                    && profile.reciprocal.root_budget == profile.root_budget
+            }
+            SessionPcrProfile::LateBound(_) if L::ROOT_BUDGET_LATE_BOUND => true,
+            _ => false,
+        };
+        let profile = profile.common();
         if !profile.mode.has_native_r()
             || profile.input_lock != self.input_lock
             || profile.maximum_goal_plies != profile.frontier_limits.maximum_goal_plies
-            || profile.reciprocal.mode != profile.mode
-            || profile.reciprocal.root_budget != profile.root_budget
+            || !budget_valid
             || !sources.cpu.is_empty()
             || sources.external.is_some()
             || sources.engine.checker_identity() != self.declaration.identity()
@@ -620,6 +635,7 @@ where
         hooks: AdaptiveSessionCollectionHooks<B>,
     ) -> Result<Self, RoventExternalSessionAdmissionRejectionV2<B>> {
         let RoventExternalSessionSourcesV2 { common, external } = sources;
+        let profile = SessionPcrProfile::Fixed(profile);
         let checked = external
             .validate_declaration(&profile, &common)
             .and_then(|()| {
@@ -685,12 +701,13 @@ where
         clock: ProcessClock,
         issuer: AdaptiveRulesOwnerIssuer,
         registration: PalsCheckerRegistration,
-        profile: RoventPcrSessionProfile,
+        profile: RoventPcrSessionProfileV3,
         retirement_sink: RegisteredProfiledRetirementSink,
         origin: Option<crate::pals_adaptive::RoventNativeCollectionOrigin>,
         hooks: AdaptiveSessionCollectionHooks<B>,
     ) -> Result<Self, RoventExternalSessionAdmissionRejectionV3<B>> {
         let RoventExternalSessionSourcesV3 { common, external } = sources;
+        let profile = SessionPcrProfile::LateBound(profile);
         let checked = external
             .validate_declaration(&profile, &common)
             .and_then(|()| {
@@ -800,6 +817,7 @@ where
         hooks: AdaptiveSessionCollectionHooks<B>,
     ) -> Result<Self, RoventExternalSessionAdmissionRejection<B>> {
         let RoventExternalSessionSources { common, external } = sources;
+        let profile = SessionPcrProfile::Fixed(profile);
         let checked = external
             .validate_declaration(&profile, &common)
             .and_then(|()| {
@@ -958,7 +976,9 @@ impl RoventPcrSessionProfile {
         manager.configure_rovent_peer_followups(self.peers)?;
         Ok(())
     }
+}
 
+impl RoventPcrSessionProfileV3 {
     /// Join the original /3 root to the actual worker before attaching the
     /// existing Store-backed frontier. No Collection authority is synthesized.
     pub(super) fn attach_profiled_external_v3<B>(
@@ -1051,7 +1071,9 @@ impl RoventPcrSessionProfile {
         manager.configure_rovent_peer_followups(self.peers)?;
         Ok(())
     }
+}
 
+impl RoventPcrSessionProfile {
     pub(super) fn attach_profiled_external<B>(
         &self,
         manager: &mut SessionManager<B>,

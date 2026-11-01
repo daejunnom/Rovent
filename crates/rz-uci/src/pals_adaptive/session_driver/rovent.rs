@@ -43,6 +43,61 @@ pub struct RoventPcrSessionProfile {
     pub reciprocal: RoventReciprocalPolicy,
     pub peers: RoventPeerFollowupPolicy,
 }
+/// V3 binds the root budget and reciprocal policy to the actual per-go
+/// admission. No placeholder budget or synthetic reciprocal policy exists.
+#[derive(Clone)]
+pub struct RoventPcrSessionProfileV3 {
+    pub mode: ExecutionMode,
+    pub maximum_goal_plies: NonZeroU16,
+    pub input_lock: Digest,
+    pub selective_policy: Digest,
+    pub model_namespace: Arc<AdaptiveModelNamespace>,
+    pub frontier_limits: FrontierLimits,
+    pub peers: RoventPeerFollowupPolicy,
+}
+
+#[derive(Clone)]
+pub(super) enum SessionPcrProfile {
+    Fixed(RoventPcrSessionProfile),
+    LateBound(RoventPcrSessionProfileV3),
+}
+
+pub(super) struct SessionPcrCommon<'a> {
+    pub mode: ExecutionMode,
+    pub maximum_goal_plies: NonZeroU16,
+    pub input_lock: Digest,
+    pub model_namespace: &'a Arc<AdaptiveModelNamespace>,
+    pub frontier_limits: &'a FrontierLimits,
+}
+
+impl SessionPcrProfile {
+    pub(super) fn common(&self) -> SessionPcrCommon<'_> {
+        match self {
+            Self::Fixed(profile) => SessionPcrCommon {
+                mode: profile.mode,
+                maximum_goal_plies: profile.maximum_goal_plies,
+                input_lock: profile.input_lock,
+                model_namespace: &profile.model_namespace,
+                frontier_limits: &profile.frontier_limits,
+            },
+            Self::LateBound(profile) => SessionPcrCommon {
+                mode: profile.mode,
+                maximum_goal_plies: profile.maximum_goal_plies,
+                input_lock: profile.input_lock,
+                model_namespace: &profile.model_namespace,
+                frontier_limits: &profile.frontier_limits,
+            },
+        }
+    }
+
+    pub(super) fn fixed(&self) -> Option<&RoventPcrSessionProfile> {
+        match self {
+            Self::Fixed(profile) => Some(profile),
+            Self::LateBound(_) => None,
+        }
+    }
+}
+
 impl RoventPcrSessionProfile {
     fn validate<B>(&self, sources: &AdaptiveSessionSources<B>) -> Result<(), SearchSessionFailure>
     where
@@ -342,7 +397,7 @@ where
         };
         context
             .goal
-            .validate(profile.maximum_goal_plies)
+            .validate(profile.common().maximum_goal_plies)
             .map_err(|error| SearchSessionFailure::debug("RoventSearchGoal", &error))?;
         let legal = position.legal_moves();
         let Some(requested) = &context.root_moves else {
@@ -448,7 +503,7 @@ where
             hooks,
             true,
         )?;
-        admitted.rovent = Some(profile);
+        admitted.rovent = Some(SessionPcrProfile::Fixed(profile));
         admitted.rovent_collection_origin = origin;
         Ok(admitted)
     }
@@ -507,6 +562,7 @@ where
         let Some(profile) = &self.rovent else {
             return Ok(None);
         };
+        let profile = profile.common();
         let admission = admission
             .ok_or_else(|| failure("RoventRootObservation", "original root admission absent"))?;
         let actual = manager

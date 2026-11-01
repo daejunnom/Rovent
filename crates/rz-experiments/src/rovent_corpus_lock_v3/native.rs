@@ -41,7 +41,7 @@ where
 struct Declaration {
     purpose: String,
     mode: String,
-    source_commit: String,
+    source_commit: Option<String>,
     source_components: BTreeMap<String, String>,
     model_semantics: String,
     encoding: String,

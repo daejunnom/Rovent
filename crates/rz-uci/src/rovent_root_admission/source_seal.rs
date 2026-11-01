@@ -538,7 +538,7 @@ impl SourceSeal {
 struct SourceDeclarations<'a> {
     canonical_sha256: &'a str,
     search: &'a rz_experiments::RoventSearchDeclaration,
-    coordinator: &'a rz_experiments::RoventCoordinatorDeclaration,
+    coordinator: rz_experiments::RoventCoordinatorView<'a>,
     resources: &'a rz_experiments::RoventResourcePlan,
     wall_time_max_ms: u64,
     cleanup_max_ms: u64,
@@ -551,7 +551,7 @@ impl<'a> SourceDeclarations<'a> {
         Self {
             canonical_sha256: &lock.canonical_sha256,
             search: &m.engine.search,
-            coordinator: &m.coordinator,
+            coordinator: m.coordinator.view(),
             resources: &m.resources,
             wall_time_max_ms: m.wall_time_max_ms,
             cleanup_max_ms: m.cleanup_max_ms,
@@ -563,7 +563,7 @@ impl<'a> SourceDeclarations<'a> {
         Self {
             canonical_sha256: &lock.canonical_sha256,
             search: &m.engine.search,
-            coordinator: &m.coordinator,
+            coordinator: m.coordinator.view(),
             resources: &m.resources,
             wall_time_max_ms: m.wall_time_max_ms,
             cleanup_max_ms: m.cleanup_max_ms,
@@ -846,7 +846,7 @@ fn prepare_root_core(
         authority: authority_descriptor(context.authority),
         node_unit: registered.node_unit.clone(),
         search_configuration_sha256: registered.search_configuration_sha256.clone(),
-        coordinator_policy_sha256: declarations.coordinator.policy_sha256.clone(),
+        coordinator_policy_sha256: declarations.coordinator.policy_sha256.to_owned(),
         original_go: RoventResolvedGo {
             coverage: RoventOriginalGoCoverage::FullOriginalGo,
             requested_nodes: context.requested_nodes,

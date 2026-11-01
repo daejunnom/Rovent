@@ -12,7 +12,7 @@ impl<'a> SourceDeclarations<'a> {
         Self {
             canonical_sha256: &lock.canonical_sha256,
             search: &m.engine.search,
-            coordinator: &m.coordinator,
+            coordinator: m.coordinator.view(),
             resources: &m.resources,
             wall_time_max_ms: m.wall_time_max_ms,
             cleanup_max_ms: m.cleanup_max_ms,

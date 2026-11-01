@@ -212,7 +212,7 @@ impl RoventTypedStartupV5 {
         };
         self.fields().admit_shared_with_system(
             &manifest.engine,
-            &manifest.coordinator,
+            manifest.coordinator.view(),
             manifest.cleanup_max_ms,
             system,
             || self.configuration_digest(),

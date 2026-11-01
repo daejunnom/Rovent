@@ -19,9 +19,11 @@ pub struct RoventExecutionManifestV3 {
     pub contract_revision: String,
     pub run_id: String,
     pub purpose: RoventPurpose,
-    pub engine: RoventEngineDeclaration,
+    /// None explicitly means the build did not register a source commit.
+    /// It never supplies a substitute SHA for reproduction.
+    pub engine: RoventEngineDeclaration<Option<String>>,
     pub resources: RoventResourcePlan,
-    pub coordinator: RoventCoordinatorDeclaration,
+    pub coordinator: RoventCoordinatorDeclarationV3,
     pub wall_time_max_ms: u64,
     pub cleanup_max_ms: u64,
     pub output_bytes_max: u64,

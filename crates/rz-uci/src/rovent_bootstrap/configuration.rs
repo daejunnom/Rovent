@@ -17,9 +17,9 @@ use rz_eval::error::{BackendError, FailureKind as K};
 use rz_eval::onnx::{NativeLoadingProfile, Provider};
 use rz_eval::pals_onnx::{PalsCuDnnConvSearch, PalsOnnxConfig};
 use rz_experiments::{
-    ArtifactRef, RoventCoordinatorDeclaration, RoventDevice, RoventEngineDeclaration,
-    RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventResearcher,
-    RoventRootTieDeclarationV2, RoventRootTiePolicyV2, SystemPlatformV6, SystemRuntimeSpecV6,
+    ArtifactRef, RoventCoordinatorView, RoventDevice, RoventEngineDeclaration, RoventInputLock,
+    RoventInputLockV2, RoventInputLockV3, RoventResearcher, RoventRootTieDeclarationV2,
+    RoventRootTiePolicyV2, SystemPlatformV6, SystemRuntimeSpecV6,
 };
 use rz_runtime::adaptive::{AdaptiveController, ControllerConfig, CoordinatorPolicy, LogicalCpu};
 use rz_search::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile};
@@ -138,7 +138,7 @@ impl StartupConfigurationDocument {
         }
         config.fields().admit_shared(
             &manifest.engine,
-            &manifest.coordinator,
+            manifest.coordinator.view(),
             manifest.cleanup_max_ms,
             || config.configuration_digest(),
             || config.search_configuration_digest(),
@@ -1067,17 +1067,17 @@ impl ConfigurationFields<'_> {
         lock.validate().map_err(|_| invalid("Rovent input lock"))?;
         self.admit_shared(
             &lock.manifest.engine,
-            &lock.manifest.coordinator,
+            lock.manifest.coordinator.view(),
             lock.manifest.cleanup_max_ms,
             configuration_digest,
             search_configuration_digest,
             nnuec_conditions_digest,
         )
     }
-    fn admit_shared(
+    fn admit_shared<S>(
         &self,
-        engine: &RoventEngineDeclaration,
-        declaration: &RoventCoordinatorDeclaration,
+        engine: &RoventEngineDeclaration<S>,
+        declaration: RoventCoordinatorView<'_>,
         cleanup_max_ms: u64,
         configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
         search_configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
@@ -1096,10 +1096,10 @@ impl ConfigurationFields<'_> {
 
     // Keep the existing admission inputs explicit across both runtime profiles.
     #[allow(clippy::too_many_arguments)]
-    fn admit_shared_with_system(
+    fn admit_shared_with_system<S>(
         &self,
-        engine: &RoventEngineDeclaration,
-        declaration: &RoventCoordinatorDeclaration,
+        engine: &RoventEngineDeclaration<S>,
+        declaration: RoventCoordinatorView<'_>,
         cleanup_max_ms: u64,
         system: Option<&SystemRuntimeSpecV6>,
         configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,

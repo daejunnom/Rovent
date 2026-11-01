@@ -315,19 +315,19 @@ mod linux {
         let mut engine = lock.manifest.engine.clone();
         engine.source_components = compiled_process_source_components_v3().unwrap();
         let policy = SourceEvidencePolicy::FunctionalWithSourceObservation;
-        let observed = observe_v3_source_evidence(&engine, policy, Digest([3; 32]));
+        let observed = observe_v3_source_evidence(&engine, policy, Some(Digest([3; 32])));
         assert_eq!(observed.component_status, SourceEvidenceStatus::Verified);
-        assert_eq!(observed.declared_aggregate, Digest([3; 32]));
+        assert_eq!(observed.declared_aggregate, Some(Digest([3; 32])));
         engine.source_components.remove("model_native_v3");
         assert_eq!(
-            observe_v3_source_evidence(&engine, policy, Digest([3; 32])).component_status,
+            observe_v3_source_evidence(&engine, policy, Some(Digest([3; 32]))).component_status,
             SourceEvidenceStatus::Missing
         );
         engine
             .source_components
             .insert("model_native_v3".into(), "0".repeat(64));
         assert_eq!(
-            observe_v3_source_evidence(&engine, policy, Digest([3; 32])).component_status,
+            observe_v3_source_evidence(&engine, policy, Some(Digest([3; 32]))).component_status,
             SourceEvidenceStatus::Mismatch
         );
     }
@@ -621,7 +621,7 @@ mod linux {
                 identity_source: ExecutableIdentitySourceV1::LinuxProcSelfExe,
             },
             input_lock: Digest([1; 32]),
-            source_aggregate: Digest([2; 32]),
+            source_aggregate: Some(Digest([2; 32])),
             source_evidence_v3: None,
         };
         let original = Arc::new(values());

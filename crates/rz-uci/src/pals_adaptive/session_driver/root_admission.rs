@@ -216,6 +216,7 @@ where
             .rovent
             .as_ref()
             .ok_or_else(|| failure("RoventStartupPolicy", "no actual Rovent PCR profile"))?;
+        let profile = profile.common();
         let profile_lock: String = profile
             .input_lock
             .0
@@ -223,6 +224,11 @@ where
             .map(|byte| format!("{byte:02x}"))
             .collect();
         if self.rovent_root_policy.is_some()
+            || self
+                .rovent
+                .as_ref()
+                .and_then(SessionPcrProfile::fixed)
+                .is_none()
             || self.rovent_root_policy_v2.is_some()
             || self.rovent_root_policy_v3.is_some()
             || self.closed.load(Ordering::Acquire)
@@ -291,6 +297,7 @@ where
             .rovent
             .as_ref()
             .ok_or_else(|| failure("RoventStartupPolicy", "no actual Rovent PCR profile"))?;
+        let profile = profile.common();
         let profile_lock: String = profile
             .input_lock
             .0
@@ -298,6 +305,11 @@ where
             .map(|byte| format!("{byte:02x}"))
             .collect();
         if self.rovent_root_policy.is_some()
+            || self
+                .rovent
+                .as_ref()
+                .and_then(SessionPcrProfile::fixed)
+                .is_none()
             || self.rovent_root_policy_v2.is_some()
             || self.rovent_root_policy_v3.is_some()
             || self.closed.load(Ordering::Acquire)
@@ -412,6 +424,7 @@ where
             .rovent
             .as_ref()
             .ok_or_else(|| failure("RoventStartupPolicy", "no actual Rovent PCR profile"))?;
+        let profile = profile.common();
         let profile_lock: String = profile
             .input_lock
             .0
@@ -419,6 +432,7 @@ where
             .map(|byte| format!("{byte:02x}"))
             .collect();
         if self.rovent_root_policy.is_some()
+            || !matches!(self.rovent.as_ref(), Some(SessionPcrProfile::LateBound(_)))
             || self.rovent_root_policy_v2.is_some()
             || self.rovent_root_policy_v3.is_some()
             || self.closed.load(Ordering::Acquire)
@@ -568,6 +582,15 @@ where
             .map_err(|error| SearchSessionFailure::debug("RoventRootAdmissionV3", &error))?;
             return Ok(Some(RoventPcrRootSource::OriginalV3(source)));
         }
-        Ok(Some(RoventPcrRootSource::Legacy(profile.root_budget)))
+        let budget = profile
+            .fixed()
+            .map(|fixed| fixed.root_budget)
+            .ok_or_else(|| {
+                failure(
+                    "RoventRootAdmission",
+                    "fixed root budget is absent for legacy root",
+                )
+            })?;
+        Ok(Some(RoventPcrRootSource::Legacy(budget)))
     }
 }

@@ -442,7 +442,7 @@ fn admit_original<'a>(
             "compiled_commit": evidence.compiled_commit,
             "declared_components": evidence.declared_components,
             "compiled_components": evidence.compiled_components,
-            "declared_aggregate_sha256": super::super::hex(evidence.declared_aggregate.0),
+            "declared_aggregate_sha256": evidence.declared_aggregate.map(|value| super::super::hex(value.0)),
         });
         if let Err(failure) =
             writer.write_bytes("source-observation.v3.json", json.to_string().as_bytes())

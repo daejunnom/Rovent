@@ -105,10 +105,10 @@ type LoadedOriginV3 = VersionedLoadedOrigin<
 /// event never proves inference, teacher completion or a physical GPU fence.
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 #[allow(clippy::too_many_arguments)]
-fn collection_ready_identity<Q: crate::pals_adaptive::NativeQuestionProjection>(
+fn collection_ready_identity<Q: crate::pals_adaptive::NativeQuestionProjection, S>(
     service: &crate::rovent_bootstrap::RoventNativeService<Q>,
     snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
-    engine: &rz_experiments::RoventEngineDeclaration,
+    engine: &rz_experiments::RoventEngineDeclaration<S>,
     purpose: rz_experiments::RoventPurpose,
     input_lock: Digest,
     weights: [u8; 32],

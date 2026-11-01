@@ -396,7 +396,7 @@ impl RoventResourcePlan {
     pub fn canonical_sha256(&self) -> Result<String, ManifestError> {
         Ok(digest(&canonical(&("rz-rovent-resource-plan/1", self))?))
     }
-    fn validate(&self, engine: &RoventEngineDeclaration) -> Result<(), ManifestError> {
+    fn validate<S>(&self, engine: &RoventEngineDeclaration<S>) -> Result<(), ManifestError> {
         require(
             (1..=256_000).contains(&self.cpu_quota_millicpus)
                 && (1..=32).contains(&self.pools.len())
@@ -541,9 +541,10 @@ impl RoventSearchDeclaration {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct RoventEngineDeclaration {
-    pub source_commit: String,
+#[serde(deny_unknown_fields, bound(deserialize = "S: Deserialize<'de>"))]
+pub struct RoventEngineDeclaration<S = String> {
+    #[serde(deserialize_with = "required_source_commit")]
+    pub source_commit: S,
     pub source_components: BTreeMap<String, String>,
     pub binary: ArtifactRef,
     #[serde(with = "ExecutionModeWire")]
@@ -554,7 +555,44 @@ pub struct RoventEngineDeclaration {
     pub nnuec: Option<RoventNnuecPin>,
     pub search: RoventSearchDeclaration,
 }
-impl RoventEngineDeclaration {
+fn required_source_commit<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer)
+}
+
+// These format parameters are intentionally sealed to the published legacy
+// and /3 representations; an external type must not weaken validation.
+mod sealed {
+    pub trait SourceCommit {}
+    impl SourceCommit for String {}
+    impl SourceCommit for Option<String> {}
+
+    pub trait Coordinator {}
+    impl Coordinator for super::RoventCoordinatorDeclaration {}
+    impl Coordinator for super::RoventCoordinatorDeclarationV3 {}
+}
+
+/// The older domains admit only a declared exact SHA; the new /3 domain may
+/// explicitly declare null when the actual source commit is unavailable.
+#[doc(hidden)]
+pub trait RoventSourceCommit: sealed::SourceCommit {
+    fn valid_source_commit(&self) -> bool;
+}
+impl RoventSourceCommit for String {
+    fn valid_source_commit(&self) -> bool {
+        hex(self, 40)
+    }
+}
+impl RoventSourceCommit for Option<String> {
+    fn valid_source_commit(&self) -> bool {
+        self.as_ref().is_none_or(|value| hex(value, 40))
+    }
+}
+
+impl<S: RoventSourceCommit> RoventEngineDeclaration<S> {
     fn validate(&self, purpose: RoventPurpose) -> Result<(), ManifestError> {
         self.validate_with_system_cuda(purpose, false)
     }
@@ -564,7 +602,7 @@ impl RoventEngineDeclaration {
         system_cuda: bool,
     ) -> Result<(), ManifestError> {
         require(
-            hex(&self.source_commit, 40)
+            self.source_commit.valid_source_commit()
                 && (1..=64).contains(&self.source_components.len())
                 && self
                     .source_components
@@ -622,14 +660,14 @@ impl RoventEngineDeclaration {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct RoventExecutionManifest {
+pub struct RoventExecutionManifest<S = String, C = RoventCoordinatorDeclaration> {
     pub domain: String,
     pub contract_revision: String,
     pub run_id: String,
     pub purpose: RoventPurpose,
-    pub engine: RoventEngineDeclaration,
+    pub engine: RoventEngineDeclaration<S>,
     pub resources: RoventResourcePlan,
-    pub coordinator: RoventCoordinatorDeclaration,
+    pub coordinator: C,
     pub wall_time_max_ms: u64,
     pub cleanup_max_ms: u64,
     pub output_bytes_max: u64,
@@ -645,6 +683,8 @@ impl RoventExecutionManifest {
     pub fn validate(&self) -> Result<(), ManifestError> {
         self.validate_with_system_cuda(false)
     }
+}
+impl<S: RoventSourceCommit, C: RoventCoordinatorRecord> RoventExecutionManifest<S, C> {
     fn validate_with_system_cuda(&self, system_cuda: bool) -> Result<(), ManifestError> {
         require(
             self.domain == ROVENT_EXECUTION_DOMAIN
@@ -658,9 +698,9 @@ impl RoventExecutionManifest {
             self.engine.validate(self.purpose)?;
         }
         self.resources.validate(&self.engine)?;
-        self.coordinator.validate()?;
+        self.coordinator.validate_record()?;
         require(
-            !self.engine.mode.has_native_r() || self.coordinator.cpu_credit_limit > 0,
+            !self.engine.mode.has_native_r() || self.coordinator.view().cpu_credit_limit > 0,
             "P-C-R needs a nonzero native CPU credit limit",
         )?;
         require(
@@ -676,6 +716,8 @@ impl RoventExecutionManifest {
         }
         Ok(())
     }
+}
+impl RoventExecutionManifest {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
         self.validate()?;
         canonical(&(ROVENT_CANONICAL_DOMAIN, self))
@@ -710,12 +752,20 @@ pub struct RoventCoordinatorDeclaration {
     pub original_root_budget_sha256: String,
     pub original_deadline_seal_sha256: String,
 }
-impl RoventCoordinatorDeclaration {
-    fn validate(&self) -> Result<(), ManifestError> {
+/// Shared declarations only; root seals belong to the actual root owner.
+#[derive(Clone, Copy, Debug)]
+pub struct RoventCoordinatorView<'a> {
+    pub policy_sha256: &'a str,
+    pub questions_max: u32,
+    pub ancestor_depth_max: u32,
+    pub waiting_jobs_max: u32,
+    pub role_tickets_max: u32,
+    pub cpu_credit_limit: u64,
+}
+impl RoventCoordinatorView<'_> {
+    fn validate(self) -> Result<(), ManifestError> {
         require(
-            sha(&self.policy_sha256)
-                && sha(&self.original_root_budget_sha256)
-                && sha(&self.original_deadline_seal_sha256)
+            sha(self.policy_sha256)
                 && (1..=65_536).contains(&self.questions_max)
                 && (1..=1024).contains(&self.ancestor_depth_max)
                 && self.ancestor_depth_max <= self.questions_max
@@ -723,6 +773,72 @@ impl RoventCoordinatorDeclaration {
                 && (1..=1024).contains(&self.role_tickets_max),
             "invalid bounded reciprocal coordinator/root credit declaration",
         )
+    }
+}
+
+/// New /3 startup declarations do not contain future root seals.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventCoordinatorDeclarationV3 {
+    pub policy_sha256: String,
+    pub questions_max: u32,
+    pub ancestor_depth_max: u32,
+    pub waiting_jobs_max: u32,
+    pub role_tickets_max: u32,
+    pub cpu_credit_limit: u64,
+}
+
+#[doc(hidden)]
+pub trait RoventCoordinatorRecord: sealed::Coordinator {
+    fn view(&self) -> RoventCoordinatorView<'_>;
+    fn validate_record(&self) -> Result<(), ManifestError>;
+}
+
+impl RoventCoordinatorDeclaration {
+    pub fn view(&self) -> RoventCoordinatorView<'_> {
+        RoventCoordinatorView {
+            policy_sha256: &self.policy_sha256,
+            questions_max: self.questions_max,
+            ancestor_depth_max: self.ancestor_depth_max,
+            waiting_jobs_max: self.waiting_jobs_max,
+            role_tickets_max: self.role_tickets_max,
+            cpu_credit_limit: self.cpu_credit_limit,
+        }
+    }
+    fn validate(&self) -> Result<(), ManifestError> {
+        self.view().validate()?;
+        require(
+            sha(&self.original_root_budget_sha256) && sha(&self.original_deadline_seal_sha256),
+            "invalid bounded reciprocal coordinator/root credit declaration",
+        )
+    }
+}
+impl RoventCoordinatorDeclarationV3 {
+    pub fn view(&self) -> RoventCoordinatorView<'_> {
+        RoventCoordinatorView {
+            policy_sha256: &self.policy_sha256,
+            questions_max: self.questions_max,
+            ancestor_depth_max: self.ancestor_depth_max,
+            waiting_jobs_max: self.waiting_jobs_max,
+            role_tickets_max: self.role_tickets_max,
+            cpu_credit_limit: self.cpu_credit_limit,
+        }
+    }
+}
+impl RoventCoordinatorRecord for RoventCoordinatorDeclaration {
+    fn view(&self) -> RoventCoordinatorView<'_> {
+        self.view()
+    }
+    fn validate_record(&self) -> Result<(), ManifestError> {
+        self.validate()
+    }
+}
+impl RoventCoordinatorRecord for RoventCoordinatorDeclarationV3 {
+    fn view(&self) -> RoventCoordinatorView<'_> {
+        self.view()
+    }
+    fn validate_record(&self) -> Result<(), ManifestError> {
+        self.view().validate()
     }
 }
 

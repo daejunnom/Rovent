@@ -146,7 +146,7 @@ where
                     })?
                     .is_none();
             let own_board = self.rovent.as_ref().is_some_and(|profile| {
-                profile.mode.has_native_r()
+                profile.common().mode.has_native_r()
                     && matches!(
                         policy.lock.manifest.engine.researcher,
                         Some(rz_experiments::RoventResearcher::Own { .. })

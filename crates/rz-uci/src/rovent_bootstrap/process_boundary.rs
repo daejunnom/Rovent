@@ -316,11 +316,11 @@ pub struct SourceEvidenceV3 {
     pub policy: SourceEvidencePolicy,
     pub commit_status: SourceEvidenceStatus,
     pub component_status: SourceEvidenceStatus,
-    pub declared_commit: String,
+    pub declared_commit: Option<String>,
     pub compiled_commit: Option<String>,
     pub declared_components: BTreeMap<String, String>,
     pub compiled_components: Option<BTreeMap<String, String>>,
-    pub declared_aggregate: Digest,
+    pub declared_aggregate: Option<Digest>,
 }
 
 fn verify_commit_registration(declared: &str) -> Result<(), ProcessBoundaryError> {
@@ -353,7 +353,7 @@ pub struct VerifiedRoventProcessBoundary<'a> {
 struct ProcessBoundaryObservation {
     executable: ExecutableIdentityV1,
     input_lock: Digest,
-    source_aggregate: Digest,
+    source_aggregate: Option<Digest>,
     source_evidence_v3: Option<SourceEvidenceV3>,
 }
 impl fmt::Debug for VerifiedRoventProcessBoundary<'_> {
@@ -373,7 +373,9 @@ impl VerifiedRoventProcessBoundary<'_> {
         &self.observation.executable
     }
     pub fn source_aggregate_digest(&self) -> Digest {
-        self.observation.source_aggregate
+        self.observation
+            .source_aggregate
+            .expect("legacy source aggregate is mandatory")
     }
     pub fn registered_source_commit(&self) -> &str {
         &self.lock.manifest.engine.source_commit
@@ -614,7 +616,9 @@ impl VerifiedRoventProcessBoundaryV2<'_> {
         &self.observation.executable
     }
     pub fn source_aggregate_digest(&self) -> Digest {
-        self.observation.source_aggregate
+        self.observation
+            .source_aggregate
+            .expect("legacy source aggregate is mandatory")
     }
     pub fn registered_source_commit(&self) -> &str {
         &self.lock.manifest.engine.source_commit
@@ -763,11 +767,11 @@ impl VerifiedRoventProcessBoundaryV3<'_> {
     pub fn executable_identity(&self) -> &ExecutableIdentityV1 {
         &self.observation.executable
     }
-    pub fn source_aggregate_digest(&self) -> Digest {
+    pub fn source_aggregate_digest(&self) -> Option<Digest> {
         self.observation.source_aggregate
     }
-    pub fn registered_source_commit(&self) -> &str {
-        &self.lock.manifest.engine.source_commit
+    pub fn registered_source_commit(&self) -> Option<&str> {
+        self.lock.manifest.engine.source_commit.as_deref()
     }
     pub fn source_scope(&self) -> &'static str {
         PROCESS_SOURCE_SCOPE_V3
@@ -1055,8 +1059,22 @@ pub fn verify_actual_process_boundary<'a>(
 /// Actual process observation shared by typed lock callers after they have
 /// validated their original lock. This private helper does not itself issue a
 /// public boundary or replace the original lock/descriptor/control owners.
-fn verify_actual_process_observation(
-    engine: &RoventEngineDeclaration,
+trait SourceCommitView {
+    fn source_commit(&self) -> Option<&str>;
+}
+impl SourceCommitView for String {
+    fn source_commit(&self) -> Option<&str> {
+        Some(self.as_str())
+    }
+}
+impl SourceCommitView for Option<String> {
+    fn source_commit(&self) -> Option<&str> {
+        self.as_deref()
+    }
+}
+
+fn verify_actual_process_observation<S: SourceCommitView>(
+    engine: &RoventEngineDeclaration<S>,
     canonical_sha256: &str,
     binary: &ArtifactRef,
     original_binary: &File,
@@ -1072,7 +1090,12 @@ fn verify_actual_process_observation(
     )?;
     match source_profile {
         SourceProfile::Historical => {
-            verify_commit_registration(&engine.source_commit)?;
+            verify_commit_registration(engine.source_commit.source_commit().ok_or_else(|| {
+                fail(
+                    ProcessBoundaryFailure::SourceCommitRegistration,
+                    "source commit missing",
+                )
+            })?)?;
             verify_component_declaration(
                 &engine.source_components,
                 engine.researcher.as_ref(),
@@ -1080,7 +1103,12 @@ fn verify_actual_process_observation(
             )?;
         }
         SourceProfile::SystemV3(SourceEvidencePolicy::StrictReproducibility) => {
-            verify_commit_registration(&engine.source_commit)?;
+            verify_commit_registration(engine.source_commit.source_commit().ok_or_else(|| {
+                fail(
+                    ProcessBoundaryFailure::SourceCommitRegistration,
+                    "source commit missing",
+                )
+            })?)?;
             verify_component_declaration_v3(
                 &engine.source_components,
                 engine.researcher.as_ref(),
@@ -1140,11 +1168,14 @@ fn verify_actual_process_observation(
             ProcessBoundaryFailure::WorkingDirectory,
             "original process working directory changed",
         )?;
-        let source_aggregate = rz_experiments::rovent_source_aggregate_sha256(
-            &engine.source_commit,
-            &engine.source_components,
-        )
-        .map_err(|_| fail(ProcessBoundaryFailure::SourceComponent, "source aggregate"))?;
+        let source_aggregate = engine
+            .source_commit
+            .source_commit()
+            .map(|commit| {
+                rz_experiments::rovent_source_aggregate_sha256(commit, &engine.source_components)
+                    .map_err(|_| fail(ProcessBoundaryFailure::SourceComponent, "source aggregate"))
+            })
+            .transpose()?;
         let parse = |value: &str| {
             rz_eval::asset::parse_sha256(value)
                 .map(Digest)
@@ -1156,7 +1187,7 @@ fn verify_actual_process_observation(
                 })
         };
         let input_lock = parse(canonical_sha256)?;
-        let source_aggregate = parse(&source_aggregate)?;
+        let source_aggregate = source_aggregate.as_deref().map(parse).transpose()?;
         let source_evidence_v3 = match source_profile {
             SourceProfile::Historical => None,
             SourceProfile::SystemV3(policy) => {
@@ -1177,10 +1208,10 @@ fn hex(bytes: [u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn observe_v3_source_evidence(
-    engine: &RoventEngineDeclaration,
+fn observe_v3_source_evidence<S: SourceCommitView>(
+    engine: &RoventEngineDeclaration<S>,
     policy: SourceEvidencePolicy,
-    declared_aggregate: Digest,
+    declared_aggregate: Option<Digest>,
 ) -> SourceEvidenceV3 {
     let compiled = env!("RZ_PALS_COMPILED_SOURCE_COMMIT");
     let valid_commit = |value: &str| {
@@ -1190,11 +1221,12 @@ fn observe_v3_source_evidence(
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
     let compiled_commit = valid_commit(compiled).then(|| compiled.to_owned());
-    let commit_status = if !valid_commit(&engine.source_commit) {
+    let declared_commit = engine.source_commit.source_commit();
+    let commit_status = if declared_commit.is_none_or(|value| !valid_commit(value)) {
         SourceEvidenceStatus::Missing
     } else if compiled_commit.is_none() {
         SourceEvidenceStatus::Unavailable
-    } else if verify_commit_registration(&engine.source_commit).is_ok() {
+    } else if declared_commit.is_some_and(|commit| verify_commit_registration(commit).is_ok()) {
         SourceEvidenceStatus::Verified
     } else {
         SourceEvidenceStatus::Mismatch
@@ -1221,7 +1253,7 @@ fn observe_v3_source_evidence(
         policy,
         commit_status,
         component_status,
-        declared_commit: engine.source_commit.clone(),
+        declared_commit: declared_commit.map(str::to_owned),
         compiled_commit,
         declared_components: engine.source_components.clone(),
         compiled_components: components,

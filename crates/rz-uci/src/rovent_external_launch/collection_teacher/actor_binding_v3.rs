@@ -21,6 +21,8 @@ const FROZEN_ACTOR_DOMAIN: &str = "rz-rovent-frozen-teacher-actor/1";
 #[derive(Debug)]
 pub enum TeacherActorBindingErrorV3 {
     Invalid(&'static str),
+    /// Corpus source matching is unavailable without a declared source ID.
+    SourceIdentityUnavailable,
     RootObservation(rz_contracts::ContractError),
     Source {
         stage: &'static str,
@@ -36,6 +38,7 @@ impl std::fmt::Display for TeacherActorBindingErrorV3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(detail) => write!(f, "teacher actor binding: {detail}"),
+            Self::SourceIdentityUnavailable => write!(f, "teacher source identity unavailable"),
             Self::RootObservation(error) => write!(f, "teacher root observation: {error}"),
             Self::Source { stage, error } => write!(f, "teacher source {stage}: {error}"),
             Self::Manifest { stage, error } => write!(f, "teacher manifest {stage}: {error}"),
@@ -199,8 +202,14 @@ pub fn bind_collection_teacher_actor_v3(
         cleanup_until,
         cancellation: Arc::clone(&context.control.cancellation),
     };
+    let source_commit = lock
+        .manifest
+        .engine
+        .source_commit
+        .as_deref()
+        .ok_or(TeacherActorBindingErrorV3::SourceIdentityUnavailable)?;
     let source_declaration = rz_experiments::rovent_source_aggregate_sha256(
-        &lock.manifest.engine.source_commit,
+        source_commit,
         &lock.manifest.engine.source_components,
     )
     .map_err(|error| TeacherActorBindingErrorV3::Manifest {
@@ -216,7 +225,7 @@ pub fn bind_collection_teacher_actor_v3(
         || !preload.matches_v3_origin(lock, startup_control)
         || until > cleanup_until
         || !root_accepts
-        || manifest.source_commit != lock.manifest.engine.source_commit
+        || manifest.source_commit != source_commit
         || manifest.source_sha256 != source_declaration
     {
         return Err(TeacherActorBindingErrorV3::Invalid(

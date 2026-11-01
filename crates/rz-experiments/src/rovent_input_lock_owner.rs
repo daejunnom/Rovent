@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use crate::{
-    ArtifactRef, ManifestError, RoventCoordinatorDeclaration, RoventEngineDeclaration,
+    ArtifactRef, ManifestError, RoventCoordinatorView, RoventEngineDeclaration,
     RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventPurpose, RoventResourcePlan,
 };
 
@@ -36,6 +36,22 @@ pub struct RoventOriginalInputLockError<T> {
 /// Borrowed common declaration fields. They are references into the original
 /// lock, not a synthesized manifest or canonical representation. `/2`-specific
 /// policy and startup fields remain available through their versioned accessors.
+/// Borrow the original typed engine without inventing a missing source commit.
+#[derive(Clone, Copy, Debug)]
+pub enum RoventEngineView<'a> {
+    Legacy(&'a RoventEngineDeclaration),
+    V3(&'a RoventEngineDeclaration<Option<String>>),
+}
+
+impl RoventEngineView<'_> {
+    pub fn source_commit(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(engine) => Some(&engine.source_commit),
+            Self::V3(engine) => engine.source_commit.as_deref(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RoventInputLockCommon<'a> {
     pub lock_domain: &'a str,
@@ -43,9 +59,9 @@ pub struct RoventInputLockCommon<'a> {
     pub contract_revision: &'a str,
     pub run_id: &'a str,
     pub purpose: RoventPurpose,
-    pub engine: &'a RoventEngineDeclaration,
+    pub engine: RoventEngineView<'a>,
     pub resources: &'a RoventResourcePlan,
-    pub coordinator: &'a RoventCoordinatorDeclaration,
+    pub coordinator: RoventCoordinatorView<'a>,
     pub wall_time_max_ms: u64,
     pub cleanup_max_ms: u64,
     pub output_bytes_max: u64,
@@ -130,7 +146,7 @@ impl RoventOriginalInputLock {
 
     pub fn common(&self) -> RoventInputLockCommon<'_> {
         macro_rules! fields {
-            ($lock:expr) => {{
+            ($lock:expr, $engine_variant:ident) => {{
                 let lock = $lock;
                 let manifest = &lock.manifest;
                 RoventInputLockCommon {
@@ -139,9 +155,9 @@ impl RoventOriginalInputLock {
                     contract_revision: &manifest.contract_revision,
                     run_id: &manifest.run_id,
                     purpose: manifest.purpose,
-                    engine: &manifest.engine,
+                    engine: RoventEngineView::$engine_variant(&manifest.engine),
                     resources: &manifest.resources,
-                    coordinator: &manifest.coordinator,
+                    coordinator: manifest.coordinator.view(),
                     wall_time_max_ms: manifest.wall_time_max_ms,
                     cleanup_max_ms: manifest.cleanup_max_ms,
                     output_bytes_max: manifest.output_bytes_max,
@@ -151,9 +167,9 @@ impl RoventOriginalInputLock {
             }};
         }
         match &self.inner {
-            OriginalLock::V1(lock) => fields!(lock),
-            OriginalLock::V2(lock) => fields!(lock),
-            OriginalLock::V3(lock) => fields!(lock),
+            OriginalLock::V1(lock) => fields!(lock, Legacy),
+            OriginalLock::V2(lock) => fields!(lock, Legacy),
+            OriginalLock::V3(lock) => fields!(lock, V3),
         }
     }
 }

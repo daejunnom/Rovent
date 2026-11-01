@@ -6,7 +6,7 @@
 //! must retain and validate its original Rules, go, clock and revocation state.
 
 use crate::{
-    ManifestError, ROVENT_POSITION_VISIT_UNIT, RoventCoordinatorDeclaration, RoventInputLock,
+    ManifestError, ROVENT_POSITION_VISIT_UNIT, RoventCoordinatorView, RoventInputLock,
     RoventInputLockV2, RoventInputLockV3, RoventResourcePlan, RoventSearchDeclaration,
 };
 use rz_contracts::{Digest, rovent::SearchGoal};
@@ -195,7 +195,7 @@ impl RoventRootDescriptor {
             &self.input,
             &lock.canonical_sha256,
             &manifest.engine.search,
-            &manifest.coordinator,
+            manifest.coordinator.view(),
             &manifest.resources,
             ExecutionLimits {
                 wall_time_max_ms: manifest.wall_time_max_ms,
@@ -303,7 +303,7 @@ impl RoventRootDescriptorV2 {
             &self.input,
             &lock.canonical_sha256,
             &manifest.engine.search,
-            &manifest.coordinator,
+            manifest.coordinator.view(),
             &manifest.resources,
             ExecutionLimits {
                 wall_time_max_ms: manifest.wall_time_max_ms,
@@ -411,7 +411,7 @@ impl RoventRootDescriptorV3 {
             &self.input,
             &lock.canonical_sha256,
             &manifest.engine.search,
-            &manifest.coordinator,
+            manifest.coordinator.view(),
             &manifest.resources,
             ExecutionLimits {
                 wall_time_max_ms: manifest.wall_time_max_ms,
@@ -454,7 +454,7 @@ fn verify_declarations(
     input: &RoventRootDescriptorInput,
     canonical_sha256: &str,
     search: &RoventSearchDeclaration,
-    coordinator: &RoventCoordinatorDeclaration,
+    coordinator: RoventCoordinatorView<'_>,
     resources: &RoventResourcePlan,
     execution_limits: ExecutionLimits,
 ) -> Result<(), ManifestError> {

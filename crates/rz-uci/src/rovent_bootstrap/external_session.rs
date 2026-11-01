@@ -14,7 +14,7 @@ use crate::pals_adaptive::{
     RoventExternalSessionAdmissionRejectionV2, RoventExternalSessionAdmissionRejectionV3,
     RoventExternalSessionSource, RoventExternalSessionSources, RoventExternalSessionSourcesV2,
     RoventExternalSessionSourcesV3, RoventExternalSourcePreparationRejection,
-    RoventPcrSessionProfile,
+    RoventPcrSessionProfile, RoventPcrSessionProfileV3,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::{PalsCheckerRegistration, SearchSessionFailure};
@@ -102,8 +102,37 @@ pub fn external_researcher_implementation_digest_from_metadata_v2(
     )
 }
 
+macro_rules! external_profile_version {
+    (fixed, $common:expr, $budget:expr) => {{
+        let common = $common;
+        let root_budget = Digest(
+            rz_eval::asset::parse_sha256($budget)
+                .map_err(|error| SearchSessionFailure::debug("RoventExternalBudget", &error))?,
+        );
+        RoventPcrSessionProfile {
+            mode: common.mode,
+            maximum_goal_plies: common.maximum_goal_plies,
+            input_lock: common.input_lock,
+            root_budget,
+            selective_policy: common.selective_policy,
+            model_namespace: common.model_namespace,
+            frontier_limits: common.frontier_limits,
+            reciprocal: crate::pals_adaptive::RoventReciprocalPolicy {
+                mode: common.mode,
+                root_budget,
+                recipient: rz_contracts::rovent::SearchRecipient::Proposer,
+                max_questions_per_job: 1,
+                node_interval: 1,
+                first_question_sequence: 1,
+            },
+            peers: common.peers,
+        }
+    }};
+    (v3, $common:expr, $budget:expr) => {{ $common }};
+}
+
 macro_rules! build_external_profile {
-    ($pins:expr, $prepared:expr, $external:expr, $identity:expr) => {{
+    ($version:ident, $pins:expr, $prepared:expr, $external:expr, $identity:expr, $root_budget_sha:expr) => {{
         let pins = $pins;
         let prepared = $prepared;
         let external = $external;
@@ -183,12 +212,6 @@ macro_rules! build_external_profile {
                     "effective recheck differs from registered configuration",
                 ));
             }
-            let root_budget = Digest(
-                rz_eval::asset::parse_sha256(
-                    &pins.lock().manifest.coordinator.original_root_budget_sha256,
-                )
-                .map_err(|error| SearchSessionFailure::debug("RoventExternalBudget", &error))?,
-            );
             let implementation = external_researcher_base_implementation_digest(configuration)
                 .map_err(|error| {
                     SearchSessionFailure::debug("RoventExternalConfiguration", &error)
@@ -224,14 +247,13 @@ macro_rules! build_external_profile {
                     .actual()
                     .map_err(|error| SearchSessionFailure::debug("RoventExternalSlice", &error))?,
             };
-            let profile = RoventPcrSessionProfile {
+            let common_profile = RoventPcrSessionProfileV3 {
                 mode: prepared.snapshot().mode,
                 maximum_goal_plies: NonZeroU16::new(
                     configuration.fields().frontier.maximum_goal_plies,
                 )
                 .ok_or_else(|| failure("RoventExternalGoal", "zero registered goal capability"))?,
                 input_lock: prepared.snapshot().input_lock,
-                root_budget,
                 selective_policy: Digest(configuration.search_configuration_digest().map_err(
                     |error| SearchSessionFailure::debug("RoventExternalConfiguration", &error),
                 )?),
@@ -239,21 +261,11 @@ macro_rules! build_external_profile {
                 frontier_limits: configuration.fields().frontier.actual().map_err(|error| {
                     SearchSessionFailure::debug("RoventExternalFrontier", &error)
                 })?,
-                // Shared profile layout only. The external attachment never
-                // installs this own-R callback policy; actual source capabilities
-                // keep external reciprocal callbacks typed unsupported.
-                reciprocal: crate::pals_adaptive::RoventReciprocalPolicy {
-                    mode: prepared.snapshot().mode,
-                    root_budget,
-                    recipient: rz_contracts::rovent::SearchRecipient::Proposer,
-                    max_questions_per_job: 1,
-                    node_interval: 1,
-                    first_question_sequence: 1,
-                },
                 peers: peers
                     .actual()
                     .map_err(|error| SearchSessionFailure::debug("RoventExternalPeers", &error))?,
             };
+            let profile = external_profile_version!($version, common_profile, $root_budget_sha);
             Ok((
                 engine,
                 metadata,
@@ -377,7 +389,18 @@ pub fn external_researcher_session(
             });
         }
     };
-    let build = build_external_profile!(&pins, &prepared, &external, identity);
+    let build = build_external_profile!(
+        fixed,
+        &pins,
+        &prepared,
+        &external,
+        identity,
+        pins.lock()
+            .manifest
+            .coordinator
+            .original_root_budget_sha256
+            .as_str()
+    );
     let (engine, metadata, registration, options, limits, profile) = match build {
         Ok(built) => built,
         Err(failure) => {
@@ -543,7 +566,18 @@ pub(crate) fn external_researcher_session_v2(
             });
         }
     };
-    let build = build_external_profile!(&pins, &prepared, &external, identity);
+    let build = build_external_profile!(
+        fixed,
+        &pins,
+        &prepared,
+        &external,
+        identity,
+        pins.lock()
+            .manifest
+            .coordinator
+            .original_root_budget_sha256
+            .as_str()
+    );
     let (engine, metadata, registration, options, limits, profile) = match build {
         Ok(built) => built,
         Err(mut failure) => {
@@ -711,7 +745,7 @@ pub(crate) fn external_researcher_session_v3(
             });
         }
     };
-    let build = build_external_profile!(&pins, &prepared, &external, identity);
+    let build = build_external_profile!(v3, &pins, &prepared, &external, identity, ());
     let (engine, metadata, registration, options, limits, profile) = match build {
         Ok(built) => built,
         Err(mut failure) => {

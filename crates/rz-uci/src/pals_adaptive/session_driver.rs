@@ -38,7 +38,11 @@ use root_admission::{RoventPcrRootAdmission, RoventPcrRootSource};
 use root_admission::{RoventPcrRootPolicy, RoventPcrRootPolicyV2, RoventPcrRootPolicyV3};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use rovent::ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN;
-pub use rovent::{ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile};
+use rovent::SessionPcrProfile;
+pub use rovent::{
+    ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile,
+    RoventPcrSessionProfileV3,
+};
 #[cfg(feature = "pals-adaptive")]
 pub use rovent::{
     ROVENT_NATIVE_ROOT_V2_DOMAIN, ROVENT_NATIVE_ROOT_V3_DOMAIN, RoventNativeRootReceiptV2,
@@ -723,7 +727,7 @@ where
     >,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     profiled_retirement_commits: Mutex<VecDeque<serde_json::Value>>,
-    rovent: Option<RoventPcrSessionProfile>,
+    rovent: Option<SessionPcrProfile>,
     #[cfg(feature = "pals-adaptive")]
     rovent_root_policy: Option<RoventPcrRootPolicy>,
     #[cfg(feature = "pals-adaptive")]
@@ -839,36 +843,42 @@ where
 
     fn attach_rovent_profile(
         &self,
-        profile: &RoventPcrSessionProfile,
+        profile: &SessionPcrProfile,
         manager: &mut SessionManager<B>,
         context: &SearchSessionContext,
         admission: &RoventPcrRootAdmission,
         _external_source: SessionExternalRootSource<'_>,
     ) -> Result<(), AdaptiveManagerError> {
         match self.researcher_class {
-            SessionResearcherClass::Legacy => profile.attach(
-                manager,
-                context,
-                &self.clock,
-                self.rovent_collection_origin.as_ref(),
-                admission,
-            ),
+            SessionResearcherClass::Legacy => profile
+                .fixed()
+                .ok_or(AdaptiveManagerError::Invalid("own-R fixed profile absent"))?
+                .attach(
+                    manager,
+                    context,
+                    &self.clock,
+                    self.rovent_collection_origin.as_ref(),
+                    admission,
+                ),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            SessionResearcherClass::ProfiledExternal => profile.attach_profiled_external(
-                manager,
-                context,
-                &self.clock,
-                self.rovent_collection_origin.as_ref(),
-                admission,
-                match _external_source {
-                    Some(SessionExternalJoined::V1(source)) => source,
-                    _ => {
-                        return Err(AdaptiveManagerError::Invalid(
-                            "actual /1 external root source is absent",
-                        ));
-                    }
-                },
-            ),
+            SessionResearcherClass::ProfiledExternal => profile
+                .fixed()
+                .ok_or(AdaptiveManagerError::Invalid("/1 fixed profile absent"))?
+                .attach_profiled_external(
+                    manager,
+                    context,
+                    &self.clock,
+                    self.rovent_collection_origin.as_ref(),
+                    admission,
+                    match _external_source {
+                        Some(SessionExternalJoined::V1(source)) => source,
+                        _ => {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "actual /1 external root source is absent",
+                            ));
+                        }
+                    },
+                ),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             SessionResearcherClass::ProfiledExternalV2 => {
                 if self.rovent_collection_origin.is_some() {
@@ -881,13 +891,10 @@ where
                         "actual /2 external root source is absent",
                     ));
                 };
-                profile.attach_profiled_external_v2(
-                    manager,
-                    context,
-                    &self.clock,
-                    admission,
-                    source,
-                )
+                profile
+                    .fixed()
+                    .ok_or(AdaptiveManagerError::Invalid("/2 fixed profile absent"))?
+                    .attach_profiled_external_v2(manager, context, &self.clock, admission, source)
             }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             SessionResearcherClass::ProfiledExternalV3 => {
@@ -899,6 +906,11 @@ where
                 let Some(SessionExternalJoined::V3(source)) = _external_source else {
                     return Err(AdaptiveManagerError::Invalid(
                         "actual /3 external root source is absent",
+                    ));
+                };
+                let SessionPcrProfile::LateBound(profile) = profile else {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "/3 late-bound profile absent",
                     ));
                 };
                 profile.attach_profiled_external_v3(
@@ -2999,6 +3011,9 @@ where
                 )?;
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 if self.rovent_collection_origin_v2.is_some() {
+                    let fixed_profile = profile.fixed().ok_or(AdaptiveManagerError::Invalid(
+                        "V2 board Collection does not support the V3 late-bound profile",
+                    ))?;
                     // Mark before invoking an external hook: it may acquire a
                     // teacher owner even if admission fails or unwinds.
                     board_collection_v2_started = true;
@@ -3009,7 +3024,7 @@ where
                             .ok_or(AdaptiveManagerError::Invalid(
                                 "V2 board root admission absent",
                             ))?,
-                        profile,
+                        fixed_profile,
                     )?;
                 }
             }
@@ -3930,7 +3945,7 @@ where
                 go,
                 &registered.lock,
                 registered.policy,
-                profile.maximum_goal_plies,
+                profile.common().maximum_goal_plies,
             )
             .map_err(|error| {
                 ContractError::new(ErrorCode::InvalidInput, Stage::Admission, error.detail)
@@ -3951,7 +3966,7 @@ where
                 go,
                 lock,
                 registered.policy,
-                profile.maximum_goal_plies,
+                profile.common().maximum_goal_plies,
             )
             .map_err(|error| {
                 ContractError::new(ErrorCode::InvalidInput, Stage::Admission, error.detail)
@@ -3972,7 +3987,7 @@ where
                 go,
                 lock,
                 registered.policy,
-                profile.maximum_goal_plies,
+                profile.common().maximum_goal_plies,
             )
             .map_err(|error| {
                 ContractError::new(ErrorCode::InvalidInput, Stage::Admission, error.detail)
@@ -3985,7 +4000,7 @@ where
     fn search_goal_capability(&self) -> Option<std::num::NonZeroU16> {
         self.rovent
             .as_ref()
-            .map(|profile| profile.maximum_goal_plies)
+            .map(|profile| profile.common().maximum_goal_plies)
     }
     fn finish_session(
         &self,

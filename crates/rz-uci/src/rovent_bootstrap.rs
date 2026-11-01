@@ -1650,14 +1650,14 @@ fn admitted_native_topology_fields(
     coordinator: &RoventCoordinatorDeclaration,
     explicit_purpose: bool,
 ) -> Result<RoventStartupTopology, BackendError> {
-    admitted_native_topology_fields_v3(engine, coordinator, explicit_purpose, false)
+    admitted_native_topology_fields_v3(engine, coordinator.view(), explicit_purpose, false)
 }
 
 /// V3 Collection uses the same model/export for all three role graphs.
 /// Historical V1/V2 admission keeps the original validator-free condition.
-fn admitted_native_topology_fields_v3(
-    engine: &RoventEngineDeclaration,
-    coordinator: &RoventCoordinatorDeclaration,
+fn admitted_native_topology_fields_v3<S>(
+    engine: &RoventEngineDeclaration<S>,
+    coordinator: rz_experiments::RoventCoordinatorView<'_>,
     explicit_purpose: bool,
     collection: bool,
 ) -> Result<RoventStartupTopology, BackendError> {

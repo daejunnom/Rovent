@@ -17,11 +17,14 @@ mod registration {
     use rz_eval::onnx::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
     use rz_experiments::{
         ArtifactRef, NativeRuntimeSourceV6, ROVENT_EXECUTION_V3_DOMAIN,
-        ROVENT_STARTUP_DOCUMENT_V5_DOMAIN, RoventCoordinatorDeclaration, RoventEngineDeclaration,
+        ROVENT_STARTUP_DOCUMENT_V5_DOMAIN, RoventCoordinatorDeclarationV3, RoventEngineDeclaration,
         RoventExecutionManifestV3, RoventPurpose, RoventResourcePlan, RoventRootTieDeclarationV2,
         RoventStartupDocumentV5, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeLockV6,
         SystemRuntimeSpecV6,
     };
+    use rz_position::contracts::{profile_digest, rules_snapshot_semantic_digest};
+    use rz_position::{BoardMove, Position};
+    use rz_uci::parser::{self, Command, ParserLimits, PositionBase};
     use rz_uci::rovent_bootstrap::{
         configuration::v5::{RoventStartupConfigurationV5, RoventTypedStartupV5},
         process_boundary::compiled_process_source_components_v3,
@@ -84,11 +87,13 @@ mod registration {
         #[serde(default)]
         source_verification: SourceVerification,
         contract_revision: String,
+        /// Exact UCI position and history; this is not a live root authority.
+        position_command: String,
         run_id: String,
         purpose: RoventPurpose,
-        engine: RoventEngineDeclaration,
+        engine: RoventEngineDeclaration<Option<String>>,
         resources: RoventResourcePlan,
-        coordinator: RoventCoordinatorDeclaration,
+        coordinator: RoventCoordinatorDeclarationV3,
         wall_time_max_ms: u64,
         cleanup_max_ms: u64,
         output_bytes_max: u64,
@@ -102,6 +107,33 @@ mod registration {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    /// Use the same bounded parser and Rules primitives as the real UCI
+    /// source seal. This prepares only semantic identity, not a live root,
+    /// clock, owner, or search budget capability.
+    fn rules_identity(command: &str) -> Result<(String, String), String> {
+        let parsed = parser::parse(command, ParserLimits::default())
+            .map_err(|error| format!("position command: {error:?}"))?;
+        let Command::Position(position) = parsed else {
+            return Err("position_command must be a UCI position command".into());
+        };
+        let mut position_state = match position.base {
+            PositionBase::StartPos => Position::startpos(),
+            PositionBase::Fen(fen) => {
+                Position::from_fen(&fen).map_err(|error| format!("position FEN: {error:?}"))?
+            }
+        };
+        for (ply, raw_move) in position.moves.iter().enumerate() {
+            let mv = BoardMove::from_uci(raw_move)
+                .map_err(|error| format!("position move syntax at ply {ply}: {error:?}"))?;
+            position_state
+                .make_move(mv)
+                .map_err(|error| format!("illegal position move at ply {ply}: {error:?}"))?;
+        }
+        Ok((
+            hex(&rules_snapshot_semantic_digest(&position_state.snapshot()).0),
+            hex(&profile_digest().0),
+        ))
     }
     fn output_path(root: &Path, name: &str) -> Result<PathBuf, String> {
         if !rz_experiments::pals_private_snapshot_path_v5(name) {
@@ -165,6 +197,10 @@ mod registration {
             );
         }
         let mut req = request(Path::new(&args[1]))?;
+        // Never consume caller-provided digest placeholders as Rules evidence.
+        let (state_and_history, rules_profile) = rules_identity(&req.position_command)?;
+        req.engine.search.root_state_and_history_sha256 = state_and_history;
+        req.engine.search.rules_profile_sha256 = rules_profile;
         let output = Path::new(&args[2]);
         if !output.is_absolute() {
             return Err("output root must be absolute".into());
@@ -261,12 +297,10 @@ mod registration {
             Ok(_) => "mismatch",
         };
         let compiled_commit = env!("RZ_PALS_COMPILED_SOURCE_COMMIT");
-        let commit_status = if compiled_commit == "unregistered" {
-            "unknown"
-        } else if compiled_commit == req.engine.source_commit {
-            "verified"
-        } else {
-            "mismatch"
+        let commit_status = match (compiled_commit, req.engine.source_commit.as_deref()) {
+            ("unregistered", _) | (_, None) => "unknown",
+            (actual, Some(declared)) if actual == declared => "verified",
+            _ => "mismatch",
         };
         if matches!(req.source_verification, SourceVerification::Strict)
             && [component_status, model_source_status, commit_status]

@@ -51,8 +51,13 @@ impl RoventCorpusManifestLockV3 {
         lock.validate()?;
         self.registration.validate()?;
         let engine = &lock.manifest.engine;
-        let source =
-            rovent_source_aggregate_sha256(&engine.source_commit, &engine.source_components)?;
+        // The current corpus registration format requires an exact source
+        // declaration. A functional /3 run may legitimately have no commit;
+        // do not fabricate one or interpret this as a product execution error.
+        let source_commit = engine.source_commit.as_deref().ok_or_else(|| {
+            ManifestError::Integrity("corpus source identity is unavailable".into())
+        })?;
+        let source = rovent_source_aggregate_sha256(source_commit, &engine.source_components)?;
         let runtime = match &lock.manifest.system_runtime_lock.runtime {
             NativeRuntimeSourceV6::SystemCuda(runtime) => runtime,
             NativeRuntimeSourceV6::Cpu => {
@@ -72,7 +77,7 @@ impl RoventCorpusManifestLockV3 {
             self.schema == ROVENT_CORPUS_MANIFEST_LOCK_V3_DOMAIN
                 && lock.manifest.purpose == RoventPurpose::Collection
                 && self.startup_lock_sha256 == lock.canonical_sha256
-                && self.registration.source_commit == engine.source_commit
+                && self.registration.source_commit == source_commit
                 && self.registration.source_sha256 == source
                 && self.registration.runtime_sha256 == core.sha256,
             "corpus /3 lock, declared source or runtime registration differs",

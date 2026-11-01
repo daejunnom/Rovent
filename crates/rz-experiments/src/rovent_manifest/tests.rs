@@ -385,14 +385,34 @@ fn system_runtime_v3_keeps_old_lock_and_startup_domains_distinct() {
     let mut startup = artifact("startup-v5.json");
     startup.sha256 = digest(&bytes);
     startup.bytes = bytes.len() as u64;
+    let old_engine = base.engine;
+    let engine = RoventEngineDeclaration {
+        source_commit: Some(old_engine.source_commit),
+        source_components: old_engine.source_components,
+        binary: old_engine.binary,
+        mode: old_engine.mode,
+        pc: old_engine.pc,
+        researcher: old_engine.researcher,
+        teachers: old_engine.teachers,
+        nnuec: old_engine.nnuec,
+        search: old_engine.search,
+    };
+    let coordinator = RoventCoordinatorDeclarationV3 {
+        policy_sha256: base.coordinator.policy_sha256,
+        questions_max: base.coordinator.questions_max,
+        ancestor_depth_max: base.coordinator.ancestor_depth_max,
+        waiting_jobs_max: base.coordinator.waiting_jobs_max,
+        role_tickets_max: base.coordinator.role_tickets_max,
+        cpu_credit_limit: base.coordinator.cpu_credit_limit,
+    };
     let fresh = RoventExecutionManifestV3 {
         domain: ROVENT_EXECUTION_V3_DOMAIN.into(),
         contract_revision: base.contract_revision,
         run_id: base.run_id,
         purpose: base.purpose,
-        engine: base.engine,
+        engine,
         resources: base.resources,
-        coordinator: base.coordinator,
+        coordinator,
         wall_time_max_ms: base.wall_time_max_ms,
         cleanup_max_ms: base.cleanup_max_ms,
         output_bytes_max: base.output_bytes_max,
@@ -404,6 +424,29 @@ fn system_runtime_v3_keeps_old_lock_and_startup_domains_distinct() {
         own_r_root_tie: old.own_r_root_tie,
         system_runtime_lock: runtime,
     };
+    let mut unknown_source = fresh.clone();
+    unknown_source.engine.source_commit = None;
+    let unknown_lock = unknown_source.lock().unwrap();
+    let mut unknown_json = serde_json::to_value(&unknown_lock).unwrap();
+    assert!(unknown_json["manifest"]["engine"]["source_commit"].is_null());
+    assert_eq!(
+        RoventInputLockV3::from_json(&unknown_json.to_string()).unwrap(),
+        unknown_lock
+    );
+    unknown_json["manifest"]["engine"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_commit");
+    assert!(RoventInputLockV3::from_json(&unknown_json.to_string()).is_err());
+    let mut historical = serde_json::to_value(policy_manifest_v2(
+        manifest(),
+        RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::PcOnly,
+        },
+    ))
+    .unwrap();
+    historical["engine"]["source_commit"] = serde_json::Value::Null;
+    assert!(RoventExecutionManifestV2::from_json(&historical.to_string()).is_err());
     let lock = fresh.lock().unwrap();
     let lock_json = serde_json::to_string(&lock).unwrap();
     assert_eq!(RoventInputLockV3::from_json(&lock_json).unwrap(), lock);
@@ -415,10 +458,8 @@ fn system_runtime_v3_keeps_old_lock_and_startup_domains_distinct() {
     assert!(owner.same_original_owner(&owner.clone()));
     let other = crate::RoventOriginalInputLock::from_v3(std::sync::Arc::new(lock.clone())).unwrap();
     assert!(!owner.same_original_owner(&other));
-    assert!(std::ptr::eq(
-        owner.common().engine,
-        &original.manifest.engine
-    ));
+    assert!(matches!(owner.common().engine,
+        crate::RoventEngineView::V3(engine) if std::ptr::eq(engine, &original.manifest.engine)));
     let mut invalid = lock.clone();
     invalid.canonical_sha256.clear();
     let invalid = std::sync::Arc::new(invalid);
@@ -468,10 +509,8 @@ fn original_versioned_lock_owner_retains_exact_arc_and_borrowed_fields() {
     assert!(!v1.same_original_owner(&v2));
     assert_eq!(v1.common().canonical_sha256, original_v1.canonical_sha256);
     assert_eq!(v2.common().canonical_sha256, original_v2.canonical_sha256);
-    assert!(std::ptr::eq(
-        v2.common().engine,
-        &original_v2.manifest.engine
-    ));
+    assert!(matches!(v2.common().engine,
+        crate::RoventEngineView::Legacy(engine) if std::ptr::eq(engine, &original_v2.manifest.engine)));
     assert!(std::ptr::eq(
         v1.common().resources,
         &original_v1.manifest.resources

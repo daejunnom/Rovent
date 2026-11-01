@@ -48,14 +48,14 @@ pub enum RoventRootTieDeclarationV2 {
 /// *declaration* validator only; no /1 lock or accepted receipt is produced.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct RoventExecutionManifestV2 {
+pub struct RoventExecutionManifestV2<S = String, C = RoventCoordinatorDeclaration> {
     pub domain: String,
     pub contract_revision: String,
     pub run_id: String,
     pub purpose: RoventPurpose,
-    pub engine: RoventEngineDeclaration,
+    pub engine: RoventEngineDeclaration<S>,
     pub resources: RoventResourcePlan,
-    pub coordinator: RoventCoordinatorDeclaration,
+    pub coordinator: C,
     pub wall_time_max_ms: u64,
     pub cleanup_max_ms: u64,
     pub output_bytes_max: u64,
@@ -77,7 +77,10 @@ impl RoventExecutionManifestV2 {
     pub fn validate(&self) -> Result<(), ManifestError> {
         self.validate_with_system_cuda(false)
     }
-
+}
+impl<S: RoventSourceCommit + Clone, C: RoventCoordinatorRecord + Clone>
+    RoventExecutionManifestV2<S, C>
+{
     /// Reuse declaration checks for the separate /3 system-runtime domain.
     /// This never parses, publishes, or converts a /2 lock or receipt.
     pub(super) fn validate_with_system_cuda(&self, system_cuda: bool) -> Result<(), ManifestError> {
@@ -170,7 +173,8 @@ impl RoventExecutionManifestV2 {
             )),
         }
     }
-
+}
+impl RoventExecutionManifestV2 {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
         self.validate()?;
         canonical(&(ROVENT_CANONICAL_V2_DOMAIN, self))

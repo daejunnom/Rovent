@@ -154,7 +154,7 @@ impl PreparedRoventExternalLaunch {
         Self::from_validated_fields(
             &lock.manifest.engine,
             &lock.canonical_sha256,
-            &lock.manifest.coordinator.original_root_budget_sha256,
+            Some(&lock.manifest.coordinator.original_root_budget_sha256),
             slot,
             profile_bytes,
         )
@@ -172,7 +172,7 @@ impl PreparedRoventExternalLaunch {
         let mut launch = Self::from_validated_fields(
             &lock.manifest.engine,
             &lock.canonical_sha256,
-            &lock.manifest.coordinator.original_root_budget_sha256,
+            Some(&lock.manifest.coordinator.original_root_budget_sha256),
             slot,
             profile_bytes,
         )?;
@@ -191,7 +191,7 @@ impl PreparedRoventExternalLaunch {
         let mut launch = Self::from_validated_fields(
             &lock.manifest.engine,
             &lock.canonical_sha256,
-            &lock.manifest.coordinator.original_root_budget_sha256,
+            None,
             slot,
             profile_bytes,
         )?;
@@ -199,10 +199,10 @@ impl PreparedRoventExternalLaunch {
         Ok(launch)
     }
 
-    fn from_validated_fields(
-        engine: &RoventEngineDeclaration,
+    fn from_validated_fields<S>(
+        engine: &RoventEngineDeclaration<S>,
         lock_sha256: &str,
-        root_budget_sha256: &str,
+        root_budget_sha256: Option<&str>,
         slot: RoventExternalSlot,
         profile_bytes: &[u8],
     ) -> Result<Self, CheckerError> {
@@ -229,7 +229,7 @@ impl PreparedRoventExternalLaunch {
         let mut launch = Self::from_pin(pin, profile_bytes)?;
         launch.input_lock_sha256 = Some(lock_sha256.to_owned());
         launch.mode = Some(engine.mode);
-        launch.root_budget = Some(digest(root_budget_sha256)?);
+        launch.root_budget = root_budget_sha256.map(digest).transpose()?;
         Ok(launch)
     }
 
@@ -392,7 +392,10 @@ impl PreparedRoventExternalLaunch {
         if cancel.load(Ordering::Acquire) || Instant::now() >= startup_deadline {
             return Err(invalid("external startup canceled or expired"));
         }
-        if self.input_lock_sha256.is_none() || self.mode.is_none() || self.root_budget.is_none() {
+        if self.input_lock_sha256.is_none()
+            || self.mode.is_none()
+            || (self.root_budget.is_none() && self.original_lock_v3.is_none())
+        {
             return Err(CheckerError::Unsupported(
                 "arena profile cannot start a research worker",
             ));
