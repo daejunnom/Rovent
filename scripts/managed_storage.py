@@ -16,37 +16,15 @@ GiB = 1024 ** 3
 SCHEMA = "rovezero.managed-build.v1"
 MAX_ENTRIES = 100_000
 DEFAULT_OUTPUT_WARNING_BYTES = 18 * GiB
-_warned_output_scopes: set[str] = set()
-
-
 def warn_output_threshold(total, threshold=DEFAULT_OUTPUT_WARNING_BYTES, *, scope="output", observed_bytes=None):
-    """Warn once per over-threshold interval; never grant cleanup authority.
+    """Classify accounting only; it is not a physical-storage warning.
 
-    Diagnostic delivery failures cannot stop the producer or change custody.
-    Per-producer reservations and physical completion checks remain separate.
+    Accounting can include reservations or logical lengths.  Keep its result
+    available to callers without implying that the device crossed a threshold.
+    Actual storage warnings come from the bounded total-usage observation.
     """
-    if type(total) is not int or type(threshold) is not int or total < 0 or threshold <= 0:
-        return False
-    label = scope if type(scope) is str and scope.isascii() and len(scope) <= 64 else "output"
-    if total <= threshold:
-        _warned_output_scopes.discard(label)
-        return False
-    if label not in _warned_output_scopes:
-        if len(_warned_output_scopes) < 64:
-            _warned_output_scopes.add(label)
-        try:
-            import sys
-            observed = (str(observed_bytes) if type(observed_bytes) is int and observed_bytes >= 0
-                        else "unknown")
-            sys.stderr.write(
-                f"rovezero_storage_warning: scope={label} accounted_bytes={total} "
-                f"(may include reservations; not actual disk usage); "
-                f"observed_logical_bytes={observed}; remaining_actual_bytes=unknown; "
-                f"warning_threshold_bytes={threshold}; safe cleanup is due\n"
-            )
-        except Exception:
-            pass
-    return True
+    return (type(total) is int and type(threshold) is int and total >= 0
+            and threshold > 0 and total > threshold)
 
 
 class StorageError(RuntimeError):

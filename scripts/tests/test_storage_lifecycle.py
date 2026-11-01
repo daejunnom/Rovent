@@ -22,6 +22,18 @@ from storage_guard import CatalogGuard, lifetime
 from storage_maintenance import inventory
 
 
+def setUpModule():
+    # These lifecycle fixtures use private temporary catalogs and must never
+    # schedule maintenance based on a real host's storage observation.
+    global _host_usage_patch
+    _host_usage_patch = patch('rovezero_usage_snapshot.confirmed_total_usage_exceeded', return_value=False)
+    _host_usage_patch.start()
+
+
+def tearDownModule():
+    _host_usage_patch.stop()
+
+
 def pin(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -185,6 +197,7 @@ class LifecycleTests(unittest.TestCase):
     def test_persistent_catalog_lock_contention_exits_without_creating_output(self):
         candidate = OutputLease(self.base / "busy", self.source, catalog=self.catalog)
         with patch.object(candidate.guard, "acquire", side_effect=CatalogBusy("busy")) as attempts, \
+             patch("rovezero_usage_snapshot.warn_cached_total_usage"), \
              patch("managed_outputs.time.monotonic", side_effect=[0.0, 0.1, 2.1]), \
              patch("managed_outputs.time.sleep") as sleeper:
             with self.assertRaises(CatalogBusy):

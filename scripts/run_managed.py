@@ -84,13 +84,6 @@ def main(*, output_preservation=None) -> int:
         parser.error("command must resolve to an executable, not a shell batch file")
     command[0] = program
     budget_failure = None
-    output_warning_seen = False
-
-    def note_output_total(total):
-        nonlocal output_warning_seen
-        if type(total) is int and total > DEFAULT_OUTPUT_WARNING_BYTES:
-            output_warning_seen = True
-
     try:
         manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose,
                                output_preservation=output_preservation)
@@ -98,14 +91,14 @@ def main(*, output_preservation=None) -> int:
         try:
             environment = manager.environment()
             if output_preservation is not None:
-                note_output_total(manager.sample_output_budget())
+                manager.sample_output_budget()
             else:
                 output_scope = {"root": str(manager.root), "owner": manager._identity(),
                                 "scope": "inherited_outer_process_group_or_job"}
                 foreign_output_cache = {}
                 manager._foreign_output_cache = foreign_output_cache
-                note_output_total(sample_output_budget(supervisor_scope=output_scope,
-                                                       foreign_cache=foreign_output_cache))
+                sample_output_budget(supervisor_scope=output_scope,
+                                     foreign_cache=foreign_output_cache)
             # The same budget is still sampled while the child runs; the
             # earlier check is not a waiver for a later failure.
         except BaseException as error:
@@ -139,10 +132,10 @@ def main(*, output_preservation=None) -> int:
                 pass
             try:
                 if output_preservation is None:
-                    note_output_total(sample_output_budget(supervisor_scope=output_scope,
-                                                           foreign_cache=foreign_output_cache))
+                    sample_output_budget(supervisor_scope=output_scope,
+                                         foreign_cache=foreign_output_cache)
                 else:
-                    note_output_total(manager.sample_output_budget())
+                    manager.sample_output_budget()
             except StorageError as exc:
                 # run_group preserves the original failure string while it
                 # drains children. Keep this original instance for diagnostics
@@ -161,7 +154,15 @@ def main(*, output_preservation=None) -> int:
         code, gone, failure = run_group(command, manager.source, environment, args.timeout, check_budget)
         receipt = manager.finish(exit_code=code, tree_gone=gone, supervisor_error=failure)
         print("managed_storage=" + json.dumps(receipt, sort_keys=True), file=sys.stderr)
-        if output_warning_seen and gone is True:
+        # The catalog total includes foreign reservations, so it cannot
+        # establish actual disk pressure. Read a fresh advisory snapshot only
+        # after the owner is released, and never let monitoring fail the run.
+        try:
+            from rovezero_usage_snapshot import confirmed_total_usage_exceeded
+            maintenance_due = confirmed_total_usage_exceeded()
+        except Exception:
+            maintenance_due = False
+        if maintenance_due and gone is True:
             # Run only after the original owner finalized and released its
             # guard. A later owner, uncertain physical state, or inaccessible
             # candidate is preserved by the maintenance routine. Maintenance
@@ -171,12 +172,12 @@ def main(*, output_preservation=None) -> int:
                 cleanup = cleanup_completed_builds(manager, seconds=5)
                 try:
                     print("managed_storage_maintenance=" + json.dumps(cleanup, sort_keys=True), file=sys.stderr)
-                except (OSError, ValueError):
+                except BaseException:
                     pass
             except Exception as error:
                 try:
                     print("managed_storage_maintenance_warning=" + type(error).__name__, file=sys.stderr)
-                except (OSError, ValueError):
+                except BaseException:
                     pass
         if budget_failure is not None:
             _emit_storage_failure_observation(budget_failure)

@@ -29,6 +29,28 @@ class SnapshotTests(unittest.TestCase):
         self.path.write_text(json.dumps(value), encoding='utf-8')
         self.path.chmod(0o644)
 
+    def test_only_fresh_proven_allocated_exceedance_enables_maintenance(self):
+        with mock.patch.object(usage.sys, 'platform', 'linux'), \
+             mock.patch.object(usage, 'DEFAULT_THRESHOLD_BYTES', 18):
+            for value, expected in (
+                (dict(self.value), True),
+                (dict(self.value, decision='unknown'), False),
+                (dict(self.value, allocated_bytes_lower_bound=18), False),
+                ({'decision': 'unknown', 'reason': 'stale_or_future'}, False),
+            ):
+                with self.subTest(value=value), mock.patch.object(usage, 'read_snapshot', return_value=value):
+                    self.assertEqual(usage.confirmed_total_usage_exceeded(), expected)
+            with mock.patch.object(usage, 'read_snapshot', side_effect=OSError):
+                self.assertFalse(usage.confirmed_total_usage_exceeded())
+
+    def test_windows_confirmed_exceedance_uses_combined_observation(self):
+        module = types.SimpleNamespace(read_windows_combined=mock.Mock(return_value=dict(self.value)))
+        with mock.patch.dict(usage.sys.modules, {'rovezero_windows_usage_snapshot': module}), \
+             mock.patch.object(usage.sys, 'platform', 'win32'), \
+             mock.patch.object(usage, 'DEFAULT_THRESHOLD_BYTES', 18):
+            self.assertTrue(usage.confirmed_total_usage_exceeded())
+        module.read_windows_combined.assert_called_once_with()
+
     @unittest.skipUnless(hasattr(__import__('os'), 'O_NOFOLLOW'), 'Linux nofollow')
     def test_complete_snapshot_and_stale_snapshot_are_distinct(self):
         self.write(self.value)

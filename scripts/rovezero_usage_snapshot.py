@@ -57,6 +57,9 @@ def read_snapshot(path=SNAPSHOT, *, now=None, max_age_seconds=MAX_AGE_SECONDS,
                 or type(value.get('threshold_bytes')) is not int
                 or value['threshold_bytes'] <= 0):
             raise ValueError('invalid_snapshot')
+        if (value['decision'] == 'exceeded'
+                and value['allocated_bytes_lower_bound'] <= value['threshold_bytes']):
+            raise ValueError('inconsistent_snapshot_decision')
         observed = datetime.fromisoformat(value['observed_at_utc'])
         if observed.tzinfo is None:
             raise ValueError('snapshot_time_without_timezone')
@@ -67,6 +70,30 @@ def read_snapshot(path=SNAPSHOT, *, now=None, max_age_seconds=MAX_AGE_SECONDS,
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def confirmed_total_usage_exceeded():
+    """Check one fresh advisory snapshot without taking an ownership gate.
+
+    A partial observation can prove an exceedance when its allocated lower
+    bound alone crosses the threshold.  Missing, stale, or inconsistent data
+    are not evidence that maintenance is due.
+    """
+    try:
+        if sys.platform == 'win32':
+            from rovezero_windows_usage_snapshot import read_windows_combined
+            value = read_windows_combined()
+        elif sys.platform.startswith('linux'):
+            value = read_snapshot()
+        else:
+            return False
+        allocated = value.get('allocated_bytes_lower_bound')
+        threshold = value.get('threshold_bytes')
+        return (value.get('decision') == 'exceeded'
+                and type(allocated) is int and type(threshold) is int
+                and threshold > 0 and allocated > max(threshold, DEFAULT_THRESHOLD_BYTES))
+    except Exception:
+        return False
 
 
 def warn_cached_total_usage():

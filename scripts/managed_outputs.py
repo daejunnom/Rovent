@@ -262,7 +262,6 @@ class OutputLease:
                 or not 1 <= retention_days <= 365):
             raise StorageError("finite output reservation and retention required")
         self.reserve, self.total_limit, self.days = reserve, total_limit, retention_days
-        self._maintenance_due = False
         self._foreign_usage_snapshot = {}
         # Only the ordinary guard-held lease may reuse admission accounting.
         # The values are reservations, never a physical-usage observation or
@@ -710,7 +709,6 @@ class OutputLease:
             rows = self._rows()
             self._seal_preservation_session()
             actual = self._output_usage(rows, allow_disappearing=True)
-        self._maintenance_due |= actual > self.total_limit
         own_usage = (tree_size(self.output, allow_disappearing=True)
                      if self._quarantine_view is not None else self._last_own_usage)
         if own_usage > self.reserve:
@@ -756,7 +754,16 @@ class OutputLease:
                         self._release_guard(sys.exc_info()[1] or error)
         if error:
             raise error
-        if self._maintenance_due and tree_gone is True and self.outer is None:
+        # Reservation accounting is not physical disk usage. Recheck the
+        # bounded advisory snapshot only after the original guard is released.
+        maintenance_due = False
+        if tree_gone is True and self.outer is None:
+            try:
+                from rovezero_usage_snapshot import confirmed_total_usage_exceeded
+                maintenance_due = confirmed_total_usage_exceeded()
+            except Exception:
+                pass
+        if maintenance_due:
             # The lease guard has been released. This best-effort maintenance
             # never removes output evidence or treats OS exit as a GPU fence.
             try:
@@ -764,12 +771,12 @@ class OutputLease:
                 result = cleanup_completed_builds_for_output(self, seconds=5)
                 try:
                     print("managed_storage_maintenance=" + json.dumps(result, sort_keys=True), file=sys.stderr)
-                except (OSError, ValueError):
+                except BaseException:
                     pass
             except Exception as maintenance_error:
                 try:
                     print("managed_storage_maintenance_warning=" + type(maintenance_error).__name__, file=sys.stderr)
-                except (OSError, ValueError):
+                except BaseException:
                     pass
         return self.record
 

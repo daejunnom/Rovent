@@ -1,5 +1,6 @@
 """After-run cache cleanup tests use only temporary owned fixture trees."""
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import os
 import stat
@@ -189,7 +190,7 @@ class OutputMaintenanceTests(unittest.TestCase):
 
 
 class CompletedCommandMaintenanceTests(unittest.TestCase):
-    def _run(self, *, total, gone=True, finish_error=None, cleanup_error=None):
+    def _run(self, *, total, confirmed=False, gone=True, finish_error=None, cleanup_error=None):
         manager = Mock()
         manager.source = Path("/source")
         manager.finished = False
@@ -219,26 +220,27 @@ class CompletedCommandMaintenanceTests(unittest.TestCase):
              patch.object(run_managed, "ManagedBuild", return_value=manager), \
              patch.object(run_managed, "sample_output_budget", return_value=total), \
              patch.object(run_managed, "run_group", return_value=(7, gone, None)), \
+             patch("rovezero_usage_snapshot.confirmed_total_usage_exceeded", return_value=confirmed), \
              patch.object(maintenance, "cleanup_completed_builds", side_effect=cleanup) as called:
             code = run_managed.main()
         return code, events, called.call_count
 
     def test_above_threshold_after_finish_once(self):
-        code, events, count = self._run(total=run_managed.DEFAULT_OUTPUT_WARNING_BYTES + 1)
+        code, events, count = self._run(total=0, confirmed=True)
         self.assertEqual((code, events, count), (7, ["finish", "maintenance"], 1))
 
     def test_at_threshold_no_maintenance(self):
-        code, events, count = self._run(total=run_managed.DEFAULT_OUTPUT_WARNING_BYTES)
+        code, events, count = self._run(total=run_managed.DEFAULT_OUTPUT_WARNING_BYTES + 1)
         self.assertEqual((code, events, count), (7, ["finish"], 0))
 
     def test_unknown_cleanup_or_finish_failure_never_maintains(self):
         for kwargs in ({"gone": False}, {"finish_error": maintenance.StorageError("finish failed")}):
             with self.subTest(kwargs=kwargs):
-                code, events, count = self._run(total=run_managed.DEFAULT_OUTPUT_WARNING_BYTES + 1, **kwargs)
+                code, events, count = self._run(total=0, confirmed=True, **kwargs)
                 self.assertEqual((code, events, count), (125, ["finish"], 0))
 
     def test_maintenance_exception_preserves_command_exit(self):
-        code, events, count = self._run(total=run_managed.DEFAULT_OUTPUT_WARNING_BYTES + 1,
+        code, events, count = self._run(total=0, confirmed=True,
                                          cleanup_error=RuntimeError("cleanup failed"))
         self.assertEqual((code, events, count), (7, ["finish", "maintenance"], 1))
 
@@ -246,7 +248,6 @@ class CompletedCommandMaintenanceTests(unittest.TestCase):
 class DirectOutputMaintenanceTests(unittest.TestCase):
     def _finish(self, *, due, tree_gone=True, outer=None, cleanup_error=None):
         lease = managed_outputs.OutputLease.__new__(managed_outputs.OutputLease)
-        lease._maintenance_due = due
         lease.record = {"state": "active"}
         lease.outer = outer
         lease.deferred = False
@@ -273,7 +274,8 @@ class DirectOutputMaintenanceTests(unittest.TestCase):
             return {"status": "protected_or_empty"}
 
         lease._release_guard = release
-        with patch.object(maintenance, "cleanup_completed_builds_for_output", side_effect=cleanup) as called:
+        with patch("rovezero_usage_snapshot.confirmed_total_usage_exceeded", return_value=due), \
+             patch.object(maintenance, "cleanup_completed_builds_for_output", side_effect=cleanup) as called:
             lease.finish(status="completed", tree_gone=tree_gone)
         return events, called.call_count, lease.record
 
@@ -293,6 +295,14 @@ class DirectOutputMaintenanceTests(unittest.TestCase):
         events, count, record = self._finish(due=True, cleanup_error=RuntimeError("unavailable"))
         self.assertEqual((events, count), (["release", "maintenance"], 1))
         self.assertEqual(record["status"], "completed")
+
+    def test_missing_diagnostic_stream_never_changes_finished_status(self):
+        with patch.object(managed_outputs, "sys", SimpleNamespace(exc_info=sys.exc_info)):
+            for cleanup_error in (None, RuntimeError("unavailable")):
+                with self.subTest(cleanup_error=cleanup_error):
+                    events, count, record = self._finish(due=True, cleanup_error=cleanup_error)
+                    self.assertEqual((events, count), (["release", "maintenance"], 1))
+                    self.assertEqual(record["status"], "completed")
 
 
 if __name__ == "__main__":
