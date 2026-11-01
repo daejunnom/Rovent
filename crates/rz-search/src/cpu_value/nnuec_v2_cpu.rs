@@ -107,7 +107,8 @@ impl V2CpuValue {
         );
         #[cfg(feature = "nnuec-scalar-diagnostics")]
         super::scalar_diagnostic::capture_reference_input(|| {
-            self.model.reference_input(self.bound.context(), &state.local, position)
+            self.model
+                .reference_input(self.bound.context(), &state.local, position)
         });
         Ok(score)
     }

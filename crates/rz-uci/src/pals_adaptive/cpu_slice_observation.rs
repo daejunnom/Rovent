@@ -168,7 +168,10 @@ pub struct AdaptiveCpuSliceDiagnosticSnapshot {
     pub unavailable: Option<AdaptiveCpuSliceDiagnosticUnavailable>,
     pub records: Vec<AdaptiveCpuSliceObservation>,
     #[cfg(feature = "native-validation-diagnostics")]
-    pub reference_input: Option<(u64, Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>)>,
+    pub reference_input: Option<(
+        u64,
+        Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>,
+    )>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     pub nnuec_chain: Vec<NnuecChainObservation>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -179,7 +182,10 @@ struct State {
     authority: Option<SearchAuthority>,
     records: Vec<AdaptiveCpuSliceObservation>,
     #[cfg(feature = "native-validation-diagnostics")]
-    reference_input: Option<(u64, Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>)>,
+    reference_input: Option<(
+        u64,
+        Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>,
+    )>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     nnuec_chain: Vec<NnuecChainObservation>,
 }
@@ -268,16 +274,26 @@ impl AdaptiveCpuSliceDiagnostic {
         execution: rz_contracts::ExecutionId,
         input: Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>,
     ) {
-        let Ok(mut state) = self.inner.state.try_lock() else { return; };
-        if state.reference_input.is_some() { return; }
-        let Some(original) = state.records.last() else { return; };
-        if original.grant.execution != execution || original.admission_rejected { return; }
+        let Ok(mut state) = self.inner.state.try_lock() else {
+            return;
+        };
+        if state.reference_input.is_some() {
+            return;
+        }
+        let Some(original) = state.records.last() else {
+            return;
+        };
+        if original.grant.execution != execution || original.admission_rejected {
+            return;
+        }
         if input.scalar.is_some_and(|sample| {
             sample.binding != original.scope.job.evaluation_namespace
                 || sample.view_seal != original.scope.view.view_digest.0
                 || sample.record_scope != original.scope.public_context.0
                 || sample.generation != original.scope.authority.root.0
-        }) { return; }
+        }) {
+            return;
+        }
         let sequence = original.sequence;
         state.reference_input = Some((sequence, input));
     }

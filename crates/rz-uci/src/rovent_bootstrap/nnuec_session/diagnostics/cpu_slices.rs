@@ -100,7 +100,10 @@ pub(crate) struct CpuSliceOwnerObservation {
     pub records: Vec<SettledSlice>,
     #[cfg(feature = "native-validation-diagnostics")]
     #[serde(skip)]
-    pub reference_input: Option<(u64, Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>)>,
+    pub reference_input: Option<(
+        u64,
+        Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>,
+    )>,
     // A separate versioned writer consumes these; existing slice JSON stays
     // unchanged. Missing handle never becomes an empty observed chain.
     #[serde(skip)]
@@ -416,7 +419,9 @@ impl From<&AdaptiveCpuSliceObservation> for SettledSlice {
 }
 #[cfg(feature = "native-validation-diagnostics")]
 impl SettledSlice {
-    pub(crate) fn sequence(&self) -> u64 { self.sequence }
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
     pub(crate) fn nnuec_scalar(&self) -> Option<&serde_json::Value> {
         self.nnuec_scalar.as_ref()
     }

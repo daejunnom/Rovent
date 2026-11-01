@@ -1208,11 +1208,14 @@ pub struct CpuWorkerEventObservation {
     original: CpuWorkerEvent,
     timing: Option<CpuWorkerSliceTiming>,
     #[cfg(feature = "nnuec-scalar-diagnostics")]
-    reference_input: Option<Arc<crate::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>>,
+    reference_input:
+        Option<Arc<crate::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>>,
 }
 impl CpuWorkerEventObservation {
     #[cfg(feature = "nnuec-scalar-diagnostics")]
-    pub fn reference_input(&self) -> Option<&Arc<crate::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>> {
+    pub fn reference_input(
+        &self,
+    ) -> Option<&Arc<crate::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>> {
         self.reference_input.as_ref()
     }
     pub fn into_parts(self) -> (CpuWorkerEvent, Option<CpuWorkerSliceTiming>) {
@@ -1868,7 +1871,9 @@ impl CpuWorker {
                     }));
                     let analyze_returned_at = Instant::now();
                     #[cfg(feature = "nnuec-scalar-diagnostics")]
-                    { reference_input = diagnostic.take_reference_input().map(Arc::new); }
+                    {
+                        reference_input = diagnostic.take_reference_input().map(Arc::new);
+                    }
                     owner_timing = Some(CpuWorkerSliceTiming {
                         run_started_at,
                         analyze_returned_at,

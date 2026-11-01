@@ -8,8 +8,10 @@ use std::cell::{Cell, RefCell};
 
 #[path = "nnuec_v2_scalar_reference.rs"]
 mod reference_input;
-pub use reference_input::{INPUT_BYTES_ENV, MAX_INPUT_BYTES, InputUnavailable, ReferenceInputSnapshot};
 pub(crate) use reference_input::capture as capture_reference_input;
+pub use reference_input::{
+    INPUT_BYTES_ENV, InputUnavailable, MAX_INPUT_BYTES, ReferenceInputSnapshot,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {

@@ -96,15 +96,25 @@ pub(crate) fn capture<T: serde::Serialize, E>(build: impl FnOnce() -> Result<T, 
     let sample = CURRENT.with(|slot| {
         slot.try_borrow().ok().and_then(|current| {
             current.as_ref().and_then(|s| {
-                (s.successful_score_returns == 1).then_some(s.first).flatten()
+                (s.successful_score_returns == 1)
+                    .then_some(s.first)
+                    .flatten()
             })
         })
     });
-    let Some(sample) = sample else { return; };
+    let Some(sample) = sample else {
+        return;
+    };
     INPUT.with(|slot| {
-        let Ok(mut slot) = slot.try_borrow_mut() else { return; };
-        let Some(capture) = slot.as_mut() else { return; };
-        if capture.attempted { return; }
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return;
+        };
+        let Some(capture) = slot.as_mut() else {
+            return;
+        };
+        if capture.attempted {
+            return;
+        }
         capture.attempted = true;
         capture.snapshot.scalar = Some(sample);
         let input = match build() {
@@ -120,7 +130,8 @@ pub(crate) fn capture<T: serde::Serialize, E>(build: impl FnOnce() -> Result<T, 
             return;
         }
         if serde_json::to_writer(&mut writer, &input).is_err() {
-            capture.snapshot.unavailable = Some(writer.failed.unwrap_or(InputUnavailable::Encoding));
+            capture.snapshot.unavailable =
+                Some(writer.failed.unwrap_or(InputUnavailable::Encoding));
             return;
         }
         match String::from_utf8(writer.bytes) {
@@ -140,13 +151,22 @@ struct BoundedBytes {
 impl BoundedBytes {
     fn new(maximum: usize) -> Self {
         let mut bytes = Vec::new();
-        let failed = bytes.try_reserve_exact(maximum).err().map(|_| InputUnavailable::Allocation);
-        Self { bytes, maximum, failed }
+        let failed = bytes
+            .try_reserve_exact(maximum)
+            .err()
+            .map(|_| InputUnavailable::Allocation);
+        Self {
+            bytes,
+            maximum,
+            failed,
+        }
     }
 }
 impl Write for BoundedBytes {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.failed.is_some() { return Err(io::Error::other("optional input writer unavailable")); }
+        if self.failed.is_some() {
+            return Err(io::Error::other("optional input writer unavailable"));
+        }
         if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) {
             self.failed = Some(InputUnavailable::ByteLimit);
             return Err(io::Error::other("optional input byte limit"));
@@ -154,7 +174,9 @@ impl Write for BoundedBytes {
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +188,10 @@ mod tests {
         assert!(Capture::from_setting(None).is_none());
         for setting in ["0", "bad", "262145"] {
             let capture = Capture::from_setting(Some(OsString::from(setting))).unwrap();
-            assert_eq!(capture.snapshot.unavailable, Some(InputUnavailable::InvalidLimit));
+            assert_eq!(
+                capture.snapshot.unavailable,
+                Some(InputUnavailable::InvalidLimit)
+            );
             assert!(capture.snapshot.input_json.is_none());
         }
     }

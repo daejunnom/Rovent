@@ -110,7 +110,9 @@ impl RoventLifecycleDiagnostics {
             return;
         };
         #[cfg(feature = "native-validation-diagnostics")]
-        if state.reference_input.is_none() { state.reference_input = reference; }
+        if state.reference_input.is_none() {
+            state.reference_input = reference;
+        }
         if state.root_runs > MAX_ROOT_ROWS {
             state.scope_incomplete = true;
             state
@@ -190,7 +192,9 @@ impl RoventLifecycleDiagnostics {
     /// This optional output is last. Its failure cannot take a required row's
     /// seat or change the original protocol/finish/diagnostic Result.
     pub(super) fn flush_reference_input(&self, state: &mut State) {
-        let Some(pending) = state.reference_input.take() else { return; };
+        let Some(pending) = state.reference_input.take() else {
+            return;
+        };
         let raw = pending.input.input_json.as_deref().map(str::as_bytes);
         let available = MAX_STREAM_BYTES.saturating_sub(state.bytes);
         let make_rows = || -> Option<Vec<Vec<u8>>> {
@@ -212,7 +216,9 @@ impl RoventLifecycleDiagnostics {
                 let mut encoded = serde_json::to_vec(&value).ok()?;
                 encoded.push(b'\n');
                 bytes = bytes.checked_add(encoded.len())?;
-                if encoded.len() > MAX_ROW_BYTES || bytes > available { return None; }
+                if encoded.len() > MAX_ROW_BYTES || bytes > available {
+                    return None;
+                }
                 rows.push(encoded);
             }
             Some(rows)
@@ -223,20 +229,24 @@ impl RoventLifecycleDiagnostics {
                 "status":"unavailable","reason":"optional_output_capacity_or_encoding",
                 "bytes":raw.map(|v|v.len())
             });
-            serde_json::to_vec(&header).ok().and_then(|mut row| {
-                row.push(b'\n');
-                (row.len() <= MAX_ROW_BYTES && row.len() <= available).then_some(vec![row])
-            }).unwrap_or_default()
+            serde_json::to_vec(&header)
+                .ok()
+                .and_then(|mut row| {
+                    row.push(b'\n');
+                    (row.len() <= MAX_ROW_BYTES && row.len() <= available).then_some(vec![row])
+                })
+                .unwrap_or_default()
         });
         let mut output = io::stderr().lock();
         for row in rows {
-            if output.write_all(&row).is_err() { break; }
+            if output.write_all(&row).is_err() {
+                break;
+            }
             state.bytes += row.len();
         }
         let _ = output.flush();
     }
 }
-
 
 #[cfg(test)]
 mod tests {

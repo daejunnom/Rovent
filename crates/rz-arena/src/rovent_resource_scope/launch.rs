@@ -695,7 +695,10 @@ impl NativeResourceCustody {
         control_panicked: bool,
     ) -> Option<PreNativeAdmissionEvidence> {
         use rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError;
-        if !before_control || control_panicked || !matches!(native_error, RoventRetainingLaunchError::Ordinary(_)) {
+        if !before_control
+            || control_panicked
+            || !matches!(native_error, RoventRetainingLaunchError::Ordinary(_))
+        {
             return None;
         }
         if self.admission_checkpoint_v3 != AdmissionCheckpointV3::ProvenanceRejected
@@ -1567,7 +1570,12 @@ fn run_native_with_resources_v3_inner(
     if let Err(native_error) = result {
         use rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError;
         let pre_native_admission = custody.try_lock().ok().and_then(|state| {
-            state.provenance_rejection_before_scope(epoch, before_control, &native_error, control_panic.is_some())
+            state.provenance_rejection_before_scope(
+                epoch,
+                before_control,
+                &native_error,
+                control_panic.is_some(),
+            )
         });
         let error = match &native_error {
             RoventRetainingLaunchError::Ordinary(error)
@@ -1757,44 +1765,95 @@ mod tests {
                 schema: ROVENT_RESOURCE_LAUNCH_PLAN.into(),
                 delegated_cgroup_path: "/unused".into(),
                 leaf_name: "unused".into(),
-                options: RoventNativeResourceOptions { pids_max: 1, affinity: vec![0], device: "unused".into() },
+                options: RoventNativeResourceOptions {
+                    pids_max: 1,
+                    affinity: vec![0],
+                    device: "unused".into(),
+                },
                 profile: RoventNativeResourceProfile::FunctionalValidation,
                 evidence_directory: "unused".into(),
             },
-            pin: RoventNativeResourcePlanPin { path: "inputs/mock.json".into(), sha256: "0".repeat(64), bytes: 1 },
+            pin: RoventNativeResourcePlanPin {
+                path: "inputs/mock.json".into(),
+                sha256: "0".repeat(64),
+                bytes: 1,
+            },
             _plan_file: file.try_clone().unwrap(),
-            directory: Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap(),
-            delegated: Some(file), control: None, bound_control: None, control_cleanup_error: None,
-            scope: None, failure: None, scope_v2: None, failure_v2: None, scope_v3: None, failure_v3: None,
-            admission: None, admission_evidence_error: None, finished_live: None,
-            finished_evidence_error: None, finished_live_error: None,
-            admission_attempted: true, admission_checkpoint_v3: AdmissionCheckpointV3::ProvenanceRejected,
-            admission_v2_succeeded: false, admission_v3_succeeded: false, finished_attempted: false,
+            directory: Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority())
+                .unwrap(),
+            delegated: Some(file),
+            control: None,
+            bound_control: None,
+            control_cleanup_error: None,
+            scope: None,
+            failure: None,
+            scope_v2: None,
+            failure_v2: None,
+            scope_v3: None,
+            failure_v3: None,
+            admission: None,
+            admission_evidence_error: None,
+            finished_live: None,
+            finished_evidence_error: None,
+            finished_live_error: None,
+            admission_attempted: true,
+            admission_checkpoint_v3: AdmissionCheckpointV3::ProvenanceRejected,
+            admission_v2_succeeded: false,
+            admission_v3_succeeded: false,
+            finished_attempted: false,
         };
         let original_error = RoventRetainingLaunchError::Ordinary(RoventLaunchError {
-            stage: "ResourceAdmission", detail: "original error".into(),
+            stage: "ResourceAdmission",
+            detail: "original error".into(),
         });
-        let evidence = owner.provenance_rejection_before_scope(37, true, &original_error, false).unwrap();
+        let evidence = owner
+            .provenance_rejection_before_scope(37, true, &original_error, false)
+            .unwrap();
         let json = serde_json::to_value(evidence).unwrap();
         assert_eq!(json["process_id"], std::process::id());
         assert_eq!(json["process_generation"], 37);
         assert_eq!(json["reason"], "resource_plan_provenance");
         assert_eq!(json["native_scope_started"], false);
-        assert!(owner.provenance_rejection_before_scope(37, false, &original_error, false).is_none());
-        assert!(owner.provenance_rejection_before_scope(37, true, &original_error, true).is_none());
+        assert!(
+            owner
+                .provenance_rejection_before_scope(37, false, &original_error, false)
+                .is_none()
+        );
+        assert!(
+            owner
+                .provenance_rejection_before_scope(37, true, &original_error, true)
+                .is_none()
+        );
         owner.admission_checkpoint_v3 = AdmissionCheckpointV3::ResourcePrepareStarted;
-        assert!(owner.provenance_rejection_before_scope(37, true, &original_error, false).is_none());
+        assert!(
+            owner
+                .provenance_rejection_before_scope(37, true, &original_error, false)
+                .is_none()
+        );
         owner.admission_checkpoint_v3 = AdmissionCheckpointV3::ProvenanceRejected;
         owner.delegated = None;
-        assert!(owner.provenance_rejection_before_scope(37, true, &original_error, false).is_none());
+        assert!(
+            owner
+                .provenance_rejection_before_scope(37, true, &original_error, false)
+                .is_none()
+        );
         let mut failure = RoventNativeResourceRunFailure {
-            detail: "original error".into(), custody: None, system_v3: true,
-            native_failure: None, native_recovery_attempts: Vec::new(), control_panic: None,
-            control_panic_may_be_native: false, control_scope_marker: None, pre_native_admission: None,
+            detail: "original error".into(),
+            custody: None,
+            system_v3: true,
+            native_failure: None,
+            native_recovery_attempts: Vec::new(),
+            control_panic: None,
+            control_panic_may_be_native: false,
+            control_scope_marker: None,
+            pre_native_admission: None,
         };
         assert!(failure.observation().get("pre_native_admission").is_none());
         failure.pre_native_admission = Some(evidence);
-        assert_eq!(failure.observation()["pre_native_admission"]["process_generation"], 37);
+        assert_eq!(
+            failure.observation()["pre_native_admission"]["process_generation"],
+            37
+        );
     }
 
     #[test]

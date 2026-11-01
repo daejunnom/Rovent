@@ -6674,8 +6674,12 @@ where
         slot: usize,
         event: CpuWorkerEvent,
     ) -> Result<(), AdaptiveManagerError> {
-        self.own_event_with_timing(slot, event, None,
-            #[cfg(feature = "native-validation-diagnostics")] None,
+        self.own_event_with_timing(
+            slot,
+            event,
+            None,
+            #[cfg(feature = "native-validation-diagnostics")]
+            None,
         )
     }
     fn own_event_observed(
@@ -6686,8 +6690,12 @@ where
         #[cfg(feature = "native-validation-diagnostics")]
         let reference_input = event.reference_input().cloned();
         let (original, timing) = event.into_parts();
-        self.own_event_with_timing(slot, original, timing,
-            #[cfg(feature = "native-validation-diagnostics")] reference_input,
+        self.own_event_with_timing(
+            slot,
+            original,
+            timing,
+            #[cfg(feature = "native-validation-diagnostics")]
+            reference_input,
         )
     }
     fn own_event_with_timing(
@@ -6695,8 +6703,9 @@ where
         slot: usize,
         event: CpuWorkerEvent,
         timing: Option<CpuWorkerSliceTiming>,
-        #[cfg(feature = "native-validation-diagnostics")]
-        reference_input: Option<Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>>,
+        #[cfg(feature = "native-validation-diagnostics")] reference_input: Option<
+            Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>,
+        >,
     ) -> Result<(), AdaptiveManagerError> {
         match event {
             CpuWorkerEvent::Slice(report) => {

@@ -301,8 +301,8 @@ pub use diagnostics::{
     ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN, RoventLifecycleDiagnostics,
     RoventProductLifecycleObservation,
 };
-pub use storage::{RoventProductStorageStartupRejection, RoventProductStorageStartupRejectionV2};
 pub(crate) use storage::SharedRoventStorageRegistration;
+pub use storage::{RoventProductStorageStartupRejection, RoventProductStorageStartupRejectionV2};
 // A product's single Arc owns exactly one selected driver for the whole
 // session, including physical shutdown and retained-source custody.
 #[allow(clippy::large_enum_variant)]
