@@ -1169,7 +1169,7 @@ impl Drop for RoventNativeProductDriverV2 {
     }
 }
 
-/// V3 system CUDA P/C owner. The original source and process remain held
+/// V3 CPU or system CUDA P/C owner. The original source and process remain held
 /// until an actual session finish confirms physical completion.
 pub struct RoventNativeProductDriverV3 {
     inner: Arc<RoventPcSessionDriver>,
@@ -2242,7 +2242,7 @@ impl Drop for RoventOwnNnuecProductDriverV2 {
     }
 }
 
-/// V3 system-CUDA P/C and own NNUEC researcher owner. The original pinned
+/// V3 CPU or system-CUDA P/C and own NNUEC researcher owner. The original pinned
 /// source and process remain in custody until the complete native/CPU session
 /// explicitly confirms physical shutdown.
 pub struct RoventOwnNnuecProductDriverV3 {

@@ -65,6 +65,45 @@ use std::{
 
 type Backend = RoventNativeBackend<PcPortQuestion>;
 type Model = AdaptivePortModel;
+
+/// Check the actual native Ready snapshot against the original /3 runtime
+/// registration. CPU uses the original pinned ORT artifact and must not be
+/// represented as a system CUDA observation.
+pub(super) fn runtime_matches_v3(
+    lock: &rz_experiments::RoventInputLockV3,
+    snapshot: &RoventNativeStartupSnapshot,
+) -> Result<bool, SearchSessionFailure> {
+    use rz_experiments::{NativeRuntimeSourceV6, RoventBackend, RoventDevice};
+    let pc = &lock.manifest.engine.pc;
+    match &lock.manifest.system_runtime_lock.runtime {
+        NativeRuntimeSourceV6::SystemCuda(spec) => {
+            let expected = Digest(
+                rz_eval::asset::parse_sha256(&spec.system_identity_sha256)
+                    .map_err(|e| SearchSessionFailure::debug("RoventV3RuntimeIdentity", &e))?,
+            );
+            Ok(snapshot
+                .system_runtime
+                .as_ref()
+                .map(|observed| observed.runtime_identity)
+                == Some(expected))
+        }
+        NativeRuntimeSourceV6::Cpu => {
+            if !matches!(pc.device, RoventDevice::Cpu)
+                || !matches!(pc.backend, RoventBackend::OrtCpu)
+                || pc.runtime_artifacts.len() != 1
+                || snapshot.system_runtime.is_some()
+                || snapshot.runtime_bundle.is_some()
+            {
+                return Ok(false);
+            }
+            let expected = Digest(
+                rz_eval::asset::parse_sha256(&pc.runtime_artifacts[0].sha256)
+                    .map_err(|e| SearchSessionFailure::debug("RoventV3CpuRuntimeIdentity", &e))?,
+            );
+            Ok(snapshot.runtime_library == expected)
+        }
+    }
+}
 enum PcSources {
     V1(Arc<RoventPinnedNativeSources>),
     V2(Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV2>>),
@@ -1178,18 +1217,7 @@ impl RoventPcSessionDriver {
                 ));
             }
             let configuration = sources.configuration().clone();
-            let system_identity = match &sources.lock().manifest.system_runtime_lock.runtime {
-                rz_experiments::NativeRuntimeSourceV6::SystemCuda(spec) => Digest(
-                    rz_eval::asset::parse_sha256(&spec.system_identity_sha256)
-                        .map_err(|e| SearchSessionFailure::debug("RoventPcV3Runtime", &e))?,
-                ),
-                rz_experiments::NativeRuntimeSourceV6::Cpu => {
-                    return Err(failure(
-                        "RoventPcV3Runtime",
-                        "system CUDA owner cannot select CPU",
-                    ));
-                }
-            };
+            let runtime_matches = runtime_matches_v3(sources.lock(), prepared.snapshot())?;
             configuration
                 .require_supported_native_capabilities()
                 .map_err(|e| SearchSessionFailure::debug("RoventPcCapability", &e))?;
@@ -1239,12 +1267,7 @@ impl RoventPcSessionDriver {
             if sources.collection_preload_sources().is_some()
                 || prepared.snapshot().mode.has_native_r()
                 || prepared.snapshot().process_epoch != clock.epoch().0
-                || prepared
-                    .snapshot()
-                    .system_runtime
-                    .as_ref()
-                    .map(|value| value.runtime_identity)
-                    != Some(system_identity)
+                || !runtime_matches
                 || identity.name.is_empty()
                 || identity.author.is_empty()
             {

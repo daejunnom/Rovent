@@ -218,6 +218,7 @@ fn runtime_receipt(
     lock: &RoventInputLockV3,
     generation: u64,
     observation: Option<&super::super::RoventSystemReadyObservationV3>,
+    cpu_provider_ready: bool,
 ) -> rz_experiments::SystemRuntimeReceiptV6 {
     use rz_experiments::{PhysicalCompletionV6, ProviderReadinessV6, SystemRuntimeReceiptV6};
     SystemRuntimeReceiptV6 {
@@ -233,7 +234,12 @@ fn runtime_receipt(
         unregistered_native_mappings: observation
             .and_then(|value| value.unregistered_native_mappings.clone()),
         // Provider setup is observed independently of mapping and inference.
-        provider_ready: if observation.is_some_and(|value| value.provider_ready) {
+        provider_ready: if observation.is_some_and(|value| value.provider_ready)
+            || (cpu_provider_ready
+                && matches!(
+                    &lock.manifest.system_runtime_lock.runtime,
+                    NativeRuntimeSourceV6::Cpu
+                )) {
             ProviderReadinessV6::Ready
         } else {
             ProviderReadinessV6::Unknown
@@ -285,17 +291,11 @@ fn admit_original<'a>(
             "collection requires an original /3 collection owner",
         ));
     }
-    let system = match &lock.manifest.system_runtime_lock.runtime {
-        NativeRuntimeSourceV6::SystemCuda(system) => system,
-        NativeRuntimeSourceV6::Cpu => {
-            return Err(error(
-                "InputLockUnsupportedV3",
-                "this /3 route explicitly selects system CUDA",
-            ));
-        }
-    };
     if arguments.startup_ms > lock.manifest.wall_time_max_ms
-        || arguments.startup_ms > system.startup_ms
+        || matches!(
+            &lock.manifest.system_runtime_lock.runtime,
+            NativeRuntimeSourceV6::SystemCuda(system) if arguments.startup_ms > system.startup_ms
+        )
     {
         return Err(error(
             "StartupWindow",
@@ -652,25 +652,38 @@ fn run_native_inner<'a>(
             ));
         }
     };
-    let system = match &lock.manifest.system_runtime_lock.runtime {
-        NativeRuntimeSourceV6::SystemCuda(system) => system,
-        NativeRuntimeSourceV6::Cpu => {
-            return Err(error(
-                "InputLockUnsupportedV3",
-                "this /3 route explicitly selects system CUDA",
-            ));
-        }
-    };
     let native = sources.configuration().fields().native;
-    let resources = super::super::RoventSystemNativeResourcesV3 {
-        configuration: native
-            .onnx_system(&lock.manifest.engine.pc.device, system)
-            .map_err(|failure| error("Configuration", failure))?,
-        drain_limit: Duration::from_millis(native.drain_ms),
-        tickets: native
-            .tickets(sources.configuration().fields().review.token_budget)
-            .map_err(|failure| error("Configuration", failure))?,
-        command_capacity: native.command_capacity,
+    let tickets = native
+        .tickets(sources.configuration().fields().review.token_budget)
+        .map_err(|failure| error("Configuration", failure))?;
+    let resources = match &lock.manifest.system_runtime_lock.runtime {
+        NativeRuntimeSourceV6::SystemCuda(system) => {
+            super::super::RoventNativeResourcesV3::SystemCuda(
+                super::super::RoventSystemNativeResourcesV3 {
+                    configuration: native
+                        .onnx_system(&lock.manifest.engine.pc.device, system)
+                        .map_err(|failure| error("Configuration", failure))?,
+                    drain_limit: Duration::from_millis(native.drain_ms),
+                    tickets,
+                    command_capacity: native.command_capacity,
+                },
+            )
+        }
+        NativeRuntimeSourceV6::Cpu => {
+            super::super::RoventNativeResourcesV3::Cpu(super::super::RoventNativeResources {
+                runtime: sources
+                    .pin_runtime()
+                    .map_err(|failure| error("Runtime", failure))?,
+                configuration: native
+                    .onnx(&lock.manifest.engine.pc.device, false)
+                    .map_err(|failure| error("Configuration", failure))?,
+                loading_profile: native.loading_profile.map(|profile| profile.actual()),
+                cuda_profile: None,
+                drain_limit: Duration::from_millis(native.drain_ms),
+                tickets,
+                command_capacity: native.command_capacity,
+            })
+        }
     };
     let diagnostic = NativeStartupDiagnostic::default();
     let owners = Arc::new(OwnerRegistry::default());
@@ -688,7 +701,7 @@ fn run_native_inner<'a>(
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
-                    let unknown = runtime_receipt(&lock, arguments.process_epoch, None);
+                    let unknown = runtime_receipt(&lock, arguments.process_epoch, None, false);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-startup.v6.json",
@@ -709,7 +722,8 @@ fn run_native_inner<'a>(
                 }
             };
             let observation = prepared.snapshot().system_runtime.clone();
-            let startup = runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+            let startup =
+                runtime_receipt(&lock, arguments.process_epoch, observation.as_ref(), true);
             write_receipt(
                 receipt_writer.as_ref(),
                 "system-runtime-startup.v6.json",
@@ -729,7 +743,7 @@ fn run_native_inner<'a>(
                 Err(mut failure) => {
                     let detail = error("ProductAssembly", &failure.failure);
                     let unknown =
-                        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+                        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref(), true);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-termination.v6.json",
@@ -758,7 +772,7 @@ fn run_native_inner<'a>(
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
-                    let unknown = runtime_receipt(&lock, arguments.process_epoch, None);
+                    let unknown = runtime_receipt(&lock, arguments.process_epoch, None, false);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-startup.v6.json",
@@ -787,7 +801,8 @@ fn run_native_inner<'a>(
                 }
             };
             let observation = prepared.snapshot().system_runtime.clone();
-            let startup = runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+            let startup =
+                runtime_receipt(&lock, arguments.process_epoch, observation.as_ref(), true);
             write_receipt(
                 receipt_writer.as_ref(),
                 "system-runtime-startup.v6.json",
@@ -810,7 +825,7 @@ fn run_native_inner<'a>(
                     use super::super::product::RoventExternalPcrV3RejectedOwners;
                     let detail = error("ProductAssembly", &failure.failure);
                     let unknown =
-                        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+                        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref(), true);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-termination.v6.json",
@@ -860,7 +875,7 @@ fn run_native_inner<'a>(
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
-                    let unknown = runtime_receipt(&lock, arguments.process_epoch, None);
+                    let unknown = runtime_receipt(&lock, arguments.process_epoch, None, false);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-startup.v6.json",
@@ -887,7 +902,8 @@ fn run_native_inner<'a>(
                 }
             };
             let observation = prepared.snapshot().system_runtime.clone();
-            let startup = runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+            let startup =
+                runtime_receipt(&lock, arguments.process_epoch, observation.as_ref(), true);
             write_receipt(
                 receipt_writer.as_ref(),
                 "system-runtime-startup.v6.json",
@@ -920,7 +936,7 @@ fn run_native_inner<'a>(
                 Err(mut failure) => {
                     let detail = error("ProductAssembly", &failure.failure);
                     let unknown =
-                        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+                        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref(), true);
                     write_receipt(
                         receipt_writer.as_ref(),
                         "system-runtime-termination.v6.json",
@@ -946,7 +962,8 @@ fn run_native_inner<'a>(
     let result = serve_driver(driver, clock, owners, settings)
         .map_err(|failure| error("UciSession", failure));
     let physical_confirmed = completion.is_confirmed();
-    let mut termination = runtime_receipt(&lock, arguments.process_epoch, observation.as_ref());
+    let mut termination =
+        runtime_receipt(&lock, arguments.process_epoch, observation.as_ref(), true);
     if physical_confirmed {
         // This is an observation of this product's confirmed finish_session,
         // not a CUDA fence token or an independent supervisor proof.

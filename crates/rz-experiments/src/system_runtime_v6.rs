@@ -411,10 +411,6 @@ impl SystemRuntimeReceiptV6 {
                 self.physical_completion,
                 PhysicalCompletionV6::Confirmed { .. }
             )
-            || self
-                .unregistered_native_mappings
-                .as_ref()
-                .is_none_or(|mappings| !mappings.is_empty())
         {
             return Err(invalid(
                 "runtime readiness or physical completion is unconfirmed",
@@ -429,6 +425,13 @@ impl SystemRuntimeReceiptV6 {
                 }
             }
             NativeRuntimeSourceV6::SystemCuda(spec) => {
+                if self
+                    .unregistered_native_mappings
+                    .as_ref()
+                    .is_none_or(|mappings| !mappings.is_empty())
+                {
+                    return Err(invalid("system CUDA native mappings are unconfirmed"));
+                }
                 if self.observed_identity_sha256.as_deref() != Some(&spec.system_identity_sha256) {
                     return Err(invalid(
                         "observed system identity differs from registration",
@@ -601,6 +604,30 @@ mod tests {
             .get_or_insert_default()
             .push("foreign.so".into());
         assert!(receipt.validate_success(&lock, 7, 1).is_err());
+    }
+
+    #[test]
+    fn cpu_success_keeps_unobserved_cuda_mappings_unknown() {
+        let lock = SystemRuntimeLockV6::new(NativeRuntimeSourceV6::Cpu).unwrap();
+        let receipt = SystemRuntimeReceiptV6 {
+            domain: SYSTEM_RUNTIME_RECEIPT_V6_DOMAIN.into(),
+            lock_sha256: lock.canonical_sha256.clone(),
+            process_id: 7,
+            process_generation: 1,
+            observed_identity_sha256: None,
+            observed_libraries: vec![],
+            unregistered_native_mappings: None,
+            provider_ready: ProviderReadinessV6::Ready,
+            physical_completion: PhysicalCompletionV6::Confirmed {
+                completion_id: "cpu-worker-joined".into(),
+            },
+        };
+        assert!(receipt.validate_success(&lock, 7, 1).is_ok());
+        let bytes = receipt.canonical_bytes(&lock, 7, 1).unwrap();
+        let decoded = SystemRuntimeReceiptV6::from_json(
+            std::str::from_utf8(&bytes).unwrap(), &lock, 7, 1,
+        ).unwrap();
+        assert_eq!(decoded.unregistered_native_mappings, None);
     }
 
     #[test]

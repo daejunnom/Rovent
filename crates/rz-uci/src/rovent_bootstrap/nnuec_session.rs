@@ -1953,28 +1953,12 @@ impl RoventNnuecSessionDriver {
                     "actual own-R configuration required",
                 ));
             };
-            let expected_system_identity =
-                match &sources.lock().manifest.system_runtime_lock.runtime {
-                    rz_experiments::NativeRuntimeSourceV6::SystemCuda(spec) => {
-                        rz_eval::asset::parse_sha256(&spec.system_identity_sha256).map_err(|e| {
-                            SearchSessionFailure::debug("RoventNnuecV3RuntimeIdentity", &e)
-                        })?
-                    }
-                    rz_experiments::NativeRuntimeSourceV6::Cpu => {
-                        return Err(failure(
-                            "RoventNnuecV3RuntimeIdentity",
-                            "system CUDA owner required",
-                        ));
-                    }
-                };
+            let runtime_matches =
+                super::pc_session::runtime_matches_v3(sources.lock(), prepared.snapshot())?;
             if !matches!(value, ResearchValueConfiguration::NnuecV2 { .. })
                 || !prepared.snapshot().mode.has_native_r()
                 || prepared.snapshot().process_epoch != clock.epoch().0
-                || prepared
-                    .snapshot()
-                    .system_runtime
-                    .as_ref()
-                    .is_none_or(|observed| observed.runtime_identity.0 != expected_system_identity)
+                || !runtime_matches
                 || prepared.snapshot().input_lock != loaded.input_lock_digest()
                 || !loaded.matches_sources(prepared.sources())
                 || identity.name.is_empty()

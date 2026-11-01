@@ -311,6 +311,19 @@ pub struct RoventSystemNativeResourcesV3 {
     pub command_capacity: usize,
 }
 
+/// Native resources selected by the original V3 runtime lock. CPU retains its
+/// original ORT pin; system CUDA retains the system-runtime registration.
+pub enum RoventNativeResourcesV3 {
+    Cpu(RoventNativeResources),
+    SystemCuda(RoventSystemNativeResourcesV3),
+}
+
+impl From<RoventSystemNativeResourcesV3> for RoventNativeResourcesV3 {
+    fn from(resources: RoventSystemNativeResourcesV3) -> Self {
+        Self::SystemCuda(resources)
+    }
+}
+
 /// Session setup and actual mapping observations from the original worker.
 /// This is not an inference result or proof of GPU physical completion.
 #[derive(Clone, Debug)]
@@ -690,7 +703,7 @@ fn prepare_native_v2_inner<Q: NativeQuestionProjection>(
     })
 }
 
-/// The original V3 system-CUDA source and its single Ready physical worker.
+/// The original V3 source and its single Ready physical worker.
 /// Collection authority and physical-completion receipts are not implied.
 pub struct PreparedRoventNativeV3<Q: NativeQuestionProjection = AdaptivePortQuestion> {
     service: RoventNativeService<Q>,
@@ -726,16 +739,16 @@ impl<Q: NativeQuestionProjection> PreparedRoventNativeV3<Q> {
     }
 }
 
-/// Prepare the admitted system-CUDA configuration on one physical worker.
+/// Prepare the admitted CPU or system-CUDA configuration on one physical worker.
 /// A Ready result is not an inference, GPU fence, or Collection receipt.
 #[cfg(target_os = "linux")]
 pub fn prepare_native_v3<Q: NativeQuestionProjection>(
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
-    resources: RoventSystemNativeResourcesV3,
+    resources: impl Into<RoventNativeResourcesV3>,
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejection<Q>> {
-    prepare_native_v3_inner(sources, resources, clock, control, None)
+    prepare_native_v3_inner(sources, resources.into(), clock, control, None)
 }
 
 /// Prepare the single original /3 Collection worker with its input observer.
@@ -745,18 +758,18 @@ pub fn prepare_native_v3<Q: NativeQuestionProjection>(
 #[cfg(target_os = "linux")]
 pub fn prepare_native_v3_collection<Q: NativeQuestionProjection>(
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
-    resources: RoventSystemNativeResourcesV3,
+    resources: impl Into<RoventNativeResourcesV3>,
     clock: ContractSystemClock,
     control: RoventStartupControl,
     observer: Box<dyn VirtualReviewCollectionObserver>,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejection<Q>> {
-    prepare_native_v3_inner(sources, resources, clock, control, Some(observer))
+    prepare_native_v3_inner(sources, resources.into(), clock, control, Some(observer))
 }
 
 #[cfg(target_os = "linux")]
 fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
-    resources: RoventSystemNativeResourcesV3,
+    resources: RoventNativeResourcesV3,
     clock: ContractSystemClock,
     control: RoventStartupControl,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
@@ -796,7 +809,21 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
                 ));
             }
         }
-        validate_system_native_resources_v3(&sources, &resources)
+        match (
+            &sources.lock().manifest.system_runtime_lock.runtime,
+            &resources,
+        ) {
+            (NativeRuntimeSourceV6::Cpu, RoventNativeResourcesV3::Cpu(cpu)) => {
+                validate_native_resources(&sources, cpu)
+            }
+            (NativeRuntimeSourceV6::SystemCuda(_), RoventNativeResourcesV3::SystemCuda(cuda)) => {
+                validate_system_native_resources_v3(&sources, cuda)
+            }
+            _ => Err(fail(
+                K::IdentityMismatch,
+                "V3 native resources differ from runtime lock",
+            )),
+        }
     };
     if let Err(error) = admission() {
         return Err(RoventNativeStartupRejection {
@@ -805,8 +832,10 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
         });
     }
     let pending_capacity = sources.lock().role_tickets_max() as usize;
-    let limits = resources.tickets;
-    let commands = resources.command_capacity;
+    let (limits, commands, expects_system_cuda) = match &resources {
+        RoventNativeResourcesV3::Cpu(cpu) => (cpu.tickets, cpu.command_capacity, false),
+        RoventNativeResourcesV3::SystemCuda(cuda) => (cuda.tickets, cuda.command_capacity, true),
+    };
     let factory_sources = Arc::clone(&sources);
     let factory_clock = clock.clone();
     let factory_control = control.clone();
@@ -819,15 +848,23 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
         clock.clone(),
         &control,
         &diagnostic,
-        move || {
-            load_native_system_v3(
+        move || match resources {
+            RoventNativeResourcesV3::Cpu(cpu) => load_native(
                 factory_sources,
-                resources,
+                cpu,
                 factory_clock,
                 &factory_control,
                 observer,
                 &factory_diagnostic,
-            )
+            ),
+            RoventNativeResourcesV3::SystemCuda(cuda) => load_native_system_v3(
+                factory_sources,
+                cuda,
+                factory_clock,
+                &factory_control,
+                observer,
+                &factory_diagnostic,
+            ),
         },
     )?;
     let ready_clock_matches = native
@@ -839,7 +876,7 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
                 && snapshot.process_epoch == clock.domain().0.0
                 && ready_clock_matches
                 && snapshot.model_namespace().is_ok()
-                && snapshot.system_runtime.is_some()
+                && snapshot.system_runtime.is_some() == expects_system_cuda
                 && snapshot.physical_workers_created == 1
                 && !snapshot.neural_service_executed =>
         {
@@ -1338,19 +1375,22 @@ fn load_native<L: NativeInputLock>(
         None => OrtRuntime::load(&resources.runtime),
     })?;
     control.check()?;
+    // V1/V2 retain Deployment; an original V3 Collection lock explicitly
+    // requests its validator and Collection inputs through the same loader.
+    let execution_mode = sources.lock().virtual_review_mode();
     let backend = diagnostic.trace(NativeStartupDiagnosticStage::ModelSessions, || {
         PalsVirtualReviewOnnxBackend::load_owned_sources_with_profile(
             sources.clone() as Arc<dyn VirtualReviewOwnedSources>,
             &sources.export_digest_text(),
             runtime,
             resources.configuration,
-            VirtualReviewExecutionMode::Deployment,
+            execution_mode,
             VirtualReviewArtifactKind::Fresh,
             profile,
         )
     })?;
     control.check()?;
-    if backend.validator_present()
+    if backend.validator_present() != (execution_mode == VirtualReviewExecutionMode::Collection)
         || backend.approximate_warm_capable()
         || backend.model_epoch() != sources.weights_digest()
         || backend.rules_input_semantic_digest()
@@ -1358,7 +1398,7 @@ fn load_native<L: NativeInputLock>(
     {
         return Err(fail(
             K::IdentityMismatch,
-            "loaded P/C namespace differs from admitted V-free export",
+            "loaded role set or model namespace differs from admitted export",
         ));
     }
     let snapshot = RoventNativeStartupSnapshot {

@@ -1,35 +1,37 @@
-//! Create new system-CUDA Rovent registrations from explicit current inputs.
+//! Create system-CUDA or CPU Rovent registrations from explicit inputs.
 //!
 //! This does not launch the engine, load ONNX Runtime or perform GPU inference.
 //! It captures current native files and checks typed declarations. Target binary,
 //! model and provenance bytes still require their normal admission verification.
 //! Run on Linux with: cargo run -p rz-uci --example rovent_system_registration
-//! --features pals-adaptive,onnx-cuda -- <request.json> <existing-output-root>
+//! --features pals-adaptive,onnx-cpu -- <request.json> <existing-output-root>
+//! System CUDA capture additionally requires feature `onnx-cuda`.
 
-#[cfg(not(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cuda")))]
+#[cfg(not(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu")))]
 fn main() {
-    eprintln!("registration requires Linux and features pals-adaptive,onnx-cuda");
+    eprintln!("registration requires Linux and features pals-adaptive,onnx-cpu");
     std::process::exit(2);
 }
 
-#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cuda"))]
+#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod registration {
     use rz_contracts::rovent::ExecutionMode;
+    #[cfg(feature = "onnx-cuda")]
     use rz_eval::onnx::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
     use rz_experiments::{
-        ArtifactRef, NativeRuntimeSourceV6, ROVENT_EXECUTION_V3_DOMAIN,
-        ROVENT_STARTUP_DOCUMENT_V5_DOMAIN, RoventBackend, RoventCoordinatorDeclarationV3,
+        ArtifactRef, NativeRuntimeSourceV6, RoventBackend, RoventCoordinatorDeclarationV3,
         RoventDevice, RoventEngineDeclaration, RoventExecutionManifestV3, RoventExternalProfilePin,
         RoventModelPin, RoventNnuecPin, RoventPcConfiguration, RoventPurpose, RoventResearcher,
         RoventResourcePlan, RoventRootTieDeclarationV2, RoventSearchDeclaration,
         RoventStartupDocumentV5, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeLockV6,
-        SystemRuntimeSpecV6,
+        SystemRuntimeSpecV6, ROVENT_EXECUTION_V3_DOMAIN, ROVENT_STARTUP_DOCUMENT_V5_DOMAIN,
     };
     use rz_position::contracts::{profile_digest, rules_snapshot_semantic_digest};
     use rz_position::{BoardMove, Position};
     use rz_uci::parser::{self, Command, ParserLimits, PositionBase};
     use rz_uci::rovent_bootstrap::{
         configuration::v5::{RoventStartupConfigurationV5, RoventTypedStartupV5},
+        configuration_digest_from_metadata,
         process_boundary::compiled_process_source_components_v3,
         system_configuration_digest_v3,
     };
@@ -66,6 +68,52 @@ mod registration {
         capture_max_file_bytes: u64,
         capture_max_total_bytes: u64,
         capture_timeout_ms: u64,
+    }
+    /// Existing CUDA requests keep their original untagged representation.
+    /// CPU must be selected explicitly and never triggers CUDA capture.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RuntimeSelection {
+        Cpu(CpuRuntimeRequest),
+        Cuda(RuntimeRequest),
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CpuRuntimeRequest {
+        kind: CpuKind,
+    }
+    #[derive(Clone, Copy, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum CpuKind {
+        Cpu,
+    }
+
+    #[cfg(test)]
+    mod runtime_selection_tests {
+        use super::RuntimeSelection;
+
+        #[test]
+        fn explicit_cpu_and_legacy_cuda_select_distinct_variants() {
+            let cpu: RuntimeSelection = serde_json::from_str(r#"{"kind":"cpu"}"#).unwrap();
+            assert!(matches!(cpu, RuntimeSelection::Cpu(_)));
+            let cuda = serde_json::json!({
+                "libraries": [],
+                "cuda_device_id": 0,
+                "cuda_arena_bytes": 1,
+                "startup_ms": 1,
+                "drain_ms": 1,
+                "capture_max_libraries": 1,
+                "capture_max_file_bytes": 1,
+                "capture_max_total_bytes": 1,
+                "capture_timeout_ms": 1
+            });
+            let parsed: RuntimeSelection = serde_json::from_value(cuda.clone()).unwrap();
+            assert!(matches!(parsed, RuntimeSelection::Cuda(_)));
+            assert!(serde_json::from_str::<RuntimeSelection>(r#"{"kind":"unknown"}"#).is_err());
+            let mut ambiguous = cuda;
+            ambiguous["kind"] = "cpu".into();
+            assert!(serde_json::from_value::<RuntimeSelection>(ambiguous).is_err());
+        }
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -179,7 +227,7 @@ mod registration {
         provenance: Vec<ArtifactRef>,
         own_r_root_tie: RoventRootTieDeclarationV2,
         startup_configuration: RoventStartupConfigurationV5,
-        system_runtime: RuntimeRequest,
+        system_runtime: RuntimeSelection,
         outputs: Outputs,
     }
 
@@ -303,14 +351,6 @@ mod registration {
                 return Err(format!("output already exists: {name}"));
             }
         }
-        let r = &req.system_runtime;
-        if r.capture_max_libraries == 0
-            || r.capture_max_file_bytes == 0
-            || r.capture_max_total_bytes == 0
-            || r.capture_timeout_ms == 0
-        {
-            return Err("capture budgets must be nonzero".into());
-        }
         let actual_components = compiled_process_source_components_v3();
         let mut required = vec![
             "rules",
@@ -415,79 +455,125 @@ mod registration {
             (_, Some(_)) => return Err("V-free execution cannot declare a validator model".into()),
             (_, None) => {}
         }
-        let requests: Vec<SystemLibraryRequest> = r
-            .libraries
-            .iter()
-            .map(|l| SystemLibraryRequest {
-                role: l.role.clone(),
-                path: PathBuf::from(&l.path),
-                required_mapping: l.required_mapping,
-            })
-            .collect();
-        let captured = SystemRuntime::capture(
-            requests,
-            SystemCaptureLimits {
-                max_libraries: r.capture_max_libraries as usize,
-                max_file_bytes: r.capture_max_file_bytes,
-                max_total_bytes: r.capture_max_total_bytes,
-                max_elapsed: Duration::from_millis(r.capture_timeout_ms),
-            },
-        )
-        .map_err(|e| format!("system library capture failed: {e:?}"))?;
-        let mut requested = HashMap::new();
-        for lib in &r.libraries {
-            if requested
-                .insert(lib.role.clone(), lib.path.clone())
-                .is_some()
-            {
-                return Err("duplicate system library role".into());
+        let (sys_lock, system_spec, runtime_binary, system_identity) = match &req.system_runtime {
+            RuntimeSelection::Cpu(cpu) => {
+                match cpu.kind {
+                    CpuKind::Cpu => {}
+                }
+                if !matches!(&req.engine.pc.backend, RoventBackend::OrtCpu)
+                    || !matches!(&req.engine.pc.device, RoventDevice::Cpu)
+                    || req.engine.pc.runtime_artifacts.len() != 1
+                {
+                    return Err(
+                        "CPU requires OrtCpu, CPU device, and exactly one original ORT artifact"
+                            .into(),
+                    );
+                }
+                let artifact = &req.engine.pc.runtime_artifacts[0];
+                artifact
+                    .validate()
+                    .map_err(|e| format!("CPU ORT artifact declaration: {e:?}"))?;
+                let digest = rz_eval::asset::parse_sha256(&artifact.sha256)
+                    .map_err(|e| format!("CPU ORT artifact digest: {e:?}"))?;
+                let lock = SystemRuntimeLockV6::new(NativeRuntimeSourceV6::Cpu)
+                    .map_err(|e| format!("CPU runtime registration: {e:?}"))?;
+                (lock, None, digest, None)
             }
-        }
-        let identities = captured.libraries();
-        let core = identities
-            .iter()
-            .find(|l| l.role == "ort-core")
-            .ok_or("captured ort-core missing")?;
-        let libraries = identities
-            .iter()
-            .map(|id| -> Result<SystemLibrarySpecV6, String> {
-                let requested_path = requested
-                    .get(&id.role)
-                    .ok_or("captured unexpected role")?
-                    .clone();
-                let canonical_path = id
-                    .canonical_path
-                    .to_str()
-                    .ok_or("system path is not UTF-8")?
-                    .to_owned();
-                Ok(SystemLibrarySpecV6 {
-                    role: id.role.clone(),
-                    requested_path,
-                    canonical_path,
-                    version: None,
-                    sha256: hex(&id.sha256),
-                    bytes: id.bytes,
-                    device: id.device,
-                    inode: id.inode,
-                    required_mapping: id.required_mapping,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let spec = SystemRuntimeSpecV6 {
-            platform: SystemPlatformV6::Linux,
-            libraries,
-            system_identity_sha256: hex(&captured.identity_sha256()),
-            cuda_device_id: r.cuda_device_id,
-            cuda_arena_bytes: r.cuda_arena_bytes,
-            startup_ms: r.startup_ms,
-            drain_ms: r.drain_ms,
-            capture_max_libraries: r.capture_max_libraries,
-            capture_max_file_bytes: r.capture_max_file_bytes,
-            capture_max_total_bytes: r.capture_max_total_bytes,
-            capture_timeout_ms: r.capture_timeout_ms,
+            RuntimeSelection::Cuda(r) => {
+                #[cfg(not(feature = "onnx-cuda"))]
+                {
+                    let _ = r;
+                    return Err("system CUDA capture requires the onnx-cuda feature".into());
+                }
+                #[cfg(feature = "onnx-cuda")]
+                {
+                    if r.capture_max_libraries == 0
+                        || r.capture_max_file_bytes == 0
+                        || r.capture_max_total_bytes == 0
+                        || r.capture_timeout_ms == 0
+                    {
+                        return Err("capture budgets must be nonzero".into());
+                    }
+                    let requests: Vec<SystemLibraryRequest> = r
+                        .libraries
+                        .iter()
+                        .map(|l| SystemLibraryRequest {
+                            role: l.role.clone(),
+                            path: PathBuf::from(&l.path),
+                            required_mapping: l.required_mapping,
+                        })
+                        .collect();
+                    let captured = SystemRuntime::capture(
+                        requests,
+                        SystemCaptureLimits {
+                            max_libraries: r.capture_max_libraries as usize,
+                            max_file_bytes: r.capture_max_file_bytes,
+                            max_total_bytes: r.capture_max_total_bytes,
+                            max_elapsed: Duration::from_millis(r.capture_timeout_ms),
+                        },
+                    )
+                    .map_err(|e| format!("system library capture failed: {e:?}"))?;
+                    let mut requested = HashMap::new();
+                    for lib in &r.libraries {
+                        if requested
+                            .insert(lib.role.clone(), lib.path.clone())
+                            .is_some()
+                        {
+                            return Err("duplicate system library role".into());
+                        }
+                    }
+                    let identities = captured.libraries();
+                    let core = identities
+                        .iter()
+                        .find(|l| l.role == "ort-core")
+                        .ok_or("captured ort-core missing")?;
+                    let libraries = identities
+                        .iter()
+                        .map(|id| -> Result<SystemLibrarySpecV6, String> {
+                            let requested_path = requested
+                                .get(&id.role)
+                                .ok_or("captured unexpected role")?
+                                .clone();
+                            let canonical_path = id
+                                .canonical_path
+                                .to_str()
+                                .ok_or("system path is not UTF-8")?
+                                .to_owned();
+                            Ok(SystemLibrarySpecV6 {
+                                role: id.role.clone(),
+                                requested_path,
+                                canonical_path,
+                                version: None,
+                                sha256: hex(&id.sha256),
+                                bytes: id.bytes,
+                                device: id.device,
+                                inode: id.inode,
+                                required_mapping: id.required_mapping,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let spec = SystemRuntimeSpecV6 {
+                        platform: SystemPlatformV6::Linux,
+                        libraries,
+                        system_identity_sha256: hex(&captured.identity_sha256()),
+                        cuda_device_id: r.cuda_device_id,
+                        cuda_arena_bytes: r.cuda_arena_bytes,
+                        startup_ms: r.startup_ms,
+                        drain_ms: r.drain_ms,
+                        capture_max_libraries: r.capture_max_libraries,
+                        capture_max_file_bytes: r.capture_max_file_bytes,
+                        capture_max_total_bytes: r.capture_max_total_bytes,
+                        capture_timeout_ms: r.capture_timeout_ms,
+                    };
+                    let sys_lock =
+                        SystemRuntimeLockV6::new(NativeRuntimeSourceV6::SystemCuda(spec.clone()))
+                            .map_err(|e| format!("system runtime registration: {e:?}"))?;
+                    let binary = core.sha256;
+                    let identity = captured.identity_sha256();
+                    (sys_lock, Some(spec), binary, Some(identity))
+                }
+            }
         };
-        let sys_lock = SystemRuntimeLockV6::new(NativeRuntimeSourceV6::SystemCuda(spec.clone()))
-            .map_err(|e| format!("system runtime registration: {e:?}"))?;
         let doc = RoventStartupDocumentV5 {
             domain: ROVENT_STARTUP_DOCUMENT_V5_DOMAIN.into(),
             system_runtime_lock_sha256: sys_lock.canonical_sha256.clone(),
@@ -504,18 +590,34 @@ mod registration {
         typed
             .require_supported_native_capabilities()
             .map_err(|e| format!("native capability declaration: {e:?}"))?;
-        let onnx = typed
-            .fields()
-            .native
-            .onnx_system(&req.engine.pc.device, &spec)
-            .map_err(|e| format!("native configuration and system selection disagree: {e:?}"))?;
-        // The request has no slots for derived digests. Construct the real
-        // declarations only after Rules and system/runtime observations exist.
-        let backend_configuration_sha256 =
-            hex(
-                &system_configuration_digest_v3(onnx, core.sha256, captured.identity_sha256())
-                    .map_err(|e| format!("native configuration identity: {e:?}"))?,
-            );
+        let native = typed.fields().native;
+        let backend_configuration_sha256 = match (&system_spec, system_identity) {
+            (Some(spec), Some(identity)) => {
+                let onnx = native
+                    .onnx_system(&req.engine.pc.device, spec)
+                    .map_err(|e| {
+                        format!("native configuration and system selection disagree: {e:?}")
+                    })?;
+                hex(
+                    &system_configuration_digest_v3(onnx, runtime_binary, identity)
+                        .map_err(|e| format!("native configuration identity: {e:?}"))?,
+                )
+            }
+            (None, None) => {
+                let onnx = native
+                    .onnx(&req.engine.pc.device, false)
+                    .map_err(|e| format!("CPU native configuration: {e:?}"))?;
+                hex(&configuration_digest_from_metadata(
+                    onnx,
+                    native.loading_profile.map(|profile| profile.actual()),
+                    runtime_binary,
+                    None,
+                    None,
+                )
+                .map_err(|e| format!("CPU native configuration identity: {e:?}"))?)
+            }
+            _ => return Err("inconsistent registered runtime identity".into()),
+        };
         let search_configuration_sha256 = hex(&typed
             .search_configuration_digest()
             .map_err(|e| format!("search identity: {e:?}"))?);
@@ -647,20 +749,24 @@ mod registration {
                 ));
             }
         }
-        println!(
-            "{{\"status\":\"registered\",\"system_identity\":\"{}\",\"runtime_lock_sha256\":\"{}\",\"execution_lock_sha256\":\"{}\",\"source_commit_observation\":\"{}\",\"source_components_observation\":\"{}\",\"model_source_observation\":\"{}\",\"source_observation_scope\":\"registration_executable_only\",\"native_capture\":true,\"engine_model_asset_bytes_verified\":false,\"provider_ready\":false,\"gpu_inference\":false}}",
-            hex(&captured.identity_sha256()),
-            sys_lock.canonical_sha256,
-            lock.canonical_sha256,
-            commit_status,
-            component_status,
-            model_source_status
-        );
+        if let Some(identity) = system_identity {
+            println!(
+                "{{\"status\":\"registered\",\"system_identity\":\"{}\",\"runtime_lock_sha256\":\"{}\",\"execution_lock_sha256\":\"{}\",\"source_commit_observation\":\"{}\",\"source_components_observation\":\"{}\",\"model_source_observation\":\"{}\",\"source_observation_scope\":\"registration_executable_only\",\"native_capture\":true,\"engine_model_asset_bytes_verified\":false,\"provider_ready\":false,\"gpu_inference\":false}}",
+                hex(&identity), sys_lock.canonical_sha256, lock.canonical_sha256,
+                commit_status, component_status, model_source_status
+            );
+        } else {
+            println!(
+                "{{\"status\":\"registered\",\"system_identity\":null,\"runtime_lock_sha256\":\"{}\",\"execution_lock_sha256\":\"{}\",\"source_commit_observation\":\"{}\",\"source_components_observation\":\"{}\",\"model_source_observation\":\"{}\",\"source_observation_scope\":\"registration_executable_only\",\"native_capture\":false,\"engine_model_asset_bytes_verified\":false,\"provider_ready\":false,\"gpu_inference\":false}}",
+                sys_lock.canonical_sha256, lock.canonical_sha256,
+                commit_status, component_status, model_source_status
+            );
+        }
         Ok(())
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cuda"))]
+#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
 fn main() {
     if let Err(e) = registration::run() {
         eprintln!("registration failed: {e}");
