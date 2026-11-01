@@ -2310,6 +2310,23 @@ mod tests {
         assert!(custody.owners().profile_file().is_some());
         assert!(custody.retains_root_capability());
 
+        // A compiled-admission rejection still owns these unopened-to-native
+        // resources. Returning the original error then dropping this owner
+        // must not keep an otherwise-unused /2 lock alive.
+        let compiled = RoventStorageCompiledFailureV2 {
+            error: compiled_mismatch("fixture compiled binding"),
+            custody,
+        };
+        assert_eq!(Arc::strong_count(&lock), 2);
+        assert!(
+            compiled
+                .error
+                .to_string()
+                .contains("fixture compiled binding")
+        );
+        drop(compiled);
+        assert_eq!(Arc::strong_count(&lock), 1);
+
         let mut request = fixture.request();
         request.profile_bytes += 1;
         let failure = match open_rovent_storage_byte_custody_v2(
@@ -2323,6 +2340,11 @@ mod tests {
         };
         assert!(Arc::ptr_eq(failure.owners.input_lock(), &lock));
         assert!(!failure.owners.retains_root_capability());
+        assert_eq!(Arc::strong_count(&lock), 2);
+        let cause = failure.error.to_string();
+        assert!(cause.contains("profile"));
+        drop(failure);
+        assert_eq!(Arc::strong_count(&lock), 1);
     }
 
     #[test]

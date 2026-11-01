@@ -644,7 +644,11 @@ fn prepare_launch_storage<'boundary, 'process>(
         Ok(custody) => custody,
         Err(rejected) => {
             let cause = error("StorageCustody", &rejected.error);
-            std::mem::forget((rejected.owners, Arc::clone(boundary)));
+            // Admission precedes native preparation: no worker received these
+            // freshly opened storage descriptors. Drop only this failed
+            // storage owner; other collection/process owners remain with their
+            // original callers.
+            drop(rejected.owners);
             return Err(cause);
         }
     };
@@ -655,7 +659,8 @@ fn prepare_launch_storage<'boundary, 'process>(
         })),
         Err(rejected) => {
             let cause = error("StorageCompiledCustody", &rejected.error);
-            std::mem::forget((rejected.custody.into_owners(), Arc::clone(boundary)));
+            // No native worker has received this custody yet.
+            drop(rejected.custody);
             Err(cause)
         }
     }
