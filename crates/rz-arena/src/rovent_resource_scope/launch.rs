@@ -343,7 +343,7 @@ impl NativeResourceCustody {
             .expect("stored original /3 scope")
             .observe();
         let (observation, evidence_error, policy) =
-            persist_v3_admission(&snapshot, &self.directory, self.plan.profile);
+            persist_admission_observation(&snapshot, &self.directory, self.plan.profile);
         self.admission = observation;
         self.admission_evidence_error = evidence_error;
         policy?;
@@ -395,9 +395,14 @@ impl NativeResourceCustody {
             .as_ref()
             .expect("stored original /2 scope")
             .observe();
-        self.admission =
-            Some(snapshot.write_evidence(&self.directory, Path::new("admission-readback.json"))?);
-        snapshot.require_admission(self.plan.profile)?;
+        // A failed evidence write is not a failure to apply or observe the
+        // original resource policy. Keep it distinct while still withholding
+        // V2 corpus eligibility when the required readback is absent.
+        let (observation, evidence_error, policy) =
+            persist_admission_observation(&snapshot, &self.directory, self.plan.profile);
+        self.admission = observation;
+        self.admission_evidence_error = evidence_error;
+        policy?;
         self.admission_v2_succeeded = true;
         Ok(())
     }
@@ -455,36 +460,30 @@ impl NativeResourceCustody {
             return Err(invalid("native resource finished observation replay"));
         }
         self.finished_attempted = true;
-        if let Some(scope) = &self.scope_v3 {
-            let snapshot = scope.observe();
-            match snapshot.write_evidence(&self.directory, Path::new("finished-live-readback.json"))
-            {
-                Ok(observation) => self.finished_live = Some(observation),
-                Err(error) => self.finished_evidence_error = Some(error.to_string()),
-            }
+        if let Some(snapshot) = self
+            .scope_v3
+            .as_ref()
+            .map(RoventNativeResourceScopeV3::observe)
+            .or_else(|| {
+                self.scope_v2
+                    .as_ref()
+                    .map(RoventNativeResourceScopeV2::observe)
+            })
+        {
+            let (observation, evidence_error, policy) =
+                persist_finished_observation(&snapshot, &self.directory, self.plan.profile);
+            self.finished_live = observation;
+            self.finished_evidence_error = evidence_error;
             // This is a post-execution observation/acceptance decision. A
             // missing file or unobserved final controls cannot rewrite the
             // already-completed engine result; retain the original reason.
-            if let Err(error) = snapshot.require_finished_profile(self.plan.profile) {
+            if let Err(error) = policy {
                 self.finished_live_error = Some(error.to_string());
             }
             return Ok(());
         }
         let result: Result<(), ArenaError> = (|| {
-            let snapshot = self
-                .scope
-                .as_ref()
-                .map(RoventNativeResourceScope::observe)
-                .or_else(|| {
-                    self.scope_v2
-                        .as_ref()
-                        .map(RoventNativeResourceScopeV2::observe)
-                })
-                .or_else(|| {
-                    self.scope_v3
-                        .as_ref()
-                        .map(RoventNativeResourceScopeV3::observe)
-                });
+            let snapshot = self.scope.as_ref().map(RoventNativeResourceScope::observe);
             if let Some(snapshot) = snapshot {
                 self.finished_live =
                     Some(snapshot.write_evidence(
@@ -520,7 +519,9 @@ impl NativeResourceCustody {
                 .as_ref()
                 .is_some_and(|scope| scope.matches_input_lock(lock))
             || self.admission.is_none()
+            || self.admission_evidence_error.is_some()
             || self.finished_live.is_none()
+            || self.finished_evidence_error.is_some()
             || self.finished_live_error.is_some()
         {
             return Err(invalid(
@@ -570,11 +571,26 @@ impl NativeResourceCustody {
             "admission":self.admission,"finished_live":self.finished_live,"finished_live_error":self.finished_live_error,
             "controlled_comparison_accepted":false,"automatic_cleanup":false})
     }
+
+    /// Separate failure diagnostics, deliberately not part of the historical
+    /// strict `/1` custody object used by N05 consumers.
+    pub(crate) fn evidence_failure_observation(&self) -> Option<Value> {
+        if self.admission_evidence_error.is_none() && self.finished_evidence_error.is_none() {
+            return None;
+        }
+        Some(json!({
+            "admission_evidence_error": self.admission_evidence_error,
+            "finished_evidence_error": self.finished_evidence_error,
+            "finished_policy_observation_error": self.finished_live_error,
+            "admission_v2_succeeded": self.admission_v2_succeeded,
+            "v2_corpus_eligibility": "unconfirmed",
+        }))
+    }
 }
 
 /// Persisting the readback is diagnostic; actual kernel-policy admission is
 /// still checked even when the evidence file cannot be created.
-fn persist_v3_admission(
+fn persist_admission_observation(
     snapshot: &RoventNativeResourceSnapshot,
     directory: &Dir,
     profile: RoventNativeResourceProfile,
@@ -589,6 +605,24 @@ fn persist_v3_admission(
             Err(error) => (None, Some(error.to_string())),
         };
     let policy = snapshot.require_admission(profile);
+    (observation, evidence_error, policy)
+}
+
+fn persist_finished_observation(
+    snapshot: &RoventNativeResourceSnapshot,
+    directory: &Dir,
+    profile: RoventNativeResourceProfile,
+) -> (
+    Option<RoventResourceObservation>,
+    Option<String>,
+    Result<(), ArenaError>,
+) {
+    let (observation, evidence_error) =
+        match snapshot.write_evidence(directory, Path::new("finished-live-readback.json")) {
+            Ok(observation) => (Some(observation), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+    let policy = snapshot.require_finished_profile(profile);
     (observation, evidence_error, policy)
 }
 
@@ -667,15 +701,8 @@ fn verify_system_v3_child_receipts(
     ),
     ArenaError,
 > {
-    use rz_experiments::{NativeRuntimeSourceV6, PhysicalCompletionV6, ProviderReadinessV6};
     let scope = state.original_v3_scope()?;
     let lock = &scope.input_lock().manifest.system_runtime_lock;
-    let system = match &lock.runtime {
-        NativeRuntimeSourceV6::SystemCuda(system) => system,
-        NativeRuntimeSourceV6::Cpu => {
-            return Err(invalid("V3 system execution requires explicit system CUDA"));
-        }
-    };
     let pid = std::process::id();
     let session = state
         .directory
@@ -690,20 +717,52 @@ fn verify_system_v3_child_receipts(
         pid,
         epoch,
     )?;
+    validate_system_v3_receipt_pair(lock, pid, epoch, &startup, &termination)?;
+    Ok((startup, termination))
+}
+
+/// Validate the original child's claims. This does not independently attest
+/// device execution or elevate a CPU run to CUDA evidence.
+fn validate_system_v3_receipt_pair(
+    lock: &rz_experiments::SystemRuntimeLockV6,
+    pid: u32,
+    epoch: u64,
+    startup: &rz_experiments::SystemRuntimeReceiptV6,
+    termination: &rz_experiments::SystemRuntimeReceiptV6,
+) -> Result<(), ArenaError> {
+    use rz_experiments::{NativeRuntimeSourceV6, PhysicalCompletionV6, ProviderReadinessV6};
+    startup.validate_against(lock, pid, epoch)?;
     if startup.provider_ready != ProviderReadinessV6::Ready
         || startup.physical_completion != PhysicalCompletionV6::Unknown
-        || startup.observed_identity_sha256.as_deref()
-            != Some(system.system_identity_sha256.as_str())
-        || !startup
-            .unregistered_native_mappings
-            .as_ref()
-            .is_some_and(Vec::is_empty)
     {
         return Err(invalid(
             "V3 startup system runtime observation is incomplete",
         ));
     }
-    system.validate_ready_observed(&startup.observed_libraries)?;
+    match &lock.runtime {
+        NativeRuntimeSourceV6::Cpu => {
+            if startup.observed_identity_sha256.is_some() || !startup.observed_libraries.is_empty()
+            {
+                return Err(invalid(
+                    "CPU startup cannot assert CUDA identity or libraries",
+                ));
+            }
+        }
+        NativeRuntimeSourceV6::SystemCuda(system) => {
+            if startup.observed_identity_sha256.as_deref()
+                != Some(system.system_identity_sha256.as_str())
+                || !startup
+                    .unregistered_native_mappings
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+            {
+                return Err(invalid(
+                    "V3 startup system runtime observation is incomplete",
+                ));
+            }
+            system.validate_ready_observed(&startup.observed_libraries)?;
+        }
+    }
     termination.validate_success(lock, pid, epoch)?;
     if termination.physical_completion
         != (PhysicalCompletionV6::Confirmed {
@@ -714,7 +773,7 @@ fn verify_system_v3_child_receipts(
             "V3 terminal receipt does not identify its original session completion",
         ));
     }
-    Ok((startup, termination))
+    Ok(())
 }
 
 /// The actual shared launch callback runs after its original lock/process
@@ -991,6 +1050,56 @@ fn parent_and_leaf<'a>(
 mod tests {
     use super::*;
     #[test]
+    fn cpu_v3_receipts_require_original_child_ready_and_session_finish() {
+        use rz_experiments::{
+            NativeRuntimeSourceV6, PhysicalCompletionV6, ProviderReadinessV6,
+            SYSTEM_RUNTIME_RECEIPT_V6_DOMAIN, SystemRuntimeLockV6, SystemRuntimeReceiptV6,
+        };
+        let lock = SystemRuntimeLockV6::new(NativeRuntimeSourceV6::Cpu).unwrap();
+        let pid = std::process::id();
+        let epoch = 7;
+        let startup = SystemRuntimeReceiptV6 {
+            domain: SYSTEM_RUNTIME_RECEIPT_V6_DOMAIN.into(),
+            lock_sha256: lock.canonical_sha256.clone(),
+            process_id: pid,
+            process_generation: epoch,
+            observed_identity_sha256: None,
+            observed_libraries: Vec::new(),
+            unregistered_native_mappings: None,
+            provider_ready: ProviderReadinessV6::Ready,
+            physical_completion: PhysicalCompletionV6::Unknown,
+        };
+        let mut termination = startup.clone();
+        termination.physical_completion = PhysicalCompletionV6::Confirmed {
+            completion_id: format!("session_finish_confirmed/1:{pid}:{epoch}"),
+        };
+        assert!(validate_system_v3_receipt_pair(&lock, pid, epoch, &startup, &termination).is_ok());
+        assert!(
+            validate_system_v3_receipt_pair(&lock, pid, epoch + 1, &startup, &termination).is_err()
+        );
+        let mut wrong_start = startup.clone();
+        wrong_start.provider_ready = ProviderReadinessV6::Unknown;
+        assert!(
+            validate_system_v3_receipt_pair(&lock, pid, epoch, &wrong_start, &termination).is_err()
+        );
+        wrong_start = startup.clone();
+        wrong_start.observed_identity_sha256 = Some("a".repeat(64));
+        assert!(
+            validate_system_v3_receipt_pair(&lock, pid, epoch, &wrong_start, &termination).is_err()
+        );
+        termination.physical_completion = PhysicalCompletionV6::Unknown;
+        assert!(
+            validate_system_v3_receipt_pair(&lock, pid, epoch, &startup, &termination).is_err()
+        );
+        termination.physical_completion = PhysicalCompletionV6::Confirmed {
+            completion_id: "different".into(),
+        };
+        assert!(
+            validate_system_v3_receipt_pair(&lock, pid, epoch, &startup, &termination).is_err()
+        );
+    }
+
+    #[test]
     fn explicit_resource_cli_preserves_native_arguments_and_rejects_duplicate_or_escape() {
         let arguments = vec![
             "--resource-plan=inputs/resources.json".into(),
@@ -1053,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_admission_preserves_write_failure_without_skipping_kernel_policy() {
+    fn readback_write_failures_do_not_skip_admission_or_finished_policy() {
         let path = std::env::temp_dir().join(format!(
             "rovent-v3-readback-{}-{}",
             std::process::id(),
@@ -1072,14 +1181,29 @@ mod tests {
             limits: Some((1, 2)),
             inventory_complete: true,
         };
-        let (observation, error, policy) = persist_v3_admission(
+        let (observation, error, policy) = persist_admission_observation(
             &snapshot,
             &directory,
             RoventNativeResourceProfile::FunctionalValidation,
         );
         assert!(observation.is_none() && error.is_some() && policy.is_ok());
         snapshot.applied = Some(false);
-        let (observation, error, policy) = persist_v3_admission(
+        let (observation, error, policy) = persist_admission_observation(
+            &snapshot,
+            &directory,
+            RoventNativeResourceProfile::FunctionalValidation,
+        );
+        assert!(observation.is_none() && error.is_some() && policy.is_err());
+        std::fs::write(path.join("finished-live-readback.json"), b"occupied").unwrap();
+        snapshot.applied = Some(true);
+        let (observation, error, policy) = persist_finished_observation(
+            &snapshot,
+            &directory,
+            RoventNativeResourceProfile::FunctionalValidation,
+        );
+        assert!(observation.is_none() && error.is_some() && policy.is_ok());
+        snapshot.applied = Some(false);
+        let (observation, error, policy) = persist_finished_observation(
             &snapshot,
             &directory,
             RoventNativeResourceProfile::FunctionalValidation,
@@ -1087,6 +1211,7 @@ mod tests {
         assert!(observation.is_none() && error.is_some() && policy.is_err());
         drop(directory);
         std::fs::remove_file(path.join("admission-readback.json")).unwrap();
+        std::fs::remove_file(path.join("finished-live-readback.json")).unwrap();
         std::fs::remove_dir(&path).unwrap();
     }
 }

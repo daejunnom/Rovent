@@ -1044,11 +1044,16 @@ impl RoventNnuecCollectionRunV2 {
             Ok(None) => ("busy", None),
             Err(_) => ("poisoned", None),
         };
-        let (resource_observation, resource) = match self.resource.try_lock() {
-            Ok(state) => ("available", Some(state.observation())),
-            Err(std::sync::TryLockError::WouldBlock) => ("busy", None),
-            Err(std::sync::TryLockError::Poisoned(_)) => ("poisoned", None),
-        };
+        let (resource_observation, resource, resource_evidence_failure) =
+            match self.resource.try_lock() {
+                Ok(state) => (
+                    "available",
+                    Some(state.observation()),
+                    state.evidence_failure_observation(),
+                ),
+                Err(std::sync::TryLockError::WouldBlock) => ("busy", None, None),
+                Err(std::sync::TryLockError::Poisoned(_)) => ("poisoned", None, None),
+            };
         let (owner_observation, owner) = match self.owner.try_status() {
             Ok(Some(status)) => ("available", Some(status)),
             Ok(None) => ("busy", None),
@@ -1176,6 +1181,12 @@ impl RoventNnuecCollectionRunV2 {
             "collection_owner_observation":owner_observation,
             "collection_owner":owner_value
         });
+        if let Some(diagnostic) = resource_evidence_failure {
+            observation
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("resource_evidence_failure".into(), diagnostic);
+        }
         // Only original installed admissions are counted. A prepared worker
         // slot is not an admission, and an admission is not completion or
         // publication. While the supervisor owns its slots, this bounded

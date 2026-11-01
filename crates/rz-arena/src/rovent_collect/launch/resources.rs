@@ -49,4 +49,7 @@ impl CollectionResourceCustody {
     pub(super) fn observation(&self) -> Value {
         self.original.observation()
     }
+    pub(super) fn evidence_failure_observation(&self) -> Option<Value> {
+        self.original.evidence_failure_observation()
+    }
 }

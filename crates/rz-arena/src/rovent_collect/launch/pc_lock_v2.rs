@@ -1498,7 +1498,13 @@ impl RoventPcCollectionRunV2 {
     }
 
     pub fn observation(&self) -> serde_json::Value {
-        let resource = self.resource.lock().ok().map(|state| state.observation());
+        let (resource, resource_evidence_failure) =
+            self.resource.lock().ok().map_or((None, None), |state| {
+                (
+                    Some(state.observation()),
+                    state.evidence_failure_observation(),
+                )
+            });
         let (owner_observation, owner) = match self.owner.try_status() {
             Ok(Some(status)) => ("available", Some(status)),
             Ok(None) => ("busy", None),
@@ -1593,6 +1599,12 @@ impl RoventPcCollectionRunV2 {
             "pump_consumer_failure":self.pump_thread_failure,
             "corpus_published":self.pump_published,
             "publisher_receipt":self.publication});
+        if let Some(diagnostic) = resource_evidence_failure {
+            observation
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("resource_evidence_failure".into(), diagnostic);
+        }
         let remaining = json!({
             "publication_attempted":self.publication_attempted,
             "secondary_supervisor_present":self.supervisor.is_some(),
