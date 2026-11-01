@@ -172,7 +172,7 @@ impl BoundDirectControl {
             }
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if is_original_parent_peer(&stream, original_parent_pid).unwrap_or(false) {
+                    if is_original_parent_peer(&stream, original_parent_pid)? {
                         return Ok(stream);
                     }
                     // A competing connection is not the launch owner. Closing
