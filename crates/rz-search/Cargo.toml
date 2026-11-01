@@ -10,6 +10,8 @@ description = "RoveZero deterministic PUCT accounting and time control"
 experimental-batch = []
 # Explicit raw NNUEC scalar observation only; no evaluator/search behavior.
 nnuec-scalar-diagnostics = []
+# Read-only same-go exact-rank observation; no corpus or policy authorization.
+experimental-teacher-exact-witness = []
 default = []
 experimental-puct = []
 experimental-search-buffers = []

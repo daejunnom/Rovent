@@ -127,6 +127,45 @@ impl TeacherDispatch {
 }
 
 /// A private terminal receipt remains mandatory even when the raw report is public.
+/// An exact-rank observation is experimental and cannot authorize a target.
+#[cfg(feature = "experimental-teacher-exact-witness")]
+#[derive(Clone, Debug)]
+pub struct CompletedExactRankSetObservation {
+    request_id: u64,
+    observation_sequence: u64,
+    opinions: Vec<ExternalPolicyOpinion>,
+    final_bestmove: BoardMove,
+}
+
+#[cfg(feature = "experimental-teacher-exact-witness")]
+impl CompletedExactRankSetObservation {
+    /// The named policy records the last observed complete exact rank set
+    /// in this go; this is not a final-bestmove or minimax claim.
+    pub const fn policy(&self) -> &'static str {
+        "completed_exact_rank_set"
+    }
+    pub fn request_id(&self) -> u64 {
+        self.request_id
+    }
+    /// Monotonic within this original go only, never across requests.
+    pub fn observation_sequence(&self) -> u64 {
+        self.observation_sequence
+    }
+    pub fn opinions(&self) -> &[ExternalPolicyOpinion] {
+        &self.opinions
+    }
+    pub fn final_bestmove(&self) -> BoardMove {
+        self.final_bestmove
+    }
+    pub fn first_matches_final(&self) -> bool {
+        self.opinions
+            .first()
+            .and_then(|opinion| opinion.pv.first())
+            .copied()
+            == Some(self.final_bestmove)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TeacherCompletion {
     dispatch: TeacherDispatch,
@@ -138,9 +177,18 @@ pub struct TeacherCompletion {
     go_issue: ExternalGoIssue,
     issued_constraint: Option<ExternalGoConstraint>,
     issued_go: Option<String>,
+    #[cfg(feature = "experimental-teacher-exact-witness")]
+    completed_exact: Option<CompletedExactRankSetObservation>,
 }
 
 impl TeacherCompletion {
+    /// Borrow the original worker's bounded observation. The original
+    /// dispatch, timing, cancellation and process must still be checked;
+    /// this does not create a target or prove GPU/process retirement.
+    #[cfg(feature = "experimental-teacher-exact-witness")]
+    pub fn completed_exact_rank_set(&self) -> Option<&CompletedExactRankSetObservation> {
+        self.completed_exact.as_ref()
+    }
     pub fn id(&self) -> TeacherJobId {
         self.dispatch.id
     }
@@ -890,6 +938,67 @@ fn coherent_policy(
             == report.best_move
 }
 
+/// Capture only this checker's original go after a natural, ready terminal.
+/// The retained set came from validated same-query info tuples, not a replay.
+#[cfg(feature = "experimental-teacher-exact-witness")]
+fn observe_completed_exact_rank_set(
+    checker: &ExternalUciCpuChecker,
+    dispatch: &TeacherDispatch,
+    result: &Result<ProfiledExternalOutcome, CheckerError>,
+    controls: ControlSnapshot,
+    timing: ProfiledExternalTiming,
+    original_deadline: Instant,
+) -> Option<CompletedExactRankSetObservation> {
+    let outcome = result.as_ref().ok()?;
+    let raw = &outcome.report.raw;
+    let attempt = checker.last_attempt()?.external.as_ref()?;
+    let go = timing.go_issued_at?;
+    let best = timing.bestmove_drained_at?;
+    let ready = timing.ready_completed_at?;
+    let returned = timing.returned_at?;
+    if checker.go_issue != ExternalGoIssue::Issued
+        || raw.completion != ExternalCompletion::BestMove
+        || !outcome.report.readiness_barrier_completed
+        || !controls.terminal
+        || controls.cancel_sequence != 0
+        || controls.yield_sequence != 0
+        || timing.stop_sent_at.is_some()
+        || !(go <= best && best <= ready && ready <= returned && returned < original_deadline)
+        || attempt.request_id != raw.request_id
+        || attempt.partial_report.as_ref() != Some(raw)
+        || attempt.process.process_identity != Some(dispatch.process_identity())
+    {
+        return None;
+    }
+    let final_bestmove = raw.best_move?;
+    let width = usize::from(outcome.requested_multipv);
+    if !(1..=4).contains(&width) {
+        return None;
+    }
+    let (sequence, selected) = checker.cooperative_exact_latest.as_ref()?;
+    if *sequence == 0
+        || selected.len() != width
+        || !selected.first().is_some_and(|first| first.depth > 0)
+        || !selected.iter().enumerate().all(|(index, opinion)| {
+            opinion.rank == index as u16 + 1
+                && opinion.depth == selected[0].depth
+                && opinion.bound == ExternalBound::ExactReported
+                && !opinion.pv.is_empty()
+                && !selected[..index]
+                    .iter()
+                    .any(|prior| prior.pv.first() == opinion.pv.first())
+        })
+    {
+        return None;
+    }
+    Some(CompletedExactRankSetObservation {
+        request_id: raw.request_id,
+        observation_sequence: *sequence,
+        opinions: selected.clone(),
+        final_bestmove,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     config: ExternalCpuConfig,
@@ -1107,6 +1216,15 @@ fn run_worker(
             let controls = job.control.seal_terminal();
             let mut final_timing = *timing.lock().unwrap_or_else(|p| p.into_inner());
             final_timing.returned_at = Some(Instant::now());
+            #[cfg(feature = "experimental-teacher-exact-witness")]
+            let completed_exact = observe_completed_exact_rank_set(
+                &checker,
+                &dispatch,
+                &result,
+                controls,
+                final_timing,
+                hard_deadline,
+            );
             let completion = TeacherCompletion {
                 dispatch,
                 process: checker
@@ -1120,6 +1238,8 @@ fn run_worker(
                 go_issue: checker.go_issue,
                 issued_constraint: checker.last_issued_constraint,
                 issued_go: checker.last_issued_go.clone(),
+                #[cfg(feature = "experimental-teacher-exact-witness")]
+                completed_exact,
             };
             let publication = if panicked {
                 supervisor.publish(completion)
@@ -1405,6 +1525,8 @@ mod tests {
             go_issue: ExternalGoIssue::NotIssued,
             issued_constraint: None,
             issued_go: None,
+            #[cfg(feature = "experimental-teacher-exact-witness")]
+            completed_exact: None,
         };
         let mut substituted = dispatch.clone();
         substituted.admission = Arc::new(AtomicBool::new(false));
@@ -1494,6 +1616,8 @@ mod tests {
             go_issue: ExternalGoIssue::NotIssued,
             issued_constraint: None,
             issued_go: None,
+            #[cfg(feature = "experimental-teacher-exact-witness")]
+            completed_exact: None,
         };
         assert!(supervisor.publish(result).is_ok());
         let retained = mailbox.take_reliable().unwrap();
@@ -1916,6 +2040,8 @@ mod tests {
         assert!(worker.submit(second.clone()).is_err());
         let completion = wait_completion(&worker, hard);
         assert_native_stop_ready(&completion, &first, ExternalCompletion::StoppedCanceled);
+        #[cfg(feature = "experimental-teacher-exact-witness")]
+        assert!(completion.completed_exact_rank_set().is_none());
         assert_eq!(completion.controls().cancel_ack, 7);
         // Delivery identity survives a missing process observation; the
         // strict submission/label check must still reject that terminal.
@@ -1938,6 +2064,8 @@ mod tests {
         second.control.request_yield(9).unwrap();
         let completion = wait_completion(&worker, hard);
         assert_native_stop_ready(&completion, &next, ExternalCompletion::StoppedYield);
+        #[cfg(feature = "experimental-teacher-exact-witness")]
+        assert!(completion.completed_exact_rank_set().is_none());
         assert_eq!(completion.controls().yield_ack, 9);
         assert!(!completion.matches_submission(&first));
         assert_eq!(next.process_identity(), first.process_identity());
@@ -1947,6 +2075,42 @@ mod tests {
         let output = String::from_utf8_lossy(diagnostics.stdout());
         assert!(output.matches("bestmove ").count() >= 2);
         assert!(output.matches("readyok").count() >= 3);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-teacher-exact-witness"))]
+    #[test]
+    fn exact_rank_observation_keeps_its_original_go_when_bestmove_changes() {
+        let _guard = super::super::tests::FIXTURE_LOCK.lock().unwrap();
+        let (mut worker, job, hard) = native_fixture("fake_uci_final_bound_changed_best");
+        let first = worker.submit(job.clone()).unwrap();
+        let completion = wait_completion(&worker, hard);
+        assert!(completion.matches_submission(&first));
+        let outcome = completion.result().as_ref().unwrap();
+        // The default target policy still rejects a changed final bestmove.
+        assert!(!outcome.conditional_policy_target_known);
+        let observed = completion.completed_exact_rank_set().unwrap();
+        assert_eq!(observed.policy(), "completed_exact_rank_set");
+        assert_eq!(observed.request_id(), outcome.report.raw.request_id);
+        assert_eq!(
+            observed.final_bestmove(),
+            outcome.report.raw.best_move.unwrap()
+        );
+        assert!(!observed.first_matches_final());
+        assert_eq!(observed.opinions().len(), 1);
+        assert_eq!(observed.opinions()[0].bound, ExternalBound::ExactReported);
+
+        // A later go retains its own request, never the earlier witness.
+        let mut next = job;
+        next.id.sequence += 1;
+        next.control = ControlMailbox::new(next.id, worker.signal());
+        let second = worker.submit(next).unwrap();
+        let next_completion = wait_completion(&worker, hard);
+        assert!(next_completion.matches_submission(&second));
+        let next_observed = next_completion.completed_exact_rank_set().unwrap();
+        assert_ne!(next_observed.request_id(), observed.request_id());
+        assert!(!next_completion.matches_submission(&first));
+        let closed = close_fixture(&mut worker, Instant::now() + Duration::from_secs(2));
+        assert_eq!(closed.process_identity, Some(first.process_identity()));
     }
 
     #[cfg(target_os = "linux")]

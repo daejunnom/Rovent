@@ -780,6 +780,12 @@ pub struct ExternalUciCpuChecker {
     // At most one completed set per actually legal first move for this job.
     cooperative_exact_completed: Vec<Vec<ExternalPolicyOpinion>>,
     cooperative_exact_limit: usize,
+    // Separate actual same-go observation order; legacy retention and target
+    // selection deliberately continue to use their existing vector above.
+    #[cfg(feature = "experimental-teacher-exact-witness")]
+    cooperative_exact_sequence: Option<u64>,
+    #[cfg(feature = "experimental-teacher-exact-witness")]
+    cooperative_exact_latest: Option<(u64, Vec<ExternalPolicyOpinion>)>,
     stop_control: Option<ExternalControlObservation>,
     go_issue: ExternalGoIssue,
     startup_multipv: Option<u16>,
@@ -863,6 +869,10 @@ impl ExternalUciCpuChecker {
             cooperative_exact_candidates: Vec::new(),
             cooperative_exact_completed: Vec::new(),
             cooperative_exact_limit: 0,
+            #[cfg(feature = "experimental-teacher-exact-witness")]
+            cooperative_exact_sequence: Some(0),
+            #[cfg(feature = "experimental-teacher-exact-witness")]
+            cooperative_exact_latest: None,
             stop_control: None,
             go_issue: ExternalGoIssue::NotIssued,
             startup_multipv: None,
@@ -1790,6 +1800,11 @@ impl ExternalUciCpuChecker {
         self.cooperative_exact_candidates.clear();
         self.cooperative_exact_completed.clear();
         self.cooperative_exact_limit = 0;
+        #[cfg(feature = "experimental-teacher-exact-witness")]
+        {
+            self.cooperative_exact_sequence = Some(0);
+            self.cooperative_exact_latest = None;
+        }
     }
 
     /// Record exact, legal tuples as reported; a bounded or incomplete next
@@ -1839,6 +1854,18 @@ impl ExternalUciCpuChecker {
                         .any(|prior| prior.pv.first() == item.pv.first())
             })
         {
+            #[cfg(feature = "experimental-teacher-exact-witness")]
+            if depth > 0 {
+                // Increment only for a complete ordered exact set at a
+                // positive depth. Overflow makes this go's new observation
+                // unavailable; never retain an older set as the latest one.
+                self.cooperative_exact_sequence = self
+                    .cooperative_exact_sequence
+                    .and_then(|sequence| sequence.checked_add(1));
+                self.cooperative_exact_latest = self
+                    .cooperative_exact_sequence
+                    .map(|sequence| (sequence, self.cooperative_exact_candidates.clone()));
+            }
             let first = self.cooperative_exact_candidates[0].pv[0];
             if let Some(old) = self.cooperative_exact_completed.iter_mut().find(|set| {
                 set.first().and_then(|opinion| opinion.pv.first()).copied() == Some(first)
@@ -3634,6 +3661,78 @@ mod tests {
                 .unwrap()
                 .cleanup_complete
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "experimental-teacher-exact-witness")]
+    #[test]
+    fn exact_rank_observation_orders_equal_depth_updates_and_clears_per_go() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut checker = ExternalUciCpuChecker::create(fixture_config("fake_uci_normal")).unwrap();
+        checker.cooperative_exact_limit = 20;
+        let opinion = |rank, depth, movement: &str, bound| ExternalPolicyOpinion {
+            rank,
+            depth,
+            seldepth: None,
+            pv: vec![BoardMove::from_uci(movement).unwrap()],
+            score: ExternalRawScore::Centipawns(0),
+            bound,
+            reported_wdl: None,
+        };
+        let first = opinion(1, 8, "e2e4", ExternalBound::ExactReported);
+        let second = opinion(2, 8, "d2d4", ExternalBound::ExactReported);
+        checker.observe_exact_policy_iteration(&first, 2);
+        assert!(checker.cooperative_exact_latest.is_none());
+        checker.observe_exact_policy_iteration(&second, 2);
+        assert_eq!(checker.cooperative_exact_latest.as_ref().unwrap().0, 1);
+
+        // The same leading move and depth can carry a changed valid rank 2.
+        // Legacy retention intentionally keeps its old same-depth set.
+        let changed = opinion(2, 8, "g1f3", ExternalBound::ExactReported);
+        checker.observe_exact_policy_iteration(&first, 2);
+        checker.observe_exact_policy_iteration(&changed, 2);
+        let (sequence, latest) = checker.cooperative_exact_latest.as_ref().unwrap();
+        assert_eq!(*sequence, 2);
+        assert_eq!(latest[1], changed);
+        assert_eq!(checker.cooperative_exact_completed[0][1], second);
+
+        // A complete zero-depth report is not a valid rank witness and must
+        // not replace the last positive-depth observation.
+        checker.observe_exact_policy_iteration(
+            &opinion(1, 0, "e2e4", ExternalBound::ExactReported),
+            2,
+        );
+        checker.observe_exact_policy_iteration(
+            &opinion(2, 0, "d2d4", ExternalBound::ExactReported),
+            2,
+        );
+        let (sequence, latest) = checker.cooperative_exact_latest.as_ref().unwrap();
+        assert_eq!(*sequence, 2);
+        assert_eq!(latest[1], changed);
+
+        // A partial/mixed-depth/bounded follow-up must not become a set.
+        checker.observe_exact_policy_iteration(
+            &opinion(1, 9, "e2e4", ExternalBound::ExactReported),
+            2,
+        );
+        checker.observe_exact_policy_iteration(
+            &opinion(2, 10, "d2d4", ExternalBound::ExactReported),
+            2,
+        );
+        checker.observe_exact_policy_iteration(&opinion(1, 10, "e2e4", ExternalBound::Lower), 2);
+        assert_eq!(checker.cooperative_exact_latest.as_ref().unwrap().0, 2);
+
+        checker.clear_cooperative_opinions();
+        assert!(checker.cooperative_exact_latest.is_none());
+        assert_eq!(checker.cooperative_exact_sequence, Some(0));
+        checker.cooperative_exact_sequence = Some(u64::MAX);
+        checker.observe_exact_policy_iteration(&first, 2);
+        checker.observe_exact_policy_iteration(&second, 2);
+        assert!(checker.cooperative_exact_sequence.is_none());
+        assert!(checker.cooperative_exact_latest.is_none());
+        checker.observe_exact_policy_iteration(&first, 2);
+        checker.observe_exact_policy_iteration(&second, 2);
+        assert!(checker.cooperative_exact_latest.is_none());
     }
 
     #[cfg(target_os = "linux")]
