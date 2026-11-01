@@ -265,6 +265,7 @@ pub struct RoventNativeSystemResourceRunReceiptV3 {
     system_lock_sha256: String,
     process_id: u32,
     process_generation: u64,
+    product_finish: Option<rz_uci::rovent_bootstrap::launch::V3ProductFinishObservation>,
     custody: Arc<Mutex<NativeResourceCustody>>,
 }
 impl RoventNativeSystemResourceRunReceiptV3 {
@@ -282,6 +283,7 @@ impl RoventNativeSystemResourceRunReceiptV3 {
             "control_cleanup_error":self.control_cleanup_error,
             "system_lock_sha256":self.system_lock_sha256,
             "process_id":self.process_id,"process_generation":self.process_generation,
+            "product_finish":self.product_finish.as_ref().map(product_finish_json),
             "startup_provider_ready":self.startup.as_ref().map(|r|r.provider_ready),
             "child_terminal_physical_completion":self.termination.as_ref().map(|r|&r.physical_completion),
             "child_system_runtime_receipts_validated":self.child_system_runtime_receipts_validated(),
@@ -291,6 +293,15 @@ impl RoventNativeSystemResourceRunReceiptV3 {
             "independent_gpu_fence_observation":false,
             "controlled_comparison_accepted":false,"training_executed":false})
     }
+}
+
+fn product_finish_json(
+    observation: &rz_uci::rovent_bootstrap::launch::V3ProductFinishObservation,
+) -> Value {
+    json!({"schema":"rz-rovent-product-finish-observation/1",
+        "process_id":observation.process_id,"process_epoch":observation.process_epoch,
+        "input_lock_sha256":observation.input_lock_sha256,
+        "state":"confirmed_by_original_product", "device_fence":false})
 }
 
 pub struct RoventNativeResourceRunFailure {
@@ -669,6 +680,7 @@ impl RoventNativeResourceRunFailure {
                 "finished_evidence_error":held.as_ref().and_then(|state|state.finished_evidence_error.as_ref()),
                 "finished_policy_observation_error":held.as_ref().and_then(|state|state.finished_live_error.as_ref()),
                 "control_cleanup_error":held.as_ref().and_then(|state|state.control_cleanup_error.as_ref()),
+                "product_finish":self.original_scope_key().and_then(|key|key.product_finish_observation()).as_ref().map(product_finish_json),
                 "session_evidence":self.original_scope_key().map(|key| match key.terminal_evidence() {
                     rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative => "before_native",
                     rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::SessionReleased => "session_released",
@@ -703,10 +715,16 @@ impl RoventNativeResourceRunFailureVersioned {
             Self::V1(failure) => failure.observation(),
             Self::V2(failure) => {
                 let mut poisoned = false;
-                let held = failure.custody.as_ref().map(|custody| match custody.lock() {
-                    Ok(owner) => owner,
-                    Err(error) => { poisoned = true; error.into_inner() }
-                });
+                let held = failure
+                    .custody
+                    .as_ref()
+                    .map(|custody| match custody.lock() {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            poisoned = true;
+                            error.into_inner()
+                        }
+                    });
                 json!({"schema":"rz-rovent-native-resource-run-failure/2",
                     "error":failure.detail,
                     "original_custody_retained":failure.custody.is_some(),
@@ -1413,17 +1431,25 @@ fn run_native_with_resources_inner(
     if state.admission_v2_succeeded {
         drop(state);
         return Ok(RoventNativeResourceRunReceiptVersioned::V2(
-            RoventNativeResourceRunReceiptV2 { admission, finished_live, custody },
+            RoventNativeResourceRunReceiptV2 {
+                admission,
+                finished_live,
+                custody,
+            },
         ));
     }
-    let admission = admission.ok_or_else(|| failure("actual resource admission did not run".into()))?;
-    let finished_live = finished_live.ok_or_else(|| failure("actual finished resource snapshot missing".into()))?;
+    let admission =
+        admission.ok_or_else(|| failure("actual resource admission did not run".into()))?;
+    let finished_live =
+        finished_live.ok_or_else(|| failure("actual finished resource snapshot missing".into()))?;
     drop(state);
-    Ok(RoventNativeResourceRunReceiptVersioned::V1(RoventNativeResourceRunReceipt {
-        admission,
-        finished_live,
-        custody,
-    }))
+    Ok(RoventNativeResourceRunReceiptVersioned::V1(
+        RoventNativeResourceRunReceipt {
+            admission,
+            finished_live,
+            custody,
+        },
+    ))
 }
 
 /// Explicit /3 system CUDA launch under its original resource owner. It uses
@@ -1802,6 +1828,10 @@ fn run_native_with_resources_v3_inner(
         system_lock_sha256,
         process_id: std::process::id(),
         process_generation: epoch,
+        product_finish: control_scope_marker
+            .as_ref()
+            .and_then(|marker| marker.get())
+            .and_then(|key| key.product_finish_observation()),
         custody,
     })
 }

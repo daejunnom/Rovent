@@ -26,6 +26,15 @@ pub enum V3ScopeTerminalEvidence {
     SessionReleased,
 }
 
+/// Observation of this original product's completed finish call. This is not
+/// a device-wide CUDA fence, a result validation, or an external tree proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V3ProductFinishObservation {
+    pub process_id: u32,
+    pub process_epoch: u64,
+    pub input_lock_sha256: String,
+}
+
 pub struct V3ScopeObservation {
     pub state: V3ScopeState,
     pub recovery_key: Option<TicketNativeRecoveryKey>,
@@ -87,6 +96,7 @@ pub enum V3NativeReobservation {
 struct SlotState {
     state: V3ScopeState,
     terminal: V3ScopeTerminalEvidence,
+    product_finish: Option<V3ProductFinishObservation>,
     // These are the same Arc-owned descriptors and source owners used by the
     // launch, not copies reopened by path after a failure.
     _pins: Vec<Box<dyn Any + Send>>,
@@ -131,6 +141,10 @@ fn registry() -> &'static Mutex<Vec<Arc<Slot>>> {
 pub struct RoventV3ScopeKey(Arc<Slot>);
 
 impl RoventV3ScopeKey {
+    /// None includes missing, busy and poisoned slots; it never grants release.
+    pub fn product_finish_observation(&self) -> Option<V3ProductFinishObservation> {
+        self.0.state.try_lock().ok()?.product_finish.clone()
+    }
     /// Reads the original slot even after retirement. Registry absence alone
     /// never implies completion; contention and poisoning are unknown.
     pub fn terminal_evidence(&self) -> V3ScopeTerminalEvidence {
@@ -363,6 +377,18 @@ impl ScopeReservation {
         }
     }
 
+    /// Called only after this product's physical finish returned confirmed and
+    /// its enclosing UCI call did not unwind.
+    pub(super) fn mark_product_finished(&mut self, epoch: u64, input_lock_sha256: &str) {
+        if let Ok(mut state) = self.key.0.state.lock() {
+            state.product_finish = Some(V3ProductFinishObservation {
+                process_id: std::process::id(),
+                process_epoch: epoch,
+                input_lock_sha256: input_lock_sha256.to_owned(),
+            });
+        }
+    }
+
     pub(super) fn reserve(
         domain: V3ScopeDomain,
         pins: Box<dyn Any + Send>,
@@ -376,6 +402,7 @@ impl ScopeReservation {
             state: Mutex::new(SlotState {
                 state: V3ScopeState::Reserved,
                 terminal: V3ScopeTerminalEvidence::Unknown,
+                product_finish: None,
                 _pins: vec![pins],
                 original: None,
                 recovery_key: None,
@@ -532,6 +559,7 @@ mod tests {
             .ok()
             .unwrap();
         let first_key = first.key().clone();
+        assert!(first_key.product_finish_observation().is_none());
         assert_eq!(
             first_key.terminal_evidence(),
             V3ScopeTerminalEvidence::Unknown
@@ -547,12 +575,20 @@ mod tests {
             .ok()
             .unwrap();
         let second_key = second.key().clone();
+        assert!(second_key.product_finish_observation().is_none());
         assert_eq!(
             second_key.terminal_evidence(),
             V3ScopeTerminalEvidence::Unknown
         );
         second.mark_session_released();
+        assert!(second_key.product_finish_observation().is_none());
+        second.mark_product_finished(37, "original-lock");
         drop(second);
+        let finish = second_key.product_finish_observation().unwrap();
+        assert_eq!(finish.process_id, std::process::id());
+        assert_eq!(finish.process_epoch, 37);
+        assert_eq!(finish.input_lock_sha256, "original-lock");
+        assert!(first_key.product_finish_observation().is_none());
         assert_eq!(
             second_key.terminal_evidence(),
             V3ScopeTerminalEvidence::SessionReleased

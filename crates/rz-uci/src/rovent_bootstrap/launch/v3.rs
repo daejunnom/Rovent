@@ -1297,7 +1297,10 @@ fn direct_selection(
             NativeRuntimeSourceV6::SystemCuda(_)
         )
     {
-        return Err(error("Assets", "CUDA control inventory requires system CUDA"));
+        return Err(error(
+            "Assets",
+            "CUDA control inventory requires system CUDA",
+        ));
     }
     let original = |path: &str| -> Result<ArtifactRef, RoventLaunchError> {
         let mut matches = lock
@@ -3049,6 +3052,7 @@ pub(super) fn run_native_admitted(
             },
         });
     }
+    scope.mark_product_finished(arguments.process_epoch, &lock.canonical_sha256);
     scope.settled_without_quarantine();
     result.map_err(Into::into)
 }

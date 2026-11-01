@@ -66,13 +66,11 @@ mod evidence;
 #[cfg(feature = "native-validation-diagnostics")]
 mod selected_view_observation;
 pub mod storage;
+#[cfg(target_os = "linux")]
+mod system_parent;
 mod v2_external;
 mod v2_rejections;
 mod v3;
-#[cfg(target_os = "linux")]
-mod system_parent;
-#[cfg(target_os = "linux")]
-pub(crate) use system_parent::ConnectedParent;
 pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
@@ -89,12 +87,14 @@ pub use collection::{
     run_pc_collection_v2_with_resource_admission, run_pc_collection_v2_with_sealed_policy,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
+#[cfg(target_os = "linux")]
+pub(crate) use system_parent::ConnectedParent;
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
 use v2_rejections::{reject_external_pcr_product_v2, reject_own_nnuec_product_v2};
 #[cfg(target_os = "linux")]
 pub use v3::v3_scope::{
-    RoventV3ScopeKey, V3NativeReobservation, V3ScopeObservation, V3ScopeState,
-    V3ScopeTerminalEvidence, unresolved_keys,
+    RoventV3ScopeKey, V3NativeReobservation, V3ProductFinishObservation, V3ScopeObservation,
+    V3ScopeState, V3ScopeTerminalEvidence, unresolved_keys,
 };
 #[cfg(target_os = "linux")]
 pub use v3::{
@@ -1016,7 +1016,15 @@ pub fn run_with_resource_admission<'a>(
     arguments: Vec<String>,
     admit_resource: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, Some(Box::new(admit_resource)), None, None, None, None)
+    run_inner(
+        arguments,
+        None,
+        Some(Box::new(admit_resource)),
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 type ResourceAdmission<'a> =
@@ -1033,7 +1041,15 @@ pub fn run_with_resource_admission_v1_v2<'a>(
     admit_v2: impl FnOnce(&Arc<RoventInputLockV2>) -> Result<(), RoventLaunchError> + 'a,
     on_v2_selected: impl FnOnce() + 'a,
 ) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, Some(Box::new(admit_v1)), Some(Box::new(admit_v2)), None, None, Some(Box::new(on_v2_selected)))
+    run_inner(
+        arguments,
+        None,
+        Some(Box::new(admit_v1)),
+        Some(Box::new(admit_v2)),
+        None,
+        None,
+        Some(Box::new(on_v2_selected)),
+    )
 }
 
 /// V3 uses its original lock and a distinct callback, never a V1/V2 projection.
@@ -1169,10 +1185,16 @@ pub fn run_with_v3_resource_admission_retaining_connected_control_slot<'a, C: Se
     control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
     parent_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
     admit_resource: impl FnOnce(
-        &Arc<RoventInputLockV3>, &Dir, &std::fs::File,
-        std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>,
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+        std::time::Instant,
+        Option<&Dir>,
+        Option<&std::path::Path>,
         &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
-    ) -> Result<(), RoventLaunchError> + 'a,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
 ) -> ControlledV3Result<C> {
     run_with_v3_control_slot_inner(arguments, control, Some(parent_stream), admit_resource)
 }
@@ -1183,10 +1205,16 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
     control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
     parent_stream: Option<Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>>,
     admit_resource: impl FnOnce(
-        &Arc<RoventInputLockV3>, &Dir, &std::fs::File,
-        std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>,
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+        std::time::Instant,
+        Option<&Dir>,
+        Option<&std::path::Path>,
         &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
-    ) -> Result<(), RoventLaunchError> + 'a,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
 ) -> ControlledV3Result<C> {
     let scope_marker = Arc::new(std::sync::OnceLock::new());
     if let Some(original_control) = control.get() {
@@ -1521,7 +1549,15 @@ fn run_inner<'a>(
                     "V1-only launch callbacks cannot consume /2",
                 ));
             }
-            return run_v2_native(arguments, lock, root, cwd, lock_file, None, resource_admission_v2);
+            return run_v2_native(
+                arguments,
+                lock,
+                root,
+                cwd,
+                lock_file,
+                None,
+                resource_admission_v2,
+            );
         }
         LaunchInputLock::V3(lock) => {
             if teacher_selections.is_some()
@@ -2077,7 +2113,15 @@ fn run_pc_collection_v2_inner<'a>(
             ));
         }
     };
-    run_v2_native(arguments, lock, root, cwd, lock_file, Some(collection), None)
+    run_v2_native(
+        arguments,
+        lock,
+        root,
+        cwd,
+        lock_file,
+        Some(collection),
+        None,
+    )
 }
 
 /// /2 products retain their original process, selected files and lock through
@@ -2195,7 +2239,10 @@ fn run_v2_native<'a>(
     // storage owner or native worker can be created. Collection keeps its
     // existing typed ordering and cannot provide this product callback.
     if collection.is_some() && product_resource.is_some() {
-        return Err(error("ResourceAdmission", "duplicate V2 resource callbacks"));
+        return Err(error(
+            "ResourceAdmission",
+            "duplicate V2 resource callbacks",
+        ));
     }
     if let Some(resource) = product_resource.take() {
         control
