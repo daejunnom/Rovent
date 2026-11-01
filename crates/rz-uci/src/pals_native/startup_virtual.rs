@@ -626,7 +626,7 @@ pub(crate) fn graph_purpose(role: &str) -> Result<Purpose, BackendError> {
         _ => Err(fail(K::UnsupportedModel, "unregistered V3 graph role")),
     }
 }
-pub(crate) fn exact_graph_snapshot_join(manifest: &str, graph: &str, file: &str) -> Result<(), BackendError> {
+fn exact_graph_snapshot_join(manifest: &str, graph: &str, file: &str) -> Result<(), BackendError> {
     if !matches!(
         Path::new(file).components().collect::<Vec<_>>().as_slice(),
         [Component::Normal(_)]

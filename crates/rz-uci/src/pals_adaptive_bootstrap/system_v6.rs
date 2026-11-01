@@ -52,19 +52,20 @@ pub(super) fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapErr
     let until = started
         .checked_add(Duration::from_millis(options.startup_ms))
         .ok_or_else(|| boundary("SystemV6StartupDeadline"))?;
-    let cancelled = AtomicBool::new(false);
+    let cancelled = Arc::new(AtomicBool::new(false));
     let cwd = std::env::current_dir().map_err(|error| failure("WorkingDirectory", &error))?;
     let owner = PinnedPalsSystemStartupV6::open(
         &options.lock_path,
         &options.lock_sha256,
         options.startup_ms,
         &cwd,
+        started,
         until,
-        &cancelled,
+        Arc::clone(&cancelled),
     )
     .map_err(|error| failure("SystemV6PinnedStartup", &error))?;
     owner
-        .verify_unchanged(until, &cancelled)
+        .verify_unchanged()
         .map_err(|error| failure("SystemV6SourceOwner", &error))?;
     // Use this executable's actual compiled coordinator identity, never a
     // fabricated digest or the optional claimed source identity in the lock.
@@ -78,7 +79,7 @@ pub(super) fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapErr
             .map_err(|error| failure("SystemV6CoordinatorIdentity", &error))?,
     );
     owner
-        .verify_unchanged(until, &cancelled)
+        .verify_unchanged()
         .map_err(|error| failure("SystemV6SourceOwner", &error))?;
     owner
         .publish_preflight()

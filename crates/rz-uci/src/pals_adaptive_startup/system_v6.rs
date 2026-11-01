@@ -17,7 +17,10 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -68,6 +71,30 @@ pub enum PalsSystemSourceObservationV6 {
     Verified,
     Missing,
     Mismatch,
+}
+
+/// Distinguish original cancellation/expiry and actual I/O from identity or
+/// allocation failure; no caller-supplied replacement control is accepted.
+#[derive(Debug)]
+pub(crate) enum PalsSystemSourceReadFailureV6 {
+    Cancelled,
+    Expired,
+    Io(std::io::Error),
+    Resource,
+    Identity,
+    Owner(ManifestError),
+}
+impl std::fmt::Display for PalsSystemSourceReadFailureV6 {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(out, "original system source cancellation"),
+            Self::Expired => write!(out, "original system source deadline expired"),
+            Self::Io(error) => write!(out, "system source I/O: {error}"),
+            Self::Resource => write!(out, "system source allocation or bound"),
+            Self::Identity => write!(out, "system source identity changed"),
+            Self::Owner(error) => write!(out, "system source original owner: {error}"),
+        }
+    }
 }
 
 /// Narrow source boundary, not an assertion about all shared runtime code.
@@ -156,8 +183,11 @@ pub struct PinnedPalsSystemStartupV6 {
     expected_lock_sha256: String,
     source_commit: PalsSystemSourceObservationV6,
     source_components: PalsSystemSourceObservationV6,
+    compiled_components: BTreeMap<String, String>,
     system_v6_source: PalsSystemSourceObservationV6,
     mapped_executable: crate::process_receipts::ExecutableIdentityV1,
+    original_until: Instant,
+    original_cancelled: Arc<AtomicBool>,
     root_path: PathBuf,
     root: Dir,
     assets: Vec<PinnedPalsSystemAssetV6>,
@@ -172,10 +202,18 @@ impl PinnedPalsSystemStartupV6 {
         expected_lock_sha256: &str,
         expected_startup_ms: u64,
         private_cwd: &Path,
-        until: Instant,
-        cancelled: &AtomicBool,
+        started: Instant,
+        upstream_until: Instant,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<Self, ManifestError> {
-        check_window(until, cancelled)?;
+        if started > Instant::now() {
+            return Err(invalid("system startup start time is in the future"));
+        }
+        let declared_until = started
+            .checked_add(std::time::Duration::from_millis(expected_startup_ms))
+            .ok_or_else(|| invalid("system startup deadline overflow"))?;
+        let until = declared_until.min(upstream_until);
+        check_window(until, &cancelled)?;
         if !super::sha256(expected_lock_sha256) {
             return Err(invalid("invalid original system startup lock digest"));
         }
@@ -194,14 +232,14 @@ impl PinnedPalsSystemStartupV6 {
         // decoding so a rename during the control read cannot go unnoticed.
         verify_root_identity(&root, private_cwd)?;
         let bytes = read_control(&root, &relative)?;
-        check_window(until, cancelled)?;
+        check_window(until, &cancelled)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| invalid("system lock is not UTF-8"))?;
         let lock = PalsSystemStartupLockV6::from_json(text)?;
         if lock.canonical_sha256 != expected_lock_sha256 {
             return Err(invalid("system startup lock differs from original owner"));
         }
         check_startup_window(lock.config.native_options.startup_ms, expected_startup_ms)?;
-        check_window(until, cancelled)?;
+        check_window(until, &cancelled)?;
         // Bind the admitted lock to the process actually running, rather than
         // trusting a path or a previously computed hash from another process.
         let current =
@@ -226,7 +264,7 @@ impl PinnedPalsSystemStartupV6 {
                 "mapped executable differs from system startup lock",
             ));
         }
-        check_window(until, cancelled)?;
+        check_window(until, &cancelled)?;
         let compiled_commit = env!("RZ_PALS_COMPILED_SOURCE_COMMIT");
         let source_commit = match lock.config.endpoint.source_commit.as_deref() {
             None => PalsSystemSourceObservationV6::Missing,
@@ -254,12 +292,12 @@ impl PinnedPalsSystemStartupV6 {
             .try_reserve_exact(lock.config.assets.len())
             .map_err(|_| invalid("system startup asset owner allocation failed"))?;
         for declaration in &lock.config.assets {
-            check_window(until, cancelled)?;
+            check_window(until, &cancelled)?;
             let artifact = ArtifactRef {
                 path: declaration.snapshot_path.clone(),
                 ..declaration.artifact.clone()
             };
-            let (file, stamp) = open_verified_until(&root, &artifact, until, cancelled)?;
+            let (file, stamp) = open_verified_until(&root, &artifact, until, &cancelled)?;
             assets.push(PinnedPalsSystemAssetV6 {
                 declaration: declaration.clone(),
                 file,
@@ -271,8 +309,11 @@ impl PinnedPalsSystemStartupV6 {
             expected_lock_sha256: expected_lock_sha256.to_owned(),
             source_commit,
             source_components,
+            compiled_components: compiled,
             system_v6_source,
             mapped_executable,
+            original_until: until,
+            original_cancelled: cancelled,
             root_path: private_cwd.to_owned(),
             root,
             assets,
@@ -290,6 +331,11 @@ impl PinnedPalsSystemStartupV6 {
     }
     pub fn source_components(&self) -> PalsSystemSourceObservationV6 {
         self.source_components
+    }
+    /// Actual binary's earlier component observation, reused without hashing
+    /// the same compiled source inventory again for this startup.
+    pub(crate) fn compiled_component(&self, name: &str) -> Option<&str> {
+        self.compiled_components.get(name).map(String::as_str)
     }
     pub fn system_v6_source(&self) -> PalsSystemSourceObservationV6 {
         self.system_v6_source
@@ -348,12 +394,8 @@ impl PinnedPalsSystemStartupV6 {
     }
     /// Recheck the original declarations and held FD identity before use.
     /// This does not turn metadata into a proof that no writer exists.
-    pub fn verify_unchanged(
-        &self,
-        until: Instant,
-        cancelled: &AtomicBool,
-    ) -> Result<(), ManifestError> {
-        check_window(until, cancelled)?;
+    pub fn verify_unchanged(&self) -> Result<(), ManifestError> {
+        check_window(self.original_until, &self.original_cancelled)?;
         verify_root_identity(&self.root, &self.root_path)?;
         self.lock.verify()?;
         if self.lock.canonical_sha256 != self.expected_lock_sha256
@@ -362,7 +404,7 @@ impl PinnedPalsSystemStartupV6 {
             return Err(invalid("system startup owner differs from original lock"));
         }
         for (held, declared) in self.assets.iter().zip(&self.lock.config.assets) {
-            check_window(until, cancelled)?;
+            check_window(self.original_until, &self.original_cancelled)?;
             if &held.declaration != declared || file_stamp(&held.file)? != held.stamp {
                 return Err(invalid("system startup asset owner changed"));
             }
@@ -380,41 +422,65 @@ impl PinnedPalsSystemStartupV6 {
         &self,
         purpose: PalsStartupAssetPurposeV5,
         maximum: usize,
-        until: Instant,
-        cancelled: &AtomicBool,
-    ) -> Result<Vec<u8>, ManifestError> {
+    ) -> Result<Vec<u8>, PalsSystemSourceReadFailureV6> {
         use std::os::unix::fs::FileExt;
-        self.verify_unchanged(until, cancelled)?;
-        let held = self.asset(purpose)?;
+        self.verify_source_unchanged()?;
+        let held = self
+            .asset(purpose)
+            .map_err(PalsSystemSourceReadFailureV6::Owner)?;
         let length = usize::try_from(held.declaration.artifact.bytes)
-            .map_err(|_| invalid("system asset length exceeds address space"))?;
+            .map_err(|_| PalsSystemSourceReadFailureV6::Resource)?;
         if length > maximum {
-            return Err(invalid("system asset exceeds caller byte limit"));
+            return Err(PalsSystemSourceReadFailureV6::Resource);
         }
         let mut raw = Vec::new();
         raw.try_reserve_exact(length)
-            .map_err(|_| invalid("system asset allocation failed"))?;
+            .map_err(|_| PalsSystemSourceReadFailureV6::Resource)?;
         raw.resize(length, 0);
         let mut offset = 0usize;
+        let mut digest = Sha256::new();
         while offset < length {
-            check_window(until, cancelled)?;
+            self.source_window()?;
             let end = offset.saturating_add(64 * 1024).min(length);
             let read = held
                 .file
                 .read_at(&mut raw[offset..end], offset as u64)
-                .map_err(|_| invalid("cannot read retained system asset"))?;
+                .map_err(PalsSystemSourceReadFailureV6::Io)?;
             if read == 0 {
-                return Err(invalid("retained system asset ended early"));
+                return Err(PalsSystemSourceReadFailureV6::Identity);
             }
+            digest.update(&raw[offset..offset + read]);
             offset += read;
         }
-        check_window(until, cancelled)?;
-        if file_stamp(&held.file)? != held.stamp
-            || format!("{:x}", Sha256::digest(&raw)) != held.declaration.artifact.sha256
+        self.source_window()?;
+        if file_stamp(&held.file).map_err(PalsSystemSourceReadFailureV6::Owner)? != held.stamp
+            || format!("{:x}", digest.finalize()) != held.declaration.artifact.sha256
         {
-            return Err(invalid("retained system asset changed during read"));
+            return Err(PalsSystemSourceReadFailureV6::Identity);
         }
+        self.source_window()?;
         Ok(raw)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_window(&self) -> Result<(), PalsSystemSourceReadFailureV6> {
+        if self.original_cancelled.load(Ordering::Acquire) {
+            return Err(PalsSystemSourceReadFailureV6::Cancelled);
+        }
+        if Instant::now() >= self.original_until {
+            return Err(PalsSystemSourceReadFailureV6::Expired);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_source_unchanged(&self) -> Result<(), PalsSystemSourceReadFailureV6> {
+        self.source_window()?;
+        if let Err(error) = self.verify_unchanged() {
+            self.source_window()?;
+            return Err(PalsSystemSourceReadFailureV6::Owner(error));
+        }
+        self.source_window()
     }
     pub fn asset(
         &self,

@@ -2,14 +2,16 @@
 //!
 //! Admission checks the actual retained descriptors and model declarations;
 //! it does not load ORT, prove numerical equivalence or authorize a game.
-use crate::pals_adaptive_startup::{PalsSystemSourceObservationV6, PinnedPalsSystemStartupV6};
-use crate::pals_native::startup_virtual::{exact_graph_snapshot_join, graph_purpose};
+use crate::pals_adaptive_startup::{
+    PalsSystemSourceObservationV6, PalsSystemSourceReadFailureV6, PinnedPalsSystemStartupV6,
+};
+use crate::pals_native::startup_virtual::graph_purpose;
 use crate::pals_native::virtual_encoding::{
     VirtualRulesDescriptorSummary, observe_pals_virtual_rules_descriptor_bytes,
     validate_pals_virtual_rules_descriptor_bytes,
 };
 use rz_eval::asset::parse_sha256;
-use rz_eval::error::{BackendError, FailureKind, FailureStage};
+use rz_eval::error::{BackendError, CauseCode, FailureKind, FailureStage};
 use rz_eval::pals_model::{PalsModelProfile, virtual_review};
 use rz_eval::pals_onnx::virtual_review::{
     VirtualReviewArtifactKind, VirtualReviewExecutionMode, VirtualReviewOwnedSources,
@@ -17,11 +19,11 @@ use rz_eval::pals_onnx::virtual_review::{
 };
 use rz_experiments::{
     PalsArtifactDomainV5, PalsEngineModeV5, PalsStartupAssetPurposeV5 as Purpose,
-    PalsSystemSourcePolicyV6, compiled_source_components_v5,
+    PalsSystemSourcePolicyV6,
 };
 use std::{
-    sync::{Arc, atomic::AtomicBool},
-    time::Instant,
+    path::{Component, Path},
+    sync::Arc,
 };
 
 fn error(detail: &'static str) -> BackendError {
@@ -34,8 +36,42 @@ fn error(detail: &'static str) -> BackendError {
 fn transport(_: rz_experiments::ManifestError) -> BackendError {
     error("retained PALS system model asset failed verification")
 }
+fn transport_source(source: PalsSystemSourceReadFailureV6) -> BackendError {
+    let (kind, code) = match &source {
+        PalsSystemSourceReadFailureV6::Cancelled => {
+            (FailureKind::BackendUnavailable, "SourceCancelled")
+        }
+        PalsSystemSourceReadFailureV6::Expired => {
+            (FailureKind::BackendUnavailable, "SourceDeadlineExpired")
+        }
+        PalsSystemSourceReadFailureV6::Io(_) => (FailureKind::Io, "SourceIo"),
+        PalsSystemSourceReadFailureV6::Resource => {
+            (FailureKind::ResourceExhausted, "SourceResource")
+        }
+        PalsSystemSourceReadFailureV6::Identity | PalsSystemSourceReadFailureV6::Owner(_) => {
+            (FailureKind::IdentityMismatch, "SourceOwner")
+        }
+    };
+    BackendError::new(
+        kind,
+        FailureStage::Admission,
+        "PALS system source admission failed",
+    )
+    .with_external_cause(CauseCode::ModelLoad, &source)
+    .with_diagnostic(code, &source.to_string())
+}
 fn hex(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+fn validate_export_graph_name(file: &str) -> Result<(), BackendError> {
+    if !matches!(
+        Path::new(file).components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    ) || Path::new(file).file_name().and_then(|name| name.to_str()) != Some(file)
+    {
+        return Err(error("PALS system export graph name is not a basename"));
+    }
+    Ok(())
 }
 
 /// Source and numeric observations are separate from functional admission.
@@ -55,33 +91,23 @@ pub(crate) struct PalsSystemVirtualObservationV6 {
 /// every source read. The backend must retain this Arc for its full lifetime.
 pub(crate) struct PalsSystemVirtualSourcesV6 {
     owner: Arc<PinnedPalsSystemStartupV6>,
-    until: Instant,
-    cancelled: Arc<AtomicBool>,
 }
 impl PalsSystemVirtualSourcesV6 {
-    pub(crate) fn new(
-        owner: Arc<PinnedPalsSystemStartupV6>,
-        until: Instant,
-        cancelled: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            owner,
-            until,
-            cancelled,
-        }
+    pub(crate) fn new(owner: Arc<PinnedPalsSystemStartupV6>) -> Self {
+        Self { owner }
     }
     fn read(&self, purpose: Purpose, maximum: usize) -> Result<Vec<u8>, BackendError> {
         self.owner
-            .read_asset_exact(purpose, maximum, self.until, &self.cancelled)
-            .map_err(transport)
+            .read_asset_exact(purpose, maximum)
+            .map_err(transport_source)
     }
     /// Validate model/export/Rules declarations against the original held
     /// bytes. Provenance, learned compatibility and independent numerical
     /// acceptance remain separate evidence and are not granted here.
     pub(crate) fn inspect(&self) -> Result<PalsSystemVirtualObservationV6, BackendError> {
         self.owner
-            .verify_unchanged(self.until, &self.cancelled)
-            .map_err(transport)?;
+            .verify_source_unchanged()
+            .map_err(transport_source)?;
         let config = &self.owner.lock().config;
         let model = &config.endpoint.model;
         if model.profile != virtual_review::PROFILE
@@ -91,8 +117,10 @@ impl PalsSystemVirtualSourcesV6 {
         {
             return Err(error("PALS system model or encoding declaration differs"));
         }
-        let compiled = compiled_source_components_v5().map_err(transport)?;
-        let compiled_model_source = compiled.get("model_native").cloned();
+        let compiled_model_source = self
+            .owner
+            .compiled_component("model_native")
+            .map(str::to_owned);
         let declared_component_source = config.source_components.get("model_native").cloned();
         let model_source_evidence = match (&compiled_model_source, &declared_component_source) {
             (Some(actual), Some(declared))
@@ -154,24 +182,19 @@ impl PalsSystemVirtualSourcesV6 {
             }
             _ => {}
         }
-        let manifest_asset = self
-            .owner
-            .asset(Purpose::ExportManifest)
-            .map_err(transport)?;
         for graph in &manifest.graphs {
+            validate_export_graph_name(&graph.file)?;
             let asset = self
                 .owner
                 .asset(graph_purpose(&graph.role)?)
                 .map_err(transport)?;
-            exact_graph_snapshot_join(
-                &manifest_asset.declaration().snapshot_path,
-                &asset.declaration().snapshot_path,
-                &graph.file,
-            )?;
             if parse_sha256(&asset.declaration().artifact.sha256)? != graph.sha256 {
                 return Err(error("PALS system graph declaration differs from export"));
             }
         }
+        self.owner
+            .verify_source_unchanged()
+            .map_err(transport_source)?;
         Ok(PalsSystemVirtualObservationV6 {
             rules,
             declared_model_source: model.implementation_sha256.clone(),
@@ -194,15 +217,7 @@ impl VirtualReviewOwnedSources for PalsSystemVirtualSourcesV6 {
         maximum: usize,
     ) -> Result<Vec<u8>, BackendError> {
         let asset = self.owner.asset(graph_purpose(role)?).map_err(transport)?;
-        let manifest = self
-            .owner
-            .asset(Purpose::ExportManifest)
-            .map_err(transport)?;
-        exact_graph_snapshot_join(
-            &manifest.declaration().snapshot_path,
-            &asset.declaration().snapshot_path,
-            registered_file,
-        )?;
+        validate_export_graph_name(registered_file)?;
         if parse_sha256(&asset.declaration().artifact.sha256)? != expected {
             return Err(error("PALS system graph differs from original export"));
         }
