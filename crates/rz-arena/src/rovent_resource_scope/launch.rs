@@ -11,6 +11,26 @@ use std::{
 
 pub const ROVENT_RESOURCE_LAUNCH_PLAN: &str = "rz-rovent-native-resource-launch/1";
 pub const ROVENT_RESOURCE_USAGE: &str = "rz-rovent-native [--resource-system-runtime-v3 [--custody-control]] --resource-plan=inputs/<plan.json> --resource-plan-sha256=<64 lowercase hex> --resource-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
+
+/// Partial diagnostic projection only. The exact event remains in its owner;
+/// unsupported or oversized details never become release authority.
+fn observed_startup_failure(failure: &rz_search::pals::coordinator::RoleFailure, remaining: &mut usize) -> Value {
+    use rz_search::pals::coordinator::RoleFailure;
+    match failure {
+        RoleFailure::Canceled => json!({"kind":"canceled"}),
+        RoleFailure::Expired => json!({"kind":"expired"}),
+        RoleFailure::InvalidOutput => json!({"kind":"invalid_output"}),
+        RoleFailure::PhysicalUnknown => json!({"kind":"physical_unknown"}),
+        RoleFailure::Backend(detail) => observed_failure_detail("backend", detail, remaining),
+        RoleFailure::Unsupported(detail) => observed_failure_detail("unsupported", detail, remaining),
+    }
+}
+
+fn observed_failure_detail(kind: &str, detail: &str, remaining: &mut usize) -> Value {
+    if detail.len() > *remaining { return json!({"kind":kind, "detail_retained_by_owner":true}); }
+    *remaining -= detail.len();
+    json!({"kind":kind, "detail":detail})
+}
 const MAX_PLAN_BYTES: u64 = 64 << 10;
 
 /// Configuration only. The actual resource owner separately validates the
@@ -331,7 +351,23 @@ impl RoventDirectQuarantine {
                         let mut snapshots = 0usize;
                         let mut panics = 0usize;
                         let mut opaque = 0usize;
+                        let mut details_remaining = super::MAX_EVIDENCE_BYTES / 2;
+                        let mut event_observations = Vec::new();
+                        let max_observations = super::MAX_EVIDENCE_BYTES / std::mem::size_of::<Value>().max(1);
                         for event in pending.events() {
+                            use rz_uci::pals_native::ticketed::TicketNativeEvent;
+                            if event_observations.len() < max_observations {
+                                let observation = match event {
+                                    Event::Native(TicketNativeEvent::StartupFailed(failure)) => json!({"kind":"startup_failed", "failure":observed_startup_failure(failure, &mut details_remaining)}),
+                                    Event::Native(TicketNativeEvent::Finished { physical_shutdown_confirmed }) => json!({"kind":"finished", "physical_shutdown_confirmed":physical_shutdown_confirmed}),
+                                    Event::Native(_) => json!({"kind":"other_native_event_retained"}),
+                                    Event::FinishReport(_) => json!({"kind":"finish_report_retained"}),
+                                    Event::FinishReportSnapshot(_) => json!({"kind":"finish_report_snapshot_retained"}),
+                                    Event::Panic(_) => json!({"kind":"panic_retained"}),
+                                    Event::Opaque(_) => json!({"kind":"opaque_retained"}),
+                                };
+                                event_observations.push(observation);
+                            }
                             match event {
                                 Event::Native(_) => native += 1,
                                 Event::FinishReport(_) => reports += 1,
@@ -347,9 +383,12 @@ impl RoventDirectQuarantine {
                             "original_failure_retained":pending.original_failure().is_some(),
                             "original_context_retained":pending.has_original_context(),
                             "factory_retained":pending.has_recovered_factory(),
+                            "first_recovery_error":pending.first_recovery_error().map(|error| format!("{error:?}")),
                             "physical_reservation_pending":pending.physical_reservation_pending(),
                             "pins_retained":pins.len(),
                             "event_counts":{"native":native,"finish_report":reports,"finish_report_snapshot":snapshots,"panic":panics,"opaque":opaque},
+                            "event_observations_omitted":pending.events().len().saturating_sub(event_observations.len()),
+                            "event_observations":event_observations,
                             "complete_event_export":false, "release_authorized":false})
                     },
                 }
@@ -1627,6 +1666,18 @@ fn parent_and_leaf<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_failure_observation_preserves_supported_detail_or_retains_oversize() {
+        use rz_search::pals::coordinator::RoleFailure;
+        let failure = RoleFailure::Backend("original failure".into());
+        let mut enough = "original failure".len();
+        assert_eq!(observed_startup_failure(&failure, &mut enough), json!({"kind":"backend","detail":"original failure"}));
+        assert_eq!(enough, 0);
+        let mut insufficient = 0;
+        assert_eq!(observed_startup_failure(&failure, &mut insufficient), json!({"kind":"backend","detail_retained_by_owner":true}));
+        assert_eq!(observed_startup_failure(&RoleFailure::PhysicalUnknown, &mut insufficient), json!({"kind":"physical_unknown"}));
+    }
     #[test]
     fn cpu_v3_receipts_require_original_child_ready_and_session_finish() {
         use rz_experiments::{

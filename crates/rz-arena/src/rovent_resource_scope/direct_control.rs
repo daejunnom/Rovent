@@ -55,6 +55,18 @@ struct RecoveryEvidenceDocument<'a> {
     original_owner_retained: bool,
     release_authorized: bool,
 }
+
+pub(super) trait ScopeObserver {
+    fn observation(&self) -> Option<rz_uci::rovent_bootstrap::launch::V3ScopeObservation>;
+    fn session_evidence(&self) -> rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence;
+    fn reobserve(&self, until: Instant) -> String;
+}
+
+impl ScopeObserver for rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey {
+    fn observation(&self) -> Option<rz_uci::rovent_bootstrap::launch::V3ScopeObservation> { self.observe() }
+    fn session_evidence(&self) -> rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence { self.terminal_evidence() }
+    fn reobserve(&self, until: Instant) -> String { format!("{:?}", self.reobserve_native(until)) }
+}
 impl Write for BoundedEvidence {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > super::MAX_EVIDENCE_BYTES.saturating_sub(self.0.len()) {
@@ -101,7 +113,7 @@ impl BoundDirectControl {
         self.original
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .observe_one(key, until, recover)
+            .observe_one(key.map(|key| key as &dyn ScopeObserver), until, recover)
     }
 
     pub(super) fn observe_bound_identity(&self) -> Result<(), ArenaError> {
@@ -277,7 +289,7 @@ impl DirectControl {
     /// request closes only that connection and never releases the owner.
     pub(super) fn observe_one(
         &self,
-        key: Option<&rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey>,
+        key: Option<&dyn ScopeObserver>,
         original_cleanup_until: Instant,
         recover: &mut dyn FnMut(Instant) -> Option<serde_json::Value>,
     ) -> io::Result<()> {
@@ -310,18 +322,6 @@ impl DirectControl {
             op: String,
         }
         let request: Request = serde_json::from_slice(&frame).map_err(io::Error::other)?;
-        let scope = key.and_then(|key| key.observe());
-        let session_evidence = key
-            .map(|key| match key.terminal_evidence() {
-                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative => {
-                    "before_native"
-                }
-                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::SessionReleased => {
-                    "session_released"
-                }
-                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::Unknown => "unknown",
-            })
-            .unwrap_or("scope_unavailable");
         let mut recovery = None;
         let observation = match request.op.as_str() {
             "status" => None,
@@ -332,7 +332,7 @@ impl DirectControl {
                     .unwrap_or(original_cleanup_until);
                 recovery = recover(deadline);
                 if Instant::now() < deadline {
-                    key.map(|key| format!("{:?}", key.reobserve_native(deadline)))
+                    key.map(|key| key.reobserve(deadline))
                 } else {
                     Some("reobserve_deadline_expired".into())
                 }
@@ -346,6 +346,16 @@ impl DirectControl {
                 ));
             }
         };
+        // The recovery callback can move the original out of a parked slot;
+        // report the post-attempt slot observation rather than stale state.
+        let scope = key.and_then(|key| key.observation());
+        let session_evidence = key
+            .map(|key| match key.session_evidence() {
+                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative => "before_native",
+                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::SessionReleased => "session_released",
+                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::Unknown => "unknown",
+            })
+            .unwrap_or("scope_unavailable");
         let evidence = self.recovery_evidence_status(recovery.as_ref());
         let response = serde_json::json!({
             "schema":"rz-rovent-direct-custody-status/1",
@@ -518,5 +528,104 @@ mod tests {
         assert_eq!(evidence["release_authorized"], false);
         control.cleanup_confirmed().unwrap();
         assert!(!path.join("custody.sock").exists());
+    }
+
+    #[test]
+    fn recovery_evidence_does_not_replace_existing_file_or_release_owner() {
+        let parent = Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap();
+        let name = format!("rovent-direct-conflict-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        parent.create_dir(&name).unwrap();
+        let mut fixture = Fixture { parent, name: name.clone(), control: None };
+        let directory = fixture.parent.open_dir(&name).unwrap();
+        let path = std::env::temp_dir().join(&name);
+        let original = path.join("before-native-recovery-observation.json");
+        std::fs::write(&original, b"existing evidence").unwrap();
+        fixture.control = Some(DirectControl::prepare(&directory, &path, Instant::now() + Duration::from_secs(60), Duration::from_secs(60)).unwrap());
+        let control = fixture.control.as_mut().unwrap();
+        control.bind().unwrap();
+        let summary = serde_json::json!({"state":"same_owner_recovered_and_retained"});
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let evidence = control.recovery_evidence_status(Some(&summary));
+            if evidence["state"] == "failed" { break; }
+            assert_eq!(evidence["state"], "writing", "{evidence}");
+            assert!(Instant::now() < until, "evidence writer did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(std::fs::read(&original).unwrap(), b"existing evidence");
+        assert_eq!(control.recovery_evidence_status(Some(&summary))["state"], "failed");
+        assert!(control.observe_bound_identity().is_ok());
+        control.cleanup_confirmed().unwrap();
+    }
+
+    #[test]
+    fn reobserve_dispatches_original_callback_under_original_deadline() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct FakeScope(AtomicUsize, AtomicBool);
+        impl ScopeObserver for FakeScope {
+            fn observation(&self) -> Option<rz_uci::rovent_bootstrap::launch::V3ScopeObservation> {
+                if self.1.load(Ordering::SeqCst) { return None; }
+                Some(rz_uci::rovent_bootstrap::launch::V3ScopeObservation {
+                    state: rz_uci::rovent_bootstrap::launch::V3ScopeState::Parked,
+                    recovery_key: None,
+                    parked_original: true,
+                })
+            }
+            fn session_evidence(&self) -> rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence {
+                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative
+            }
+            fn reobserve(&self, _: Instant) -> String {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if self.1.load(Ordering::SeqCst) { "mock_scope_removed" } else { "mock_original_scope" }.into()
+            }
+        }
+        let parent = Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap();
+        let name = format!("rovent-direct-reobserve-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        parent.create_dir(&name).unwrap();
+        let mut fixture = Fixture { parent, name: name.clone(), control: None };
+        let directory = fixture.parent.open_dir(&name).unwrap();
+        let path = std::env::temp_dir().join(&name);
+        let original_deadline = Instant::now() + Duration::from_secs(10);
+        fixture.control = Some(DirectControl::prepare(&directory, &path, original_deadline, Duration::from_secs(10)).unwrap());
+        let control = fixture.control.as_mut().unwrap();
+        control.bind().unwrap();
+        control.listener().unwrap().set_nonblocking(true).unwrap();
+        let scope = FakeScope(AtomicUsize::new(0), AtomicBool::new(false));
+        let calls = AtomicUsize::new(0);
+        std::thread::scope(|threads| {
+            let serving = threads.spawn(|| {
+                let mut recover = |deadline| {
+                    assert!(deadline <= original_deadline);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    scope.1.store(true, Ordering::SeqCst);
+                    Some(serde_json::json!({"state":"mock_recovered"}))
+                };
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match control.observe_one(Some(&scope), original_deadline, &mut recover) {
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
+                        result => return result,
+                    }
+                }
+            });
+            let mut client = std::os::unix::net::UnixStream::connect(control.path()).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.write_all(b"{\"op\":\"reobserve\"}\n").unwrap();
+            let mut response = String::new();
+            BufReader::new(client).read_line(&mut response).unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["session_evidence"], "before_native");
+            assert!(response["original_owner_parked"].is_null());
+            assert_eq!(response["before_native_recovery"]["state"], "mock_recovered");
+            assert_eq!(response["native_observation"], "mock_scope_removed");
+            assert_eq!(response["physical_completion"], "unknown");
+            assert_eq!(response["release_authorized"], false);
+            serving.join().unwrap().unwrap();
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(scope.0.load(Ordering::SeqCst), 1);
+        control.cleanup_confirmed().unwrap();
     }
 }

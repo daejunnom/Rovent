@@ -93,7 +93,7 @@ pub use v3::v3_scope::{
 };
 #[cfg(target_os = "linux")]
 pub use v3::{
-    V3BeforeNativeRecovered, V3BeforeNativeScopeRecovery, V3ControlDirectory,
+    V3BeforeNativeAttemptError, V3BeforeNativeRecovered, V3BeforeNativeScopeRecovery, V3ControlDirectory,
     V3FactoryOriginalEvent, V3FactoryPending, V3SettledFactoryOwner,
 };
 

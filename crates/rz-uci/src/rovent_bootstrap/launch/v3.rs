@@ -217,6 +217,7 @@ enum V3FactoryRejection<Q: NativeQuestionProjection> {
         error: RoventLaunchError,
         recovered: V3BeforeNativeRecovered,
         recovery_key: Option<crate::pals_native::ticketed::TicketNativeRecoveryKey>,
+        first_recovery_error: V3BeforeNativeAttemptError,
     },
     Unknown {
         error: RoventLaunchError,
@@ -224,6 +225,7 @@ enum V3FactoryRejection<Q: NativeQuestionProjection> {
         recovery_key: Option<crate::pals_native::ticketed::TicketNativeRecoveryKey>,
         events: Vec<V3FactoryOriginalEvent>,
         before_native: bool,
+        first_recovery_error: Option<V3BeforeNativeAttemptError>,
     },
 }
 
@@ -313,6 +315,7 @@ pub struct V3FactoryPending {
     key: Option<crate::pals_native::ticketed::TicketNativeRecoveryKey>,
     before_native: bool,
     recovered_factory: Option<super::super::RoventSystemFactoryCustodyV3>,
+    first_recovery_error: Option<V3BeforeNativeAttemptError>,
 }
 
 #[cfg(target_os = "linux")]
@@ -322,6 +325,11 @@ impl V3FactoryPending {
     /// observed; the caller must preserve this pending value.
     pub fn events(&self) -> &[V3FactoryOriginalEvent] {
         &self.events
+    }
+
+    /// First observed failure while recovering this same owner, if any.
+    pub fn first_recovery_error(&self) -> Option<V3BeforeNativeAttemptError> {
+        self.first_recovery_error
     }
 
     pub fn original_failure(&self) -> Option<&(dyn std::any::Any + Send)> {
@@ -390,7 +398,8 @@ pub enum V3BeforeNativeScopeRecovery {
 }
 
 #[cfg(target_os = "linux")]
-enum V3BeforeNativeAttemptError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V3BeforeNativeAttemptError {
     Ticket(crate::pals_native::ticketed::TicketRecoveryError),
     Physical(rz_eval::worker::PhysicalReservationCancelError),
 }
@@ -411,6 +420,7 @@ impl v3_scope::RoventV3ScopeKey {
             .try_recover_original_until::<V3FactoryPending, (), V3BeforeNativeAttemptError>(
                 until,
                 |pending| {
+                    let attempt = (|| {
                     if let Some(factory) = pending.recovered_factory.as_mut() {
                         return try_cancel_before_native_physical(factory)
                             .map_err(V3BeforeNativeAttemptError::Physical);
@@ -452,6 +462,11 @@ impl v3_scope::RoventV3ScopeKey {
                             .expect("original factory just stored"),
                     )
                     .map_err(V3BeforeNativeAttemptError::Physical)
+                    })();
+                    if let Err(reason) = attempt {
+                        pending.first_recovery_error.get_or_insert(reason);
+                    }
+                    attempt
                 },
             );
         match result {
@@ -703,25 +718,27 @@ fn reject_factory_v3<Q: NativeQuestionProjection>(
             let Some(mut drain) = drain else {
                 return V3FactoryRejection::Ordinary(detail);
             };
+            let mut first_recovery_error = None;
             if drain.joined && drain.before_native {
                 // Drop only the already-joined service to hand the original
                 // receiver back to the same pre-reserved recovery key.
                 drop(failure.native.take());
                 if let Some(key) = recovery_key.as_ref() {
-                    if collect_before_native_events(key, until, &mut drain.events).is_ok() {
-                        if let Ok(factory) = key
-                            .take_before_native::<super::super::RoventSystemFactoryCustodyV3>(until)
-                        {
+                    let recovered_factory = collect_before_native_events(key, until, &mut drain.events)
+                        .and_then(|()| key.take_before_native::<super::super::RoventSystemFactoryCustodyV3>(until));
+                    match recovered_factory {
+                        Ok(factory) => {
                             let mut recovered = V3BeforeNativeRecovered {
                                 factory,
                                 events: drain.events,
                                 original_failure: Box::new(failure),
                             };
-                            if !recovered.try_cancel_unpublished_physical() {
+                            if let Err(reason) = try_cancel_before_native_physical(&mut recovered.factory) {
                                 return V3FactoryRejection::BeforeNativePhysicalPending {
                                     error: error("BeforeNativePhysicalReservationPending", detail),
                                     recovered,
                                     recovery_key,
+                                    first_recovery_error: V3BeforeNativeAttemptError::Physical(reason),
                                 };
                             }
                             return V3FactoryRejection::Unstarted {
@@ -731,6 +748,7 @@ fn reject_factory_v3<Q: NativeQuestionProjection>(
                                 },
                             };
                         }
+                        Err(reason) => first_recovery_error = Some(V3BeforeNativeAttemptError::Ticket(reason)),
                     }
                 }
             }
@@ -756,6 +774,7 @@ fn reject_factory_v3<Q: NativeQuestionProjection>(
                 recovery_key,
                 events: drain.events,
                 before_native: drain.before_native,
+                first_recovery_error,
             }
         }
         super::super::RoventNativeStartupRejectionV3::Unstarted {
@@ -774,6 +793,63 @@ mod retaining_failure_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct OriginalOwner(Arc<AtomicUsize>);
+
+    #[test]
+    fn typed_before_native_pending_keeps_original_event_and_pin_on_repeated_invalid_key() {
+        use crate::pals_native::ticketed::TicketRecoveryError;
+        use rz_search::pals::coordinator::RoleFailure;
+
+        let pin = Arc::new(AtomicUsize::new(37));
+        let original_failure = Arc::new(41_u32);
+        let cause = String::from("original pre-native mock failure");
+        let original_cause_ptr = cause.as_ptr() as usize;
+        let pending = V3FactoryPending {
+            original_failure: Some(Box::new(Arc::clone(&original_failure))),
+            context: None,
+            events: vec![V3FactoryOriginalEvent::Native(TicketNativeEvent::StartupFailed(
+                RoleFailure::Backend(cause),
+            ))],
+            key: None,
+            before_native: true,
+            recovered_factory: None,
+            first_recovery_error: None,
+        };
+        let mut scope = v3_scope::ScopeReservation::reserve(
+            v3_scope::V3ScopeDomain::Cpu,
+            Box::new(Arc::clone(&pin)),
+        ).ok().unwrap();
+        scope.arm();
+        let key = scope.park(Box::new(pending), None);
+        let until = Instant::now() + Duration::from_secs(5);
+
+        for _ in 0..2 {
+            assert!(matches!(key.recover_before_native(until),
+                V3BeforeNativeScopeRecovery::Pending(TicketRecoveryError::InvalidKey)));
+            let observed = key.with_original::<V3FactoryPending, _>(|pending| {
+                assert_eq!(pending.first_recovery_error(), Some(
+                    V3BeforeNativeAttemptError::Ticket(TicketRecoveryError::InvalidKey)
+                ));
+                let failure = pending.original_failure().unwrap()
+                    .downcast_ref::<Arc<u32>>().unwrap();
+                assert!(Arc::ptr_eq(failure, &original_failure));
+                match pending.events() {
+                    [V3FactoryOriginalEvent::Native(TicketNativeEvent::StartupFailed(
+                        RoleFailure::Backend(cause),
+                    ))] => assert_eq!(cause.as_ptr() as usize, original_cause_ptr),
+                    _ => panic!("original startup failure was not retained"),
+                }
+            });
+            assert!(observed.is_some());
+            let retained_pin = key.cloned_pin::<AtomicUsize>().unwrap();
+            assert!(Arc::ptr_eq(&retained_pin, &pin));
+        }
+        // Retire only this synthetic, never-started test fixture. This helper
+        // does not claim production factory recovery or physical completion.
+        assert!(matches!(
+            key.try_recover_original_until::<V3FactoryPending, (), ()>(until, |_| Ok(())),
+            v3_scope::V3ScopeRecovery::Recovered { .. }
+        ));
+    }
 
     #[test]
     fn recoverable_finish_requires_matching_original_report() {
@@ -2069,6 +2145,7 @@ pub(super) fn run_native_admitted(
                             error,
                             recovered,
                             recovery_key,
+                            first_recovery_error,
                         } => RoventV3LaunchFailure::Quarantined {
                             error,
                             owner: RoventV3QuarantinedOwner {
@@ -2087,6 +2164,7 @@ pub(super) fn run_native_admitted(
                                         key: recovery_key.clone(),
                                         before_native: true,
                                         recovered_factory: Some(recovered.factory),
+                                        first_recovery_error: Some(first_recovery_error),
                                     }),
                                     recovery_key.clone(),
                                 ),
@@ -2099,6 +2177,7 @@ pub(super) fn run_native_admitted(
                             recovery_key,
                             events,
                             before_native,
+                            first_recovery_error,
                         } => RoventV3LaunchFailure::Quarantined {
                             error,
                             owner: RoventV3QuarantinedOwner {
@@ -2117,6 +2196,7 @@ pub(super) fn run_native_admitted(
                                         key: recovery_key.clone(),
                                         before_native,
                                         recovered_factory: None,
+                                        first_recovery_error,
                                     }),
                                     recovery_key.clone(),
                                 ),
@@ -2295,6 +2375,7 @@ pub(super) fn run_native_admitted(
                             error,
                             recovered,
                             recovery_key,
+                            first_recovery_error,
                         } => RoventV3LaunchFailure::Quarantined {
                             error,
                             owner: RoventV3QuarantinedOwner {
@@ -2314,6 +2395,7 @@ pub(super) fn run_native_admitted(
                                         key: recovery_key.clone(),
                                         before_native: true,
                                         recovered_factory: Some(recovered.factory),
+                                        first_recovery_error: Some(first_recovery_error),
                                     }),
                                     recovery_key.clone(),
                                 ),
@@ -2326,6 +2408,7 @@ pub(super) fn run_native_admitted(
                             recovery_key,
                             events,
                             before_native,
+                            first_recovery_error,
                         } => RoventV3LaunchFailure::Quarantined {
                             error,
                             owner: RoventV3QuarantinedOwner {
@@ -2345,6 +2428,7 @@ pub(super) fn run_native_admitted(
                                         key: recovery_key.clone(),
                                         before_native,
                                         recovered_factory: None,
+                                        first_recovery_error,
                                     }),
                                     recovery_key.clone(),
                                 ),
@@ -2537,6 +2621,7 @@ pub(super) fn run_native_admitted(
                             error,
                             recovered,
                             recovery_key,
+                            first_recovery_error,
                         } => RoventV3LaunchFailure::Quarantined {
                             error,
                             owner: RoventV3QuarantinedOwner {
@@ -2555,6 +2640,7 @@ pub(super) fn run_native_admitted(
                                         key: recovery_key.clone(),
                                         before_native: true,
                                         recovered_factory: Some(recovered.factory),
+                                        first_recovery_error: Some(first_recovery_error),
                                     }),
                                     recovery_key.clone(),
                                 ),
@@ -2567,6 +2653,7 @@ pub(super) fn run_native_admitted(
                             recovery_key,
                             events,
                             before_native,
+                            first_recovery_error,
                         } => RoventV3LaunchFailure::Quarantined {
                             error,
                             owner: RoventV3QuarantinedOwner {
@@ -2585,6 +2672,7 @@ pub(super) fn run_native_admitted(
                                         key: recovery_key.clone(),
                                         before_native,
                                         recovered_factory: None,
+                                        first_recovery_error,
                                     }),
                                     recovery_key.clone(),
                                 ),
