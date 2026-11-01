@@ -194,7 +194,8 @@ def _open_directory(path: Path, expected: os.stat_result):
 
 
 def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRESHOLD,
-                     max_entries=1_000_000, max_seconds=60.0):
+                     max_entries=1_000_000, max_seconds=60.0,
+                     stop_when_exceeded=False):
     """Observe explicitly scoped roots, without deleting or modifying any file.
 
     The global inode set covers overlapping roots and hardlinks across roots on
@@ -206,7 +207,8 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
     if (type(threshold_bytes) is not int or threshold_bytes <= 0
             or type(max_entries) is not int or max_entries <= 0
             or not isinstance(max_seconds, (int, float)) or isinstance(max_seconds, bool)
-            or not math.isfinite(max_seconds) or max_seconds <= 0):
+            or not math.isfinite(max_seconds) or max_seconds <= 0
+            or type(stop_when_exceeded) is not bool):
         raise ValueError("positive finite threshold, entry count, and deadline required")
     started = time.monotonic()
     deadline = started + max_seconds
@@ -223,6 +225,8 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
     logical = 0
     # The deadline includes discovery and cannot be reset by another root.
     def bounded():
+        if errors["threshold_short_circuit"]:
+            return False
         if time.monotonic() >= deadline:
             errors["deadline"] += 1
             return False
@@ -383,6 +387,9 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
                                         else:
                                             allocated += file_allocation
                                         stats["unique_regular_files"] += 1
+                                        if stop_when_exceeded and allocated > threshold_bytes:
+                                            errors["threshold_short_circuit"] = 1
+                                            break
                                 else:
                                     stats["nonregular_excluded"] += 1
                             except OSError:
@@ -392,7 +399,7 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
                 finally:
                     if fd is not None:
                         os.close(fd)
-                if errors["deadline"] or errors["entry_limit"]:
+                if errors["deadline"] or errors["entry_limit"] or errors["threshold_short_circuit"]:
                     break
         except OSError:
             errors["root_unavailable"] += 1
@@ -413,7 +420,7 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
         root_record.update({"allocated_bytes": allocated - before_allocated,
                             "logical_bytes": logical - before_logical,
                             "partial": sum(errors.values()) != before_errors})
-        if errors["deadline"] or errors["entry_limit"]:
+        if errors["deadline"] or errors["entry_limit"] or errors["threshold_short_circuit"]:
             break
 
     # A skipped link is harmless only when its actual non-link target has
@@ -459,6 +466,7 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
         "filesystem_metadata_bytes": "unknown",
         "shared_extents": "unknown",
         "roots": root_results,
+        "unvisited_roots": [str(root) for root in selected[len(root_results):]],
         "counts": dict(stats),
         "partial_reasons": dict(errors),
     }
@@ -491,11 +499,14 @@ def main(argv=None):
     parser.add_argument("--threshold-bytes", type=int, default=DEFAULT_THRESHOLD)
     parser.add_argument("--max-entries", type=int, default=1_000_000)
     parser.add_argument("--max-seconds", type=float, default=60.0)
+    parser.add_argument("--stop-when-exceeded", action="store_true",
+                        help="stop after proving this scope exceeds its threshold; report partial coverage")
     args = parser.parse_args(argv)
     try:
         result = scan_total_usage(args.root, discover_parents=args.discover_parent,
                                   threshold_bytes=args.threshold_bytes,
-                                  max_entries=args.max_entries, max_seconds=args.max_seconds)
+                                  max_entries=args.max_entries, max_seconds=args.max_seconds,
+                                  stop_when_exceeded=args.stop_when_exceeded)
         emit_usage_warning(result)
         print(json.dumps(result, sort_keys=True))
     except (OSError, ValueError) as exc:

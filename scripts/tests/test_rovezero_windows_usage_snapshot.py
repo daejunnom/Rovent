@@ -22,6 +22,27 @@ def sample(schema, allocated, observed=1000, coverage='complete_for_scoped_regul
 
 
 class CombinedTests(unittest.TestCase):
+    def setUp(self):
+        # Never consult the user's real registry configuration in fixtures.
+        patcher = mock.patch.object(usage, '_read_source_roots_config', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_changed_source_configuration_never_reuses_prior_paired_sum(self):
+        old = '3c1f640d-f646-4f6f-b7f7-233d076d7f21'
+        new = '1996a1d1-1526-48ff-ac81-6c9230cd09bb'
+        windows = sample(usage.WINDOWS_SCHEMA, 10 * usage.GIB)
+        windows['source_roots_revision'] = old
+        linux = sample(usage.LINUX_SCHEMA, 10 * usage.GIB)
+        combined = usage.combine(windows, linux, proven_disjoint=True, now=1001)
+        combined['pairing_status'] = 'verified_at_scan'
+        with mock.patch.object(usage, '_read_snapshot', return_value=combined), \
+             mock.patch.object(usage, '_read_source_roots_config', return_value={'revision': new}):
+            result = usage.read_windows_combined(Path('ignored'), now=1001)
+        self.assertEqual(result['aggregation'], 'overlap_unknown_max')
+        self.assertEqual(result['windows_source_scope'], 'changed_or_unavailable')
+        self.assertEqual(result['decision'], 'unknown')
+
     def test_disjoint_sum_warns_even_when_neither_side_individually_exceeds(self):
         result = usage.combine(sample(usage.WINDOWS_SCHEMA, 10 * usage.GIB),
                                sample(usage.LINUX_SCHEMA, 10 * usage.GIB),
@@ -113,7 +134,7 @@ class WindowsHandleTests(unittest.TestCase):
     def setUp(self):
         # Fixture tests must not inherit a real user's installed monitor.
         self.installed_patch = mock.patch.object(usage, 'windows_monitor_installed', return_value=False)
-        self.installed_patch.start()
+        self.installed = self.installed_patch.start()
         self.addCleanup(self.installed_patch.stop)
         # Keep fixture observers isolated from an actual user-level timer while
         # still testing mutual exclusion among fixture threads/processes.
@@ -213,6 +234,41 @@ class WindowsHandleTests(unittest.TestCase):
             self.assertEqual(len(roots), 1)
             self.assertEqual(usage._normalize_windows_path(roots[0]),
                              usage._normalize_windows_path(base / 'RoveZero'))
+
+    def test_configured_source_roots_are_explicit_checked_and_deduplicated(self):
+        import winreg
+        with tempfile.TemporaryDirectory() as directory:
+            appdata = Path(directory) / 'roaming'
+            (appdata / 'RoveZero').mkdir(parents=True)
+            source = Path(directory) / 'Desktop' / 'RoveZero'
+            source.mkdir(parents=True)
+            (source / '.git').touch()
+            worktree = Path(directory) / 'worktrees' / 'slot' / 'RoveZero'
+            worktree.mkdir(parents=True)
+            (worktree / '.git').mkdir()
+            values = {}
+            def query(_key, name):
+                if name not in values:
+                    raise FileNotFoundError(name)
+                return values[name]
+            def set_value(_key, name, _reserved, kind, value):
+                values[name] = (value, kind)
+            self.installed.return_value = True
+            with mock.patch.dict(os.environ, {'APPDATA': str(appdata), 'LOCALAPPDATA': directory}, clear=False), \
+                 mock.patch.object(winreg, 'OpenKey', return_value=mock.MagicMock()), \
+                 mock.patch.object(winreg, 'QueryValueEx', side_effect=query), \
+                 mock.patch.object(winreg, 'SetValueEx', side_effect=set_value):
+                result = usage.register_source_roots([source, source, worktree])
+                self.assertEqual(result, {'status': 'source_roots_registered', 'count': 2})
+                config = usage._read_source_roots_config()
+                self.assertEqual(set(usage._checked_source_roots(config)), {source, worktree})
+                self.assertEqual(set(usage.discover_windows_roots()), {appdata / 'RoveZero', source, worktree})
+                (source / '.git').unlink()
+                with self.assertRaises(OSError):
+                    usage.discover_windows_roots()
+                values.pop('SourceRootsEnabled')
+                with self.assertRaises(ValueError):
+                    usage._read_source_roots_config()
 
     def test_discovery_deduplicates_distinct_paths_with_same_handle_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -326,7 +382,7 @@ class WindowsHandleTests(unittest.TestCase):
             self.assertEqual(result['components']['linux']['allocated_bytes_lower_bound'], 4096)
             self.assertNotIn(directory.lower(), json.dumps(result).lower())
             windows = usage._read_snapshot(usage.monitor_dir() / 'windows.json', usage.WINDOWS_SCHEMA)
-            self.assertEqual(windows['scope'], 'windows_standard_and_codex_roots_custom_unknown')
+            self.assertEqual(windows['scope'], 'windows_standard_codex_and_configured_sources_custom_unknown')
             self.assertGreaterEqual(windows['logical_bytes_lower_bound'], 384)
 
     def test_observed_root_identity_must_match_the_same_current_handle(self):

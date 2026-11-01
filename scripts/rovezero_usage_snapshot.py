@@ -103,7 +103,7 @@ def warn_cached_total_usage():
         public = {key: value[key] for key in ('decision', 'reason', 'coverage',
                   'allocated_bytes_lower_bound', 'logical_bytes_lower_bound',
                   'threshold_bytes', 'observed_at_utc', 'source_observed_at_utc',
-                  'scope', 'age_seconds') if key in value}
+                  'scope', 'windows_source_scope', 'age_seconds') if key in value}
         if isinstance(value.get('components'), dict):
             public['source_observed_at_utc'] = {
                 name: row.get('observed_at_utc', 'unknown')
@@ -305,7 +305,8 @@ def create_snapshot(path=SNAPSHOT, *, extra_roots=(), max_entries=2_000_000,
     result = scan_total_usage(roots + list(extra_roots),
                               discover_parents=parents,
                               threshold_bytes=threshold_bytes,
-                              max_entries=max_entries, max_seconds=max_seconds)
+                              max_entries=max_entries, max_seconds=max_seconds,
+                              stop_when_exceeded=True)
     # Unknown XDG cache roots and nonstandard user-home locations prevent an
     # exhaustive claim. A proven threshold exceedance remains meaningful.
     value = {key: result[key] for key in ('observed_at_utc', 'decision',

@@ -228,6 +228,47 @@ class TotalUsageTests(unittest.TestCase):
         self.assertEqual(result["allocated_measure"], "sum_of_observed_unique_file_reported_allocations")
         self.assertEqual(path.read_bytes(), b"payload")
 
+    def test_opt_in_threshold_stop_keeps_scanned_root_proof_and_marks_unvisited(self):
+        first = self.root("a-first")
+        second = self.root("z-second")
+        first_file = first / "data"
+        first_file.write_bytes(b"first")
+        (second / "data").write_bytes(b"second")
+        allocated = usage._allocated_bytes(first_file, first_file.stat())
+        if allocated is None or allocated <= 1:
+            self.skipTest("fixture filesystem does not expose nonzero allocation")
+        result = usage.scan_total_usage([first, second], threshold_bytes=allocated - 1,
+                                        stop_when_exceeded=True)
+        self.assertEqual(result["decision"], "exceeded")
+        self.assertEqual(result["coverage"], "partial")
+        self.assertEqual(result["partial_reasons"]["threshold_short_circuit"], 1)
+        self.assertEqual(result["unvisited_roots"], [str(second)])
+        self.assertEqual(len(result["roots"]), 1)
+        self.assertEqual(result["roots"][0]["root"], str(first))
+        self.assertTrue(result["roots"][0]["identity_unchanged"])
+        self.assertTrue(result["roots"][0]["partial"])
+
+    def test_default_and_below_threshold_opt_in_finish_all_scopes(self):
+        first = self.root("a-all")
+        second = self.root("z-all")
+        first_file = first / "data"
+        first_file.write_bytes(b"first")
+        (second / "data").write_bytes(b"second")
+        allocated = usage._allocated_bytes(first_file, first_file.stat())
+        if allocated is None or allocated <= 1:
+            self.skipTest("fixture filesystem does not expose nonzero allocation")
+        ordinary = usage.scan_total_usage([first, second], threshold_bytes=allocated - 1)
+        self.assertEqual(ordinary["decision"], "exceeded")
+        self.assertEqual(ordinary["coverage"], "complete_for_scoped_regular_files")
+        self.assertEqual(ordinary["logical_bytes_lower_bound"], len(b"firstsecond"))
+        self.assertEqual(ordinary["unvisited_roots"], [])
+        below = usage.scan_total_usage([first, second], threshold_bytes=10**12,
+                                      stop_when_exceeded=True)
+        self.assertEqual(below["decision"], "within")
+        self.assertEqual(below["coverage"], "complete_for_scoped_regular_files")
+        self.assertEqual(below["logical_bytes_lower_bound"], len(b"firstsecond"))
+        self.assertEqual(below["unvisited_roots"], [])
+
     def test_symlink_is_not_followed(self):
         root = self.root("scope")
         outside = self.root("outside")

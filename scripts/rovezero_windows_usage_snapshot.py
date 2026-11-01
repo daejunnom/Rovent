@@ -32,6 +32,8 @@ ALLOCATED_MEASURE = 'sum_of_observed_unique_file_reported_allocations'
 PAIRING_SCHEMA = 'rovezero.usage-pairing.v1'
 MONITOR_CONFIG_SCHEMA = 'rovezero.storage-monitor-configuration.v1'
 MONITOR_REGISTRY_KEY = r'Software\RoveZero\StorageMonitor'
+SOURCE_ROOTS_SCHEMA = 'rovezero.storage-source-roots.v1'
+MAX_SOURCE_ROOTS = 64
 
 
 def windows_monitor_installed():
@@ -164,8 +166,97 @@ def _windows_root_candidates():
     return roots
 
 
-def discover_windows_roots():
-    return _distinct_windows_roots(_windows_root_candidates())
+def _read_source_roots_config():
+    """Read explicit installation scope; never infer arbitrary worktrees."""
+    if not windows_monitor_installed():
+        return None
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, MONITOR_REGISTRY_KEY) as key:
+        try:
+            enabled, enabled_kind = winreg.QueryValueEx(key, 'SourceRootsEnabled')
+        except FileNotFoundError:
+            try:
+                winreg.QueryValueEx(key, 'SourceRoots')
+            except FileNotFoundError:
+                return None  # Existing installations may not have configured sources.
+            raise ValueError('source_roots_marker_missing')
+        if enabled_kind != winreg.REG_DWORD or enabled != 1:
+            raise ValueError('invalid_source_roots_marker')
+        raw, kind = winreg.QueryValueEx(key, 'SourceRoots')
+    if kind != winreg.REG_SZ or not isinstance(raw, str) or len(raw) > 32768:
+        raise ValueError('invalid_source_roots_config')
+    value = json.loads(raw)
+    if (not isinstance(value, dict) or value.get('schema') != SOURCE_ROOTS_SCHEMA
+            or not isinstance(value.get('revision'), str)
+            or not isinstance(value.get('roots'), list) or len(value['roots']) > MAX_SOURCE_ROOTS):
+        raise ValueError('invalid_source_roots_config')
+    value['revision'] = str(uuid.UUID(value['revision']))
+    return value
+
+
+def _source_roots_revision(config):
+    return 'unconfigured' if config is None else config['revision']
+
+
+def _checked_source_roots(config):
+    """Recheck explicitly registered source directory and checkout identity."""
+    if config is None:
+        return []
+    result = []
+    for entry in config['roots']:
+        if (not isinstance(entry, dict) or not isinstance(entry.get('directory'), str)
+                or type(entry.get('volume_serial')) is not int or type(entry.get('file_index')) is not int):
+            raise ValueError('invalid_source_root')
+        path = Path(entry['directory'])
+        if not path.is_absolute() or '..' in path.parts or path.name.casefold() not in ('rovezero', 'rovent'):
+            raise ValueError('invalid_source_root_scope')
+        identity = _identity_nofollow(path, directory=True)
+        if (identity['volume_serial'], identity['file_index']) != (entry['volume_serial'], entry['file_index']):
+            raise ValueError('registered_source_root_changed')
+        git_entry = (path / '.git').lstat()
+        if (stat.S_ISLNK(git_entry.st_mode) or getattr(git_entry, 'st_file_attributes', 0) & 0x400
+                or not (stat.S_ISDIR(git_entry.st_mode) or stat.S_ISREG(git_entry.st_mode))):
+            raise ValueError('source_checkout_metadata_invalid')
+        result.append(path)
+    return result
+
+
+def register_source_roots(values):
+    """Replace explicit source roots only after all paths are validated."""
+    if os.name != 'nt' or not windows_monitor_installed():
+        raise ValueError('installed_windows_monitor_required')
+    if not values or len(values) > MAX_SOURCE_ROOTS:
+        raise ValueError('source_roots_count_invalid')
+    import winreg
+    entries = []
+    seen = set()
+    for raw in values:
+        path = Path(raw)
+        if not path.is_absolute() or '..' in path.parts or path.name.casefold() not in ('rovezero', 'rovent'):
+            raise ValueError('invalid_source_root_scope')
+        identity = _identity_nofollow(path, directory=True)
+        key = (identity['volume_serial'], identity['file_index'])
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({'directory': str(path), 'volume_serial': key[0], 'file_index': key[1]})
+    config = {'schema': SOURCE_ROOTS_SCHEMA, 'revision': str(uuid.uuid4()), 'roots': entries}
+    _checked_source_roots(config)
+    encoded = json.dumps(config, sort_keys=True)
+    if len(encoded) > 32768:
+        raise ValueError('source_roots_config_too_large')
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, MONITOR_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        # The complete configuration is one atomic registry value. The marker
+        # permits a missing/corrupt value to be distinguished from no setup.
+        winreg.SetValueEx(key, 'SourceRoots', 0, winreg.REG_SZ, encoded)
+        winreg.SetValueEx(key, 'SourceRootsEnabled', 0, winreg.REG_DWORD, 1)
+    return {'status': 'source_roots_registered', 'count': len(entries)}
+
+
+def discover_windows_roots(*, source_config=None, load_config=True):
+    if load_config:
+        source_config = _read_source_roots_config()
+    return _distinct_windows_roots(_windows_root_candidates() + _checked_source_roots(source_config))
 
 
 def _distinct_windows_roots(roots):
@@ -522,18 +613,28 @@ def read_windows_combined(path=None, *, now=None, max_age_seconds=MAX_AGE):
         raise ValueError('snapshot_components_invalid')
     windows = dict(components.get('windows', {}), schema=WINDOWS_SCHEMA)
     linux = dict(components.get('linux', {}), schema=LINUX_SCHEMA)
+    try:
+        current_revision = _source_roots_revision(_read_source_roots_config())
+        scope_matches = windows.get('source_roots_revision', 'unconfigured') == current_revision
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        scope_matches = False
+    if not scope_matches:
+        # Retain a proven standalone exceedance as an observed lower bound,
+        # but never present an outdated source scope as the current full scope.
+        windows['coverage'] = 'partial'
     # Revalidate each component against the current time. A combined file can
     # be fresh while one of the samples it contains has since gone stale.
     # A paired assertion is valid only for its bounded observation time; the
     # scheduled scan checks live handles before writing it. A local public
     # snapshot is advisory, not an authorization or cryptographic attestation.
-    disjoint = (value.get('aggregation') == 'disjoint_sum'
+    disjoint = (scope_matches and value.get('aggregation') == 'disjoint_sum'
                 and value.get('pairing_status') == 'verified_at_scan')
     result = combine(windows, linux, proven_disjoint=disjoint, now=now,
                      threshold=value['threshold_bytes'], max_age=max_age_seconds)
     result['observed_at_utc'] = value['observed_at_utc']
     result['pairing_status'] = ('verified_at_scan' if result['aggregation'] == 'disjoint_sum'
                                 else 'unverified')
+    result['windows_source_scope'] = 'matched' if scope_matches else 'changed_or_unavailable'
     return result
 
 
@@ -551,6 +652,9 @@ def combine(windows, linux, *, proven_disjoint=False, now=None, threshold=THRESH
             parts[label] = {key: value[key] for key in
                             ('observed_at_utc', 'coverage', 'decision', 'threshold_bytes',
                              'allocated_bytes_lower_bound', 'logical_bytes_lower_bound', 'allocated_measure')}
+            revision = value.get('source_roots_revision') if label == 'windows' else None
+            if isinstance(revision, str) and len(revision) <= 36:
+                parts[label]['source_roots_revision'] = revision
             proof = value.get('origin_proof') if label == 'linux' else None
             if (isinstance(proof, dict)
                     and all(_hex_tag(proof.get(k)) for k in ('pair_tag', 'machine_tag', 'boot_tag'))
@@ -691,14 +795,21 @@ def scan_once(*, max_entries=2_000_000, max_seconds=120.0, threshold_bytes=THRES
             'rovezero_total_usage', Path(__file__).with_name('rovezero_total_usage.py'))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        roots = discover_windows_roots()
+        try:
+            source_config = _read_source_roots_config()
+            revision = _source_roots_revision(source_config)
+            roots = discover_windows_roots(source_config=source_config, load_config=False)
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            revision = 'unavailable'
+            roots = discover_windows_roots(source_config=None, load_config=False)
         result = module.scan_total_usage(roots, threshold_bytes=threshold_bytes,
-                                         max_entries=max_entries, max_seconds=max_seconds)
+                                         max_entries=max_entries, max_seconds=max_seconds,
+                                         stop_when_exceeded=True)
         windows = {key: result[key] for key in ('observed_at_utc', 'decision', 'coverage',
                    'threshold_bytes', 'allocated_bytes_lower_bound', 'logical_bytes_lower_bound')}
-        windows.update(schema=WINDOWS_SCHEMA, scope='windows_standard_and_codex_roots_custom_unknown',
+        windows.update(schema=WINDOWS_SCHEMA, scope='windows_standard_codex_and_configured_sources_custom_unknown',
                        host_physical_bytes='unknown', consistency='best_effort_non_atomic',
-                       allocated_measure=ALLOCATED_MEASURE)
+                       allocated_measure=ALLOCATED_MEASURE, source_roots_revision=revision)
         # Other package identities and user-selected locations may exist even
         # if both discovered roots were scanned without an error.
         windows['coverage'] = 'partial'
@@ -713,8 +824,12 @@ def scan_once(*, max_entries=2_000_000, max_seconds=120.0, threshold_bytes=THRES
             manifest = json.loads(_read_nofollow(base / 'pairing.json'))
             # Root discovery must still match after the scan; identity handles
             # are then rechecked by pairing_matches before allowing a sum.
-            unchanged_roots = sorted(map(_normalize_windows_path, roots)) == sorted(
-                map(_normalize_windows_path, discover_windows_roots()))
+            current_config = _read_source_roots_config()
+            unchanged_roots = (revision != 'unavailable'
+                and revision == _source_roots_revision(current_config)
+                and sorted(map(_normalize_windows_path, roots)) == sorted(
+                    map(_normalize_windows_path, discover_windows_roots(source_config=current_config,
+                                                                          load_config=False))))
             paired = (unchanged_roots and _scan_roots_match_handles(result, roots)
                       and pairing_matches(manifest, linux, roots))
         except (OSError, ValueError, KeyError, TypeError, OverflowError):
@@ -736,14 +851,18 @@ def main():
                         help='non-secret UUID from the matching root-owned Linux configuration')
     parser.add_argument('--register-monitor-dir', metavar='PATH',
                         help='explicit setup: pin an existing validated Windows monitor directory')
+    parser.add_argument('--set-source-root', metavar='PATH', action='append',
+                        help='replace the explicit RoveZero checkout list; repeat for each source root')
     args = parser.parse_args()
     if bool(args.register_pairing) != bool(args.pair_id):
         parser.error('--register-pairing and --pair-id must be provided together')
-    if args.register_monitor_dir and args.register_pairing:
-        parser.error('register the monitor directory and pairing in separate steps')
+    if sum(bool(value) for value in (args.register_monitor_dir, args.register_pairing, args.set_source_root)) > 1:
+        parser.error('register monitor directory, source roots and pairing in separate steps')
     try:
         if args.register_monitor_dir:
             result = register_monitor_dir(args.register_monitor_dir)
+        elif args.set_source_root:
+            result = register_source_roots(args.set_source_root)
         elif args.register_pairing:
             result = register_pairing(args.register_pairing, args.pair_id)
         else:
