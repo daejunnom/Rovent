@@ -976,6 +976,9 @@ impl PalsVirtualReviewOnnxBackend {
             (Provider::Cuda { .. }, Some(_)) => runtime.verify_cuda_dependencies()?,
             _ => {}
         }
+        // Construct the fallible host bank before creating any native session.
+        // A bank admission failure must not drop already-created CUDA sessions.
+        let memory = MemoryBank::new(1, MAX_PUBLIC_BYTES).map_err(public_bank_error)?;
         let mut sessions = BTreeMap::new();
         let mut applied_session_settings = Vec::with_capacity(manifest.graphs.len());
         let mut placements = Vec::new();
@@ -1071,7 +1074,7 @@ impl PalsVirtualReviewOnnxBackend {
             trained: manifest.trained,
             rules_semantics,
             backend_digest,
-            memory: Some(MemoryBank::new(1, MAX_PUBLIC_BYTES).map_err(public_bank_error)?),
+            memory: Some(memory),
             active_memory: None,
             active: None,
             #[cfg(feature = "experimental-io-binding")]
