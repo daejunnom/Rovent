@@ -212,9 +212,41 @@ impl AdaptiveExecutionLimits {
     }
 }
 
+/// Provenance of a value observed from the manager's original finish report
+/// or its immutable retained snapshot. This is not a GPU Run/fence witness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSessionReleaseSource {
+    OriginalReport,
+    Snapshot,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSessionReleaseObservation {
+    release: rz_eval::worker::SessionReleased,
+    source: NativeSessionReleaseSource,
+}
+impl NativeSessionReleaseObservation {
+    pub fn release(&self) -> rz_eval::worker::SessionReleased { self.release }
+    pub fn source(&self) -> NativeSessionReleaseSource { self.source }
+    pub(super) fn from_report(
+        report: &crate::pals_native::ticketed::TicketNativeFinishReport,
+        original: bool,
+    ) -> Option<Self> {
+        report.session_release.map(|release| Self {
+            release,
+            source: if original { NativeSessionReleaseSource::OriginalReport } else { NativeSessionReleaseSource::Snapshot },
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum AdaptiveManagerError {
     NativeObservation(TicketNativeObservationFailure),
+    /// Original shutdown causes; neither substitutes for the physical fence.
+    NativeShutdown {
+        event_physical_shutdown_confirmed: bool,
+        snapshot: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
+        transferred: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
+    },
     Collection(AdaptiveCollectionError),
     Coordinator(CoordinatorError),
     Contract(ContractError),
@@ -2387,6 +2419,9 @@ where
     next_control: u64,
     phase: ManagerPhase,
     native_finished: Option<bool>,
+    // true means the report is the original one-time transfer; false is the
+    // immutable snapshot retained when another consumer already took it.
+    native_finish_report: Option<(crate::pals_native::ticketed::TicketNativeFinishReport, bool)>,
     native_joined: bool,
     native_root_fence: Option<NativeRootFence>,
     close_mode: AdaptiveCloseMode,
@@ -3039,6 +3074,13 @@ where
     }
     pub fn phase(&self) -> ManagerPhase {
         self.phase
+    }
+    pub(super) fn native_session_release_observation(&self) -> Option<NativeSessionReleaseObservation> {
+        if !self.native_joined || self.native_finished != Some(true) {
+            return None;
+        }
+        let (report, original) = self.native_finish_report.as_ref()?;
+        NativeSessionReleaseObservation::from_report(report, *original)
     }
     pub fn counters(&self) -> AdaptiveManagerCounters {
         self.counters
@@ -5320,7 +5362,34 @@ where
                         return Err(AdaptiveManagerError::Invalid("duplicate native shutdown"));
                     }
                     self.native_finished = Some(physical_shutdown_confirmed);
-                    if !physical_shutdown_confirmed {
+                    let requires = self.native.requires_finish_report();
+                    let snapshot = self.native.finish_report_snapshot();
+                    let transferred = self.native.take_finish_report();
+                    let mismatch = (requires && snapshot.is_none())
+                        || (snapshot.is_none() && transferred.is_some())
+                        || (!requires && snapshot.is_some())
+                        || snapshot.as_ref().zip(transferred.as_ref())
+                            .is_some_and(|(snapshot, original)| snapshot != original)
+                        || snapshot.as_ref().is_some_and(|report|
+                        report.physical_shutdown_confirmed != physical_shutdown_confirmed
+                    );
+                    let failure = snapshot.as_ref().is_some_and(|report|
+                        report.physical_failure.is_some() || report.semantic_failure.is_some());
+                    if mismatch || failure {
+                        self.record_failure(AdaptiveManagerError::NativeShutdown {
+                            event_physical_shutdown_confirmed: physical_shutdown_confirmed,
+                            snapshot: snapshot.clone(),
+                            transferred: transferred.clone(),
+                        });
+                    }
+                    self.native_finish_report = match transferred {
+                        Some(original) => Some((original, true)),
+                        None => snapshot.map(|copy| (copy, false)),
+                    };
+                    if mismatch {
+                        self.native_finished = Some(false);
+                    }
+                    if !physical_shutdown_confirmed || mismatch {
                         return Err(AdaptiveManagerError::PhysicalUnknown);
                     }
                 }

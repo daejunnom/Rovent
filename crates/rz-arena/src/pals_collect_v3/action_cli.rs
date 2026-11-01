@@ -1362,6 +1362,7 @@ fn load_verified_frozen(
                 rz_uci::pals_adaptive_bootstrap::AdaptiveBootstrapError {
                     stage: "FrozenIntakeTeacherSource",
                     detail: error.to_string(),
+                    cleanup_failures: None,
                 }
             })
         }),

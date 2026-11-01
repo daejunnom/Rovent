@@ -267,6 +267,28 @@ where
     fn finish(&mut self, until: Instant) -> bool {
         self.backend.finish(until)
     }
+    fn finish_report(&mut self, until: Instant) -> crate::pals_native::ticketed::TicketNativeFinishReport {
+        self.backend.finish_report(until)
+    }
+    fn recovery_owner(&self) -> Option<rz_eval::worker::PhysicalRecoveryKey> {
+        self.backend.recovery_owner()
+    }
+    fn recovery_work_scope(&self) -> Option<rz_eval::worker::PhysicalWorkScope> {
+        self.backend.recovery_work_scope()
+    }
+    fn reobserve_quarantined(
+        &mut self,
+        until: Instant,
+    ) -> Result<crate::pals_native::ticketed::TicketNativeRecoveryProbe, RoleFailure> {
+        self.backend.reobserve_quarantined(until)
+    }
+    fn release_quarantined(
+        &mut self,
+        proof: &rz_eval::worker::PhysicalRecoveryConfirmation,
+        until: Instant,
+    ) -> Result<crate::pals_native::ticketed::TicketNativeRelease, RoleFailure> {
+        self.backend.release_quarantined(proof, until)
+    }
 }
 
 fn matches_original<Q, P>(

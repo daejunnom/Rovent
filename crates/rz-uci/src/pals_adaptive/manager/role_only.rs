@@ -394,6 +394,8 @@ where
     native_ready: bool,
     verifier_registered: bool,
     native_finished: Option<bool>,
+    // true identifies the one-time original transfer; false is a snapshot.
+    native_finish_report: Option<(crate::pals_native::ticketed::TicketNativeFinishReport, bool)>,
     native_joined: bool,
     native_root_fence: Option<NativeRootFence>,
     root_quiesce_requested: bool,
@@ -511,6 +513,7 @@ where
             native_ready,
             verifier_registered,
             native_finished: None,
+            native_finish_report: None,
             native_joined: false,
             native_root_fence: None,
             root_quiesce_requested: false,
@@ -2532,7 +2535,34 @@ where
                     ));
                 }
                 self.native_finished = Some(physical_shutdown_confirmed);
-                if !physical_shutdown_confirmed {
+                let requires = self.native.requires_finish_report();
+                let snapshot = self.native.finish_report_snapshot();
+                let transferred = self.native.take_finish_report();
+                let mismatch = (requires && snapshot.is_none())
+                    || (snapshot.is_none() && transferred.is_some())
+                    || (!requires && snapshot.is_some())
+                    || snapshot.as_ref().zip(transferred.as_ref())
+                        .is_some_and(|(snapshot, original)| snapshot != original)
+                    || snapshot.as_ref().is_some_and(|report|
+                    report.physical_shutdown_confirmed != physical_shutdown_confirmed
+                );
+                let failure = snapshot.as_ref().is_some_and(|report|
+                    report.physical_failure.is_some() || report.semantic_failure.is_some());
+                if mismatch || failure {
+                    self.record_failure(AdaptiveManagerError::NativeShutdown {
+                        event_physical_shutdown_confirmed: physical_shutdown_confirmed,
+                        snapshot: snapshot.clone(),
+                        transferred: transferred.clone(),
+                    });
+                }
+                self.native_finish_report = match transferred {
+                    Some(original) => Some((original, true)),
+                    None => snapshot.map(|copy| (copy, false)),
+                };
+                if mismatch {
+                    self.native_finished = Some(false);
+                }
+                if !physical_shutdown_confirmed || mismatch {
                     return Err(AdaptiveManagerError::PhysicalUnknown);
                 }
             }

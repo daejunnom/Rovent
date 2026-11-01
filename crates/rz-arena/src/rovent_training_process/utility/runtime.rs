@@ -7,7 +7,7 @@ use super::ancestry::VerifiedUtilityAncestors;
 use super::cli::{RoventUtilityCliAction, RoventUtilityCliAdmissionRequest};
 use super::execution::{RoventUtilityExecutionAction, RoventUtilityInitializationSource};
 #[path = "ipc_endpoint.rs"]
-mod ipc_endpoint;
+pub(crate) mod ipc_endpoint;
 
 use self::ipc_endpoint::{OwnedUtilityEndpoint, UtilityListener};
 use super::ledger::{

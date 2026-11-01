@@ -98,20 +98,20 @@ enum Cleanup {
 
 /// The listener closes before its last presence token is dropped. There is no
 /// clone/FD escape API; accepted streams remain scoped inside serve(ctx).
-pub(super) struct UtilityListener {
+pub(crate) struct UtilityListener {
     listener: UnixListener,
     _presence: Arc<()>,
 }
 impl UtilityListener {
-    pub(super) fn set_nonblocking(&self, value: bool) -> io::Result<()> {
+    pub(crate) fn set_nonblocking(&self, value: bool) -> io::Result<()> {
         self.listener.set_nonblocking(value)
     }
-    pub(super) fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
+    pub(crate) fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
         self.listener.accept()
     }
 }
 
-pub(super) struct OwnedUtilityEndpoint {
+pub(crate) struct OwnedUtilityEndpoint {
     directory: File,
     directory_path: PathBuf,
     directory_identity: DirectoryIdentity,
@@ -129,7 +129,7 @@ pub(super) struct OwnedUtilityEndpoint {
 impl OwnedUtilityEndpoint {
     /// Prepare and place this owner in Custody before bind. Admission failure
     /// must retain it even if bind succeeds but endpoint readback fails.
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         directory: File,
         directory_path: &Path,
         socket: &Path,
@@ -194,7 +194,33 @@ impl OwnedUtilityEndpoint {
             self.directory_identity.uid,
         )
     }
-    pub(super) fn bind(&mut self) -> Result<UtilityListener, ArenaError> {
+
+    /// Read-only identity recheck. This does not establish that a peer can
+    /// connect, grant cleanup authority, or prove native completion.
+    pub(crate) fn observe_bound_identity(&self) -> Result<(), ArenaError> {
+        if !self.bound {
+            return Err(invalid("original endpoint was not bound"));
+        }
+        self.check_directory()?;
+        let identity = self.identity.ok_or_else(|| invalid("original bound identity unknown"))?;
+        let inode = self.inode.as_ref().ok_or_else(|| invalid("original bound endpoint FD missing"))?;
+        if EndpointIdentity::read(
+            fstat(inode).map_err(|_| invalid("held endpoint metadata unknown"))?,
+            self.directory_identity.uid,
+        )? != identity || self.named_identity()? != identity {
+            return Err(invalid("original endpoint identity changed or is unavailable"));
+        }
+        Ok(())
+    }
+
+    /// A short, process-specific route through the same retained directory
+    /// FD. The pathname grants no authority: callers must authenticate the
+    /// peer, and an unavailable procfs route is not completion evidence.
+    pub(crate) fn owner_process_socket_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), self.directory.as_raw_fd()))
+            .join(&self.name)
+    }
+    pub(crate) fn bind(&mut self) -> Result<UtilityListener, ArenaError> {
         if self.attempted || self.cleanup != Cleanup::Armed {
             return Err(invalid("endpoint bind cannot retry"));
         }
@@ -296,7 +322,7 @@ impl OwnedUtilityEndpoint {
     }
     /// Called after the actual broker join; a failure is sticky and never
     /// retried by Drop or replaced with a successful normal-close outcome.
-    pub(super) fn cleanup(&mut self) -> Result<(), ArenaError> {
+    pub(crate) fn cleanup(&mut self) -> Result<(), ArenaError> {
         match self.cleanup {
             Cleanup::Complete => return Ok(()),
             Cleanup::Preserved => {
@@ -311,6 +337,22 @@ impl OwnedUtilityEndpoint {
             Cleanup::Preserved
         };
         result
+    }
+
+    /// Start a distinct, already-authorized post-session endpoint cleanup
+    /// window. This does not retry a previous failed cleanup or grant any
+    /// native/device completion authority; the caller must establish its own
+    /// same-owner session termination before calling it.
+    pub(crate) fn cleanup_after_session(&mut self, until: Instant) -> Result<(), ArenaError> {
+        if self.cleanup != Cleanup::Armed {
+            return self.cleanup();
+        }
+        if Instant::now() >= until {
+            self.cleanup = Cleanup::Preserved;
+            return Err(invalid("post-session endpoint cleanup window expired; retained"));
+        }
+        self.until = until;
+        self.cleanup()
     }
 }
 impl Drop for OwnedUtilityEndpoint {
@@ -398,6 +440,31 @@ mod tests {
             b"original evidence"
         );
         endpoint.cleanup().unwrap();
+    }
+    #[test]
+    fn post_session_window_allows_expired_startup_deadline_without_retrying_failure() {
+        let root = Root::new();
+        let (mut endpoint, listener) = root.bind();
+        drop(listener);
+        endpoint.until = Instant::now() - std::time::Duration::from_secs(1);
+        endpoint.cleanup_after_session(Instant::now() + std::time::Duration::from_secs(1)).unwrap();
+        assert!(!root.path().exists());
+
+        let (mut failed, listener) = root.bind();
+        drop(listener);
+        failed.until = Instant::now() - std::time::Duration::from_secs(1);
+        assert!(failed.cleanup().is_err());
+        assert!(failed.cleanup_after_session(Instant::now() + std::time::Duration::from_secs(1)).is_err());
+        assert!(root.path().exists(), "failed original owner must remain preserved");
+    }
+    #[test]
+    fn expired_post_session_window_does_not_retry_on_drop() {
+        let root = Root::new();
+        let (mut endpoint, listener) = root.bind();
+        drop(listener);
+        assert!(endpoint.cleanup_after_session(Instant::now()).is_err());
+        drop(endpoint);
+        assert!(root.path().exists(), "expired cleanup keeps the original endpoint");
     }
     #[test]
     fn startup_failure_after_bind_drops_listener_before_endpoint_guard() {

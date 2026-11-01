@@ -219,6 +219,28 @@ struct RuntimeLatch {
 
 static RUNTIME: Mutex<Option<RuntimeLatch>> = Mutex::new(None);
 
+#[cfg(target_os = "linux")]
+fn system_runtime_unavailable() -> BackendError {
+    BackendError::new(
+        K::BackendUnavailable,
+        S::Backend,
+        "system ORT initialization failed; install compatible native dependencies",
+    )
+}
+
+/// Keep the callback adjacent to the actual native invocation. In particular,
+/// a non-UTF8 path rejects before notifying the original owner.
+#[cfg(target_os = "linux")]
+fn with_system_ort_entry<T>(
+    path: Option<&str>,
+    before_native: impl FnOnce(),
+    initialize: impl FnOnce(&str) -> Result<T, BackendError>,
+) -> Result<T, BackendError> {
+    let path = path.ok_or_else(system_runtime_unavailable)?;
+    before_native();
+    initialize(path)
+}
+
 impl OrtRuntime {
     /// Bootstrap must be the sole initializer of the process-global `ort`
     /// library. Refuse prior initialization, path changes and failed retries.
@@ -395,13 +417,24 @@ impl OrtRuntime {
     /// Provider readiness and physical completion require separate real checks.
     #[cfg(target_os = "linux")]
     pub fn load_system_cuda(runtime: &SystemRuntime) -> Result<Self, BackendError> {
-        let unavailable = || {
-            BackendError::new(
-                K::BackendUnavailable,
-                S::Backend,
-                "system ORT initialization failed; install compatible native dependencies",
-            )
-        };
+        Self::load_system_cuda_with_entry(runtime, || {})
+    }
+
+    /// Reports this attempt's first ORT native entry to its original owner.
+    /// Pure admission failures and reuse of the process latch do not call the
+    /// callback. Neither callback nor latch reuse attests GPU completion or
+    /// says whether earlier work in the process has completed.
+    ///
+    /// The callback executes immediately before `ort::init_from` and within
+    /// the same unwind boundary as initialization. If it panics, initialization
+    /// is not attempted; the original owner and typed panic error remain in
+    /// the process latch. Callers must separately preserve their own custody.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_with_entry(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce(),
+    ) -> Result<Self, BackendError> {
+        let unavailable = system_runtime_unavailable;
         let libraries = runtime.libraries();
         let core = libraries
             .iter()
@@ -444,43 +477,44 @@ impl OrtRuntime {
             loaded.verify_cuda_mappings(false)?;
             return Ok(loaded);
         }
+        // This is a new load. A source-path encoding error precedes native
+        // entry and must not install a latch for an unattempted initialization.
+        // Existing latch reuse retains its historical validation order.
+        let core_path = core.canonical_path.to_str().ok_or_else(unavailable)?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let path = core.canonical_path.to_str().ok_or_else(unavailable)?;
-            if !ort::init_from(path)
-                .with_name("RoveZero-C-system")
-                .commit()
-                .map_err(|error| {
-                    unavailable().with_ort_cause(CauseCode::RuntimeInitialize, error)
-                })?
-            {
-                return Err(BackendError::new(
-                    K::IdentityMismatch,
-                    S::Backend,
-                    "ORT was initialized outside bootstrap",
-                ));
-            }
-            let info = ort::info();
-            // ort's dynamic initialization must acquire its required C API;
-            // a build commit string is an observation, not a compatibility gate.
-            let observation = runtime.observe_mappings().map_err(loader_error)?;
-            if observation.availability == SystemMappingAvailability::Observed
-                && (!observation
-                    .mapped_roles
-                    .iter()
-                    .any(|role| role == "ort-core"))
-            {
-                return Err(BackendError::new(
-                    K::IdentityMismatch,
-                    S::Backend,
-                    "system ORT core mapping does not match the captured runtime",
-                ));
-            }
-            Ok(Self {
-                owner: owner.clone(),
-                build_info: info.to_owned(),
-                cuda_libraries: None,
-                ort_libraries: None,
-                loading_profile: None,
+            with_system_ort_entry(Some(core_path), before_native, |path| {
+                if !ort::init_from(path)
+                    .with_name("RoveZero-C-system")
+                    .commit()
+                    .map_err(|error| {
+                        unavailable().with_ort_cause(CauseCode::RuntimeInitialize, error)
+                    })?
+                {
+                    return Err(BackendError::new(
+                        K::IdentityMismatch,
+                        S::Backend,
+                        "ORT was initialized outside bootstrap",
+                    ));
+                }
+                let info = ort::info();
+                // A build commit is an observation, not a compatibility gate.
+                let observation = runtime.observe_mappings().map_err(loader_error)?;
+                if observation.availability == SystemMappingAvailability::Observed
+                    && !observation.mapped_roles.iter().any(|role| role == "ort-core")
+                {
+                    return Err(BackendError::new(
+                        K::IdentityMismatch,
+                        S::Backend,
+                        "system ORT core mapping does not match the captured runtime",
+                    ));
+                }
+                Ok(Self {
+                    owner: owner.clone(),
+                    build_info: info.to_owned(),
+                    cuda_libraries: None,
+                    ort_libraries: None,
+                    loading_profile: None,
+                })
             })
         }))
         .unwrap_or_else(|payload| {
@@ -830,6 +864,48 @@ fn cuda_loading_profile(
 #[cfg(test)]
 mod native_loading_profile_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_ort_entry_rejects_bad_path_before_native_callback() {
+        let entered = std::cell::Cell::new(false);
+        let called = std::cell::Cell::new(false);
+        let result = with_system_ort_entry(
+            None,
+            || entered.set(true),
+            |_| { called.set(true); Ok(()) },
+        );
+        assert_eq!(result.unwrap_err().kind, K::BackendUnavailable);
+        assert!(!entered.get());
+        assert!(!called.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_ort_entry_runs_owner_hook_before_native_invocation() {
+        let entered = std::cell::Cell::new(false);
+        let output = with_system_ort_entry(
+            Some("/not-opened-in-this-test"),
+            || entered.set(true),
+            |path| { assert!(entered.get()); Ok(path.len()) },
+        ).unwrap();
+        assert_eq!(output, "/not-opened-in-this-test".len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_ort_entry_hook_panic_does_not_call_initializer() {
+        let called = std::cell::Cell::new(false);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_system_ort_entry(
+                Some("/not-opened-in-this-test"),
+                || panic!("owner hook failure"),
+                |_| { called.set(true); Ok(()) },
+            );
+        }));
+        assert!(panic.is_err());
+        assert!(!called.get());
+    }
 
     #[test]
     fn cpu_bootstrap_keeps_no_native_profile_and_rejects_explicit_shim() {

@@ -63,6 +63,13 @@ use std::{
     time::Instant,
 };
 
+/// Product assembly happens after the original native owner was started.
+/// An admission error alone cannot certify that owner's physical completion.
+fn assembly_completion_unknown(mut error: SearchSessionFailure) -> SearchSessionFailure {
+    error.physical_completion = DriverPhysicalCompletion::Unknown;
+    error
+}
+
 // Shared assembly over the original pinned V1/V2 declarations. The session
 // constructors below still own their version-specific admission and custody.
 macro_rules! build_own_board_pcr {
@@ -1180,6 +1187,87 @@ pub struct RoventNativeProductDriverV3 {
 
 pub type RoventProductV3StartupRejection = RoventPcSessionV3Rejection;
 
+/// Original P/C and optional shared NNUEC owners held in the registered V3
+/// assembly scope throughout validation and driver construction.
+pub(crate) struct RoventPcAssemblyV3 {
+    prepared: Option<PreparedRoventNativeV3<PcPortQuestion>>,
+    loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+    process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    driver: Option<Arc<RoventNativeProductDriverV3>>,
+}
+impl RoventPcAssemblyV3 {
+    pub(crate) fn new(
+        loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    ) -> Self {
+        Self {
+            prepared: None,
+            loaded,
+            process,
+            driver: None,
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_prepared(
+        &mut self,
+        prepared: PreparedRoventNativeV3<PcPortQuestion>,
+    ) -> Result<(), PreparedRoventNativeV3<PcPortQuestion>> {
+        if self.prepared.is_some() || self.driver.is_some() {
+            return Err(prepared);
+        }
+        self.prepared = Some(prepared);
+        Ok(())
+    }
+    pub(crate) fn prepared_service(
+        &mut self,
+    ) -> Option<&mut super::RoventNativeService<PcPortQuestion>> {
+        self.prepared.as_mut().map(|prepared| &mut prepared.service)
+    }
+    pub(crate) fn system_runtime_observation(
+        &self,
+    ) -> Option<super::RoventSystemReadyObservationV3> {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.snapshot().system_runtime.clone())
+    }
+    pub(crate) fn assemble(
+        &mut self,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Arc<RoventNativeProductDriverV3>, SearchSessionFailure> {
+        if self.driver.is_some() {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        let sources = Arc::clone(
+            self.prepared
+                .as_ref()
+                .ok_or_else(SearchSessionFailure::physical_completion_unknown)?
+                .sources(),
+        );
+        let physically_closed = Arc::new(AtomicBool::new(false));
+        let inner = RoventPcSessionDriver::new_v3_in_slots(
+            &mut self.prepared,
+            &mut self.loaded,
+            Arc::clone(&self.process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+        .map_err(assembly_completion_unknown)?;
+        let driver = Arc::new(RoventNativeProductDriverV3 {
+            inner: Arc::new(inner),
+            sources,
+            process: Arc::clone(&self.process),
+            physically_closed,
+        });
+        self.driver = Some(Arc::clone(&driver));
+        Ok(driver)
+    }
+}
+
 impl RoventNativeProductDriverV3 {
     #[allow(clippy::result_large_err)]
     pub fn pc(
@@ -1913,6 +2001,193 @@ pub struct RoventExternalPcrV3StartupRejection {
     pub process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
 }
 
+/// Caller-owned original V3 external assembly. The registered launch scope
+/// retains this exact slot across validation, native/session setup and UCI.
+pub(crate) struct RoventExternalAssemblyV3 {
+    prepared: Option<PreparedRoventNativeV3<AdaptivePortQuestion>>,
+    external: Option<RoventPinnedExternalRSource<rz_experiments::RoventInputLockV3>>,
+    evidence: Option<LaunchRetirementEvidence>,
+    registration: Option<Arc<LaunchRetirementRegistrationCustody>>,
+    session: Option<super::external_session::RoventExternalSessionCustodyV3>,
+    process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    driver: Option<Arc<RoventExternalPcrProductDriverV3>>,
+}
+impl RoventExternalAssemblyV3 {
+    pub(crate) fn new(
+        external: RoventPinnedExternalRSource<rz_experiments::RoventInputLockV3>,
+        evidence: LaunchRetirementEvidence,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    ) -> Self {
+        Self {
+            prepared: None,
+            external: Some(external),
+            evidence: Some(evidence),
+            registration: None,
+            session: None,
+            process,
+            driver: None,
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_prepared(
+        &mut self,
+        prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+    ) -> Result<(), PreparedRoventNativeV3<AdaptivePortQuestion>> {
+        if self.prepared.is_some() || self.session.is_some() || self.driver.is_some() {
+            return Err(prepared);
+        }
+        self.prepared = Some(prepared);
+        Ok(())
+    }
+    pub(crate) fn system_runtime_observation(
+        &self,
+    ) -> Option<super::RoventSystemReadyObservationV3> {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.snapshot().system_runtime.clone())
+    }
+    pub(crate) fn prepared_service(
+        &mut self,
+    ) -> Option<&mut super::RoventNativeService<AdaptivePortQuestion>> {
+        if let Some(prepared) = &mut self.prepared {
+            return Some(&mut prepared.service);
+        }
+        self.session
+            .as_mut()
+            .and_then(|session| session.prepared_service())
+    }
+    pub(crate) fn recovery_key(
+        &self,
+    ) -> Option<crate::pals_native::ticketed::TicketNativeRecoveryKey> {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.service.recovery_key())
+            .or_else(|| {
+                self.session
+                    .as_ref()
+                    .and_then(|session| session.recovery_key())
+            })
+    }
+    /// Observe only the actual original external owner. This does not prove
+    /// the native service's completion or authorize a GPU release.
+    pub(crate) fn external_start_observation(
+        &self,
+    ) -> crate::pals_adaptive::RoventExternalV3StartObservation {
+        use crate::pals_adaptive::RoventExternalV3StartObservation;
+        if self.driver.is_some() {
+            return RoventExternalV3StartObservation::Unknown;
+        }
+        match (&self.external, &self.session) {
+            (Some(_), None) => RoventExternalV3StartObservation::NeverStarted,
+            (None, Some(session)) => session.external_start_observation(),
+            _ => RoventExternalV3StartObservation::Unknown,
+        }
+    }
+    pub(crate) fn assemble(
+        &mut self,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Arc<RoventExternalPcrProductDriverV3>, SearchSessionFailure> {
+        if self.driver.is_some() || self.session.is_some() {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+        let external = self
+            .external
+            .as_ref()
+            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+        let evidence = self
+            .evidence
+            .as_ref()
+            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+        let sources = Arc::clone(prepared.sources());
+        if !Arc::ptr_eq(sources.lock_owner(), self.process.input_lock())
+            || !self
+                .process
+                .matches_startup_control(prepared.startup_control())
+            || sources.private_root_path() != self.process.private_cwd()
+            || !Arc::ptr_eq(&sources, external.original_sources())
+            || evidence.input_lock_digest() != sources.lock_digest()
+            || !evidence
+                .original_lock_owner_v3()
+                .is_some_and(|owner| Arc::ptr_eq(owner, sources.lock_owner()))
+            || !evidence
+                .original_process_v3()
+                .is_some_and(|original| Arc::ptr_eq(original, &self.process))
+        {
+            return Err(assembly_completion_unknown(failure(
+                "RoventExternalPcrV3Owner",
+                "native, external, retirement and process owners differ",
+            )));
+        }
+        if !sources
+            .same_original_root(self.process.original_root())
+            .map_err(|error| {
+                assembly_completion_unknown(SearchSessionFailure::debug(
+                    "RoventExternalPcrV3Root",
+                    &error,
+                ))
+            })?
+        {
+            return Err(assembly_completion_unknown(failure(
+                "RoventExternalPcrV3Owner",
+                "native and process root differ",
+            )));
+        }
+        let physically_closed = Arc::new(AtomicBool::new(false));
+        // Only pure moves remain before each original is stored back in the
+        // scope-owned session/registration slots.
+        let (sink, registration) = self
+            .evidence
+            .take()
+            .expect("validated retirement owner")
+            .into_parts();
+        self.registration = Some(registration);
+        self.session = Some(
+            super::external_session::RoventExternalSessionCustodyV3::new(
+                self.external.take().expect("validated external owner"),
+                sink,
+            ),
+        );
+        let prepared = self.prepared.take().expect("validated native owner");
+        if let Err(original) = self
+            .session
+            .as_mut()
+            .expect("original session slot")
+            .install_prepared(prepared)
+        {
+            self.prepared = Some(original);
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        let session = self.session.as_mut().expect("original session slot");
+        session
+            .assemble(clock, owners, identity, root_policy)
+            .map_err(assembly_completion_unknown)?;
+        let registration = Arc::clone(
+            self.registration
+                .as_ref()
+                .expect("original registration slot"),
+        );
+        let inner = session
+            .take_driver()
+            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+        let driver = Arc::new(RoventExternalPcrProductDriverV3 {
+            inner: Arc::new(inner),
+            sources,
+            process: Arc::clone(&self.process),
+            retirement_sources: registration,
+            physically_closed,
+        });
+        self.driver = Some(Arc::clone(&driver));
+        Ok(driver)
+    }
+}
+
 impl RoventExternalPcrProductDriverV3 {
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     pub fn external_pcr(
@@ -2259,6 +2534,91 @@ pub struct RoventOwnNnuecV3StartupRejection {
     pub rejected: RoventNnuecSessionV3Rejection,
 }
 
+/// Original V3 assembly owners live in the caller's pre-registered scope.
+/// This slot neither observes a physical fence nor authorizes device reuse.
+pub(crate) struct RoventOwnNnuecAssemblyV3 {
+    prepared: Option<PreparedRoventNativeV3<AdaptivePortQuestion>>,
+    loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+    process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    driver: Option<Arc<RoventOwnNnuecProductDriverV3>>,
+}
+impl RoventOwnNnuecAssemblyV3 {
+    pub(crate) fn new(
+        loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    ) -> Self {
+        Self {
+            prepared: None,
+            loaded: Some(loaded),
+            process,
+            driver: None,
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_prepared(
+        &mut self,
+        prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+    ) -> Result<(), PreparedRoventNativeV3<AdaptivePortQuestion>> {
+        if self.prepared.is_some() || self.driver.is_some() {
+            return Err(prepared);
+        }
+        self.prepared = Some(prepared);
+        Ok(())
+    }
+    /// Borrow the same failed-assembly native owner for bounded draining;
+    /// neither access nor a recovery key is a physical-completion proof.
+    pub(crate) fn prepared_service(
+        &mut self,
+    ) -> Option<&mut super::RoventNativeService<AdaptivePortQuestion>> {
+        self.prepared.as_mut().map(|prepared| &mut prepared.service)
+    }
+    pub(crate) fn system_runtime_observation(
+        &self,
+    ) -> Option<super::RoventSystemReadyObservationV3> {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.snapshot().system_runtime.clone())
+    }
+    /// On validation error or unwind the caller's same slots still own the
+    /// original prepared service, NNUEC loaded owner and process boundary.
+    pub(crate) fn assemble(
+        &mut self,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Arc<RoventOwnNnuecProductDriverV3>, SearchSessionFailure> {
+        if self.driver.is_some() {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        let sources = Arc::clone(
+            self.prepared
+                .as_ref()
+                .ok_or_else(SearchSessionFailure::physical_completion_unknown)?
+                .sources(),
+        );
+        let physically_closed = Arc::new(AtomicBool::new(false));
+        let driver = RoventNnuecSessionDriver::new_v3_in_slots(
+            &mut self.prepared,
+            &mut self.loaded,
+            Arc::clone(&self.process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+        .map_err(assembly_completion_unknown)?;
+        let driver = Arc::new(RoventOwnNnuecProductDriverV3 {
+            inner: Arc::new(driver),
+            sources,
+            process: Arc::clone(&self.process),
+            physically_closed,
+        });
+        self.driver = Some(Arc::clone(&driver));
+        Ok(driver)
+    }
+}
+
 impl RoventOwnNnuecProductDriverV3 {
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     pub fn own_nnuec_pcr(
@@ -2455,6 +2815,28 @@ mod v2_own_worker_identity_tests {
             *expected_worker_conditions_sha256 = "00".repeat(32);
         }
         assert!(validate_v2_own_worker_identities(&bad_conditions, [&a, &b]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v3_assembly_failure_tests {
+    use super::*;
+
+    #[test]
+    fn admission_error_does_not_claim_physical_completion_after_native_start() {
+        let preflight = failure("OwnerMismatch", "original reason");
+        assert_eq!(
+            preflight.physical_completion,
+            DriverPhysicalCompletion::Confirmed
+        );
+
+        let started = assembly_completion_unknown(failure("OwnerMismatch", "original reason"));
+        assert_eq!(
+            started.physical_completion,
+            DriverPhysicalCompletion::Unknown
+        );
+        assert_eq!(started.code, "OwnerMismatch");
+        assert_eq!(started.detail, "original reason");
     }
 }
 

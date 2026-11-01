@@ -472,6 +472,7 @@ pub fn run_collection<'a>(
         }),
         None,
         None,
+        None,
     )
 }
 
@@ -495,6 +496,7 @@ pub fn run_collection_with_resource_admission<'a>(
             assemble: Box::new(assemble),
         }),
         Some(Box::new(admit_resource)),
+        None,
         None,
     )
 }
@@ -528,5 +530,6 @@ pub fn run_collection_with_driver<'a>(
         }),
         Some(Box::new(admit_resource)),
         Some(Box::new(run)),
+        None,
     )
 }

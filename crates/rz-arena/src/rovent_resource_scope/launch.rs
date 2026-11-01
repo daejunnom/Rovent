@@ -3,10 +3,10 @@
 //! or any failure. UCI parsing, native tickets and engine assembly stay in UCI.
 use super::*;
 use rz_uci::rovent_bootstrap::launch::{RoventLaunchError, run_with_resource_admission};
-use std::{io::Read, path::PathBuf, sync::Mutex};
+use std::{io::{Read, Write}, path::PathBuf, sync::{Mutex, OnceLock}};
 
 pub const ROVENT_RESOURCE_LAUNCH_PLAN: &str = "rz-rovent-native-resource-launch/1";
-pub const ROVENT_RESOURCE_USAGE: &str = "rz-rovent-native [--resource-system-runtime-v3] --resource-plan=inputs/<plan.json> --resource-plan-sha256=<64 lowercase hex> --resource-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
+pub const ROVENT_RESOURCE_USAGE: &str = "rz-rovent-native [--resource-system-runtime-v3 [--custody-control]] --resource-plan=inputs/<plan.json> --resource-plan-sha256=<64 lowercase hex> --resource-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 const MAX_PLAN_BYTES: u64 = 64 << 10;
 
 /// Configuration only. The actual resource owner separately validates the
@@ -83,6 +83,7 @@ pub enum RoventNativeResourceCli {
     RunSystemV3 {
         pin: RoventNativeResourcePlanPin,
         arguments: Vec<String>,
+        custody_control: bool,
     },
 }
 pub fn parse_native_resource_cli(
@@ -99,11 +100,16 @@ pub fn parse_native_resource_cli(
     }
     let (mut path, mut sha256, mut bytes) = (None, None, None);
     let mut system_v3 = false;
+    let mut custody_control = false;
     let mut original = Vec::new();
     for argument in arguments {
         if argument == "--resource-system-runtime-v3" {
             if std::mem::replace(&mut system_v3, true) {
                 return Err(invalid("duplicate system runtime resource selection"));
+            }
+        } else if argument == "--custody-control" {
+            if std::mem::replace(&mut custody_control, true) {
+                return Err(invalid("duplicate direct custody control selection"));
             }
         } else if let Some(value) = argument.strip_prefix("--resource-plan=") {
             if path.replace(PathBuf::from(value)).is_some() {
@@ -128,10 +134,14 @@ pub fn parse_native_resource_cli(
         bytes: bytes.ok_or_else(|| invalid("resource plan bytes missing"))?,
     };
     pin.validate()?;
+    if custody_control && !system_v3 {
+        return Err(invalid("direct custody control requires explicit V3 selection"));
+    }
     Ok(if system_v3 {
         RoventNativeResourceCli::RunSystemV3 {
             pin,
             arguments: original,
+            custody_control,
         }
     } else {
         RoventNativeResourceCli::Run {
@@ -180,6 +190,7 @@ pub struct RoventNativeSystemResourceRunReceiptV3 {
     pub admission_evidence_error: Option<String>,
     pub finished_evidence_error: Option<String>,
     pub finished_policy_observation_error: Option<String>,
+    pub control_cleanup_error: Option<String>,
     startup: Option<rz_experiments::SystemRuntimeReceiptV6>,
     termination: Option<rz_experiments::SystemRuntimeReceiptV6>,
     system_runtime_evidence_error: Option<String>,
@@ -200,6 +211,7 @@ impl RoventNativeSystemResourceRunReceiptV3 {
             "admission_evidence_error":self.admission_evidence_error,
             "finished_evidence_error":self.finished_evidence_error,
             "finished_policy_observation_error":self.finished_policy_observation_error,
+            "control_cleanup_error":self.control_cleanup_error,
             "system_lock_sha256":self.system_lock_sha256,
             "process_id":self.process_id,"process_generation":self.process_generation,
             "startup_provider_ready":self.startup.as_ref().map(|r|r.provider_ready),
@@ -217,12 +229,108 @@ pub struct RoventNativeResourceRunFailure {
     pub detail: String,
     custody: Option<Arc<Mutex<NativeResourceCustody>>>,
     system_v3: bool,
+    native_failure: Option<rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError>,
+    native_recovery_attempts: Vec<rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery>,
+    control_panic: Option<Box<dyn std::any::Any + Send>>,
+    control_panic_may_be_native: bool,
+    control_scope_marker: Option<Arc<OnceLock<rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey>>>,
+}
+
+/// The actual native/cgroup failure and the exact endpoint created for the
+/// same controlled run. Neither this wrapper nor a client request is a fence.
+pub struct RoventDirectQuarantine {
+    original_failure: RoventNativeResourceRunFailure,
+    original_control: Arc<Mutex<super::direct_control::BoundDirectControl>>,
+}
+
+/// Opt-in direct control keeps pre-control failures distinct from a native
+/// quarantine that necessarily owns the same bound endpoint.
+pub enum RoventControlledRunFailure {
+    BeforeControl(RoventNativeResourceRunFailure),
+    Failed(RoventNativeResourceRunFailure),
+    Quarantined(RoventDirectQuarantine),
+}
+
+enum V3InnerFailure {
+    BeforeControl(RoventNativeResourceRunFailure),
+    Failed(RoventNativeResourceRunFailure),
+    Quarantined(RoventDirectQuarantine),
+}
+
+impl From<RoventNativeResourceRunFailure> for V3InnerFailure {
+    fn from(failure: RoventNativeResourceRunFailure) -> Self { Self::Failed(failure) }
+}
+
+impl RoventDirectQuarantine {
+    /// The process remains a visible, reconnectable foreground owner until a
+    /// separately implemented same-owner completion path can release it.
+    pub fn serve(mut self) -> ! {
+        let key = self.original_failure.original_scope_key().cloned();
+        let cleanup_until = key.as_ref().and_then(|key| key.cleanup_until())
+            .unwrap_or_else(std::time::Instant::now);
+        let _ = writeln!(std::io::stderr().lock(), "{}", self.original_failure.observation());
+        let socket_identity = self.original_control.lock().unwrap_or_else(|error| error.into_inner())
+            .observe_bound_identity();
+        let _ = writeln!(std::io::stderr().lock(), "{}", json!({
+            "schema":"rz-rovent-direct-custody-quarantined/1",
+            "process_id":std::process::id(), "physical_completion":"unknown",
+            "reconnectable":"unknown", "socket_identity_verified":socket_identity.is_ok(),
+            "socket_identity_error":socket_identity.err().map(|error| error.to_string()),
+            "release_authorized":false,
+        }));
+        let mut last_error: Option<String> = None;
+        let mut error_count = 0u64;
+        loop {
+            // The exact owner and listener stay alive even when one client
+            // disconnects or requests malformed data. This is an explicit
+            // registered quarantine, not a new native execution or a fence.
+            let failure = &mut self.original_failure;
+            let mut recover = |until| failure.try_recover_before_native_until(until).map(|result| {
+                use rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery as Recovery;
+                match result {
+                    Recovery::Missing => "missing".into(),
+                    Recovery::Busy => "busy".into(),
+                    Recovery::WrongState => "wrong_state".into(),
+                    Recovery::WrongType => "wrong_type".into(),
+                    Recovery::Pending(error) => format!("pending:{error:?}"),
+                    Recovery::Panic(_) => "panic_payload_retained".into(),
+                    Recovery::LostRegistration => "registration_lost".into(),
+                    Recovery::InvariantViolation { .. } => "invariant_owner_retained".into(),
+                    Recovery::Recovered { .. } => "same_owner_recovered_and_retained".into(),
+                }
+            });
+            let result = self.original_control.lock().unwrap_or_else(|error| error.into_inner())
+                .observe_one(key.as_ref(), cleanup_until, &mut recover);
+            match result {
+                Err(error) => {
+                    let detail = error.to_string();
+                    if last_error.as_deref() == Some(detail.as_str()) {
+                        error_count = error_count.saturating_add(1);
+                    } else {
+                        if let Some(previous) = last_error.replace(detail.clone()) {
+                            let _ = writeln!(std::io::stderr().lock(), "direct custody prior observation error repeated {error_count} time(s): {previous}");
+                        }
+                        error_count = 1;
+                        let _ = writeln!(std::io::stderr().lock(), "direct custody observation failed: {detail}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                Ok(()) => {
+                    if let Some(previous) = last_error.take() {
+                        let _ = writeln!(std::io::stderr().lock(), "direct custody observation resumed after {error_count} error(s): {previous}");
+                    }
+                    error_count = 0;
+                }
+            }
+        }
+    }
 }
 impl std::fmt::Debug for RoventNativeResourceRunFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RoventNativeResourceRunFailure")
             .field("detail", &self.detail)
             .field("original_custody_retained", &self.custody.is_some())
+            .field("native_quarantined", &self.native_quarantined())
             .finish()
     }
 }
@@ -233,14 +341,115 @@ impl std::fmt::Display for RoventNativeResourceRunFailure {
 }
 impl std::error::Error for RoventNativeResourceRunFailure {}
 impl RoventNativeResourceRunFailure {
+    /// Retains the original native failure together with the resource scope.
+    /// Merely inspecting this value is not a physical-completion proof.
+    pub fn native_failure(
+        &self,
+    ) -> Option<&rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError> {
+        self.native_failure.as_ref()
+    }
+
+    /// The caller must keep the entire failure, including its original
+    /// resource owner, for as long as the native scope is quarantined.
+    /// This observation itself does not authorize exit or resource release.
+    pub fn native_quarantined(&self) -> bool {
+        self.control_panic_may_be_native || matches!(
+            self.native_failure.as_ref(),
+            Some(rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError::Quarantined { .. })
+        )
+    }
+
+    /// A panic payload is retained exactly; this boolean is not a fence.
+    pub fn original_control_panic_retained(&self) -> bool { self.control_panic.is_some() }
+
+    /// Exact scope of this attempt, when it was actually reserved. A key is
+    /// an observation capability, never proof of completion or release.
+    pub fn original_scope_key(&self) -> Option<&rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey> {
+        match self.native_failure.as_ref() {
+            Some(rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError::Quarantined { owner, .. }) => Some(owner.scope_key()),
+            _ => self.control_scope_marker.as_ref().and_then(|marker| marker.get()),
+        }
+    }
+
+    /// Move a quarantined run together with its original control. If any
+    /// capability is missing the original failure is returned intact.
+    pub fn into_direct_quarantine(self) -> Result<RoventDirectQuarantine, Self> {
+        if !self.native_quarantined() { return Err(self); }
+        let control = self.custody.as_ref().and_then(|owner| {
+            owner.lock().unwrap_or_else(|error| error.into_inner()).bound_control.clone()
+        });
+        match control {
+            Some(original_control) => Ok(RoventDirectQuarantine { original_failure: self, original_control }),
+            None => Err(self),
+        }
+    }
+
+    /// Original recovery results remain inspectable, including opaque owners.
+    pub fn native_recovery_attempts(
+        &self,
+    ) -> &[rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery] {
+        &self.native_recovery_attempts
+    }
+
+    /// Retry only the original pre-native reservation recovery, using its
+    /// original cleanup deadline. All returned owners, events and failures
+    /// remain in this failure value until its caller deliberately consumes it.
+    /// No result here establishes completion of other native or GPU work.
+    pub fn try_recover_before_native(
+        &mut self,
+    ) -> Option<&rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery> {
+        let until = self.original_scope_key()?.cleanup_until()?;
+        self.try_recover_before_native_until(until)
+    }
+
+    fn try_recover_before_native_until(
+        &mut self,
+        requested_until: std::time::Instant,
+    ) -> Option<&rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery> {
+        use rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError;
+        use rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery as Recovery;
+        // Terminal outcomes may carry original, non-serializable ownership.
+        // Keep the first such result and never overwrite it on re-observation.
+        if let Some(index) = self.native_recovery_attempts.iter().position(|result| matches!(result,
+            Recovery::Recovered { .. } | Recovery::Panic(_) | Recovery::InvariantViolation { .. } | Recovery::LostRegistration)) {
+            return self.native_recovery_attempts.get(index);
+        }
+        let Some(RoventRetainingLaunchError::Quarantined { owner, .. }) = self.native_failure.as_ref() else {
+            return None;
+        };
+        // The original scope validates its typed before-native state itself;
+        // an error string is not a recovery authority.
+        let deadline = owner.cleanup_until().min(requested_until);
+        if std::time::Instant::now() >= deadline { return None; }
+        let result = owner.scope_key().recover_before_native(deadline);
+        // Non-owning typed observations have a finite domain. Coalesce only
+        // exact repetitions so repeated requests cannot grow this owner
+        // without bound; payload-bearing results are never coalesced.
+        if let Some(index) = self.native_recovery_attempts.iter().position(|previous| match (previous, &result) {
+            (Recovery::Missing, Recovery::Missing) | (Recovery::Busy, Recovery::Busy)
+            | (Recovery::WrongState, Recovery::WrongState) | (Recovery::WrongType, Recovery::WrongType) => true,
+            (Recovery::Pending(a), Recovery::Pending(b)) => a == b,
+            _ => false,
+        }) {
+            return self.native_recovery_attempts.get(index);
+        }
+        self.native_recovery_attempts.push(result);
+        self.native_recovery_attempts.last()
+    }
+
     pub fn observation(&self) -> Value {
-        let held = self
-            .custody
-            .as_ref()
-            .and_then(|custody| custody.lock().ok());
+        let mut resource_state_poisoned = false;
+        let held = self.custody.as_ref().map(|custody| match custody.lock() {
+            Ok(owner) => owner,
+            Err(error) => {
+                resource_state_poisoned = true;
+                error.into_inner()
+            }
+        });
         if self.system_v3 {
             return json!({"schema":"rz-rovent-native-system-resource-run-failure/3","error":self.detail,
                 "original_custody_retained":self.custody.is_some(),
+                "resource_state_poisoned":resource_state_poisoned,
                 "evidence_directory":held.as_ref().map(|state|&state.plan.evidence_directory),
                 "resource_failure":held.as_ref().and_then(|state|state.failure_v3.as_ref().map(|failure|failure.observation())),
                 "admission":held.as_ref().and_then(|state|state.admission.as_ref()),
@@ -248,10 +457,18 @@ impl RoventNativeResourceRunFailure {
                 "finished_live":held.as_ref().and_then(|state|state.finished_live.as_ref()),
                 "finished_evidence_error":held.as_ref().and_then(|state|state.finished_evidence_error.as_ref()),
                 "finished_policy_observation_error":held.as_ref().and_then(|state|state.finished_live_error.as_ref()),
+                "control_cleanup_error":held.as_ref().and_then(|state|state.control_cleanup_error.as_ref()),
+                "session_evidence":self.original_scope_key().map(|key| match key.terminal_evidence() {
+                    rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative => "before_native",
+                    rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::SessionReleased => "session_released",
+                    rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::Unknown => "unknown",
+                }).unwrap_or("scope_unavailable"),
+                "control_panic_payload_retained":self.original_control_panic_retained(),
                 "automatic_cleanup":false,"training_executed":false});
         }
         json!({"schema":"rz-rovent-native-resource-run-failure/1","error":self.detail,
             "original_custody_retained":self.custody.is_some(),
+            "resource_state_poisoned":resource_state_poisoned,
             "evidence_directory":held.as_ref().map(|state|&state.plan.evidence_directory),
             "resource_failure":held.as_ref().and_then(|state|state.failure.as_ref().map(|failure|failure.observation())),
             "admission":held.as_ref().and_then(|state|state.admission.as_ref()),
@@ -267,6 +484,9 @@ pub(crate) struct NativeResourceCustody {
     pin: RoventNativeResourcePlanPin,
     // Hold the exact plan source and output directory through every return.
     _plan_file: File,
+    control: Option<Arc<Mutex<super::direct_control::DirectControl>>>,
+    bound_control: Option<Arc<Mutex<super::direct_control::BoundDirectControl>>>,
+    control_cleanup_error: Option<String>,
     directory: Dir,
     delegated: Option<File>,
     scope: Option<RoventNativeResourceScope>,
@@ -796,6 +1016,11 @@ pub fn run_native_with_resources(
         detail: error.to_string(),
         custody: None,
         system_v3: false,
+        native_failure: None,
+        native_recovery_attempts: Vec::new(),
+        control_panic: None,
+        control_panic_may_be_native: false,
+        control_scope_marker: None,
     })?;
     let custody = Arc::new(Mutex::new(state));
     let callback = Arc::clone(&custody);
@@ -820,6 +1045,11 @@ pub fn run_native_with_resources(
         detail,
         custody: Some(Arc::clone(&custody)),
         system_v3: false,
+        native_failure: None,
+        native_recovery_attempts: Vec::new(),
+        control_panic: None,
+        control_panic_may_be_native: false,
+        control_scope_marker: None,
     };
     if let Err(error) = result {
         let detail = match &finish {
@@ -856,8 +1086,32 @@ pub fn run_native_with_resources(
 /// supervisor must still observe process exit and any independent GPU fence.
 pub fn run_native_with_resources_v3(
     pin: RoventNativeResourcePlanPin,
-    mut arguments: Vec<String>,
+    arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventNativeResourceRunFailure> {
+    run_native_with_resources_v3_inner(pin, arguments, false).map_err(|error| match error {
+        V3InnerFailure::BeforeControl(failure) | V3InnerFailure::Failed(failure) => failure,
+        V3InnerFailure::Quarantined(quarantine) => quarantine.original_failure,
+    })
+}
+
+/// Explicit opt-in for a reconnectable owner endpoint prepared before native
+/// entry. This does not change the legacy V3 or CPU resource requirements.
+pub fn run_native_with_resources_v3_control(
+    pin: RoventNativeResourcePlanPin,
+    arguments: Vec<String>,
+) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
+    run_native_with_resources_v3_inner(pin, arguments, true).map_err(|error| match error {
+        V3InnerFailure::BeforeControl(failure) => RoventControlledRunFailure::BeforeControl(failure),
+        V3InnerFailure::Failed(failure) => RoventControlledRunFailure::Failed(failure),
+        V3InnerFailure::Quarantined(quarantine) => RoventControlledRunFailure::Quarantined(quarantine),
+    })
+}
+
+fn run_native_with_resources_v3_inner(
+    pin: RoventNativeResourcePlanPin,
+    mut arguments: Vec<String>,
+    custody_control: bool,
+) -> Result<RoventNativeSystemResourceRunReceiptV3, V3InnerFailure> {
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
         let root = Dir::open_ambient_dir(
@@ -871,6 +1125,11 @@ pub fn run_native_with_resources_v3(
         detail: error.to_string(),
         custody: None,
         system_v3: true,
+        native_failure: None,
+        native_recovery_attempts: Vec::new(),
+        control_panic: None,
+        control_panic_may_be_native: false,
+        control_scope_marker: None,
     })?;
     state.system_v3 = true;
     let custody = Arc::new(Mutex::new(state));
@@ -878,6 +1137,11 @@ pub fn run_native_with_resources_v3(
         detail,
         custody: Some(Arc::clone(&custody)),
         system_v3: true,
+        native_failure: None,
+        native_recovery_attempts: Vec::new(),
+        control_panic: None,
+        control_panic_may_be_native: false,
+        control_scope_marker: None,
     };
     let epoch = {
         let state = custody
@@ -887,8 +1151,79 @@ pub fn run_native_with_resources_v3(
             .map_err(|error| failure(error.to_string()))?
     };
     let callback = Arc::clone(&custody);
-    let result =
-        rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission(arguments, move |lock| {
+    let control_slot: Arc<OnceLock<Arc<Mutex<super::direct_control::BoundDirectControl>>>> = Arc::new(OnceLock::new());
+    let mut control_panic = None;
+    let mut control_panic_may_be_native = false;
+    let mut control_scope_marker = None;
+    let mut before_control = false;
+    let mut controlled_bound = None;
+    let result = if custody_control {
+        use rz_uci::rovent_bootstrap::launch::{BeforeControlV3Outcome, ControlledV3Outcome, ControlledV3Result, RoventRetainingLaunchError};
+        let controlled = rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_control_slot(arguments, Arc::clone(&control_slot), move |lock, _root, _file, _startup_until, cleanup_until, directory, path, slot| {
+            let mut state = callback.lock().map_err(|_| RoventLaunchError {
+                stage: "ResourceAdmission", detail: "original resource owner poisoned".into(),
+            })?;
+            state.admit_v3(lock).map_err(|error| RoventLaunchError {
+                stage: "ResourceAdmission", detail: error.to_string(),
+            })?;
+            let directory = directory.ok_or_else(|| RoventLaunchError {
+                stage: "ControlAdmission", detail: "original writer directory unavailable".into(),
+            })?;
+            let path = path.ok_or_else(|| RoventLaunchError {
+                stage: "ControlAdmission", detail: "original writer route unavailable".into(),
+            })?;
+            let control = Arc::new(Mutex::new(super::direct_control::DirectControl::prepare(directory, path, cleanup_until, std::time::Duration::from_millis(lock.manifest.cleanup_max_ms))
+                .map_err(|error| RoventLaunchError { stage: "ControlAdmission", detail: error.to_string() })?));
+            // Retain the shell before bind, including on a bind failure/panic.
+            state.control = Some(Arc::clone(&control));
+            let mut shell = control.lock().unwrap_or_else(|error| error.into_inner());
+            shell.bind().map_err(|error| RoventLaunchError {
+                    stage: "ControlAdmission", detail: error.to_string(),
+                })?;
+            let control_path = shell.path();
+            let _ = writeln!(std::io::stderr().lock(), "{}", json!({"schema":"rz-rovent-direct-custody-startup/1",
+                "process_id":std::process::id(),"control_path":control_path,
+                "physical_completion":"unknown_until_original_owner_confirms"}));
+            drop(shell);
+            let bound = super::direct_control::BoundDirectControl::from_bound(control)
+                .map_err(|_original| RoventLaunchError { stage: "ControlAdmission", detail: "original listener not bound".into() })?;
+            let bound = Arc::new(Mutex::new(bound));
+            slot.set(Arc::clone(&bound)).map_err(|_original| RoventLaunchError {
+                stage: "ControlAdmission", detail: "original control slot already installed".into(),
+            })?;
+            state.bound_control = Some(bound);
+            Ok(())
+        });
+        let outcome = match controlled {
+            ControlledV3Result::BeforeControl { outcome } => {
+                before_control = true;
+                match outcome {
+                    BeforeControlV3Outcome::Error(error) => ControlledV3Outcome::Returned(Err(RoventRetainingLaunchError::Ordinary(error))),
+                    BeforeControlV3Outcome::Panic(payload) => ControlledV3Outcome::Panic(payload),
+                }
+            },
+            ControlledV3Result::Controlled { original_control, scope_marker, outcome } => {
+                // Restore this exact Arc even when the callback unwound after
+                // installing it but before updating the resource state.
+                custody.lock().unwrap_or_else(|error| error.into_inner()).bound_control = Some(Arc::clone(&original_control));
+                controlled_bound = Some(original_control);
+                control_panic_may_be_native = matches!(&outcome, ControlledV3Outcome::Panic(_)) && scope_marker.get().is_some();
+                control_scope_marker = Some(scope_marker);
+                outcome
+            }
+        };
+        match outcome {
+            ControlledV3Outcome::Returned(result) => result,
+            ControlledV3Outcome::Panic(payload) => {
+                control_panic = Some(payload);
+                Err(RoventRetainingLaunchError::Ordinary(RoventLaunchError {
+                    stage: "ControlPanic",
+                    detail: "original control panic payload retained".into(),
+                }))
+            }
+        }
+    } else {
+        rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining(arguments, move |lock, _original_root, _original_lock_file, _original_deadline| {
             callback
                 .lock()
                 .map_err(|_| RoventLaunchError {
@@ -900,21 +1235,87 @@ pub fn run_native_with_resources_v3(
                     stage: "ResourceAdmission",
                     detail: error.to_string(),
                 })
-        });
-    let finish = custody
-        .lock()
-        .map_err(|_| invalid("original resource owner poisoned"))
-        .and_then(|mut state| state.finish_live());
-    if let Err(error) = result {
+        })
+    };
+    // A quarantined native owner may still be doing work.  Keep its resource
+    // owner and do not publish an observation as a finished-run readback.
+    let native_quarantined = control_panic_may_be_native || matches!(
+        &result,
+        Err(rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError::Quarantined { .. })
+    );
+    // This proves only the original session finished. Use it for the endpoint
+    // cleanup window after a returned call, never to release quarantine or to
+    // claim a product-wide/device-wide completion fence.
+    let session_released = control_scope_marker.as_ref().and_then(|marker| marker.get())
+        .is_some_and(|key| matches!(key.terminal_evidence(), rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::SessionReleased));
+    if !native_quarantined && custody_control {
+        let mut state = match custody.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                let mut state = error.into_inner();
+                state.control_cleanup_error = Some("original resource state was poisoned".into());
+                state
+            }
+        };
+        if let Some(control) = state.control.as_ref() {
+            let mut control = control.lock().unwrap_or_else(|error| error.into_inner());
+            let result = if session_released && control_panic.is_none() {
+                control.cleanup_after_session()
+            } else {
+                control.cleanup_confirmed()
+            };
+            drop(control);
+            if let Err(error) = result {
+                let previous = state.control_cleanup_error.take();
+                state.control_cleanup_error = Some(match previous {
+                    Some(previous) => format!("{previous}; {error}"),
+                    None => error.to_string(),
+                });
+            }
+        }
+    }
+    let finish = if native_quarantined || control_panic.is_some() {
+        None
+    } else {
+        Some(custody
+            .lock()
+            .map_err(|_| invalid("original resource owner poisoned"))
+            .and_then(|mut state| state.finish_live()))
+    };
+    if let Err(native_error) = result {
+        use rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError;
+        let error = match &native_error {
+            RoventRetainingLaunchError::Ordinary(error)
+            | RoventRetainingLaunchError::Unstarted { error, .. }
+            | RoventRetainingLaunchError::Settled { error, .. }
+            | RoventRetainingLaunchError::Quarantined { error, .. } => error,
+        };
         let detail = match &finish {
-            Ok(()) => error.to_string(),
-            Err(resource_error) => {
+            None | Some(Ok(())) => error.to_string(),
+            Some(Err(resource_error)) => {
                 format!("{error}; resource observation also failed: {resource_error}")
             }
         };
-        return Err(failure(detail));
+        let mut retained = failure(detail);
+        retained.native_failure = Some(native_error);
+        retained.control_panic = control_panic;
+        retained.control_panic_may_be_native = control_panic_may_be_native;
+        retained.control_scope_marker = control_scope_marker;
+        if native_quarantined {
+            if let Some(original_control) = controlled_bound {
+                return Err(V3InnerFailure::Quarantined(RoventDirectQuarantine {
+                    original_failure: retained, original_control,
+                }));
+            }
+        }
+        return Err(if before_control {
+            V3InnerFailure::BeforeControl(retained)
+        } else {
+            V3InnerFailure::Failed(retained)
+        });
     }
-    finish.map_err(|error| failure(error.to_string()))?;
+    finish.expect("successful native execution is not quarantined")
+        .map_err(|error| failure(error.to_string()))?;
     let state = custody
         .lock()
         .map_err(|_| failure("original resource owner poisoned".into()))?;
@@ -938,6 +1339,7 @@ pub fn run_native_with_resources_v3(
     let admission_evidence_error = state.admission_evidence_error.clone();
     let finished_evidence_error = state.finished_evidence_error.clone();
     let finished_policy_observation_error = state.finished_live_error.clone();
+    let control_cleanup_error = state.control_cleanup_error.clone();
     drop(state);
     Ok(RoventNativeSystemResourceRunReceiptV3 {
         admission,
@@ -945,6 +1347,7 @@ pub fn run_native_with_resources_v3(
         admission_evidence_error,
         finished_evidence_error,
         finished_policy_observation_error,
+        control_cleanup_error,
         startup,
         termination,
         system_runtime_evidence_error,
@@ -986,6 +1389,9 @@ pub(crate) fn prepare_resource_custody(
         plan,
         pin,
         _plan_file: plan_file.into_std(),
+        control: None,
+        bound_control: None,
+        control_cleanup_error: None,
         directory,
         delegated: Some(delegated),
         scope: None,
@@ -1159,6 +1565,25 @@ mod tests {
         let mut duplicate_selection = original;
         duplicate_selection.push("--resource-system-runtime-v3".into());
         assert!(parse_native_resource_cli(duplicate_selection).is_err());
+    }
+
+    #[test]
+    fn custody_control_is_explicit_v3_only() {
+        let args = vec!["--resource-system-runtime-v3".to_owned(),
+            "--custody-control".to_owned(),
+            "--resource-plan=inputs/resources.json".to_owned(),
+            format!("--resource-plan-sha256={}", "a".repeat(64)),
+            "--resource-plan-bytes=42".to_owned()];
+        let RoventNativeResourceCli::RunSystemV3 { custody_control, arguments, .. } =
+            parse_native_resource_cli(args.clone()).unwrap()
+        else { panic!("V3 selection expected") };
+        assert!(custody_control);
+        assert!(!arguments.iter().any(|value| value == "--custody-control"));
+        let mut duplicate = args.clone();
+        duplicate.push("--custody-control".to_owned());
+        assert!(parse_native_resource_cli(duplicate).is_err());
+        let ordinary = args.into_iter().filter(|value| value != "--resource-system-runtime-v3").collect();
+        assert!(parse_native_resource_cli(ordinary).is_err());
     }
 
     #[test]

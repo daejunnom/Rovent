@@ -14,7 +14,8 @@ use crate::pals_adaptive::{
     RoventExternalSessionAdmissionRejectionV2, RoventExternalSessionAdmissionRejectionV3,
     RoventExternalSessionSource, RoventExternalSessionSources, RoventExternalSessionSourcesV2,
     RoventExternalSessionSourcesV3, RoventExternalSourcePreparationRejection,
-    RoventPcrSessionProfile, RoventPcrSessionProfileV3,
+    RoventExternalV3AdmissionCustody, RoventExternalV3StartObservation, RoventPcrSessionProfile,
+    RoventPcrSessionProfileV3,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::{PalsCheckerRegistration, SearchSessionFailure};
@@ -663,6 +664,187 @@ pub struct RoventExternalProductStartupRejectionV3 {
     pub owners: RoventExternalProductStartupOwnersV3,
     pub sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
     pub retirement_sink: Option<RegisteredProfiledRetirementSink>,
+}
+
+/// Caller-owned /3 assembly, registered before native startup. Each stage
+/// retains the actual owner rather than a path or reconstructed descriptor.
+pub(crate) struct RoventExternalSessionCustodyV3 {
+    prepared: Option<PreparedRoventNativeV3<AdaptivePortQuestion>>,
+    external_pinned: Option<RoventPinnedExternalRSource<RoventInputLockV3>>,
+    external_ready: Option<RoventExternalSessionSource<RoventInputLockV3>>,
+    retirement_sink: Option<RegisteredProfiledRetirementSink>,
+    common: Option<AdaptiveSessionSources<RoventNativeBackend<AdaptivePortQuestion>>>,
+    admission: Option<RoventExternalV3AdmissionCustody<RoventNativeBackend<AdaptivePortQuestion>>>,
+    recovery_key: Option<crate::pals_native::ticketed::TicketNativeRecoveryKey>,
+}
+impl RoventExternalSessionCustodyV3 {
+    pub(crate) fn new(
+        external: RoventPinnedExternalRSource<RoventInputLockV3>,
+        sink: RegisteredProfiledRetirementSink,
+    ) -> Self {
+        Self {
+            prepared: None,
+            external_pinned: Some(external),
+            external_ready: None,
+            retirement_sink: Some(sink),
+            common: None,
+            admission: None,
+            recovery_key: None,
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_prepared(
+        &mut self,
+        prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+    ) -> Result<(), PreparedRoventNativeV3<AdaptivePortQuestion>> {
+        if self.prepared.is_some() || self.admission.is_some() {
+            return Err(prepared);
+        }
+        self.prepared = Some(prepared);
+        self.recovery_key = self
+            .prepared
+            .as_ref()
+            .and_then(|owner| owner.service.recovery_key());
+        Ok(())
+    }
+    pub(crate) fn recovery_key(
+        &self,
+    ) -> Option<crate::pals_native::ticketed::TicketNativeRecoveryKey> {
+        self.recovery_key.clone()
+    }
+    /// Only the original retained source may establish that its external
+    /// process was never started. This does not establish native completion.
+    pub(crate) fn external_start_observation(&self) -> RoventExternalV3StartObservation {
+        match (&self.external_pinned, &self.external_ready, &self.admission) {
+            (Some(_), None, None) => RoventExternalV3StartObservation::NeverStarted,
+            (None, Some(source), None) => source.start_observation_v3(),
+            (None, None, Some(admission)) => admission.external_start_observation(),
+            _ => RoventExternalV3StartObservation::Unknown,
+        }
+    }
+    pub(crate) fn prepared_service(
+        &mut self,
+    ) -> Option<&mut super::RoventNativeService<AdaptivePortQuestion>> {
+        if let Some(prepared) = &mut self.prepared {
+            return Some(&mut prepared.service);
+        }
+        if let Some(common) = &mut self.common {
+            return Some(&mut common.native);
+        }
+        self.admission
+            .as_mut()
+            .and_then(|admission| admission.native_service())
+    }
+    pub(crate) fn driver(&self) -> Option<&RoventExternalProductSession> {
+        self.admission
+            .as_ref()
+            .and_then(|admission| admission.driver())
+    }
+    pub(crate) fn take_driver(&mut self) -> Option<RoventExternalProductSession> {
+        self.admission
+            .as_mut()
+            .and_then(|admission| admission.take_driver())
+    }
+    /// All validation and profile construction borrow the original slots.
+    /// A panic leaves these stages in this same caller-owned custody object.
+    pub(crate) fn assemble(
+        &mut self,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<(), SearchSessionFailure> {
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| failure("RoventExternalV3Custody", "original native owner absent"))?;
+        let external = self
+            .external_pinned
+            .as_ref()
+            .ok_or_else(|| failure("RoventExternalV3Custody", "original external owner absent"))?;
+        let pins = Arc::clone(prepared.sources());
+        if !Arc::ptr_eq(external.original_sources(), &pins)
+            || external.input_lock_digest() != prepared.snapshot().input_lock
+            || external.source_purpose() != rz_experiments::RoventExternalPurpose::ResearchChecker
+            || !prepared.snapshot().mode.has_native_r()
+            || prepared.snapshot().process_epoch != clock.epoch().0
+            || !matches!(
+                pins.configuration().fields().execution,
+                ExecutionConfiguration::ExternalResearcher { .. }
+            )
+            || !matches!(
+                pins.lock().manifest.purpose,
+                rz_experiments::RoventPurpose::Validation
+                    | rz_experiments::RoventPurpose::Deployment
+            )
+            || pins.collection_preload_sources().is_some()
+        {
+            return Err(failure(
+                "RoventExternalProductSourcesV3",
+                "original /3 native and external sources or purpose differ",
+            ));
+        }
+        let ready = prepared
+            .service
+            .ready_clock()
+            .ok_or_else(|| failure("RoventExternalReadyV3", "native Ready clock is absent"))?;
+        let expected = clock.runtime_clock();
+        if prepared.service.is_quarantined()
+            || prepared.service.native_acceptance_verifier().is_none()
+            || ready.domain() != expected.domain()
+            || ready.origin() != expected.origin()
+        {
+            return Err(failure(
+                "RoventExternalReadyV3",
+                "native physical owner or clock differs",
+            ));
+        }
+        RoventExternalSessionSource::from_pinned_in_slots(
+            &mut self.external_pinned,
+            &mut self.external_ready,
+        )
+        .map_err(|error| SearchSessionFailure::debug("RoventExternalDeclarationV3", &error))?;
+        let external = self
+            .external_ready
+            .as_ref()
+            .expect("original external ready slot");
+        let (engine, metadata, registration, options, limits, profile) =
+            build_external_profile!(v3, &pins, prepared, external, identity, ())?;
+        self.admission = Some(RoventExternalV3AdmissionCustody::default());
+        let (native, _, _) = self
+            .prepared
+            .take()
+            .expect("original prepared owner")
+            .into_parts();
+        self.common = Some(AdaptiveSessionSources {
+            native,
+            engine,
+            cpu: Vec::new(),
+            external: None,
+            checker_metadata: metadata,
+        });
+        let admission = self
+            .admission
+            .as_mut()
+            .expect("admission custody installed");
+        admission.install_in_slots(
+            &mut self.common,
+            &mut self.external_ready,
+            &mut self.retirement_sink,
+        )?;
+        let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
+        AdaptiveSessionDriver::admit_rovent_external_v3_in_custody(
+            admission,
+            options,
+            limits,
+            clock,
+            issuer,
+            registration,
+            profile,
+            Arc::clone(pins.lock_owner()),
+            root_policy,
+        )
+    }
 }
 
 /// Assemble an external researcher from the same original /3 native source.

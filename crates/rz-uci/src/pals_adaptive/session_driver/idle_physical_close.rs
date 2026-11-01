@@ -35,11 +35,39 @@ where
                     TicketNativeEvent::Finished {
                         physical_shutdown_confirmed,
                     } => {
+                        if owners.native_finished.is_some() {
+                            return Err(SearchSessionFailure::physical_completion_unknown());
+                        }
                         owners.native_finished = Some(physical_shutdown_confirmed);
+                        owners.native_finish_snapshot = owners.native.finish_report_snapshot();
+                        owners.native_finish_report = owners.native.take_finish_report();
                     }
                     TicketNativeEvent::Ready { .. } | TicketNativeEvent::RootQuiesced(_) => {}
                     _ => return Err(SearchSessionFailure::physical_completion_unknown()),
                 }
+            }
+            // A process-closed manager may have consumed Finished before it
+            // transferred this service to IdleOwners. The sticky snapshot is
+            // still the same producer observation, never a new completion.
+            if owners.native_finished.is_some() && owners.native_finish_snapshot.is_none() {
+                owners.native_finish_snapshot = owners.native.finish_report_snapshot();
+            }
+            let requires = owners.native.requires_finish_report();
+            let snapshot = owners.native_finish_snapshot.as_ref();
+            let transferred = owners.native_finish_report.as_ref();
+            let mismatch = owners.native_finished.is_some() && (
+                (requires && snapshot.is_none())
+                || (snapshot.is_none() && transferred.is_some())
+                || (!requires && snapshot.is_some())
+                || snapshot.zip(transferred).is_some_and(|(s, t)| s != t)
+                || snapshot.is_some_and(|report|
+                    owners.native_finished != Some(report.physical_shutdown_confirmed))
+            );
+            if mismatch {
+                return Err(SearchSessionFailure::debug(
+                    "NativeShutdownMismatch",
+                    &(owners.native_finished, snapshot, transferred),
+                ).unknown_if_unclosed());
             }
             if !owners.native_joined {
                 owners.native_joined = owners
@@ -96,10 +124,20 @@ where
                         receipt.cleanup_complete && !receipt.quarantined && !receipt.ownership_lost
                     }));
             if owners.native_joined && owners.native_finished == Some(true) && external_complete {
+                if let Some(report) = &owners.native_finish_snapshot {
+                    if report.physical_failure.is_some() || report.semantic_failure.is_some() {
+                        return Err(SearchSessionFailure::debug("NativeShutdown", report));
+                    }
+                }
                 return Ok(());
             }
             if Instant::now() >= until || owners.native_finished == Some(false) {
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(match &owners.native_finish_snapshot {
+                    Some(report) if report.physical_failure.is_some() || report.semantic_failure.is_some() => {
+                        SearchSessionFailure::debug("NativeShutdown", report).unknown_if_unclosed()
+                    }
+                    _ => SearchSessionFailure::physical_completion_unknown(),
+                });
             }
             owners
                 .native

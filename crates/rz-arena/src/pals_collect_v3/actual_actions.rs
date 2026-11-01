@@ -531,6 +531,7 @@ impl ActualGenerationActionOutcomeFactoryV3 {
                 .map_err(|error| AdaptiveBootstrapError {
                     stage: "ActionTeacherAdmission",
                     detail: error.to_string(),
+                    cleanup_failures: None,
                 })
         });
         let teacher_observer = capture.teacher_observers()[0].observer();

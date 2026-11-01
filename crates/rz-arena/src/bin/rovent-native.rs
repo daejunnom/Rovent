@@ -4,6 +4,7 @@ fn main() -> std::process::ExitCode {
     use rz_arena::rovent_resource_scope::launch::{
         ROVENT_RESOURCE_USAGE, RoventNativeResourceCli, parse_native_resource_cli,
         run_native_with_resources, run_native_with_resources_v3,
+        run_native_with_resources_v3_control, RoventControlledRunFailure,
     };
     use std::io::Write;
     let result = match parse_native_resource_cli(std::env::args().skip(1).collect()) {
@@ -31,13 +32,26 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
-        Ok(RoventNativeResourceCli::RunSystemV3 { pin, arguments }) => {
-            match run_native_with_resources_v3(pin, arguments) {
-                Ok(receipt) => writeln!(std::io::stderr().lock(), "{}", receipt.observation())
-                    .map_err(|error| error.to_string()),
-                Err(failure) => {
-                    let _ = writeln!(std::io::stderr().lock(), "{}", failure.observation());
-                    Err(failure.to_string())
+        Ok(RoventNativeResourceCli::RunSystemV3 { pin, arguments, custody_control }) => {
+            if custody_control {
+                match run_native_with_resources_v3_control(pin, arguments) {
+                    Ok(receipt) => writeln!(std::io::stderr().lock(), "{}", receipt.observation())
+                        .map_err(|error| error.to_string()),
+                    Err(RoventControlledRunFailure::Quarantined(owner)) => owner.serve(),
+                    Err(RoventControlledRunFailure::BeforeControl(failure))
+                    | Err(RoventControlledRunFailure::Failed(failure)) => {
+                        let _ = writeln!(std::io::stderr().lock(), "{}", failure.observation());
+                        Err(failure.to_string())
+                    }
+                }
+            } else {
+                match run_native_with_resources_v3(pin, arguments) {
+                    Ok(receipt) => writeln!(std::io::stderr().lock(), "{}", receipt.observation())
+                        .map_err(|error| error.to_string()),
+                    Err(failure) => {
+                        let _ = writeln!(std::io::stderr().lock(), "{}", failure.observation());
+                        Err(failure.to_string())
+                    }
                 }
             }
         }

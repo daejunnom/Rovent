@@ -1052,7 +1052,71 @@ struct NativeOwner {
     service: RoventNativeService<AdaptivePortQuestion>,
     finished: Option<bool>,
     joined: bool,
+    failures: NativeTerminalFailures,
     unexpected: Vec<TicketNativeEvent<VirtualReviewTicketOutput>>,
+}
+#[derive(Default)]
+struct NativeTerminalFailures {
+    physical: Vec<rz_search::pals::coordinator::RoleFailure>,
+    semantic: Vec<rz_search::pals::coordinator::RoleFailure>,
+    reports: Vec<crate::pals_native::ticketed::TicketNativeFinishReport>,
+}
+impl NativeTerminalFailures {
+    fn failure(&self, physical_confirmed: bool) -> Option<SearchSessionFailure> {
+        if self.physical.is_empty() && self.semantic.is_empty() {
+            return None;
+        }
+        let mut error = SearchSessionFailure::debug(
+            "RoventNnuecNativeShutdownFailure",
+            &(&self.physical, &self.semantic),
+        );
+        error.physical_completion = if physical_confirmed {
+            DriverPhysicalCompletion::Confirmed
+        } else {
+            DriverPhysicalCompletion::Unknown
+        };
+        Some(error)
+    }
+}
+#[cfg(test)]
+mod native_terminal_failure_tests {
+    use super::*;
+    use rz_search::pals::coordinator::RoleFailure;
+
+    #[test]
+    fn physical_and_semantic_causes_survive_independent_completion_observation() {
+        let failures = NativeTerminalFailures {
+            physical: vec![RoleFailure::Backend("physical cause".into())],
+            semantic: vec![RoleFailure::Backend("semantic cause".into())],
+            reports: Vec::new(),
+        };
+        let unknown = failures.failure(false).unwrap();
+        assert_eq!(
+            unknown.physical_completion,
+            DriverPhysicalCompletion::Unknown
+        );
+        let complete = failures.failure(true).unwrap();
+        assert_eq!(
+            complete.physical_completion,
+            DriverPhysicalCompletion::Confirmed
+        );
+        assert!(complete.detail.contains("physical cause"));
+        assert!(complete.detail.contains("semantic cause"));
+        assert_eq!(failures.physical.len(), 1);
+        assert_eq!(failures.semantic.len(), 1);
+
+        let semantic_only = NativeTerminalFailures {
+            physical: Vec::new(),
+            semantic: vec![RoleFailure::Backend("semantic only".into())],
+            reports: Vec::new(),
+        };
+        let complete = semantic_only.failure(true).unwrap();
+        assert_eq!(
+            complete.physical_completion,
+            DriverPhysicalCompletion::Confirmed
+        );
+        assert!(complete.detail.contains("semantic only"));
+    }
 }
 impl NativeOwner {
     fn new(service: RoventNativeService<AdaptivePortQuestion>) -> Self {
@@ -1060,8 +1124,21 @@ impl NativeOwner {
             service,
             finished: None,
             joined: false,
+            failures: NativeTerminalFailures::default(),
             unexpected: Vec::new(),
         }
+    }
+    fn terminal_failure(&self) -> Option<SearchSessionFailure> {
+        self.failures
+            .failure(self.joined && self.finished == Some(true))
+            .or_else(|| {
+                (!self.unexpected.is_empty()).then(|| {
+                    failure(
+                        "RoventNnuecNativeProtocol",
+                        "unexpected native terminal retained",
+                    )
+                })
+            })
     }
     fn finish(&mut self, until: Instant) -> Result<(), SearchSessionFailure> {
         self.service.begin_shutdown(until);
@@ -1074,28 +1151,65 @@ impl NativeOwner {
                         physical_shutdown_confirmed,
                     } => {
                         self.finished =
-                            Some(self.finished.unwrap_or(true) && physical_shutdown_confirmed)
+                            Some(self.finished.unwrap_or(true) && physical_shutdown_confirmed);
+                        let snapshot = self.service.finish_report_snapshot();
+                        let missing = self.service.requires_finish_report() && snapshot.is_none();
+                        let original = self.service.take_finish_report();
+                        let inconsistent = matches!((&snapshot, &original),
+                            (Some(snapshot), Some(original)) if snapshot != original);
+                        if missing || inconsistent {
+                            self.finished = Some(false);
+                            self.failures.physical.push(
+                                rz_search::pals::coordinator::RoleFailure::Backend(
+                                    if missing {
+                                        "recoverable native finish report is missing"
+                                    } else {
+                                        "native finish report and snapshot disagree"
+                                    }
+                                    .into(),
+                                ),
+                            );
+                        }
+                        let mut reports =
+                            [original, if inconsistent { snapshot.clone() } else { None }];
+                        if reports[0].is_none() {
+                            reports[0] = snapshot;
+                        }
+                        for report in reports.into_iter().flatten() {
+                            if report.physical_shutdown_confirmed != physical_shutdown_confirmed {
+                                self.finished = Some(false);
+                                self.failures.physical.push(
+                                    rz_search::pals::coordinator::RoleFailure::Backend(
+                                        "native finish event and original report disagree".into(),
+                                    ),
+                                );
+                            }
+                            self.failures
+                                .physical
+                                .extend(report.physical_failure.clone());
+                            self.failures
+                                .semantic
+                                .extend(report.semantic_failure.clone());
+                            self.failures.reports.push(report);
+                        }
                     }
                     TicketNativeEvent::Ready { .. } | TicketNativeEvent::RootQuiesced(_) => {}
                     other => self.unexpected.push(other),
                 }
             }
-            self.joined = self
-                .service
-                .try_join()
-                .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+            self.joined = self.service.try_join().map_err(|_| {
+                self.failures
+                    .failure(false)
+                    .unwrap_or_else(SearchSessionFailure::physical_completion_unknown)
+            })?;
             if self.joined && self.finished == Some(true) {
-                return if self.unexpected.is_empty() {
-                    Ok(())
-                } else {
-                    Err(unknown(
-                        "RoventNnuecNativeProtocol",
-                        "unexpected native terminal retained",
-                    ))
-                };
+                return Ok(());
             }
             if Instant::now() >= until || self.finished == Some(false) {
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(self
+                    .failures
+                    .failure(false)
+                    .unwrap_or_else(SearchSessionFailure::physical_completion_unknown));
             }
             signal.wait_changed(
                 observed,
@@ -1120,7 +1234,9 @@ enum State {
     Retained {
         _owners: Box<dyn Any + Send>,
     },
-    Closed,
+    Closed {
+        native: NativeOwner,
+    },
     Moving,
 }
 
@@ -1907,187 +2023,224 @@ impl RoventNnuecSessionDriver {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventNnuecSessionV3Rejection> {
-        let built = (|| -> Result<_, SearchSessionFailure> {
-            let sources = prepared.sources();
-            if !Arc::ptr_eq(sources.lock_owner(), process.input_lock())
-                || !process.matches_startup_control(prepared.startup_control())
-                || sources.private_root_path() != process.private_cwd()
-                || !sources
-                    .same_original_root(process.original_root())
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecV3Root", &e))?
-            {
-                return Err(failure(
-                    "RoventNnuecV3Custody",
-                    "original V3 source, process and control differ",
-                ));
-            }
-            if sources.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection
-                || sources.collection_preload_sources().is_some()
-            {
-                return Err(failure(
-                    "RoventNnuecV3CollectionUnsupported",
-                    "V3 Collection source owner is not connected",
-                ));
-            }
-            let collection_origin_v2 = None;
-            let document = sources.configuration();
-            document
-                .require_supported_native_capabilities()
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecCapability", &e))?;
-            let fields = document.fields();
-            let ExecutionConfiguration::OwnResearcher {
-                event_order,
-                queues,
-                max_rounds,
-                max_native_nodes,
-                cpu_depth,
-                cpu_nodes_per_task,
-                cpu_plan,
-                value,
-                controller,
-                ..
-            } = fields.execution
-            else {
-                return Err(failure(
-                    "RoventNnuecStartup",
-                    "actual own-R configuration required",
-                ));
-            };
-            let runtime_matches =
-                super::pc_session::runtime_matches_v3(sources.lock(), prepared.snapshot())?;
-            if !matches!(value, ResearchValueConfiguration::NnuecV2 { .. })
-                || !prepared.snapshot().mode.has_native_r()
-                || prepared.snapshot().process_epoch != clock.epoch().0
-                || !runtime_matches
-                || prepared.snapshot().input_lock != loaded.input_lock_digest()
-                || !loaded.matches_sources(prepared.sources())
-                || identity.name.is_empty()
-                || identity.author.is_empty()
-            {
-                return Err(failure(
-                    "RoventNnuecStartup",
-                    "loaded NNUEC/source/process identity mismatch",
-                ));
-            }
-            let collection_origin = None;
-            let original_owner =
-                rz_experiments::RoventOriginalInputLock::from_v3(Arc::clone(sources.lock_owner()))
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecV3Lock", &e.error))?;
-            let ready = prepared
-                .service
-                .ready_clock()
-                .ok_or_else(|| failure("RoventNnuecStartup", "actual native Ready absent"))?;
-            let original = clock.runtime_clock();
-            if prepared.service.is_quarantined()
-                || prepared.service.native_acceptance_verifier().is_none()
-                || ready.domain() != original.domain()
-                || ready.origin() != original.origin()
-            {
-                return Err(SearchSessionFailure::physical_completion_unknown());
-            }
-            let control = controller
-                .actual(*event_order)
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecController", &e))?;
-            // One initial Bound materializes exactly one physical researcher.
-            // Wider declarations are rejected rather than silently resized.
-            if control.max_workers != 1 || control.initial_workers != 1 {
-                return Err(failure(
-                    "RoventNnuecWorkers",
-                    "this same-source assembly requires one declared own worker",
-                ));
-            }
-            let limits = queues
-                .actual()
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecQueues", &e))?;
-            if cpu_plan.paused_bytes_limit != limits.paused_bytes_per_worker_max {
-                return Err(failure(
-                    "RoventNnuecQueues",
-                    "actual paused-owner budget differs from queues",
-                ));
-            }
-            let root_tie_policy = document
-                .own_r_root_tie_policy()
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecTiePolicy", &e))?
-                .ok_or_else(|| failure("RoventNnuecTiePolicy", "own-R policy is required"))?;
-            let plan = DeferredNnuecCpuPlan::new_with_root_tie_policy(
-                cpu_plan
+        let mut prepared = Some(prepared);
+        let mut loaded = Some(loaded);
+        match Self::new_v3_in_slots(
+            &mut prepared,
+            &mut loaded,
+            Arc::clone(&process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+        ) {
+            Ok(driver) => Ok(driver),
+            Err(failure) => Err(RoventNnuecSessionV3Rejection {
+                failure,
+                prepared: prepared.expect("failed V3 validation retains original prepared owner"),
+                loaded: loaded.expect("failed V3 validation retains original loaded owner"),
+                process,
+            }),
+        }
+    }
+
+    /// Validate using the caller's original custody slots. No native/model
+    /// owner is removed while the validation closure can fail or unwind.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_v3_in_slots(
+        prepared_slot: &mut Option<PreparedRoventNativeV3<AdaptivePortQuestion>>,
+        loaded_slot: &mut Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+        process: Arc<super::process_boundary::VerifiedOwnedRoventProcessBoundaryV3>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, SearchSessionFailure> {
+        let prepared = prepared_slot
+            .as_ref()
+            .ok_or_else(|| failure("RoventNnuecV3Custody", "original prepared owner is absent"))?;
+        let loaded = loaded_slot
+            .as_ref()
+            .ok_or_else(|| failure("RoventNnuecV3Custody", "original loaded owner is absent"))?;
+        let built =
+            (|| -> Result<_, SearchSessionFailure> {
+                let sources = prepared.sources();
+                if !Arc::ptr_eq(sources.lock_owner(), process.input_lock())
+                    || !process.matches_startup_control(prepared.startup_control())
+                    || sources.private_root_path() != process.private_cwd()
+                    || !sources
+                        .same_original_root(process.original_root())
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecV3Root", &e))?
+                {
+                    return Err(failure(
+                        "RoventNnuecV3Custody",
+                        "original V3 source, process and control differ",
+                    ));
+                }
+                if sources.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection
+                    || sources.collection_preload_sources().is_some()
+                {
+                    return Err(failure(
+                        "RoventNnuecV3CollectionUnsupported",
+                        "V3 Collection source owner is not connected",
+                    ));
+                }
+                let collection_origin_v2 = None;
+                let document = sources.configuration();
+                document
+                    .require_supported_native_capabilities()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecCapability", &e))?;
+                let fields = document.fields();
+                let ExecutionConfiguration::OwnResearcher {
+                    event_order,
+                    queues,
+                    max_rounds,
+                    max_native_nodes,
+                    cpu_depth,
+                    cpu_nodes_per_task,
+                    cpu_plan,
+                    value,
+                    controller,
+                    ..
+                } = fields.execution
+                else {
+                    return Err(failure(
+                        "RoventNnuecStartup",
+                        "actual own-R configuration required",
+                    ));
+                };
+                let runtime_matches =
+                    super::pc_session::runtime_matches_v3(sources.lock(), prepared.snapshot())?;
+                if !matches!(value, ResearchValueConfiguration::NnuecV2 { .. })
+                    || !prepared.snapshot().mode.has_native_r()
+                    || prepared.snapshot().process_epoch != clock.epoch().0
+                    || !runtime_matches
+                    || prepared.snapshot().input_lock != loaded.input_lock_digest()
+                    || !loaded.matches_sources(prepared.sources())
+                    || identity.name.is_empty()
+                    || identity.author.is_empty()
+                {
+                    return Err(failure(
+                        "RoventNnuecStartup",
+                        "loaded NNUEC/source/process identity mismatch",
+                    ));
+                }
+                let collection_origin = None;
+                let original_owner = rz_experiments::RoventOriginalInputLock::from_v3(Arc::clone(
+                    sources.lock_owner(),
+                ))
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecV3Lock", &e.error))?;
+                let ready = prepared
+                    .service
+                    .ready_clock()
+                    .ok_or_else(|| failure("RoventNnuecStartup", "actual native Ready absent"))?;
+                let original = clock.runtime_clock();
+                if prepared.service.is_quarantined()
+                    || prepared.service.native_acceptance_verifier().is_none()
+                    || ready.domain() != original.domain()
+                    || ready.origin() != original.origin()
+                {
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+                let control = controller
+                    .actual(*event_order)
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecController", &e))?;
+                // One initial Bound materializes exactly one physical researcher.
+                // Wider declarations are rejected rather than silently resized.
+                if control.max_workers != 1 || control.initial_workers != 1 {
+                    return Err(failure(
+                        "RoventNnuecWorkers",
+                        "this same-source assembly requires one declared own worker",
+                    ));
+                }
+                let limits = queues
                     .actual()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?,
-                cpu_plan.ordering(),
-                cpu_plan.paused_bytes_limit,
-                cpu_plan.preserve_paused_side_scope,
-                limits.worker_commands_max,
-                cpu_plan.affinity(),
-                root_tie_policy,
-            )
-            .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?;
-            let source = DeferredNnuecRSource::new(Arc::clone(loaded.model()), plan);
-            let model = AdaptivePortModel::new_with_namespace(
-                prepared.snapshot().role_model_identity(),
-                Some(
-                    prepared
-                        .snapshot()
-                        .model_value_identity()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
-                ),
-                prepared
-                    .snapshot()
-                    .model_namespace()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
-            )
-            .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?;
-            let owner = ResearcherPreparingOwner::new_selected(
-                ResearcherSemanticProfile {
-                    config: PalsConfig {
-                        beam_width: fields.semantic.beam_width,
-                        line_plies: fields.semantic.line_plies,
-                        max_nodes: fields.semantic.max_nodes,
-                        max_records: fields.semantic.max_records,
-                        max_role_calls: fields.semantic.max_role_calls,
-                        cpu_nodes_per_task: *cpu_nodes_per_task,
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecQueues", &e))?;
+                if cpu_plan.paused_bytes_limit != limits.paused_bytes_per_worker_max {
+                    return Err(failure(
+                        "RoventNnuecQueues",
+                        "actual paused-owner budget differs from queues",
+                    ));
+                }
+                let root_tie_policy = document
+                    .own_r_root_tie_policy()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecTiePolicy", &e))?
+                    .ok_or_else(|| failure("RoventNnuecTiePolicy", "own-R policy is required"))?;
+                let plan = DeferredNnuecCpuPlan::new_with_root_tie_policy(
+                    cpu_plan
+                        .actual()
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?,
+                    cpu_plan.ordering(),
+                    cpu_plan.paused_bytes_limit,
+                    cpu_plan.preserve_paused_side_scope,
+                    limits.worker_commands_max,
+                    cpu_plan.affinity(),
+                    root_tie_policy,
+                )
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?;
+                let source = DeferredNnuecRSource::new(Arc::clone(loaded.model()), plan);
+                let model =
+                    AdaptivePortModel::new_with_namespace(
+                        prepared.snapshot().role_model_identity(),
+                        Some(prepared.snapshot().model_value_identity().map_err(|e| {
+                            SearchSessionFailure::debug("RoventNnuecNamespace", &e)
+                        })?),
+                        prepared
+                            .snapshot()
+                            .model_namespace()
+                            .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
+                    )
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?;
+                let owner = ResearcherPreparingOwner::new_selected(
+                    ResearcherSemanticProfile {
+                        config: PalsConfig {
+                            beam_width: fields.semantic.beam_width,
+                            line_plies: fields.semantic.line_plies,
+                            max_nodes: fields.semantic.max_nodes,
+                            max_records: fields.semantic.max_records,
+                            max_role_calls: fields.semantic.max_role_calls,
+                            cpu_nodes_per_task: *cpu_nodes_per_task,
+                        },
+                        maximum_root_prefix_plies: fields.semantic.maximum_root_prefix_plies,
                     },
-                    maximum_root_prefix_plies: fields.semantic.maximum_root_prefix_plies,
-                },
-                model,
-                ResolverPolicy::ModelWdlRestricted,
-                document.post_repair_policy_for(prepared.snapshot().mode),
-                fields
-                    .review
-                    .actual()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecReview", &e))?,
-                fields
-                    .index
-                    .actual()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecIndex", &e))?,
-                source,
-            )
-            .map_err(|e| SearchSessionFailure::debug("RoventNnuecSemantic", &e))?;
-            let implementation =
-                Self::implementation_digest_from_metadata(document, root_policy)
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?;
-            Ok((
-                owner,
-                original_owner,
-                collection_origin,
-                collection_origin_v2,
-                implementation,
-                Digest(
-                    document
-                        .search_configuration_digest()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?,
-                ),
-                fields
-                    .frontier
-                    .actual()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecFrontier", &e))?,
-                limits,
-                control,
-                event_order.actual(),
-                *max_rounds,
-                *max_native_nodes,
-                *cpu_depth,
-            ))
-        })();
+                    model,
+                    ResolverPolicy::ModelWdlRestricted,
+                    document.post_repair_policy_for(prepared.snapshot().mode),
+                    fields
+                        .review
+                        .actual()
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecReview", &e))?,
+                    fields
+                        .index
+                        .actual()
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecIndex", &e))?,
+                    source,
+                )
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecSemantic", &e))?;
+                let implementation =
+                    Self::implementation_digest_from_metadata(document, root_policy)
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?;
+                Ok((
+                    owner,
+                    original_owner,
+                    collection_origin,
+                    collection_origin_v2,
+                    implementation,
+                    Digest(document.search_configuration_digest().map_err(|e| {
+                        SearchSessionFailure::debug("RoventNnuecConfiguration", &e)
+                    })?),
+                    fields
+                        .frontier
+                        .actual()
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecFrontier", &e))?,
+                    limits,
+                    control,
+                    event_order.actual(),
+                    *max_rounds,
+                    *max_native_nodes,
+                    *cpu_depth,
+                ))
+            })();
         let (
             owner,
             original_owner,
@@ -2102,20 +2255,16 @@ impl RoventNnuecSessionDriver {
             max_rounds,
             max_native_nodes,
             cpu_depth,
-        ) = match built {
-            Ok(value) => value,
-            Err(failure) => {
-                return Err(RoventNnuecSessionV3Rejection {
-                    failure,
-                    prepared,
-                    loaded,
-                    process,
-                });
-            }
-        };
+        ) = built?;
         let configuration = prepared.sources().configuration().clone();
-        let (native, snapshot, sources) = prepared.into_parts();
         let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
+        // The borrowed validation and all its fallible work have finished.
+        // Transfer the same originals only into the completed driver.
+        let (native, snapshot, sources) = prepared_slot
+            .take()
+            .expect("validated prepared owner")
+            .into_parts();
+        let loaded = loaded_slot.take().expect("validated loaded owner");
         Ok(Self {
             sources: NnuecSources::V3(sources),
             loaded: NnuecLoaded::V3(loaded),
@@ -3065,11 +3214,13 @@ impl RoventNnuecSessionDriver {
             .state
             .try_lock()
             .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
-        if matches!(*state, State::Closed) {
+        if let State::Closed { native } = &*state {
             // Closed is installed only after this same hook's physical
             // completion (when present) and native cleanup have succeeded.
             return if revoke_panicked {
                 Err(teacher_unknown())
+            } else if let Some(error) = native.terminal_failure() {
+                Err(error)
             } else {
                 Ok(())
             };
@@ -3154,8 +3305,14 @@ impl RoventNnuecSessionDriver {
                     }
                 }
             }
-            *state = State::Closed;
-            Ok(())
+            let State::Idle(idle) = std::mem::replace(&mut *state, State::Moving) else {
+                unreachable!("idle owner is retained throughout cleanup")
+            };
+            let terminal_failure = idle.native.terminal_failure();
+            *state = State::Closed {
+                native: idle.native,
+            };
+            terminal_failure.map_or(Ok(()), Err)
         } else {
             Err(SearchSessionFailure::physical_completion_unknown())
         }
@@ -3257,7 +3414,7 @@ impl SearchSessionDriver for RoventNnuecSessionDriver {
 impl Drop for RoventNnuecSessionDriver {
     fn drop(&mut self) {
         let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
-        if !matches!(state, State::Closed) {
+        if !matches!(state, State::Closed { .. }) {
             std::mem::forget(std::mem::replace(state, State::Moving));
             // The Frontier was already retired when this read-only receipt
             // was observed. Quarantining the physical owners must not drop

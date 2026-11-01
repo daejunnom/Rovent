@@ -53,7 +53,8 @@ pub use rovent_external::{
     RoventExternalSessionAdmissionRejection, RoventExternalSessionAdmissionRejectionV2,
     RoventExternalSessionAdmissionRejectionV3, RoventExternalSessionSource,
     RoventExternalSessionSources, RoventExternalSessionSourcesV2, RoventExternalSessionSourcesV3,
-    RoventExternalSourcePreparationRejection,
+    RoventExternalSourcePreparationRejection, RoventExternalV3AdmissionCustody,
+    RoventExternalV3StartObservation,
 };
 
 use super::AdaptiveSearchDriver as _;
@@ -311,6 +312,10 @@ struct IdleOwners<B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>> {
     researcher_source: SessionResearcherSource,
     continuation: Option<AdaptiveSequenceContinuation>,
     native_finished: Option<bool>,
+    // Retain the one-time transfer separately from the immutable snapshot.
+    native_finish_report: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
+    native_finish_snapshot: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
+    native_session_release: Option<super::NativeSessionReleaseObservation>,
     native_joined: bool,
     external_finished: Option<CheckerShutdown>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -573,6 +578,7 @@ pub struct AdaptiveSessionProcessReceipt {
     last_authority: Option<SearchAuthority>,
     native_owner_joined: bool,
     native_physical_shutdown_confirmed: bool,
+    native_session_release: Option<super::NativeSessionReleaseObservation>,
     external_shutdown: Option<CheckerShutdown>,
     store_archive_closed: bool,
     latest_root: Option<AdaptiveShutdownReceipt>,
@@ -591,6 +597,11 @@ impl AdaptiveSessionProcessReceipt {
     }
     pub fn native_physical_shutdown_confirmed(&self) -> bool {
         self.native_physical_shutdown_confirmed
+    }
+    /// Same-owner session-release observation, when emitted by the original
+    /// finish path. It is not a GPU Run, placement or device-fence witness.
+    pub fn native_session_release(&self) -> Option<super::NativeSessionReleaseObservation> {
+        self.native_session_release
     }
     pub fn external_shutdown(&self) -> Option<CheckerShutdown> {
         self.external_shutdown
@@ -1020,6 +1031,7 @@ where
         ),
         SearchSessionFailure,
     > {
+        let native_session_release = manager.native_session_release_observation();
         match self.researcher_class {
             SessionResearcherClass::Legacy => {
                 let parts = if process_closed {
@@ -1050,6 +1062,9 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        native_finish_report: None,
+                        native_finish_snapshot: None,
+                        native_session_release,
                         native_joined,
                         external_finished: None,
                         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -1097,6 +1112,9 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        native_finish_report: None,
+                        native_finish_snapshot: None,
+                        native_session_release,
                         native_joined,
                         external_finished,
                         profiled_retirement: None,
@@ -1142,6 +1160,9 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        native_finish_report: None,
+                        native_finish_snapshot: None,
+                        native_session_release,
                         native_joined,
                         external_finished,
                         profiled_retirement: None,
@@ -1187,6 +1208,9 @@ where
                         unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
+                        native_finish_report: None,
+                        native_finish_snapshot: None,
+                        native_session_release,
                         native_joined,
                         external_finished,
                         profiled_retirement: None,
@@ -1391,8 +1415,59 @@ where
             SessionResearcherSource,
         ),
     > {
+        let mut sources_slot = Some(sources);
+        let mut researcher_slot = Some(researcher_source);
+        match Self::admit_with_researcher_source_in_slots(
+            options,
+            limits,
+            &mut sources_slot,
+            clock,
+            issuer,
+            registration,
+            dispatch_observer,
+            closure_observer,
+            collection_hooks,
+            explicit_native_limits,
+            &mut researcher_slot,
+        ) {
+            Ok(driver) => Ok(driver),
+            Err(failure) => Err((
+                AdaptiveSessionAdmissionRejection {
+                    failure,
+                    sources: sources_slot.expect("failed admission retains original sources"),
+                },
+                researcher_slot.expect("failed admission retains original researcher source"),
+            )),
+        }
+    }
+
+    /// Validate while the caller retains the exact native and researcher
+    /// owners. They are moved only after all fallible admission checks pass.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_with_researcher_source_in_slots(
+        options: AdaptiveSessionOptions,
+        limits: AdaptiveExecutionLimits,
+        sources_slot: &mut Option<AdaptiveSessionSources<B>>,
+        clock: ProcessClock,
+        issuer: AdaptiveRulesOwnerIssuer,
+        registration: PalsCheckerRegistration,
+        dispatch_observer: Option<AdaptiveCollectionDispatchObserver>,
+        closure_observer: Option<AdaptiveRootClosureObserver<B>>,
+        collection_hooks: AdaptiveSessionCollectionHooks<B>,
+        explicit_native_limits: bool,
+        researcher_slot: &mut Option<SessionResearcherSource>,
+    ) -> Result<Self, SearchSessionFailure> {
+        let sources = sources_slot
+            .as_ref()
+            .ok_or_else(|| failure("AdaptiveSessionSources", "original session sources absent"))?;
+        let researcher_source = researcher_slot.as_ref().ok_or_else(|| {
+            failure(
+                "AdaptiveSessionSources",
+                "original researcher source absent",
+            )
+        })?;
         let profiled_external = researcher_source.is_profiled_external();
-        let researcher_class = match &researcher_source {
+        let researcher_class = match researcher_source {
             SessionResearcherSource::Legacy => SessionResearcherClass::Legacy,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             SessionResearcherSource::ProfiledExternal(_) => {
@@ -1533,12 +1608,7 @@ where
             }
             Ok(())
         })();
-        if let Err(failure) = checked {
-            return Err((
-                AdaptiveSessionAdmissionRejection { failure, sources },
-                researcher_source,
-            ));
-        }
+        checked?;
         let resolver = PalsResolverIdentity::from_semantics(
             registration.resolver_version,
             registration.resolver_semantics,
@@ -1559,16 +1629,7 @@ where
                 match ProcessWorkJournal::new_pals_with_search_policy(resolver, identity) {
                     Ok(work) => work,
                     Err(error) => {
-                        return Err((
-                            AdaptiveSessionAdmissionRejection {
-                                failure: SearchSessionFailure::debug(
-                                    "AdaptiveSearchPolicy",
-                                    &error,
-                                ),
-                                sources,
-                            },
-                            researcher_source,
-                        ));
+                        return Err(SearchSessionFailure::debug("AdaptiveSearchPolicy", &error));
                     }
                 }
             }
@@ -1580,7 +1641,12 @@ where
             cpu,
             external,
             checker_metadata,
-        } = sources;
+        } = sources_slot
+            .take()
+            .expect("validated original session sources");
+        let researcher_source = researcher_slot
+            .take()
+            .expect("validated original researcher source");
         Ok(Self {
             completion: Mutex::new(CompletionJournal::new(
                 clock.epoch(),
@@ -1604,6 +1670,9 @@ where
                 researcher_source,
                 continuation: None,
                 native_finished: None,
+                native_finish_report: None,
+                native_finish_snapshot: None,
+                native_session_release: None,
                 native_joined: false,
                 external_finished: None,
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -3883,6 +3952,16 @@ where
             last_authority,
             native_owner_joined: owners.native_joined,
             native_physical_shutdown_confirmed: owners.native_finished == Some(true),
+            native_session_release: if owners.native_joined && owners.native_finished == Some(true) {
+                owners.native_session_release.or_else(|| {
+                    owners.native_finish_report.as_ref()
+                        .and_then(|report| super::NativeSessionReleaseObservation::from_report(report, true))
+                        .or_else(|| owners.native_finish_snapshot.as_ref()
+                            .and_then(|report| super::NativeSessionReleaseObservation::from_report(report, false)))
+                })
+            } else {
+                None
+            },
             external_shutdown: owners.external_finished,
             store_archive_closed: closed,
             latest_root,
@@ -4539,12 +4618,30 @@ mod tests {
         assert!(matches!(operation, ArchiveQuarantineReason::Operation(_)));
     }
     #[test]
+    fn process_release_observation_distinguishes_zero_and_source_from_absence() {
+        use super::super::{NativeSessionReleaseObservation, NativeSessionReleaseSource};
+        let mut report = crate::pals_native::ticketed::TicketNativeFinishReport {
+            physical_shutdown_confirmed: true,
+            physical_failure: None,
+            semantic_failure: None,
+            session_release: Some(rz_eval::worker::SessionReleased { completed_synchronous_runs: 0 }),
+        };
+        let original = NativeSessionReleaseObservation::from_report(&report, true).unwrap();
+        let snapshot = NativeSessionReleaseObservation::from_report(&report, false).unwrap();
+        assert_eq!(original.release().completed_synchronous_runs, 0);
+        assert_eq!(original.source(), NativeSessionReleaseSource::OriginalReport);
+        assert_eq!(snapshot.source(), NativeSessionReleaseSource::Snapshot);
+        report.session_release = None;
+        assert_eq!(NativeSessionReleaseObservation::from_report(&report, true), None);
+    }
+    #[test]
     fn process_receipt_requires_join_and_physical_finish_independently() {
         let mut receipt = AdaptiveSessionProcessReceipt {
             epoch: ProcessEpoch(3),
             last_authority: None,
             native_owner_joined: false,
             native_physical_shutdown_confirmed: false,
+            native_session_release: None,
             external_shutdown: None,
             store_archive_closed: true,
             latest_root: None,

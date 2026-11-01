@@ -122,6 +122,7 @@ where
             next_control,
             phase: ManagerPhase::Running,
             native_finished: None,
+            native_finish_report: None,
             native_joined: false,
             native_root_fence: None,
             close_mode: AdaptiveCloseMode::ProcessShutdown,

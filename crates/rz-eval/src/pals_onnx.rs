@@ -2007,6 +2007,60 @@ impl PalsAppliedSessionSettings {
         "setters_execution_provider_registration_and_session_commit_success"
     }
 }
+/// Failure from one session constructor. This describes provider setup in
+/// this function only: an earlier ORT runtime load may itself have entered
+/// native code. A returned session stays in the caller-owned slot; the failure
+/// only records whether that slot contains the returned session.
+enum SessionLoadFailure {
+    BeforeProvider(BackendError),
+    ProviderEntered {
+        error: BackendError,
+        /// The actual session, when present, remains in the caller-owned slot.
+        returned_session: bool,
+    },
+}
+impl From<BackendError> for SessionLoadFailure {
+    fn from(error: BackendError) -> Self {
+        Self::BeforeProvider(error)
+    }
+}
+impl SessionLoadFailure {
+    /// Historical call sites preserve their existing error contract. This is
+    /// not a physical-completion claim and must not be used by the new owner.
+    fn into_error(self) -> BackendError {
+        match self {
+            Self::BeforeProvider(error) | Self::ProviderEntered { error, .. } => error,
+        }
+    }
+}
+
+/// Validate only the caller-owned slots before invoking either callback. This
+/// boundary is deliberately generic so its ordering can be tested without
+/// loading ORT or touching a GPU.
+fn begin_session_native<T>(
+    session_occupied: bool,
+    serialized_present: bool,
+    before_native: impl FnOnce(),
+    builder: impl FnOnce() -> T,
+) -> Result<T, SessionLoadFailure> {
+    if session_occupied {
+        return Err(SessionLoadFailure::BeforeProvider(fail(
+            K::InvalidInput,
+            S::Admission,
+            "PALS session custody slot is already occupied",
+        )));
+    }
+    if !serialized_present {
+        return Err(SessionLoadFailure::BeforeProvider(fail(
+            K::InvalidInput,
+            S::Admission,
+            "PALS serialized model custody slot is empty",
+        )));
+    }
+    before_native();
+    Ok(builder())
+}
+
 fn load_session(
     bytes: Vec<u8>,
     config: PalsOnnxConfig,
@@ -2020,6 +2074,44 @@ fn load_session(
     ),
     BackendError,
 > {
+    let mut serialized_bytes = Some(bytes);
+    let mut session = None;
+    let (placement, settings) =
+        load_session_retaining_failure(
+            &mut serialized_bytes,
+            config,
+            role,
+            audit,
+            &mut session,
+            false,
+            || {},
+        )
+            .map_err(SessionLoadFailure::into_error)?;
+    Ok((
+        session.expect("successful session load owns session"),
+        placement,
+        settings,
+    ))
+}
+
+/// `returned_session` is the original owner's slot, not a temporary inside
+/// this function. ORT success is moved there before any placement/log callback
+/// can fail or unwind. `serialized_bytes` is likewise an original owner slot:
+/// V3 callers request preservation on unsuccessful or unwinding commits;
+/// the legacy wrapper releases failed-commit bytes at its original time.
+/// Successful native-copy commits release bytes immediately after the
+/// returned Session is installed.
+/// The owner must itself survive unwinding and unknown physical completion;
+/// this function does not create that owner or a fence.
+fn load_session_retaining_failure(
+    serialized_bytes: &mut Option<Vec<u8>>,
+    config: PalsOnnxConfig,
+    role: &str,
+    audit: Option<(&PalsCudaControlPolicy, &Path)>,
+    returned_session: &mut Option<Session>,
+    preserve_failed_input: bool,
+    before_native: impl FnOnce(),
+) -> Result<(Option<PalsGraphPlacement>, PalsAppliedSessionSettings), SessionLoadFailure> {
     let configure = |e| {
         native(
             CauseCode::SessionConfiguration,
@@ -2027,7 +2119,14 @@ fn load_session(
             e,
         )
     };
-    let mut builder = Session::builder()
+    // Even when the ORT runtime latch already exists, constructing a fresh
+    // session enters native code. Pure slot failures never call either closure.
+    let mut builder = begin_session_native(
+        returned_session.is_some(),
+        serialized_bytes.is_some(),
+        before_native,
+        Session::builder,
+    )?
         .map_err(configure)?
         .with_no_environment_execution_providers()
         .map_err(configure)?
@@ -2051,6 +2150,15 @@ fn load_session(
         })
         .map_err(configure)?;
     let mut cuda_provider_available = None;
+    // CPU and CUDA keep separate accounting. The caller must mark the broader
+    // ORT runtime/provider boundary *before* invoking native runtime loading.
+    let provider_entered = |error| match config.provider {
+        Provider::Cpu => SessionLoadFailure::BeforeProvider(error),
+        Provider::Cuda { .. } => SessionLoadFailure::ProviderEntered {
+            error,
+            returned_session: false,
+        },
+    };
     builder = match config.provider {
         Provider::Cpu => builder
             .with_execution_providers([CPUExecutionProvider::default()
@@ -2070,12 +2178,16 @@ fn load_session(
                         .with_conv_algorithm_search(CuDNNConvAlgorithmSearch::Default)
                 }
             };
-            if !cuda.is_available().map_err(configure)? {
-                return Err(fail(
+            if !cuda
+                .is_available()
+                .map_err(configure)
+                .map_err(provider_entered)?
+            {
+                return Err(provider_entered(fail(
                     K::BackendUnavailable,
                     S::Backend,
                     "PALS CUDA provider unavailable; CPU fallback forbidden",
-                ));
+                )));
             }
             cuda_provider_available = Some(true);
             builder
@@ -2085,7 +2197,8 @@ fn load_session(
                     "session.disable_cpu_ep_fallback",
                     if audit.is_some() { "0" } else { "1" },
                 )
-                .map_err(configure)?
+                .map_err(configure)
+                .map_err(provider_entered)?
                 .with_execution_providers([cuda
                     .with_device_id(device_id)
                     .with_memory_limit(arena_bytes)
@@ -2094,25 +2207,49 @@ fn load_session(
                     .with_cuda_graph(false)
                     .build()
                     .error_on_failure()])
-                .map_err(configure)?
+                .map_err(configure)
+                .map_err(provider_entered)?
         }
     };
     let placement_log = if let Some((policy, root)) = audit {
-        let (configured, log) =
-            policy.configure(builder, role, &root.join(format!("pals-{role}-kernels")))?;
+        let (configured, log) = policy
+            .configure(builder, role, &root.join(format!("pals-{role}-kernels")))
+            .map_err(provider_entered)?;
         builder = configured;
         Some(log)
     } else {
         None
     };
     // Default native copying; no direct-reference initializer option is enabled.
-    // Serialized owned bytes are freed immediately after successful/failed load.
-    let loaded = builder.commit_from_memory(&bytes);
-    drop(bytes);
+    // Successful commits release serialized bytes after Session ownership is
+    // secured. The original V3 owner preserves its bytes on failed commits.
+    let loaded = builder.commit_from_memory(
+        serialized_bytes
+            .as_deref()
+            .expect("serialized slot checked before commit"),
+    );
+    let loaded_ok = loaded.is_ok();
+    // Move the actual Session into original custody before policy/log calls.
+    // On Err ORT does not return a Session: the caller must retain unknown.
+    let load_error = match loaded {
+        Ok(session) => {
+            *returned_session = Some(session);
+            // This builder uses ORT's native-copy model path, with no direct
+            // reference to the source buffer. Preserve the existing successful
+            // commit's early release while retaining failed/unknown inputs.
+            drop(serialized_bytes.take());
+            None
+        }
+        Err(error) => {
+            if !preserve_failed_input {
+                // Preserve the legacy wrapper's original pre-log release.
+                drop(serialized_bytes.take());
+            }
+            Some(error)
+        }
+    };
     let placement = if let (Some((policy, _)), Some(log)) = (audit, &placement_log) {
-        loaded
-            .is_ok()
-            .then(|| policy.verify_initialization(role, log))
+        loaded_ok.then(|| policy.verify_initialization(role, log))
     } else {
         None
     };
@@ -2122,7 +2259,7 @@ fn load_session(
                 log,
                 &root.join(format!("{role}-initial-placement.json")),
                 role,
-                loaded.is_ok(),
+                loaded_ok,
                 placement.as_ref(),
             )
         } else {
@@ -2130,7 +2267,7 @@ fn load_session(
                 log,
                 &root.join(format!("{role}-initial-placement.json")),
                 role,
-                loaded.is_ok(),
+                loaded_ok,
                 placement.as_ref(),
             )
         }
@@ -2139,12 +2276,30 @@ fn load_session(
     };
     // Preserve the primary native initialization failure; successful sessions
     // require both a saved bounded log and the independent pre-Run gate.
-    let session =
-        loaded.map_err(|e| native(CauseCode::ModelLoad, "PALS ONNX loading failed", e))?;
+    if let Some(error) = load_error {
+        return Err(provider_entered(native(
+            CauseCode::ModelLoad,
+            "PALS ONNX loading failed",
+            error,
+        )));
+    }
     // Recording is attempted even for a rejected native/policy initialization.
     // Preserve that primary error; a successful gate cannot bypass failed IO.
-    let placement = placement.transpose()?;
-    recorded?;
+    let placement = match placement.transpose() {
+        Ok(placement) => placement,
+        Err(error) => {
+            return Err(SessionLoadFailure::ProviderEntered {
+                error,
+                returned_session: true,
+            });
+        }
+    };
+    if let Err(error) = recorded {
+        return Err(SessionLoadFailure::ProviderEntered {
+            error,
+            returned_session: true,
+        });
+    }
     // 위 setter/EP 등록/commit과 모든 기존 초기화 검사가 성공한 뒤에만 발급한다.
     let applied = PalsAppliedSessionSettings {
         role: role.to_owned(),
@@ -2156,7 +2311,7 @@ fn load_session(
         parallel_execution: false,
         cuda_provider_available,
     };
-    Ok((session, placement, applied))
+    Ok((placement, applied))
 }
 
 struct ActiveInputs {
@@ -5072,6 +5227,38 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_native_boundary_rejects_invalid_slots_before_callbacks() {
+        for (occupied, present) in [(true, true), (false, false), (true, false)] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = begin_session_native(
+                occupied,
+                present,
+                || calls.borrow_mut().push("native-entry"),
+                || calls.borrow_mut().push("builder"),
+            );
+            assert!(matches!(result, Err(SessionLoadFailure::BeforeProvider(_))));
+            assert!(calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn session_native_boundary_marks_entry_before_mock_builder() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = begin_session_native(
+            false,
+            true,
+            || calls.borrow_mut().push("native-entry"),
+            || {
+                calls.borrow_mut().push("builder");
+                7
+            },
+        );
+        assert!(matches!(result, Ok(7)));
+        assert_eq!(*calls.borrow(), ["native-entry", "builder"]);
+    }
+
     fn host_page_observation_fixture() -> HostRecordPageSnapshot {
         HostRecordPageSnapshot {
             policy: HostRecordPagePolicy::for_registered_graph([4; 32]),

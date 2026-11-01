@@ -32,6 +32,7 @@ const ROVENT_NATIVE_RESOURCE_SOURCE: &str = "https://github.com/daejunnom/RoveZe
 const MAX_EVIDENCE_BYTES: usize = 4 << 20;
 
 pub mod launch;
+mod direct_control;
 
 /// Declaration only. CPU/memory come from the same exact input lock; these
 /// remaining physical bounds are explicit and are checked by the OS owner.

@@ -769,6 +769,28 @@ impl RoventPinnedNativeSources<RoventInputLockV3> {
             &self.lock.manifest.system_runtime_lock, control.until, control.cancellation.as_ref(),
         )
     }
+
+    /// Same pinned source and deadlines, with an owner-supplied callback at
+    /// the actual ORT entry boundary. An earlier source failure has not
+    /// entered the runtime; the callback must retain its captured owner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn load_system_cuda_with(
+        &self,
+        control: &RoventStartupControl,
+        load: impl FnOnce(&rz_eval::onnx::SystemRuntime) -> Result<rz_eval::onnx::OrtRuntime, BackendError>,
+    ) -> Result<
+        crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup,
+        BackendError,
+    > {
+        self.validate_lock()?;
+        control.check()?;
+        if !self.admits_original_startup_control(control) {
+            return Err(fail(K::IdentityMismatch, "system CUDA startup control differs from original owner"));
+        }
+        crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup::capture_and_load_until_with(
+            &self.lock.manifest.system_runtime_lock, control.until, control.cancellation.as_ref(), load,
+        )
+    }
 }
 
 fn same_startup_control(left: &RoventStartupControl, right: &RoventStartupControl) -> bool {

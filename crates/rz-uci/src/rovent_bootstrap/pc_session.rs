@@ -27,7 +27,9 @@ use crate::pals_adaptive::{
     AdaptiveCollectionObserverBoxV3, RoleOnlyCollectionV3Rejection,
     RoventCollectionRootAdmissionV3, RoventNativeCollectionOriginV3,
 };
-use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
+use crate::pals_native::ticketed::{
+    TicketNativeEvent, TicketNativeFinishReport, VirtualReviewTicketOutput,
+};
 use crate::rovent_root_admission::source_seal::{
     InitialAdmissionOutcome, InitialAdmissionOutcomeV2, InitialAdmissionOutcomeV3,
     PreparedSourceV2, PreparedSourceV3, RoventRootAdmissionV2, RoventRootAdmissionV3, SourceSeal,
@@ -44,6 +46,7 @@ use rz_eval::error::{BackendError, FailureKind};
 use rz_position::{BoardMove, Position};
 use rz_runtime::contracts::ContractClock;
 use rz_search::cpu_value::nnuec::v2::review::PreparationActor;
+use rz_search::pals::coordinator::RoleFailure;
 use rz_search::pals::engine::adaptive_port::{AdaptivePortModel, AdaptiveRulesOwnerIssuer};
 use rz_search::pals::engine::pc_port::{PcFrontierStartup, PcPortQuestion, PcSemanticPort};
 use rz_search::pals::engine::{PcSemanticOwner, PostRepairRecheckPolicy};
@@ -887,6 +890,11 @@ struct NativeOwner {
     finished: Option<bool>,
     joined: bool,
     unexpected: Vec<TicketNativeEvent<VirtualReviewTicketOutput>>,
+    shutdown_physical_failures: Vec<RoleFailure>,
+    shutdown_semantic_failures: Vec<RoleFailure>,
+    shutdown_reports: Vec<TicketNativeFinishReport>,
+    finish_report_missing: bool,
+    finish_report_inconsistent: bool,
     // A recovered native source retains the original typed root/cache closure
     // even if subsequent semantic handoff or receipt publication is rejected.
     // Unknown State drop quarantines this slot with its original process.
@@ -899,6 +907,11 @@ impl NativeOwner {
             finished: None,
             joined: false,
             unexpected: Vec::new(),
+            shutdown_physical_failures: Vec::new(),
+            shutdown_semantic_failures: Vec::new(),
+            shutdown_reports: Vec::new(),
+            finish_report_missing: false,
+            finish_report_inconsistent: false,
             _root_closure: None,
         }
     }
@@ -916,8 +929,40 @@ impl NativeOwner {
                     TicketNativeEvent::Finished {
                         physical_shutdown_confirmed,
                     } => {
-                        self.finished =
-                            Some(self.finished.unwrap_or(true) && physical_shutdown_confirmed);
+                        let snapshot = self.service.finish_report_snapshot();
+                        let report_required = self.service.requires_finish_report();
+                        self.finish_report_missing |= report_required && snapshot.is_none();
+                        let original = self.service.take_finish_report();
+                        let inconsistent = matches!((&snapshot, &original),
+                            (Some(snapshot), Some(original)) if snapshot != original);
+                        self.finish_report_inconsistent |= inconsistent;
+                        let confirmed = physical_shutdown_confirmed
+                            && !self.finish_report_missing
+                            && !self.finish_report_inconsistent
+                            && snapshot
+                                .as_ref()
+                                .is_none_or(|value| value.physical_shutdown_confirmed)
+                            && original
+                                .as_ref()
+                                .is_none_or(|value| value.physical_shutdown_confirmed);
+                        self.finished = Some(self.finished.unwrap_or(true) && confirmed);
+                        // If another consumer took the report, its independent
+                        // snapshot still preserves our failure evidence. If the
+                        // two disagree, retain both instead of hiding either.
+                        let mut reports =
+                            [original, if inconsistent { snapshot.clone() } else { None }];
+                        if reports[0].is_none() {
+                            reports[0] = snapshot;
+                        }
+                        for report in reports.into_iter().flatten() {
+                            if let Some(failure) = &report.physical_failure {
+                                self.shutdown_physical_failures.push(failure.clone());
+                            }
+                            if let Some(failure) = &report.semantic_failure {
+                                self.shutdown_semantic_failures.push(failure.clone());
+                            }
+                            self.shutdown_reports.push(report);
+                        }
                     }
                     TicketNativeEvent::Ready { .. } | TicketNativeEvent::RootQuiesced(_) => {}
                     other => self.unexpected.push(other),
@@ -926,9 +971,13 @@ impl NativeOwner {
             self.joined = self
                 .service
                 .try_join()
-                .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+                .map_err(|error| self.shutdown_failure(false, Some(&error)))?;
             if self.joined && self.finished == Some(true) {
-                return if self.unexpected.is_empty() {
+                return if !self.shutdown_physical_failures.is_empty()
+                    || !self.shutdown_semantic_failures.is_empty()
+                {
+                    Err(self.shutdown_failure(true, None))
+                } else if self.unexpected.is_empty() {
                     Ok(())
                 } else {
                     Err(failure(
@@ -938,7 +987,7 @@ impl NativeOwner {
                 };
             }
             if Instant::now() >= until || self.finished == Some(false) {
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(self.shutdown_failure(false, None));
             }
             signal.wait_changed(
                 observed,
@@ -947,6 +996,28 @@ impl NativeOwner {
                     .min(Duration::from_millis(10)),
             );
         }
+    }
+
+    fn shutdown_failure(
+        &self,
+        physical_confirmed: bool,
+        join_error: Option<&dyn std::fmt::Debug>,
+    ) -> SearchSessionFailure {
+        let mut failure = SearchSessionFailure::debug(
+            "RoventPcNativeShutdown",
+            &(
+                &self.shutdown_physical_failures,
+                &self.shutdown_semantic_failures,
+                self.finish_report_missing,
+                self.finish_report_inconsistent,
+                join_error,
+            ),
+        );
+        if !physical_confirmed {
+            failure.code = "PhysicalCompletionUnknown";
+            failure.physical_completion = DriverPhysicalCompletion::Unknown;
+        }
+        failure
     }
 }
 // One mutex-protected session slot owns the current native/semantic custody.
@@ -965,6 +1036,12 @@ enum State {
     },
     ArchiveRetained {
         native: NativeOwner,
+    },
+    // The physical owner and storage have shut down, but their original
+    // reported failure remains available on every later finish call.
+    ClosedFailure {
+        native: NativeOwner,
+        failure: SearchSessionFailure,
     },
     Closed,
     Moving,
@@ -1199,6 +1276,45 @@ impl RoventPcSessionDriver {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventPcSessionV3Rejection> {
+        let mut prepared = Some(prepared);
+        let mut loaded = loaded;
+        match Self::new_v3_in_slots(
+            &mut prepared,
+            &mut loaded,
+            Arc::clone(&process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+        ) {
+            Ok(driver) => Ok(driver),
+            Err(failure) => Err(RoventPcSessionV3Rejection {
+                failure,
+                prepared: prepared
+                    .expect("failed V3 validation retains the original prepared owner"),
+                process,
+                loaded,
+            }),
+        }
+    }
+
+    /// Validate the caller's original, already registered custody without
+    /// moving either native or NNUEC owner across a fallible callback. A
+    /// panic during validation leaves the same values in those slots.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_v3_in_slots(
+        prepared_slot: &mut Option<PreparedRoventNativeV3<PcPortQuestion>>,
+        loaded_slot: &mut Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, SearchSessionFailure> {
+        let prepared = prepared_slot
+            .as_ref()
+            .ok_or_else(|| failure("RoventPcV3Custody", "original prepared owner is absent"))?;
+        let loaded = loaded_slot.as_ref();
         let build = (|| -> Result<_, SearchSessionFailure> {
             let sources = prepared.sources();
             sources
@@ -1221,7 +1337,7 @@ impl RoventPcSessionDriver {
             configuration
                 .require_supported_native_capabilities()
                 .map_err(|e| SearchSessionFailure::debug("RoventPcCapability", &e))?;
-            match (configuration.fields().execution, &loaded) {
+            match (configuration.fields().execution, loaded) {
                 (
                     ExecutionConfiguration::RolesOnly {
                         shared_nnuec_readout: None,
@@ -1351,19 +1467,15 @@ impl RoventPcSessionDriver {
             implementation,
             selective_policy,
             frontier_limits,
-        ) = match build {
-            Ok(value) => value,
-            Err(failure) => {
-                return Err(RoventPcSessionV3Rejection {
-                    failure,
-                    prepared,
-                    process,
-                    loaded,
-                });
-            }
-        };
-        let (native, snapshot, sources) = prepared.into_parts();
+        ) = build?;
         let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
+        // After validation and preparation, the same originals are moved
+        // only into the finished driver. Neither slot was touched on error.
+        let (native, snapshot, sources) = prepared_slot
+            .take()
+            .expect("validated V3 prepared owner")
+            .into_parts();
+        let loaded = loaded_slot.take();
         Ok(Self {
             sources: PcSources::V3(sources),
             original_v2_owner: Some(original_owner),
@@ -2159,7 +2271,7 @@ impl RoventPcSessionDriver {
             } else {
                 observation.complete = false;
             }
-        } else if !matches!(&*state, State::Closed) {
+        } else if !matches!(&*state, State::Closed | State::ClosedFailure { .. }) {
             observation.complete = false;
         }
         Ok(Some(observation))
@@ -3823,6 +3935,11 @@ impl RoventPcSessionDriver {
                     *state = State::Closed;
                     return Ok(());
                 }
+                State::ClosedFailure { native, failure } => {
+                    let result = failure.clone();
+                    *state = State::ClosedFailure { native, failure };
+                    return Err(result);
+                }
                 State::Idle(mut idle) => {
                     if let Some(actor) = shared_actor.as_mut() {
                         if let Err(error) = actor.finish(until) {
@@ -3831,11 +3948,19 @@ impl RoventPcSessionDriver {
                         }
                     }
                     let result = idle.native.finish(until);
-                    if storage.is_some() && result.is_err() {
+                    let physical_done = idle.native.joined
+                        && idle.native.finished == Some(true)
+                        && result.as_ref().err().is_none_or(|error| {
+                            error.physical_completion == DriverPhysicalCompletion::Confirmed
+                        });
+                    if storage.is_some() && !physical_done {
                         *state = State::Idle(idle);
-                        return result.map_err(storage_unknown_failure);
+                        return Err(result
+                            .err()
+                            .map(storage_unknown_failure)
+                            .unwrap_or_else(SearchSessionFailure::physical_completion_unknown));
                     }
-                    if idle.native.joined && idle.native.finished == Some(true) {
+                    if physical_done {
                         if let Some(storage) = storage.as_mut() {
                             let signal = idle.native.service.signal();
                             match storage.finish(
@@ -3858,7 +3983,13 @@ impl RoventPcSessionDriver {
                                 }
                             }
                         }
-                        *state = State::Closed;
+                        *state = match &result {
+                            Ok(()) => State::Closed,
+                            Err(failure) => State::ClosedFailure {
+                                native: idle.native,
+                                failure: failure.clone(),
+                            },
+                        };
                     } else {
                         *state = State::Idle(idle);
                     }
@@ -3872,11 +4003,19 @@ impl RoventPcSessionDriver {
                         }
                     }
                     let result = native.finish(until);
-                    if storage.is_some() && result.is_err() {
+                    let physical_done = native.joined
+                        && native.finished == Some(true)
+                        && result.as_ref().err().is_none_or(|error| {
+                            error.physical_completion == DriverPhysicalCompletion::Confirmed
+                        });
+                    if storage.is_some() && !physical_done {
                         *state = State::RejectedOwner { native, owner };
-                        return result.map_err(storage_unknown_failure);
+                        return Err(result
+                            .err()
+                            .map(storage_unknown_failure)
+                            .unwrap_or_else(SearchSessionFailure::physical_completion_unknown));
                     }
-                    if native.joined && native.finished == Some(true) {
+                    if physical_done {
                         if let Some(storage) = storage.as_mut() {
                             let signal = native.service.signal();
                             if let Err(mut rejected) = storage.finish(
@@ -3898,7 +4037,13 @@ impl RoventPcSessionDriver {
                                 return Err(rejected.failure);
                             }
                         }
-                        *state = State::Closed;
+                        *state = match &result {
+                            Ok(()) => State::Closed,
+                            Err(failure) => State::ClosedFailure {
+                                native,
+                                failure: failure.clone(),
+                            },
+                        };
                     } else {
                         *state = State::RejectedOwner { native, owner };
                     }
@@ -3912,8 +4057,13 @@ impl RoventPcSessionDriver {
                         }
                     }
                     let result = native.finish(until);
+                    let physical_done = native.joined
+                        && native.finished == Some(true)
+                        && result.as_ref().err().is_none_or(|error| {
+                            error.physical_completion == DriverPhysicalCompletion::Confirmed
+                        });
                     if storage.is_some() {
-                        if result.is_err() || !native.joined || native.finished != Some(true) {
+                        if !physical_done {
                             *state = State::RejectedPort { native, port };
                             return result
                                 .map_err(storage_unknown_failure)
@@ -3943,8 +4093,14 @@ impl RoventPcSessionDriver {
                             }
                         }
                     }
-                    if native.joined && native.finished == Some(true) {
-                        *state = State::Closed;
+                    if physical_done {
+                        *state = match &result {
+                            Ok(()) => State::Closed,
+                            Err(failure) => State::ClosedFailure {
+                                native,
+                                failure: failure.clone(),
+                            },
+                        };
                     } else {
                         *state = State::RejectedPort { native, port };
                     }
@@ -3957,9 +4113,18 @@ impl RoventPcSessionDriver {
                             return Err(error);
                         }
                     }
-                    if let Err(error) = native.finish(until) {
+                    let native_result = native.finish(until);
+                    if !native.joined
+                        || native.finished != Some(true)
+                        || native_result.as_ref().err().is_some_and(|error| {
+                            error.physical_completion == DriverPhysicalCompletion::Unknown
+                        })
+                    {
                         *state = State::ArchiveRetained { native };
-                        return Err(storage_unknown_failure(error));
+                        return Err(native_result
+                            .err()
+                            .map(storage_unknown_failure)
+                            .unwrap_or_else(SearchSessionFailure::physical_completion_unknown));
                     }
                     let outcome = match storage.as_mut() {
                         Some(storage) => {
@@ -3976,7 +4141,9 @@ impl RoventPcSessionDriver {
                         None => Err(SearchSessionFailure::physical_completion_unknown()),
                     };
                     *state = State::ArchiveRetained { native };
-                    return outcome.and(Err(SearchSessionFailure::physical_completion_unknown()));
+                    return outcome
+                        .and(native_result.map_err(storage_unknown_failure))
+                        .and(Err(SearchSessionFailure::physical_completion_unknown()));
                 }
                 State::Manager(mut manager) => {
                     let actor = shared_actor.as_ref().and_then(|owner| owner.actor.as_ref());
@@ -4161,7 +4328,7 @@ impl Drop for RoventPcSessionDriver {
             .state
             .get_mut()
             .unwrap_or_else(|poison| poison.into_inner());
-        if !matches!(state, State::Closed) {
+        if !matches!(state, State::Closed | State::ClosedFailure { .. }) {
             let retained = std::mem::replace(state, State::Moving);
             std::mem::forget(retained);
             // Preserve the original descriptors with the quarantined physical

@@ -652,6 +652,7 @@ fn finish_role_only_test_native(
         while let Some(event) = sources.native.poll() {
             if let TicketNativeEvent::Finished {
                 physical_shutdown_confirmed: confirmed,
+                ..
             } = event
             {
                 assert!(physical_shutdown_confirmed.replace(confirmed).is_none());
@@ -661,6 +662,7 @@ fn finish_role_only_test_native(
             while let Some(event) = sources.native.poll() {
                 if let TicketNativeEvent::Finished {
                     physical_shutdown_confirmed: confirmed,
+                    ..
                 } = event
                 {
                     assert!(physical_shutdown_confirmed.replace(confirmed).is_none());

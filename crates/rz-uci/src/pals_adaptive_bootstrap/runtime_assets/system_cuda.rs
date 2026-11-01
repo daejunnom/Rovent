@@ -133,6 +133,19 @@ impl SystemCudaStartup {
         until: Instant,
         cancelled: &AtomicBool,
     ) -> Result<Self, BackendError> {
+        Self::capture_and_load_until_with(lock, until, cancelled, OrtRuntime::load_system_cuda)
+    }
+
+    /// Runs bounded, non-native inventory first, and passes the original
+    /// captured system owner to the caller precisely at the ORT load boundary.
+    /// The callback owns the responsibility to register native entry before
+    /// calling ORT. It does not grant a GPU completion fence.
+    pub(crate) fn capture_and_load_until_with(
+        lock: &SystemRuntimeLockV6,
+        until: Instant,
+        cancelled: &AtomicBool,
+        load: impl FnOnce(&SystemRuntime) -> Result<OrtRuntime, BackendError>,
+    ) -> Result<Self, BackendError> {
         let spec = system_spec(lock)?;
         check_cancellation(cancelled)?;
         let remaining = until
@@ -189,7 +202,7 @@ impl SystemCudaStartup {
         }
         // ORT retains the owner even if cancellation arrives while its native
         // initializer is running; no provider or physical completion is inferred.
-        let runtime = OrtRuntime::load_system_cuda(&owner)?;
+        let runtime = load(&owner)?;
         check_cancellation(cancelled)?;
         if !runtime.is_cuda() || runtime.cuda_runtime_identity() != Some(owner.identity_sha256()) {
             return Err(identity_error(

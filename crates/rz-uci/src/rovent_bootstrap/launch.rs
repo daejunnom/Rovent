@@ -68,6 +68,10 @@ pub mod storage;
 mod v2_external;
 mod v2_rejections;
 mod v3;
+#[cfg(target_os = "linux")]
+pub use v3::v3_scope::{RoventV3ScopeKey, V3NativeReobservation, V3ScopeObservation, V3ScopeState, V3ScopeTerminalEvidence, unresolved_keys};
+#[cfg(target_os = "linux")]
+pub use v3::{V3SettledFactoryOwner, V3FactoryOriginalEvent, V3BeforeNativeRecovered, V3BeforeNativeScopeRecovery, V3FactoryPending, V3ControlDirectory};
 pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
@@ -765,7 +769,98 @@ impl ExternalSelectionWire {
 /// The caller passes only process arguments. No account, token or external
 /// credential file is inspected by this native UCI entry.
 pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, None, None)
+    run_inner(arguments, None, None, None, None)
+}
+
+/// A V3 pre-native failure returns its exact original owner to the process
+/// caller. It does not make claims about prior device or process work.
+#[cfg(target_os = "linux")]
+pub enum RoventRetainingLaunchError {
+    Ordinary(RoventLaunchError),
+    Unstarted {
+        error: RoventLaunchError,
+        owner: super::RoventUnstartedNativeCustodyV3,
+    },
+    Settled {
+        error: RoventLaunchError,
+        owner: V3SettledFactoryOwner,
+    },
+    Quarantined {
+        error: RoventLaunchError,
+        owner: RoventQuarantinedLaunchCustody,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl From<RoventLaunchError> for RoventRetainingLaunchError {
+    fn from(error: RoventLaunchError) -> Self {
+        Self::Ordinary(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct RoventQuarantinedLaunchCustody {
+    original: v3::RoventV3QuarantinedOwner,
+}
+#[cfg(target_os = "linux")]
+impl RoventQuarantinedLaunchCustody {
+    /// The key identifies this process-local native owner only; it is not a
+    /// GPU fence or a cross-process authorization.
+    pub fn recovery_key(&self) -> Option<&crate::pals_native::ticketed::TicketNativeRecoveryKey> {
+        self.original.recovery_key()
+    }
+
+    /// Identifies the same process-local scope; it is neither release authority
+    /// nor evidence that any physical operation has completed.
+    pub fn scope_key(&self) -> &RoventV3ScopeKey {
+        self.original.scope_key()
+    }
+
+    /// Original cleanup deadline, not a newly extended execution window.
+    pub fn cleanup_until(&self) -> std::time::Instant {
+        self.original.cleanup_until()
+    }
+
+    /// Observe the same native owner without granting release authority.
+    pub fn reobserve_native(&self, until: std::time::Instant) -> V3NativeReobservation {
+        self.scope_key().reobserve_native(until)
+    }
+
+    /// Retry recovery of this exact pre-native scope; this is not a GPU fence.
+    pub fn recover_before_native(&self, until: std::time::Instant) -> V3BeforeNativeScopeRecovery {
+        self.scope_key().recover_before_native(until)
+    }
+
+    /// Clone only the original verified control directory capability.
+    pub fn clone_original_control_directory(&self) -> V3ControlDirectory {
+        self.scope_key().clone_original_control_directory()
+    }
+}
+#[cfg(target_os = "linux")]
+enum RetainedV3Owner {
+    Unstarted(super::RoventUnstartedNativeCustodyV3),
+    Settled(V3SettledFactoryOwner),
+    Quarantined(RoventQuarantinedLaunchCustody),
+}
+#[cfg(target_os = "linux")]
+type V3OwnerSlot<'a> = Option<&'a mut Option<RetainedV3Owner>>;
+#[cfg(not(target_os = "linux"))]
+type V3OwnerSlot<'a> = Option<&'a mut ()>;
+
+/// Retaining counterpart for the actual V3 process entry; legacy `run`
+/// retains its previous result type and behavior.
+#[cfg(target_os = "linux")]
+pub fn run_retaining(arguments: Vec<String>) -> Result<(), RoventRetainingLaunchError> {
+    let mut owner = None;
+    match run_inner(arguments, None, None, None, Some(&mut owner)) {
+        Ok(()) => Ok(()),
+        Err(error) => match owner {
+            Some(RetainedV3Owner::Unstarted(owner)) => Err(RoventRetainingLaunchError::Unstarted { error, owner }),
+            Some(RetainedV3Owner::Settled(owner)) => Err(RoventRetainingLaunchError::Settled { error, owner }),
+            Some(RetainedV3Owner::Quarantined(owner)) => Err(RoventRetainingLaunchError::Quarantined { error, owner }),
+            None => Err(RoventRetainingLaunchError::Ordinary(error)),
+        },
+    }
 }
 
 /// 같은 원 lock으로 자원 admission을 한 번 수행한 뒤 native launch를 잇는다.
@@ -775,7 +870,7 @@ pub fn run_with_resource_admission<'a>(
     arguments: Vec<String>,
     admit_resource: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, Some(Box::new(admit_resource)), None)
+    run_inner(arguments, None, Some(Box::new(admit_resource)), None, None)
 }
 
 type ResourceAdmission<'a> =
@@ -816,12 +911,167 @@ pub fn run_with_v3_resource_admission<'a>(
         root,
         cwd,
         lock_file,
-        Box::new(admit_resource),
+        ResourceAdmissionV3 {
+            require_control_dir: false,
+            scope_pin: None,
+            is_installed: None,
+            #[cfg(target_os = "linux")]
+            scope_reserved: None,
+            callback: Box::new(move |lock, _root, _file, _until, _cleanup, _control, _path| admit_resource(lock)),
+        },
     )
 }
 
-type ResourceAdmissionV3<'a> =
-    Box<dyn FnOnce(&Arc<RoventInputLockV3>) -> Result<(), RoventLaunchError> + 'a>;
+/// The actual V3 resource owner uses this typed route to receive the original
+/// unstarted or quarantined native scope. This does not grant a GPU fence.
+#[cfg(target_os = "linux")]
+pub fn run_with_v3_resource_admission_retaining<'a>(
+    arguments: Vec<String>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV3>, &Dir, &std::fs::File, std::time::Instant) -> Result<(), RoventLaunchError> + 'a,
+) -> Result<(), RoventRetainingLaunchError> {
+    run_with_v3_resource_admission_retaining_inner(arguments, ResourceAdmissionV3 {
+        require_control_dir: false,
+        scope_pin: None,
+        is_installed: None,
+        scope_reserved: None,
+        callback: Box::new(move |lock, root, file, until, _cleanup, _control, _path| admit_resource(lock, root, file, until)),
+    })
+}
+
+/// The caller retains the same write-once control slot on every return path.
+/// Its control owner must be installed before the callback performs fallible
+/// native-adjacent setup. No completion or release authority is implied.
+#[cfg(target_os = "linux")]
+pub enum ControlledV3Outcome {
+    Returned(Result<(), RoventRetainingLaunchError>),
+    Panic(Box<dyn std::any::Any + Send>),
+}
+
+#[cfg(target_os = "linux")]
+pub enum BeforeControlV3Outcome {
+    Error(RoventLaunchError),
+    Panic(Box<dyn std::any::Any + Send>),
+}
+
+#[cfg(target_os = "linux")]
+pub enum ControlledV3Result<C> {
+    BeforeControl { outcome: BeforeControlV3Outcome },
+    Controlled { original_control: Arc<std::sync::Mutex<C>>, scope_marker: Arc<std::sync::OnceLock<RoventV3ScopeKey>>, outcome: ControlledV3Outcome },
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'static>(
+    arguments: Vec<String>,
+    control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV3>, &Dir, &std::fs::File, std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>, &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>) -> Result<(), RoventLaunchError> + 'a,
+) -> ControlledV3Result<C> {
+    let scope_marker = Arc::new(std::sync::OnceLock::new());
+    if let Some(original_control) = control.get() {
+        return ControlledV3Result::Controlled {
+            original_control: Arc::clone(original_control),
+            scope_marker,
+            outcome: ControlledV3Outcome::Returned(Err(RoventRetainingLaunchError::Ordinary(
+                error("ControlAdmission", "control slot was already installed"),
+            ))),
+        };
+    }
+    let result_control = Arc::clone(&control);
+    let callback_control = Arc::clone(&control);
+    let gate_control = Arc::clone(&control);
+    let marker_for_scope = Arc::clone(&scope_marker);
+    let admitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let arguments = Arguments::parse(&arguments)?;
+        let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
+        let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
+            .map_err(|failure| error("Cwd", failure))?;
+        let lock_file = root.open_with(&arguments.input_lock, cap_std::fs::OpenOptions::new().read(true))
+            .map_err(|failure| error("InputLock", failure))?.into_std();
+        let bytes = read_bounded(&lock_file, MAX_LOCK_BYTES)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| error("InputLock", "UTF-8 input required"))?;
+        let lock = Arc::new(RoventInputLockV3::from_json(text).map_err(|failure| error("InputLock", failure))?);
+        let resource = ResourceAdmissionV3 {
+            require_control_dir: true,
+            scope_pin: Some(Box::new(control)),
+            is_installed: Some(Box::new(move || gate_control.get().is_some())),
+            scope_reserved: Some(Box::new(move |key| {
+                marker_for_scope.set(key.clone()).map_err(|_| error("ControlAdmission", "scope marker already installed"))
+            })),
+            callback: Box::new(move |lock, root, file, start, cleanup, dir, path| {
+                admit_resource(lock, root, file, start, cleanup, dir, path, &callback_control)
+            }),
+        };
+        let original = v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?;
+        Ok::<_, RoventLaunchError>((arguments, original))
+    }));
+    let (arguments, original) = match admitted {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return match result_control.get() {
+            Some(control) => ControlledV3Result::Controlled { original_control: Arc::clone(control), scope_marker, outcome: ControlledV3Outcome::Returned(Err(RoventRetainingLaunchError::Ordinary(error))) },
+            None => ControlledV3Result::BeforeControl { outcome: BeforeControlV3Outcome::Error(error) },
+        },
+        Err(payload) => return match result_control.get() {
+            Some(control) => ControlledV3Result::Controlled { original_control: Arc::clone(control), scope_marker, outcome: ControlledV3Outcome::Panic(payload) },
+            None => ControlledV3Result::BeforeControl { outcome: BeforeControlV3Outcome::Panic(payload) },
+        },
+    };
+    let Some(original_control) = result_control.get().map(Arc::clone) else {
+        return ControlledV3Result::BeforeControl { outcome: BeforeControlV3Outcome::Error(error("ControlAdmission", "control was not installed")) };
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match v3::run_native_admitted(arguments, original) {
+            Ok(()) => Ok(()),
+            Err(v3::RoventV3LaunchFailure::Ordinary(error)) => Err(RoventRetainingLaunchError::Ordinary(error)),
+            Err(v3::RoventV3LaunchFailure::Unstarted { error, owner }) => Err(RoventRetainingLaunchError::Unstarted { error, owner }),
+            Err(v3::RoventV3LaunchFailure::Settled { error, owner }) => Err(RoventRetainingLaunchError::Settled { error, owner }),
+            Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => Err(RoventRetainingLaunchError::Quarantined { error, owner: RoventQuarantinedLaunchCustody { original: owner } }),
+        }
+    })).map_or_else(ControlledV3Outcome::Panic, ControlledV3Outcome::Returned);
+    ControlledV3Result::Controlled { original_control, scope_marker, outcome }
+}
+
+#[cfg(target_os = "linux")]
+fn run_with_v3_resource_admission_retaining_inner<'a>(
+    arguments: Vec<String>, resource: ResourceAdmissionV3<'a>,
+) -> Result<(), RoventRetainingLaunchError> {
+    if arguments == ["--build-capabilities-json"]
+        || arguments == ["--build-system-runtime-capabilities-json"]
+    {
+        return run_retaining(arguments);
+    }
+    let arguments = Arguments::parse(&arguments)?;
+    let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
+    let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
+        .map_err(|failure| error("Cwd", failure))?;
+    let lock_file = root
+        .open_with(&arguments.input_lock, cap_std::fs::OpenOptions::new().read(true))
+        .map_err(|failure| error("InputLock", failure))?
+        .into_std();
+    let bytes = read_bounded(&lock_file, MAX_LOCK_BYTES)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| error("InputLock", "UTF-8 input required"))?;
+    let lock = Arc::new(RoventInputLockV3::from_json(text)
+        .map_err(|failure| error("InputLock", failure))?);
+    match v3::run_native_with_resource_retaining(
+        arguments, lock, root, cwd, lock_file, resource,
+    ) {
+        Ok(()) => Ok(()),
+        Err(v3::RoventV3LaunchFailure::Ordinary(error)) => Err(RoventRetainingLaunchError::Ordinary(error)),
+        Err(v3::RoventV3LaunchFailure::Unstarted { error, owner }) => Err(RoventRetainingLaunchError::Unstarted { error, owner }),
+        Err(v3::RoventV3LaunchFailure::Settled { error, owner }) => Err(RoventRetainingLaunchError::Settled { error, owner }),
+        Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => Err(RoventRetainingLaunchError::Quarantined {
+            error, owner: RoventQuarantinedLaunchCustody { original: owner },
+        }),
+    }
+}
+
+struct ResourceAdmissionV3<'a> {
+    require_control_dir: bool,
+    scope_pin: Option<Box<dyn std::any::Any + Send>>,
+    is_installed: Option<Box<dyn Fn() -> bool + Send + 'a>>,
+    #[cfg(target_os = "linux")]
+    scope_reserved: Option<Box<dyn FnOnce(&RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
+    callback: Box<dyn FnOnce(&Arc<RoventInputLockV3>, &Dir, &std::fs::File, std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>) -> Result<(), RoventLaunchError> + 'a>,
+}
 
 /// The parser retains the actual version and never projects a /2 lock to /1.
 #[derive(Debug)]
@@ -876,6 +1126,7 @@ fn run_inner<'a>(
     collection: Option<CollectionLaunch<'a>>,
     resource_admission: Option<ResourceAdmission<'a>>,
     product_runner: Option<ProductRunner<'a>>,
+    v3_owner_slot: V3OwnerSlot<'_>,
 ) -> Result<(), RoventLaunchError> {
     if arguments == ["--build-system-runtime-capabilities-json"] {
         let sources = super::process_boundary::compiled_process_source_components_v3()
@@ -970,6 +1221,25 @@ fn run_inner<'a>(
                     "InputLockUnsupportedV3",
                     "legacy callbacks cannot consume a /3 lock",
                 ));
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(owner_slot) = v3_owner_slot {
+                return match v3::run_native_retaining(arguments, lock, root, cwd, lock_file) {
+                    Ok(()) => Ok(()),
+                    Err(v3::RoventV3LaunchFailure::Ordinary(error)) => Err(error),
+                    Err(v3::RoventV3LaunchFailure::Unstarted { error, owner }) => {
+                        *owner_slot = Some(RetainedV3Owner::Unstarted(owner));
+                        Err(error)
+                    }
+                    Err(v3::RoventV3LaunchFailure::Settled { error, owner }) => {
+                        *owner_slot = Some(RetainedV3Owner::Settled(owner));
+                        Err(error)
+                    }
+                    Err(v3::RoventV3LaunchFailure::Quarantined { error, owner }) => {
+                        *owner_slot = Some(RetainedV3Owner::Quarantined(RoventQuarantinedLaunchCustody { original: owner }));
+                        Err(error)
+                    }
+                };
             }
             return v3::run_native(arguments, lock, root, cwd, lock_file);
         }
@@ -2150,15 +2420,26 @@ fn reject_factory<Q: NativeQuestionProjection>(
             NativeStartupDiagnosticPhase::Entry,
         );
         let confirmed = drain_native(native, until);
+        // A joined factory that provably never entered the native runtime is
+        // a distinct absence-of-entry result, not a fabricated GPU fence.
+        // Pending/unobserved/unknown states still retain the original owner.
+        let before_native = !confirmed
+            && native.startup_status()
+                == crate::pals_native::ticketed::NativeFactoryStartupStatus::BeforeNative
+            && !native.is_quarantined()
+            && native.try_join() == Ok(true);
+        if before_native {
+            eprintln!("native startup cleanup: original factory joined before native entry");
+        }
         diagnostic.emit(
             NativeStartupDiagnosticStage::FactoryDrain,
-            if confirmed {
+            if confirmed || before_native {
                 NativeStartupDiagnosticPhase::Exit
             } else {
                 NativeStartupDiagnosticPhase::Error
             },
         );
-        !confirmed
+        !(confirmed || before_native)
     }) {
         let _quarantine = Box::leak(Box::new(failure));
         return error("PhysicalCompletionUnknown", detail);

@@ -67,6 +67,95 @@ where
     pub external: RoventExternalSessionSource<RoventInputLockV3>,
 }
 
+/// Observation of the actual /3 source owner only. It carries no native/GPU
+/// fence and is not inferred from a missing receipt or process identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventExternalV3StartObservation {
+    NeverStarted,
+    Unknown,
+}
+
+/// Caller-owned original /3 admission stages. This owns the actual native
+/// service, external FD source and retirement sink; it is not a fence.
+pub struct RoventExternalV3AdmissionCustody<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    common: Option<AdaptiveSessionSources<B>>,
+    researcher: Option<SessionResearcherSource>,
+    retirement_sink: Option<RegisteredProfiledRetirementSink>,
+    driver: Option<AdaptiveSessionDriver<B>>,
+}
+impl<B> Default for RoventExternalV3AdmissionCustody<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    fn default() -> Self {
+        Self {
+            common: None,
+            researcher: None,
+            retirement_sink: None,
+            driver: None,
+        }
+    }
+}
+impl<B> RoventExternalV3AdmissionCustody<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    pub(crate) fn external_start_observation(&self) -> RoventExternalV3StartObservation {
+        if self.driver.is_some() {
+            return RoventExternalV3StartObservation::Unknown;
+        }
+        match self.researcher.as_ref() {
+            Some(SessionResearcherSource::ProfiledExternalV3(external)) => {
+                external.start_observation_v3()
+            }
+            _ => RoventExternalV3StartObservation::Unknown,
+        }
+    }
+    pub(crate) fn install_in_slots(
+        &mut self,
+        common: &mut Option<AdaptiveSessionSources<B>>,
+        external: &mut Option<RoventExternalSessionSource<RoventInputLockV3>>,
+        sink: &mut Option<RegisteredProfiledRetirementSink>,
+    ) -> Result<(), SearchSessionFailure> {
+        if self.common.is_some()
+            || self.researcher.is_some()
+            || self.retirement_sink.is_some()
+            || self.driver.is_some()
+            || common.is_none()
+            || external.is_none()
+            || sink.is_none()
+        {
+            return Err(failure(
+                "RoventExternalV3Custody",
+                "original admission slots are missing or occupied",
+            ));
+        }
+        self.researcher = Some(SessionResearcherSource::ProfiledExternalV3(Box::new(
+            external.take().expect("validated external owner"),
+        )));
+        self.retirement_sink = sink.take();
+        self.common = common.take();
+        Ok(())
+    }
+    pub(crate) fn native_service(
+        &mut self,
+    ) -> Option<&mut TicketedNativeService<ReviewView, AdaptivePortQuestion, B>> {
+        self.common.as_mut().map(|sources| &mut sources.native)
+    }
+    pub(crate) fn driver(&self) -> Option<&AdaptiveSessionDriver<B>> {
+        self.driver.as_ref()
+    }
+    pub(crate) fn take_driver(&mut self) -> Option<AdaptiveSessionDriver<B>> {
+        self.driver.take()
+    }
+}
+
 pub struct RoventExternalSessionAdmissionRejectionV3<B>
 where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
@@ -157,6 +246,53 @@ impl SessionExternalLock for RoventInputLockV3 {
 }
 
 impl<L: SessionExternalLock> RoventExternalSessionSource<L> {
+    /// Prepare metadata while the caller still owns the exact pinned source.
+    /// The destination slot is installed only after every fallible declaration
+    /// check; no process is started here.
+    pub(crate) fn from_pinned_in_slots(
+        source: &mut Option<RoventPinnedExternalRSource<L>>,
+        destination: &mut Option<Self>,
+    ) -> Result<(), CheckerError> {
+        if destination.is_some() {
+            return Err(CheckerError::Invalid(
+                "external source destination already occupied",
+            ));
+        }
+        let external = source
+            .as_ref()
+            .ok_or(CheckerError::Invalid("original external source absent"))?;
+        if external.source_purpose() != RoventExternalPurpose::ResearchChecker {
+            return Err(CheckerError::Invalid(
+                "external session requires the original researcher source",
+            ));
+        }
+        let checker = external.checker_declaration()?;
+        let admission = checker.profiled_researcher_admission()?;
+        let declaration = AdaptiveCheckerMetadata::capture(&checker)?;
+        let input_lock = external.input_lock_digest();
+        let (canonical_profile, capability) = external.launch_identities();
+        let canonical_profile = canonical_profile.to_owned();
+        let capability = capability.to_owned();
+        let (launch, _profile_bytes, executable, working_directory, custody) = source
+            .take()
+            .expect("validated original external source")
+            .into_parts();
+        *destination = Some(Self {
+            input_lock,
+            canonical_profile,
+            capability,
+            state: ExternalProcessState::Dormant(DormantExternalSource {
+                launch,
+                executable,
+                working_directory,
+            }),
+            custody: Some(custody),
+            declaration,
+            admission: Some(admission),
+            shutdown: None,
+        });
+        Ok(())
+    }
     // A rejected preparation returns its original source/FD custody without
     // allocating a replacement error owner on the failure path.
     #[allow(clippy::result_large_err)]
@@ -573,6 +709,17 @@ impl RoventExternalSessionSource<RoventInputLockV2> {
 }
 
 impl RoventExternalSessionSource<RoventInputLockV3> {
+    pub(crate) fn start_observation_v3(&self) -> RoventExternalV3StartObservation {
+        if matches!(self.state, ExternalProcessState::Dormant(_))
+            && self.custody.is_some()
+            && self.admission.is_some()
+            && self.shutdown.is_none()
+        {
+            RoventExternalV3StartObservation::NeverStarted
+        } else {
+            RoventExternalV3StartObservation::Unknown
+        }
+    }
     pub(super) fn same_original_lock(&self, original: &Arc<RoventInputLockV3>) -> bool {
         match &self.state {
             ExternalProcessState::Returned(source) => source
@@ -619,6 +766,70 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// Validate the same /3 owners in their caller-provided slots and install
+    /// the resulting driver before any post-admission root-policy callback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_rovent_external_v3_in_custody(
+        custody: &mut RoventExternalV3AdmissionCustody<B>,
+        options: AdaptiveSessionOptions,
+        limits: AdaptiveExecutionLimits,
+        clock: ProcessClock,
+        issuer: AdaptiveRulesOwnerIssuer,
+        registration: PalsCheckerRegistration,
+        profile: RoventPcrSessionProfileV3,
+        lock: Arc<RoventInputLockV3>,
+        root_policy: crate::rovent_root_admission::RoventRootAdmissionPolicy,
+    ) -> Result<(), SearchSessionFailure> {
+        if custody.driver.is_some() {
+            return Err(failure(
+                "RoventExternalV3Custody",
+                "driver destination occupied",
+            ));
+        }
+        let common = custody
+            .common
+            .as_ref()
+            .ok_or_else(|| failure("RoventExternalV3Custody", "native owner absent"))?;
+        let external = match custody.researcher.as_ref() {
+            Some(SessionResearcherSource::ProfiledExternalV3(external)) => external,
+            _ => {
+                return Err(failure(
+                    "RoventExternalV3Custody",
+                    "original external owner absent",
+                ));
+            }
+        };
+        let sink = custody
+            .retirement_sink
+            .as_ref()
+            .ok_or_else(|| failure("RoventExternalV3Custody", "retirement owner absent"))?;
+        let profile = SessionPcrProfile::LateBound(profile);
+        external.validate_declaration(&profile, common)?;
+        if sink.admission_closed() {
+            return Err(failure(
+                "RoventExternalRetirementSink",
+                "original durable evidence sink admission is closed",
+            ));
+        }
+        let driver = Self::admit_with_researcher_source_in_slots(
+            options,
+            limits,
+            &mut custody.common,
+            clock,
+            issuer,
+            registration,
+            None,
+            None,
+            AdaptiveSessionCollectionHooks::default(),
+            true,
+            &mut custody.researcher,
+        )?;
+        custody.driver = Some(driver);
+        let driver = custody.driver.as_mut().expect("original driver installed");
+        driver.rovent = Some(profile);
+        driver.profiled_retirement_sink = Mutex::new(custody.retirement_sink.take());
+        driver.register_rovent_root_policy_v3(lock, root_policy)
+    }
     /// /2 is admitted only with its retained pinned researcher and /2 root
     /// policy. Collection needs its own original-owner join and stays closed.
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]

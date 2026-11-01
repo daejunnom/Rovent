@@ -264,6 +264,20 @@ impl<L: ExternalNativeInputLock> RoventPinnedExternalRSource<L> {
         &self.source_profile
     }
 
+    /// Borrow the original pinned declaration before moving any held FD.
+    /// This starts no external process and grants no completion authority.
+    pub(crate) fn checker_declaration(
+        &self,
+    ) -> Result<rz_search::external_cpu::ExternalUciCpuChecker, CheckerError> {
+        self.prepared.checker_declaration()
+    }
+    pub(crate) fn launch_identities(&self) -> (&str, &str) {
+        (
+            self.prepared.canonical_sha256(),
+            self.prepared.capability_sha256(),
+        )
+    }
+
     /// Exact /3 query selection and the original external slice quantum. No
     /// limits are inferred from depth/node options or silently reduced.
     pub fn question_policy(&self) -> Result<(ExternalGoConstraint, Duration), BackendError> {

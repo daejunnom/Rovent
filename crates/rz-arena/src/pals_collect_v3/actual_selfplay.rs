@@ -173,6 +173,7 @@ fn actual_hooks_v3(
                 .map_err(|e| AdaptiveBootstrapError {
                     stage: "CollectionTeacherSource",
                     detail: e.to_string(),
+                    cleanup_failures: None,
                 })
         }),
         root_admission: Arc::new(move |manager| {
