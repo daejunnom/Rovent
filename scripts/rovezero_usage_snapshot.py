@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -26,6 +27,10 @@ DEFAULT_THRESHOLD_BYTES = 18 * 1024 ** 3
 _last_check = float('-inf')
 _last_warning = None
 CHECK_INTERVAL_SECONDS = 60
+WINDOWS_REFRESH_TASK = 'RoveZero Total Storage Warning'
+WINDOWS_TASK_RUNNER = Path('/mnt/c/Windows/System32/schtasks.exe')
+WINDOWS_REFRESH_STATE = 'windows-refresh.state'
+MIRROR_CONFIG = 'paired-mirror.json'
 
 
 def read_snapshot(path=SNAPSHOT, *, now=None, max_age_seconds=MAX_AGE_SECONDS,
@@ -66,10 +71,44 @@ def read_snapshot(path=SNAPSHOT, *, now=None, max_age_seconds=MAX_AGE_SECONDS,
         age = (time.time() if now is None else now) - observed.timestamp()
         if age < -60 or age > max_age_seconds:
             return {'decision': 'unknown', 'reason': 'stale_or_future', 'age_seconds': int(age)}
+        # A Windows scan can finish after the Linux timer has published its
+        # snapshot. Re-read only the tiny, previously configured mirror here;
+        # never traverse the storage trees on an engine startup path.
+        config = _read_mirror_config(Path(path).parent, require_root_owner=require_root_owner)
+        mirror = (config['directory'] if config is not None
+                  and value.get('_mirror_revision') == config['revision'] else None)
+        source = value
+        if value.get('scope') == 'paired_observations_not_host_physical_total':
+            source = value.get('_linux_observation')
+            if not _valid_linux_observation(source, value, now=now, max_age_seconds=max_age_seconds):
+                source = None
+        if source is not None and mirror is not None:
+            paired = paired_observation(mirror, source, now=now, max_age_seconds=max_age_seconds)
+            if paired is not None:
+                paired['windows_refresh'] = 'paired'
+                return paired
         return value
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _valid_linux_observation(source, paired, *, now, max_age_seconds):
+    """Recombine only a fresh raw Linux sample embedded in the paired total."""
+    try:
+        if (not isinstance(source, dict) or source.get('schema') != SCHEMA
+                or source.get('scope') == 'paired_observations_not_host_physical_total'
+                or source.get('threshold_bytes') != paired['threshold_bytes']
+                or source.get('origin_proof') != paired.get('origin_proof')
+                or source.get('allocated_measure') != paired['allocated_measure']
+                or any(type(source.get(k)) is not int or source[k] < 0
+                       for k in ('allocated_bytes_lower_bound', 'logical_bytes_lower_bound'))):
+            return False
+        observed = datetime.fromisoformat(source['observed_at_utc'])
+        age = (time.time() if now is None else now) - observed.timestamp()
+        return observed.tzinfo is not None and -60 <= age <= max_age_seconds
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def _current_total_usage():
@@ -214,7 +253,7 @@ def warn_cached_total_usage():
         public = {key: value[key] for key in ('decision', 'reason', 'coverage',
                   'allocated_bytes_lower_bound', 'logical_bytes_lower_bound',
                   'threshold_bytes', 'observed_at_utc', 'source_observed_at_utc',
-                  'scope', 'windows_source_scope', 'age_seconds') if key in value}
+                  'scope', 'windows_source_scope', 'windows_refresh', 'age_seconds') if key in value}
         if isinstance(value.get('components'), dict):
             public['source_observed_at_utc'] = {
                 name: row.get('observed_at_utc', 'unknown')
@@ -223,7 +262,10 @@ def warn_cached_total_usage():
             }
             public['aggregation'] = value.get('aggregation', 'unknown')
         signature = (public.get('decision'), public.get('reason'), public.get('coverage'),
-                     public.get('observed_at_utc'))
+                     public.get('observed_at_utc'), public.get('scope'),
+                     public.get('windows_refresh'), public.get('allocated_bytes_lower_bound'),
+                     public.get('logical_bytes_lower_bound'),
+                     json.dumps(public.get('source_observed_at_utc'), sort_keys=True))
         if signature == _last_warning:
             return
         sys.stderr.write('rovezero_storage_total_warning: '
@@ -261,7 +303,7 @@ def default_roots_and_discovery(home_parent=Path('/home'), root_cache_parent=Pat
     return roots, parents
 
 
-def _publish(path, value):
+def _publish(path, value, *, mode=0o644):
     path = Path(path)
     payload = (json.dumps(value, sort_keys=True) + '\n').encode('utf-8')
     parent = path.parent
@@ -276,10 +318,10 @@ def _publish(path, value):
                 or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)):
             raise ValueError('snapshot_parent_changed')
         fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                     0o644, dir_fd=directory)
+                     mode, dir_fd=directory)
         try:
             with os.fdopen(fd, 'wb') as f:
-                os.fchmod(f.fileno(), 0o644)
+                os.fchmod(f.fileno(), mode)
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
@@ -291,6 +333,38 @@ def _publish(path, value):
                 pass
     finally:
         os.close(directory)
+
+
+def _read_mirror_config(parent, *, require_root_owner=True):
+    """Read root-private local configuration without exposing paths in totals."""
+    fd = None
+    try:
+        fd = os.open(Path(parent) / MIRROR_CONFIG, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077
+                or info.st_size > MAX_BYTES or (require_root_owner and info.st_uid != 0)):
+            return None
+        with os.fdopen(fd, 'rb') as stream:
+            fd = None
+            raw = stream.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            return None
+        value = json.loads(raw)
+        if (not isinstance(value, dict) or set(value) != {'schema', 'directory', 'revision'}
+                or value['schema'] != 'rovezero.paired-mirror-config.v1'):
+            return None
+        directory = value['directory']
+        revision = value['revision']
+        if (not isinstance(directory, str) or len(directory) > 4096 or not Path(directory).is_absolute()
+                or not isinstance(revision, str) or len(revision) != 32
+                or any(ch not in '0123456789abcdef' for ch in revision)):
+            return None
+        return value
+    except (OSError, ValueError, TypeError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def origin_proof(result, pair_id):
@@ -331,7 +405,7 @@ def origin_proof(result, pair_id):
         return None
 
 
-def paired_observation(mirror_dir, linux, *, now=None):
+def paired_observation(mirror_dir, linux, *, now=None, max_age_seconds=MAX_AGE_SECONDS):
     """Read a paired Windows snapshot only as a bounded advisory observation.
 
     The Windows observer has already checked the configured VHD and root
@@ -373,7 +447,7 @@ def paired_observation(mirror_dir, linux, *, now=None):
         current = time.time() if now is None else now
         for component in (left, right):
             observed = datetime.fromisoformat(component['observed_at_utc'])
-            if observed.tzinfo is None or not -60 <= current - observed.timestamp() <= MAX_AGE_SECONDS:
+            if observed.tzinfo is None or not -60 <= current - observed.timestamp() <= max_age_seconds:
                 return None
             for key in ('allocated_bytes_lower_bound', 'logical_bytes_lower_bound'):
                 if type(component[key]) is not int or component[key] < 0:
@@ -398,6 +472,68 @@ def paired_observation(mirror_dir, linux, *, now=None):
         return result
     except (OSError, ValueError, TypeError, KeyError, OverflowError):
         return None
+
+
+def request_windows_refresh_once(state_parent, linux, *, runner=WINDOWS_TASK_RUNNER):
+    """Request the existing Windows observer once per paired Linux boot.
+
+    This is advisory and runs in the low-priority timer, never in a product
+    admission path. Persist the attempt before starting the short-lived task
+    request so interruption cannot create an unbounded stream of processes.
+    """
+    import fcntl
+    proof = linux.get('origin_proof')
+    if not isinstance(proof, dict) or not proof.get('single_linux_device'):
+        return 'pair_identity_unknown'
+    tags = [proof.get('pair_tag'), proof.get('boot_tag')]
+    if any(not isinstance(tag, str) or len(tag) != 64
+           or any(ch not in '0123456789abcdef' for ch in tag) for tag in tags):
+        return 'pair_identity_unknown'
+    directory = fd = None
+    try:
+        directory = os.open(state_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(WINDOWS_REFRESH_STATE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=directory)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 256):
+            return 'state_unavailable'
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 'request_in_progress'
+        named = os.stat(WINDOWS_REFRESH_STATE, dir_fd=directory, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+            return 'state_unavailable'
+        identity = (tags[0] + ':' + tags[1]).encode('ascii')
+        previous = os.read(fd, 257)
+        if previous == identity:
+            # The process might have stopped after recording the attempt but
+            # before Windows received it. Do not claim delivery occurred.
+            return 'attempt_already_recorded'
+        if previous and (len(previous) != 129 or previous[64:65] != b':'
+                         or any(ch not in b'0123456789abcdef' for ch in previous[:64] + previous[65:])):
+            # A partial state write is uncertain. Never start a second task
+            # from an unreadable previous attempt.
+            return 'state_unavailable'
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.write(fd, identity) != len(identity):
+            return 'state_unavailable'
+        os.ftruncate(fd, len(identity))
+        os.fsync(fd)
+        try:
+            result = subprocess.run([str(runner), '/Run', '/TN', WINDOWS_REFRESH_TASK],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=5, check=False)
+            return 'requested' if result.returncode == 0 else 'request_failed'
+        except (OSError, subprocess.SubprocessError):
+            return 'request_failed'
+    except (OSError, ValueError):
+        return 'state_unavailable'
+    finally:
+        for handle in (fd, directory):
+            if handle is not None:
+                os.close(handle)
 
 
 def create_snapshot(path=SNAPSHOT, *, extra_roots=(), max_entries=2_000_000,
@@ -432,6 +568,7 @@ def create_snapshot(path=SNAPSHOT, *, extra_roots=(), max_entries=2_000_000,
     path = Path(path)
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     local_value = value
+    paired_value = None
     if mirror_dir is not None:
         # Configured only by the root-owned systemd environment. Publish totals
         # only, and never follow a redirected mirror directory. An unavailable
@@ -441,11 +578,28 @@ def create_snapshot(path=SNAPSHOT, *, extra_roots=(), max_entries=2_000_000,
             if not mirror.is_absolute() or mirror.resolve(strict=True) != mirror or not mirror.is_dir():
                 raise ValueError('invalid_mirror_directory')
             _publish(mirror / 'linux.json', value)
-            local_value = paired_observation(mirror, value) or value
+            revision = uuid.uuid4().hex
+            _publish(path.parent / MIRROR_CONFIG,
+                     {'schema': 'rovezero.paired-mirror-config.v1', 'directory': str(mirror),
+                      'revision': revision},
+                     mode=0o600)
+            paired = paired_observation(mirror, value)
+            # Preserve the raw Linux sample separately, so an updated Windows
+            # sample can be combined without counting Windows twice. Users
+            # unable to read the root-private mirror configuration can still
+            # consume the already-paired public total.
+            local_value = dict(paired or value)
+            local_value['_mirror_revision'] = revision
+            if paired:
+                local_value['_linux_observation'] = value
+            local_value['windows_refresh'] = ('not_needed' if paired else
+                request_windows_refresh_once(path.parent, value))
+            if paired:
+                paired_value = dict(paired, windows_refresh='paired')
         except Exception:
             print('rovezero_total_usage_mirror=unavailable', file=sys.stderr)
     _publish(path, local_value)
-    return local_value
+    return paired_value or local_value
 
 
 def main():

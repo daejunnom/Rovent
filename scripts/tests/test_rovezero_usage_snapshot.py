@@ -215,6 +215,150 @@ class SnapshotTests(unittest.TestCase):
             self.tmp.name, dict(linux, origin_proof=dict(proof, boot_tag='4' * 64)), now=1001))
         self.assertIsNone(usage.paired_observation(self.tmp.name, linux, now=5000))
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory snapshot')
+    def test_cached_linux_snapshot_rechecks_later_windows_pair_without_rescan(self):
+        proof = {'pair_tag': '1' * 64, 'machine_tag': '2' * 64,
+                 'boot_tag': '3' * 64, 'single_linux_device': True}
+        row = {'observed_at_utc': datetime.fromtimestamp(1000, timezone.utc).isoformat(),
+               'allocated_bytes_lower_bound': 10, 'logical_bytes_lower_bound': 10,
+               'allocated_measure': 'sum_of_observed_unique_file_reported_allocations'}
+        combined = {'schema': 'rovezero.total-usage-combined-snapshot.v1',
+                    'aggregation': 'disjoint_sum', 'pairing_status': 'verified_at_scan',
+                    'allocated_measure': row['allocated_measure'],
+                    'components': {'linux': dict(row, origin_proof=proof), 'windows': dict(row)}}
+        (Path(self.tmp.name) / 'combined.json').write_text(json.dumps(combined), encoding='utf-8')
+        revision = 'e' * 32
+        usage._publish(Path(self.tmp.name) / usage.MIRROR_CONFIG,
+                       {'schema': 'rovezero.paired-mirror-config.v1', 'directory': self.tmp.name,
+                        'revision': revision}, mode=0o600)
+        self.write(dict(self.value, decision='unknown', threshold_bytes=18,
+                        allocated_bytes_lower_bound=10, logical_bytes_lower_bound=10,
+                        origin_proof=proof, _mirror_revision=revision))
+        paired = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
+        self.assertEqual((paired['allocated_bytes_lower_bound'], paired['decision']), (20, 'exceeded'))
+        self.assertEqual(paired['windows_refresh'], 'paired')
+        raw_linux = dict(self.value, decision='unknown', threshold_bytes=18,
+                         allocated_bytes_lower_bound=10, logical_bytes_lower_bound=10,
+                         origin_proof=proof, scope='linux_only', _mirror_revision=revision)
+        self.write(dict(paired, _linux_observation=raw_linux))
+        twice = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
+        self.assertEqual(twice['allocated_bytes_lower_bound'], 20)
+        with mock.patch.object(usage, '_read_mirror_config', return_value=None):
+            unprivileged = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
+        self.assertEqual(unprivileged['allocated_bytes_lower_bound'], 20)
+        self.write(dict(raw_linux, _mirror_revision='f' * 32))
+        stale_config = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
+        self.assertEqual((stale_config['allocated_bytes_lower_bound'], stale_config['decision']), (10, 'unknown'))
+        without_config = dict(raw_linux)
+        without_config.pop('_mirror_revision')
+        self.write(without_config)
+        removed_config = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
+        self.assertEqual((removed_config['allocated_bytes_lower_bound'], removed_config['decision']), (10, 'unknown'))
+        self.write(raw_linux)
+        combined['components']['linux']['origin_proof']['boot_tag'] = '4' * 64
+        (Path(self.tmp.name) / 'combined.json').write_text(json.dumps(combined), encoding='utf-8')
+        local = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
+        self.assertEqual((local['allocated_bytes_lower_bound'], local['decision']), (10, 'unknown'))
+        # Older or externally supplied already-paired snapshots must not add
+        # the same Windows bytes a second time.
+        self.write(dict(self.value, decision='unknown', threshold_bytes=25,
+                        allocated_bytes_lower_bound=20, logical_bytes_lower_bound=20,
+                        scope='paired_observations_not_host_physical_total',
+                        origin_proof=proof, _mirror_revision=revision))
+        already_paired = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
+        self.assertEqual((already_paired['allocated_bytes_lower_bound'], already_paired['decision']),
+                         (20, 'unknown'))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory snapshot')
+    def test_scan_preserves_raw_linux_alongside_existing_windows_pair(self):
+        root = Path(self.tmp.name) / 'source'
+        mirror = Path(self.tmp.name) / 'mirror'
+        root.mkdir()
+        mirror.mkdir()
+        (root / 'file').write_bytes(b'content')
+        proof = {'pair_tag': '1' * 64, 'machine_tag': '2' * 64,
+                 'boot_tag': '3' * 64, 'single_linux_device': True}
+
+        def paired(_mirror, linux):
+            return dict(linux, allocated_bytes_lower_bound=linux['allocated_bytes_lower_bound'] + 10,
+                        scope='paired_observations_not_host_physical_total')
+
+        with mock.patch.object(usage, 'default_roots_and_discovery', return_value=([root], [])), \
+             mock.patch.object(usage, 'origin_proof', return_value=proof), \
+             mock.patch.object(usage, 'paired_observation', side_effect=paired), \
+             mock.patch.object(usage, 'request_windows_refresh_once') as request:
+            published = usage.create_snapshot(self.path, mirror_dir=mirror, pair_id='configured')
+        stored = json.loads(self.path.read_text(encoding='utf-8'))
+        self.assertEqual(published['allocated_bytes_lower_bound'], stored['allocated_bytes_lower_bound'])
+        self.assertEqual(stored['allocated_bytes_lower_bound'],
+                         stored['_linux_observation']['allocated_bytes_lower_bound'] + 10)
+        self.assertEqual(stored['scope'], 'paired_observations_not_host_physical_total')
+        self.assertNotIn(str(mirror), json.dumps(stored))
+        self.assertEqual((Path(self.tmp.name) / usage.MIRROR_CONFIG).stat().st_mode & 0o777, 0o600)
+        request.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory snapshot')
+    def test_scan_disabling_mirror_never_reuses_previous_configuration(self):
+        root = Path(self.tmp.name) / 'source'
+        mirror = Path(self.tmp.name) / 'mirror'
+        root.mkdir()
+        mirror.mkdir()
+        (root / 'file').write_bytes(b'content')
+        proof = {'pair_tag': '1' * 64, 'machine_tag': '2' * 64,
+                 'boot_tag': '3' * 64, 'single_linux_device': True}
+        row = {'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+               'allocated_bytes_lower_bound': 1000, 'logical_bytes_lower_bound': 1000,
+               'allocated_measure': 'sum_of_observed_unique_file_reported_allocations'}
+        combined = {'schema': 'rovezero.total-usage-combined-snapshot.v1',
+                    'aggregation': 'disjoint_sum', 'pairing_status': 'verified_at_scan',
+                    'allocated_measure': row['allocated_measure'],
+                    'components': {'linux': dict(row, origin_proof=proof), 'windows': dict(row)}}
+        (mirror / 'combined.json').write_text(json.dumps(combined), encoding='utf-8')
+        with mock.patch.object(usage, 'default_roots_and_discovery', return_value=([root], [])), \
+             mock.patch.object(usage, 'origin_proof', return_value=proof):
+            usage.create_snapshot(self.path, mirror_dir=mirror, pair_id='configured')
+            first = json.loads(self.path.read_text(encoding='utf-8'))
+            private = json.loads((Path(self.tmp.name) / usage.MIRROR_CONFIG).read_text(encoding='utf-8'))
+            self.assertEqual(first['_mirror_revision'], private['revision'])
+            usage.create_snapshot(self.path, pair_id='configured')
+        second = usage.read_snapshot(self.path, require_root_owner=False)
+        self.assertNotIn('_mirror_revision', second)
+        self.assertEqual(second['scope'], 'default_rovezero_caches_siblings_and_var_tmp_xdg_exceptions_unknown')
+        self.assertTrue((Path(self.tmp.name) / usage.MIRROR_CONFIG).exists())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory flock')
+    def test_windows_refresh_requests_once_per_pair_boot_and_failure_is_advisory(self):
+        proof = {'pair_tag': 'a' * 64, 'boot_tag': 'b' * 64, 'single_linux_device': True}
+        linux = {'origin_proof': proof}
+        with mock.patch.object(usage.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(usage.request_windows_refresh_once(self.tmp.name, linux), 'requested')
+            self.assertEqual(usage.request_windows_refresh_once(self.tmp.name, linux), 'attempt_already_recorded')
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][1:], ['/Run', '/TN', usage.WINDOWS_REFRESH_TASK])
+        other = {'origin_proof': dict(proof, boot_tag='c' * 64)}
+        with mock.patch.object(usage.subprocess, 'run', side_effect=OSError):
+            self.assertEqual(usage.request_windows_refresh_once(self.tmp.name, other), 'request_failed')
+            self.assertEqual(usage.request_windows_refresh_once(self.tmp.name, other), 'attempt_already_recorded')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory flock')
+    def test_windows_refresh_rejects_symlink_or_damaged_state_without_running_task(self):
+        target = self.path.with_name('victim')
+        target.write_text('unchanged', encoding='utf-8')
+        state = Path(self.tmp.name) / usage.WINDOWS_REFRESH_STATE
+        state.symlink_to(target)
+        linux = {'origin_proof': {'pair_tag': 'a' * 64, 'boot_tag': 'b' * 64,
+                                  'single_linux_device': True}}
+        with mock.patch.object(usage.subprocess, 'run') as run:
+            self.assertEqual(usage.request_windows_refresh_once(self.tmp.name, linux), 'state_unavailable')
+            run.assert_not_called()
+        self.assertEqual(target.read_text(encoding='utf-8'), 'unchanged')
+        state.unlink()
+        state.write_bytes(b'partial')
+        state.chmod(0o600)
+        with mock.patch.object(usage.subprocess, 'run') as run:
+            self.assertEqual(usage.request_windows_refresh_once(self.tmp.name, linux), 'state_unavailable')
+            run.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
