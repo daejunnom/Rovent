@@ -932,6 +932,7 @@ mod metadata {
                 StartupConfigurationDocument::V2(_) => ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN,
                 StartupConfigurationDocument::V3(_) => ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
                 StartupConfigurationDocument::V4(_) => ROVENT_STARTUP_CONFIGURATION_V4_DOMAIN,
+                StartupConfigurationDocument::V5(_) => rz_experiments::ROVENT_STARTUP_DOCUMENT_V5_DOMAIN,
             },
             source_configuration: byte_pin(bytes),
             canonical_configuration: byte_pin(&canonical),
