@@ -9,6 +9,8 @@ use rz_position::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "archive-origin-diagnostics")]
+pub use super::engine::archive_lifecycle::ArchiveRecordOrigin;
 use super::engine::{RecordKind, RoleQueryPurpose, RoleRecord};
 use super::store::{
     EvidenceScope, Move16, ObservationId, ObservationKind, PalsStores, StateId, StoreError,
@@ -214,6 +216,10 @@ pub struct ReviewView {
     cohort_cpu7_binding: Option<[u8; 32]>,
     records: Vec<RoleRecord>,
     metadata: Vec<ReviewRecordMetadata>,
+    // Optional diagnostic evidence, aligned with selected records if present.
+    // It never authorizes a load, selection, submission, or consumption.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    archive_origins: Vec<Option<ArchiveRecordOrigin>>,
     anchors: Vec<ReviewAnchor>,
     // 원 selected-record 순서의 source 이력이다. 모델 입력·seal의 추가 feature가
     // 아니며 native 수집과 NNUEC 준비가 같은 immutable backing을 공유한다.
@@ -253,6 +259,15 @@ impl ReviewView {
     }
     pub fn records_metadata(&self) -> &[ReviewRecordMetadata] {
         &self.metadata
+    }
+    /// Bounded historical provenance for an actually selected record. Store
+    /// and archive owners matched when this view was formed, not necessarily
+    /// when this getter is called. `None` is unknown, not evidence of a hot
+    /// origin. This is not submission or physical-completion evidence and it
+    /// does not issue a Store capability.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub fn selected_archive_origin(&self, index: usize) -> Option<&ArchiveRecordOrigin> {
+        self.archive_origins.get(index).and_then(Option::as_ref)
     }
     pub fn anchors(&self) -> &[ReviewAnchor] {
         &self.anchors
@@ -347,6 +362,14 @@ impl ReviewView {
     /// physical sharing is deliberately not guessed from Arc identities.
     pub fn owned_host_bytes(&self) -> Option<u64> {
         let mut bytes = std::mem::size_of::<Self>();
+        #[cfg(feature = "archive-origin-diagnostics")]
+        {
+            bytes = bytes.checked_add(
+                self.archive_origins
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Option<ArchiveRecordOrigin>>())?,
+            )?;
+        }
         for backing in [
             self.records
                 .capacity()
@@ -456,6 +479,8 @@ struct IndexedRecord {
     record: RoleRecord,
     evidence: Option<ObservationId>,
     bundle: u64,
+    #[cfg(feature = "archive-origin-diagnostics")]
+    archive_origin: Option<ArchiveRecordOrigin>,
 }
 
 /// The single Search writer updates only the changed record/bundle. Selection
@@ -544,6 +569,43 @@ impl ReviewContextIndex {
             return Err(ReviewError::OwnerMismatch);
         }
         Ok(())
+    }
+    /// Called only for a newly installed source record after the load owner has
+    /// completed installation, release and re-pinning. Existing entries are
+    /// never relabelled unless the caller has established that the entry was
+    /// absent before that same load. Failure is diagnostic-only.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub(crate) fn attach_archive_origin(
+        &mut self,
+        stores: &PalsStores,
+        original: &RoleRecord,
+        origin: ArchiveRecordOrigin,
+    ) {
+        if self.check_owner(stores).is_err() || !origin.matches_original(stores, original) {
+            return;
+        }
+        let Some(entry) = self.records.get_mut(&original.revision) else {
+            return;
+        };
+        let current = &entry.record;
+        // `critical` is deliberately mutable index state and can differ after
+        // normal root refresh or another publication of the same kind.
+        if entry.archive_origin.is_some()
+            || current.revision != original.revision
+            || current.parent_revision != original.parent_revision
+            || current.supersedes_revision != original.supersedes_revision
+            || current.origin_state != original.origin_state
+            || current.kind != original.kind
+            || current.line != original.line
+            || current.value != original.value
+            || current.completed_depth != original.completed_depth
+            || current.score_scope != original.score_scope
+            || current.cpu_observation != original.cpu_observation
+            || current.perspective != original.perspective
+        {
+            return;
+        }
+        entry.archive_origin = Some(origin);
     }
     /// Preserve the existing bounded projection during idle Store maintenance.
     /// This is not a submitted view, another lease, or consumption authority.
@@ -779,6 +841,8 @@ impl ReviewContextIndex {
                 record: record.clone(),
                 evidence,
                 bundle: id,
+                #[cfg(feature = "archive-origin-diagnostics")]
+                archive_origin: None,
             },
         );
         if self.owner.is_none() {
@@ -971,6 +1035,10 @@ impl ReviewContextIndex {
         }
         let mut records = Vec::new();
         let mut metadata = Vec::new();
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let mut archive_origins = Vec::new();
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let mut archive_origins_unavailable = false;
         let mut source_snapshots = Vec::new();
         let mut selected_bundles = Vec::new();
         let mut cpu7_original_bundle = None;
@@ -1164,6 +1232,28 @@ impl ReviewContextIndex {
                 .collect();
             for (revision, offset) in revisions.iter().zip(offsets) {
                 let entry = &self.records[revision];
+                #[cfg(feature = "archive-origin-diagnostics")]
+                if !archive_origins_unavailable {
+                    let origin = entry
+                        .archive_origin
+                        .as_ref()
+                        .filter(|origin| origin.matches_owner(stores));
+                    if archive_origins.is_empty() && origin.is_some() {
+                        if archive_origins
+                            .try_reserve_exact(usize::from(policy.max_records))
+                            .is_err()
+                        {
+                            archive_origins_unavailable = true;
+                        } else {
+                            archive_origins.resize_with(records.len(), || None);
+                        }
+                    }
+                    if !archive_origins_unavailable
+                        && (origin.is_some() || !archive_origins.is_empty())
+                    {
+                        archive_origins.push(origin.cloned());
+                    }
+                }
                 let mut selected = entry.record.clone();
                 selected.line = selected.line[offset..].to_vec();
                 selected.origin_state = anchors[anchor_index].state;
@@ -1233,6 +1323,8 @@ impl ReviewContextIndex {
             cohort_cpu7_binding,
             records,
             metadata,
+            #[cfg(feature = "archive-origin-diagnostics")]
+            archive_origins,
             anchors,
             source_snapshots: source_snapshots.into(),
             query,
@@ -1408,6 +1500,22 @@ impl ReviewContextIndex {
         let cohort_cpu7_binding = source.cohort_cpu7.as_ref().map(|original| {
             cohort_cpu7_view_binding(original.digest(), source.policy.digest(), digest, seal)
         });
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let archive_origins = {
+            let mut origins = Vec::new();
+            if origins
+                .try_reserve_exact(source.archive_origins.len())
+                .is_ok()
+            {
+                origins.extend(source.archive_origins.iter().map(|origin| {
+                    origin
+                        .as_ref()
+                        .filter(|origin| origin.matches_owner(stores))
+                        .cloned()
+                }));
+            }
+            origins
+        };
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
             sequence,
@@ -1418,6 +1526,8 @@ impl ReviewContextIndex {
             cohort_cpu7_binding,
             records: source.records.clone(),
             metadata: source.metadata.clone(),
+            #[cfg(feature = "archive-origin-diagnostics")]
+            archive_origins,
             anchors: source.anchors.clone(),
             source_snapshots: Arc::clone(&source.source_snapshots),
             query,

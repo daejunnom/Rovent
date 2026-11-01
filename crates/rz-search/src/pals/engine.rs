@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 pub mod adaptive_port;
 pub mod adaptive_root;
-mod archive_lifecycle;
+pub(crate) mod archive_lifecycle;
 mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;

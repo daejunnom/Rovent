@@ -14,6 +14,46 @@ pub(super) const SEARCH_ARCHIVE_IO_BYTES: u64 = 16 * 1024 * 1024;
 const NODE_METADATA_BYTES: usize = 4096;
 const NODE_METADATA_MAGIC: &[u8; 8] = b"RZENGN01";
 
+/// Non-authoritative, bounded observation of one newly restored original
+/// record. It never owns archive files, store pins, or submission authority.
+#[cfg(feature = "archive-origin-diagnostics")]
+#[derive(Clone, Debug)]
+pub struct ArchiveRecordOrigin {
+    store_owner: crate::pals::store::StoreReadOwner,
+    archive_owner: std::sync::Weak<()>,
+    pub(crate) archive_generation: u64,
+    pub(crate) archive_checksum: [u8; 32],
+    pub(crate) record_digest: [u8; 32],
+}
+
+#[cfg(feature = "archive-origin-diagnostics")]
+impl ArchiveRecordOrigin {
+    /// Original committed archive generation, for observation only.
+    pub fn archive_generation(&self) -> u64 {
+        self.archive_generation
+    }
+
+    /// Committed archive checksum, not a capability or a completion fence.
+    pub fn archive_checksum(&self) -> [u8; 32] {
+        self.archive_checksum
+    }
+
+    /// Fingerprint of the original RoleRecord wire fields only.
+    pub fn record_digest(&self) -> [u8; 32] {
+        self.record_digest
+    }
+
+    pub(crate) fn matches_owner(&self, stores: &PalsStores) -> bool {
+        self.store_owner.matches(stores)
+            && stores.diagnostic_archive_owner_matches(&self.archive_owner)
+    }
+
+    pub(crate) fn matches_original(&self, stores: &PalsStores, record: &RoleRecord) -> bool {
+        self.matches_owner(stores)
+            && EngineArchiveReceipt::diagnostic_record_digest(record) == Some(self.record_digest)
+    }
+}
+
 struct ArchiveRestorePolicy<'a> {
     config: &'a PalsSemanticConfig,
     cpu_value: Option<&'a CpuValueIdentity>,
@@ -1754,6 +1794,37 @@ impl<M: RoleModel> PalsSemanticState<M> {
             .stores
             .load_engine_archive_for_state_with_budget(&receipt, state, budget)
             .map_err(PalsError::Store)?;
+        // Snapshot only bounded revision metadata before installation. Do not
+        // allocate or fingerprint in the original archive deadline path.
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let origin_candidates = {
+            const MAX_ORIGINS: usize = 64;
+            let mut candidates = [0_u64; MAX_ORIGINS];
+            let mut count = 0;
+            if loaded.engine_records.len() <= MAX_ORIGINS {
+                if let Some(index) = self.review_index.as_ref() {
+                    for record in &loaded.engine_records {
+                        if self
+                            .records
+                            .iter()
+                            .any(|old| old.revision == record.revision)
+                            || index.contains_revision(record.revision)
+                            || loaded
+                                .engine_records
+                                .iter()
+                                .filter(|other| other.revision == record.revision)
+                                .count()
+                                != 1
+                        {
+                            continue;
+                        }
+                        candidates[count] = record.revision;
+                        count += 1;
+                    }
+                }
+            }
+            (candidates, count)
+        };
         let pin = loaded.pin;
         let result = self.install_loaded_archive(
             ArchiveRestorePolicy {
@@ -1773,10 +1844,40 @@ impl<M: RoleModel> PalsSemanticState<M> {
         let release = self.stores.release_loaded(pin);
         match result {
             Err(error) => Err(error),
-            Ok(root) => {
+            Ok((root, _index_restored)) => {
                 release.map_err(PalsError::Store)?;
                 self.stores
                     .set_archive_pins(self.resident_archive_pins()?)?;
+                // Positive provenance is attached only after the original load,
+                // installation, archive load-pin release and repin all succeeded.
+                // An index restore error or unmatched source remains unknown.
+                #[cfg(feature = "archive-origin-diagnostics")]
+                if _index_restored {
+                    if let Some(index) = self.review_index.as_mut() {
+                        let (owner, generation, checksum) = receipt.diagnostic_origin();
+                        for &revision in &origin_candidates.0[..origin_candidates.1] {
+                            if let Some(record) = self
+                                .records
+                                .iter()
+                                .find(|record| record.revision == revision)
+                            {
+                                let Some(digest) =
+                                    EngineArchiveReceipt::diagnostic_record_digest(record)
+                                else {
+                                    continue;
+                                };
+                                let origin = ArchiveRecordOrigin {
+                                    store_owner: self.stores.read_owner(),
+                                    archive_owner: owner.clone(),
+                                    archive_generation: generation,
+                                    archive_checksum: checksum,
+                                    record_digest: digest,
+                                };
+                                index.attach_archive_origin(&self.stores, record, origin);
+                            }
+                        }
+                    }
+                }
                 Ok(Some(root))
             }
         }
@@ -1789,7 +1890,7 @@ impl<M: RoleModel> PalsSemanticState<M> {
         expected: &Position,
         deadline: Instant,
         metadata: RestoredEngineMetadata,
-    ) -> Result<usize, PalsError> {
+    ) -> Result<(usize, bool), PalsError> {
         let config = policy.config;
         let RestoredEngineMetadata {
             situations,
@@ -1911,8 +2012,8 @@ impl<M: RoleModel> PalsSemanticState<M> {
         self.nodes.extend(new_nodes);
         self.records.extend(added_records);
         self.records.sort_by_key(|record| record.revision);
-        self.restore_review_context_after_load(config);
-        Ok(root)
+        let index_restored = self.restore_review_context_after_load(config);
+        Ok((root, index_restored))
     }
 
     fn validate_loaded_node_evidence(
@@ -3055,6 +3156,33 @@ mod tests {
             .unwrap()
             .publish(&engine.semantic.stores, &record, None)
             .unwrap();
+        // A hot record has no cold-restore provenance even if its contents
+        // will later be written to the archive.
+        #[cfg(feature = "archive-origin-diagnostics")]
+        {
+            let index = engine.semantic.review_index.as_mut().unwrap();
+            let bundle = index.bundle_for_revision(revision).unwrap();
+            let hot_view = index
+                .select(
+                    &engine.semantic.stores,
+                    old_state,
+                    ReviewQuerySequences {
+                        purpose: RoleQueryPurpose::ValueFresh,
+                        prefix: &[],
+                        proposal: &[],
+                        counterexample: None,
+                        legal: &[],
+                        divergences: &[],
+                    },
+                    ReviewSelectionPolicy {
+                        required_bundle: Some(bundle),
+                        ..ReviewSelectionPolicy::default()
+                    },
+                )
+                .unwrap();
+            assert!(hot_view.selected_archive_origin(0).is_none());
+            drop(hot_view);
+        }
         assert_eq!(engine.semantic.review_index.as_mut().unwrap().compact(), 1);
         engine.semantic.review_index =
             Some(ReviewContextIndex::new(ReviewIndexLimits::default()).unwrap());
@@ -3067,6 +3195,24 @@ mod tests {
             engine.semantic.stores.states.get(old_state),
             Err(StoreError::ColdRecord(_))
         ));
+        #[cfg(feature = "archive-origin-diagnostics")]
+        {
+            assert!(
+                engine
+                    .semantic
+                    .records
+                    .iter()
+                    .all(|entry| entry.revision != revision)
+            );
+            assert!(
+                !engine
+                    .semantic
+                    .review_index
+                    .as_ref()
+                    .unwrap()
+                    .contains_revision(revision)
+            );
+        }
         engine
             .load_archived_root(
                 &start,
@@ -3113,6 +3259,22 @@ mod tests {
             .position(|metadata| metadata.source_revision == revision)
             .unwrap();
         assert_eq!(view.records()[selected].line, vec![reply]);
+        #[cfg(feature = "archive-origin-diagnostics")]
+        {
+            let origin = view
+                .selected_archive_origin(selected)
+                .expect("cold record provenance");
+            let raw = engine
+                .semantic
+                .records
+                .iter()
+                .find(|entry| entry.revision == revision)
+                .unwrap();
+            assert!(origin.matches_original(&engine.semantic.stores, raw));
+            let mut different = raw.clone();
+            different.revision += 1;
+            assert!(!origin.matches_original(&engine.semantic.stores, &different));
+        }
         assert_eq!(view.records_metadata()[selected].source_line_offset, 1);
         assert_eq!(
             view.records_metadata()[selected].original_first_move,

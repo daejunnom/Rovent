@@ -100,7 +100,10 @@ impl<M: RoleModel> PalsSemanticState<M> {
     /// Raw engine topology has already been committed successfully by its
     /// exact-history archive loader. A selected-index issue cannot retroactively
     /// turn that successful raw recovery into a failed or incomplete load.
-    pub(super) fn restore_review_context_after_load(&mut self, config: &PalsSemanticConfig) {
+    pub(super) fn restore_review_context_after_load(
+        &mut self,
+        config: &PalsSemanticConfig,
+    ) -> bool {
         let result = match (&mut self.review_index, self.review_policy) {
             (Some(index), Some(_)) => (|| -> Result<(), ReviewError> {
                 let roots = self.records.iter().map(|record| record.revision);
@@ -114,8 +117,12 @@ impl<M: RoleModel> PalsSemanticState<M> {
             (None, None) => Ok(()),
             _ => Err(ReviewError::InvalidPolicy),
         };
-        if let Err(issue) = result {
-            self.last_review_issue = Some(issue);
+        match result {
+            Ok(()) => true,
+            Err(issue) => {
+                self.last_review_issue = Some(issue);
+                false
+            }
         }
     }
 
@@ -385,7 +392,7 @@ impl<M: RoleModel> PalsEngine<M> {
     #[cfg(test)]
     pub(super) fn restore_review_context_after_load(&mut self) {
         let config = self.semantic_sequence_config();
-        self.semantic.restore_review_context_after_load(&config);
+        let _ = self.semantic.restore_review_context_after_load(&config);
     }
     #[cfg(test)]
     fn review_policy_for_question(

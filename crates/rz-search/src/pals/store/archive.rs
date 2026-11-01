@@ -865,6 +865,42 @@ impl EngineArchiveReceipt {
     pub(crate) fn actual_root(&self) -> Option<(SituationId, StateId, u64)> {
         self.actual_root
     }
+
+    /// Diagnostic metadata only: this weak identity cannot load or pin data.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub(crate) fn diagnostic_origin(&self) -> (Weak<()>, u64, [u8; 32]) {
+        (
+            self.archive.owner.clone(),
+            self.archive.generation,
+            self.archive.checksum,
+        )
+    }
+
+    /// Fingerprint the original record in the same format as the archive.
+    /// This is not a fingerprint of the observation/dependency closure.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub(crate) fn diagnostic_record_digest(
+        record: &crate::pals::engine::RoleRecord,
+    ) -> Option<[u8; 32]> {
+        if record.line.len() > 256 {
+            return None;
+        }
+        let wire = RoleRecordWire::encode(record).ok()?;
+        let bytes = serde_json::to_vec(&wire).ok()?;
+        let mut hash = Sha256::new();
+        hash.update(b"rz-pals-archive-origin-record-v1\0");
+        hash.update(bytes);
+        Some(hash.finalize().into())
+    }
+}
+
+#[cfg(feature = "archive-origin-diagnostics")]
+impl PalsStores {
+    pub(crate) fn diagnostic_archive_owner_matches(&self, owner: &Weak<()>) -> bool {
+        self.archive.as_ref().is_some_and(|archive| {
+            owner.strong_count() > 0 && owner.ptr_eq(&Arc::downgrade(&archive.identity))
+        })
+    }
 }
 
 mod sealed {
