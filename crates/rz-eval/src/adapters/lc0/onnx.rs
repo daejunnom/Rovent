@@ -6,24 +6,26 @@
 //! logical cancellation or deadline rejection.
 
 use crate::asset::{
-    self, AssetMetadata, AssetProfile, MaiaAsset, INPUT_NAME, MLH_NAME, POLICY_NAME, WDL_NAME,
+    self, AssetMetadata, AssetProfile, INPUT_NAME, MLH_NAME, MaiaAsset, POLICY_NAME, WDL_NAME,
 };
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
 use crate::runtime_pin::RuntimeLibraryPin;
-use crate::{output, RawOutput};
+use crate::{RawOutput, output};
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
-use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
 use rz_encoding::POLICY_SIZE;
+use rz_encoding::classical::{EncodedInput, INPUT_VALUES};
 #[cfg(target_os = "linux")]
-pub use rz_native_loader::system::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
+pub use rz_native_loader::system::{
+    SystemCaptureLimits, SystemLibraryRequest, SystemMappingAvailability, SystemRuntime,
+};
 use rz_native_loader::{LibrarySet, LoadError, ProcessLibrarySet};
 pub use rz_native_loader::{
-    NativeLoadingProfile, NativeMappingObservation, NVIDIA_LOAD_ORDER, ORT_LIBRARY_NAMES,
+    NVIDIA_LOAD_ORDER, NativeLoadingProfile, NativeMappingObservation, ORT_LIBRARY_NAMES,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,6 +35,15 @@ use std::time::Instant;
 #[path = "onnx_io.rs"]
 mod io;
 const MAX_BATCH: usize = 16;
+
+/// A successful normal-operation check may leave native mapping evidence
+/// unknown. Only `Observed` represents a complete mapping observation; neither
+/// variant is a CUDA completion fence or proof of a successful GPU Run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaRuntimeMappingEvidence {
+    Observed,
+    Unknown,
+}
 
 /// CPU wall-clock boundaries. Run includes kernels and synchronization;
 /// these are not GPU event times. None means that transfer is inside Run.
@@ -86,7 +97,10 @@ pub fn declared_backend_identity(
     bundle: Option<[u8; 32]>,
     config: &BackendConfig,
 ) -> [u8; 32] {
-    let mut profile=format!("rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={runtime:?};asset={asset_manifest:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",config.provider,config.intra_threads,config.max_batch);
+    let mut profile = format!(
+        "rz-maia-ort-v1;ort=1.22.0;wrapper=2.0.0-rc.10;runtime={runtime:?};asset={asset_manifest:?};provider={:?};threads={};batch={};fp32;tf32=0;opt=1;sync;full=1;temp=1;sum=1e-5",
+        config.provider, config.intra_threads, config.max_batch
+    );
     if let Some(bundle) = bundle {
         profile.push_str(&format!(
             ";cuda-bundle-v1={bundle:?};loader=linux-exact-global-v1"
@@ -449,11 +463,12 @@ impl OrtRuntime {
             // ort's dynamic initialization must acquire its required C API;
             // a build commit string is an observation, not a compatibility gate.
             let observation = runtime.observe_mappings().map_err(loader_error)?;
-            if !observation
-                .mapped_roles
-                .iter()
-                .any(|role| role == "ort-core")
-                || !observation.unregistered_native_mappings.is_empty()
+            if observation.availability == SystemMappingAvailability::Observed
+                && (!observation
+                    .mapped_roles
+                    .iter()
+                    .any(|role| role == "ort-core")
+                    || !observation.unregistered_native_mappings.is_empty())
             {
                 return Err(BackendError::new(
                     K::IdentityMismatch,
@@ -549,8 +564,8 @@ impl OrtRuntime {
         &self,
         include_runtime: bool,
     ) -> Result<NativeMappingObservation, BackendError> {
-        self.audit_cuda_mappings(include_runtime, true)
-            .map(|observed| observed.expect("explicit origin observation was requested"))
+        self.audit_cuda_mappings(include_runtime, true, true)
+            .map(|(observed, _)| observed.expect("explicit origin observation was requested"))
     }
 
     /// Canonical descriptors of the actually retained runtime bundle. This is
@@ -584,18 +599,30 @@ impl OrtRuntime {
     /// before accepting their final GPU report. This is an origin audit, not a
     /// completion fence, VRAM measurement or device-drain operation.
     pub fn verify_cuda_runtime_mappings(&self) -> Result<(), BackendError> {
-        self.verify_cuda_mappings(true)
+        self.audit_cuda_mappings(true, false, true).map(|_| ())
+    }
+
+    /// Check for observed CUDA mapping conflicts during normal execution.
+    /// Missing `/proc` evidence is explicitly `Unknown`; callers must not
+    /// promote that result to a strict mapping witness or physical completion.
+    pub fn observe_cuda_runtime_mappings(
+        &self,
+    ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+        self.audit_cuda_mappings(true, false, false)
+            .map(|(_, evidence)| evidence)
     }
 
     fn verify_cuda_mappings(&self, include_runtime: bool) -> Result<(), BackendError> {
-        self.audit_cuda_mappings(include_runtime, false).map(|_| ())
+        self.audit_cuda_mappings(include_runtime, false, false)
+            .map(|_| ())
     }
 
     fn audit_cuda_mappings(
         &self,
         include_runtime: bool,
         observe: bool,
-    ) -> Result<Option<NativeMappingObservation>, BackendError> {
+        strict: bool,
+    ) -> Result<(Option<NativeMappingObservation>, CudaRuntimeMappingEvidence), BackendError> {
         // Existing clones must observe the first latched failure too. A later
         // filesystem/map change cannot turn a poisoned process runtime into a
         // valid constructor input, or replace its original typed cause.
@@ -629,27 +656,21 @@ impl OrtRuntime {
                     "legacy CUDA bundle observation does not represent system runtime mappings",
                 ));
             }
-            let result = if include_runtime {
+            let observed = if strict && include_runtime {
                 runtime.verify_mappings()
             } else {
                 runtime.observe_mappings()
-            }
-            .map_err(loader_error)
-            .and_then(|observation| {
-                if !observation.unregistered_native_mappings.is_empty()
-                    || !observation
-                        .mapped_roles
-                        .iter()
-                        .any(|role| role == "ort-core")
-                {
-                    Err(BackendError::new(
-                        K::IdentityMismatch,
-                        S::Backend,
-                        "system runtime core or registered mappings differ",
-                    ))
-                } else {
-                    Ok(None)
+            };
+            if let Err(error) = &observed {
+                if error.kind == rz_native_loader::LoadErrorKind::ObservationUnavailable {
+                    // An unavailable observation remains retryable and does
+                    // not poison the process-global ORT runtime.
+                    return Err(loader_error(error.clone()));
                 }
+            }
+            let result = observed.map_err(loader_error).and_then(|observation| {
+                classify_system_mapping(&observation, include_runtime)
+                    .map(|evidence| (None, evidence))
             });
             if let Err(failure) = &result {
                 if let Some(latch) = guard.as_mut() {
@@ -704,7 +725,80 @@ impl OrtRuntime {
                 }
             }
         }
-        verified
+        verified.map(|observation| (observation, CudaRuntimeMappingEvidence::Observed))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_system_mapping(
+    observation: &rz_native_loader::system::SystemMappingObservation,
+    include_runtime: bool,
+) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+    if !observation.unregistered_native_mappings.is_empty()
+        || (observation.availability == SystemMappingAvailability::Observed
+            && (!observation
+                .mapped_roles
+                .iter()
+                .any(|role| role == "ort-core")
+                || (include_runtime && !observation.missing_required_roles.is_empty())))
+    {
+        return Err(BackendError::new(
+            K::IdentityMismatch,
+            S::Backend,
+            "system runtime core or registered mappings differ",
+        ));
+    }
+    if observation.availability == SystemMappingAvailability::Observed
+        && observation.preexisting_mapping_observed
+    {
+        Ok(CudaRuntimeMappingEvidence::Observed)
+    } else {
+        Ok(CudaRuntimeMappingEvidence::Unknown)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod system_mapping_evidence_tests {
+    use super::*;
+    use rz_native_loader::system::SystemMappingObservation;
+
+    #[test]
+    fn unavailable_is_unknown_but_observed_conflicts_fail() {
+        let mut observation = SystemMappingObservation {
+            identity_sha256: [0; 32],
+            availability: SystemMappingAvailability::Unavailable,
+            preexisting_mapping_observed: false,
+            mapped_roles: vec![],
+            missing_required_roles: vec![],
+            missing_optional_roles: vec![],
+            unregistered_native_mappings: vec![],
+            gpu_provider_verified: false,
+            gpu_completion_verified: false,
+        };
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        observation.availability = SystemMappingAvailability::Observed;
+        observation.mapped_roles.push("ort-core".into());
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        observation.preexisting_mapping_observed = true;
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Observed
+        );
+        observation
+            .unregistered_native_mappings
+            .push("foreign.so".into());
+        assert!(classify_system_mapping(&observation, true).is_err());
+        observation.unregistered_native_mappings.clear();
+        observation
+            .missing_required_roles
+            .push("ort-provider-cuda".into());
+        assert!(classify_system_mapping(&observation, true).is_err());
     }
 }
 
@@ -1146,8 +1240,11 @@ impl OnnxBackend {
         }
         match (config.provider, runtime.cuda_runtime_identity()) {
             (Provider::Cuda { .. }, None) => {
-                return Err(BackendError::new(K::IdentityMismatch, S::Backend,
-                    "CUDA requires an explicitly captured CUDA runtime; CPU-only pin is not sufficient"));
+                return Err(BackendError::new(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "CUDA requires an explicitly captured CUDA runtime; CPU-only pin is not sufficient",
+                ));
             }
             (Provider::Cpu, Some(_)) => {
                 return Err(BackendError::new(

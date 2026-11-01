@@ -2,20 +2,21 @@
 //!
 //! This is a transport primitive only: validating a declaration grants no
 //! process, storage, root, worker, model or physical-completion authority.
-//! Neither version is converted into the other. Existing consumers keep their
+//! No version is converted into another. Existing consumers keep their
 //! typed APIs until they explicitly support this owner.
 
 use std::sync::Arc;
 
 use crate::{
     ArtifactRef, ManifestError, RoventCoordinatorDeclaration, RoventEngineDeclaration,
-    RoventInputLock, RoventInputLockV2, RoventPurpose, RoventResourcePlan,
+    RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventPurpose, RoventResourcePlan,
 };
 
 #[derive(Clone, Debug)]
 enum OriginalLock {
     V1(Arc<RoventInputLock>),
     V2(Arc<RoventInputLockV2>),
+    V3(Arc<RoventInputLockV3>),
 }
 
 /// Retains the actual parsed lock, including its version and canonical digest.
@@ -34,7 +35,7 @@ pub struct RoventOriginalInputLockError<T> {
 
 /// Borrowed common declaration fields. They are references into the original
 /// lock, not a synthesized manifest or canonical representation. `/2`-specific
-/// policy and startup fields remain available only through `v2()`.
+/// policy and startup fields remain available through their versioned accessors.
 #[derive(Clone, Copy, Debug)]
 pub struct RoventInputLockCommon<'a> {
     pub lock_domain: &'a str,
@@ -75,25 +76,45 @@ impl RoventOriginalInputLock {
         })
     }
 
+    /// Preserve the actual /3 lock and its independent system runtime domain.
+    pub fn from_v3(
+        original: Arc<RoventInputLockV3>,
+    ) -> Result<Self, RoventOriginalInputLockError<RoventInputLockV3>> {
+        if let Err(error) = original.validate() {
+            return Err(RoventOriginalInputLockError { error, original });
+        }
+        Ok(Self {
+            inner: OriginalLock::V3(original),
+        })
+    }
+
     /// Recheck the exact typed original; this does not observe external files.
     pub fn validate(&self) -> Result<(), ManifestError> {
         match &self.inner {
             OriginalLock::V1(lock) => lock.validate(),
             OriginalLock::V2(lock) => lock.validate(),
+            OriginalLock::V3(lock) => lock.validate(),
         }
     }
 
     pub fn v1(&self) -> Option<&Arc<RoventInputLock>> {
         match &self.inner {
             OriginalLock::V1(lock) => Some(lock),
-            OriginalLock::V2(_) => None,
+            OriginalLock::V2(_) | OriginalLock::V3(_) => None,
         }
     }
 
     pub fn v2(&self) -> Option<&Arc<RoventInputLockV2>> {
         match &self.inner {
             OriginalLock::V2(lock) => Some(lock),
-            OriginalLock::V1(_) => None,
+            OriginalLock::V1(_) | OriginalLock::V3(_) => None,
+        }
+    }
+
+    pub fn v3(&self) -> Option<&Arc<RoventInputLockV3>> {
+        match &self.inner {
+            OriginalLock::V3(lock) => Some(lock),
+            OriginalLock::V1(_) | OriginalLock::V2(_) => None,
         }
     }
 
@@ -102,6 +123,7 @@ impl RoventOriginalInputLock {
         match (&self.inner, &other.inner) {
             (OriginalLock::V1(a), OriginalLock::V1(b)) => Arc::ptr_eq(a, b),
             (OriginalLock::V2(a), OriginalLock::V2(b)) => Arc::ptr_eq(a, b),
+            (OriginalLock::V3(a), OriginalLock::V3(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -131,6 +153,7 @@ impl RoventOriginalInputLock {
         match &self.inner {
             OriginalLock::V1(lock) => fields!(lock),
             OriginalLock::V2(lock) => fields!(lock),
+            OriginalLock::V3(lock) => fields!(lock),
         }
     }
 }

@@ -68,6 +68,52 @@ fn lock_v2(base: &RoventInputLock) -> RoventInputLockV2 {
         .unwrap()
 }
 
+fn lock_v3(base: &RoventInputLock) -> RoventInputLockV3 {
+    let v2 = lock_v2(base);
+    let mut wire = serde_json::to_value(&v2.manifest).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.insert("domain".into(), json!(crate::ROVENT_EXECUTION_V3_DOMAIN));
+    object.insert(
+        "system_runtime_lock".into(),
+        serde_json::to_value(
+            crate::SystemRuntimeLockV6::new(crate::NativeRuntimeSourceV6::Cpu).unwrap(),
+        )
+        .unwrap(),
+    );
+    crate::RoventExecutionManifestV3::from_json(&wire.to_string())
+        .unwrap()
+        .lock()
+        .unwrap()
+}
+
+#[test]
+fn v3_root_descriptor_joins_original_v3_without_reusing_v2_domain() {
+    let original = lock();
+    let old_lock = lock_v2(&original);
+    let mut old_input = input(&original);
+    old_input.startup_lock_sha256 = old_lock.canonical_sha256.clone();
+    let old = RoventRootDescriptorV2::seal(old_input, &old_lock).unwrap();
+    let old_bytes = old.canonical_bytes().unwrap();
+
+    let new_lock = lock_v3(&original);
+    let mut new_input = input(&original);
+    new_input.startup_lock_sha256 = new_lock.canonical_sha256.clone();
+    let new = RoventRootDescriptorV3::seal(new_input, &new_lock).unwrap();
+    let encoded = new.canonical_bytes().unwrap();
+    let text = std::str::from_utf8(&encoded).unwrap();
+    assert_eq!(RoventRootDescriptorV3::from_json(text).unwrap(), new);
+    assert!(RoventRootDescriptorV2::from_json(text).is_err());
+    assert!(RoventRootDescriptorV3::from_json(std::str::from_utf8(&old_bytes).unwrap()).is_err());
+    assert!(new.verify_against(&new_lock).is_ok());
+    let mut other = new_lock.manifest.clone();
+    other.run_id.push_str("-other");
+    assert!(new.verify_against(&other.lock().unwrap()).is_err());
+    let mut changed = new.input.clone();
+    changed.clock.hard.clock_epoch += 1;
+    assert!(RoventRootDescriptorV3::seal(changed, &new_lock).is_err());
+    assert_eq!(old.canonical_bytes().unwrap(), old_bytes);
+}
+
 #[test]
 fn v2_descriptor_has_distinct_wire_and_joins_only_exact_v2_lock() {
     let old = lock();

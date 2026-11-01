@@ -6,8 +6,9 @@
 //! the output allocation boundary into an observed bestmove completion time.
 
 use crate::{
-    ManifestError, RoventInputLock, RoventInputLockV2, RoventRootAuthority, RoventRootDeadline,
-    RoventRootDescriptor, RoventRootDescriptorInput, RoventRootDescriptorV2,
+    ManifestError, RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventRootAuthority,
+    RoventRootDeadline, RoventRootDescriptor, RoventRootDescriptorInput, RoventRootDescriptorV2,
+    RoventRootDescriptorV3,
 };
 use rz_contracts::Digest;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use std::collections::BTreeMap;
 
 pub const ROVENT_ROOT_ALLOCATION_CLOCK_DOMAIN: &str = "rz-rovent-root-allocation-clock/1";
 pub const ROVENT_ROOT_ALLOCATION_CLOCK_V2_DOMAIN: &str = "rz-rovent-root-allocation-clock/2";
+pub const ROVENT_ROOT_ALLOCATION_CLOCK_V3_DOMAIN: &str = "rz-rovent-root-allocation-clock/3";
 pub const MAX_ROOT_ALLOCATION_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -117,6 +119,88 @@ impl RoventRootAllocationClockV2 {
     pub fn digest(&self) -> Result<Digest, ManifestError> {
         let mut hash = Sha256::new();
         hash.update(ROVENT_ROOT_ALLOCATION_CLOCK_V2_DOMAIN.as_bytes());
+        hash.update([0]);
+        hash.update(self.canonical_bytes()?);
+        Ok(Digest(hash.finalize().into()))
+    }
+}
+
+/// Separate /3 wire, joined only to the exact typed /3 declarations.
+/// No live clock, process observation, or root authority is produced.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventRootAllocationClockV3 {
+    pub domain: String,
+    pub startup_lock_domain: String,
+    pub input: RoventRootAllocationInput,
+}
+
+impl RoventRootAllocationClockV3 {
+    pub fn seal(
+        input: RoventRootAllocationInput,
+        descriptor: &RoventRootDescriptorV3,
+        lock: &RoventInputLockV3,
+    ) -> Result<Self, ManifestError> {
+        let value = Self {
+            domain: ROVENT_ROOT_ALLOCATION_CLOCK_V3_DOMAIN.into(),
+            startup_lock_domain: crate::ROVENT_LOCK_V3_DOMAIN.into(),
+            input,
+        };
+        value.verify_against(descriptor, lock)?;
+        Ok(value)
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        require(
+            input.len() <= MAX_ROOT_ALLOCATION_BYTES,
+            "allocation-clock JSON exceeds 4 KiB",
+        )?;
+        let value: Self = crate::decode_json(input)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        require(
+            self.startup_lock_domain == crate::ROVENT_LOCK_V3_DOMAIN,
+            "allocation-clock /3 lock domain differs",
+        )?;
+        validate_body(
+            &self.input,
+            &self.domain,
+            ROVENT_ROOT_ALLOCATION_CLOCK_V3_DOMAIN,
+        )?;
+        require(
+            canonical(self)?.len() <= MAX_ROOT_ALLOCATION_BYTES,
+            "allocation-clock canonical JSON exceeds 4 KiB",
+        )
+    }
+
+    pub fn verify_against(
+        &self,
+        descriptor: &RoventRootDescriptorV3,
+        lock: &RoventInputLockV3,
+    ) -> Result<(), ManifestError> {
+        descriptor.verify_against(lock)?;
+        self.validate()?;
+        verify_join(
+            &self.input,
+            &descriptor.input,
+            descriptor.digest()?,
+            &lock.canonical_sha256,
+            lock.manifest.wall_time_max_ms,
+            lock.manifest.cleanup_max_ms,
+        )
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
+        canonical(self)
+    }
+
+    pub fn digest(&self) -> Result<Digest, ManifestError> {
+        let mut hash = Sha256::new();
+        hash.update(ROVENT_ROOT_ALLOCATION_CLOCK_V3_DOMAIN.as_bytes());
         hash.update([0]);
         hash.update(self.canonical_bytes()?);
         Ok(Digest(hash.finalize().into()))

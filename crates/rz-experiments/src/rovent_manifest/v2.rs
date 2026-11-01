@@ -75,6 +75,12 @@ impl RoventExecutionManifestV2 {
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validate_with_system_cuda(false)
+    }
+
+    /// Reuse declaration checks for the separate /3 system-runtime domain.
+    /// This never parses, publishes, or converts a /2 lock or receipt.
+    pub(super) fn validate_with_system_cuda(&self, system_cuda: bool) -> Result<(), ManifestError> {
         require(
             self.domain == ROVENT_EXECUTION_V2_DOMAIN,
             "Rovent /2 execution domain mismatch",
@@ -126,7 +132,7 @@ impl RoventExecutionManifestV2 {
                 .pools
                 .retain(|pool| !pool.actors.is_empty());
         }
-        shared.validate()?;
+        shared.validate_with_system_cuda(system_cuda)?;
         self.startup_document.validate()?;
         require(
             sha(&self.startup_configuration_sha256)

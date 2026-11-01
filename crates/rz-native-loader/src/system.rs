@@ -7,7 +7,7 @@
 //! execution, numerical correctness, or safe completion. Those are separate
 //! checks by the backend owner.
 
-use super::{claim_native_mode, linux, LoadError, LoadErrorKind};
+use super::{LoadError, LoadErrorKind, claim_native_mode, linux};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -58,9 +58,21 @@ pub struct SystemLibraryIdentity {
 
 /// An observation of this process only. A missing optional mapping is not
 /// represented as evidence that the library cannot be needed later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemMappingAvailability {
+    Observed,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SystemMappingObservation {
     pub identity_sha256: [u8; 32],
+    /// An unavailable process-maps observation is neither an empty map nor
+    /// evidence that the declared libraries are absent.
+    pub availability: SystemMappingAvailability,
+    /// Whether the pre-capture mapping state was actually observed. A later
+    /// successful read cannot retroactively establish that earlier observation.
+    pub preexisting_mapping_observed: bool,
     pub mapped_roles: Vec<String>,
     pub missing_required_roles: Vec<String>,
     pub missing_optional_roles: Vec<String>,
@@ -80,6 +92,7 @@ struct LibraryPin {
 struct Inner {
     identity_sha256: [u8; 32],
     libraries: Vec<LibraryPin>,
+    preexisting_mapping_observed: bool,
 }
 
 #[derive(Default)]
@@ -250,26 +263,13 @@ impl SystemRuntime {
         }
         // Existing native images cannot be attributed retrospectively to this
         // new owner. Driver images such as libcuda remain OS-owned.
-        for mapping in linux::read_maps()? {
-            if let Some(name) = mapping
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-            {
-                if linux::is_nvidia_runtime(name) || name.starts_with("libonnxruntime") {
-                    return Err(error(
-                        LoadErrorKind::ForeignMapping,
-                        "native runtime was mapped before system capture",
-                    ));
-                }
-            }
-        }
+        let preexisting_mapping_observed = assess_preexisting_maps(linux::read_maps())?;
         check_deadline(deadline)?;
         claim_native_mode(2)?;
         let inner = Arc::new(Inner {
             identity_sha256,
             libraries,
+            preexisting_mapping_observed,
         });
         guard.owner = Some(Arc::clone(&inner));
         Ok(Self { inner })
@@ -329,32 +329,29 @@ impl SystemRuntime {
         if let Some(failure) = &guard.failure {
             return Err(failure.clone());
         }
-        let result = self.observe_inner().and_then(|observation| {
-            if strict && !observation.missing_required_roles.is_empty() {
-                return Err(error(
-                    LoadErrorKind::MissingMapping,
-                    "a required system library is not mapped",
-                ));
-            }
-            if strict && !observation.unregistered_native_mappings.is_empty() {
-                return Err(error(
-                    LoadErrorKind::ForeignMapping,
-                    "an unregistered system native library is mapped",
-                ));
-            }
-            Ok(observation)
-        });
-        if let Err(failure) = &result {
-            guard.failure = Some(failure.clone());
-        }
-        result
+        apply_observation(&mut guard, self.observe_inner(), strict)
     }
 
     fn observe_inner(&self) -> Result<SystemMappingObservation, LoadError> {
         for pin in &self.inner.libraries {
             check_still_named(pin)?;
         }
-        let maps = linux::read_maps()?;
+        let maps = match linux::read_maps() {
+            Ok(maps) => maps,
+            Err(_) => {
+                return Ok(SystemMappingObservation {
+                    identity_sha256: self.inner.identity_sha256,
+                    availability: SystemMappingAvailability::Unavailable,
+                    preexisting_mapping_observed: self.inner.preexisting_mapping_observed,
+                    mapped_roles: Vec::new(),
+                    missing_required_roles: Vec::new(),
+                    missing_optional_roles: Vec::new(),
+                    unregistered_native_mappings: Vec::new(),
+                    gpu_provider_verified: false,
+                    gpu_completion_verified: false,
+                });
+            }
+        };
         let mut matched = BTreeSet::new();
         let mut unregistered = BTreeSet::new();
         let mut by_inode = BTreeMap::new();
@@ -399,6 +396,8 @@ impl SystemRuntime {
         }
         Ok(SystemMappingObservation {
             identity_sha256: self.inner.identity_sha256,
+            availability: SystemMappingAvailability::Observed,
+            preexisting_mapping_observed: self.inner.preexisting_mapping_observed,
             mapped_roles: matched.into_iter().collect(),
             missing_required_roles,
             missing_optional_roles,
@@ -407,6 +406,83 @@ impl SystemRuntime {
             gpu_completion_verified: false,
         })
     }
+}
+
+fn apply_observation(
+    state: &mut ProcessState,
+    observation: Result<SystemMappingObservation, LoadError>,
+    strict: bool,
+) -> Result<SystemMappingObservation, LoadError> {
+    if let Some(failure) = &state.failure {
+        return Err(failure.clone());
+    }
+    let result =
+        observation.and_then(|observation| assess_mapping_observation(observation, strict));
+    if let Err(failure) = &result {
+        // A transient unavailable observation must not poison a live
+        // runtime; conflicts and identity failures remain latched.
+        if failure.kind != LoadErrorKind::ObservationUnavailable {
+            state.failure = Some(failure.clone());
+        }
+    }
+    result
+}
+
+fn assess_preexisting_maps(
+    maps: Result<Vec<linux::MapEntry>, LoadError>,
+) -> Result<bool, LoadError> {
+    let maps = match maps {
+        Ok(maps) => maps,
+        // No conclusion about pre-existing mappings can be drawn from an
+        // unavailable or malformed process-map observation.
+        Err(_) => return Ok(false),
+    };
+    for mapping in maps {
+        if let Some(name) = mapping
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+        {
+            if linux::is_nvidia_runtime(name) || name.starts_with("libonnxruntime") {
+                return Err(error(
+                    LoadErrorKind::ForeignMapping,
+                    "native runtime was mapped before system capture",
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn assess_mapping_observation(
+    observation: SystemMappingObservation,
+    strict: bool,
+) -> Result<SystemMappingObservation, LoadError> {
+    // Actual conflicts remain errors even when the pre-capture state was
+    // unavailable. Strict acceptance also requires all evidence to exist.
+    if !observation.unregistered_native_mappings.is_empty() {
+        return Err(error(
+            LoadErrorKind::ForeignMapping,
+            "an unregistered system native library is mapped",
+        ));
+    }
+    if strict
+        && (observation.availability == SystemMappingAvailability::Unavailable
+            || !observation.preexisting_mapping_observed)
+    {
+        return Err(error(
+            LoadErrorKind::ObservationUnavailable,
+            "system mapping evidence is unavailable",
+        ));
+    }
+    if strict && !observation.missing_required_roles.is_empty() {
+        return Err(error(
+            LoadErrorKind::MissingMapping,
+            "a required system library is not mapped",
+        ));
+    }
+    Ok(observation)
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), LoadError> {
@@ -613,6 +689,105 @@ fn identity_digest(libraries: &[LibraryPin]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observation(availability: SystemMappingAvailability) -> SystemMappingObservation {
+        SystemMappingObservation {
+            identity_sha256: [0; 32],
+            availability,
+            preexisting_mapping_observed: true,
+            mapped_roles: vec!["ort-core".into()],
+            missing_required_roles: Vec::new(),
+            missing_optional_roles: Vec::new(),
+            unregistered_native_mappings: Vec::new(),
+            gpu_provider_verified: false,
+            gpu_completion_verified: false,
+        }
+    }
+
+    #[test]
+    fn unavailable_maps_are_unknown_without_masking_observed_conflicts() {
+        let unreadable = error(LoadErrorKind::FileAccess, "maps unavailable");
+        assert!(!assess_preexisting_maps(Err(unreadable)).unwrap());
+        assert!(assess_preexisting_maps(Ok(Vec::new())).unwrap());
+        let foreign = linux::MapEntry {
+            dev_major: 0,
+            dev_minor: 0,
+            inode: 1,
+            path: Some("/usr/lib/libcudart.so.12".into()),
+            deleted: false,
+        };
+        assert_eq!(
+            assess_preexisting_maps(Ok(vec![foreign])).unwrap_err().kind,
+            LoadErrorKind::ForeignMapping
+        );
+
+        let unknown = observation(SystemMappingAvailability::Unavailable);
+        assert!(assess_mapping_observation(unknown.clone(), false).is_ok());
+        assert_eq!(
+            assess_mapping_observation(unknown, true).unwrap_err().kind,
+            LoadErrorKind::ObservationUnavailable
+        );
+        let mut earlier_unknown = observation(SystemMappingAvailability::Observed);
+        earlier_unknown.preexisting_mapping_observed = false;
+        assert!(assess_mapping_observation(earlier_unknown.clone(), false).is_ok());
+        assert_eq!(
+            assess_mapping_observation(earlier_unknown, true)
+                .unwrap_err()
+                .kind,
+            LoadErrorKind::ObservationUnavailable
+        );
+        let mut conflict = observation(SystemMappingAvailability::Observed);
+        conflict
+            .unregistered_native_mappings
+            .push("libcudart.so.12".into());
+        assert_eq!(
+            assess_mapping_observation(conflict, false)
+                .unwrap_err()
+                .kind,
+            LoadErrorKind::ForeignMapping
+        );
+    }
+
+    #[test]
+    fn unavailable_strict_observation_does_not_poison_later_normal_run() {
+        let mut state = ProcessState::default();
+        let unknown = observation(SystemMappingAvailability::Unavailable);
+        assert_eq!(
+            apply_observation(&mut state, Ok(unknown), true)
+                .unwrap_err()
+                .kind,
+            LoadErrorKind::ObservationUnavailable
+        );
+        assert!(state.failure.is_none());
+        assert!(
+            apply_observation(
+                &mut state,
+                Ok(observation(SystemMappingAvailability::Observed)),
+                false
+            )
+            .is_ok()
+        );
+        let mut conflict = observation(SystemMappingAvailability::Observed);
+        conflict
+            .unregistered_native_mappings
+            .push("libcudart.so.12".into());
+        assert_eq!(
+            apply_observation(&mut state, Ok(conflict), false)
+                .unwrap_err()
+                .kind,
+            LoadErrorKind::ForeignMapping
+        );
+        assert_eq!(
+            apply_observation(
+                &mut state,
+                Ok(observation(SystemMappingAvailability::Observed)),
+                false
+            )
+            .unwrap_err()
+            .kind,
+            LoadErrorKind::ForeignMapping
+        );
+    }
 
     #[test]
     fn capture_enforces_byte_and_elapsed_limits_before_hashing() {

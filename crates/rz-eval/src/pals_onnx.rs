@@ -6,18 +6,21 @@
 //! buffers. Public memory is exact and role-neutral; role latents start fresh.
 use crate::asset::{self, parse_sha256};
 use crate::error::{BackendError, CauseCode, FailureKind as K, FailureStage as S};
-use crate::onnx::{NativeLoadingProfile, NativeMappingObservation, OrtRuntime, Provider};
+use crate::onnx::{
+    CudaRuntimeMappingEvidence, NativeLoadingProfile, NativeMappingObservation, OrtRuntime,
+    Provider,
+};
 use crate::pals_model::{
-    PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRole,
-    PreparedPalsFullLineTensors, PreparedPalsTensors, MAX_LINE_PLY, PALS_ENCODING_SCHEMA,
-    PALS_MODEL_SCHEMA, QUERY_LINE_COUNT, V_TASK_NAMES,
+    MAX_LINE_PLY, PALS_ENCODING_SCHEMA, PALS_MODEL_SCHEMA, PalsModelConfig, PalsModelInput,
+    PalsModelProfile, PalsRawOutput, PalsRole, PreparedPalsFullLineTensors, PreparedPalsTensors,
+    QUERY_LINE_COUNT, V_TASK_NAMES,
 };
 use crate::worker::{PhysicalRun, SingleWorker};
 use ort::execution_providers::cuda::CuDNNConvAlgorithmSearch;
 use ort::execution_providers::{
     ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider,
 };
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::tensor::TensorElementType;
 use ort::value::{Tensor, ValueType};
 use rz_contracts::{Digest, PrecisionProfile};
@@ -28,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 mod cuda_control;
@@ -47,46 +50,46 @@ pub use cuda_control::{
     VirtualReviewCudaPlacementWitness,
 };
 pub use device_packing_admission::{
-    DevicePackingAdmissionError, DevicePackingDeclaredResources, DevicePackingResourceDeclaration,
-    PackingArtifactPart, PackingArtifactRegistration, PackingNativeVerification,
-    PackingVerificationScope, RegisteredPackingArtifactBytes, RegisteredPackingBytePin,
     DEVICE_PACKING_DOMAIN, DEVICE_PACKING_GRAPH_FILE, DEVICE_PACKING_MANIFEST_FILE,
     DEVICE_PACKING_MAX_GRAPH_BYTES, DEVICE_PACKING_MAX_MANIFEST_BYTES,
-    DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA,
+    DEVICE_PACKING_MAX_NODE_PAYLOAD_SUM, DEVICE_PACKING_SCHEMA, DevicePackingAdmissionError,
+    DevicePackingDeclaredResources, DevicePackingResourceDeclaration, PackingArtifactPart,
+    PackingArtifactRegistration, PackingNativeVerification, PackingVerificationScope,
+    RegisteredPackingArtifactBytes, RegisteredPackingBytePin,
 };
-pub use device_packing_assets::{load_checked_fixed_packing_graph, DevicePackingAssetError};
+pub use device_packing_assets::{DevicePackingAssetError, load_checked_fixed_packing_graph};
 pub use device_packing_graph::{
-    CheckedFixedPackingGraph, PackingGraphBodyError, PackingGraphBodyInspection,
-    PackingGraphBodyVerification, PackingGraphDataType, PackingGraphDimension,
-    PackingGraphInspectionBudget, PackingGraphName, PackingGraphNodeDescriptor, PackingGraphShape,
-    PackingGraphTensorDescriptor, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
-    PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS,
+    CheckedFixedPackingGraph, PACKING_GRAPH_BODY_INSPECTOR_VERSION,
+    PACKING_GRAPH_MAX_INSPECTION_HOST_BYTES, PACKING_GRAPH_MAX_WIRE_FIELDS, PackingGraphBodyError,
+    PackingGraphBodyInspection, PackingGraphBodyVerification, PackingGraphDataType,
+    PackingGraphDimension, PackingGraphInspectionBudget, PackingGraphName,
+    PackingGraphNodeDescriptor, PackingGraphShape, PackingGraphTensorDescriptor,
 };
 #[cfg(feature = "experimental-io-binding")]
 pub use device_pages_plan::native::{
-    resident_cuda_minimum_metadata_host_bytes, CudaRecordPageSnapshot, CudaRecordPageStats,
+    CudaRecordPageSnapshot, CudaRecordPageStats, resident_cuda_minimum_metadata_host_bytes,
 };
 pub use device_pages_plan::{
-    device_packing_maximum_node_payload_sum, CpuOwnedPublicBacking, DevicePageDomain,
-    DevicePageError, DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload,
-    DevicePagePlan, DevicePageReservation, DevicePagesLimits, DevicePagesRegistry,
-    DeviceProjectionOffset, DevicePublicBacking, DevicePublicBlock, DevicePublicBlockDescriptor,
-    DEVICE_PAGE_RECORD_CAPACITY,
+    CpuOwnedPublicBacking, DEVICE_PAGE_RECORD_CAPACITY, DevicePageDomain, DevicePageError,
+    DevicePageInvocationDeclaration, DevicePageNamespace, DevicePagePayload, DevicePagePlan,
+    DevicePageReservation, DevicePagesLimits, DevicePagesRegistry, DeviceProjectionOffset,
+    DevicePublicBacking, DevicePublicBlock, DevicePublicBlockDescriptor,
+    device_packing_maximum_node_payload_sum,
 };
 pub use public_pages::{HostRecordPagePolicy, HostRecordPageSnapshot, HostRecordPageStats};
 #[cfg(feature = "experimental-io-binding")]
 pub use warm::cuda::{
-    cuda_private_warm_implementation_digest, PalsCudaWarmCapability, PalsCudaWarmExecutionBinding,
+    PRIVATE_CUDA_QUERY_SEMANTICS, PRIVATE_CUDA_WARM_EXECUTION_DOMAIN,
+    PRIVATE_CUDA_WARM_GRAPH_SEMANTICS, PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
+    PRIVATE_CUDA_WARM_SCHEMA, PalsCudaWarmCapability, PalsCudaWarmExecutionBinding,
     PalsCudaWarmInput, PalsCudaWarmInvocationObservation, PalsCudaWarmInvocationPurpose,
     PalsCudaWarmInvocationState, PalsCudaWarmObservationHandle, PalsCudaWarmObservationSnapshot,
     PalsCudaWarmObservationStatus, PalsCudaWarmOwnerObservation, PalsCudaWarmRuntimeLimits,
-    PRIVATE_CUDA_QUERY_SEMANTICS, PRIVATE_CUDA_WARM_EXECUTION_DOMAIN,
-    PRIVATE_CUDA_WARM_GRAPH_SEMANTICS, PRIVATE_CUDA_WARM_MEASUREMENT_CONTRACT,
-    PRIVATE_CUDA_WARM_SCHEMA,
+    cuda_private_warm_implementation_digest,
 };
 pub use warm::{
-    PalsWarmCapability, PalsWarmInput, FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS,
-    PRIVATE_WARM_SCHEMA,
+    FROZEN_QUERY_SEMANTICS_V1, PRIVATE_WARM_GRAPH_SEMANTICS, PRIVATE_WARM_SCHEMA,
+    PalsWarmCapability, PalsWarmInput,
 };
 
 /// Implementation provenance only. Changing this source digest does not
@@ -455,6 +458,7 @@ pub enum PalsStartupStageBoundary {
     ReturnedOk,
     ReturnedError,
     Observed,
+    ObservationUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1386,6 +1390,9 @@ fn validate_role_tag(shape: &[i64], values: &[bool], critic: bool) -> Result<(),
 enum CudaMappingAudit {
     #[default]
     AwaitingFirstRun,
+    /// A Run physically completed, but native mapping provenance was not
+    /// observable. This is neither a failure nor an acceptance witness.
+    ObservationUnknown,
     Confirmed,
     Rejected(BackendError),
 }
@@ -1396,18 +1403,32 @@ impl CudaMappingAudit {
             _ => Ok(()),
         }
     }
+    #[cfg(test)]
     fn after_run(
         &mut self,
         completed: bool,
         full_audit: impl FnOnce() -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
+        self.after_run_observed(completed, || {
+            full_audit().map(|()| CudaRuntimeMappingEvidence::Observed)
+        })
+    }
+    fn after_run_observed(
+        &mut self,
+        completed: bool,
+        full_audit: impl FnOnce() -> Result<CudaRuntimeMappingEvidence, BackendError>,
+    ) -> Result<(), BackendError> {
         self.allow_run()?;
-        if !completed || matches!(self, Self::Confirmed) {
+        if !completed || matches!(self, Self::Confirmed | Self::ObservationUnknown) {
             return Ok(());
         }
         match full_audit() {
-            Ok(()) => {
+            Ok(CudaRuntimeMappingEvidence::Observed) => {
                 *self = Self::Confirmed;
+                Ok(())
+            }
+            Ok(CudaRuntimeMappingEvidence::Unknown) => {
+                *self = Self::ObservationUnknown;
                 Ok(())
             }
             Err(mut failure) => {
@@ -1422,6 +1443,13 @@ impl CudaMappingAudit {
         full_audit: impl FnOnce() -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
         self.allow_run()?;
+        if matches!(self, Self::ObservationUnknown) {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS CUDA mapping observation is unavailable",
+            ));
+        }
         if !matches!(self, Self::Confirmed) {
             return Err(fail(
                 K::BackendUnavailable,
@@ -1431,6 +1459,42 @@ impl CudaMappingAudit {
         }
         match full_audit() {
             Ok(()) => Ok(()),
+            Err(mut failure) => {
+                failure.detail =
+                    "PALS CUDA final full mapping audit failed after completed native Run";
+                *self = Self::Rejected(failure.clone());
+                Err(failure)
+            }
+        }
+    }
+
+    /// A strict caller can retry an unavailable observation without poisoning
+    /// the live backend. Only an actual conflicting observation is latched.
+    fn final_audit_observed(
+        &mut self,
+        full_audit: impl FnOnce() -> Result<CudaRuntimeMappingEvidence, BackendError>,
+    ) -> Result<(), BackendError> {
+        self.allow_run()?;
+        if matches!(self, Self::AwaitingFirstRun) {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS full CUDA audit requires a completed native Run",
+            ));
+        }
+        match full_audit() {
+            Ok(CudaRuntimeMappingEvidence::Observed) => {
+                *self = Self::Confirmed;
+                Ok(())
+            }
+            Ok(CudaRuntimeMappingEvidence::Unknown) => {
+                *self = Self::ObservationUnknown;
+                Err(fail(
+                    K::BackendUnavailable,
+                    S::Backend,
+                    "PALS CUDA mapping observation is unavailable",
+                ))
+            }
             Err(mut failure) => {
                 failure.detail =
                     "PALS CUDA final full mapping audit failed after completed native Run";
@@ -3590,7 +3654,7 @@ impl PalsOnnxBackend {
         if matches!(self.config.provider, Provider::Cuda { .. }) {
             self.cuda_mapping_audit
                 .borrow_mut()
-                .final_audit(|| self.runtime.verify_cuda_runtime_mappings())?;
+                .final_audit_observed(|| self.runtime.observe_cuda_runtime_mappings())?;
         }
         Ok(())
     }
@@ -4036,18 +4100,29 @@ impl PalsOnnxBackend {
             // `run_active`'s synchronous Run or `run_device`'s output sync has
             // physically completed. ORT provider images can now be required;
             // this one-time audit must never preempt session creation, and is
-            // not a per-node mapping scan. A failed origin audit is latched but
-            // does not mislabel this already-fenced execution as unknown.
+            // not a per-node mapping scan. An observed conflict is latched;
+            // unavailable mapping evidence remains unknown and does not
+            // mislabel this already-fenced execution as physically incomplete.
             self.cuda_mapping_audit
                 .borrow_mut()
-                .after_run(result.is_ok(), || {
+                .after_run_observed(result.is_ok(), || {
                     startup_enter(trace, PalsStartupBackendStage::FirstRuntimeOriginAudit);
-                    let verified = self.runtime.verify_cuda_runtime_mappings();
-                    startup_return(
-                        trace,
-                        PalsStartupBackendStage::FirstRuntimeOriginAudit,
-                        verified.is_ok(),
-                    );
+                    let verified = self.runtime.observe_cuda_runtime_mappings();
+                    match &verified {
+                        Ok(CudaRuntimeMappingEvidence::Unknown) => {
+                            if let Some(trace) = trace {
+                                trace.record(
+                                    PalsStartupBackendStage::FirstRuntimeOriginAudit,
+                                    PalsStartupStageBoundary::ObservationUnavailable,
+                                );
+                            }
+                        }
+                        result => startup_return(
+                            trace,
+                            PalsStartupBackendStage::FirstRuntimeOriginAudit,
+                            result.is_ok(),
+                        ),
+                    }
                     verified
                 })?;
         }
@@ -5081,12 +5156,14 @@ mod tests {
         );
         let poisoned = HostRecordPageObservationHandle::new(host_page_observation_fixture());
         let other = poisoned.clone();
-        assert!(std::thread::spawn(move || {
-            let _guard = other.0.latest.lock().unwrap();
-            panic!("poison metadata-only host page observation fixture");
-        })
-        .join()
-        .is_err());
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = other.0.latest.lock().unwrap();
+                panic!("poison metadata-only host page observation fixture");
+            })
+            .join()
+            .is_err()
+        );
         let snapshot = poisoned.snapshot();
         assert_eq!(snapshot.status, HostRecordPageObservationStatus::Poisoned);
         assert!(snapshot.latest.is_some());
@@ -5126,10 +5203,12 @@ mod tests {
         trace.update_input(|slot| *slot = Some(metadata(&trace, &input())));
         let frozen = legacy.snapshot_and_stop();
         assert!(frozen.input_observations.is_none());
-        assert!(serde_json::to_value(frozen)
-            .unwrap()
-            .get("input_observations")
-            .is_none());
+        assert!(
+            serde_json::to_value(frozen)
+                .unwrap()
+                .get("input_observations")
+                .is_none()
+        );
 
         let probe = PalsStartupStageProbe::new();
         assert!(probe.start_with_input_observations(Instant::now()));
@@ -5161,9 +5240,11 @@ mod tests {
         assert_ne!(observations[0].input_key, observations[1].input_key);
         assert_eq!(observations[0].role_evaluation_returned_ok, Some(true));
         assert_eq!(observations[1].role_evaluation_returned_ok, Some(false));
-        assert!(observations
-            .iter()
-            .all(|input| input.completion_binding.is_none()));
+        assert!(
+            observations
+                .iter()
+                .all(|input| input.completion_binding.is_none())
+        );
         assert!(!probe.start_with_input_observations(Instant::now()));
         first.update_input(|slot| *slot = None);
         assert_eq!(
@@ -5213,14 +5294,18 @@ mod tests {
         );
         assert_eq!(observed.events[1].role, PalsRole::Proposer);
         assert_eq!(observed.events[1].request_ordinal, 1);
-        assert!(observed
-            .events
-            .windows(2)
-            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns));
-        assert!(observed
-            .events
-            .iter()
-            .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap()));
+        assert!(
+            observed
+                .events
+                .windows(2)
+                .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns)
+        );
+        assert!(
+            observed
+                .events
+                .iter()
+                .all(|event| event.elapsed_ns <= observed.snapshot_elapsed_ns.unwrap())
+        );
         // A late native return cannot mutate the already frozen startup view,
         // arm a new capture, or be mistaken for an observed physical fence.
         startup_return(Some(&trace), PalsStartupBackendStage::PublicRun, true);
@@ -5329,12 +5414,14 @@ mod tests {
     fn startup_stage_probe_poison_is_explicit_and_does_not_rearm() {
         let probe = PalsStartupStageProbe::new();
         let other = probe.clone();
-        assert!(std::thread::spawn(move || {
-            let _held = other.shared.ledger.lock().unwrap();
-            panic!("poison metadata-only startup diagnostic fixture");
-        })
-        .join()
-        .is_err());
+        assert!(
+            std::thread::spawn(move || {
+                let _held = other.shared.ledger.lock().unwrap();
+                panic!("poison metadata-only startup diagnostic fixture");
+            })
+            .join()
+            .is_err()
+        );
         assert!(!probe.start(Instant::now()));
         assert!(probe.begin_role(PalsRole::Proposer).is_none());
         let snapshot = probe.snapshot_and_stop();
@@ -5425,9 +5512,11 @@ mod tests {
         };
         assert!(config.validate_execution_selection(eager, false).is_err());
         assert!(config.validate_execution_selection(None, true).is_err());
-        assert!(config
-            .validate_execution_selection(Some(NativeLoadingProfile::CuDnnShimLazyV1), true)
-            .is_err());
+        assert!(
+            config
+                .validate_execution_selection(Some(NativeLoadingProfile::CuDnnShimLazyV1), true)
+                .is_err()
+        );
         config.validate_execution_selection(eager, true).unwrap();
         config.device_public_memory = true;
         assert!(config.validate().is_err());
@@ -5439,30 +5528,40 @@ mod tests {
         let eager = Some(NativeLoadingProfile::EagerCuda12Cudnn9V1);
         let mut config = PalsOnnxConfig::cpu();
         config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm;
-        assert!(config
-            .validate_cuda_warm_execution_selection(eager, true)
-            .is_err());
+        assert!(
+            config
+                .validate_cuda_warm_execution_selection(eager, true)
+                .is_err()
+        );
         config.provider = Provider::Cuda {
             device_id: 0,
             arena_bytes: 256 * 1024 * 1024,
         };
-        assert!(config
-            .validate_cuda_warm_execution_selection(eager, true)
-            .is_err());
+        assert!(
+            config
+                .validate_cuda_warm_execution_selection(eager, true)
+                .is_err()
+        );
         config.device_public_memory = true;
         assert!(config.validate_execution_selection(eager, true).is_err());
-        assert!(config
-            .validate_cuda_warm_execution_selection(eager, false)
-            .is_err());
-        assert!(config
-            .validate_cuda_warm_execution_selection(
-                Some(NativeLoadingProfile::CuDnnShimLazyV1),
-                true
-            )
-            .is_err());
-        assert!(config
-            .validate_cuda_warm_execution_selection(None, true)
-            .is_err());
+        assert!(
+            config
+                .validate_cuda_warm_execution_selection(eager, false)
+                .is_err()
+        );
+        assert!(
+            config
+                .validate_cuda_warm_execution_selection(
+                    Some(NativeLoadingProfile::CuDnnShimLazyV1),
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            config
+                .validate_cuda_warm_execution_selection(None, true)
+                .is_err()
+        );
         assert_eq!(
             config
                 .validate_cuda_warm_execution_selection(eager, true)
@@ -5470,9 +5569,11 @@ mod tests {
             cfg!(feature = "experimental-io-binding")
         );
         config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefault;
-        assert!(config
-            .validate_cuda_warm_execution_selection(eager, true)
-            .is_err());
+        assert!(
+            config
+                .validate_cuda_warm_execution_selection(eager, true)
+                .is_err()
+        );
     }
 
     fn shim_observation() -> NativeMappingObservation {
@@ -6165,11 +6266,13 @@ mod tests {
             failure
         );
         let mut final_rejected = CudaMappingAudit::default();
-        assert!(final_rejected
-            .final_audit(|| panic!(
-                "final audit cannot require lazy provider images before first Run"
-            ))
-            .is_err());
+        assert!(
+            final_rejected
+                .final_audit(|| panic!(
+                    "final audit cannot require lazy provider images before first Run"
+                ))
+                .is_err()
+        );
         final_rejected.after_run(true, || Ok(())).unwrap();
         let failure = final_rejected
             .final_audit(|| {
@@ -6199,5 +6302,51 @@ mod tests {
                 .unwrap_err(),
             failure
         );
+    }
+
+    #[test]
+    fn unavailable_mapping_observation_keeps_runs_enabled_but_not_a_witness() {
+        let mut phase = CudaMappingAudit::default();
+        phase
+            .after_run_observed(true, || Ok(CudaRuntimeMappingEvidence::Unknown))
+            .unwrap();
+        assert!(matches!(phase, CudaMappingAudit::ObservationUnknown));
+        phase.allow_run().unwrap();
+        phase
+            .after_run_observed(true, || panic!("unknown is not a per-node rescan"))
+            .unwrap();
+        let error = phase
+            .final_audit(|| panic!("unknown cannot become acceptance evidence"))
+            .unwrap_err();
+        assert_eq!(error.kind, K::BackendUnavailable);
+        assert!(matches!(phase, CudaMappingAudit::ObservationUnknown));
+        phase.allow_run().unwrap();
+        assert!(
+            phase
+                .final_audit_observed(|| Ok(CudaRuntimeMappingEvidence::Unknown))
+                .is_err()
+        );
+        assert!(matches!(phase, CudaMappingAudit::ObservationUnknown));
+        phase.allow_run().unwrap();
+        phase
+            .final_audit_observed(|| Ok(CudaRuntimeMappingEvidence::Observed))
+            .unwrap();
+        assert!(matches!(phase, CudaMappingAudit::Confirmed));
+
+        let mut conflict = CudaMappingAudit::default();
+        conflict
+            .after_run_observed(true, || Ok(CudaRuntimeMappingEvidence::Unknown))
+            .unwrap();
+        assert!(
+            conflict
+                .final_audit_observed(|| Err(fail(
+                    K::IdentityMismatch,
+                    S::Backend,
+                    "actual foreign mapping"
+                )))
+                .is_err()
+        );
+        assert!(matches!(conflict, CudaMappingAudit::Rejected(_)));
+        assert!(conflict.allow_run().is_err());
     }
 }

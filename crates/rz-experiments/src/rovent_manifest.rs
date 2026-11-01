@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
 
 mod v2;
+mod v3;
 pub use v2::*;
+pub use v3::*;
 
 pub const ROVENT_EXECUTION_DOMAIN: &str = "rz-rovent-execution/1";
 pub const ROVENT_LOCK_DOMAIN: &str = "rz-rovent-input-lock/1";
@@ -221,6 +223,9 @@ pub struct RoventPcConfiguration {
 }
 impl RoventPcConfiguration {
     fn validate(&self) -> Result<(), ManifestError> {
+        self.validate_with_system_cuda(false)
+    }
+    fn validate_with_system_cuda(&self, system_cuda: bool) -> Result<(), ManifestError> {
         self.proposer.validate()?;
         self.critic.validate()?;
         if let Some(v) = &self.validator {
@@ -237,6 +242,13 @@ impl RoventPcConfiguration {
         )?;
         for artifact in &self.runtime_artifacts {
             artifact.validate()?;
+        }
+        if system_cuda
+            && (self.backend != RoventBackend::OrtCuda || !self.runtime_artifacts.is_empty())
+        {
+            return Err(ManifestError::Integrity(
+                "system CUDA requires OrtCuda and no copied runtime artifacts".into(),
+            ));
         }
         match self.backend {
             RoventBackend::RustCpu => require(
@@ -255,7 +267,7 @@ impl RoventPcConfiguration {
                         .ort_inter_threads
                         .is_some_and(|v| (1..=256).contains(&v))
                     && self.ort_spinning.is_some()
-                    && !self.runtime_artifacts.is_empty(),
+                    && (system_cuda || !self.runtime_artifacts.is_empty()),
                 "ORT provider/device/thread declarations are incomplete or contradictory",
             ),
         }
@@ -544,6 +556,13 @@ pub struct RoventEngineDeclaration {
 }
 impl RoventEngineDeclaration {
     fn validate(&self, purpose: RoventPurpose) -> Result<(), ManifestError> {
+        self.validate_with_system_cuda(purpose, false)
+    }
+    fn validate_with_system_cuda(
+        &self,
+        purpose: RoventPurpose,
+        system_cuda: bool,
+    ) -> Result<(), ManifestError> {
         require(
             hex(&self.source_commit, 40)
                 && (1..=64).contains(&self.source_components.len())
@@ -554,7 +573,11 @@ impl RoventEngineDeclaration {
             "invalid exact source/component identity",
         )?;
         self.binary.validate()?;
-        self.pc.validate()?;
+        if system_cuda {
+            self.pc.validate_with_system_cuda(true)?;
+        } else {
+            self.pc.validate()?;
+        }
         self.mode
             .validate_assembly(self.pc.device.compute(), self.researcher.is_some())
             .map_err(|e| ManifestError::Integrity(format!("Rovent assembly: {e}")))?;
@@ -620,13 +643,20 @@ impl RoventExecutionManifest {
         Ok(manifest)
     }
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validate_with_system_cuda(false)
+    }
+    fn validate_with_system_cuda(&self, system_cuda: bool) -> Result<(), ManifestError> {
         require(
             self.domain == ROVENT_EXECUTION_DOMAIN
                 && self.contract_revision == ROVENT_SEARCH_REVISION
                 && text(&self.run_id),
             "Rovent domain/revision/run mismatch; legacy input is not converted",
         )?;
-        self.engine.validate(self.purpose)?;
+        if system_cuda {
+            self.engine.validate_with_system_cuda(self.purpose, true)?;
+        } else {
+            self.engine.validate(self.purpose)?;
+        }
         self.resources.validate(&self.engine)?;
         self.coordinator.validate()?;
         require(

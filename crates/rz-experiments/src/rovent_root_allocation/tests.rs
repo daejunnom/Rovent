@@ -143,6 +143,59 @@ fn tick(at_ns: u64) -> RoventRootDeadline {
 }
 
 #[test]
+fn v3_allocation_joins_exact_v3_root_and_preserves_v1_wire() {
+    let (old_lock, old_descriptor, mut allocation_input) = fixture();
+    let old = RoventRootAllocationClock::seal(allocation_input.clone(), &old_descriptor, &old_lock)
+        .unwrap();
+    let old_bytes = old.canonical_bytes().unwrap();
+    let mut wire = serde_json::to_value(&old_lock.manifest).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.insert("domain".into(), json!(crate::ROVENT_EXECUTION_V3_DOMAIN));
+    object.insert("startup_document".into(), artifact("startup"));
+    object.insert("startup_configuration_sha256".into(), json!(sha_value('4')));
+    object.insert(
+        "startup_search_configuration_sha256".into(),
+        json!(old_lock.manifest.engine.search.search_configuration_sha256),
+    );
+    object.insert(
+        "own_r_root_tie".into(),
+        json!({"kind":"not_applicable", "reason":"pc_only"}),
+    );
+    object.insert(
+        "system_runtime_lock".into(),
+        serde_json::to_value(
+            crate::SystemRuntimeLockV6::new(crate::NativeRuntimeSourceV6::Cpu).unwrap(),
+        )
+        .unwrap(),
+    );
+    let lock = crate::RoventExecutionManifestV3::from_json(&wire.to_string())
+        .unwrap()
+        .lock()
+        .unwrap();
+    let mut descriptor_input = old_descriptor.input.clone();
+    descriptor_input.startup_lock_sha256 = lock.canonical_sha256.clone();
+    let descriptor = crate::RoventRootDescriptorV3::seal(descriptor_input, &lock).unwrap();
+    allocation_input.startup_lock_sha256 = lock.canonical_sha256.clone();
+    allocation_input.root_descriptor_sha256 = digest_hex(descriptor.digest().unwrap());
+    let allocation =
+        RoventRootAllocationClockV3::seal(allocation_input, &descriptor, &lock).unwrap();
+    let encoded = allocation.canonical_bytes().unwrap();
+    let text = std::str::from_utf8(&encoded).unwrap();
+    assert_eq!(
+        RoventRootAllocationClockV3::from_json(text).unwrap(),
+        allocation
+    );
+    assert!(RoventRootAllocationClockV2::from_json(text).is_err());
+    assert!(
+        RoventRootAllocationClockV3::from_json(std::str::from_utf8(&old_bytes).unwrap()).is_err()
+    );
+    let mut bad = allocation.clone();
+    bad.input.authority.root += 1;
+    assert!(bad.verify_against(&descriptor, &lock).is_err());
+    assert_eq!(old.canonical_bytes().unwrap(), old_bytes);
+}
+
+#[test]
 fn v2_allocation_rejects_old_wire_and_joins_exact_v2_descriptor_and_lock() {
     let (old_lock, old_descriptor, mut input) = fixture();
     let old = RoventRootAllocationClock::seal(input.clone(), &old_descriptor, &old_lock).unwrap();

@@ -89,8 +89,12 @@ impl NativeLoadingProfile {
     /// unchanged binary bundle digest. Indices refer to NVIDIA_LOAD_ORDER.
     pub const fn canonical_descriptor(self) -> &'static str {
         match self {
-            Self::EagerCuda12Cudnn9V1 => "rz-native-loading-profile/1;eager-cuda12-cudnn9-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15;deferred=none;resident=exact-pins",
-            Self::CuDnnShimLazyV1 => "rz-native-loading-profile/1;experimental-cudnn-shim-lazy-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,15;deferred=8,9,10,11,12,13,14;resident=exact-pins",
+            Self::EagerCuda12Cudnn9V1 => {
+                "rz-native-loading-profile/1;eager-cuda12-cudnn9-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15;deferred=none;resident=exact-pins"
+            }
+            Self::CuDnnShimLazyV1 => {
+                "rz-native-loading-profile/1;experimental-cudnn-shim-lazy-v1;declared-nvidia=16;declared-ort=3;rtld=now-global;eager=0,1,2,3,4,5,6,7,15;deferred=8,9,10,11,12,13,14;resident=exact-pins"
+            }
         }
     }
 
@@ -323,6 +327,9 @@ pub enum LoadErrorKind {
     FileIdentity,
     FileAccess,
     InvalidMaps,
+    /// System mapping observation could not be read or interpreted. This is
+    /// evidence unavailable, not proof of a conflicting native mapping.
+    ObservationUnavailable,
     ForeignMapping,
     MissingMapping,
     MappingIdentity,
@@ -381,6 +388,7 @@ impl LoadError {
             LoadErrorKind::FileIdentity => "native.file_identity",
             LoadErrorKind::FileAccess => "native.file_access",
             LoadErrorKind::InvalidMaps => "native.invalid_maps",
+            LoadErrorKind::ObservationUnavailable => "native.observation_unavailable",
             LoadErrorKind::ForeignMapping => "native.foreign_mapping",
             LoadErrorKind::MissingMapping => "native.missing_mapping",
             LoadErrorKind::MappingIdentity => "native.mapping_identity",
@@ -1611,13 +1619,10 @@ mod linux {
                 "1000-2000 r-xp 0 08:03 19 /private native/libcudart.so.12\n",
                 "1000-2000 r-xp 0 08:02 19 /ambient/libcudnn.so.8\n",
             ] {
-                assert!(audit_entries(
-                    &expected(),
-                    1,
-                    &parse_maps(line.as_bytes()).unwrap(),
-                    false
-                )
-                .is_err());
+                assert!(
+                    audit_entries(&expected(), 1, &parse_maps(line.as_bytes()).unwrap(), false)
+                        .is_err()
+                );
             }
             assert_eq!(
                 audit_entries(&expected(), 1, &[], false).unwrap_err().kind,
@@ -1703,13 +1708,10 @@ mod linux {
         fn exact_name_does_not_admit_invented_hash_or_size() {
             let accepted = TRUSTED_NATIVE_PROFILE[0];
             let path = Path::new("/private native/libcudart.so.12");
-            assert!(validate_declaration(
-                path,
-                accepted.bytes,
-                accepted.digest,
-                &NVIDIA_LOAD_ORDER
-            )
-            .is_ok());
+            assert!(
+                validate_declaration(path, accepted.bytes, accepted.digest, &NVIDIA_LOAD_ORDER)
+                    .is_ok()
+            );
             for (bytes, digest) in [
                 (accepted.bytes, [0; 32]),
                 (accepted.bytes + 1, accepted.digest),

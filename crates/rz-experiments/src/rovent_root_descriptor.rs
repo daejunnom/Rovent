@@ -7,7 +7,7 @@
 
 use crate::{
     ManifestError, ROVENT_POSITION_VISIT_UNIT, RoventCoordinatorDeclaration, RoventInputLock,
-    RoventInputLockV2, RoventResourcePlan, RoventSearchDeclaration,
+    RoventInputLockV2, RoventInputLockV3, RoventResourcePlan, RoventSearchDeclaration,
 };
 use rz_contracts::{Digest, rovent::SearchGoal};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,9 @@ pub const ROVENT_ROOT_DEADLINE_DOMAIN: &str = "rz-rovent-root-deadline/1";
 pub const ROVENT_ROOT_ADMISSION_V2_DOMAIN: &str = "rz-rovent-root-admission/2";
 pub const ROVENT_ROOT_BUDGET_V2_DOMAIN: &str = "rz-rovent-root-budget/2";
 pub const ROVENT_ROOT_DEADLINE_V2_DOMAIN: &str = "rz-rovent-root-deadline/2";
+pub const ROVENT_ROOT_ADMISSION_V3_DOMAIN: &str = "rz-rovent-root-admission/3";
+pub const ROVENT_ROOT_BUDGET_V3_DOMAIN: &str = "rz-rovent-root-budget/3";
+pub const ROVENT_ROOT_DEADLINE_V3_DOMAIN: &str = "rz-rovent-root-deadline/3";
 const MAX_DESCRIPTOR_BYTES: usize = 64 << 10;
 const MAX_RAW_MOVES_BYTES: usize = 32 << 10;
 const MAX_ROOT_MOVES: usize = 218;
@@ -318,6 +321,114 @@ impl RoventRootDescriptorV2 {
     pub fn digest(&self) -> Result<Digest, ManifestError> {
         Ok(domain_hash(
             ROVENT_ROOT_ADMISSION_V2_DOMAIN,
+            &self.canonical_bytes()?,
+        ))
+    }
+
+    pub fn root_budget_digest(&self) -> Result<Digest, ManifestError> {
+        self.validate()?;
+        parse_digest(&self.root_budget_sha256)
+    }
+
+    pub fn deadline_seal_digest(&self) -> Result<Digest, ManifestError> {
+        self.validate()?;
+        parse_digest(&self.deadline_seal_sha256)
+    }
+}
+
+/// A distinct /3 wire domain for declarations joined to a typed /3 lock.
+/// It is metadata only and cannot grant a live root or observation authority.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventRootDescriptorV3 {
+    pub domain: String,
+    pub startup_lock_domain: String,
+    pub input: RoventRootDescriptorInput,
+    pub root_budget_sha256: String,
+    pub deadline_seal_sha256: String,
+}
+
+impl RoventRootDescriptorV3 {
+    pub fn seal(
+        input: RoventRootDescriptorInput,
+        lock: &RoventInputLockV3,
+    ) -> Result<Self, ManifestError> {
+        let (root_budget_sha256, deadline_seal_sha256) = seals_for(
+            &input,
+            ROVENT_ROOT_BUDGET_V3_DOMAIN,
+            ROVENT_ROOT_DEADLINE_V3_DOMAIN,
+        )?;
+        let value = Self {
+            domain: ROVENT_ROOT_ADMISSION_V3_DOMAIN.into(),
+            startup_lock_domain: crate::ROVENT_LOCK_V3_DOMAIN.into(),
+            input,
+            root_budget_sha256,
+            deadline_seal_sha256,
+        };
+        value.verify_against(lock)?;
+        canonical(&value)?;
+        Ok(value)
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        require(
+            input.len() <= MAX_DESCRIPTOR_BYTES,
+            "root descriptor input exceeds 64 KiB",
+        )?;
+        let value: Self = crate::decode_json(input)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        require(
+            self.domain == ROVENT_ROOT_ADMISSION_V3_DOMAIN
+                && self.startup_lock_domain == crate::ROVENT_LOCK_V3_DOMAIN
+                && sha(&self.root_budget_sha256)
+                && sha(&self.deadline_seal_sha256),
+            "root /3 descriptor domain or seal syntax differs",
+        )?;
+        let (budget, deadline) = seals_for(
+            &self.input,
+            ROVENT_ROOT_BUDGET_V3_DOMAIN,
+            ROVENT_ROOT_DEADLINE_V3_DOMAIN,
+        )?;
+        require(
+            budget == self.root_budget_sha256 && deadline == self.deadline_seal_sha256,
+            "root /3 descriptor seals differ from their canonical inputs",
+        )?;
+        canonical(self)?;
+        Ok(())
+    }
+
+    /// Compares declarations only. The caller must separately preserve and
+    /// validate the real owner, Rules state, clock and revocation gate.
+    pub fn verify_against(&self, lock: &RoventInputLockV3) -> Result<(), ManifestError> {
+        lock.validate()?;
+        self.validate()?;
+        let manifest = &lock.manifest;
+        verify_declarations(
+            &self.input,
+            &lock.canonical_sha256,
+            &manifest.engine.search,
+            &manifest.coordinator,
+            &manifest.resources,
+            ExecutionLimits {
+                wall_time_max_ms: manifest.wall_time_max_ms,
+                cleanup_max_ms: manifest.cleanup_max_ms,
+                output_bytes_max: manifest.output_bytes_max,
+            },
+        )
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
+        canonical(self)
+    }
+
+    pub fn digest(&self) -> Result<Digest, ManifestError> {
+        Ok(domain_hash(
+            ROVENT_ROOT_ADMISSION_V3_DOMAIN,
             &self.canonical_bytes()?,
         ))
     }

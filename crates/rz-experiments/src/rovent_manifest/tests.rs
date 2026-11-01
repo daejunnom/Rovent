@@ -318,6 +318,126 @@ fn policy_manifest_v2(
 }
 
 #[test]
+fn system_runtime_v3_keeps_old_lock_and_startup_domains_distinct() {
+    use crate::{
+        NativeRuntimeSourceV6, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeLockV6,
+        SystemRuntimeSpecV6,
+    };
+    let libraries = ["ort-core", "ort-provider-cuda"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, role)| SystemLibrarySpecV6 {
+            role: role.into(),
+            requested_path: format!("/usr/lib/{role}.so"),
+            canonical_path: format!("/usr/lib/{role}.so.1"),
+            version: None,
+            sha256: if index == 0 {
+                sha_value('a')
+            } else {
+                sha_value('b')
+            },
+            bytes: (index + 1) as u64,
+            device: 1,
+            inode: (index + 1) as u64,
+            required_mapping: true,
+        })
+        .collect();
+    let runtime =
+        SystemRuntimeLockV6::new(NativeRuntimeSourceV6::SystemCuda(SystemRuntimeSpecV6 {
+            platform: SystemPlatformV6::Linux,
+            libraries,
+            system_identity_sha256: sha_value('c'),
+            cuda_device_id: 0,
+            cuda_arena_bytes: 1024,
+            startup_ms: 1000,
+            drain_ms: 200,
+            capture_max_libraries: 2,
+            capture_max_file_bytes: 2,
+            capture_max_total_bytes: 3,
+            capture_timeout_ms: 100,
+        }))
+        .unwrap();
+    let mut base = manifest();
+    base.engine.mode = ExecutionMode::HybridPc;
+    base.engine.pc.backend = RoventBackend::OrtCuda;
+    base.engine.pc.device = RoventDevice::Cuda {
+        ordinal: 0,
+        registered_device: "fixture-gpu".into(),
+    };
+    base.engine.pc.ort_intra_threads = Some(1);
+    base.engine.pc.ort_inter_threads = Some(1);
+    base.engine.pc.ort_spinning = Some(false);
+    base.resources.gpu_devices = 1;
+    // A historical /2 declaration still requires its original runtime assets.
+    let old = policy_manifest_v2(
+        base.clone(),
+        RoventRootTieDeclarationV2::NotApplicable {
+            reason: RoventOwnRNotApplicableV2::PcOnly,
+        },
+    );
+    assert!(old.validate().is_err());
+    let doc = RoventStartupDocumentV5 {
+        domain: ROVENT_STARTUP_DOCUMENT_V5_DOMAIN.into(),
+        system_runtime_lock_sha256: runtime.canonical_sha256.clone(),
+        configuration: serde_json::json!({"domain": ROVENT_STARTUP_CONFIGURATION_V5_DOMAIN}),
+    };
+    let bytes = doc.canonical_bytes().unwrap();
+    let mut startup = artifact("startup-v5.json");
+    startup.sha256 = digest(&bytes);
+    startup.bytes = bytes.len() as u64;
+    let fresh = RoventExecutionManifestV3 {
+        domain: ROVENT_EXECUTION_V3_DOMAIN.into(),
+        contract_revision: base.contract_revision,
+        run_id: base.run_id,
+        purpose: base.purpose,
+        engine: base.engine,
+        resources: base.resources,
+        coordinator: base.coordinator,
+        wall_time_max_ms: base.wall_time_max_ms,
+        cleanup_max_ms: base.cleanup_max_ms,
+        output_bytes_max: base.output_bytes_max,
+        agent_renewable: base.agent_renewable,
+        provenance: base.provenance,
+        startup_document: startup,
+        startup_configuration_sha256: old.startup_configuration_sha256,
+        startup_search_configuration_sha256: old.startup_search_configuration_sha256,
+        own_r_root_tie: old.own_r_root_tie,
+        system_runtime_lock: runtime,
+    };
+    let lock = fresh.lock().unwrap();
+    let lock_json = serde_json::to_string(&lock).unwrap();
+    assert_eq!(RoventInputLockV3::from_json(&lock_json).unwrap(), lock);
+    assert!(RoventInputLockV2::from_json(&lock_json).is_err());
+    let original = std::sync::Arc::new(lock.clone());
+    let owner = crate::RoventOriginalInputLock::from_v3(std::sync::Arc::clone(&original)).unwrap();
+    assert!(std::sync::Arc::ptr_eq(owner.v3().unwrap(), &original));
+    assert!(owner.v1().is_none() && owner.v2().is_none());
+    assert!(owner.same_original_owner(&owner.clone()));
+    let other = crate::RoventOriginalInputLock::from_v3(std::sync::Arc::new(lock.clone())).unwrap();
+    assert!(!owner.same_original_owner(&other));
+    assert!(std::ptr::eq(
+        owner.common().engine,
+        &original.manifest.engine
+    ));
+    let mut invalid = lock.clone();
+    invalid.canonical_sha256.clear();
+    let invalid = std::sync::Arc::new(invalid);
+    let failure =
+        crate::RoventOriginalInputLock::from_v3(std::sync::Arc::clone(&invalid)).unwrap_err();
+    assert!(std::sync::Arc::ptr_eq(&failure.original, &invalid));
+    assert!(doc.validate_against(&lock, &bytes).is_ok());
+    assert!(doc.validate_against(&lock, b"{}").is_err());
+    let mut changed = lock.clone();
+    changed
+        .manifest
+        .engine
+        .pc
+        .runtime_artifacts
+        .push(artifact("cuda-copy.so"));
+    assert!(changed.validate().is_err());
+}
+
+#[test]
 fn original_versioned_lock_owner_retains_exact_arc_and_borrowed_fields() {
     use crate::RoventOriginalInputLock;
     use std::sync::Arc;
