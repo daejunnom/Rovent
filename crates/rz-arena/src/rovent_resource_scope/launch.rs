@@ -14,7 +14,10 @@ pub const ROVENT_RESOURCE_USAGE: &str = "rz-rovent-native [--resource-system-run
 
 /// Partial diagnostic projection only. The exact event remains in its owner;
 /// unsupported or oversized details never become release authority.
-fn observed_startup_failure(failure: &rz_search::pals::coordinator::RoleFailure, remaining: &mut usize) -> Value {
+fn observed_startup_failure(
+    failure: &rz_search::pals::coordinator::RoleFailure,
+    remaining: &mut usize,
+) -> Value {
     use rz_search::pals::coordinator::RoleFailure;
     match failure {
         RoleFailure::Canceled => json!({"kind":"canceled"}),
@@ -22,12 +25,16 @@ fn observed_startup_failure(failure: &rz_search::pals::coordinator::RoleFailure,
         RoleFailure::InvalidOutput => json!({"kind":"invalid_output"}),
         RoleFailure::PhysicalUnknown => json!({"kind":"physical_unknown"}),
         RoleFailure::Backend(detail) => observed_failure_detail("backend", detail, remaining),
-        RoleFailure::Unsupported(detail) => observed_failure_detail("unsupported", detail, remaining),
+        RoleFailure::Unsupported(detail) => {
+            observed_failure_detail("unsupported", detail, remaining)
+        }
     }
 }
 
 fn observed_failure_detail(kind: &str, detail: &str, remaining: &mut usize) -> Value {
-    if detail.len() > *remaining { return json!({"kind":kind, "detail_retained_by_owner":true}); }
+    if detail.len() > *remaining {
+        return json!({"kind":kind, "detail_retained_by_owner":true});
+    }
     *remaining -= detail.len();
     json!({"kind":kind, "detail":detail})
 }
@@ -1672,11 +1679,20 @@ mod tests {
         use rz_search::pals::coordinator::RoleFailure;
         let failure = RoleFailure::Backend("original failure".into());
         let mut enough = "original failure".len();
-        assert_eq!(observed_startup_failure(&failure, &mut enough), json!({"kind":"backend","detail":"original failure"}));
+        assert_eq!(
+            observed_startup_failure(&failure, &mut enough),
+            json!({"kind":"backend","detail":"original failure"})
+        );
         assert_eq!(enough, 0);
         let mut insufficient = 0;
-        assert_eq!(observed_startup_failure(&failure, &mut insufficient), json!({"kind":"backend","detail_retained_by_owner":true}));
-        assert_eq!(observed_startup_failure(&RoleFailure::PhysicalUnknown, &mut insufficient), json!({"kind":"physical_unknown"}));
+        assert_eq!(
+            observed_startup_failure(&failure, &mut insufficient),
+            json!({"kind":"backend","detail_retained_by_owner":true})
+        );
+        assert_eq!(
+            observed_startup_failure(&RoleFailure::PhysicalUnknown, &mut insufficient),
+            json!({"kind":"physical_unknown"})
+        );
     }
     #[test]
     fn cpu_v3_receipts_require_original_child_ready_and_session_finish() {

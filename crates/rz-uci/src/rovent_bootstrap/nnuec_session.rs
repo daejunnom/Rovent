@@ -1053,6 +1053,7 @@ struct NativeOwner {
     finished: Option<bool>,
     joined: bool,
     failures: NativeTerminalFailures,
+    session_release: Option<crate::pals_adaptive::NativeSessionReleaseObservation>,
     unexpected: Vec<TicketNativeEvent<VirtualReviewTicketOutput>>,
 }
 #[derive(Default)]
@@ -1125,6 +1126,7 @@ impl NativeOwner {
             finished: None,
             joined: false,
             failures: NativeTerminalFailures::default(),
+            session_release: None,
             unexpected: Vec::new(),
         }
     }
@@ -1157,6 +1159,16 @@ impl NativeOwner {
                         let original = self.service.take_finish_report();
                         let inconsistent = matches!((&snapshot, &original),
                             (Some(snapshot), Some(original)) if snapshot != original);
+                        if !missing && !inconsistent {
+                            self.session_release = original
+                                .as_ref()
+                                .and_then(|report| crate::pals_adaptive::NativeSessionReleaseObservation::from_report(report, true))
+                                .or_else(|| snapshot.as_ref().and_then(|report| {
+                                    crate::pals_adaptive::NativeSessionReleaseObservation::from_report(report, false)
+                                }));
+                        } else {
+                            self.session_release = None;
+                        }
                         if missing || inconsistent {
                             self.finished = Some(false);
                             self.failures.physical.push(
@@ -1238,6 +1250,44 @@ enum State {
         native: NativeOwner,
     },
     Moving,
+}
+
+fn observe_whole_session_state_v3(state: &Mutex<State>) -> super::product::WholeSessionClosedV3 {
+    match state.try_lock() {
+        Ok(state) if matches!(&*state, State::Closed { .. }) => {
+            super::product::WholeSessionClosedV3::Confirmed
+        }
+        _ => super::product::WholeSessionClosedV3::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod whole_session_observation_tests {
+    use super::*;
+
+    #[test]
+    fn moving_busy_and_poisoned_are_not_closed_evidence() {
+        use super::super::product::WholeSessionClosedV3;
+        let state = Mutex::new(State::Moving);
+        assert_eq!(
+            observe_whole_session_state_v3(&state),
+            WholeSessionClosedV3::Unknown
+        );
+        let lock = state.lock().unwrap();
+        assert_eq!(
+            observe_whole_session_state_v3(&state),
+            WholeSessionClosedV3::Unknown
+        );
+        drop(lock);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().unwrap();
+            panic!("poisoned test owner");
+        }));
+        assert_eq!(
+            observe_whole_session_state_v3(&state),
+            WholeSessionClosedV3::Unknown
+        );
+    }
 }
 
 pub struct RoventNnuecSessionRejection {
@@ -1375,6 +1425,25 @@ pub struct RoventNnuecSessionDriver {
     nnuec_diagnostics: diagnostics::NnuecDiagnosticJournal,
 }
 impl RoventNnuecSessionDriver {
+    /// Observe only the native owner retained in this fully closed session.
+    /// A release of zero completed runs is not evidence of inference.
+    pub(crate) fn session_release_observation(
+        &self,
+    ) -> Option<crate::pals_adaptive::NativeSessionReleaseObservation> {
+        let state = self.state.try_lock().ok()?;
+        let State::Closed { native } = &*state else {
+            return None;
+        };
+        (native.joined && native.finished == Some(true))
+            .then_some(native.session_release)
+            .flatten()
+    }
+    /// The actual owner installs Closed only after actor, native, storage and
+    /// any collection hook are drained. This observation never waits and never
+    /// turns an in-progress, retained or poisoned state into evidence.
+    pub(crate) fn observe_whole_session_closed_v3(&self) -> super::product::WholeSessionClosedV3 {
+        observe_whole_session_state_v3(&self.state)
+    }
     /// A secondary revoke panic must not replace the original root error or
     /// release resources hidden in its payload while physical state is unknown.
     fn retain_v2_revoke_panic(&self, payload: Box<dyn Any + Send>) {

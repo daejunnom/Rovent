@@ -892,7 +892,7 @@ struct NativeOwner {
     unexpected: Vec<TicketNativeEvent<VirtualReviewTicketOutput>>,
     shutdown_physical_failures: Vec<RoleFailure>,
     shutdown_semantic_failures: Vec<RoleFailure>,
-    shutdown_reports: Vec<TicketNativeFinishReport>,
+    shutdown_reports: Vec<(TicketNativeFinishReport, bool)>,
     finish_report_missing: bool,
     finish_report_inconsistent: bool,
     // A recovered native source retains the original typed root/cache closure
@@ -949,19 +949,19 @@ impl NativeOwner {
                         // If another consumer took the report, its independent
                         // snapshot still preserves our failure evidence. If the
                         // two disagree, retain both instead of hiding either.
-                        let mut reports =
-                            [original, if inconsistent { snapshot.clone() } else { None }];
-                        if reports[0].is_none() {
-                            reports[0] = snapshot;
-                        }
-                        for report in reports.into_iter().flatten() {
-                            if let Some(failure) = &report.physical_failure {
-                                self.shutdown_physical_failures.push(failure.clone());
+                        let original_missing = original.is_none();
+                        let reports = [(original, true), (snapshot, false)];
+                        for (report, original) in reports {
+                            let Some(report) = report else { continue };
+                            if original || original_missing || inconsistent {
+                                if let Some(failure) = &report.physical_failure {
+                                    self.shutdown_physical_failures.push(failure.clone());
+                                }
+                                if let Some(failure) = &report.semantic_failure {
+                                    self.shutdown_semantic_failures.push(failure.clone());
+                                }
                             }
-                            if let Some(failure) = &report.semantic_failure {
-                                self.shutdown_semantic_failures.push(failure.clone());
-                            }
-                            self.shutdown_reports.push(report);
+                            self.shutdown_reports.push((report, original));
                         }
                     }
                     TicketNativeEvent::Ready { .. } | TicketNativeEvent::RootQuiesced(_) => {}
@@ -1043,8 +1043,25 @@ enum State {
         native: NativeOwner,
         failure: SearchSessionFailure,
     },
+    ClosedNative {
+        native: NativeOwner,
+    },
     Closed,
     Moving,
+}
+
+fn observe_whole_session_closed_v3(state: &Mutex<State>) -> super::product::WholeSessionClosedV3 {
+    match state.try_lock() {
+        Ok(state)
+            if matches!(
+                &*state,
+                State::Closed | State::ClosedNative { .. } | State::ClosedFailure { .. }
+            ) =>
+        {
+            super::product::WholeSessionClosedV3::Confirmed
+        }
+        _ => super::product::WholeSessionClosedV3::Unknown,
+    }
 }
 
 /// Startup rejection returns the original prepared physical owner intact.
@@ -1192,6 +1209,50 @@ pub struct RoventPcSessionDriver {
     storage: Mutex<Option<Box<SessionStorageLifecycle>>>,
 }
 impl RoventPcSessionDriver {
+    /// A release observation is tied to the same closed session and its
+    /// matching original finish report and immutable snapshot.
+    pub(crate) fn session_release_observation(
+        &self,
+    ) -> Option<crate::pals_adaptive::NativeSessionReleaseObservation> {
+        let state = self.state.try_lock().ok()?;
+        let native = match &*state {
+            State::ClosedNative { native } | State::ClosedFailure { native, .. } => native,
+            _ => return None,
+        };
+        if !native.joined
+            || native.finished != Some(true)
+            || native.finish_report_missing
+            || native.finish_report_inconsistent
+        {
+            return None;
+        }
+        let snapshot = native
+            .shutdown_reports
+            .iter()
+            .find(|(_, original)| !*original)?;
+        match native
+            .shutdown_reports
+            .iter()
+            .find(|(_, original)| *original)
+        {
+            Some(original) if original.0 == snapshot.0 => {
+                crate::pals_adaptive::NativeSessionReleaseObservation::from_report(
+                    &original.0,
+                    true,
+                )
+            }
+            Some(_) => None,
+            None => crate::pals_adaptive::NativeSessionReleaseObservation::from_report(
+                &snapshot.0,
+                false,
+            ),
+        }
+    }
+    /// Observe the same session's completed teardown without waiting. A
+    /// native completion flag alone is not a whole-session closure proof.
+    pub(crate) fn observe_whole_session_closed_v3(&self) -> super::product::WholeSessionClosedV3 {
+        observe_whole_session_closed_v3(&self.state)
+    }
     /// Source/configuration-derived identity only. This pure calculation opens
     /// no assets and constructs no session, Ready, clock or root authority.
     /// Native construction uses this same producer after its actual admission.
@@ -2271,7 +2332,10 @@ impl RoventPcSessionDriver {
             } else {
                 observation.complete = false;
             }
-        } else if !matches!(&*state, State::Closed | State::ClosedFailure { .. }) {
+        } else if !matches!(
+            &*state,
+            State::Closed | State::ClosedNative { .. } | State::ClosedFailure { .. }
+        ) {
             observation.complete = false;
         }
         Ok(Some(observation))
@@ -3935,6 +3999,10 @@ impl RoventPcSessionDriver {
                     *state = State::Closed;
                     return Ok(());
                 }
+                State::ClosedNative { native } => {
+                    *state = State::ClosedNative { native };
+                    return Ok(());
+                }
                 State::ClosedFailure { native, failure } => {
                     let result = failure.clone();
                     *state = State::ClosedFailure { native, failure };
@@ -3984,7 +4052,9 @@ impl RoventPcSessionDriver {
                             }
                         }
                         *state = match &result {
-                            Ok(()) => State::Closed,
+                            Ok(()) => State::ClosedNative {
+                                native: idle.native,
+                            },
                             Err(failure) => State::ClosedFailure {
                                 native: idle.native,
                                 failure: failure.clone(),
@@ -4038,7 +4108,7 @@ impl RoventPcSessionDriver {
                             }
                         }
                         *state = match &result {
-                            Ok(()) => State::Closed,
+                            Ok(()) => State::ClosedNative { native },
                             Err(failure) => State::ClosedFailure {
                                 native,
                                 failure: failure.clone(),
@@ -4095,7 +4165,7 @@ impl RoventPcSessionDriver {
                     }
                     if physical_done {
                         *state = match &result {
-                            Ok(()) => State::Closed,
+                            Ok(()) => State::ClosedNative { native },
                             Err(failure) => State::ClosedFailure {
                                 native,
                                 failure: failure.clone(),
@@ -4328,7 +4398,10 @@ impl Drop for RoventPcSessionDriver {
             .state
             .get_mut()
             .unwrap_or_else(|poison| poison.into_inner());
-        if !matches!(state, State::Closed | State::ClosedFailure { .. }) {
+        if !matches!(
+            state,
+            State::Closed | State::ClosedNative { .. } | State::ClosedFailure { .. }
+        ) {
             let retained = std::mem::replace(state, State::Moving);
             std::mem::forget(retained);
             // Preserve the original descriptors with the quarantined physical
@@ -4468,6 +4541,46 @@ fn poisoned() -> ContractError {
         rz_contracts::Stage::Output,
         "Rovent P/C observation mutex poisoned",
     )
+}
+
+#[cfg(test)]
+mod whole_session_closed_tests {
+    use super::{State, observe_whole_session_closed_v3};
+    use crate::rovent_bootstrap::product::WholeSessionClosedV3;
+    use std::sync::Mutex;
+
+    #[test]
+    fn actual_closed_and_moving_states_have_distinct_observations() {
+        let state = Mutex::new(State::Closed);
+        assert_eq!(
+            observe_whole_session_closed_v3(&state),
+            WholeSessionClosedV3::Confirmed
+        );
+        *state.lock().unwrap() = State::Moving;
+        assert_eq!(
+            observe_whole_session_closed_v3(&state),
+            WholeSessionClosedV3::Unknown
+        );
+    }
+
+    #[test]
+    fn busy_and_poisoned_closed_state_are_unknown() {
+        let state = Mutex::new(State::Closed);
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            observe_whole_session_closed_v3(&state),
+            WholeSessionClosedV3::Unknown
+        );
+        drop(guard);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().unwrap();
+            panic!("poison closed state for observation test");
+        }));
+        assert_eq!(
+            observe_whole_session_closed_v3(&state),
+            WholeSessionClosedV3::Unknown
+        );
+    }
 }
 
 #[cfg(test)]

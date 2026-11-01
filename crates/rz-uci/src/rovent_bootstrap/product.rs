@@ -330,6 +330,13 @@ pub struct RoventNativeProductDriver {
 pub(crate) struct RoventProductPhysicalClose {
     closed: Arc<AtomicBool>,
 }
+/// Observes the same session owner's completed shutdown. It is not a device
+/// fence, inference success or proof for a different session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WholeSessionClosedV3 {
+    Confirmed,
+    Unknown,
+}
 impl RoventProductPhysicalClose {
     pub(crate) fn is_confirmed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -1269,6 +1276,11 @@ impl RoventPcAssemblyV3 {
 }
 
 impl RoventNativeProductDriverV3 {
+    pub(crate) fn session_release_observation(
+        &self,
+    ) -> Option<crate::pals_adaptive::NativeSessionReleaseObservation> {
+        self.inner.session_release_observation()
+    }
     #[allow(clippy::result_large_err)]
     pub fn pc(
         prepared: PreparedRoventNativeV3<PcPortQuestion>,
@@ -1374,8 +1386,13 @@ impl SearchSessionDriver for RoventNativeProductDriverV3 {
         until: Instant,
     ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
         let result = self.inner.finish_session(until);
-        if matches!(result, Ok(Some(DriverPhysicalCompletion::Confirmed))) {
+        if matches!(
+            self.inner.observe_whole_session_closed_v3(),
+            WholeSessionClosedV3::Confirmed
+        ) {
             self.physically_closed.store(true, Ordering::Release);
+        } else if matches!(result, Ok(Some(DriverPhysicalCompletion::Confirmed))) {
+            return Err(SearchSessionFailure::physical_completion_unknown());
         }
         result
     }
@@ -2620,6 +2637,11 @@ impl RoventOwnNnuecAssemblyV3 {
 }
 
 impl RoventOwnNnuecProductDriverV3 {
+    pub(crate) fn session_release_observation(
+        &self,
+    ) -> Option<crate::pals_adaptive::NativeSessionReleaseObservation> {
+        self.inner.session_release_observation()
+    }
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     pub fn own_nnuec_pcr(
         prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
@@ -2700,8 +2722,13 @@ impl SearchSessionDriver for RoventOwnNnuecProductDriverV3 {
         until: Instant,
     ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
         let result = self.inner.finish_session(until);
-        if matches!(result, Ok(Some(DriverPhysicalCompletion::Confirmed))) {
+        if matches!(
+            self.inner.observe_whole_session_closed_v3(),
+            WholeSessionClosedV3::Confirmed
+        ) {
             self.physically_closed.store(true, Ordering::Release);
+        } else if matches!(result, Ok(Some(DriverPhysicalCompletion::Confirmed))) {
+            return Err(SearchSessionFailure::physical_completion_unknown());
         }
         result
     }

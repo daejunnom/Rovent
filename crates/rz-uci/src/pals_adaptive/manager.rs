@@ -231,7 +231,7 @@ impl NativeSessionReleaseObservation {
     pub fn source(&self) -> NativeSessionReleaseSource {
         self.source
     }
-    pub(super) fn from_report(
+    pub(crate) fn from_report(
         report: &crate::pals_native::ticketed::TicketNativeFinishReport,
         original: bool,
     ) -> Option<Self> {

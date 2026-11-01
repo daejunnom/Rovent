@@ -63,9 +63,15 @@ pub(super) trait ScopeObserver {
 }
 
 impl ScopeObserver for rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey {
-    fn observation(&self) -> Option<rz_uci::rovent_bootstrap::launch::V3ScopeObservation> { self.observe() }
-    fn session_evidence(&self) -> rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence { self.terminal_evidence() }
-    fn reobserve(&self, until: Instant) -> String { format!("{:?}", self.reobserve_native(until)) }
+    fn observation(&self) -> Option<rz_uci::rovent_bootstrap::launch::V3ScopeObservation> {
+        self.observe()
+    }
+    fn session_evidence(&self) -> rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence {
+        self.terminal_evidence()
+    }
+    fn reobserve(&self, until: Instant) -> String {
+        format!("{:?}", self.reobserve_native(until))
+    }
 }
 impl Write for BoundedEvidence {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -220,7 +226,7 @@ impl DirectControl {
             }) {
                 let directory = self.endpoint.clone_original_directory();
                 let mut bytes = BoundedEvidence(Vec::new());
-                let encoded = serde_json::to_writer(
+                let mut encoded = serde_json::to_writer(
                     &mut bytes,
                     &RecoveryEvidenceDocument {
                         schema: "rz-rovent-before-native-recovery-observation/1",
@@ -230,6 +236,26 @@ impl DirectControl {
                         release_authorized: false,
                     },
                 );
+                if encoded.is_err() {
+                    // A large/escaped optional summary must not discard the
+                    // original owner or prevent a small failure observation.
+                    // This fallback is never a complete event export.
+                    bytes.0.clear();
+                    let fallback = serde_json::json!({
+                        "state":"same_owner_recovered_and_retained",
+                        "observation_details_omitted":"serialization_failed",
+                    });
+                    encoded = serde_json::to_writer(
+                        &mut bytes,
+                        &RecoveryEvidenceDocument {
+                            schema: "rz-rovent-before-native-recovery-observation/1",
+                            observation: &fallback,
+                            complete_event_export: false,
+                            original_owner_retained: true,
+                            release_authorized: false,
+                        },
+                    );
+                }
                 match (directory, encoded) {
                     (Ok(directory), Ok(())) => {
                         let bytes = bytes.0;
@@ -351,8 +377,12 @@ impl DirectControl {
         let scope = key.and_then(|key| key.observation());
         let session_evidence = key
             .map(|key| match key.session_evidence() {
-                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative => "before_native",
-                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::SessionReleased => "session_released",
+                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative => {
+                    "before_native"
+                }
+                rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::SessionReleased => {
+                    "session_released"
+                }
                 rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::Unknown => "unknown",
             })
             .unwrap_or("scope_unavailable");
@@ -532,29 +562,110 @@ mod tests {
 
     #[test]
     fn recovery_evidence_does_not_replace_existing_file_or_release_owner() {
-        let parent = Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap();
-        let name = format!("rovent-direct-conflict-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let parent =
+            Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap();
+        let name = format!(
+            "rovent-direct-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         parent.create_dir(&name).unwrap();
-        let mut fixture = Fixture { parent, name: name.clone(), control: None };
+        let mut fixture = Fixture {
+            parent,
+            name: name.clone(),
+            control: None,
+        };
         let directory = fixture.parent.open_dir(&name).unwrap();
         let path = std::env::temp_dir().join(&name);
         let original = path.join("before-native-recovery-observation.json");
         std::fs::write(&original, b"existing evidence").unwrap();
-        fixture.control = Some(DirectControl::prepare(&directory, &path, Instant::now() + Duration::from_secs(60), Duration::from_secs(60)).unwrap());
+        fixture.control = Some(
+            DirectControl::prepare(
+                &directory,
+                &path,
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
         let control = fixture.control.as_mut().unwrap();
         control.bind().unwrap();
         let summary = serde_json::json!({"state":"same_owner_recovered_and_retained"});
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             let evidence = control.recovery_evidence_status(Some(&summary));
-            if evidence["state"] == "failed" { break; }
+            if evidence["state"] == "failed" {
+                break;
+            }
             assert_eq!(evidence["state"], "writing", "{evidence}");
             assert!(Instant::now() < until, "evidence writer did not finish");
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(std::fs::read(&original).unwrap(), b"existing evidence");
-        assert_eq!(control.recovery_evidence_status(Some(&summary))["state"], "failed");
+        assert_eq!(
+            control.recovery_evidence_status(Some(&summary))["state"],
+            "failed"
+        );
+        assert!(control.observe_bound_identity().is_ok());
+        control.cleanup_confirmed().unwrap();
+    }
+
+    #[test]
+    fn oversized_escaped_recovery_summary_keeps_small_non_authoritative_observation() {
+        let parent =
+            Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap();
+        let name = format!(
+            "rovent-direct-oversize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        parent.create_dir(&name).unwrap();
+        let mut fixture = Fixture {
+            parent,
+            name: name.clone(),
+            control: None,
+        };
+        let directory = fixture.parent.open_dir(&name).unwrap();
+        let path = std::env::temp_dir().join(&name);
+        fixture.control = Some(
+            DirectControl::prepare(
+                &directory,
+                &path,
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let control = fixture.control.as_mut().unwrap();
+        control.bind().unwrap();
+        let summary = serde_json::json!({"state":"same_owner_recovered_and_retained", "original_error":"\n".repeat(super::super::MAX_EVIDENCE_BYTES / 2)});
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let evidence = control.recovery_evidence_status(Some(&summary));
+            if evidence["state"] == "observation_synced" {
+                break;
+            }
+            assert_eq!(evidence["state"], "writing", "{evidence}");
+            assert!(Instant::now() < until, "evidence writer did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.join("before-native-recovery-observation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence["observation"]["observation_details_omitted"],
+            "serialization_failed"
+        );
+        assert_eq!(evidence["original_owner_retained"], true);
+        assert_eq!(evidence["complete_event_export"], false);
+        assert_eq!(evidence["release_authorized"], false);
         assert!(control.observe_bound_identity().is_ok());
         control.cleanup_confirmed().unwrap();
     }
@@ -565,30 +676,58 @@ mod tests {
         struct FakeScope(AtomicUsize, AtomicBool);
         impl ScopeObserver for FakeScope {
             fn observation(&self) -> Option<rz_uci::rovent_bootstrap::launch::V3ScopeObservation> {
-                if self.1.load(Ordering::SeqCst) { return None; }
+                if self.1.load(Ordering::SeqCst) {
+                    return None;
+                }
                 Some(rz_uci::rovent_bootstrap::launch::V3ScopeObservation {
                     state: rz_uci::rovent_bootstrap::launch::V3ScopeState::Parked,
                     recovery_key: None,
                     parked_original: true,
                 })
             }
-            fn session_evidence(&self) -> rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence {
+            fn session_evidence(
+                &self,
+            ) -> rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence {
                 rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative
             }
             fn reobserve(&self, _: Instant) -> String {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                if self.1.load(Ordering::SeqCst) { "mock_scope_removed" } else { "mock_original_scope" }.into()
+                if self.1.load(Ordering::SeqCst) {
+                    "mock_scope_removed"
+                } else {
+                    "mock_original_scope"
+                }
+                .into()
             }
         }
-        let parent = Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap();
-        let name = format!("rovent-direct-reobserve-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let parent =
+            Dir::open_ambient_dir(std::env::temp_dir(), cap_std::ambient_authority()).unwrap();
+        let name = format!(
+            "rovent-direct-reobserve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         parent.create_dir(&name).unwrap();
-        let mut fixture = Fixture { parent, name: name.clone(), control: None };
+        let mut fixture = Fixture {
+            parent,
+            name: name.clone(),
+            control: None,
+        };
         let directory = fixture.parent.open_dir(&name).unwrap();
         let path = std::env::temp_dir().join(&name);
         let original_deadline = Instant::now() + Duration::from_secs(10);
-        fixture.control = Some(DirectControl::prepare(&directory, &path, original_deadline, Duration::from_secs(10)).unwrap());
+        fixture.control = Some(
+            DirectControl::prepare(
+                &directory,
+                &path,
+                original_deadline,
+                Duration::from_secs(10),
+            )
+            .unwrap(),
+        );
         let control = fixture.control.as_mut().unwrap();
         control.bind().unwrap();
         control.listener().unwrap().set_nonblocking(true).unwrap();
@@ -605,20 +744,30 @@ mod tests {
                 let until = Instant::now() + Duration::from_secs(2);
                 loop {
                     match control.observe_one(Some(&scope), original_deadline, &mut recover) {
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < until =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
                         result => return result,
                     }
                 }
             });
             let mut client = std::os::unix::net::UnixStream::connect(control.path()).unwrap();
-            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             client.write_all(b"{\"op\":\"reobserve\"}\n").unwrap();
             let mut response = String::new();
             BufReader::new(client).read_line(&mut response).unwrap();
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
             assert_eq!(response["session_evidence"], "before_native");
             assert!(response["original_owner_parked"].is_null());
-            assert_eq!(response["before_native_recovery"]["state"], "mock_recovered");
+            assert_eq!(
+                response["before_native_recovery"]["state"],
+                "mock_recovered"
+            );
             assert_eq!(response["native_observation"], "mock_scope_removed");
             assert_eq!(response["physical_completion"], "unknown");
             assert_eq!(response["release_authorized"], false);
