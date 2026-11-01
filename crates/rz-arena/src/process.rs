@@ -18,6 +18,11 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
 type LoadedImageVerifier<'a> = &'a mut dyn FnMut(&File) -> Result<(), ()>;
+/// A nonblocking owner operation, polled only while the original child is
+/// alive and its supervisor still owns the wait relationship. The deadline is
+/// the original process execution deadline, never a new per-poll timeout.
+pub(crate) type SpawnControl<'a> =
+    &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<(), ArenaError>;
 
 pub const MAX_ORIGINAL_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -846,6 +851,38 @@ pub(crate) fn supervise_tree_observed_with_spawn(
     stdout_observer: Option<StdoutObserver<'_>>,
     spawned: Option<&mut SpawnCustody>,
 ) -> Result<ProcessOutput, ArenaError> {
+    supervise_tree_observed_with_spawn_and_control(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        spawned,
+        None,
+    )
+}
+
+/// As above, additionally polling the caller's bounded native owner control in
+/// the same event loop that holds the actual child. The caller retains the
+/// control object and any native resources after all error paths.
+pub(crate) fn supervise_tree_observed_with_spawn_and_control<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&'v mut SpawnCustody>,
+    control: Option<SpawnControl<'v>>,
+) -> Result<ProcessOutput, ArenaError> {
+    if control.is_some() && spawned.is_none() {
+        return Err(ArenaError::Invalid(
+            "owner control requires original externally retained spawn custody".into(),
+        ));
+    }
     limits.validate()?;
     watch.validate()?;
     #[cfg(target_os = "linux")]
@@ -872,13 +909,22 @@ pub(crate) fn supervise_tree_observed_with_spawn(
             stdout_observer,
             linux::InvocationIo {
                 spawned,
+                control,
                 ..Default::default()
             },
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel, stdout_observer, spawned);
+        let _ = (
+            program,
+            args,
+            directory,
+            cancel,
+            stdout_observer,
+            spawned,
+            control,
+        );
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
         ))
@@ -1182,6 +1228,7 @@ fn supervise_original_input(
                 verify_loaded,
                 numerical_environment,
                 spawned: None,
+                control: None,
             },
         )?;
         let returned = Instant::now();
@@ -1240,6 +1287,7 @@ mod linux {
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
         pub numerical_environment: Option<OriginalNumericalEnvironment>,
         pub spawned: Option<&'v mut SpawnCustody>,
+        pub control: Option<SpawnControl<'v>>,
     }
 
     #[derive(Clone, Copy)]
@@ -1302,6 +1350,7 @@ mod linux {
             mut verify_loaded,
             numerical_environment,
             spawned,
+            mut control,
         } = io;
         let mut local_custody = SpawnCustody::default();
         let custody = spawned.unwrap_or(&mut local_custody);
@@ -1573,6 +1622,7 @@ mod linux {
                 crate::native_diagnostics::observe_stream(false, &err[prior_err..]);
             }
             let previously_exited = leader_done;
+            let mut owner_live_this_tick = false;
             if !leader_done {
                 match waitid(
                     Id::Pid(group),
@@ -1592,7 +1642,7 @@ mod linux {
                             receipt.exit_signal = Some(signal as i32);
                         }
                     }
-                    Ok(WaitStatus::StillAlive) => {}
+                    Ok(WaitStatus::StillAlive) => owner_live_this_tick = true,
                     Ok(_) => {
                         evidence(&mut receipt, "process.wait_status");
                         stop.get_or_insert(ProcessStop::IoFailure);
@@ -1608,6 +1658,18 @@ mod linux {
                         evidence(&mut receipt, "process.ownership_lost");
                         break;
                     }
+                }
+            }
+            if owner_live_this_tick
+                && !leader_done
+                && !ownership_lost
+                && stop.is_none()
+                && let Some(owner_control) = control.as_deref_mut()
+            {
+                let deadline = original.map_or_else(|| started + wall, |window| window.execution);
+                if let Err(error) = owner_control(custody, deadline) {
+                    evidence(&mut receipt, &format!("process.owner_control:{error}"));
+                    stop = Some(ProcessStop::IoFailure);
                 }
             }
             if !previously_exited
@@ -2498,6 +2560,99 @@ mod linux {
                 max_output_bytes: 256 * 1024,
                 max_child_processes: 1,
             }
+        }
+
+        #[test]
+        fn owner_control_observes_original_live_child_and_preserves_its_error() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let mut spawned = SpawnCustody::default();
+            let mut observations = Vec::new();
+            let mut control = |owner: &SpawnCustody, deadline: Instant| {
+                let child = owner.child().expect("the actual child is still owned");
+                let pid = child.id();
+                assert!(owner.pending.load(Ordering::Acquire));
+                assert_eq!(owner.last_spawn_pid, Some(pid));
+                assert!(matches!(
+                    waitid(
+                        Id::Pid(Pid::from_raw(i32::try_from(pid).unwrap())),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ),
+                    Ok(WaitStatus::StillAlive)
+                ));
+                let now = Instant::now();
+                assert!(deadline > now);
+                assert!(deadline.duration_since(now) <= Duration::from_secs(5));
+                observations.push(pid);
+                Err(ArenaError::Invalid("control test failure".into()))
+            };
+            let result = crate::process::supervise_tree_observed_with_spawn_and_control(
+                &program,
+                &["10".into()],
+                &cwd,
+                original_limits(),
+                None,
+                &watch,
+                None,
+                Some(&mut spawned),
+                Some(&mut control),
+            )
+            .unwrap();
+            assert_eq!(observations, vec![result.receipt.pid]);
+            assert_eq!(result.receipt.stop, ProcessStop::IoFailure);
+            assert!(
+                result
+                    .receipt
+                    .errors
+                    .iter()
+                    .any(|item| item.starts_with("process.owner_control:")
+                        && item.contains("control test failure"))
+            );
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+        }
+
+        #[test]
+        fn owner_control_does_not_start_without_custody_or_after_cancellation() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let mut spawned = SpawnCustody::default();
+            let cancelled = AtomicBool::new(true);
+            let mut calls = 0;
+            let mut control = |_: &SpawnCustody, _: Instant| {
+                calls += 1;
+                Ok(())
+            };
+            let without_owner = crate::process::supervise_tree_observed_with_spawn_and_control(
+                &program,
+                &["10".into()],
+                &cwd,
+                original_limits(),
+                None,
+                &watch,
+                None,
+                None,
+                Some(&mut control),
+            );
+            assert!(without_owner.is_err());
+            let after_cancel = crate::process::supervise_tree_observed_with_spawn_and_control(
+                &program,
+                &["10".into()],
+                &cwd,
+                original_limits(),
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut spawned),
+                Some(&mut control),
+            );
+            assert!(after_cancel.is_err());
+            assert_eq!(calls, 0);
+            assert!(spawned.child().is_none());
+            assert!(!spawned.pending.load(Ordering::Acquire));
         }
 
         #[test]
