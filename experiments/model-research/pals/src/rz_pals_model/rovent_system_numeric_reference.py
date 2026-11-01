@@ -146,6 +146,34 @@ def _probability_comparison(actual, reference, label):
     return {"count": len(actual), "max_absolute": maximum, "passed": maximum <= PROBABILITY_ATOL}
 
 
+def _critic_divergence_coverage(captures, results):
+    """Summarize only comparisons with an actual nonempty critic input head."""
+    indices = [index for index, case in enumerate(captures)
+               if isinstance(case, dict) and case.get("role") == "critic"
+               and isinstance(case.get("input"), dict)
+               and isinstance(case["input"].get("divergences"), list)
+               and len(case["input"]["divergences"]) > 0]
+    if not indices:
+        return {"status": "not_observed", "input_count": 0, "compared_count": 0}
+    by_index = {row.get("index"): row for row in results if isinstance(row, dict)}
+    comparisons = []
+    for index in indices:
+        row = by_index.get(index, {})
+        field = row.get("fields", {}).get("divergence_logits")
+        expected_count = len(captures[index]["input"]["divergences"])
+        if (not isinstance(field, dict) or field.get("count") != expected_count
+                or type(field.get("passed")) is not bool):
+            continue
+        comparisons.append(field["passed"])
+    if any(value is False for value in comparisons):
+        status = "mismatch"
+    elif len(comparisons) != len(indices):
+        status = "incomplete"
+    else:
+        status = "match"
+    return {"status": status, "input_count": len(indices), "compared_count": len(comparisons)}
+
+
 def _write_new(path, value):
     path = Path(path)
     if not path.is_absolute():
@@ -190,6 +218,7 @@ def compare(observation_path, lock_path, canonical_manifest_path, snapshot_root,
                 "observation_claims_session_physical_confirmed": observation["session_physical_confirmed"],
                 "physical_completion": "not_independently_verified", "capture_origin": "not_independently_verified",
                 "model_reference_executed": False, "tensor_bytes_equivalence": "not_observed",
+                "critic_nonempty_divergence": _critic_divergence_coverage([], []),
                 "gpu_placement": "not_inferred", "performance_claim": False, "cases": []}
     if (type(lock) is not dict or not _sha(observation.get("input_lock_sha256"))
             or lock.get("canonical_sha256") != observation["input_lock_sha256"]):
@@ -311,6 +340,7 @@ def compare(observation_path, lock_path, canonical_manifest_path, snapshot_root,
             fields["wdl_probability"] = _probability_comparison(actual["wdl_logits"], expected["wdl_logits"], "WDL")
             passed = all(field["passed"] for field in fields.values())
             return {"role": case["role"], "ticket": case["ticket"], "authority": case["authority"],
+                    "capture_kind": case.get("capture_kind"),
                     "logical_input_sha256": hashlib.sha256(json.dumps(case["input"], sort_keys=True,
                         separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest(),
                     "fields": fields, "status": "match" if passed else "mismatch", "passed": passed}
@@ -357,6 +387,8 @@ def compare(observation_path, lock_path, canonical_manifest_path, snapshot_root,
             "physical_completion": "not_independently_verified",
             "capture_origin": "not_independently_verified",
             "role_coverage": sorted(role_coverage),
+            "critic_nonempty_divergence": _critic_divergence_coverage(observation["captures"], results),
+            "observation_claims_critic_nonempty_divergence": observation.get("critic_nonempty_divergence_observed"),
             "logical_input_comparison": True, "tensor_bytes_equivalence": "not_observed",
             "gpu_placement": "not_inferred", "rules_legality": "not_inferred", "numerical_acceptance": False,
             "performance_claim": False,
