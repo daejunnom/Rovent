@@ -247,7 +247,13 @@ class CompletedCommandMaintenanceTests(unittest.TestCase):
 
 class DirectOutputMaintenanceTests(unittest.TestCase):
     def _finish(self, *, due, tree_gone=True, outer=None, cleanup_error=None):
-        lease = managed_outputs.OutputLease.__new__(managed_outputs.OutputLease)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        source = base / "source"
+        source.mkdir()
+        lease = managed_outputs.OutputLease(base / "output", source, catalog=base / "catalog",
+                                            reserve=1024 * 1024)
         lease.record = {"state": "active"}
         lease.outer = outer
         lease.deferred = False

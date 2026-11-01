@@ -161,7 +161,8 @@ def cleanup_completed_builds(manager, *, seconds=30):
         cpu_graphs = {"removed_files": 0, "removed_bytes": 0, "protected": 0,
                       "warnings": [type(error).__name__], "output_total_changed": False}
     return {"schema": "rovezero.output-warning-cache-maintenance.v1",
-            "status": "completed" if cpu_graphs["removed_files"] else "protected_or_empty",
+            "status": ("deferred_active_source" if cpu_graphs.get("deferred_active_sources") else
+                       "completed" if cpu_graphs["removed_files"] else "protected_or_empty"),
             "removed_slots": 0, "removed_bytes": 0, "protected_slots": 0,
             "warnings": cpu_graphs["warnings"], "cpu_static_graphs": cpu_graphs,
             "output_total_changed": cpu_graphs["output_total_changed"],
@@ -183,7 +184,8 @@ def cleanup_completed_builds_for_output(lease, *, seconds=30):
         cpu_graphs = cleanup_registered_cpu_graphs(None, lease.catalog, seconds=min(seconds / 2, 2),
                                                   own_lease=lease)
         return {"schema": "rovezero.output-warning-cache-maintenance.v1",
-                "status": "completed" if cpu_graphs["removed_files"] else "protected_or_empty",
+                "status": ("deferred_active_source" if cpu_graphs.get("deferred_active_sources") else
+                           "completed" if cpu_graphs["removed_files"] else "protected_or_empty"),
                 "removed_slots": 0, "removed_bytes": 0, "protected_slots": 0,
                 "warnings": cpu_graphs["warnings"], "output_total_changed": cpu_graphs["output_total_changed"],
                 "cpu_static_graphs": cpu_graphs, "build_cache_maintenance": "deferred_to_idle"}

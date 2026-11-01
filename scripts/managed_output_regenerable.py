@@ -115,6 +115,7 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
     general physical-GPU-completion assertion. Any uncertainty is skipped.
     """
     result = {"removed_files": 0, "removed_bytes": 0, "removed_bytes_scope": "logical_file_size", "protected": 0,
+              "deferred_active_sources": False, "candidate_count": "not_counted",
               "directory_sync_unconfirmed": 0,
               "warnings": [], "output_total_changed": False,
               "observation_limit": "current-visible-proc-namespace-only; active worker mount namespaces and aliases may be unknown; lock hold deadline is cooperative and cannot preempt blocking filesystem I/O"}
@@ -148,14 +149,9 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
     return result
 
 
-def _active_sources(catalog, tick):
-    """Observe active source directories, retaining same-process anchor IDs.
-
-    Historical rows have no persisted source inode. Their present identity is
-    an observation only; do not call it the original producer's source pin.
-    """
-    from managed_outputs import _read, _live_handoff_guard, _live_handoffs
-    result = []
+def _has_active_source(catalog, tick):
+    """Detect an active row without inspecting sources or counting candidates."""
+    from managed_outputs import _read
     entries = list(catalog.iterdir())
     from managed_outputs import MAX_RUNS
     if len(entries) > MAX_RUNS + 1:
@@ -173,59 +169,11 @@ def _active_sources(catalog, tick):
         expected_key = hashlib.sha256(os.path.normcase(str(output)).encode()).hexdigest()
         if row.get("key") != expected_key or entry.name != expected_key + ".json":
             raise StorageError("output catalog row identity changed")
-        if row.get("state") != "active":
-            continue
-        source_raw = row.get("source")
-        if not isinstance(source_raw, str) or not Path(source_raw).is_absolute():
-            raise StorageError("active source path unavailable")
-        # A malformed or removed source may still have a lexical relationship
-        # to this candidate. Preserve that scope without turning a disjoint
-        # source observation failure into an unrelated producer failure.
-        source = Path(os.path.abspath(source_raw))
-        try:
-            source = checked(source)
-            info = source.lstat()
-            if not stat.S_ISDIR(info.st_mode):
-                raise StorageError("active source is not a directory")
-            observed = (info.st_dev, info.st_ino)
-        except (OSError, StorageError):
-            observed = None
-        original = None
-        with _live_handoff_guard:
-            for owner in _live_handoffs.values():
-                if owner.record == row and owner._live_anchor is not None:
-                    anchor = owner._live_anchor
-                    info = os.fstat(anchor["source_fd"])
-                    original = tuple(anchor["source_id"])
-                    if (info.st_dev, info.st_ino) != original:
-                        raise StorageError("active original source descriptor changed")
-                    break
-        result.append((source, observed, original))
-    return result
-
-
-def _candidate_protected_by_active_source(target, sources):
-    # Check only this candidate's own ancestor chain. No source-tree scan is
-    # permitted here: maintenance remains bounded and independent candidates
-    # can still be reclaimed.
-    if not sources:
-        return False
-    ancestors = set()
-    for path in (target.parent, *target.parent.parents):
-        info = path.stat()
-        if not stat.S_ISDIR(info.st_mode):
-            raise StorageError("candidate ancestor is not a directory")
-        ancestors.add((info.st_dev, info.st_ino))
-    for source, observed, original in sources:
-        if target == source or target.is_relative_to(source) or source.is_relative_to(target):
+        if row.get("state") == "active":
+            # Every active row protects every candidate: worker mount
+            # namespaces are unknown. No source inode or later catalog row
+            # can authorize deletion during this pass.
             return True
-        if observed in ancestors or original in ancestors:
-            return True
-        # A v1 row and even a same-process source FD do not prove the mount
-        # namespace of every worker or exclude a later bind under that source.
-        # A same-namespace /proc snapshot or differing device cannot supply
-        # that proof. Protect this candidate while such an active row exists.
-        return True
     return False
 
 
@@ -245,7 +193,10 @@ def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease,
         from managed_outputs import _read, identity
         from storage_code_retirement import _process_census
         guard.assert_held()
-        sources = _active_sources(catalog, tick)
+        if _has_active_source(catalog, tick):
+            result["deferred_active_sources"] = True
+            result["warnings"].append("active_source_scope_unresolved: candidate enumeration deferred")
+            return result
         for entry in catalog.iterdir():
             tick()
             if not entry.name.endswith(".json"):
@@ -314,10 +265,6 @@ def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease,
                         or asset != {"bytes": mark.get("bytes"), "sha256": mark.get("sha256")}):
                     raise StorageError("CPU static validation evidence missing")
                 target = checked(output / RELATIVE)
-                if _candidate_protected_by_active_source(target, sources):
-                    result["protected"] += 1
-                    result["warnings"].append("active_source_scope_unresolved: candidate retained")
-                    continue
                 pin = _file_pin(target)
                 if pin != {key: mark[key] for key in ("bytes", "sha256", "identity", "stamp")}:
                     raise StorageError("CPU static graph changed")
@@ -380,8 +327,6 @@ def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease,
                             or identity(output) != row["identity"]):
                         raise StorageError("CPU graph path changed after journal")
                     guard.assert_held()
-                    if _candidate_protected_by_active_source(target, sources):
-                        raise StorageError("CPU graph overlaps an active source")
                     os.unlink(target.name, dir_fd=parent_fd)
                     unlinked = True
                     # The namespace changed at unlink, independently of

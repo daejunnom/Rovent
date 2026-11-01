@@ -112,7 +112,7 @@ class CpuGraphReclamationTests(unittest.TestCase):
             self.assertTrue(result["warnings"])
         self.assertTrue(self.graph.exists())
 
-    def test_active_source_protects_only_overlapping_graph(self):
+    def test_active_source_defers_candidate_enumeration(self):
         base = self.output.parent
         active = managed_outputs.OutputLease(base / "active", self.output, catalog=self.catalog,
                                              reserve=1024 * 1024)
@@ -122,11 +122,24 @@ class CpuGraphReclamationTests(unittest.TestCase):
         try:
             result = self.cleanup_graph()
             self.assertEqual(result["removed_files"], 0, result)
-            self.assertGreaterEqual(result["protected"], 1)
+            self.assertTrue(result["deferred_active_sources"])
+            self.assertEqual(result["candidate_count"], "not_counted")
+            self.assertEqual(result["protected"], 0)
             self.assertTrue(self.graph.exists())
         finally:
             active.resume_live()
             active.finish(status="fixture_done", tree_gone=True)
+
+    def test_first_active_row_stops_catalog_scan_without_counting_candidates(self):
+        output = self.output.parent / "other-active"
+        key = hashlib.sha256(os.path.normcase(str(output)).encode()).hexdigest()
+        first = self.catalog / (key + ".json")
+        later = self.catalog / "must-not-be-read.json"
+        row = {"output": str(output), "key": key, "state": "active"}
+        with patch.object(Path, "iterdir", return_value=iter([first, later])), \
+             patch.object(managed_outputs, "_read", side_effect=[row, AssertionError("later row read")]) as read:
+            self.assertTrue(reclaim._has_active_source(self.catalog, lambda: None))
+        self.assertEqual(read.call_count, 1)
 
     def test_live_source_on_different_filesystem_without_worker_mount_proof_is_protected(self):
         if not Path("/dev/shm").is_dir() or not os.access("/dev/shm", os.W_OK):
@@ -144,7 +157,8 @@ class CpuGraphReclamationTests(unittest.TestCase):
                 # The source worker could use a distinct mount namespace; an
                 # independent device in this process alone is not proof.
                 self.assertEqual(result["removed_files"], 0, result)
-                self.assertGreaterEqual(result["protected"], 1)
+                self.assertTrue(result["deferred_active_sources"])
+                self.assertEqual(result["candidate_count"], "not_counted")
                 self.assertTrue(self.graph.exists())
             finally:
                 other.resume_live()
@@ -159,7 +173,8 @@ class CpuGraphReclamationTests(unittest.TestCase):
         try:
             result = self.cleanup_graph()
             self.assertEqual(result["removed_files"], 0, result)
-            self.assertGreaterEqual(result["protected"], 1)
+            self.assertTrue(result["deferred_active_sources"])
+            self.assertEqual(result["candidate_count"], "not_counted")
             self.assertTrue(self.graph.exists())
         finally:
             other.resume_live()
@@ -194,7 +209,8 @@ lease.finish(status='fixture_done', tree_gone=True)
             self.assertEqual(worker.stdout.readline().strip(), "ready")
             result = self.cleanup_graph()
             self.assertEqual(result["removed_files"], 0, result)
-            self.assertGreaterEqual(result["protected"], 1)
+            self.assertTrue(result["deferred_active_sources"])
+            self.assertEqual(result["candidate_count"], "not_counted")
             self.assertTrue(any("active_source_scope_unresolved" in item for item in result["warnings"]))
             self.assertTrue(self.graph.exists())
         finally:
