@@ -141,6 +141,24 @@ class CpuGraphReclamationTests(unittest.TestCase):
             self.assertTrue(reclaim._has_active_source(self.catalog, lambda: None))
         self.assertEqual(read.call_count, 1)
 
+    def test_later_active_row_defers_before_resolving_inactive_paths(self):
+        earlier = self.catalog / "inactive.json"
+        active = self.catalog / "active.json"
+        with patch.object(Path, "iterdir", return_value=iter([earlier, active])), \
+             patch.object(managed_outputs, "_read", side_effect=[
+                 {"state": "retained", "output": str(self.output)},
+                 {"state": "active"}]), \
+             patch.object(reclaim, "checked", side_effect=AssertionError("resolved output path")):
+            self.assertTrue(reclaim._has_active_source(self.catalog, lambda: None))
+
+    def test_inactive_rows_still_require_valid_catalog_identity(self):
+        invalid = self.catalog / "incorrect-key.json"
+        with patch.object(Path, "iterdir", return_value=iter([invalid])), \
+             patch.object(managed_outputs, "_read", return_value={
+                 "state": "retained", "output": str(self.output), "key": "bad"}):
+            with self.assertRaises(reclaim.StorageError):
+                reclaim._has_active_source(self.catalog, lambda: None)
+
     def test_live_source_on_different_filesystem_without_worker_mount_proof_is_protected(self):
         if not Path("/dev/shm").is_dir() or not os.access("/dev/shm", os.W_OK):
             self.skipTest("independent tmpfs unavailable")

@@ -156,11 +156,22 @@ def _has_active_source(catalog, tick):
     from managed_outputs import MAX_RUNS
     if len(entries) > MAX_RUNS + 1:
         raise StorageError("output catalog entry bound exceeded")
+    inactive_rows = []
     for entry in entries:
         tick()
         if entry.name == "catalog.lock":
             continue
         row = _read(entry)
+        if row.get("state") == "active":
+            # An active row can only make deletion less safe, even if some
+            # other field is missing or its output path is unavailable.  Do
+            # not resolve every earlier inactive output path before deferring.
+            return True
+        inactive_rows.append((entry, row))
+    # Only the no-active case may authorize later reclamation.  Preserve the
+    # complete original path and catalog-key checks before returning False.
+    for entry, row in inactive_rows:
+        tick()
         output_raw = row.get("output")
         if (not isinstance(output_raw, str) or not Path(output_raw).is_absolute()
                 or row.get("state") not in {"active", "retained", "interrupted_retained"}):
@@ -169,11 +180,6 @@ def _has_active_source(catalog, tick):
         expected_key = hashlib.sha256(os.path.normcase(str(output)).encode()).hexdigest()
         if row.get("key") != expected_key or entry.name != expected_key + ".json":
             raise StorageError("output catalog row identity changed")
-        if row.get("state") == "active":
-            # Every active row protects every candidate: worker mount
-            # namespaces are unknown. No source inode or later catalog row
-            # can authorize deletion during this pass.
-            return True
     return False
 
 
