@@ -239,18 +239,34 @@ impl RoventPcCollectionRunV2 {
     #[cfg(feature = "experimental-teacher-exact-observation")]
     pub fn take_exact_teacher_diagnostics(&mut self) -> serde_json::Value {
         let mut roots = Vec::new();
-        let primary = if self.worker_exit.is_some() && !self.worker_thread_panicked
-            && !matches!(self.worker_exit,
-                Some(PcWorkerExitKindV2::CaughtPanic | PcWorkerExitKindV2::OuterPanic)) {
-            self.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
-        } else { None };
+        let primary = if self.worker_exit.is_some()
+            && !self.worker_thread_panicked
+            && !matches!(
+                self.worker_exit,
+                Some(PcWorkerExitKindV2::CaughtPanic | PcWorkerExitKindV2::OuterPanic)
+            ) {
+            self.worker
+                .try_lock()
+                .ok()
+                .map(|mut worker| worker.take_exact_diagnostics())
+        } else {
+            None
+        };
         roots.push(json!({"root_index":0,"diagnostic":primary,
             "status":if primary.is_some() {"observed"} else {"unknown"}}));
         for (index, slot) in self.secondary_slots.iter().enumerate() {
-            let value = if slot.worker_join_observed && !matches!(slot.worker_exit_kind,
-                Some(PcWorkerExitKindV2::CaughtPanic | PcWorkerExitKindV2::OuterPanic)) {
-                slot.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
-            } else { None };
+            let value = if slot.worker_join_observed
+                && !matches!(
+                    slot.worker_exit_kind,
+                    Some(PcWorkerExitKindV2::CaughtPanic | PcWorkerExitKindV2::OuterPanic)
+                ) {
+                slot.worker
+                    .try_lock()
+                    .ok()
+                    .map(|mut worker| worker.take_exact_diagnostics())
+            } else {
+                None
+            };
             roots.push(json!({"root_index":index + 1,"diagnostic":value,
                 "status":if value.is_some() {"observed"} else {"unknown"}}));
         }

@@ -286,13 +286,17 @@ impl ExactDiagnosticRing {
 
     fn observe(&mut self, row: &RoventRetiredLockV2Record, sealed: &SealedTeacherPolicyV2) {
         let id = row.ticket().id;
-        self.capture(Some((id.epoch.0, id.sequence)), ||
-            super::exact_observation_v2::project_original_exact_observation_v2(row, sealed));
+        self.capture(Some((id.epoch.0, id.sequence)), || {
+            super::exact_observation_v2::project_original_exact_observation_v2(row, sealed)
+        });
     }
 
     fn capture<F>(&mut self, ticket: Option<(u64, u64)>, project: F)
     where
-        F: FnOnce() -> Result<rz_experiments::pals_data_v3::teacher_exact_rank::TeacherExactRankObservation, ArenaError>,
+        F: FnOnce() -> Result<
+            rz_experiments::pals_data_v3::teacher_exact_rank::TeacherExactRankObservation,
+            ArenaError,
+        >,
     {
         if !self.enabled {
             return;
@@ -311,11 +315,19 @@ impl ExactDiagnosticRing {
             Ok(Ok(value)) => ("observed", Some(value), None),
             Ok(Err(error)) => {
                 self.unknown = self.unknown.saturating_add(1);
-                ("unknown", None, Some(error.to_string().chars().take(512).collect::<String>()))
+                (
+                    "unknown",
+                    None,
+                    Some(error.to_string().chars().take(512).collect::<String>()),
+                )
             }
             Err(_) => {
                 self.unknown = self.unknown.saturating_add(1);
-                ("unknown", None, Some("diagnostic_projection_panicked".to_owned()))
+                (
+                    "unknown",
+                    None,
+                    Some("diagnostic_projection_panicked".to_owned()),
+                )
             }
         };
         let entry = serde_json::json!({"status":status,"observation":observation,"detail":detail,"ticket":ticket,
@@ -562,8 +574,8 @@ impl RetiredRowPumpV2 {
             observation_deadline,
             #[cfg(feature = "experimental-teacher-exact-observation")]
             exact_diagnostics: ExactDiagnosticRing {
-                enabled: std::env::var_os("RZ_TEACHER_EXACT_DIAGNOSTICS")
-                    .as_deref() == Some(std::ffi::OsStr::new("1")),
+                enabled: std::env::var_os("RZ_TEACHER_EXACT_DIAGNOSTICS").as_deref()
+                    == Some(std::ffi::OsStr::new("1")),
                 ..ExactDiagnosticRing::default()
             },
         })
@@ -937,23 +949,23 @@ impl RetiredRowPumpV2 {
                 #[cfg(feature = "experimental-teacher-exact-observation")]
                 self.exact_diagnostics.observe(&entry.row, &sealed);
                 match prepare_teacher_policy_lock_v2(&entry.row, sealed) {
-                Ok(prepared) => Stage::Prepared(prepared),
-                Err(rejected) => {
-                    let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 {
-                        error,
-                        sealed,
-                        panic,
-                    } = *rejected;
-                    let evidence = if let Some(panic) = panic {
-                        self.pending_failure = true;
-                        FailedEvidence::PreparationPanicked { sealed, panic }
-                    } else {
-                        FailedEvidence::Sealed(sealed)
-                    };
-                    Stage::Failed { error, evidence }
+                    Ok(prepared) => Stage::Prepared(prepared),
+                    Err(rejected) => {
+                        let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 {
+                            error,
+                            sealed,
+                            panic,
+                        } = *rejected;
+                        let evidence = if let Some(panic) = panic {
+                            self.pending_failure = true;
+                            FailedEvidence::PreparationPanicked { sealed, panic }
+                        } else {
+                            FailedEvidence::Sealed(sealed)
+                        };
+                        Stage::Failed { error, evidence }
+                    }
                 }
-                }
-            },
+            }
             unchanged => unchanged,
         };
         Ok(())
@@ -1193,26 +1205,26 @@ impl RetiredRowPumpV2 {
                         #[cfg(feature = "experimental-teacher-exact-observation")]
                         self.exact_diagnostics.observe(row, &sealed);
                         match prepare_teacher_policy_lock_v2(row, sealed) {
-                        Ok(prepared) => CapturedStage::Prepared(prepared),
-                        Err(rejected) => {
-                            let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 {
-                                error,
-                                sealed,
-                                panic,
-                            } = *rejected;
-                            CapturedStage::Failed {
-                                error,
-                                evidence: match panic {
-                                    Some(panic) => {
-                                        self.pending_failure = true;
-                                        FailedEvidence::PreparationPanicked { sealed, panic }
-                                    }
-                                    None => FailedEvidence::Sealed(sealed),
-                                },
+                            Ok(prepared) => CapturedStage::Prepared(prepared),
+                            Err(rejected) => {
+                                let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 {
+                                    error,
+                                    sealed,
+                                    panic,
+                                } = *rejected;
+                                CapturedStage::Failed {
+                                    error,
+                                    evidence: match panic {
+                                        Some(panic) => {
+                                            self.pending_failure = true;
+                                            FailedEvidence::PreparationPanicked { sealed, panic }
+                                        }
+                                        None => FailedEvidence::Sealed(sealed),
+                                    },
+                                }
                             }
                         }
-                        }
-                    },
+                    }
                     Err(rejected) => {
                         let (cause, sealed) = *rejected;
                         match cause {
@@ -1463,7 +1475,9 @@ mod exact_diagnostic_tests {
         ring.enabled = true;
         ring.capture(Some((1, 2)), || panic!("diagnostic panic"));
         for _ in 1..=ExactDiagnosticRing::MAX_ENTRIES {
-            ring.capture(Some((1, 3)), || Err(invalid("original diagnostic unavailable")));
+            ring.capture(Some((1, 3)), || {
+                Err(invalid("original diagnostic unavailable"))
+            });
         }
         let receipt = ring.take();
         assert_eq!(receipt["attempted"], 33);

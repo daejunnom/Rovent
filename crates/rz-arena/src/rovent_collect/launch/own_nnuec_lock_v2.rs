@@ -94,17 +94,30 @@ impl RoventNnuecCollectionRunV2 {
     #[cfg(feature = "experimental-teacher-exact-observation")]
     pub fn take_exact_teacher_diagnostics(&mut self) -> serde_json::Value {
         let mut roots = Vec::new();
-        let primary = if self.primary_join_observed() && !self.primary_panic_observed()
-            && !self.worker_custody_poisoned {
-            self.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
-        } else { None };
+        let primary = if self.primary_join_observed()
+            && !self.primary_panic_observed()
+            && !self.worker_custody_poisoned
+        {
+            self.worker
+                .try_lock()
+                .ok()
+                .map(|mut worker| worker.take_exact_diagnostics())
+        } else {
+            None
+        };
         roots.push(json!({"root_index":0,"diagnostic":primary,
             "status":if primary.is_some() {"observed"} else {"unknown"}}));
         for (index, slot) in self.secondary_slots.iter().enumerate() {
             let value = if slot.worker_join_observed
-                && !matches!(slot.worker_exit_kind, Some(OwnWorkerExitKindV2::Panicked)) {
-                slot.worker.try_lock().ok().map(|mut worker| worker.take_exact_diagnostics())
-            } else { None };
+                && !matches!(slot.worker_exit_kind, Some(OwnWorkerExitKindV2::Panicked))
+            {
+                slot.worker
+                    .try_lock()
+                    .ok()
+                    .map(|mut worker| worker.take_exact_diagnostics())
+            } else {
+                None
+            };
             roots.push(json!({"root_index":index + 1,"diagnostic":value,
                 "status":if value.is_some() {"observed"} else {"unknown"}}));
         }

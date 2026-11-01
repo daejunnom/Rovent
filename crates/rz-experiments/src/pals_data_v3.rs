@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod targets;
 pub use targets::*;
+mod frozen_action;
 #[cfg(feature = "experimental-teacher-exact-evidence")]
 pub mod teacher_exact_rank;
-mod frozen_action;
 pub use frozen_action::*;
 
 pub const GENERATION_DATA_DOMAIN: &str = "rz-pals-generation-data/3";
