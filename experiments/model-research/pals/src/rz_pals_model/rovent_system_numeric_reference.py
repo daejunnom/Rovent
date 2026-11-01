@@ -183,10 +183,12 @@ def compare(observation_path, lock_path, canonical_manifest_path, snapshot_root,
         raise ValueError("original input lock must belong to the snapshot")
     if not observation["captures"]:
         return {"domain": RESULT_DOMAIN, "status": "partial", "reason": "no_completed_capture",
+                "comparison_status": "incomplete", "coverage_status": "partial",
                 "observation_raw_sha256": observation_sha, "input_lock_raw_sha256": lock_raw_sha,
                 "input_lock_canonical_sha256_declared": observation.get("input_lock_sha256"),
                 "canonical_digest_recomputed": False, "source_observation_status": observation["status"],
-                "session_physical_confirmed": observation["session_physical_confirmed"],
+                "observation_claims_session_physical_confirmed": observation["session_physical_confirmed"],
+                "physical_completion": "not_independently_verified", "capture_origin": "not_independently_verified",
                 "model_reference_executed": False, "tensor_bytes_equivalence": "not_observed",
                 "gpu_placement": "not_inferred", "performance_claim": False, "cases": []}
     if (type(lock) is not dict or not _sha(observation.get("input_lock_sha256"))
