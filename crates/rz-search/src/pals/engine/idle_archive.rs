@@ -131,10 +131,32 @@ pub struct IdleSemanticArchiveOwner<M: RoleModel> {
     last_checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
     last_transition_remaining: Option<u64>,
     setup: Option<UnusedIdleArchiveSetupSnapshot>,
+    #[cfg(feature = "archive-origin-diagnostics")]
+    last_prepare_pressure: Option<ArchiveRootPressure>,
     #[cfg(test)]
     panic_setup_after_enable: bool,
     #[cfg(test)]
     cancel_after_close: bool,
+}
+
+/// Scalars from the actual idle PrepareRoot operation; this is not a pin or
+/// proof that reclaim or loading occurred. Pin totals count typed entries.
+#[cfg(feature = "archive-origin-diagnostics")]
+#[derive(Clone, Copy, Debug)]
+pub struct ArchiveRootPressure {
+    pub semantic_nodes: usize,
+    pub semantic_nodes_limit: usize,
+    pub semantic_records: usize,
+    pub semantic_records_limit: usize,
+    pub projection_pin_entries: usize,
+    pub resident_pin_entries: usize,
+    pub pressure: bool,
+}
+
+#[cfg(feature = "archive-origin-diagnostics")]
+fn pin_entries(pins: &StorePins) -> usize {
+    pins.states.len() + pins.lines.len() + pins.observations.len()
+        + pins.situations.len() + pins.executions.len()
 }
 
 impl<M: RoleModel> ResearcherPreparingOwner<M> {
@@ -152,6 +174,8 @@ impl<M: RoleModel> ResearcherPreparingOwner<M> {
             last_checkpoint: None,
             last_transition_remaining: None,
             setup: None,
+            #[cfg(feature = "archive-origin-diagnostics")]
+            last_prepare_pressure: None,
             #[cfg(test)]
             panic_setup_after_enable: false,
             #[cfg(test)]
@@ -174,6 +198,8 @@ impl<M: RoleModel> PcSemanticOwner<M> {
             last_checkpoint: None,
             last_transition_remaining: None,
             setup: None,
+            #[cfg(feature = "archive-origin-diagnostics")]
+            last_prepare_pressure: None,
             #[cfg(test)]
             panic_setup_after_enable: false,
             #[cfg(test)]
@@ -200,6 +226,8 @@ impl<M: RoleModel> PalsEngine<M> {
             last_checkpoint: None,
             last_transition_remaining: None,
             setup: None,
+            #[cfg(feature = "archive-origin-diagnostics")]
+            last_prepare_pressure: None,
             #[cfg(test)]
             panic_setup_after_enable: false,
             #[cfg(test)]
@@ -545,6 +573,8 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
+        #[cfg(feature = "archive-origin-diagnostics")]
+        { self.last_prepare_pressure = None; }
         self.validate_idle()?;
         allocation_controls(Some((deadline, cancel)))?;
         if !self.archive_enabled() {
@@ -566,12 +596,27 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
             semantic.charge_engine_archive_io(before.saturating_sub(budget.max_bytes))?;
             result?;
         }
-        semantic
-            .stores
-            .set_archive_pins(semantic.resident_archive_pins_with(&pins)?)?;
-        if semantic.engine_archive_pressure(&config, position) {
+        let resident_pins = semantic.resident_archive_pins_with(&pins)?;
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let (semantic_nodes, semantic_records, resident_pin_entries) =
+            (semantic.nodes.len(), semantic.records.len(), pin_entries(&resident_pins));
+        semantic.stores.set_archive_pins(resident_pins)?;
+        let pressure = semantic.engine_archive_pressure(&config, position);
+        #[cfg(feature = "archive-origin-diagnostics")]
+        let diagnostic = ArchiveRootPressure {
+            semantic_nodes,
+            semantic_nodes_limit: config.max_nodes,
+            semantic_records,
+            semantic_records_limit: config.max_records,
+            projection_pin_entries: pin_entries(&pins),
+            resident_pin_entries,
+            pressure,
+        };
+        #[cfg(feature = "archive-origin-diagnostics")]
+        { self.last_prepare_pressure = Some(diagnostic); }
+        if pressure {
             // Idle validation rejects every resume token, active task and view.
-            semantic.reclaim_archive_for_root(
+            self.semantic_mut().reclaim_archive_for_root(
                 &config,
                 &pins,
                 &|_| false,
@@ -582,6 +627,11 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
         allocation_controls(Some((deadline, cancel)))?;
         Ok(())
+    }
+
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub(super) fn take_prepare_pressure(&mut self) -> Option<ArchiveRootPressure> {
+        self.last_prepare_pressure.take()
     }
     pub(super) fn remaining_io(&self) -> u64 {
         self.semantic().archive_remaining_io()
@@ -1291,6 +1341,36 @@ mod tests {
         owner.abandon_unconsumed_adaptive_root(scope).unwrap();
         drop(registered);
         owner.intern(position).unwrap();
+    }
+
+    #[cfg(feature = "archive-origin-diagnostics")]
+    #[test]
+    fn idle_prepare_pressure_reports_existing_counts_without_reclaim() {
+        let mut scratch = EngineScratch::new();
+        let until = Instant::now() + Duration::from_secs(20);
+        let (mut owner, _, _, _) = configured_engine(engine_fixture(until), &scratch, until);
+        let position = Position::startpos();
+        let pins = owner.projection_pins().unwrap();
+        let resident = owner.semantic().resident_archive_pins_with(&pins).unwrap();
+        let nodes = owner.semantic().nodes.len();
+        let records = owner.semantic().records.len();
+        let config = owner.config();
+        let hot_before = owner.stores().hot_stats();
+        owner.prepare_root(&position, until, &AtomicBool::new(false)).unwrap();
+        let sample = owner.take_prepare_pressure().expect("observed prepare root");
+        assert_eq!((sample.semantic_nodes, sample.semantic_records), (nodes, records));
+        assert_eq!((sample.semantic_nodes_limit, sample.semantic_records_limit),
+            (config.max_nodes, config.max_records));
+        assert_eq!(sample.projection_pin_entries, pin_entries(&pins));
+        assert_eq!(sample.resident_pin_entries, pin_entries(&resident));
+        assert!(!sample.pressure);
+        assert_eq!(owner.stores().hot_stats(), hot_before);
+        assert!(owner.take_prepare_pressure().is_none());
+        owner.advance_transition(
+            IdleArchiveTransitionKind::Finish, until, &AtomicBool::new(false),
+        ).unwrap();
+        assert!(owner.transition_snapshot().unwrap().unwrap().completed);
+        scratch.1 = true;
     }
 
     #[test]

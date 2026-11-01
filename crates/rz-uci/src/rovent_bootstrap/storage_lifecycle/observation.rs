@@ -102,7 +102,8 @@ fn operation(value: ArchiveOperationKind) -> &'static str {
     }
 }
 fn receipt(value: &ArchiveWorkReceipt) -> Value {
-    json!({"nonce":value.nonce,"authority":scope(value.authority),
+    #[allow(unused_mut)] // Only the optional diagnostics feature extends this projection.
+    let mut result = json!({"nonce":value.nonce,"authority":scope(value.authority),
         "operation":operation(value.operation),"generation_before":value.generation_before,
         "generation_after":value.generation_after,"hot_before":hot(value.hot_before),
         "hot_after":hot(value.hot_after),"io_bytes":value.io_bytes,
@@ -112,7 +113,22 @@ fn receipt(value: &ArchiveWorkReceipt) -> Value {
         "idle_checkpoint":value.idle_checkpoint.as_ref().map(|checkpoint|json!({
             "hot":hot(checkpoint.hot),"records":checkpoint.records,"nodes":checkpoint.nodes,
             "committed_bytes":checkpoint.committed_bytes,"io_bytes":checkpoint.io_bytes,
-            "archive_owner":owner_observation(checkpoint.owner)}))})
+            "archive_owner":owner_observation(checkpoint.owner)}))});
+    #[cfg(feature = "archive-origin-diagnostics")]
+    if let Some(pressure) = value.root_pressure {
+        result["root_pressure"] = json!({
+            "sample":"idle_prepare_root_after_pin_install_before_reclaim",
+            "scope":"enclosing_work_authority_not_target_root",
+            "pressure_reason":"unknown_combined_predicate",
+            "pin_count_semantics":"typed_set_entries_not_full_closure_or_unique_objects",
+            "resident_includes_projection":true,
+            "semantic_nodes":pressure.semantic_nodes,"semantic_nodes_limit":pressure.semantic_nodes_limit,
+            "semantic_records":pressure.semantic_records,"semantic_records_limit":pressure.semantic_records_limit,
+            "projection_pin_entries":pressure.projection_pin_entries,
+            "resident_pin_entries":pressure.resident_pin_entries,"pressure":pressure.pressure
+        });
+    }
+    result
 }
 
 pub(super) fn project<M: RoleModel + 'static>(

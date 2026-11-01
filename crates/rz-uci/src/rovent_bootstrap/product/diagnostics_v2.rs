@@ -343,11 +343,17 @@ fn compact_storage(value: serde_json::Value) -> serde_json::Value {
                 .iter()
                 .take(2)
                 .map(|item| {
-                    serde_json::json!({
+                    #[allow(unused_mut)] // Optional archive diagnostics extend this projection.
+                    let mut result = serde_json::json!({
                         "operation":item.get("operation"), "authority":item.get("authority"),
                         "loaded_root":item.get("loaded_root"), "io_bytes":item.get("io_bytes"),
                         "archive_owner":compact_archive_owner(&item["archive_owner"])
-                    })
+                    });
+                    #[cfg(feature = "archive-origin-diagnostics")]
+                    if let Some(pressure) = item.get("root_pressure") {
+                        result["root_pressure"] = pressure.clone();
+                    }
+                    result
                 })
                 .collect::<Vec<_>>()
         });
@@ -530,6 +536,24 @@ mod tests {
 
     struct FailingSink {
         calls: usize,
+    }
+
+    #[cfg(feature = "archive-origin-diagnostics")]
+    #[test]
+    fn storage_summary_preserves_pressure_without_inventing_missing_samples() {
+        let summary = compact_storage(serde_json::json!({
+            "complete":true,
+            "facts":{"phase_receipts_known":true,"phase_receipts":[
+                {"operation":"prepare_root","root_pressure":{
+                    "semantic_nodes":3,"semantic_nodes_limit":100,
+                    "semantic_records":2,"semantic_records_limit":20,
+                    "resident_pin_entries":5,"projection_pin_entries":2,"pressure":false}},
+                {"operation":"restore_root_if_archived"}
+            ]}
+        }));
+        assert_eq!(summary["phase_receipts"][0]["root_pressure"]["semantic_nodes"], 3);
+        assert_eq!(summary["phase_receipts"][0]["root_pressure"]["pressure"], false);
+        assert!(summary["phase_receipts"][1].get("root_pressure").is_none());
     }
     impl Write for FailingSink {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {

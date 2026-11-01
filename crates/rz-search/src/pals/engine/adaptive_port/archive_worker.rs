@@ -433,6 +433,10 @@ pub struct ArchiveWorkReceipt {
     pub archive_owner: Option<ArchiveOwnerSnapshot>,
     pub next_authority: Option<SearchAuthority>,
     pub idle_checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
+    /// Optional scalar snapshot from the original idle PrepareRoot. It grants
+    /// no storage, pin or physical-completion authority.
+    #[cfg(feature = "archive-origin-diagnostics")]
+    pub root_pressure: Option<super::super::idle_archive::ArchiveRootPressure>,
 }
 #[derive(Clone, Debug)]
 pub enum ArchiveQuarantineReason {
@@ -1888,6 +1892,12 @@ fn execute_idle<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
         } else {
             None
         },
+        #[cfg(feature = "archive-origin-diagnostics")]
+        root_pressure: if kind == ArchiveOperationKind::PrepareRoot {
+            owner.take_prepare_pressure()
+        } else {
+            None
+        },
     };
     ArchiveCompletion {
         owner: command.owner,
@@ -2085,6 +2095,8 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
         archive_owner: engine.archive_owner_snapshot().ok().flatten(),
         next_authority: command.seal.next_game,
         idle_checkpoint: None,
+        #[cfg(feature = "archive-origin-diagnostics")]
+        root_pressure: None,
     };
     ArchiveCompletion {
         owner: command.owner,
