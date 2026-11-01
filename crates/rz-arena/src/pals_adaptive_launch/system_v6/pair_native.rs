@@ -85,10 +85,6 @@ impl NativeLaunchDeclaration for LockedPalsSystemArenaPairV6 {
         "PALS-system-V6"
     }
 
-    fn gpu_only_physical_guard(&self) -> bool {
-        true
-    }
-
     fn runtime_source_v6(&self, role: NativeEngineRole) -> Option<&NativeRuntimeSourceV6> {
         Some(
             &self
