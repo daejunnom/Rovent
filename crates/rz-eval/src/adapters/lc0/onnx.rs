@@ -834,7 +834,10 @@ fn classify_system_mapping(
     // identity conflict. SystemRuntime::observe_mappings already reports
     // actual path/inode/lifetime conflicts as errors before this projection.
     if observation.availability == SystemMappingAvailability::Observed
-        && observation.mapped_roles.iter().any(|role| role == "ort-core")
+        && observation
+            .mapped_roles
+            .iter()
+            .any(|role| role == "ort-core")
         && (!include_runtime || observation.missing_required_roles.is_empty())
         && observation.preexisting_mapping_observed
         && observation.preexisting_native_mappings.is_empty()
