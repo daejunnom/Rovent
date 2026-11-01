@@ -2,7 +2,9 @@
 //! checker metadata exists in this state machine.
 
 use super::configuration::{ExecutionConfiguration, StartupConfigurationDocument};
-use super::launch::storage::RoventStorageOwnedRuntimeRegistration;
+use super::launch::storage::{
+    RoventStorageOwnedRuntimeRegistration, RoventStorageOwnedRuntimeRegistrationV2,
+};
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::{
     VerifiedOwnedRoventProcessBoundaryV2, VerifiedOwnedRoventProcessBoundaryV3,
@@ -2283,6 +2285,99 @@ impl RoventPcSessionDriver {
         *slot = Some(SessionStorageLifecycle::new(Arc::clone(&shared)));
         Ok(shared)
     }
+
+    /// Attach a selected archive profile only to the original unused /2
+    /// session and its original process/lock owners. No archive work is
+    /// issued until the session receives an independently admitted live go.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_storage_registration_v2(
+        &self,
+        original: RoventStorageOwnedRuntimeRegistrationV2,
+    ) -> Result<
+        Arc<SharedRoventStorageRegistration>,
+        (
+            RoventStorageOwnedRuntimeRegistrationV2,
+            SearchSessionFailure,
+        ),
+    > {
+        let PcSources::V2(sources) = &self.sources else {
+            return Err((
+                original,
+                failure(
+                    "RoventPcV2Storage",
+                    "storage requires an original V2 session",
+                ),
+            ));
+        };
+        if !self
+            .process_v2
+            .as_ref()
+            .is_some_and(|process| Arc::ptr_eq(process, original.process_boundary()))
+        {
+            return Err((
+                original,
+                failure(
+                    "RoventPcV2Storage",
+                    "storage and session process owners differ",
+                ),
+            ));
+        }
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return Err((
+                    original,
+                    physical_unknown_at(
+                        "RoventPcStorageInstall",
+                        "original session owner is busy/poisoned",
+                    ),
+                ));
+            }
+        };
+        let mut slot = match self.storage.try_lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Err((
+                    original,
+                    physical_unknown_at("RoventPcStorageInstall", "storage slot is busy/poisoned"),
+                ));
+            }
+        };
+        let valid_idle = matches!(&*state, State::Idle(idle)
+            if matches!(idle.custody, IdleCustody::StartupReady)
+                && idle.game.is_none() && idle.owner.as_ref().is_some_and(|owner| owner.stores().generation() == 0 && owner.stores().root().is_none())
+                && idle.native.finished.is_none() && !idle.native.joined
+                && !idle.native.service.is_quarantined() && idle.native.service.occupancy() == 0);
+        if slot.is_some() || self.closed.load(Ordering::Acquire) || !valid_idle {
+            return Err((
+                original,
+                physical_unknown_at(
+                    "RoventPcStorageInstall",
+                    "storage requires the unused original native StartupReady owner",
+                ),
+            ));
+        }
+        if let Err(error) =
+            original.validate_session_attachment(sources.lock(), &self.clock, self.implementation)
+        {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventPcStorageNamespace", &error),
+            ));
+        }
+        if let Err(error) = original
+            .profile()
+            .validate_for_manifest_v2(&sources.lock().manifest)
+        {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventPcStorageResources", &error),
+            ));
+        }
+        let shared = Arc::new(SharedRoventStorageRegistration::new_v2(original));
+        *slot = Some(SessionStorageLifecycle::new(Arc::clone(&shared)));
+        Ok(shared)
+    }
     pub fn shared_nnuec_readback(
         &self,
     ) -> Result<Option<RoventPcSharedNnuecReadback>, ContractError> {
@@ -2679,22 +2774,32 @@ impl RoventPcSessionDriver {
             idle.game = Some(context.authority.game.0);
         }
         if let Some(storage) = storage.as_mut() {
-            let original_admission = match &root_admission {
-                PcRootAdmission::V1(value) => Arc::clone(value),
-                PcRootAdmission::V2(_) | PcRootAdmission::V3(_) => {
-                    *state = State::Idle(idle);
-                    return Err(failure("RoventPcV2Storage", "V2 storage is not connected"));
-                }
-            };
+            if matches!(&root_admission, PcRootAdmission::V3(_)) {
+                *state = State::Idle(idle);
+                return Err(failure("RoventPcV3Storage", "V3 storage is not connected"));
+            }
             let owner = idle.owner.take().expect("original semantic owner");
             let signal = idle.native.service.signal();
-            match storage.prepare(
-                StorageSemanticOwner::Pc(owner),
-                original_admission,
-                reset,
-                position,
-                &signal,
-            ) {
+            let result = match &root_admission {
+                PcRootAdmission::V1(admission) => storage.prepare(
+                    StorageSemanticOwner::Pc(owner),
+                    Arc::clone(admission),
+                    reset,
+                    position,
+                    &signal,
+                ),
+                PcRootAdmission::V2(admission) => storage.prepare_v2(
+                    StorageSemanticOwner::Pc(owner),
+                    Arc::clone(admission),
+                    reset,
+                    position,
+                    &signal,
+                ),
+                PcRootAdmission::V3(_) => {
+                    unreachable!("V3 storage was rejected before owner transfer")
+                }
+            };
+            match result {
                 Ok(StorageSemanticOwner::Pc(owner)) => {
                     idle.owner = Some(owner);
                     idle.game = Some(context.authority.game.0);

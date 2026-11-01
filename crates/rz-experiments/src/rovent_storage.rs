@@ -713,6 +713,35 @@ mod tests {
     }
 
     #[test]
+    fn v2_pc_collection_teacher_keeps_its_original_resource_declaration() {
+        let mut manifest = manifest_v2(ExecutionMode::CpuPc);
+        manifest.purpose = RoventPurpose::Collection;
+        manifest.engine.teachers.push(RoventExternalProfilePin {
+            domain: ROVENT_EXTERNAL_PROFILE_DOMAIN.into(),
+            profile: artifact("teacher-profile.json"),
+            canonical_sha256: "8".repeat(64),
+            capability_sha256: "9".repeat(64),
+            purpose: RoventExternalPurpose::Teacher,
+            binary: artifact("teacher-engine"),
+            source_commit: "b".repeat(40),
+            requested_threads: 1,
+            requested_hash_mib: 256,
+        });
+        manifest.resources.pools.push(RoventThreadPool {
+            actors: BTreeSet::from([RoventActor::Teacher]),
+            max_threads: 1,
+            cpu_charge_millicpus: 500,
+        });
+        assert!(manifest.validate().is_ok());
+        assert!(profile().validate_for_manifest_v2(&manifest).is_ok());
+
+        // Omitting the real teacher pool must not make an archive declaration
+        // valid by silently projecting the /2 Collection inputs into /1.
+        manifest.resources.pools.pop();
+        assert!(profile().validate_for_manifest_v2(&manifest).is_err());
+    }
+
+    #[test]
     fn helper_pool_must_be_unique_separate_sized_and_charged() {
         for mutate in [
             (|v: &mut RoventResourcePlan| {

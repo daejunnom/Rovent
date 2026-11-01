@@ -10,16 +10,22 @@
 use crate::rovent_bootstrap::RoventStartupControl;
 use crate::rovent_bootstrap::process_boundary::{
     PROCESS_SOURCE_SCOPE, ProcessBoundaryError, VerifiedOwnedRoventProcessBoundary,
-    VerifiedRoventProcessBoundary, compiled_process_source_components,
+    VerifiedOwnedRoventProcessBoundaryV2, VerifiedRoventProcessBoundary,
+    VerifiedRoventProcessBoundaryV2, compiled_process_source_components,
 };
-use crate::{engine::ProcessClock, rovent_root_admission::RoventRootAdmission};
+use crate::{
+    engine::ProcessClock,
+    rovent_root_admission::{RoventRootAdmission, source_seal::RoventRootAdmissionV2},
+    search_driver::SearchSessionContext,
+};
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
-use rz_contracts::{ContractError, Digest};
+use rz_contracts::{ContractError, Deadline, Digest, pals::SearchAuthority};
 use rz_experiments::{
-    ArtifactRef, CompiledSourceInventoryV5, ManifestError, RoventInputLock, RoventStorageProfile,
+    ArtifactRef, CompiledSourceInventoryV5, ManifestError, RoventInputLock, RoventInputLockV2,
+    RoventStorageProfile,
 };
-use rz_runtime::contracts::ContractClock;
+use rz_runtime::contracts::{ContractClock, ContractSystemClock};
 use rz_search::pals::engine::idle_archive::{
     UnusedIdleArchiveSetup, UnusedIdleArchiveSetupControl, UnusedIdleArchiveSetupIdentity,
 };
@@ -69,8 +75,8 @@ pub struct RoventStorageAdmissionRequest<'a> {
 /// Read-only admission custody, not a physical fence or an enabled archive.
 /// This owner is intentionally not Clone. Partial failures retain the same
 /// original successful descriptor/directory opens rather than reopening them.
-pub struct RoventStorageAdmissionOwners {
-    input_lock: Arc<RoventInputLock>,
+pub struct RoventStorageAdmissionOwners<L = RoventInputLock> {
+    input_lock: Arc<L>,
     control: RoventStartupControl,
     artifact: Option<ArtifactRef>,
     profile: Option<RoventStorageProfile>,
@@ -80,8 +86,8 @@ pub struct RoventStorageAdmissionOwners {
     capability: Option<ArchiveRootCapability>,
 }
 
-impl RoventStorageAdmissionOwners {
-    pub fn input_lock(&self) -> &Arc<RoventInputLock> {
+impl<L> RoventStorageAdmissionOwners<L> {
+    pub fn input_lock(&self) -> &Arc<L> {
         &self.input_lock
     }
     pub fn profile_artifact(&self) -> Option<&ArtifactRef> {
@@ -116,16 +122,13 @@ impl RoventStorageAdmissionOwners {
 /// unverified. This cannot configure/start an archive: a separate Root-owned
 /// final compiled/source comparison and checked runtime bridge are required.
 /// No such runtime bridge is provided by this independent library entry.
-pub struct RoventStorageByteCustody {
-    owners: RoventStorageAdmissionOwners,
+pub struct RoventStorageByteCustody<L = RoventInputLock> {
+    owners: RoventStorageAdmissionOwners<L>,
 }
 
-impl RoventStorageByteCustody {
-    pub fn owners(&self) -> &RoventStorageAdmissionOwners {
+impl<L> RoventStorageByteCustody<L> {
+    pub fn owners(&self) -> &RoventStorageAdmissionOwners<L> {
         &self.owners
-    }
-    pub fn input_lock_sha256(&self) -> &str {
-        &self.owners.input_lock.canonical_sha256
     }
     pub fn profile(&self) -> &RoventStorageProfile {
         self.owners.profile.as_ref().expect("admitted profile")
@@ -151,8 +154,20 @@ impl RoventStorageByteCustody {
         require_separation(&self.owners)?;
         check(&self.owners.control)
     }
-    pub fn into_owners(self) -> RoventStorageAdmissionOwners {
+    pub fn into_owners(self) -> RoventStorageAdmissionOwners<L> {
         self.owners
+    }
+}
+
+impl RoventStorageByteCustody<RoventInputLock> {
+    pub fn input_lock_sha256(&self) -> &str {
+        &self.owners.input_lock.canonical_sha256
+    }
+}
+
+impl RoventStorageByteCustody<RoventInputLockV2> {
+    pub fn input_lock_sha256(&self) -> &str {
+        &self.owners.input_lock.canonical_sha256
     }
 }
 
@@ -203,11 +218,11 @@ pub struct RoventStorageRuntimeRegistration<'boundary, 'process> {
     state: StorageRuntimeState,
 }
 
-struct StorageRuntimeState {
+struct StorageRuntimeState<A = RoventRootAdmission> {
     expected_clock: ProcessClock,
     expected_implementation: Digest,
     identity: UnusedIdleArchiveSetupIdentity,
-    issued_admission: Option<Arc<RoventRootAdmission>>,
+    issued_admission: Option<Arc<A>>,
 }
 
 impl RoventStorageRuntimeRegistration<'_, '_> {
@@ -426,9 +441,9 @@ impl fmt::Debug for RoventStorageRuntimeRegistrationFailure<'_, '_> {
 /// The registration remains borrowed in-place on rejection. Only this exact
 /// original admission is returned; no replacement control/deadline is minted.
 #[derive(Debug)]
-pub struct RoventStorageSetupRejection {
+pub struct RoventStorageSetupRejection<A = RoventRootAdmission> {
     pub error: RoventStorageRuntimeError,
-    pub admission: Arc<RoventRootAdmission>,
+    pub admission: Arc<A>,
 }
 
 /// Freeze successful startup custody while its original startup control is
@@ -477,6 +492,18 @@ fn prepare_runtime_state(
     expected_clock: &ProcessClock,
     expected_implementation: Digest,
 ) -> Result<StorageRuntimeState, RoventStorageRuntimeError> {
+    prepare_runtime_state_common::<RoventRootAdmission>(
+        custody,
+        expected_clock,
+        expected_implementation,
+    )
+}
+
+fn prepare_runtime_state_common<A: StorageGo>(
+    custody: &RoventStorageByteCustody<A::Lock>,
+    expected_clock: &ProcessClock,
+    expected_implementation: Digest,
+) -> Result<StorageRuntimeState<A>, RoventStorageRuntimeError> {
     if expected_clock.epoch().0 == 0 || expected_implementation == Digest([0; 32]) {
         return Err(RoventStorageRuntimeError::Namespace(
             "nonzero expected clock/implementation required",
@@ -495,20 +522,21 @@ fn prepare_runtime_state(
     })
 }
 
-fn validate_runtime_profile(
-    custody: &RoventStorageByteCustody,
+fn validate_runtime_profile<L: StorageAdmissionLock>(
+    custody: &RoventStorageByteCustody<L>,
 ) -> Result<(), RoventStorageRuntimeError> {
     verify_native_allowance(custody.profile().maintenance_io_bytes_max)
         .map_err(RoventStorageRuntimeError::Compiled)?;
     custody
-        .profile()
-        .validate_for_manifest(&custody.owners.input_lock.manifest)
+        .owners
+        .input_lock
+        .validate_storage_profile(custody.profile())
         .map_err(RoventStorageCompiledError::Input)
         .map_err(RoventStorageRuntimeError::Compiled)
 }
 
-fn runtime_identity(
-    custody: &RoventStorageByteCustody,
+fn runtime_identity<L: StorageAdmissionLock>(
+    custody: &RoventStorageByteCustody<L>,
     clock: &ProcessClock,
     implementation: Digest,
 ) -> Result<UnusedIdleArchiveSetupIdentity, RoventStorageRuntimeError> {
@@ -519,10 +547,10 @@ fn runtime_identity(
         .map_err(RoventStorageCompiledError::Input)
         .map_err(fail)?;
     let profile = compiled_digest(&profile_text).map_err(fail)?;
-    let input_lock = compiled_digest(custody.input_lock_sha256()).map_err(fail)?;
+    let input_lock = compiled_digest(custody.owners.input_lock.canonical_sha256()).map_err(fail)?;
     let aggregate = rz_experiments::rovent_source_aggregate_sha256(
-        &custody.owners.input_lock.manifest.engine.source_commit,
-        &custody.owners.input_lock.manifest.engine.source_components,
+        custody.owners.input_lock.source_commit(),
+        custody.owners.input_lock.source_components(),
     )
     .map_err(RoventStorageCompiledError::Input)
     .map_err(fail)?;
@@ -534,13 +562,7 @@ fn runtime_identity(
     hash_frame(&mut hash, PROCESS_SOURCE_SCOPE.as_bytes());
     hash_frame(
         &mut hash,
-        custody
-            .owners
-            .input_lock
-            .manifest
-            .engine
-            .source_commit
-            .as_bytes(),
+        custody.owners.input_lock.source_commit().as_bytes(),
     );
     // Expected epoch/implementation are framed as selections, not proof. The
     // raw Instant origin is never serialized; the retained clock is compared
@@ -587,20 +609,90 @@ struct PreparedSetupValues {
     control: UnusedIdleArchiveSetupControl,
 }
 
-fn validate_original_setup_go(
-    custody: &RoventStorageByteCustody,
-    state: &StorageRuntimeState,
-    admission: &RoventRootAdmission,
+trait StorageGo {
+    type Lock: StorageAdmissionLock;
+    fn owns_lock(&self, lock: &Arc<Self::Lock>) -> bool;
+    fn startup_lock_digest(&self) -> Digest;
+    fn authority(&self) -> SearchAuthority;
+    fn original_context(&self) -> &SearchSessionContext;
+    fn runtime_clock(&self) -> &ContractSystemClock;
+    fn hard_deadline(&self) -> Deadline;
+    fn soft_deadline(&self) -> Deadline;
+    fn admission_deadline(&self) -> Deadline;
+    fn cleanup_deadline(&self) -> Deadline;
+}
+
+macro_rules! storage_go_accessors {
+    ($admission:ty) => {
+        fn startup_lock_digest(&self) -> Digest {
+            <$admission>::startup_lock_digest(self)
+        }
+        fn authority(&self) -> SearchAuthority {
+            <$admission>::authority(self)
+        }
+        fn original_context(&self) -> &SearchSessionContext {
+            <$admission>::original_context(self)
+        }
+        fn runtime_clock(&self) -> &ContractSystemClock {
+            <$admission>::runtime_clock(self)
+        }
+        fn hard_deadline(&self) -> Deadline {
+            <$admission>::hard_deadline(self)
+        }
+        fn soft_deadline(&self) -> Deadline {
+            <$admission>::soft_deadline(self)
+        }
+        fn admission_deadline(&self) -> Deadline {
+            <$admission>::admission_deadline(self)
+        }
+        fn cleanup_deadline(&self) -> Deadline {
+            <$admission>::cleanup_deadline(self)
+        }
+    };
+}
+
+impl StorageGo for RoventRootAdmission {
+    type Lock = RoventInputLock;
+    // /1 admission retains its source digest rather than an Arc lock owner.
+    fn owns_lock(&self, _: &Arc<Self::Lock>) -> bool {
+        true
+    }
+    storage_go_accessors!(RoventRootAdmission);
+}
+
+impl StorageGo for RoventRootAdmissionV2 {
+    type Lock = RoventInputLockV2;
+    fn owns_lock(&self, lock: &Arc<Self::Lock>) -> bool {
+        self.owner()
+            .v2()
+            .is_some_and(|original| Arc::ptr_eq(original, lock))
+    }
+    storage_go_accessors!(RoventRootAdmissionV2);
+}
+
+fn validate_original_setup_go<A: StorageGo>(
+    custody: &RoventStorageByteCustody<A::Lock>,
+    state: &StorageRuntimeState<A>,
+    admission: &A,
 ) -> Result<(), RoventStorageRuntimeError> {
     if state.issued_admission.is_some() {
         return Err(RoventStorageRuntimeError::AlreadyIssued);
     }
+    validate_original_live_go(custody, state, admission)
+}
+
+fn validate_original_live_go<A: StorageGo>(
+    custody: &RoventStorageByteCustody<A::Lock>,
+    state: &StorageRuntimeState<A>,
+    admission: &A,
+) -> Result<(), RoventStorageRuntimeError> {
     validate_runtime_profile(custody)?;
     let actual = admission.runtime_clock();
     let expected = state.expected_clock.runtime_clock();
     let context = admission.original_context();
-    if admission.startup_lock_digest() != state.identity.input_lock
-        || compiled_digest(custody.input_lock_sha256())
+    if !admission.owns_lock(&custody.owners.input_lock)
+        || admission.startup_lock_digest() != state.identity.input_lock
+        || compiled_digest(custody.owners.input_lock.canonical_sha256())
             .map_err(RoventStorageRuntimeError::Compiled)?
             != state.identity.input_lock
         || admission.authority().epoch != state.expected_clock.epoch()
@@ -641,10 +733,10 @@ fn validate_original_setup_go(
     Ok(())
 }
 
-fn prepare_setup_values(
-    custody: &RoventStorageByteCustody,
-    state: &StorageRuntimeState,
-    admission: &RoventRootAdmission,
+fn prepare_setup_values<A: StorageGo>(
+    custody: &RoventStorageByteCustody<A::Lock>,
+    state: &StorageRuntimeState<A>,
+    admission: &A,
 ) -> Result<PreparedSetupValues, RoventStorageRuntimeError> {
     validate_original_setup_go(custody, state, admission)?;
     if !custody.retains_root_capability() {
@@ -693,6 +785,14 @@ fn split_unused_setup(
     state: &mut StorageRuntimeState,
     admission: Arc<RoventRootAdmission>,
 ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection> {
+    split_unused_setup_common(custody, state, admission)
+}
+
+fn split_unused_setup_common<A: StorageGo>(
+    custody: &mut RoventStorageByteCustody<A::Lock>,
+    state: &mut StorageRuntimeState<A>,
+    admission: Arc<A>,
+) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection<A>> {
     let prepared = match prepare_setup_values(custody, state, &admission).and_then(|prepared| {
         // Last fallible/liveness check precedes the sole capability take.
         validate_original_setup_go(custody, state, &admission)?;
@@ -790,9 +890,288 @@ pub fn check_rovent_storage_compiled_custody<'boundary, 'process>(
     }
 }
 
+/// Checked byte custody tied to the original /2 process observation. This
+/// type does not authorize a worker, a later go, or physical completion.
+pub struct RoventStorageCompiledCustodyV2<'boundary, 'process> {
+    custody: RoventStorageByteCustody<RoventInputLockV2>,
+    boundary: &'boundary VerifiedRoventProcessBoundaryV2<'process>,
+}
+
+impl RoventStorageCompiledCustodyV2<'_, '_> {
+    pub fn owners(&self) -> &RoventStorageAdmissionOwners<RoventInputLockV2> {
+        self.custody.owners()
+    }
+    pub fn profile(&self) -> &RoventStorageProfile {
+        self.custody.profile()
+    }
+    pub fn retains_root_capability(&self) -> bool {
+        self.custody.retains_root_capability()
+    }
+    pub fn revalidate_startup(&self) -> Result<(), RoventStorageCompiledError> {
+        verify_compiled_custody_v2(&self.custody, self.boundary)
+    }
+    pub fn into_byte_custody(self) -> RoventStorageByteCustody<RoventInputLockV2> {
+        self.custody
+    }
+}
+
+pub struct RoventStorageCompiledFailureV2 {
+    pub error: RoventStorageCompiledError,
+    pub custody: RoventStorageByteCustody<RoventInputLockV2>,
+}
+impl fmt::Debug for RoventStorageCompiledFailureV2 {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_struct("RoventStorageCompiledFailureV2")
+            .field("error", &self.error)
+            .field(
+                "root_capability_retained",
+                &self.custody.retains_root_capability(),
+            )
+            .finish()
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub fn check_rovent_storage_compiled_custody_v2<'boundary, 'process>(
+    custody: RoventStorageByteCustody<RoventInputLockV2>,
+    boundary: &'boundary VerifiedRoventProcessBoundaryV2<'process>,
+) -> Result<RoventStorageCompiledCustodyV2<'boundary, 'process>, RoventStorageCompiledFailureV2> {
+    match verify_compiled_custody_v2(&custody, boundary) {
+        Ok(()) => Ok(RoventStorageCompiledCustodyV2 { custody, boundary }),
+        Err(error) => Err(RoventStorageCompiledFailureV2 { error, custody }),
+    }
+}
+
+/// Runtime setup retains the original /2 process view and original lock. It
+/// still issues no archive worker until a live original /2 go is supplied.
+pub struct RoventStorageRuntimeRegistrationV2<'boundary, 'process> {
+    custody: RoventStorageCompiledCustodyV2<'boundary, 'process>,
+    state: StorageRuntimeState<RoventRootAdmissionV2>,
+}
+
+impl RoventStorageRuntimeRegistrationV2<'_, '_> {
+    pub fn owners(&self) -> &RoventStorageAdmissionOwners<RoventInputLockV2> {
+        self.custody.owners()
+    }
+    pub fn profile(&self) -> &RoventStorageProfile {
+        self.custody.profile()
+    }
+    pub fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
+        self.state.identity
+    }
+    pub fn issued_admission(&self) -> Option<&Arc<RoventRootAdmissionV2>> {
+        self.state.issued_admission.as_ref()
+    }
+}
+
+pub struct RoventStorageRegistrationFailureV2<'boundary, 'process> {
+    pub error: RoventStorageRuntimeError,
+    pub custody: RoventStorageCompiledCustodyV2<'boundary, 'process>,
+    pub expected_process_clock: ProcessClock,
+    pub expected_session_implementation: Digest,
+}
+impl fmt::Debug for RoventStorageRegistrationFailureV2<'_, '_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_struct("RoventStorageRegistrationFailureV2")
+            .field("error", &self.error)
+            .field(
+                "root_capability_retained",
+                &self.custody.retains_root_capability(),
+            )
+            .finish()
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub fn register_rovent_storage_runtime_v2<'boundary, 'process>(
+    custody: RoventStorageCompiledCustodyV2<'boundary, 'process>,
+    expected_process_clock: ProcessClock,
+    expected_session_implementation: Digest,
+) -> Result<
+    RoventStorageRuntimeRegistrationV2<'boundary, 'process>,
+    RoventStorageRegistrationFailureV2<'boundary, 'process>,
+> {
+    let prepared = (|| {
+        custody
+            .revalidate_startup()
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        let state = prepare_runtime_state_common::<RoventRootAdmissionV2>(
+            &custody.custody,
+            &expected_process_clock,
+            expected_session_implementation,
+        )?;
+        check(&custody.custody.owners.control)
+            .map_err(RoventStorageCompiledError::Admission)
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        Ok(state)
+    })();
+    match prepared {
+        Ok(state) => Ok(RoventStorageRuntimeRegistrationV2 { custody, state }),
+        Err(error) => Err(RoventStorageRegistrationFailureV2 {
+            error,
+            custody,
+            expected_process_clock,
+            expected_session_implementation,
+        }),
+    }
+}
+
+pub struct RoventStorageOwnedRuntimeRegistrationV2 {
+    custody: RoventStorageByteCustody<RoventInputLockV2>,
+    boundary: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+    state: StorageRuntimeState<RoventRootAdmissionV2>,
+}
+
+impl RoventStorageOwnedRuntimeRegistrationV2 {
+    pub(crate) fn validate_live_admission(
+        &self,
+        admission: &RoventRootAdmissionV2,
+    ) -> Result<(), RoventStorageRuntimeError> {
+        validate_original_live_go(&self.custody, &self.state, admission)
+    }
+    pub(crate) fn validate_session_attachment(
+        &self,
+        lock: &RoventInputLockV2,
+        clock: &ProcessClock,
+        implementation: Digest,
+    ) -> Result<(), RoventStorageRuntimeError> {
+        let original = self.state.expected_clock.runtime_clock();
+        let actual = clock.runtime_clock();
+        if !std::ptr::eq(self.custody.owners.input_lock.as_ref(), lock)
+            || clock.epoch() != self.state.expected_clock.epoch()
+            || actual.domain() != original.domain()
+            || actual.origin() != original.origin()
+            || implementation != self.state.expected_implementation
+        {
+            return Err(RoventStorageRuntimeError::Namespace(
+                "/2 session and original storage lock/clock/implementation differ",
+            ));
+        }
+        Ok(())
+    }
+    pub fn owners(&self) -> &RoventStorageAdmissionOwners<RoventInputLockV2> {
+        self.custody.owners()
+    }
+    pub fn profile(&self) -> &RoventStorageProfile {
+        self.custody.profile()
+    }
+    pub fn process_boundary(&self) -> &Arc<VerifiedOwnedRoventProcessBoundaryV2> {
+        &self.boundary
+    }
+    pub fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
+        self.state.identity
+    }
+    pub fn issued_admission(&self) -> Option<&Arc<RoventRootAdmissionV2>> {
+        self.state.issued_admission.as_ref()
+    }
+    pub fn retains_root_capability(&self) -> bool {
+        self.custody.retains_root_capability()
+    }
+    pub fn take_unused_idle_setup(
+        &mut self,
+        admission: Arc<RoventRootAdmissionV2>,
+    ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection<RoventRootAdmissionV2>> {
+        split_unused_setup_common(&mut self.custody, &mut self.state, admission)
+    }
+}
+
+pub struct RoventStorageRuntimeOwnershipFailureV2<'boundary, 'process> {
+    pub error: RoventStorageRuntimeError,
+    pub registration: RoventStorageRuntimeRegistrationV2<'boundary, 'process>,
+    pub candidate: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+}
+impl fmt::Debug for RoventStorageRuntimeOwnershipFailureV2<'_, '_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_struct("RoventStorageRuntimeOwnershipFailureV2")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Convert only from the same original /2 lock, startup control, descriptor
+/// objects and actual observation; rejected conversion returns both owners.
+#[allow(clippy::result_large_err)]
+pub fn own_rovent_storage_runtime_registration_v2<'boundary, 'process>(
+    registration: RoventStorageRuntimeRegistrationV2<'boundary, 'process>,
+    candidate: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+) -> Result<
+    RoventStorageOwnedRuntimeRegistrationV2,
+    RoventStorageRuntimeOwnershipFailureV2<'boundary, 'process>,
+> {
+    let checked = (|| {
+        candidate
+            .matches_original_view(
+                registration.custody.boundary,
+                &registration.custody.custody.owners.input_lock,
+                &registration.custody.custody.owners.control,
+            )
+            .map_err(RoventStorageCompiledError::CompiledBoundary)
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        registration
+            .custody
+            .revalidate_startup()
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        candidate
+            .revalidate_startup()
+            .map_err(RoventStorageCompiledError::CompiledBoundary)
+            .map_err(RoventStorageRuntimeError::Compiled)
+    })();
+    match checked {
+        Ok(()) => Ok(RoventStorageOwnedRuntimeRegistrationV2 {
+            custody: registration.custody.custody,
+            boundary: candidate,
+            state: registration.state,
+        }),
+        Err(error) => Err(RoventStorageRuntimeOwnershipFailureV2 {
+            error,
+            registration,
+            candidate,
+        }),
+    }
+}
+
+fn verify_compiled_custody_v2(
+    custody: &RoventStorageByteCustody<RoventInputLockV2>,
+    boundary: &VerifiedRoventProcessBoundaryV2<'_>,
+) -> Result<(), RoventStorageCompiledError> {
+    verify_compiled_custody_common(custody, || {
+        Ok(StorageProcessBinding {
+            input_lock: boundary.input_lock_digest(),
+            source_aggregate: boundary.source_aggregate_digest(),
+            source_commit: boundary.registered_source_commit(),
+            source_scope: boundary.source_scope(),
+            private_root: directory_identity(boundary.original_root())
+                .map_err(RoventStorageCompiledError::Admission)?,
+            executable_bytes: boundary.executable_identity().bytes,
+            executable_sha256: &boundary.executable_identity().sha256,
+        })
+    })
+}
+
 fn verify_compiled_custody(
     custody: &RoventStorageByteCustody,
     boundary: &VerifiedRoventProcessBoundary<'_>,
+) -> Result<(), RoventStorageCompiledError> {
+    verify_compiled_custody_common(custody, || {
+        Ok(StorageProcessBinding {
+            input_lock: boundary.input_lock_digest(),
+            source_aggregate: boundary.source_aggregate_digest(),
+            source_commit: boundary.registered_source_commit(),
+            source_scope: boundary.source_scope(),
+            private_root: directory_identity(boundary.original_root())
+                .map_err(RoventStorageCompiledError::Admission)?,
+            executable_bytes: boundary.executable_identity().bytes,
+            executable_sha256: &boundary.executable_identity().sha256,
+        })
+    })
+}
+
+fn verify_compiled_custody_common<'a, L: StorageAdmissionLock>(
+    custody: &RoventStorageByteCustody<L>,
+    make_binding: impl FnOnce() -> Result<StorageProcessBinding<'a>, RoventStorageCompiledError>,
 ) -> Result<(), RoventStorageCompiledError> {
     let owners = &custody.owners;
     check(&owners.control).map_err(RoventStorageCompiledError::Admission)?;
@@ -801,15 +1180,16 @@ fn verify_compiled_custody(
         .revalidate_startup()
         .map_err(RoventStorageCompiledError::Admission)?;
     let profile = custody.profile();
-    profile
-        .validate_for_manifest(&owners.input_lock.manifest)
+    owners
+        .input_lock
+        .validate_storage_profile(profile)
         .map_err(RoventStorageCompiledError::Input)?;
     let profile_artifact = owners
         .artifact
         .as_ref()
         .ok_or_else(|| compiled_mismatch("original profile artifact is absent"))?;
     if Some(profile_artifact) != owners.profile_file.as_ref().map(|held| &held.artifact)
-        || unique_provenance(&owners.input_lock, &profile_artifact.path)
+        || unique_provenance(owners.input_lock.provenance(), &profile_artifact.path)
             .map_err(RoventStorageCompiledError::Admission)?
             != profile_artifact
     {
@@ -820,20 +1200,11 @@ fn verify_compiled_custody(
     let original_private = owners.directories[PRIVATE]
         .as_ref()
         .ok_or_else(|| compiled_mismatch("original private directory is not held"))?;
-    let binding = StorageProcessBinding {
-        input_lock: boundary.input_lock_digest(),
-        source_aggregate: boundary.source_aggregate_digest(),
-        source_commit: boundary.registered_source_commit(),
-        source_scope: boundary.source_scope(),
-        private_root: directory_identity(boundary.original_root())
-            .map_err(RoventStorageCompiledError::Admission)?,
-        executable_bytes: boundary.executable_identity().bytes,
-        executable_sha256: &boundary.executable_identity().sha256,
-    };
+    let binding = make_binding()?;
     let actual_components = compiled_process_source_components()
         .map_err(RoventStorageCompiledError::CompiledBoundary)?;
     verify_original_process_binding(
-        &owners.input_lock,
+        owners.input_lock.as_ref(),
         original_private.identity,
         &binding,
         &actual_components,
@@ -849,7 +1220,7 @@ fn verify_compiled_custody(
             .ok_or_else(|| compiled_mismatch("original source descriptor is absent"))?;
         if !held.revalidated
             || &held.artifact != *artifact
-            || unique_provenance(&owners.input_lock, &artifact.path)
+            || unique_provenance(owners.input_lock.provenance(), &artifact.path)
                 .map_err(RoventStorageCompiledError::Admission)?
                 != *artifact
         {
@@ -889,25 +1260,26 @@ struct StorageProcessBinding<'a> {
     executable_sha256: &'a str,
 }
 
-fn verify_original_process_binding(
-    lock: &RoventInputLock,
+fn verify_original_process_binding<L: StorageAdmissionLock>(
+    lock: &L,
     original_private: (u64, u64),
     binding: &StorageProcessBinding<'_>,
     actual_components: &BTreeMap<String, String>,
 ) -> Result<(), RoventStorageCompiledError> {
-    lock.validate().map_err(RoventStorageCompiledError::Input)?;
+    lock.validate_storage_lock()
+        .map_err(RoventStorageCompiledError::Input)?;
     let aggregate = rz_experiments::rovent_source_aggregate_sha256(
-        &lock.manifest.engine.source_commit,
-        &lock.manifest.engine.source_components,
+        lock.source_commit(),
+        lock.source_components(),
     )
     .map_err(RoventStorageCompiledError::Input)?;
-    if compiled_digest(&lock.canonical_sha256)? != binding.input_lock
+    if compiled_digest(lock.canonical_sha256())? != binding.input_lock
         || compiled_digest(&aggregate)? != binding.source_aggregate
-        || lock.manifest.engine.source_commit != binding.source_commit
+        || lock.source_commit() != binding.source_commit
         || binding.source_scope != PROCESS_SOURCE_SCOPE
         || original_private != binding.private_root
-        || lock.manifest.engine.binary.bytes != binding.executable_bytes
-        || lock.manifest.engine.binary.sha256 != binding.executable_sha256
+        || lock.binary().bytes != binding.executable_bytes
+        || lock.binary().sha256 != binding.executable_sha256
     {
         return Err(compiled_mismatch(
             "original lock/source/executable/private-root binding differs",
@@ -917,9 +1289,7 @@ fn verify_original_process_binding(
     // Compare its entire original declaration again with the complete actual
     // compiled map, including extra declared keys; no cherry-picked role set.
     if lock
-        .manifest
-        .engine
-        .source_components
+        .source_components()
         .iter()
         .any(|(name, digest)| actual_components.get(name) != Some(digest))
     {
@@ -1006,12 +1376,12 @@ impl fmt::Display for RoventStorageAdmissionError {
 impl Error for RoventStorageAdmissionError {}
 
 /// The exact original lock and each successfully opened owner survive failure.
-pub struct RoventStorageAdmissionFailure {
+pub struct RoventStorageAdmissionFailure<L = RoventInputLock> {
     pub error: RoventStorageAdmissionError,
-    pub owners: RoventStorageAdmissionOwners,
+    pub owners: RoventStorageAdmissionOwners<L>,
 }
 
-impl fmt::Debug for RoventStorageAdmissionFailure {
+impl<L> fmt::Debug for RoventStorageAdmissionFailure<L> {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         output
             .debug_struct("RoventStorageAdmissionFailure")
@@ -1053,8 +1423,101 @@ pub fn open_rovent_storage_byte_custody(
     }
 }
 
-fn admit(
-    owners: &mut RoventStorageAdmissionOwners,
+/// Admit the original /2 lock directly. This opens and retains the same
+/// descriptors as /1 but does not create a legacy lock or issue archive work.
+#[allow(clippy::result_large_err)]
+pub fn open_rovent_storage_byte_custody_v2(
+    input_lock: Arc<RoventInputLockV2>,
+    private_root: &Dir,
+    request: RoventStorageAdmissionRequest<'_>,
+    control: RoventStartupControl,
+) -> Result<
+    RoventStorageByteCustody<RoventInputLockV2>,
+    RoventStorageAdmissionFailure<RoventInputLockV2>,
+> {
+    let mut owners = RoventStorageAdmissionOwners {
+        input_lock,
+        control,
+        artifact: None,
+        profile: None,
+        profile_file: None,
+        source_files: [None, None, None],
+        directories: [None, None, None, None],
+        capability: None,
+    };
+    match admit(&mut owners, private_root, request) {
+        Ok(()) => Ok(RoventStorageByteCustody { owners }),
+        Err(error) => Err(RoventStorageAdmissionFailure { error, owners }),
+    }
+}
+
+trait StorageAdmissionLock {
+    fn validate_storage_lock(&self) -> Result<(), ManifestError>;
+    fn provenance(&self) -> &[ArtifactRef];
+    fn canonical_sha256(&self) -> &str;
+    fn source_commit(&self) -> &str;
+    fn source_components(&self) -> &BTreeMap<String, String>;
+    fn binary(&self) -> &ArtifactRef;
+    fn validate_storage_profile(&self, profile: &RoventStorageProfile)
+    -> Result<(), ManifestError>;
+}
+
+impl StorageAdmissionLock for RoventInputLock {
+    fn validate_storage_lock(&self) -> Result<(), ManifestError> {
+        self.validate()
+    }
+    fn provenance(&self) -> &[ArtifactRef] {
+        &self.manifest.provenance
+    }
+    fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+    fn source_commit(&self) -> &str {
+        &self.manifest.engine.source_commit
+    }
+    fn source_components(&self) -> &BTreeMap<String, String> {
+        &self.manifest.engine.source_components
+    }
+    fn binary(&self) -> &ArtifactRef {
+        &self.manifest.engine.binary
+    }
+    fn validate_storage_profile(
+        &self,
+        profile: &RoventStorageProfile,
+    ) -> Result<(), ManifestError> {
+        profile.validate_for_manifest(&self.manifest)
+    }
+}
+
+impl StorageAdmissionLock for RoventInputLockV2 {
+    fn validate_storage_lock(&self) -> Result<(), ManifestError> {
+        self.validate()
+    }
+    fn provenance(&self) -> &[ArtifactRef] {
+        &self.manifest.provenance
+    }
+    fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+    fn source_commit(&self) -> &str {
+        &self.manifest.engine.source_commit
+    }
+    fn source_components(&self) -> &BTreeMap<String, String> {
+        &self.manifest.engine.source_components
+    }
+    fn binary(&self) -> &ArtifactRef {
+        &self.manifest.engine.binary
+    }
+    fn validate_storage_profile(
+        &self,
+        profile: &RoventStorageProfile,
+    ) -> Result<(), ManifestError> {
+        profile.validate_for_manifest_v2(&self.manifest)
+    }
+}
+
+fn admit<L: StorageAdmissionLock>(
+    owners: &mut RoventStorageAdmissionOwners<L>,
     private_root: &Dir,
     request: RoventStorageAdmissionRequest<'_>,
 ) -> Result<(), RoventStorageAdmissionError> {
@@ -1071,8 +1534,8 @@ fn admit(
             "original bounded profile/control selection is required",
         ));
     }
-    owners.input_lock.validate().map_err(input)?;
-    let artifact = unique_provenance(&owners.input_lock, request.profile_path)?.clone();
+    owners.input_lock.validate_storage_lock().map_err(input)?;
+    let artifact = unique_provenance(owners.input_lock.provenance(), request.profile_path)?.clone();
     owners.artifact = Some(artifact.clone());
     if artifact.sha256 != request.profile_sha256 || artifact.bytes != request.profile_bytes {
         return Err(invalid(
@@ -1090,10 +1553,8 @@ fn admit(
     let profile = RoventStorageProfile::from_json(text).map_err(input)?;
     owners.profile = Some(profile);
     owners
-        .profile
-        .as_ref()
-        .unwrap()
-        .validate_for_manifest(&owners.input_lock.manifest)
+        .input_lock
+        .validate_storage_profile(owners.profile.as_ref().unwrap())
         .map_err(input)?;
 
     let declared_sources = &owners.profile.as_ref().unwrap().source_pins;
@@ -1104,7 +1565,7 @@ fn admit(
     ];
     for (index, artifact) in sources.into_iter().enumerate() {
         check(&owners.control)?;
-        if unique_provenance(&owners.input_lock, &artifact.path)? != &artifact {
+        if unique_provenance(owners.input_lock.provenance(), &artifact.path)? != &artifact {
             return Err(invalid(
                 "source pin metadata differs from original provenance",
             ));
@@ -1161,14 +1622,10 @@ fn admit(
 }
 
 fn unique_provenance<'a>(
-    lock: &'a RoventInputLock,
+    provenance: &'a [ArtifactRef],
     path: &str,
 ) -> Result<&'a ArtifactRef, RoventStorageAdmissionError> {
-    let mut matching = lock
-        .manifest
-        .provenance
-        .iter()
-        .filter(|artifact| artifact.path == path);
+    let mut matching = provenance.iter().filter(|artifact| artifact.path == path);
     let artifact = matching
         .next()
         .ok_or_else(|| invalid("input is absent from original provenance"))?;
@@ -1398,8 +1855,8 @@ fn open_directory(
     })
 }
 
-fn require_separation(
-    owners: &RoventStorageAdmissionOwners,
+fn require_separation<L>(
+    owners: &RoventStorageAdmissionOwners<L>,
 ) -> Result<(), RoventStorageAdmissionError> {
     let archive = owners.directories[ARCHIVE]
         .as_ref()
@@ -1824,6 +2281,141 @@ mod tests {
         RoventExecutionManifest::from_json(&value.to_string()).unwrap()
     }
 
+    fn v2_lock(fixture: &Fixture) -> Arc<RoventInputLockV2> {
+        let mut value = serde_json::to_value(&fixture.lock.manifest).unwrap();
+        value["domain"] = "rz-rovent-execution/2".into();
+        value["startup_document"] =
+            serde_json::to_value(artifact("inputs/startup.json", b"fixture")).unwrap();
+        value["startup_configuration_sha256"] = "7".repeat(64).into();
+        value["startup_search_configuration_sha256"] = "e".repeat(64).into();
+        value["own_r_root_tie"] = serde_json::json!({"kind":"not_applicable","reason":"pc_only"});
+        let manifest =
+            rz_experiments::RoventExecutionManifestV2::from_json(&value.to_string()).unwrap();
+        Arc::new(manifest.lock().unwrap())
+    }
+
+    #[test]
+    fn v2_byte_admission_preserves_original_lock_and_failure_owners() {
+        let fixture = Fixture::new();
+        let lock = v2_lock(&fixture);
+        let custody = open_rovent_storage_byte_custody_v2(
+            Arc::clone(&lock),
+            &fixture.private,
+            fixture.request(),
+            control(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(custody.owners().input_lock(), &lock));
+        assert_eq!(custody.input_lock_sha256(), lock.canonical_sha256);
+        assert!(custody.owners().profile_file().is_some());
+        assert!(custody.retains_root_capability());
+
+        let mut request = fixture.request();
+        request.profile_bytes += 1;
+        let failure = match open_rovent_storage_byte_custody_v2(
+            Arc::clone(&lock),
+            &fixture.private,
+            request,
+            control(),
+        ) {
+            Ok(_) => panic!("mismatched original profile pin was accepted"),
+            Err(failure) => failure,
+        };
+        assert!(Arc::ptr_eq(failure.owners.input_lock(), &lock));
+        assert!(!failure.owners.retains_root_capability());
+    }
+
+    #[test]
+    fn v2_setup_rejects_equal_but_distinct_lock_and_retains_capability() {
+        use crate::engine::driver_start_fixture::{FixtureStart, issue_start};
+        use crate::rovent_root_admission::source_seal::PreparedSourceV2;
+        let fixture = runtime_fixture();
+        let lock = v2_lock(&fixture);
+        let clock = ProcessClock::new(rz_contracts::ProcessEpoch(7202));
+        let implementation = Digest([9; 32]);
+        let position = rz_position::Position::startpos();
+        let start = clock.runtime_clock().origin();
+        let context = match issue_start(
+            &position,
+            crate::parser::GoLimits {
+                nodes: Some(4096),
+                ..Default::default()
+            },
+            rz_contracts::pals::SearchAuthority {
+                epoch: clock.epoch(),
+                game: rz_contracts::GameGeneration(1),
+                root: rz_contracts::RootGeneration(1),
+                implementation,
+            },
+            &clock,
+            start,
+            crate::bridge::BuildSearchSettings {
+                time_config: rz_search::time::TimeBudgetConfig::default(),
+                max_simulations: 4096,
+                untimed_limit: Duration::from_secs(10),
+            },
+            Duration::from_millis(500),
+        )
+        .unwrap()
+        {
+            FixtureStart::Started(context) => context,
+            FixtureStart::RulesOnly(_) => panic!("ongoing fixture start required"),
+        };
+        let admit = |original: Arc<RoventInputLockV2>| {
+            let owner = rz_experiments::RoventOriginalInputLock::from_v2(original).unwrap();
+            Arc::new(
+                PreparedSourceV2::prepare(
+                    &owner,
+                    crate::rovent_root_admission::RoventRootAdmissionPolicy::DynamicGo,
+                    &position,
+                    &context,
+                    &clock,
+                )
+                .unwrap()
+                .try_into_live()
+                .unwrap(),
+            )
+        };
+        let different = admit(Arc::new(lock.as_ref().clone()));
+        let mut custody = open_rovent_storage_byte_custody_v2(
+            Arc::clone(&lock),
+            &fixture.private,
+            fixture.request(),
+            control(),
+        )
+        .unwrap();
+        let mut state =
+            prepare_runtime_state_common::<RoventRootAdmissionV2>(&custody, &clock, implementation)
+                .unwrap();
+        let rejected = match split_unused_setup_common(&mut custody, &mut state, different) {
+            Ok(_) => panic!("equal /2 lock from a different owner was accepted"),
+            Err(rejected) => rejected,
+        };
+        assert!(
+            rejected
+                .admission
+                .owner()
+                .v2()
+                .is_some_and(|held| !Arc::ptr_eq(held, &lock))
+        );
+        assert!(custody.retains_root_capability());
+        let actual = admit(Arc::clone(&lock));
+        let setup =
+            split_unused_setup_common(&mut custody, &mut state, Arc::clone(&actual)).unwrap();
+        assert_eq!(setup.identity(), state.identity);
+        assert!(Arc::ptr_eq(
+            state.issued_admission.as_ref().unwrap(),
+            &actual
+        ));
+        assert!(!custody.retains_root_capability());
+        assert!(validate_original_live_go(&custody, &state, actual.as_ref()).is_ok());
+        context.control.cancellation.store(true, Ordering::Release);
+        assert!(matches!(
+            validate_original_live_go(&custody, &state, actual.as_ref()),
+            Err(RoventStorageRuntimeError::GoNoLongerLive)
+        ));
+    }
+
     #[test]
     fn runtime_split_is_one_shot_and_uses_original_go_control_after_startup_ends() {
         use std::os::fd::AsRawFd;
@@ -1998,7 +2590,7 @@ mod tests {
     #[test]
     fn compiled_binding_requires_original_lock_source_binary_and_private_root() {
         let fixture = Fixture::new();
-        let lock = &fixture.lock;
+        let lock = fixture.lock.as_ref();
         let aggregate = rz_experiments::rovent_source_aggregate_sha256(
             &lock.manifest.engine.source_commit,
             &lock.manifest.engine.source_components,

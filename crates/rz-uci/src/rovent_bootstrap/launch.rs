@@ -8,12 +8,13 @@ use super::external_session::RoventExternalProductStartupOwners;
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::{
     RoventProcessBoundaryInputs, RoventProcessBoundaryInputsV2, VerifiedOwnedRoventProcessBoundary,
-    VerifiedRoventProcessBoundary, verify_actual_owned_process_boundary,
+    VerifiedOwnedRoventProcessBoundaryV2, VerifiedRoventProcessBoundary,
+    VerifiedRoventProcessBoundaryV2, verify_actual_owned_process_boundary,
     verify_actual_owned_process_boundary_v2, verify_actual_process_boundary,
 };
 use super::product::{
     RoventNativeProductDriver, RoventProductStartupOwners, RoventProductStartupRejection,
-    RoventProductStorageStartupRejection,
+    RoventProductStorageStartupRejection, RoventProductStorageStartupRejectionV2,
 };
 use super::{
     NativeStartupDiagnostic, NativeStartupDiagnosticPhase, NativeStartupDiagnosticStage,
@@ -660,6 +661,67 @@ fn prepare_launch_storage<'boundary, 'process>(
     }
 }
 
+/// Holds the /2 byte and process owners until a product adopts this exact
+/// compiled custody. This does not fabricate a /1 lock or a completion proof.
+struct PendingLaunchStorageV2<'boundary, 'process> {
+    custody: Option<storage::RoventStorageCompiledCustodyV2<'boundary, 'process>>,
+    boundary: Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+}
+impl Drop for PendingLaunchStorageV2<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(custody) = self.custody.take() {
+            std::mem::forget((
+                custody.into_byte_custody().into_owners(),
+                Arc::clone(&self.boundary),
+            ));
+        }
+    }
+}
+
+fn prepare_launch_storage_v2<'boundary, 'process>(
+    selection: Option<&StorageArguments>,
+    boundary: &Arc<VerifiedOwnedRoventProcessBoundaryV2>,
+    view: &'boundary VerifiedRoventProcessBoundaryV2<'process>,
+    lock: &Arc<RoventInputLockV2>,
+    control: &RoventStartupControl,
+) -> Result<Option<PendingLaunchStorageV2<'boundary, 'process>>, RoventLaunchError> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let custody = match storage::open_rovent_storage_byte_custody_v2(
+        Arc::clone(lock),
+        boundary.original_root(),
+        storage::RoventStorageAdmissionRequest {
+            profile_path: &selection.profile,
+            profile_sha256: &selection.profile_sha256,
+            profile_bytes: selection.profile_bytes,
+            archive_root: &selection.archive_root,
+            checkout_root: &selection.checkout_root,
+            private_snapshot_root: boundary.private_cwd(),
+            protected_execution_root: &selection.protected_root,
+        },
+        control.clone(),
+    ) {
+        Ok(custody) => custody,
+        Err(rejected) => {
+            let cause = error("StorageCustody", &rejected.error);
+            std::mem::forget((rejected.owners, Arc::clone(boundary)));
+            return Err(cause);
+        }
+    };
+    match storage::check_rovent_storage_compiled_custody_v2(custody, view) {
+        Ok(custody) => Ok(Some(PendingLaunchStorageV2 {
+            custody: Some(custody),
+            boundary: Arc::clone(boundary),
+        })),
+        Err(rejected) => {
+            let cause = error("StorageCompiledCustody", &rejected.error);
+            std::mem::forget((rejected.custody.into_owners(), Arc::clone(boundary)));
+            Err(cause)
+        }
+    }
+}
+
 /// A rejected attachment retains its original custody until the real product
 /// shutdown. Successful attachment proceeds to the normal UCI owner; setup is
 /// still deferred until the first admitted go, before root registration.
@@ -691,6 +753,42 @@ fn reject_storage_runtime_registration(
     };
     // Both retain the same physical-close flag. Unknown Drop quarantines the
     // rejected registration as well as the real product inner/source owners.
+    drop(rejected);
+    drop(driver);
+    result
+}
+
+/// Reject only this product's selected /2 archive installation and attempt
+/// its original session shutdown. Its retained rejection is not a fence.
+fn reject_storage_runtime_registration_v2<T, D: SearchSessionDriver>(
+    driver: D,
+    rejected: RoventProductStorageStartupRejectionV2<'_, '_>,
+    cleanup_until: Instant,
+    native_settled: Option<&AtomicBool>,
+) -> Result<T, RoventLaunchError> {
+    let primary = &rejected.failure;
+    let result = match driver.finish_session(cleanup_until) {
+        Ok(Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)) => {
+            if let Some(settled) = native_settled {
+                settled.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(error("StorageRuntimeRegistration", &primary.detail))
+        }
+        Ok(_) => Err(error(
+            "PhysicalCompletionUnknown",
+            format!(
+                "storage registration failed: {}; original product shutdown is unknown",
+                primary.detail
+            ),
+        )),
+        Err(failure) => Err(error(
+            "PhysicalCompletionUnknown",
+            format!(
+                "storage registration failed: {}; original shutdown failed: {}: {}",
+                primary.detail, failure.code, failure.detail
+            ),
+        )),
+    };
     drop(rejected);
     drop(driver);
     result
@@ -1906,7 +2004,6 @@ fn run_v2_native<'a>(
     if arguments.direct_native_assets.is_some()
         || arguments.system_runtime_receipt_root.is_some()
         || arguments.strict_source.is_some()
-        || arguments.storage.is_some()
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
         || arguments.initial_stop_source_diagnostics
@@ -1921,7 +2018,7 @@ fn run_v2_native<'a>(
     {
         return Err(error(
             "InputLockUnsupportedV2",
-            "the /2 native route does not support this asset, storage, or diagnostic",
+            "the /2 native route does not support this asset or diagnostic",
         ));
     }
     let topology = if collection.is_some() {
@@ -1930,6 +2027,14 @@ fn run_v2_native<'a>(
         super::admitted_topology_v2(&lock)
     }
     .map_err(|failure| error("InputLockUnsupportedV2", failure))?;
+    if arguments.storage.is_some()
+        && matches!(topology, super::RoventStartupTopology::ExternalResearcher)
+    {
+        return Err(error(
+            "InputLockUnsupportedV2",
+            "archive-on requires a native PC or own-researcher session",
+        ));
+    }
     if let Some(request) = &collection {
         if !matches!(
             (&request.hooks, topology),
@@ -1997,6 +2102,13 @@ fn run_v2_native<'a>(
     let view = boundary
         .startup_view()
         .map_err(|failure| error("ProcessBoundary", failure))?;
+    let mut pending_storage = prepare_launch_storage_v2(
+        arguments.storage.as_ref(),
+        &boundary,
+        &view,
+        &lock,
+        &control,
+    )?;
     let board_product_custody = collection
         .as_ref()
         .map(|request| Arc::clone(&request.board_product_custody));
@@ -2242,10 +2354,42 @@ fn run_v2_native<'a>(
         name: format!("Rovent {:?}", lock.manifest.engine.mode),
         author: "Rovent contributors".into(),
     };
+    // Install before converting the concrete product into a UCI trait object.
+    // External R is rejected before native construction when storage is set.
+    macro_rules! attach_v2_storage {
+        (supported, $driver:ident) => {
+            if let Some(mut pending) = pending_storage.take() {
+                let custody = pending
+                    .custody
+                    .take()
+                    .expect("selected original /2 storage custody");
+                if let Err(rejected) = $driver.attach_storage_runtime_registration_v2(
+                    custody,
+                    Arc::clone(&pending.boundary),
+                    &clock,
+                ) {
+                    return reject_storage_runtime_registration_v2(
+                        $driver,
+                        rejected,
+                        cleanup_until,
+                        native_settled.as_deref(),
+                    );
+                }
+            }
+        };
+        (unsupported, $driver:ident) => {
+            if pending_storage.is_some() {
+                return Err(error(
+                    "InputLockUnsupportedV2",
+                    "archive-on is unsupported for this product",
+                ));
+            }
+        };
+    }
     // Each arm transfers the one original prepared worker into its matching
     // product. The common error path retains the same boundary and FDs.
     macro_rules! launch_v2_product {
-        ($question:ty, $constructor:path, $reject:path $(, $extra:expr)*) => {{
+        ($archive:ident, $question:ty, $constructor:path, $reject:path $(, $extra:expr)*) => {{
             let prepared = super::prepare_native_v2::<$question>(
                 Arc::clone(&sources),
                 resources,
@@ -2253,7 +2397,7 @@ fn run_v2_native<'a>(
                 control.clone(),
             )
             .map_err(|rejection| reject_factory(rejection, cleanup_until, &diagnostic))?;
-            let driver = $constructor(
+            let mut driver = $constructor(
                 prepared,
                 $($extra,)*
                 Arc::clone(&boundary),
@@ -2263,6 +2407,7 @@ fn run_v2_native<'a>(
                 arguments.root_policy,
             )
             .map_err(|rejection| $reject(rejection, cleanup_until, &diagnostic))?;
+            attach_v2_storage!($archive, driver);
             let completion = driver.physical_close_observation();
             let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2 {
                 Arc::new(super::product::diagnostics_v2::ObservedV2::new(driver, lock.canonical_sha256.clone()))
@@ -2311,7 +2456,7 @@ fn run_v2_native<'a>(
             }
             macro_rules! collection_driver {
                 ($driver:expr, $reject:expr) => {{
-                    let driver = $driver.map_err(|rejection| {
+                    let mut driver = $driver.map_err(|rejection| {
                         let failure = ($reject)(rejection, cleanup_until, &diagnostic);
                         if failure.stage != "PhysicalCompletionUnknown" {
                             if let Some(settled) = &native_settled {
@@ -2320,6 +2465,7 @@ fn run_v2_native<'a>(
                         }
                         failure
                     })?;
+                    attach_v2_storage!(supported, driver);
                     let completion = driver.physical_close_observation();
                     let driver: Arc<dyn SearchSessionDriver> = if arguments.lifecycle_diagnostics_v2
                     {
@@ -2372,23 +2518,27 @@ fn run_v2_native<'a>(
         }
         match (topology, loaded_nnuec, external) {
             (super::RoventStartupTopology::RolesOnly, None, None) => launch_v2_product!(
+                supported,
                 PcPortQuestion,
                 super::product::RoventNativeProductDriverV2::pc,
                 reject_product_v2
             ),
             (super::RoventStartupTopology::RolesOnly, Some(loaded), None) => launch_v2_product!(
+                supported,
                 PcPortQuestion,
                 super::product::RoventNativeProductDriverV2::pc_with_shared_nnuec,
                 reject_product_v2,
                 loaded
             ),
             (super::RoventStartupTopology::OwnResearcher, None, None) => launch_v2_product!(
+                supported,
                 AdaptivePortQuestion,
                 super::product::RoventOwnPcrProductDriverV2::own_board_pcr,
                 reject_own_pcr_product_v2
             ),
             (super::RoventStartupTopology::OwnResearcher, Some(loaded), None) => {
                 launch_v2_product!(
+                    supported,
                     AdaptivePortQuestion,
                     super::product::RoventOwnNnuecProductDriverV2::own_nnuec_pcr,
                     reject_own_nnuec_product_v2,
@@ -2400,6 +2550,7 @@ fn run_v2_native<'a>(
                 None,
                 Some((external, retirement)),
             ) => launch_v2_product!(
+                unsupported,
                 AdaptivePortQuestion,
                 super::product::RoventExternalPcrProductDriverV2::external_pcr,
                 reject_external_pcr_product_v2,
@@ -2412,6 +2563,7 @@ fn run_v2_native<'a>(
     let (driver, completion) = match assembled {
         Ok(assembled) => assembled,
         Err(failure) => {
+            drop(pending_storage);
             drop(view);
             if failure.stage == "PhysicalCompletionUnknown" {
                 std::mem::forget((
@@ -2432,6 +2584,7 @@ fn run_v2_native<'a>(
     settings.search.untimed_limit = Duration::from_millis(lock.manifest.wall_time_max_ms);
     let result = serve_driver(driver, clock, owners, settings)
         .map_err(|failure| error("UciSession", failure));
+    drop(pending_storage);
     drop(view);
     if !completion.is_confirmed() {
         std::mem::forget((

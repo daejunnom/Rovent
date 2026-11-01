@@ -451,6 +451,92 @@ mod linux {
     }
 
     #[test]
+    fn v2_original_view_rejects_substituted_owners_and_observation() {
+        // Private mock values exercise identity only. They are not produced by
+        // actual process verification and must never become launch evidence.
+        let fixture = Fixture::new();
+        let inputs = unexecuted_inputs_v2(&fixture, control());
+        let values = || ProcessBoundaryObservation {
+            executable: ExecutableIdentityV1 {
+                sha256: "b".repeat(64),
+                bytes: 7,
+                identity_source: ExecutableIdentitySourceV1::LinuxProcSelfExe,
+            },
+            input_lock: Digest([1; 32]),
+            source_aggregate: Some(Digest([2; 32])),
+            source_evidence_v3: None,
+        };
+        let owner = VerifiedOwnedRoventProcessBoundaryV2 {
+            inputs,
+            observation: Arc::new(values()),
+        };
+        let view = owner.startup_view().unwrap();
+        let control = &owner.inputs.control;
+        let lock = &owner.inputs.lock;
+        owner.matches_original_view(&view, lock, control).unwrap();
+
+        let equal_lock = Arc::new(lock.as_ref().clone());
+        assert_eq!(lock.canonical_sha256, equal_lock.canonical_sha256);
+        assert_eq!(
+            owner
+                .matches_original_view(&view, &equal_lock, control)
+                .unwrap_err()
+                .kind,
+            ProcessBoundaryFailure::InvalidInputLock
+        );
+        let mut different_control = (*control).clone();
+        different_control.cancellation = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            owner
+                .matches_original_view(&view, lock, &different_control)
+                .unwrap_err()
+                .kind,
+            ProcessBoundaryFailure::InvalidInputLock
+        );
+        let independent_observation = VerifiedRoventProcessBoundaryV2 {
+            lock: view.lock,
+            original_binary: view.original_binary,
+            original_root: view.original_root,
+            observation: Arc::new(values()),
+        };
+        assert_eq!(
+            owner
+                .matches_original_view(&independent_observation, lock, control)
+                .unwrap_err()
+                .kind,
+            ProcessBoundaryFailure::MappedExecutable
+        );
+        let reopened_binary = File::open(fixture.root.join("binary")).unwrap();
+        let wrong_binary = VerifiedRoventProcessBoundaryV2 {
+            lock: view.lock,
+            original_binary: &reopened_binary,
+            original_root: view.original_root,
+            observation: Arc::clone(&view.observation),
+        };
+        assert_eq!(
+            owner
+                .matches_original_view(&wrong_binary, lock, control)
+                .unwrap_err()
+                .kind,
+            ProcessBoundaryFailure::BinaryDescriptor
+        );
+        let reopened_root = fixture.capability();
+        let wrong_root = VerifiedRoventProcessBoundaryV2 {
+            lock: view.lock,
+            original_binary: view.original_binary,
+            original_root: &reopened_root,
+            observation: Arc::clone(&view.observation),
+        };
+        assert_eq!(
+            owner
+                .matches_original_view(&wrong_root, lock, control)
+                .unwrap_err()
+                .kind,
+            ProcessBoundaryFailure::WorkingDirectory
+        );
+    }
+
+    #[test]
     fn owned_public_rejection_returns_original_lock_descriptors_cursor_and_controls() {
         let fixture = Fixture::new();
         for canceled in [false, true] {

@@ -697,6 +697,35 @@ impl VerifiedOwnedRoventProcessBoundaryV2 {
             "owned /2 process observation changed during original startup",
         )
     }
+
+    /// A storage registration must borrow this exact /2 lock, descriptors and
+    /// observation while the original startup control remains live. Equal
+    /// bytes or another observation do not transfer the original ownership.
+    pub(crate) fn matches_original_view(
+        &self,
+        view: &VerifiedRoventProcessBoundaryV2<'_>,
+        lock: &Arc<RoventInputLockV2>,
+        control: &RoventStartupControl,
+    ) -> Result<(), ProcessBoundaryError> {
+        verify_original_startup_control(&self.inputs.control, control)?;
+        require(
+            Arc::ptr_eq(&self.inputs.lock, lock)
+                && std::ptr::eq(self.inputs.lock.as_ref(), view.lock),
+            ProcessBoundaryFailure::InvalidInputLock,
+            "owned /2 process and registration use different original lock objects",
+        )?;
+        require(
+            std::ptr::eq(&self.inputs.original_binary, view.original_binary),
+            ProcessBoundaryFailure::BinaryDescriptor,
+            "view does not borrow original /2 binary",
+        )?;
+        require(
+            std::ptr::eq(&self.inputs.original_root, view.original_root),
+            ProcessBoundaryFailure::WorkingDirectory,
+            "view does not borrow original /2 root",
+        )?;
+        verify_original_observation(&self.observation, &view.observation)
+    }
 }
 
 /// A rejected /2 observation returns the same owner and every held input.

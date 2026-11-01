@@ -3,7 +3,9 @@
 //! moves. A logical archive result never replaces their physical root fence.
 
 use super::*;
-use crate::rovent_bootstrap::launch::storage::RoventStorageOwnedRuntimeRegistration;
+use crate::rovent_bootstrap::launch::storage::{
+    RoventStorageOwnedRuntimeRegistration, RoventStorageOwnedRuntimeRegistrationV2,
+};
 use crate::rovent_bootstrap::product::SharedRoventStorageRegistration;
 use crate::rovent_bootstrap::storage_lifecycle::{SessionStorageLifecycle, StorageSemanticOwner};
 
@@ -26,6 +28,20 @@ pub(super) fn original_storage_admission(
                 "original opaque per-go admission is required",
             )
         })
+}
+
+enum OriginalStorageAdmission {
+    V1(Arc<crate::rovent_root_admission::RoventRootAdmission>),
+    V2(Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>),
+}
+
+fn original_storage_admission_versioned(
+    admission: Option<&RoventPcrRootAdmission>,
+) -> Result<OriginalStorageAdmission, SearchSessionFailure> {
+    if let Some(original) = admission.and_then(|value| value.original_v2.as_ref()) {
+        return Ok(OriginalStorageAdmission::V2(Arc::clone(original)));
+    }
+    original_storage_admission(admission).map(OriginalStorageAdmission::V1)
 }
 
 pub(super) fn unused_engine_storage_owner<B>(owners: &IdleOwners<B>) -> bool
@@ -199,6 +215,156 @@ where
         Ok(shared)
     }
 
+    /// Install the same move-only registration for the original /2 session.
+    /// The /2 root policy and process clock are checked before the owner moves.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_storage_registration_v2(
+        &self,
+        original: RoventStorageOwnedRuntimeRegistrationV2,
+    ) -> Result<
+        Arc<SharedRoventStorageRegistration>,
+        (
+            RoventStorageOwnedRuntimeRegistrationV2,
+            SearchSessionFailure,
+        ),
+    > {
+        let checked = (|| {
+            let state = self.state.try_lock().map_err(|_| {
+                failure(
+                    "RoventEngineStorageInstall",
+                    "original session owner is busy/poisoned",
+                )
+                .unknown_if_unclosed()
+            })?;
+            let slot = self.storage.try_lock().map_err(|_| {
+                failure(
+                    "RoventEngineStorageInstall",
+                    "original storage slot is busy/poisoned",
+                )
+                .unknown_if_unclosed()
+            })?;
+            let policy = self.rovent_root_policy_v2.as_ref().ok_or_else(|| {
+                failure(
+                    "RoventEngineStorageInstall",
+                    "original /2 root policy is absent",
+                )
+            })?;
+            let lock = policy.owner.v2().ok_or_else(|| {
+                failure("RoventEngineStorageInstall", "original /2 lock is absent")
+            })?;
+            let no_prior_go = self
+                .latest_root
+                .try_lock()
+                .map_err(|_| {
+                    failure(
+                        "RoventEngineStorageInstall",
+                        "root receipt is busy/poisoned",
+                    )
+                })?
+                .is_none()
+                && self
+                    .latest_rovent_root
+                    .try_lock()
+                    .map_err(|_| {
+                        failure(
+                            "RoventEngineStorageInstall",
+                            "Rovent root receipt is busy/poisoned",
+                        )
+                    })?
+                    .is_none()
+                && self
+                    .latest_rovent_root_v2
+                    .try_lock()
+                    .map_err(|_| {
+                        failure(
+                            "RoventEngineStorageInstall",
+                            "/2 root receipt is busy/poisoned",
+                        )
+                    })?
+                    .is_none()
+                && self
+                    .latest_rovent_initial
+                    .try_lock()
+                    .map_err(|_| {
+                        failure(
+                            "RoventEngineStorageInstall",
+                            "initial source receipt is busy/poisoned",
+                        )
+                    })?
+                    .is_none()
+                && self
+                    .latest_rovent_initial_v2
+                    .try_lock()
+                    .map_err(|_| {
+                        failure(
+                            "RoventEngineStorageInstall",
+                            "/2 initial source receipt is busy/poisoned",
+                        )
+                    })?
+                    .is_none()
+                && self
+                    .pending_output
+                    .try_lock()
+                    .map_err(|_| {
+                        failure(
+                            "RoventEngineStorageInstall",
+                            "original UCI output is busy/poisoned",
+                        )
+                    })?
+                    .is_none();
+            let own_board = self.rovent.as_ref().is_some_and(|profile| {
+                profile.common().mode.has_native_r()
+                    && matches!(
+                        lock.manifest.engine.researcher,
+                        Some(rz_experiments::RoventResearcher::Own { .. })
+                    )
+                    && lock.manifest.engine.nnuec.is_none()
+            });
+            let valid = matches!(&*state, SessionState::Idle(owners)
+                if unused_engine_storage_owner(owners)
+                    && owners.native.ready_clock().is_some_and(|clock|
+                        clock.domain() == self.clock.domain()
+                            && clock.origin() == self.clock.runtime_clock().origin()));
+            if !own_board
+                || !matches!(self.researcher_class, SessionResearcherClass::Legacy)
+                || !matches!(self.registration.identity, CheckerIdentity::Owned(_))
+                || slot.is_some()
+                || self.closed.load(Ordering::Acquire)
+                || self.reset_requests.load(Ordering::Acquire) != 0
+                || !valid
+                || !no_prior_go
+            {
+                return Err(failure(
+                    "RoventEngineStorageInstall",
+                    "/2 storage requires the unused own-board native Rovent Engine owner",
+                ));
+            }
+            original
+                .validate_session_attachment(lock, &self.clock, self.options.implementation)
+                .map_err(|error| {
+                    SearchSessionFailure::debug("RoventEngineStorageNamespace", &error)
+                })?;
+            original
+                .profile()
+                .validate_for_manifest_v2(&lock.manifest)
+                .map_err(|error| {
+                    SearchSessionFailure::debug("RoventEngineStorageResources", &error)
+                })?;
+            Ok((state, slot))
+        })();
+        let (_state, mut slot) = match checked {
+            Ok(guards) => guards,
+            Err(error) => return Err((original, error)),
+        };
+        let shared = Arc::new(SharedRoventStorageRegistration::new_v2(original));
+        *slot = Some(EngineStorageSlot {
+            lifecycle: SessionStorageLifecycle::new(Arc::clone(&shared)),
+            last_authority: None,
+            caller_panic: None,
+        });
+        Ok(shared)
+    }
+
     /// The source has passed into_initial before this method is reached. A
     /// stopped-initial source never resets a CPU or takes the Engine Box.
     pub(super) fn prepare_engine_storage(
@@ -220,7 +386,7 @@ where
         let Some(storage) = slot.as_mut() else {
             return Ok(false);
         };
-        let original = original_storage_admission(admission)?;
+        let original = original_storage_admission_versioned(admission)?;
         let initial_setup = !storage.lifecycle.configured();
         if initial_setup {
             // Keep the same borrowed IdleOwners even if a model preflight or
@@ -248,13 +414,16 @@ where
             .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
         storage.last_authority = engine.last_adaptive_authority();
         let signal = owners.native.signal();
-        match storage.lifecycle.prepare(
-            StorageSemanticOwner::EnginePcr(engine),
-            original,
-            reset,
-            position,
-            &signal,
-        ) {
+        let owner = StorageSemanticOwner::EnginePcr(engine);
+        let prepared = match original {
+            OriginalStorageAdmission::V1(original) => storage
+                .lifecycle
+                .prepare(owner, original, reset, position, &signal),
+            OriginalStorageAdmission::V2(original) => storage
+                .lifecycle
+                .prepare_v2(owner, original, reset, position, &signal),
+        };
+        match prepared {
             Ok(StorageSemanticOwner::EnginePcr(engine)) => {
                 owners.engine = Some(engine);
                 Ok(true)

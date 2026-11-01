@@ -4,8 +4,8 @@
 
 use super::launch::storage::RoventStorageSetupRejection;
 use super::product::SharedRoventStorageRegistration;
-use crate::rovent_root_admission::RoventRootAdmission;
-use crate::search_driver::{DriverPhysicalCompletion, SearchSessionFailure};
+use crate::rovent_root_admission::{RoventRootAdmission, source_seal::RoventRootAdmissionV2};
+use crate::search_driver::{DriverPhysicalCompletion, SearchSessionContext, SearchSessionFailure};
 use rz_contracts::RootGeneration;
 use rz_contracts::pals::SearchAuthority;
 use rz_position::Position;
@@ -33,6 +33,38 @@ use std::time::{Duration, Instant};
 
 const MAINTENANCE_IO_BYTES: u64 = 16 * 1024 * 1024;
 const RECEIPTS_MAX: usize = 64;
+
+#[derive(Clone)]
+enum OriginalStorageAdmission {
+    V1(Arc<RoventRootAdmission>),
+    V2(Arc<RoventRootAdmissionV2>),
+}
+impl OriginalStorageAdmission {
+    fn context(&self) -> &SearchSessionContext {
+        match self {
+            Self::V1(a) => a.original_context(),
+            Self::V2(a) => a.original_context(),
+        }
+    }
+    fn authority(&self) -> SearchAuthority {
+        match self {
+            Self::V1(a) => a.authority(),
+            Self::V2(a) => a.authority(),
+        }
+    }
+}
+enum StorageSetupRejection {
+    V1(RoventStorageSetupRejection),
+    V2(RoventStorageSetupRejection<RoventRootAdmissionV2>),
+}
+impl StorageSetupRejection {
+    fn detail(&self) -> String {
+        match self {
+            Self::V1(a) => a.error.to_string(),
+            Self::V2(a) => a.error.to_string(),
+        }
+    }
+}
 
 mod observation;
 pub(crate) use observation::StorageLifecycleObservation;
@@ -131,7 +163,7 @@ struct WorkerCustody<M: RoleModel + 'static = AdaptivePortModel> {
     idle: Option<IdleSemanticArchiveOwner<M>>,
     unexpected: Option<Box<ArchiveOwner<M>>>,
     setup: Option<UnusedIdleArchiveSetup>,
-    setup_admission_rejection: Option<RoventStorageSetupRejection>,
+    setup_admission_rejection: Option<StorageSetupRejection>,
     setup_rejected: Option<Box<UnusedIdleArchiveSetupCompletion<M>>>,
     quarantine: Option<Box<ArchiveQuarantine<M>>>,
     rejected_work: Option<Box<ArchiveWork>>,
@@ -695,7 +727,7 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
 pub(crate) struct SessionStorageLifecycle<M: RoleModel + 'static = AdaptivePortModel> {
     registration: Arc<SharedRoventStorageRegistration>,
     core: WorkerCustody<M>,
-    active_admission: Option<Arc<RoventRootAdmission>>,
+    active_admission: Option<OriginalStorageAdmission>,
 }
 impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
     /// Read-only bounded facts from the original installed receipts. No owner,
@@ -764,7 +796,34 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
         signal: &CompletionSignal,
     ) -> Result<StorageSemanticOwner<M>, StorageLifecycleFailure<M>> {
         match catch_unwind(AssertUnwindSafe(|| {
-            self.prepare_inner(owner, admission, reset, position, signal)
+            self.prepare_inner(
+                owner,
+                OriginalStorageAdmission::V1(admission),
+                reset,
+                position,
+                signal,
+            )
+        })) {
+            Ok(result) => result,
+            Err(payload) => Err(self.retain_panic(payload)),
+        }
+    }
+    pub(crate) fn prepare_v2(
+        &mut self,
+        owner: StorageSemanticOwner<M>,
+        admission: Arc<RoventRootAdmissionV2>,
+        reset: bool,
+        position: &Position,
+        signal: &CompletionSignal,
+    ) -> Result<StorageSemanticOwner<M>, StorageLifecycleFailure<M>> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.prepare_inner(
+                owner,
+                OriginalStorageAdmission::V2(admission),
+                reset,
+                position,
+                signal,
+            )
         })) {
             Ok(result) => result,
             Err(payload) => Err(self.retain_panic(payload)),
@@ -773,12 +832,12 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
     fn prepare_inner(
         &mut self,
         owner: StorageSemanticOwner<M>,
-        admission: Arc<RoventRootAdmission>,
+        admission: OriginalStorageAdmission,
         reset: bool,
         position: &Position,
         signal: &CompletionSignal,
     ) -> Result<StorageSemanticOwner<M>, StorageLifecycleFailure<M>> {
-        self.active_admission = Some(Arc::clone(&admission));
+        self.active_admission = Some(admission.clone());
         self.core
             .adopt(owner)
             .map_err(|(owner, failure)| StorageLifecycleFailure {
@@ -788,21 +847,47 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
         if let Some(failure) = &self.core.first_failure {
             return Err(failure.clone().into());
         }
-        let context = admission.original_context();
+        match &admission {
+            OriginalStorageAdmission::V1(_) if !self.registration.accepts_v1_admission() => {
+                return Err(self
+                    .core
+                    .fail(
+                        "RoventStorageOriginalAdmission",
+                        "V1 admission with V2 registration",
+                    )
+                    .into());
+            }
+            OriginalStorageAdmission::V2(a) => {
+                if let Err(error) = self.registration.validate_v2_admission(a) {
+                    return Err(self
+                        .core
+                        .fail("RoventStorageOriginalAdmission", error)
+                        .into());
+                }
+            }
+            _ => {}
+        }
+        let context = admission.context();
         let scope = admission.authority();
-        if let Err(error) = self
-            .registration
-            .profile()
-            .validate_for_manifest(&self.registration.input_lock_owner().manifest)
-        {
+        if let Err(error) = self.registration.validate_profile() {
             return Err(self.core.fail("RoventStorageResources", error).into());
         }
         self.core.ensure_worker(signal)?;
         let fresh_game = if !self.configured() {
-            let setup = match self.registration.take_unused_setup(Arc::clone(&admission)) {
+            let setup_result = match &admission {
+                OriginalStorageAdmission::V1(a) => self
+                    .registration
+                    .take_unused_setup(Arc::clone(a))
+                    .map_err(StorageSetupRejection::V1),
+                OriginalStorageAdmission::V2(a) => self
+                    .registration
+                    .take_unused_setup_v2(Arc::clone(a))
+                    .map_err(StorageSetupRejection::V2),
+            };
+            let setup = match setup_result {
                 Ok(setup) => setup,
                 Err(rejected) => {
-                    let detail = rejected.error.to_string();
+                    let detail = rejected.detail();
                     self.core.setup_admission_rejection = Some(rejected);
                     return Err(self.core.fail("RoventStorageSetupAdmission", detail).into());
                 }
@@ -890,6 +975,17 @@ impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
                     "original go stopped before archive handoff",
                 )
                 .into());
+        }
+        // A newer root may revoke the original even when its cancellation bit
+        // remains unset. Check the very same /2 admission after the worker has
+        // joined, before returning the original owner to search.
+        if let OriginalStorageAdmission::V2(a) = &admission {
+            if let Err(error) = self.registration.validate_v2_admission(a) {
+                return Err(self
+                    .core
+                    .fail("RoventStorageOriginalAdmission", error)
+                    .into());
+            }
         }
         self.core.restore().map_err(Into::into)
     }
