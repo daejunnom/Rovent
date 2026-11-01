@@ -1399,11 +1399,21 @@ mod tests {
         output.key.encoding = encoding;
         output.key.precision = precision;
         output.key.frozen_epoch = frozen_epoch;
+        // The fixture's root ranking and proposal have already consumed
+        // request IDs; the arm is the next request in that same authority.
+        let next_sequence = port
+            .accepted
+            .iter()
+            .map(|id| id.sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("test request sequence");
         let mut registry = RoleTicketRegistry::<ReviewView, RoleOutput>::new(
             port.authority,
             512,
             rz_runtime::adaptive::CoordinatorPolicy::Fixed,
-            1,
+            next_sequence,
         )
         .unwrap();
         let ticket = registry
@@ -1421,6 +1431,10 @@ mod tests {
             )
             .unwrap();
         output.id = ticket.id;
+        assert!(
+            !port.accepted.contains(&ticket.id),
+            "arm must use a fresh request"
+        );
         registry.take_dispatch().unwrap();
         registry
             .complete_reciprocal_role(RoleCompletion {
@@ -1449,6 +1463,8 @@ mod tests {
         let guard = port
             .begin_utility_route_commit(&action, &arm, StepExecution::Role(ticket.id))
             .unwrap();
+        port.validate_role(&arm, &ticket, &output)
+            .expect("fresh arm ticket and exact selected input");
         let _answer = port
             .consume_cpu_reciprocal(&arm, &accepted, &output, None)
             .unwrap();
