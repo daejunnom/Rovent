@@ -216,6 +216,14 @@ class LifecycleTests(unittest.TestCase):
         (owner.output / "large-output").write_bytes(b"x" * 10000)
         with self.assertRaises(OutputBudgetError):
             owner.finish(status="completed", tree_gone=True)
+        observation = owner.live_finish_observation()
+        self.assertEqual(observation["phase"], "terminal_verified_released")
+        self.assertEqual(observation["receipt"]["status"], "failed_output_budget")
+        self.assertEqual(observation["receipt"]["original_error"]["type"], "OutputBudgetError")
+        self.assertEqual(observation["receipt"]["terminal_record"], owner.record)
+        self.assertEqual(observation["physical_completion"], "not_inferred")
+        observation["receipt"]["terminal_record"]["status"] = "mutated-copy"
+        self.assertEqual(owner.live_finish_observation()["receipt"]["status"], "failed_output_budget")
         with self.assertRaises(StorageError):
             original_live_handoff(key)
         self.assertEqual(owner.record["state"], "retained")
@@ -344,9 +352,14 @@ class LifecycleTests(unittest.TestCase):
             with patch("managed_outputs.write_record", side_effect=fail_write):
                 with self.assertRaisesRegex(OSError, "injected .* write failure"):
                     owner.finish(status="completed", tree_gone=True)
+            self.assertEqual(owner.live_finish_observation()["phase"], "terminal_pending")
+            self.assertIsNone(owner.live_finish_observation()["receipt"])
             self.assertIsNone(owner.guard.stream)
             self.assertIs(original_live_handoff(key), owner)
             receipt = owner.recover_live_terminal()
+            after = owner.live_finish_observation()
+            self.assertEqual(after["phase"], "terminal_verified_released")
+            self.assertEqual(after["receipt"], receipt)
             self.assertEqual(receipt["original_error"]["type"], "OSError")
             self.assertIn(failure_target, receipt["original_error"]["message"])
             self.assertEqual(receipt["physical_completion"], "not_inferred")
@@ -404,12 +417,90 @@ class LifecycleTests(unittest.TestCase):
                 owner.finish(status="completed", tree_gone=True)
         observation = owner.live_handoff_observation()
         self.assertEqual(observation["preterminal_error"]["type"], "OSError")
+        phase = owner.live_finish_observation()
+        self.assertEqual(phase["phase"], "active_before_intent")
+        self.assertEqual(phase["preterminal_error"]["type"], "OSError")
+        self.assertIsNone(phase["receipt"])
         self.assertIn("budget I/O failed", observation["preterminal_error"]["message"])
         self.assertTrue(owner._live_suspended)
         self.assertIsNone(owner.guard.stream)
         self.assertEqual(owner.record["state"], "active")
         owner.resume_live()
         owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_finish_anchor_close_error_is_unknown_not_terminal_success(self):
+        owner = self.lease("live-close-error", reserve=8192)
+        owner.prepare_live_handoff()
+        close_original = owner._close_live_anchor
+        def close_then_fail():
+            close_original()
+            raise OSError("anchor close outcome unavailable")
+        with patch.object(owner, "_close_live_anchor", side_effect=close_then_fail):
+            with self.assertRaisesRegex(OSError, "anchor close outcome unavailable"):
+                owner.finish(status="completed", tree_gone=True)
+        observation = owner.live_finish_observation()
+        self.assertEqual(observation["phase"], "unknown")
+        self.assertIsNone(observation["receipt"])
+        self.assertEqual(observation["descriptor_close_error"]["type"], "OSError")
+        self.assertEqual(observation["physical_completion"], "not_inferred")
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_finish_both_descriptor_errors_preserve_distinct_outcomes(self):
+        owner = self.lease("live-both-close-errors", reserve=8192)
+        owner.prepare_live_handoff()
+        descriptors = {
+            name: (owner._live_anchor[name + "_fd"], list(owner._live_anchor[name + "_id"]))
+            for name in ("output", "source")
+        }
+        real_close = os.close
+        def close_then_fail(fd):
+            real_close(fd)
+            for name, (original_fd, _) in descriptors.items():
+                if fd == original_fd:
+                    raise OSError(name + " close returned an error")
+        with patch("managed_outputs.os.close", side_effect=close_then_fail):
+            with self.assertRaisesRegex(OSError, "output close returned an error"):
+                owner.finish(status="completed", tree_gone=True)
+        observation = owner.live_finish_observation()
+        self.assertEqual(observation["phase"], "unknown")
+        self.assertIsNone(observation["receipt"])
+        for name, (fd, identity) in descriptors.items():
+            result = observation["descriptor_close"][name]
+            self.assertEqual(result["identity"], identity)
+            self.assertEqual(result["fd_at_attempt"], fd)
+            self.assertEqual(result["outcome"], "unknown")
+            self.assertEqual(result["error"]["type"], "OSError")
+            self.assertIn(name, result["error"]["message"])
+        self.assertEqual(observation["physical_completion"], "not_inferred")
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_finish_unprintable_close_error_still_closes_second_descriptor(self):
+        owner = self.lease("live-unprintable-close-error", reserve=8192)
+        owner.prepare_live_handoff()
+        first_fd = owner._live_anchor["output_fd"]
+        second_fd = owner._live_anchor["source_fd"]
+        class UnprintableCloseError(OSError):
+            def __str__(self):
+                raise RuntimeError("cannot format")
+        original_error = UnprintableCloseError()
+        real_close = os.close
+        close_attempts = []
+        def close_then_fail(fd):
+            real_close(fd)
+            if fd in (first_fd, second_fd):
+                close_attempts.append(fd)
+            if fd == first_fd:
+                raise original_error
+        with patch("managed_outputs.os.close", side_effect=close_then_fail):
+            with self.assertRaises(UnprintableCloseError) as raised:
+                owner.finish(status="completed", tree_gone=True)
+        self.assertIs(raised.exception, original_error)
+        self.assertEqual(close_attempts, [first_fd, second_fd])
+        observation = owner.live_finish_observation()
+        self.assertEqual(observation["phase"], "unknown")
+        self.assertEqual(observation["descriptor_close"]["output"]["error"]["message"], "<unprintable>")
+        self.assertEqual(observation["descriptor_close"]["source"]["outcome"], "closed")
 
     @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
     def test_live_finish_preterminal_identity_and_release_errors_are_distinct(self):

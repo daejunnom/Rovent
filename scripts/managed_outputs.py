@@ -35,8 +35,17 @@ _live_handoffs = {}
 def _live_error_summary(error):
     if error is None:
         return None
-    return {"type": type(error).__name__, "message": str(error)[:512],
-            "notes": [str(note)[:512] for note in getattr(error, "__notes__", ())]}
+    def safe_text(value):
+        try:
+            return str(value)[:512]
+        except BaseException:
+            return "<unprintable>"
+    try:
+        raw_notes = getattr(error, "__notes__", ())
+        notes = [safe_text(note) for note in raw_notes[:16]] if type(raw_notes) in (list, tuple) else []
+    except BaseException:
+        notes = []
+    return {"type": type(error).__name__, "message": safe_text(error), "notes": notes}
 
 
 def original_live_handoff(key):
@@ -307,6 +316,9 @@ class OutputLease:
         self._live_terminal_error = None
         self._live_terminal_secondary_error = None
         self._live_preterminal_error = None
+        self._live_finish_receipt = None
+        self._live_finish_close_error = None
+        self._live_descriptor_close_receipt = None
         self._live_guard_release_error = None
         self._live_suspend_error = None
         self._live_resume_error = None
@@ -710,13 +722,45 @@ class OutputLease:
                        "secondary_error": _live_error_summary(self._live_terminal_secondary_error),
                        "guard_release_error": _live_error_summary(self._live_guard_release_error),
                        "status": self.record.get("status"),
+                       "terminal_record": copy.deepcopy(self.record),
                        "physical_completion": "not_inferred"}
             try:
                 self._close_live_anchor()
+                receipt["descriptor_close"] = copy.deepcopy(self._live_descriptor_close_receipt)
+                self._live_finish_receipt = copy.deepcopy(receipt)
+            except BaseException as error:
+                if self._live_finish_close_error is None:
+                    self._live_finish_close_error = error
+                raise
             finally:
                 if self._live_anchor is None:
                     self._live_suspended = False
             return receipt
+
+    def live_finish_observation(self):
+        """Observe this original object's finish progress, never physical GPU completion.
+
+        Pending includes an intent that may not yet have reached either file.
+        An unavailable anchor without a saved receipt is deliberately unknown.
+        This observation grants no authority to recreate or release an owner.
+        The shared owner lock may wait for a concurrent finish or recovery I/O.
+        """
+        with self._live_gate:
+            if self._live_anchor is not None:
+                phase = "terminal_pending" if self._live_terminal_intents else "active_before_intent"
+            elif self._live_finish_receipt is not None:
+                phase = "terminal_verified_released"
+            else:
+                phase = "unknown"
+            return {"phase": phase,
+                    "receipt": copy.deepcopy(self._live_finish_receipt),
+                    "preterminal_error": _live_error_summary(self._live_preterminal_error),
+                    "original_error": _live_error_summary(self._live_terminal_error),
+                    "secondary_error": _live_error_summary(self._live_terminal_secondary_error),
+                    "guard_release_error": _live_error_summary(self._live_guard_release_error),
+                    "descriptor_close_error": _live_error_summary(self._live_finish_close_error),
+                    "descriptor_close": copy.deepcopy(self._live_descriptor_close_receipt),
+                    "physical_completion": "not_inferred"}
 
     def live_handoff_observation(self):
         """Report accounting uncertainty without asserting GPU completion."""
@@ -738,13 +782,25 @@ class OutputLease:
     def _close_live_anchor(self):
         anchor = self._live_anchor
         if anchor is not None:
+            # These numbers are observations, not reusable descriptors or a
+            # right to close again: a failed close may already have released
+            # its descriptor, which the process could subsequently reuse.
+            self._live_descriptor_close_receipt = {
+                name: {"identity": list(anchor[name + "_id"]),
+                       "fd_at_attempt": anchor[name + "_fd"],
+                       "outcome": "unknown", "error": None}
+                for name in ("output", "source")
+            }
             first = None
-            for key in ("output_fd", "source_fd"):
+            for name in ("output", "source"):
                 try:
-                    os.close(anchor[key])
-                except OSError as error:
+                    os.close(anchor[name + "_fd"])
+                except BaseException as error:
+                    self._live_descriptor_close_receipt[name]["error"] = _live_error_summary(error)
                     if first is None:
                         first = error
+                else:
+                    self._live_descriptor_close_receipt[name]["outcome"] = "closed"
             self._live_anchor = None
             with _live_handoff_guard:
                 if self._live_key is not None and _live_handoffs.get(self._live_key) is self:
@@ -1189,7 +1245,20 @@ class OutputLease:
         if terminal_verified and guard_released:
             try:
                 self._close_live_anchor()
+                self._live_finish_receipt = {
+                    "terminal_recovered": False,
+                    "preterminal_error": _live_error_summary(self._live_preterminal_error),
+                    "original_error": _live_error_summary(self._live_terminal_error),
+                    "secondary_error": _live_error_summary(self._live_terminal_secondary_error),
+                    "guard_release_error": _live_error_summary(self._live_guard_release_error),
+                    "status": self.record.get("status"),
+                    "terminal_record": copy.deepcopy(self.record),
+                    "descriptor_close": copy.deepcopy(self._live_descriptor_close_receipt),
+                    "physical_completion": "not_inferred",
+                }
             except BaseException as close_error:
+                if self._live_finish_close_error is None:
+                    self._live_finish_close_error = close_error
                 if error is None:
                     raise
                 if hasattr(error, "add_note"):
