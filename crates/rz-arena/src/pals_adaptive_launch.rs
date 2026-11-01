@@ -23,6 +23,7 @@ mod export_rules;
 mod normalized_receipt;
 mod numerical;
 mod storage;
+mod system_v6;
 pub use artifact_domains::*;
 pub use evaluation_series::*;
 #[cfg(feature = "pals-collection-onnx")]
@@ -33,6 +34,7 @@ pub use normalized_receipt::*;
 pub use numerical::*;
 pub use numerical::{pals_numerical_input_tensors_v5, pals_numerical_tensor_digest_v5};
 pub use storage::*;
+pub use system_v6::*;
 
 pub const PALS_ARENA_V5_DOMAIN: &str = "rz-pals-arena-launch-v5/1";
 pub const PALS_STAGING_BYTES_V5: u64 = 18 << 30;
