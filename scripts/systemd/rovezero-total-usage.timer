@@ -2,7 +2,7 @@
 Description=Periodic RoveZero aggregate storage observation
 
 [Timer]
-OnBootSec=2min
+OnBootSec=5min
 OnUnitActiveSec=30min
 AccuracySec=1min
 Persistent=true
