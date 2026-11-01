@@ -6,21 +6,33 @@
 //! process exit. The legacy CLI intentionally rejects this path until that
 //! caller and the normal shutdown/receipt path are connected.
 
+use super::NativeConfig;
+use crate::engine::OwnerRegistry;
 use crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup;
 use crate::rovent_bootstrap::launch::ConnectedParent;
+use rz_contracts::{
+    CompletionContext, ContractError, Digest, EncodingHandle, ErrorCode, ModelHandle,
+    SlotGeneration, Stage,
+};
+use rz_encoding::classical::HistoryFill;
 use rz_eval::{
     asset::{AssetMetadata, MaiaAsset},
+    contracts::{ClassicalProjection, MaiaBinding, PhysicalFailure, encoding_manifest},
     error::{BackendError, FailureKind, FailureStage},
+    native_runtime_bridge::NativeWorkerOwner,
     onnx::{
         BackendConfig, Lc0StartupCustody, Lc0StartupState, OnnxBackend, OrtRuntime, Provider,
         SystemRuntime,
     },
+    worker::{PhysicalRecoveryKey, PhysicalRecoveryReservation, SessionReleased},
 };
 use rz_experiments::{NativeRuntimeSourceV6, SystemRuntimeLockV6};
+use rz_telemetry::source::SourceJournal;
 use std::{
     io,
     os::unix::net::UnixStream,
     sync::{Arc, atomic::AtomicBool},
+    task::Poll,
     time::Instant,
 };
 
@@ -98,6 +110,8 @@ pub(super) enum Lc0SystemStartupPhase {
     OrtReady,
     SessionEntryUnknown,
     BackendReady,
+    WorkerOwned,
+    SessionReleased,
 }
 
 fn matches_registered_provider(provider: Provider, device_id: i32, arena_bytes: u64) -> bool {
@@ -117,6 +131,10 @@ pub(super) struct Lc0SystemStartupCustody {
     startup: Option<SystemCudaStartup>,
     model: Option<Lc0StartupCustody>,
     ready: Option<Lc0ReadyObjects>,
+    worker: Option<NativeWorkerOwner>,
+    reservation: Option<PhysicalRecoveryReservation>,
+    recovery_key: Option<PhysicalRecoveryKey>,
+    session_release: Option<SessionReleased>,
     parent: Option<Arc<ConnectedParent>>,
     process_epoch: u64,
     phase: Lc0SystemStartupPhase,
@@ -141,6 +159,7 @@ impl Lc0SystemStartupCustody {
         parent: Arc<ConnectedParent>,
         process_epoch: u64,
         lock: &SystemRuntimeLockV6,
+        config: &NativeConfig,
     ) -> Result<Self, BackendError> {
         lock.verify().map_err(|_| {
             BackendError::new(
@@ -159,6 +178,62 @@ impl Lc0SystemStartupCustody {
                 ));
             }
         };
+        let lock_path = config.system_cuda_lock.as_ref().ok_or_else(|| {
+            BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 system CUDA lock path is absent",
+            )
+        })?;
+        let lock_bytes = rz_eval::asset::read_bounded(lock_path, 256 * 1024)?;
+        if Some(rz_eval::asset::sha256(&lock_bytes)) != config.system_cuda_lock_sha256 {
+            return Err(BackendError::new(
+                FailureKind::IdentityMismatch,
+                FailureStage::Admission,
+                "LC0 system CUDA lock file digest differs",
+            ));
+        }
+        let lock_text = std::str::from_utf8(&lock_bytes).map_err(|_| {
+            BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 system CUDA lock file is not UTF-8",
+            )
+        })?;
+        let file_lock = SystemRuntimeLockV6::from_json(lock_text).map_err(|_| {
+            BackendError::new(
+                FailureKind::IdentityMismatch,
+                FailureStage::Admission,
+                "LC0 system CUDA lock file is invalid",
+            )
+        })?;
+        let core = spec.libraries.iter().find(|entry| entry.role == "ort-core");
+        let expected_core = config
+            .ort_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let selected_core = std::fs::canonicalize(&config.ort_library).map_err(|_| {
+            BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 system CUDA ORT core path cannot be resolved",
+            )
+        })?;
+        if file_lock.canonical_sha256 != lock.canonical_sha256
+            || asset.manifest_digest() != config.manifest_sha256
+            || u64::try_from(asset.profile().cuda_arena_bytes()) != Ok(spec.cuda_arena_bytes)
+            || !core.is_some_and(|entry| {
+                entry.sha256 == expected_core
+                    && selected_core == std::path::Path::new(&entry.canonical_path)
+            })
+        {
+            return Err(BackendError::new(
+                FailureKind::IdentityMismatch,
+                FailureStage::Admission,
+                "LC0 asset, ORT core or system runtime declaration differs",
+            ));
+        }
         if process_epoch == 0
             || !parent.matches(process_epoch, &lock.canonical_sha256, spec.cuda_device_id)
         {
@@ -168,6 +243,9 @@ impl Lc0SystemStartupCustody {
                 "LC0 supervisor is not bound to the V6 system runtime lock",
             ));
         }
+        // Reserve before the first possible native entry. This reserves a
+        // process-local recovery slot, not a GPU or an external supervisor.
+        let (reservation, recovery_key) = PhysicalRecoveryReservation::reserve()?;
         Ok(Self {
             asset: Some(asset),
             system: None,
@@ -175,6 +253,10 @@ impl Lc0SystemStartupCustody {
             startup: None,
             model: None,
             ready: None,
+            worker: None,
+            reservation: Some(reservation),
+            recovery_key: Some(recovery_key),
+            session_release: None,
             parent: Some(parent),
             process_epoch,
             phase: Lc0SystemStartupPhase::BeforeOrtCall,
@@ -346,6 +428,142 @@ impl Lc0SystemStartupCustody {
                 .map(|backend| (&ready.metadata, backend))
         })
     }
+
+    /// Build the existing LC0 model/encoding projection without dispatching a
+    /// neural request or transferring the physical backend.
+    pub(super) fn build_projection(
+        &self,
+        owners: &OwnerRegistry,
+    ) -> Result<ClassicalProjection, ContractError> {
+        let (metadata, backend) = self.ready_parts().ok_or_else(|| {
+            ContractError::new(
+                ErrorCode::InvalidInput,
+                Stage::Admission,
+                "LC0 original metadata and backend are not ready",
+            )
+        })?;
+        let fill = HistoryFill::No;
+        let encoding = EncodingHandle {
+            owner: owners.allocate()?,
+            slot: 0,
+            generation: SlotGeneration(1),
+            manifest: encoding_manifest(fill),
+        };
+        let model = ModelHandle {
+            owner: owners.allocate()?,
+            slot: 0,
+            generation: SlotGeneration(1),
+            manifest: Digest(metadata.manifest_digest()),
+        };
+        Ok(ClassicalProjection::new(MaiaBinding::for_backend(
+            backend, model, encoding, fill,
+        )?))
+    }
+
+    /// Transfer only through the original reservation-aware factory. On any
+    /// admission/spawn failure the factory returns with backend and reservation
+    /// still in their original slots; success installs the same worker here.
+    pub(super) fn start_retained_worker(
+        &mut self,
+        projection: ClassicalProjection,
+        diagnostic_capacity: usize,
+        trace: Option<SourceJournal<CompletionContext>>,
+    ) -> Result<(), PhysicalFailure> {
+        if self.phase != Lc0SystemStartupPhase::BackendReady || self.worker.is_some() {
+            return Err(BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 system backend is not ready for worker transfer",
+            )
+            .into());
+        }
+        self.parent
+            .as_ref()
+            .expect("original parent retained")
+            .ensure_live()
+            .map_err(|_| {
+                BackendError::new(
+                    FailureKind::BackendUnavailable,
+                    FailureStage::Admission,
+                    "LC0 original supervisor unavailable before worker transfer",
+                )
+            })?;
+        let ready = self.ready.as_mut().ok_or_else(|| {
+            BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 original handoff is absent",
+            )
+        })?;
+        let reservation = self.reservation.as_mut().ok_or_else(|| {
+            BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 original physical reservation is absent",
+            )
+        })?;
+        let worker = NativeWorkerOwner::from_system_cuda_onnx_retained_profiled(
+            &mut ready.backend,
+            reservation,
+            projection,
+            diagnostic_capacity,
+            trace,
+        )?;
+        self.worker = Some(worker);
+        self.phase = Lc0SystemStartupPhase::WorkerOwned;
+        Ok(())
+    }
+
+    pub(super) fn worker(&self) -> Option<&NativeWorkerOwner> {
+        self.worker.as_ref()
+    }
+
+    pub(super) fn runtime(&self) -> Option<&OrtRuntime> {
+        self.runtime.as_ref()
+    }
+
+    pub(super) fn recovery_key(&self) -> Option<&PhysicalRecoveryKey> {
+        self.recovery_key.as_ref()
+    }
+
+    /// Normal same-worker release only. It is not a device-wide GPU fence and
+    /// cannot convert a failed or unknown physical execution into success.
+    pub(super) fn try_finish(&mut self) -> Poll<Result<SessionReleased, PhysicalFailure>> {
+        if self.phase == Lc0SystemStartupPhase::SessionReleased {
+            return Poll::Ready(Ok(self
+                .session_release
+                .expect("released phase has evidence")));
+        }
+        if self.phase != Lc0SystemStartupPhase::WorkerOwned {
+            return Poll::Ready(Err(BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 original worker is not active",
+            )
+            .into()));
+        }
+        let worker = self.worker.as_ref().expect("worker-owned phase");
+        match worker.try_shutdown() {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        match worker.try_session_release() {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(None)) => Poll::Ready(Err(BackendError::new(
+                FailureKind::BackendUnavailable,
+                FailureStage::Backend,
+                "LC0 same-worker session release is unknown",
+            )
+            .into())),
+            Poll::Ready(Ok(Some(release))) => {
+                self.session_release = Some(release);
+                self.phase = Lc0SystemStartupPhase::SessionReleased;
+                Poll::Ready(Ok(release))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,7 +585,10 @@ mod tests {
 
 impl Drop for Lc0SystemStartupCustody {
     fn drop(&mut self) {
-        if self.phase != Lc0SystemStartupPhase::BeforeOrtCall {
+        if !matches!(
+            self.phase,
+            Lc0SystemStartupPhase::BeforeOrtCall | Lc0SystemStartupPhase::SessionReleased
+        ) {
             // Defensive in-process quarantine only: the real caller still
             // needs to retain the process and original parent on unknown.
             std::mem::forget((
@@ -378,6 +599,9 @@ impl Drop for Lc0SystemStartupCustody {
                 self.model.take(),
                 self.ready.take(),
                 self.parent.take(),
+                self.worker.take(),
+                self.reservation.take(),
+                self.recovery_key.take(),
             ));
         }
     }

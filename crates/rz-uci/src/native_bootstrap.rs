@@ -1693,6 +1693,41 @@ pub struct NativeCudaFactory {
 }
 #[cfg(feature = "onnx-cuda")]
 impl NativeCudaFactory {
+    /// Uses only the same worker/runtime already held by the original system
+    /// custody. It does not start native execution or transfer the custody;
+    /// callers must retain that owner through shutdown and session release.
+    #[cfg(all(feature = "pals-adaptive", target_os = "linux"))]
+    #[allow(dead_code)]
+    fn from_system_custody(
+        custody: &system_cuda::Lc0SystemStartupCustody,
+    ) -> Result<Self, NativeBootstrapError> {
+        let owner = custody
+            .worker()
+            .cloned()
+            .ok_or(NativeBootstrapError::Config(
+                "original system CUDA worker is not available",
+            ))?;
+        let runtime = custody
+            .runtime()
+            .cloned()
+            .ok_or(NativeBootstrapError::Config(
+                "original system CUDA runtime is not available",
+            ))?;
+        if owner.origin() != NativeWorkerOrigin::CudaOnnx
+            || !runtime.is_system_cuda()
+            || !owner.system_cuda_metadata().is_some_and(|metadata| {
+                Some(metadata.system_runtime_identity.0) == runtime.cuda_runtime_identity()
+            })
+        {
+            return Err(NativeBootstrapError::Config(
+                "original system CUDA owner identity differs",
+            ));
+        }
+        Ok(Self {
+            inner: NativeSessionFactory::from_owner(owner, Some(runtime))?,
+        })
+    }
+
     #[cfg(feature = "experimental-batch")]
     pub fn batch_journal(
         &self,
