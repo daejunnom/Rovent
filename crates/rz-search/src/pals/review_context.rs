@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use rz_position::{
-    BoardMove, Color, MAX_UCI_REPLAY_PLIES, Position, PositionLimits, PositionSnapshot,
+    BoardMove, Color, Position, PositionLimits, PositionSnapshot, MAX_UCI_REPLAY_PLIES,
 };
 use sha2::{Digest, Sha256};
 
@@ -329,6 +329,18 @@ impl ReviewView {
             return Err(StoreError::InvalidConditions("CPU7 view required"));
         }
         stores.project_review_store_closure(&self.pin, max_records, max_bytes, check)
+    }
+    /// Capture this exact live CPU7 selection and its Store projection under
+    /// caller-owned deadline/cancel control. This detached evidence is not yet
+    /// a published trial sidecar or a physical-completion proof.
+    pub fn capture_cohort_cpu7_evidence(
+        &self,
+        stores: &PalsStores,
+        max_records: usize,
+        max_bytes: usize,
+        check: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Vec<u8>, StoreError> {
+        stores.capture_cohort_cpu7_view(self, &self.pin, max_records, max_bytes, check)
     }
     /// Known owned host backing, not a measured peak. Shared Rules history
     /// chains are conservatively charged once per retained anchor/source;
@@ -1889,6 +1901,34 @@ mod tests {
             .unwrap();
         assert_eq!(first.records().len(), 9);
         assert!(first.is_cohort_cpu7());
+        let first_evidence = first
+            .capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Ok(()))
+            .unwrap();
+        let captured: serde_json::Value = serde_json::from_slice(&first_evidence).unwrap();
+        assert_eq!(captured["schema"], "rz-pals-cpu7-view-evidence/1");
+        assert_eq!(captured["records"].as_array().unwrap().len(), 9);
+        assert_eq!(captured["selected_len"], 9);
+        assert_eq!(
+            captured["store"]["observations"].as_array().unwrap().len(),
+            7
+        );
+        let standalone = first
+            .project_cohort_cpu7_store(&stores, 128, 1 << 20, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            captured["store"],
+            serde_json::from_slice::<serde_json::Value>(&standalone).unwrap()
+        );
+        assert_eq!(
+            first.capture_cohort_cpu7_evidence(&stores, 128, 1, &mut || Ok(())),
+            Err(StoreError::ArchiveByteBudget)
+        );
+        assert_eq!(
+            first.capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Err(
+                StoreError::CancelledConsumer
+            )),
+            Err(StoreError::CancelledConsumer)
+        );
         assert_eq!(
             first.cohort_cpu7_original_bundle().unwrap().records().len(),
             9
@@ -1916,6 +1956,15 @@ mod tests {
         let original = again.cohort_cpu7_original_bundle().unwrap();
         assert_eq!(original.records().len(), 12);
         assert_eq!(original.selected_len(), 9);
+        let evidence = again
+            .capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Ok(()))
+            .unwrap();
+        let captured: serde_json::Value = serde_json::from_slice(&evidence).unwrap();
+        assert_eq!(captured["records"].as_array().unwrap().len(), 12);
+        assert_eq!(
+            captured["store"]["observations"].as_array().unwrap().len(),
+            10
+        );
         assert_eq!(
             original.records()[8].record().revision,
             again.records_metadata()[8].source_revision
@@ -1932,6 +1981,10 @@ mod tests {
         let ordinary = index.select(&stores, state, empty_query(), policy).unwrap();
         assert_eq!(ordinary.records().len(), 12);
         assert!(!ordinary.is_cohort_cpu7());
+        assert!(matches!(
+            ordinary.capture_cohort_cpu7_evidence(&stores, 128, 1 << 20, &mut || Ok(())),
+            Err(StoreError::InvalidConditions(_))
+        ));
     }
 
     #[test]
@@ -1993,11 +2046,10 @@ mod tests {
         assert_eq!(view.selection_policy().max_records, 10);
         assert_eq!(view.records()[2].kind, RecordKind::Repair);
         assert_eq!(view.records_metadata()[2].parent, Some(1));
-        assert!(
-            view.records()
-                .iter()
-                .all(|record| record.line.first() == Some(&BoardMove::from_uci("e2e4").unwrap()))
-        );
+        assert!(view
+            .records()
+            .iter()
+            .all(|record| record.line.first() == Some(&BoardMove::from_uci("e2e4").unwrap())));
     }
 
     #[test]
@@ -2098,14 +2150,12 @@ mod tests {
         assert_eq!(view.token_count(), 1);
         assert_eq!(view.records_metadata()[0].source_line_offset, 2);
         assert_eq!(view.source_snapshots().len(), view.records_metadata().len());
-        assert!(
-            stores
-                .states
-                .get(origin)
-                .unwrap()
-                .weak_position_identity()
-                .matches(&view.source_snapshots()[0])
-        );
+        assert!(stores
+            .states
+            .get(origin)
+            .unwrap()
+            .weak_position_identity()
+            .matches(&view.source_snapshots()[0]));
         assert!(!view.source_snapshots()[0].same_state(&actual.snapshot()));
         assert_eq!(
             view.records_metadata()[0].original_first_move,
@@ -2163,12 +2213,10 @@ mod tests {
         assert_eq!(view.records_metadata()[0].anchor, 1);
         assert!(view.anchors()[1].snapshot.same_state(&actual.snapshot()));
         assert_eq!(view.source_snapshots().len(), 1);
-        assert!(
-            actual
-                .snapshot()
-                .weak_position_identity()
-                .matches(&view.source_snapshots()[0])
-        );
+        assert!(actual
+            .snapshot()
+            .weak_position_identity()
+            .matches(&view.source_snapshots()[0]));
     }
 
     #[test]

@@ -5,6 +5,17 @@ use super::*;
 const PROJECTION_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PROJECTION_MAX_RECORDS: usize = 65_536;
 
+fn validate_projection_bounds(max_records: usize, max_bytes: usize) -> Result<(), StoreError> {
+    if max_records == 0
+        || max_records > PROJECTION_MAX_RECORDS
+        || max_bytes == 0
+        || max_bytes > PROJECTION_MAX_BYTES
+    {
+        return Err(StoreError::InvalidConditions("review projection bounds"));
+    }
+    Ok(())
+}
+
 struct ProjectionWriter<'a> {
     bytes: Vec<u8>,
     limit: usize,
@@ -138,6 +149,94 @@ impl StoreReadPin {
 }
 
 impl PalsStores {
+    /// Detached evidence for one already-selected original CPU7 view. This
+    /// does not claim when it was called, bind a trial, or persist anything.
+    /// A caller must capture it at the selection boundary using the original
+    /// cancellation and deadline, then bind and publish it separately.
+    pub(crate) fn capture_cohort_cpu7_view(
+        &self,
+        view: &crate::pals::review_context::ReviewView,
+        pin: &StoreReadPin,
+        max_records: usize,
+        max_bytes: usize,
+        check: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Vec<u8>, StoreError> {
+        check()?;
+        let original = view
+            .cohort_cpu7_original_bundle()
+            .ok_or(StoreError::InvalidConditions("CPU7 view required"))?;
+        let binding = view
+            .cohort_cpu7_binding()
+            .ok_or(StoreError::InvalidEvidence("CPU7 view binding missing"))?;
+        if original.generation() != self.generation()
+            || original.root() != view.root_state()
+            || original.selected_len() > original.records().len()
+        {
+            return Err(StoreError::StaleConsumer);
+        }
+        let anchor = original
+            .records()
+            .first()
+            .ok_or(StoreError::InvalidEvidence("CPU7 original bundle empty"))?
+            .record()
+            .origin_state;
+        if original
+            .records()
+            .iter()
+            .any(|r| r.record().origin_state != anchor)
+        {
+            return Err(StoreError::InvalidEvidence("CPU7 original anchor mismatch"));
+        }
+        validate_projection_bounds(max_records, max_bytes)?;
+        pin.projection_validate(self, check)?;
+        let mut out = ProjectionWriter {
+            bytes: Vec::new(),
+            limit: max_bytes,
+            check,
+            failed: None,
+        };
+        out.raw(b"{\"schema\":\"rz-pals-cpu7-view-evidence/1\",\"bundle_id\":")?;
+        out.value(&original.bundle_id())?;
+        out.raw(b",\"generation\":")?;
+        out.value(&original.generation())?;
+        out.raw(b",\"root\":")?;
+        out.value(&StateWire::encode(
+            original.root(),
+            original.root_snapshot(),
+        )?)?;
+        out.raw(b",\"anchor\":")?;
+        out.value(&StateWire::encode(anchor, original.anchor())?)?;
+        out.raw(b",\"selected_len\":")?;
+        out.value(&original.selected_len())?;
+        out.raw(b",\"original_record_handle_digest\":")?;
+        out.value(&original.digest())?;
+        out.raw(b",\"view_binding\":")?;
+        out.value(&binding)?;
+        out.raw(b",\"view_digest\":")?;
+        out.value(&view.digest())?;
+        out.raw(b",\"view_seal\":")?;
+        out.value(&view.seal_digest())?;
+        out.raw(b",\"policy_digest\":")?;
+        out.value(&view.policy_digest())?;
+        out.raw(b",\"records\":[")?;
+        for (index, record) in original.records().iter().enumerate() {
+            if index != 0 {
+                out.raw(b",")?;
+            }
+            out.raw(b"{\"record\":")?;
+            out.value(&RoleRecordWire::encode(record.record())?)?;
+            out.raw(b",\"evidence\":")?;
+            out.value(&record.evidence())?;
+            out.raw(b"}")?;
+        }
+        out.raw(b"],\"store\":")?;
+        self.write_review_store_closure(pin, max_records, &mut out)?;
+        out.raw(b"}")?;
+        pin.projection_validate(self, &mut *out.check)?;
+        (out.check)()?;
+        Ok(out.bytes)
+    }
+
     /// Only the pin's original owner and generation may project its existing
     /// dependency closure. No cold record is loaded, and no pin or authority
     /// is issued. `max_records` bounds the closure and `max_bytes` bounds the
@@ -151,26 +250,32 @@ impl PalsStores {
         check: &mut dyn FnMut() -> Result<(), StoreError>,
     ) -> Result<Vec<u8>, StoreError> {
         check()?;
-        if max_records == 0
-            || max_records > PROJECTION_MAX_RECORDS
-            || max_bytes == 0
-            || max_bytes > PROJECTION_MAX_BYTES
-        {
-            return Err(StoreError::InvalidConditions("review projection bounds"));
-        }
-        let seed = pin.projection_seed(self, max_records, check)?;
-        if seed.observations.is_empty() {
-            return Err(StoreError::InvalidEvidence(
-                "review projection has no observations",
-            ));
-        }
-        let closure = self.retirement_dependency_closure_controlled(&seed, max_records, check)?;
+        validate_projection_bounds(max_records, max_bytes)?;
         let mut out = ProjectionWriter {
             bytes: Vec::new(),
             limit: max_bytes,
             check,
             failed: None,
         };
+        self.write_review_store_closure(pin, max_records, &mut out)?;
+        Ok(out.bytes)
+    }
+
+    fn write_review_store_closure(
+        &self,
+        pin: &StoreReadPin,
+        max_records: usize,
+        out: &mut ProjectionWriter<'_>,
+    ) -> Result<(), StoreError> {
+        (out.check)()?;
+        let seed = pin.projection_seed(self, max_records, &mut *out.check)?;
+        if seed.observations.is_empty() {
+            return Err(StoreError::InvalidEvidence(
+                "review projection has no observations",
+            ));
+        }
+        let closure =
+            self.retirement_dependency_closure_controlled(&seed, max_records, &mut *out.check)?;
         out.raw(b"{\"schema\":\"rz-pals-review-store-projection/1\",\"generation\":")?;
         out.value(&self.generation())?;
         out.raw(b",\"states\":[")?;
@@ -230,6 +335,6 @@ impl PalsStores {
         (out.check)()?;
         pin.projection_validate(self, &mut *out.check)?;
         (out.check)()?;
-        Ok(out.bytes)
+        Ok(())
     }
 }
