@@ -10,6 +10,8 @@ description = "RoveZero E01 input manifests, validation and artifact identity"
 default = []
 pals-content-types = ["dep:rz-eval"]
 pals-content-admission = ["pals-content-types", "rz-eval/onnx", "rz-eval/contracts"]
+# Explicit observation codec only; no teacher target or training admission.
+experimental-teacher-exact-evidence = []
 
 
 [dependencies]

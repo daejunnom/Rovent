@@ -904,6 +904,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
                 "experiments/model-research/pals/src/rz_pals_model/strategic_verifier_utility.py"
             ),
             source!("experiments/model-research/pals/src/rz_pals_model/target_coverage.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/teacher_exact_rank.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/training.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/v5_source_registry.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/verifier_feedback.py"),
@@ -1106,6 +1107,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-experiments/Cargo.toml"),
             source!("crates/rz-experiments/src/pals_data_v3.rs"),
             source!("crates/rz-experiments/src/pals_data_v3/targets.rs"),
+            source!("crates/rz-experiments/src/pals_data_v3/teacher_exact_rank.rs"),
             source!("crates/rz-experiments/src/rovent_corpus.rs"),
             source!("crates/rz-experiments/src/rovent_corpus_v2.rs"),
             source!("crates/rz-experiments/src/rovent_r_readout.rs"),
@@ -1131,6 +1133,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py"
             ),
+            source!("experiments/model-research/pals/src/rz_pals_model/teacher_exact_rank.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus_codec.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_divergence.py"),
@@ -1201,6 +1204,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-experiments/src/pals_data_v3.rs"),
             source!("crates/rz-experiments/src/pals_data_v3/frozen_action.rs"),
             source!("crates/rz-experiments/src/pals_data_v3/targets.rs"),
+            source!("crates/rz-experiments/src/pals_data_v3/teacher_exact_rank.rs"),
             source!("crates/rz-experiments/src/rovent_corpus.rs"),
             source!("crates/rz-experiments/src/rovent_corpus_v2.rs"),
             source!("crates/rz-experiments/src/rovent_r_readout.rs"),
@@ -1212,6 +1216,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py"
             ),
+            source!("experiments/model-research/pals/src/rz_pals_model/teacher_exact_rank.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus_codec.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_divergence.py"),
@@ -1361,6 +1366,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py"
             ),
+            source!("experiments/model-research/pals/src/rz_pals_model/teacher_exact_rank.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus_codec.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_external_root.py"),
             source!(

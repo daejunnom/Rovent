@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod targets;
 pub use targets::*;
+#[cfg(feature = "experimental-teacher-exact-evidence")]
+pub mod teacher_exact_rank;
 mod frozen_action;
 pub use frozen_action::*;
 
