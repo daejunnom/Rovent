@@ -3,9 +3,9 @@
 //! No metadata from an old initializer is edited or issued by this module.
 use super::{Config, Result};
 #[cfg(target_os = "linux")]
-use cap_fs_ext::DirExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 #[cfg(target_os = "linux")]
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use rz_experiments::{
     ArtifactRef, ManifestError, PalsArtifactDomainV5, PalsEngineModeV5, PalsModelBackendV3,
     PalsNumericalScopeV5, PalsPrecisionV3, PalsStartupAssetPurposeV5 as Purpose,
@@ -23,9 +23,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 const DOMAIN: &str = "rz-explicit-gpu-inflight-content-bound-input/1";
-#[cfg(target_os = "linux")]
-const MAX_BYTES: u64 = 18 << 30;
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ContentBoundValidation {
@@ -399,12 +396,12 @@ impl HeldAsset {
             "held prerequisite name or descriptor changed",
         )
     }
-    fn stream(&self, maximum: usize, collect: bool, until: Instant) -> Result<Vec<u8>> {
+    fn stream(&self, maximum: u64, collect: bool, until: Instant) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
         deadline(until)?;
         self.check_name()?;
         need(
-            self.artifact.bytes <= maximum as u64,
+            self.artifact.bytes <= maximum,
             "bounded prerequisite read exceeded",
         )?;
         let mut bytes = Vec::new();
@@ -459,8 +456,18 @@ impl HeldAssets {
             }
             let mut local = declared.artifact.clone();
             local.path = (*name).to_owned();
-            let file = local.open_verified_at(&parent, MAX_BYTES)?;
+            // Open the original named file once without following links. The
+            // held descriptor is verified against the scope's exact bytes and
+            // hash below while enforcing the original deadline. The global
+            // storage-warning threshold is not a per-file input limit.
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .follow(FollowSymlinks::No)
+                .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
+            let file = parent.open_with(*name, &options)?.into_std();
             let stamp = identity(&file)?;
+            need(stamp.2 == local.bytes, "held prerequisite byte length differs")?;
             let held = HeldAsset {
                 artifact: declared.artifact.clone(),
                 parent,
@@ -469,6 +476,7 @@ impl HeldAssets {
                 identity: stamp,
             };
             held.check_name()?;
+            held.stream(held.artifact.bytes, false, until)?;
             deadline(until)?;
             need(
                 files.insert(declared.artifact.path.clone(), held).is_none(),
@@ -489,11 +497,11 @@ impl HeldAssets {
             file.artifact == *artifact,
             "same path has different actual metadata",
         )?;
-        file.stream(limit, true, until)
+        file.stream(limit as u64, true, until)
     }
     fn recheck(&self, until: Instant) -> Result<()> {
         for file in self.files.values() {
-            file.stream(usize::try_from(MAX_BYTES)?, false, until)?;
+            file.stream(file.artifact.bytes, false, until)?;
         }
         Ok(())
     }
