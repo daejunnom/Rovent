@@ -6,8 +6,8 @@
 //! Store/physical authority and does not attest source bytes or execution.
 
 use crate::{
-    ArtifactRef, ManifestError, RoventActor, RoventExecutionManifest, RoventResearcher,
-    RoventResourcePlan, decode_json, digest,
+    ArtifactRef, ManifestError, RoventActor, RoventEngineDeclaration, RoventExecutionManifest,
+    RoventExecutionManifestV2, RoventResearcher, RoventResourcePlan, decode_json, digest,
 };
 use rz_contracts::rovent::ExecutionMode;
 use serde::{Deserialize, Serialize};
@@ -176,7 +176,26 @@ impl RoventStorageProfile {
     ) -> Result<(), ManifestError> {
         self.validate()?;
         manifest.validate()?;
-        let engine = &manifest.engine;
+        self.validate_for_engine_and_resources(&manifest.engine, &manifest.resources)
+    }
+
+    /// Validate the original /2 declaration without creating a /1 lock or
+    /// granting storage authority. The launcher must still retain its actual
+    /// /2 lock, process boundary, live admission, and archive owner.
+    pub fn validate_for_manifest_v2(
+        &self,
+        manifest: &RoventExecutionManifestV2,
+    ) -> Result<(), ManifestError> {
+        self.validate()?;
+        manifest.validate()?;
+        self.validate_for_engine_and_resources(&manifest.engine, &manifest.resources)
+    }
+
+    fn validate_for_engine_and_resources(
+        &self,
+        engine: &RoventEngineDeclaration,
+        resources: &RoventResourcePlan,
+    ) -> Result<(), ManifestError> {
         let expected_shared_nnuec = match engine.mode {
             ExecutionMode::CpuPc | ExecutionMode::HybridPc => {
                 require(
@@ -197,7 +216,7 @@ impl RoventStorageProfile {
             self.helpers.shared_nnuec == expected_shared_nnuec,
             "shared NNUEC helper subrole differs from the selected native session",
         )?;
-        self.validate_resource_helpers(&manifest.resources)
+        self.validate_resource_helpers(resources)
     }
 
     /// Storage-specific pool check only. Use validate_for_manifest for complete
@@ -259,10 +278,12 @@ fn require(ok: bool, reason: &str) -> Result<(), ManifestError> {
 mod tests {
     use super::*;
     use crate::{
-        ROVENT_EXECUTION_DOMAIN, ROVENT_EXTERNAL_PROFILE_DOMAIN, ROVENT_POSITION_VISIT_UNIT,
-        RoventBackend, RoventCoordinatorDeclaration, RoventDevice, RoventEngineDeclaration,
-        RoventExternalProfilePin, RoventExternalPurpose, RoventModelPin, RoventNnuecPin,
-        RoventPcConfiguration, RoventPurpose, RoventSearchDeclaration, RoventThreadPool,
+        ROVENT_EXECUTION_DOMAIN, ROVENT_EXECUTION_V2_DOMAIN, ROVENT_EXTERNAL_PROFILE_DOMAIN,
+        ROVENT_POSITION_VISIT_UNIT, RoventBackend, RoventCoordinatorDeclaration, RoventDevice,
+        RoventEngineDeclaration, RoventExternalProfilePin, RoventExternalPurpose, RoventModelPin,
+        RoventNnuecPin, RoventOwnRNotApplicableV2, RoventPcConfiguration, RoventPurpose,
+        RoventRootTieDeclarationV2, RoventRootTiePolicyV2, RoventSearchDeclaration,
+        RoventThreadPool,
     };
     use rz_contracts::rovent::ROVENT_SEARCH_REVISION;
     use std::collections::{BTreeMap, BTreeSet};
@@ -442,6 +463,39 @@ mod tests {
             output_bytes_max: 256 << 20,
             agent_renewable: true,
             provenance: vec![artifact("storage-profile.json")],
+        }
+    }
+
+    fn manifest_v2(mode: ExecutionMode) -> RoventExecutionManifestV2 {
+        let v1 = manifest(mode);
+        let own_r_root_tie = if mode.has_native_r() {
+            RoventRootTieDeclarationV2::Own {
+                policy: RoventRootTiePolicyV2::RulesOrderConfirmed,
+                expected_search_identity: "fixture-own-r/1".into(),
+                expected_worker_conditions_sha256: "6".repeat(64),
+            }
+        } else {
+            RoventRootTieDeclarationV2::NotApplicable {
+                reason: RoventOwnRNotApplicableV2::PcOnly,
+            }
+        };
+        RoventExecutionManifestV2 {
+            domain: ROVENT_EXECUTION_V2_DOMAIN.into(),
+            contract_revision: v1.contract_revision,
+            run_id: v1.run_id,
+            purpose: v1.purpose,
+            engine: v1.engine,
+            resources: v1.resources,
+            coordinator: v1.coordinator,
+            wall_time_max_ms: v1.wall_time_max_ms,
+            cleanup_max_ms: v1.cleanup_max_ms,
+            output_bytes_max: v1.output_bytes_max,
+            agent_renewable: v1.agent_renewable,
+            provenance: v1.provenance,
+            startup_document: artifact("startup.json"),
+            startup_configuration_sha256: "7".repeat(64),
+            startup_search_configuration_sha256: "e".repeat(64),
+            own_r_root_tie,
         }
     }
 
@@ -631,6 +685,31 @@ mod tests {
         let mut pcr = manifest(ExecutionMode::CpuPcr);
         pcr.resources.pools[1].max_threads = 2;
         assert!(selected.validate_for_manifest(&pcr).is_err());
+    }
+
+    #[test]
+    fn v2_storage_checks_original_manifest_and_matching_helper_budget() {
+        for mode in [
+            ExecutionMode::CpuPc,
+            ExecutionMode::HybridPc,
+            ExecutionMode::CpuPcr,
+            ExecutionMode::HybridPcr,
+        ] {
+            let original = manifest_v2(mode);
+            assert!(original.validate().is_ok());
+            let canonical = original.canonical_bytes().unwrap();
+            let lock = original.clone().lock().unwrap();
+            assert!(profile().validate_for_manifest_v2(&original).is_ok());
+            assert_eq!(original.canonical_bytes().unwrap(), canonical);
+            assert_eq!(original.clone().lock().unwrap(), lock);
+
+            let mut bad_helpers = profile();
+            bad_helpers.helpers.shared_nnuec = 1;
+            assert!(bad_helpers.validate_for_manifest_v2(&original).is_err());
+            let mut bad_manifest = original;
+            bad_manifest.resources.pools[1].cpu_charge_millicpus = 0;
+            assert!(profile().validate_for_manifest_v2(&bad_manifest).is_err());
+        }
     }
 
     #[test]
