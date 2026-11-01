@@ -644,11 +644,7 @@ fn prepare_launch_storage<'boundary, 'process>(
         Ok(custody) => custody,
         Err(rejected) => {
             let cause = error("StorageCustody", &rejected.error);
-            // Admission precedes native preparation: no worker received these
-            // freshly opened storage descriptors. Drop only this failed
-            // storage owner; other collection/process owners remain with their
-            // original callers.
-            drop(rejected.owners);
+            std::mem::forget((rejected.owners, Arc::clone(boundary)));
             return Err(cause);
         }
     };
@@ -659,11 +655,29 @@ fn prepare_launch_storage<'boundary, 'process>(
         })),
         Err(rejected) => {
             let cause = error("StorageCompiledCustody", &rejected.error);
-            // No native worker has received this custody yet.
-            drop(rejected.custody);
+            std::mem::forget((rejected.custody.into_owners(), Arc::clone(boundary)));
             Err(cause)
         }
     }
+}
+
+// /2 storage admission happens before native preparation. Only the freshly
+// opened storage owner is released; unrelated collection/process owners stay
+// with their own callers. Keep the original error before dropping the owner.
+fn reject_v2_storage_admission_before_native(
+    rejected: storage::RoventStorageAdmissionFailure<RoventInputLockV2>,
+) -> RoventLaunchError {
+    let cause = error("StorageCustody", &rejected.error);
+    drop(rejected.owners);
+    cause
+}
+
+fn reject_v2_storage_compiled_before_native(
+    rejected: storage::RoventStorageCompiledFailureV2,
+) -> RoventLaunchError {
+    let cause = error("StorageCompiledCustody", &rejected.error);
+    drop(rejected.custody);
+    cause
 }
 
 /// Holds the /2 byte and process owners until a product adopts this exact
@@ -708,22 +722,14 @@ fn prepare_launch_storage_v2<'boundary, 'process>(
         control.clone(),
     ) {
         Ok(custody) => custody,
-        Err(rejected) => {
-            let cause = error("StorageCustody", &rejected.error);
-            std::mem::forget((rejected.owners, Arc::clone(boundary)));
-            return Err(cause);
-        }
+        Err(rejected) => return Err(reject_v2_storage_admission_before_native(rejected)),
     };
     match storage::check_rovent_storage_compiled_custody_v2(custody, view) {
         Ok(custody) => Ok(Some(PendingLaunchStorageV2 {
             custody: Some(custody),
             boundary: Arc::clone(boundary),
         })),
-        Err(rejected) => {
-            let cause = error("StorageCompiledCustody", &rejected.error);
-            std::mem::forget((rejected.custody.into_owners(), Arc::clone(boundary)));
-            Err(cause)
-        }
+        Err(rejected) => Err(reject_v2_storage_compiled_before_native(rejected)),
     }
 }
 

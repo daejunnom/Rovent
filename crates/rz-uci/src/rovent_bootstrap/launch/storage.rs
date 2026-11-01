@@ -2318,13 +2318,9 @@ mod tests {
             custody,
         };
         assert_eq!(Arc::strong_count(&lock), 2);
-        assert!(
-            compiled
-                .error
-                .to_string()
-                .contains("fixture compiled binding")
-        );
-        drop(compiled);
+        let cause = super::super::reject_v2_storage_compiled_before_native(compiled);
+        assert_eq!(cause.stage, "StorageCompiledCustody");
+        assert!(cause.detail.contains("fixture compiled binding"));
         assert_eq!(Arc::strong_count(&lock), 1);
 
         let mut request = fixture.request();
@@ -2341,9 +2337,9 @@ mod tests {
         assert!(Arc::ptr_eq(failure.owners.input_lock(), &lock));
         assert!(!failure.owners.retains_root_capability());
         assert_eq!(Arc::strong_count(&lock), 2);
-        let cause = failure.error.to_string();
-        assert!(cause.contains("profile"));
-        drop(failure);
+        let cause = super::super::reject_v2_storage_admission_before_native(failure);
+        assert_eq!(cause.stage, "StorageCustody");
+        assert!(cause.detail.contains("profile"));
         assert_eq!(Arc::strong_count(&lock), 1);
     }
 
