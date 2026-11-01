@@ -8,6 +8,7 @@ description = "RoveZero paired opening plans and attempt/failure ledger"
 
 [features]
 test-fixtures = []
+experimental-teacher-exact-observation = ["pals-collection-onnx", "rz-search/experimental-teacher-exact-witness", "rz-experiments/experimental-teacher-exact-evidence"]
 experimental-snapshot-io = []
 experimental-snapshot-reclaim = []
 pals-collection = ["dep:rz-uci"]

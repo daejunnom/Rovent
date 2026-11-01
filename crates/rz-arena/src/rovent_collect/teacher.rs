@@ -11,6 +11,9 @@ pub use collection::RoventCollectionTeacherBinding;
 // The live row pump is wired separately; this module alone is not a caller.
 #[allow(dead_code)]
 pub(super) mod lock_v2_policy;
+#[cfg(feature = "experimental-teacher-exact-observation")]
+#[allow(dead_code)]
+pub(super) mod exact_observation_v2;
 #[allow(dead_code)]
 pub(super) mod lock_v2_row_pump;
 mod session;
