@@ -305,6 +305,49 @@ enum ClosureEdge {
     Line(LineId),
     Observation(ObservationId),
     Execution(ExecutionId),
+    Situation(SituationId),
+}
+
+fn situation_closure_header(situation: &Situation) -> [ClosureEdge; 2] {
+    [
+        ClosureEdge::State(situation.state),
+        ClosureEdge::Line(situation.focus),
+    ]
+}
+fn situation_conclusion_edges(
+    line: LineId,
+    conclusion: &ContinuationConclusion,
+) -> [Option<ClosureEdge>; 3] {
+    [
+        Some(ClosureEdge::Line(line)),
+        conclusion.evidence.map(ClosureEdge::Observation),
+        match conclusion.status {
+            ContinuationStatus::RepairedBy(line) => Some(ClosureEdge::Line(line)),
+            _ => None,
+        },
+    ]
+}
+fn execution_closure_header(task: &TaskRecord) -> [Option<ClosureEdge>; 3] {
+    [
+        Some(ClosureEdge::State(task.key.state)),
+        task.key.line.map(ClosureEdge::Line),
+        task.resumed_from.map(ClosureEdge::Execution),
+    ]
+}
+fn execution_consumer_edge(situation: SituationId) -> ClosureEdge {
+    ClosureEdge::Situation(situation)
+}
+fn execution_status_edge(status: TaskStatus) -> Option<ClosureEdge> {
+    match status {
+        TaskStatus::Completed(observation) => Some(ClosureEdge::Observation(observation)),
+        TaskStatus::Paused { evidence, .. } | TaskStatus::RetiredPaused { evidence, .. } => {
+            evidence.map(ClosureEdge::Observation)
+        }
+        _ => None,
+    }
+}
+fn reverse_dependency_edge(observation: ObservationId, retained: bool) -> Option<ClosureEdge> {
+    retained.then_some(ClosureEdge::Observation(observation))
 }
 
 fn line_closure_edges(line: &LineChunk) -> [Option<ClosureEdge>; 2] {
@@ -343,12 +386,14 @@ fn insert_closure_edge(
         ClosureEdge::Execution(id) => {
             insert_closure_pin(&mut pins.executions, id, count, maximum, check)
         }
+        ClosureEdge::Situation(id) => {
+            insert_closure_pin(&mut pins.situations, id, count, maximum, check)
+        }
     }
 }
 
-/// Test-only partial worklist. Situation, execution and reverse-dependency
-/// traversal are deliberately unsupported: it is not a complete snapshot,
-/// a production cursor, or a selection-time/mutation attestation.
+/// Test-only experimental worklist. It has no mutation/owner gate and is not a
+/// complete snapshot, production cursor, or selection-time attestation.
 #[cfg(test)]
 mod partial_closure_cursor {
     use super::*;
@@ -369,15 +414,52 @@ mod partial_closure_cursor {
         states: BTreeSet<StateId>,
         lines: BTreeSet<LineId>,
         observations: BTreeSet<ObservationId>,
+        situations: BTreeSet<SituationId>,
+        executions: BTreeSet<ExecutionId>,
+        active: Option<Active>,
+        allow_complex: bool,
+        include_task_consumers: bool,
         count: usize,
         maximum: usize,
         failed: bool,
     }
+    enum Active {
+        Conclusions {
+            situation: SituationId,
+            after: Option<LineId>,
+        },
+        Dependencies {
+            situation: SituationId,
+            after: Option<ObservationId>,
+        },
+        Consumers {
+            execution: ExecutionId,
+            index: usize,
+        },
+        ExecutionStatus {
+            execution: ExecutionId,
+        },
+    }
     impl Cursor {
-        pub(super) fn new(mut seed: StorePins, maximum: usize) -> Result<Self, Error> {
+        pub(super) fn new(seed: StorePins, maximum: usize) -> Result<Self, Error> {
             if !seed.situations.is_empty() || !seed.executions.is_empty() {
                 return Err(Error::Unsupported);
             }
+            Self::new_inner(seed, maximum, false, false)
+        }
+        pub(super) fn new_complex(
+            seed: StorePins,
+            maximum: usize,
+            include_task_consumers: bool,
+        ) -> Result<Self, Error> {
+            Self::new_inner(seed, maximum, true, include_task_consumers)
+        }
+        fn new_inner(
+            mut seed: StorePins,
+            maximum: usize,
+            allow_complex: bool,
+            include_task_consumers: bool,
+        ) -> Result<Self, Error> {
             let count = seed.count();
             if count > maximum {
                 return Err(StoreError::Capacity("retirement dependency closure").into());
@@ -386,6 +468,11 @@ mod partial_closure_cursor {
                 states: std::mem::take(&mut seed.states),
                 lines: std::mem::take(&mut seed.lines),
                 observations: std::mem::take(&mut seed.observations),
+                situations: std::mem::take(&mut seed.situations),
+                executions: std::mem::take(&mut seed.executions),
+                active: None,
+                allow_complex,
+                include_task_consumers,
                 completed: seed,
                 count,
                 maximum,
@@ -403,7 +490,15 @@ mod partial_closure_cursor {
                 ClosureEdge::Observation(id) => {
                     !self.completed.observations.contains(&id) && !self.observations.contains(&id)
                 }
-                ClosureEdge::Execution(_) => return Err(Error::Unsupported),
+                ClosureEdge::Execution(id) if self.allow_complex => {
+                    !self.completed.executions.contains(&id) && !self.executions.contains(&id)
+                }
+                ClosureEdge::Situation(id) if self.allow_complex => {
+                    !self.completed.situations.contains(&id) && !self.situations.contains(&id)
+                }
+                ClosureEdge::Execution(_) | ClosureEdge::Situation(_) => {
+                    return Err(Error::Unsupported);
+                }
             };
             if !fresh {
                 return Ok(());
@@ -423,7 +518,12 @@ mod partial_closure_cursor {
                 ClosureEdge::Observation(id) => {
                     self.observations.insert(id);
                 }
-                ClosureEdge::Execution(_) => unreachable!(),
+                ClosureEdge::Execution(id) => {
+                    self.executions.insert(id);
+                }
+                ClosureEdge::Situation(id) => {
+                    self.situations.insert(id);
+                }
             }
             Ok(())
         }
@@ -449,7 +549,78 @@ mod partial_closure_cursor {
             check: &mut dyn FnMut() -> Result<(), StoreError>,
         ) -> Result<bool, Error> {
             check()?;
-            if let Some(id) = self.states.pop_first() {
+            if let Some(active) = self.active.take() {
+                use std::ops::Bound::{Excluded, Unbounded};
+                match active {
+                    Active::Conclusions { situation, after } => {
+                        let entries = &stores.situations.get(situation)?.conclusions.continuations;
+                        let next = match after {
+                            Some(id) => entries.range((Excluded(id), Unbounded)).next(),
+                            None => entries.iter().next(),
+                        }
+                        .map(|(id, conclusion)| (*id, *conclusion));
+                        if let Some((line, conclusion)) = next {
+                            for edge in situation_conclusion_edges(line, &conclusion)
+                                .into_iter()
+                                .flatten()
+                            {
+                                check()?;
+                                self.add(edge)?;
+                            }
+                            self.active = Some(Active::Conclusions {
+                                situation,
+                                after: Some(line),
+                            });
+                        } else {
+                            self.active = Some(Active::Dependencies {
+                                situation,
+                                after: None,
+                            });
+                        }
+                    }
+                    Active::Dependencies { situation, after } => {
+                        let entries = &stores.dependencies.dependents;
+                        let next = match after {
+                            Some(id) => entries.range((Excluded(id), Unbounded)).next(),
+                            None => entries.iter().next(),
+                        }
+                        .map(|(id, values)| (*id, values.contains(&situation)));
+                        if let Some((observation, retained)) = next {
+                            if let Some(edge) = reverse_dependency_edge(observation, retained) {
+                                check()?;
+                                self.add(edge)?;
+                            }
+                            self.active = Some(Active::Dependencies {
+                                situation,
+                                after: Some(observation),
+                            });
+                        }
+                    }
+                    Active::Consumers { execution, index } => {
+                        let task = stores.tasks.get(execution)?;
+                        if self.include_task_consumers && index < task.consumers.len() {
+                            let edge =
+                                execution_consumer_edge(task.consumers[index].consumer.situation);
+                            check()?;
+                            self.add(edge)?;
+                            self.active = Some(Active::Consumers {
+                                execution,
+                                index: index + 1,
+                            });
+                        } else {
+                            self.active = Some(Active::ExecutionStatus { execution });
+                        }
+                    }
+                    Active::ExecutionStatus { execution } => {
+                        if let Some(edge) =
+                            execution_status_edge(stores.tasks.get(execution)?.status)
+                        {
+                            check()?;
+                            self.add(edge)?;
+                        }
+                    }
+                }
+            } else if let Some(id) = self.states.pop_first() {
                 stores.states.get(id)?;
                 self.completed.states.insert(id);
             } else if let Some(id) = self.lines.pop_first() {
@@ -468,6 +639,28 @@ mod partial_closure_cursor {
                         self.add(edge)?;
                     }
                 }
+            } else if let Some(id) = self.situations.pop_first() {
+                let edges = situation_closure_header(stores.situations.get(id)?);
+                self.completed.situations.insert(id);
+                for edge in edges {
+                    check()?;
+                    self.add(edge)?;
+                }
+                self.active = Some(Active::Conclusions {
+                    situation: id,
+                    after: None,
+                });
+            } else if let Some(id) = self.executions.pop_first() {
+                let edges = execution_closure_header(stores.tasks.get(id)?);
+                self.completed.executions.insert(id);
+                for edge in edges.into_iter().flatten() {
+                    check()?;
+                    self.add(edge)?;
+                }
+                self.active = Some(Active::Consumers {
+                    execution: id,
+                    index: 0,
+                });
             } else {
                 check()?;
                 return Ok(true);
@@ -480,6 +673,9 @@ mod partial_closure_cursor {
                 && self.states.is_empty()
                 && self.lines.is_empty()
                 && self.observations.is_empty()
+                && self.situations.is_empty()
+                && self.executions.is_empty()
+                && self.active.is_none()
             {
                 Ok(self.completed)
             } else {
@@ -2899,22 +3095,16 @@ impl PalsStores {
             for id in clone_closure_set(&pins.situations, &mut check)? {
                 check_pin_closure(&mut check)?;
                 let s = self.situations.get(id)?;
-                insert_closure_pin(&mut pins.states, s.state, &mut count, maximum, &mut check)?;
-                insert_closure_pin(&mut pins.lines, s.focus, &mut count, maximum, &mut check)?;
+                for edge in situation_closure_header(s) {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
+                }
                 for (line, conclusion) in s.conclusions.iter() {
                     check_pin_closure(&mut check)?;
-                    insert_closure_pin(&mut pins.lines, *line, &mut count, maximum, &mut check)?;
-                    if let Some(o) = conclusion.evidence {
-                        insert_closure_pin(
-                            &mut pins.observations,
-                            o,
-                            &mut count,
-                            maximum,
-                            &mut check,
-                        )?;
-                    }
-                    if let ContinuationStatus::RepairedBy(line) = conclusion.status {
-                        insert_closure_pin(&mut pins.lines, line, &mut count, maximum, &mut check)?;
+                    for edge in situation_conclusion_edges(*line, conclusion)
+                        .into_iter()
+                        .flatten()
+                    {
+                        insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                     }
                     check_pin_closure(&mut check)?;
                 }
@@ -2944,31 +3134,15 @@ impl PalsStores {
             for id in clone_closure_set(&pins.executions, &mut check)? {
                 check_pin_closure(&mut check)?;
                 let task = self.tasks.get(id)?;
-                insert_closure_pin(
-                    &mut pins.states,
-                    task.key.state,
-                    &mut count,
-                    maximum,
-                    &mut check,
-                )?;
-                if let Some(line) = task.key.line {
-                    insert_closure_pin(&mut pins.lines, line, &mut count, maximum, &mut check)?;
-                }
-                if let Some(execution) = task.resumed_from {
-                    insert_closure_pin(
-                        &mut pins.executions,
-                        execution,
-                        &mut count,
-                        maximum,
-                        &mut check,
-                    )?;
+                for edge in execution_closure_header(task).into_iter().flatten() {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                 }
                 if include_task_consumers {
                     for consumer in &task.consumers {
                         check_pin_closure(&mut check)?;
-                        insert_closure_pin(
-                            &mut pins.situations,
-                            consumer.consumer.situation,
+                        insert_closure_edge(
+                            &mut pins,
+                            execution_consumer_edge(consumer.consumer.situation),
                             &mut count,
                             maximum,
                             &mut check,
@@ -2976,29 +3150,8 @@ impl PalsStores {
                         check_pin_closure(&mut check)?;
                     }
                 }
-                match task.status {
-                    TaskStatus::Completed(o) => {
-                        insert_closure_pin(
-                            &mut pins.observations,
-                            o,
-                            &mut count,
-                            maximum,
-                            &mut check,
-                        )?;
-                    }
-                    TaskStatus::Paused { evidence, .. }
-                    | TaskStatus::RetiredPaused { evidence, .. } => {
-                        if let Some(observation) = evidence {
-                            insert_closure_pin(
-                                &mut pins.observations,
-                                observation,
-                                &mut count,
-                                maximum,
-                                &mut check,
-                            )?;
-                        }
-                    }
-                    _ => {}
+                if let Some(edge) = execution_status_edge(task.status) {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                 }
                 check_pin_closure(&mut check)?;
             }
@@ -3013,14 +3166,8 @@ impl PalsStores {
                     }
                     check_pin_closure(&mut check)?;
                 }
-                if retained {
-                    insert_closure_pin(
-                        &mut pins.observations,
-                        *observation,
-                        &mut count,
-                        maximum,
-                        &mut check,
-                    )?;
+                if let Some(edge) = reverse_dependency_edge(*observation, retained) {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                 }
                 check_pin_closure(&mut check)?;
             }

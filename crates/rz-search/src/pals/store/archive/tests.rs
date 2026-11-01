@@ -2276,6 +2276,102 @@ fn retirement_closure_keeps_original_consumers_and_checks_unique_pin_bound() {
 }
 
 #[test]
+fn experimental_worklist_visits_situation_task_and_reverse_edges_incrementally() {
+    use super::partial_closure_cursor::Cursor;
+    let mut store = PalsStores::new(limits());
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let line_root = store.situations.get(root).unwrap().focus;
+    let line_first = store.lines.append(line_root, &[mv("e2e4")]).unwrap();
+    let line_repair = store.lines.append(line_first, &[mv("e7e5")]).unwrap();
+    let other = store.situations.insert(state, line_first).unwrap();
+    let unrelated = store.situations.insert(state, line_root).unwrap();
+    let evidence = store.append_observation(observation(state)).unwrap();
+    let reverse = store.append_observation(observation(state)).unwrap();
+    let terminal = store.append_observation(observation(state)).unwrap();
+    let unrelated_observation = store.append_observation(observation(state)).unwrap();
+    store
+        .situations
+        .get_mut(root)
+        .unwrap()
+        .conclusions
+        .continuations
+        .insert(
+            line_first,
+            ContinuationConclusion {
+                status: ContinuationStatus::RepairedBy(line_repair),
+                evidence: Some(evidence),
+                revision: 1,
+            },
+        );
+    store.dependencies.add(reverse, root).unwrap();
+    store
+        .dependencies
+        .add(unrelated_observation, unrelated)
+        .unwrap();
+    let consumer = TaskConsumer {
+        id: 81,
+        situation: root,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let TaskAdmission::Start(execution) = store.request_task(key(state), consumer, 0).unwrap()
+    else {
+        panic!("fixture task")
+    };
+    assert!(
+        matches!(store.request_task(key(state), TaskConsumer { id: 82, situation: other, ..consumer }, 0).unwrap(), TaskAdmission::Join(id) if id == execution)
+    );
+    // Task-table fixture only; no actual worker or physical-completion claim.
+    store.tasks.complete(execution, terminal).unwrap();
+    let mut seed = StorePins::default();
+    seed.executions.insert(execution);
+    let expected = StorePins {
+        states: BTreeSet::from([state]),
+        lines: BTreeSet::from([line_root, line_first, line_repair]),
+        observations: BTreeSet::from([evidence, reverse, terminal]),
+        situations: BTreeSet::from([root, other]),
+        executions: BTreeSet::from([execution]),
+    };
+    let mut cursor = Cursor::new_complex(seed.clone(), 128, true).unwrap();
+    let mut steps = 0;
+    let mut done = false;
+    for _ in 0..128 {
+        steps += 1;
+        if cursor.step(&store, &mut || Ok(())).unwrap() {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert!(steps > 10);
+    assert_eq!(cursor.into_completed().unwrap(), expected);
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, 128).unwrap(),
+        expected
+    );
+    let expected_legacy = StorePins {
+        states: BTreeSet::from([state]),
+        observations: BTreeSet::from([terminal]),
+        executions: BTreeSet::from([execution]),
+        ..StorePins::default()
+    };
+    let mut legacy = Cursor::new_complex(seed.clone(), 128, false).unwrap();
+    let mut done = false;
+    for _ in 0..128 {
+        if legacy.step(&store, &mut || Ok(())).unwrap() {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert_eq!(legacy.into_completed().unwrap(), expected_legacy);
+    assert_eq!(store.expand_pins(seed).unwrap(), expected_legacy);
+}
+
+#[test]
 fn profiled_archive_roundtrip_retains_missing_limits_raw_units_and_question() {
     let root = TestRoot::new();
     let mut store = setup(&root);
