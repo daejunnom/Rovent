@@ -2090,6 +2090,190 @@ mod tests {
             },
         )
     }
+    /// Read-only CPU evidence for comparing two independently built encoders.
+    /// The runner must first compare `view` structurally, then compare
+    /// `tensors`; a differing selected view is not a fixed-view comparison.
+    #[test]
+    fn fixed_view_tensor_projection_evidence() {
+        fn moves(values: &[BoardMove]) -> Vec<String> {
+            values.iter().map(ToString::to_string).collect()
+        }
+        fn emit(
+            name: &str,
+            root: Position,
+            prefix: &[&str],
+            records: &[(&str, Option<CpuScoreScope>)],
+            reverse: bool,
+        ) {
+            let (_stores, question) = question_with_options(root, prefix, records, None, reverse);
+            let view = &question.view;
+            let query = view.query();
+            let (input, _) = encode_view(&question, [0; 32], [0; 32]).unwrap();
+            let tensors = input.prepare().unwrap();
+            let bits = |values: &[f32]| {
+                values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            let anchors = view.anchors().iter().map(|anchor| serde_json::json!({
+                "known_history_fens":anchor.snapshot.known_history_fens(),
+                "history_origin":format!("{:?}",anchor.snapshot.history_origin()),
+                "history_completeness":format!("{:?}",anchor.snapshot.history_completeness())
+            })).collect::<Vec<_>>();
+            let records = view
+                .records()
+                .iter()
+                .zip(view.records_metadata())
+                .map(|(record, meta)| {
+                    serde_json::json!({
+                        "kind":format!("{:?}",record.kind), "line":moves(&record.line),
+                        "revision":record.revision,"parent_revision":record.parent_revision,
+                        "supersedes_revision":record.supersedes_revision,"completed_depth":record.completed_depth,
+                        "value":format!("{:?}",record.value),"cpu_observation":format!("{:?}",record.cpu_observation),
+                        "critical":record.critical,
+                        "perspective":format!("{:?}",record.perspective),
+                        "score_scope":format!("{:?}",record.score_scope),
+                        "anchor":meta.anchor, "parent":meta.parent, "supersedes":meta.supersedes,
+                        "source_revision":meta.source_revision,
+                        "source_line_offset":meta.source_line_offset,
+                        "original_first_move":meta.original_first_move.map(|value|value.to_string())
+                    })
+                })
+                .collect::<Vec<_>>();
+            let seals =
+                serde_json::json!({"view":view.seal_digest(),"policy":view.policy_digest()});
+            let view = serde_json::json!({
+                "endpoint_history_fens":question.query.position.snapshot().known_history_fens(),
+                "endpoint_history_origin":format!("{:?}",question.query.position.snapshot().history_origin()),
+                "endpoint_history_completeness":format!("{:?}",question.query.position.snapshot().history_completeness()),
+                "source_history_fens":view.source_snapshots().iter().map(|snapshot| snapshot.known_history_fens()).collect::<Vec<_>>(),
+                "source_history_origins":view.source_snapshots().iter().map(|snapshot| format!("{:?}",snapshot.history_origin())).collect::<Vec<_>>(),
+                "source_history_completeness":view.source_snapshots().iter().map(|snapshot| format!("{:?}",snapshot.history_completeness())).collect::<Vec<_>>(),
+                "anchors":anchors, "records":records,
+                "purpose":format!("{:?}",query.purpose), "prefix":moves(&query.prefix),
+                "proposal":moves(&query.proposal), "counter":query.counterexample.as_deref().map(moves),
+                "legal":moves(&query.legal), "divergences":query.divergences,
+                "context_public_revision":question.query.context.public_revision,
+                "context_game_generation":question.query.context.game_generation,
+                "context_search_generation":question.query.context.search_generation,
+                "token_budget":view.token_budget(), "token_count":view.token_count(),
+                "length_bucket":view.length_bucket()
+            });
+            let (a, r, c, d, l) = (
+                tensors.anchors,
+                tensors.records_count,
+                tensors.candidates_count,
+                tensors.divergences_count,
+                tensors.length_bucket,
+            );
+            let tensors = serde_json::json!({
+                "role":format!("{:?}",input.role),
+                "role_critic_scalar":input.role == PalsRole::Critic,
+                "declared_prepare_shapes_and_dtypes":{
+                    "role":["bool",[]],
+                    "anchor_board":["i64",[1,a,64]],"anchor_mask":["bool",[1,a]],
+                    "anchor_metadata":["f32",[1,a,16]],"candidate_mask":["bool",[1,c]],
+                    "candidates":["i64",[1,c,3]],"divergence_features":["f32",[1,d,8]],
+                    "divergence_mask":["bool",[1,d]],"query":["f32",[1,8]],
+                    "query_anchor":["i64",[1,3]],"query_line_mask":["bool",[1,3,l]],
+                    "query_line_tokens":["i64",[1,3,l,3]],"record_anchor":["i64",[1,r]],
+                    "record_line_mask":["bool",[1,r,l]],"record_line_tokens":["i64",[1,r,l,3]],
+                    "record_mask":["bool",[1,r]],"record_relations":["i64",[1,r,2]],
+                    "records":["f32",[1,r,8]]
+                },
+                "anchors":tensors.anchors,"records_count":tensors.records_count,
+                "candidates_count":tensors.candidates_count,"divergences_count":tensors.divergences_count,
+                "length_bucket":tensors.length_bucket,"token_count":tensors.token_count,
+                "anchor_board":tensors.anchor_board,"anchor_metadata_bits":bits(&tensors.anchor_metadata),
+                "anchor_mask":tensors.anchor_mask,"records_bits":bits(&tensors.records),
+                "record_anchor":tensors.record_anchor,"record_mask":tensors.record_mask,
+                "record_line_tokens":tensors.record_line_tokens,"record_line_mask":tensors.record_line_mask,
+                "record_relations":tensors.record_relations,"query_bits":bits(&tensors.query),
+                "query_anchor":tensors.query_anchor,"query_line_tokens":tensors.query_line_tokens,
+                "query_line_mask":tensors.query_line_mask,"candidates":tensors.candidates,
+                "candidate_mask":tensors.candidate_mask,"divergence_bits":bits(&tensors.divergence_features),
+                "divergence_mask":tensors.divergence_mask
+            });
+            println!(
+                "ROVENT_PROJECTION_AUDIT_V1 {}",
+                serde_json::json!({"case":name,"view":view,"seals":seals,"tensors":tensors})
+            );
+        }
+        let registered = [
+            "start",
+            "prefix",
+            "legal_reversed",
+            "promotion",
+            "black_promotion",
+            "en_passant",
+            "castling",
+            "black_history",
+        ];
+        println!(
+            "ROVENT_PROJECTION_CASES_V1 {}",
+            serde_json::json!(registered)
+        );
+        emit(
+            registered[0],
+            Position::startpos(),
+            &[],
+            &[("e2e4", None)],
+            false,
+        );
+        emit(
+            registered[1],
+            Position::startpos(),
+            &["e2e4"],
+            &[("e2e4", None)],
+            false,
+        );
+        emit(
+            registered[2],
+            Position::startpos(),
+            &[],
+            &[("e2e4", None)],
+            true,
+        );
+        emit(
+            registered[3],
+            Position::from_fen("7k/P7/8/8/8/8/8/7K w - - 0 1").unwrap(),
+            &[],
+            &[("a7a8q", None)],
+            false,
+        );
+        emit(
+            registered[4],
+            Position::from_fen("7k/8/8/8/8/8/p7/7K b - - 0 1").unwrap(),
+            &[],
+            &[("a2a1q", None)],
+            false,
+        );
+        emit(
+            registered[5],
+            Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap(),
+            &[],
+            &[("e5d6", None)],
+            false,
+        );
+        emit(
+            registered[6],
+            Position::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap(),
+            &[],
+            &[("e1g1", None)],
+            false,
+        );
+        let mut with_history = Position::startpos();
+        with_history
+            .apply_uci_moves(&["e2e4", "e7e5", "g1f3"])
+            .unwrap();
+        emit(registered[7], with_history, &[], &[("b8c6", None)], false);
+        println!(
+            "ROVENT_PROJECTION_COMPLETE_V1 {}",
+            serde_json::json!(registered)
+        );
+    }
+
     #[test]
     fn complete_legal_permutation_preserves_the_submitted_policy_order() {
         let (_store, ordered) = question(Position::startpos(), &[], &[]);
