@@ -230,6 +230,11 @@ pub enum RoventUtilityInterventionPolicyV2 {
     /// or validate that actual proposal with installed own R. Repair requires
     /// separate original counter evidence and is not synthesized by this policy.
     FrozenProposalReviewV1,
+    /// Experimental AnchoredCompact preparation: the target proposal bundle
+    /// selects through its first seven verified CPU search observations. This
+    /// value is encoded before execution, not chosen from results. A record is
+    /// not proof of physical completion or complete observation provenance.
+    FrozenProposalReviewCpu7V1,
 }
 
 /// Passive /2 registration. The original neutral target and NNUEC input are
@@ -291,6 +296,19 @@ impl RoventUtilityInterventionCohortV2 {
             self.target_record < 64,
             "intervention target exceeds the selected-view bound",
         )?;
+        if self.policy == RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1 {
+            // The preserved /2 projection does not yet carry the complete
+            // indexed-bundle preimage proving this was the *first* seven.
+            // Keep all CPU7 outcomes diagnostic until that proof exists.
+            require(
+                self.input.usage == RoventUtilityCohortUsage::ValidationOnly,
+                "CPU7 prefix provenance is validation-only",
+            )?;
+            require(
+                self.target_record == 0,
+                "CPU7 requires the original proposal at target 0",
+            )?;
+        }
         self.canonical_unchecked()?;
         Ok(())
     }
@@ -412,6 +430,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cpu7_intervention_is_explicit_and_changes_profile_digest() {
+        let mut input = cohort().input;
+        input
+            .requested_recipients
+            .push(RoventUtilityCohortRecipient::Critic);
+        let legacy = RoventUtilityInterventionCohortV2::seal(input, 0).unwrap();
+        let original = legacy.canonical_bytes().unwrap();
+        let mut cpu7 = legacy.clone();
+        cpu7.policy = RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1;
+        assert_ne!(cpu7.digest().unwrap(), legacy.digest().unwrap());
+        let raw = String::from_utf8(cpu7.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(
+            RoventUtilityInterventionCohortV2::from_json(&raw).unwrap(),
+            cpu7
+        );
+        assert_eq!(legacy.canonical_bytes().unwrap(), original);
+        cpu7.target_record = 1;
+        assert!(cpu7.validate().is_err());
+        cpu7.target_record = 0;
+        cpu7.input.usage = RoventUtilityCohortUsage::CollectionCandidate;
+        assert!(cpu7.validate().is_err());
     }
 
     #[test]

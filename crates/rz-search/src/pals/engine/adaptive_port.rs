@@ -556,6 +556,7 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     goal_local: goal_local::GoalLocalPortState,
     goal_lanes: goal_hooks::AdaptiveGoalLanes,
     utility_continuations: utility_dependencies::UtilityContinuationRegistry,
+    cohort_cpu7: bool,
 }
 #[derive(Clone)]
 struct CpuPortAdmission {
@@ -827,7 +828,26 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             goal_local: goal_local::GoalLocalPortState::default(),
             goal_lanes: goal_hooks::AdaptiveGoalLanes::default(),
             utility_continuations: utility_dependencies::UtilityContinuationRegistry::default(),
+            cohort_cpu7: false,
         }
+    }
+
+    /// Install only for an explicitly registered experimental cohort before
+    /// its manager starts the root. Existing frames are never rewritten.
+    pub fn enable_cohort_cpu7(&mut self) -> Result<(), PalsError> {
+        self.check_live()?;
+        if self.cohort_cpu7 {
+            return Err(PalsError::InvalidConfig);
+        }
+        if self.engine.semantic.review_policy.is_none_or(|policy| {
+            policy.mode != crate::pals::review_context::ReviewAnchorMode::AnchoredCompact
+        }) {
+            return Err(
+                RoleError::Unsupported("CPU7 requires AnchoredCompact review semantics").into(),
+            );
+        }
+        self.cohort_cpu7 = true;
+        Ok(())
     }
     /// Explicit root-local diagnostic opt-in before the first observed call.
     /// No callback, worker, acceptance or coordinator-transition authority.
@@ -2031,10 +2051,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 }
                 view
             }
-            None => self
-                .engine
-                .prepare_review_view(node, question, &legal)?
-                .ok_or(PalsError::InvalidConfig)?,
+            None => {
+                let view = if self.cohort_cpu7 && stage == RefinementStage::ProposalContinuation {
+                    self.engine
+                        .prepare_cohort_cpu7_review_view(node, question, &legal)?
+                } else {
+                    self.engine.prepare_review_view(node, question, &legal)?
+                };
+                view.ok_or(PalsError::InvalidConfig)?
+            }
         };
         let sequence = self.next_question;
         self.next_question = sequence.checked_add(1).ok_or(PalsError::Capacity)?;

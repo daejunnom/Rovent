@@ -249,6 +249,12 @@ impl UtilityInterventionSourceObserver<AdaptivePortQuestion> for SourceObserver 
         if !snapshot.has_target(state.profile.target_record) {
             return UtilityInterventionSourceDisposition::ContinuePrelude;
         }
+        if matches!(
+            state.profile.policy,
+            rz_experiments::rovent_utility_cohort::RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
+        ) && !snapshot.has_cpu7_target(state.profile.target_record) {
+            return UtilityInterventionSourceDisposition::ContinuePrelude;
+        }
         if state.owner.is_none() {
             match UtilityInterventionCohortOwner::register(
                 state.profile.clone(),

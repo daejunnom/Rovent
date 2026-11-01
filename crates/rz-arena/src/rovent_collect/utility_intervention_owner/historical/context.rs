@@ -40,12 +40,79 @@ fn replay(root: &Position, moves: &[rz_position::BoardMove]) -> Result<Position,
     }
     Ok(p)
 }
-pub(super) fn original_source_offer(preparation: &Value) -> Result<&Value, ArenaError> {
-    let offers = array(preparation, "offers", 3)?;
+pub(super) fn original_source_offer(
+    preparation: &Value,
+    selected_frame: Option<u64>,
+) -> Result<&Value, ArenaError> {
+    let offers = array(
+        preparation,
+        "offers",
+        if selected_frame.is_some() { 64 } else { 3 },
+    )?;
+    if let Some(selected) = selected_frame {
+        let mut matching = offers
+            .iter()
+            .filter(|offer| offer["frame_sequence"].as_u64() == Some(selected));
+        let offer = matching
+            .next()
+            .ok_or_else(|| error("/2 CPU7 selected source is not an original offer"))?;
+        ensure(
+            selected > 0 && matching.next().is_none(),
+            "/2 CPU7 selected source is not unique",
+        )?;
+        return Ok(offer);
+    }
     ["route_p", "route_r", "route_c"]
         .into_iter()
         .find_map(|recipient| offers.iter().find(|v| v["recipient"] == recipient))
         .ok_or_else(|| error("/2 actual neutral source absent"))
+}
+
+#[cfg(test)]
+mod cpu7_offer_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn explicit_cpu7_source_can_follow_legacy_first_offer_but_must_be_unique() {
+        let preparation = json!({"offers":[
+            {"frame_sequence":1,"recipient":"route_p"},
+            {"frame_sequence":2,"recipient":"route_r"}
+        ]});
+        assert_eq!(
+            original_source_offer(&preparation, None).unwrap()["frame_sequence"],
+            1
+        );
+        assert_eq!(
+            original_source_offer(&preparation, Some(2)).unwrap()["frame_sequence"],
+            2
+        );
+        assert!(original_source_offer(&preparation, Some(3)).is_err());
+        let duplicate = json!({"offers":[
+            {"frame_sequence":2,"recipient":"route_p"},
+            {"frame_sequence":2,"recipient":"route_r"}
+        ]});
+        assert!(original_source_offer(&duplicate, Some(2)).is_err());
+    }
+
+    #[test]
+    fn cpu7_keeps_bounded_multiple_original_offers_for_each_recipient() {
+        let offers: Vec<_> = (1..=64)
+            .map(|frame| json!({"frame_sequence":frame,"recipient":"route_p"}))
+            .collect();
+        let preparation = json!({"offers":offers});
+        assert_eq!(
+            original_source_offer(&preparation, Some(64)).unwrap()["frame_sequence"],
+            64
+        );
+        assert!(original_source_offer(&preparation, None).is_err());
+        let mut over = preparation.clone();
+        over["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"frame_sequence":65,"recipient":"route_c"}));
+        assert!(original_source_offer(&over, Some(65)).is_err());
+    }
 }
 /// Projection contains only fields derived from the independently validated
 /// neutral payload and original source; it never creates /1 metadata or a cap.
@@ -149,6 +216,12 @@ pub(super) fn verify_neutral(
             "record_scope_sha256":value["record_scope_sha256"],"policy_sha256":source_offer["view"]["context_policy_sha256"],"model":value["model_identity"]}});
     let input = shared::verify_captured_utility_input(&projection, model, root_rules)?;
     shared::verify_submitted_input_source(&projection, source_offer, root)?;
+    if matches!(
+        profile.policy,
+        rz_experiments::rovent_utility_cohort::RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
+    ) {
+        verify_cpu7_observed_shape(&input, source_offer)?;
+    }
     let actual_root = shared::restore_rules_snapshot(&value["root_rules"])?;
     ensure(
         hex(
@@ -196,6 +269,50 @@ pub(super) fn verify_neutral(
         proposal,
         first,
     })
+}
+
+/// Validate only the selected source actually preserved in /2. This cannot
+/// prove it was the first seven in the original complete indexed bundle; the
+/// profile remains validation-only until a separate original-prefix proof exists.
+fn verify_cpu7_observed_shape(
+    input: &shared::CheckedInput,
+    offer: &Value,
+) -> Result<(), ArenaError> {
+    use rz_search::pals::review_context::{ReviewAnchorMode, ReviewSelectionPolicy};
+    let reference: v2::utility::Reference = decode(input.reference_json.as_bytes())?;
+    let lines = &reference.base_input.context_lines;
+    let kinds = |kind| lines.iter().filter(|line| line.kind == kind).count();
+    ensure(
+        (8..=64).contains(&lines.len())
+            && number(&offer["view"], "selected_records")? == lines.len() as u64
+            && lines[0].kind == 0
+            && kinds(3) == 7
+            && reference.target_ids == (0u64..lines.len() as u64).collect::<Vec<_>>(),
+        "/2 CPU7 observed original source shape",
+    )?;
+    let observed_policy = hash_field(&offer["view"], "context_policy_sha256")?;
+    let tokens = number(&offer["view"], "actual_tokens")?;
+    let anchors = number(&offer["view"], "anchors")?;
+    let mut policy_matches = false;
+    for token_budget in [128, 256, 512] {
+        for max_anchors in 1..=4 {
+            let policy = ReviewSelectionPolicy {
+                mode: ReviewAnchorMode::AnchoredCompact,
+                token_budget,
+                max_records: lines.len() as u16,
+                max_anchors,
+                required_bundle: None,
+            };
+            if policy.validate().is_ok()
+                && tokens <= u64::from(token_budget)
+                && anchors <= u64::from(max_anchors)
+                && hex(rz_contracts::Digest(policy.digest())) == observed_policy
+            {
+                policy_matches = true;
+            }
+        }
+    }
+    ensure(policy_matches, "/2 CPU7 observed effective view policy")
 }
 /// A fresh role query is checked separately; it is never a fabricated Ready offer.
 pub(super) fn verify_arm(

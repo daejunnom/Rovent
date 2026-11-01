@@ -235,6 +235,7 @@ pub enum AdaptiveManagerError {
         replacement_reserve: usize,
     },
     Invalid(&'static str),
+    CohortCpu7Unsupported(&'static str),
     /// Two independently reconstructed intervention roots did not seal the
     /// same target. Neither digest is a live authority or a valid label.
     InterventionNeutralMismatch {
@@ -376,6 +377,13 @@ pub type UtilityInterventionTargetBinding<Q> = Result<
 >;
 
 pub trait AdaptiveSearchDriver<Q> {
+    /// Install a cohort-only source-view policy on the original search owner.
+    /// Drivers without this explicit support must reject it before admission.
+    fn enable_cohort_cpu7(&mut self) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::CohortCpu7Unsupported(
+            "cohort CPU7 source-view policy unsupported",
+        ))
+    }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn utility_cohort_common_work(
         &self,

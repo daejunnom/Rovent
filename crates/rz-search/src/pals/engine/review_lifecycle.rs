@@ -253,6 +253,59 @@ impl<M: RoleModel> PalsSemanticState<M> {
         )?)))
     }
 
+    /// Cohort-only variant, selected before a Ready question is sealed. Before
+    /// seven observations exist the ordinary prelude continues; the cohort
+    /// admission must separately require a CPU7-tagged view.
+    pub(super) fn prepare_cohort_cpu7_review_view(
+        &mut self,
+        config: &PalsSemanticConfig,
+        node: usize,
+        question: RoleQuestion<'_>,
+        legal: &[BoardMove],
+    ) -> Result<Option<Arc<ReviewView>>, PalsError> {
+        match (&self.review_index, self.review_policy) {
+            (None, None) => return Ok(None),
+            (Some(_), Some(_)) => {}
+            _ => return Err(PalsError::InvalidConfig),
+        }
+        let root = self.review_root_for_question(config, node, question, legal)?;
+        let query = ReviewQuerySequences {
+            purpose: question.purpose,
+            prefix: question.prefix,
+            proposal: question.proposal,
+            counterexample: question.refutation,
+            legal,
+            divergences: question.divergences,
+        };
+        let base_policy = self.review_policy_for_question(root, question)?;
+        let mut policy = base_policy;
+        if policy.required_bundle.is_none() {
+            // A ProposalContinuation uses ProposePolicy, for which the normal
+            // selector does not require a bundle. This experiment may only
+            // bind the exact actual first move of the source question.
+            let first = question.prefix.first().copied();
+            let proposal_matches = question
+                .proposal
+                .first()
+                .copied()
+                .is_none_or(|candidate| Some(candidate) == first);
+            if let Some(first) = first.filter(|_| proposal_matches) {
+                policy.required_bundle = self
+                    .review_index
+                    .as_ref()
+                    .ok_or(PalsError::InvalidConfig)?
+                    .bundle_for_first_move(root, Some(first))?;
+            }
+        }
+        let index = self.review_index.as_mut().ok_or(PalsError::InvalidConfig)?;
+        let view = if index.cohort_cpu7_ready(&self.stores, policy) {
+            index.select_cohort_cpu7(&self.stores, root, query, policy)?
+        } else {
+            index.select(&self.stores, root, query, base_policy)?
+        };
+        Ok(Some(Arc::new(view)))
+    }
+
     /// Prepare both endpoint envelopes before either can publish an evaluation.
     /// The selector admits the larger query first and forks its immutable record
     /// scope, never selecting the second endpoint against newer public memory.
@@ -351,6 +404,16 @@ impl<M: RoleModel> PalsEngine<M> {
         let config = self.semantic_sequence_config();
         self.semantic
             .prepare_review_view(&config, node, question, legal)
+    }
+    pub(super) fn prepare_cohort_cpu7_review_view(
+        &mut self,
+        node: usize,
+        question: RoleQuestion<'_>,
+        legal: &[BoardMove],
+    ) -> Result<Option<Arc<ReviewView>>, PalsError> {
+        let config = self.semantic_sequence_config();
+        self.semantic
+            .prepare_cohort_cpu7_review_view(&config, node, question, legal)
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_frozen_review_views(

@@ -292,6 +292,17 @@ impl NnuecUtilityInputCapture {
     pub fn source_snapshots(&self) -> &[PositionSnapshot] {
         &self.sources
     }
+    /// Project the original index observation only while this capture's exact
+    /// original ReviewView owner is still live. This does not grant a pin,
+    /// physical completion, trial authority, or permission to replay it.
+    pub fn with_cohort_cpu7_original_bundle<T>(
+        &self,
+        project: impl FnOnce(&crate::pals::review_context::CohortCpu7OriginalBundle, [u8; 32]) -> T,
+    ) -> Option<T> {
+        let original = self.view.upgrade()?;
+        let bundle = original.cohort_cpu7_original_bundle()?;
+        Some(project(bundle, original.cohort_cpu7_binding()?))
+    }
     /// Same original weak Store owner and generation only. No time check,
     /// view reselection, pin creation, or retired/live authority conversion.
     pub fn matches_original_store(&self, stores: &PalsStores) -> bool {

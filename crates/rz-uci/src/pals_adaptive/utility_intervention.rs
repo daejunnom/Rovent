@@ -31,9 +31,12 @@ pub struct UtilityInterventionSourceSnapshot<Q> {
 }
 impl<Q> UtilityInterventionSourceSnapshot<Q> {
     pub fn has_target(&self, target: u16) -> bool {
-        self.selected_source_index(target).is_some()
+        self.selected_source_index(target, false).is_some()
     }
-    fn selected_source_index(&self, target: u16) -> Option<usize> {
+    pub fn has_cpu7_target(&self, target: u16) -> bool {
+        self.selected_source_index(target, true).is_some()
+    }
+    fn selected_source_index(&self, target: u16, cpu7_only: bool) -> Option<usize> {
         [
             UtilityRouteRecipient::Proposer,
             UtilityRouteRecipient::Researcher,
@@ -41,7 +44,11 @@ impl<Q> UtilityInterventionSourceSnapshot<Q> {
         ]
         .into_iter()
         .filter_map(|r| self.actual.selected_offer_index(r))
-        .find(|index| self.actual.offers()[*index].intervention_target_matches(target))
+        .find(|index| {
+            let offer = &self.actual.offers()[*index];
+            offer.intervention_target_matches(target)
+                && (!cpu7_only || offer.intervention_uses_cpu7())
+        })
     }
     pub fn admission(&self) -> &crate::pals_adaptive::RoventCollectionRootAdmission {
         self.actual.admission()
@@ -223,14 +230,27 @@ impl UtilityInterventionCohortOwner {
             }
             // This selects an ORIGINAL source fairly. It is not an offer of
             // the requested alternative; that is minted only after preparation.
+            let cpu7 = matches!(
+                self.profile().policy,
+                rz_experiments::rovent_utility_cohort::RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
+            );
             let selected = snapshot
-                .selected_source_index(self.profile().target_record)
+                .selected_source_index(self.profile().target_record, cpu7)
                 .ok_or_else(|| invalid("intervention has no original fair source"))?;
             let sequence = state.next as u64 + 1;
-            let preparation = freeze_ready_prelude(
+            let mut preparation = freeze_ready_prelude(
                 &snapshot.actual,
                 super::utility_cohort::actual_offer_group(&snapshot.actual)?,
             )?;
+            if cpu7 {
+                preparation
+                    .as_object_mut()
+                    .ok_or_else(|| invalid("intervention original preparation object missing"))?
+                    .insert(
+                        "selected_source_frame".into(),
+                        json!(snapshot.actual.offers()[selected].frame().sequence),
+                    );
+            }
             let root = snapshot.admission().raw_receipt().clone();
             bounded_json(&root)?;
             state.active = Some(sequence);

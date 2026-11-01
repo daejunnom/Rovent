@@ -146,6 +146,61 @@ pub struct ReviewRecordMetadata {
     pub original_first_move: Option<BoardMove>,
 }
 
+/// Original, bounded index contents observed at CPU7 selection. A compacted
+/// index is not the complete game journal. This is detached evidence only:
+/// it cannot create a view, trial, or worker authority.
+#[derive(Debug)]
+pub struct CohortCpu7OriginalRecord {
+    record: RoleRecord,
+    evidence: Option<ObservationId>,
+}
+impl CohortCpu7OriginalRecord {
+    pub fn record(&self) -> &RoleRecord {
+        &self.record
+    }
+    pub fn evidence(&self) -> Option<ObservationId> {
+        self.evidence
+    }
+}
+
+#[derive(Debug)]
+pub struct CohortCpu7OriginalBundle {
+    bundle_id: u64,
+    generation: u64,
+    root: StateId,
+    root_snapshot: PositionSnapshot,
+    anchor: PositionSnapshot,
+    records: Vec<CohortCpu7OriginalRecord>,
+    selected_len: usize,
+    digest: [u8; 32],
+}
+impl CohortCpu7OriginalBundle {
+    pub fn bundle_id(&self) -> u64 {
+        self.bundle_id
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn root(&self) -> StateId {
+        self.root
+    }
+    pub fn root_snapshot(&self) -> &PositionSnapshot {
+        &self.root_snapshot
+    }
+    pub fn anchor(&self) -> &PositionSnapshot {
+        &self.anchor
+    }
+    pub fn records(&self) -> &[CohortCpu7OriginalRecord] {
+        &self.records
+    }
+    pub fn selected_len(&self) -> usize {
+        self.selected_len
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
 /// The pin, source seal and atomic consumption authority are owned by the
 /// immutable view. None of its selected input can be edited after submission.
 #[derive(Debug)]
@@ -155,6 +210,8 @@ pub struct ReviewView {
     root_state: StateId,
     generation: u64,
     policy: ReviewSelectionPolicy,
+    cohort_cpu7: Option<Arc<CohortCpu7OriginalBundle>>,
+    cohort_cpu7_binding: Option<[u8; 32]>,
     records: Vec<RoleRecord>,
     metadata: Vec<ReviewRecordMetadata>,
     anchors: Vec<ReviewAnchor>,
@@ -171,6 +228,17 @@ pub struct ReviewView {
     consumed: AtomicBool,
 }
 impl ReviewView {
+    /// True only for an original view selected by the explicit CPU7 cohort
+    /// policy; it is not an acceptance or physical-completion receipt.
+    pub fn is_cohort_cpu7(&self) -> bool {
+        self.cohort_cpu7.is_some()
+    }
+    pub fn cohort_cpu7_original_bundle(&self) -> Option<&CohortCpu7OriginalBundle> {
+        self.cohort_cpu7.as_deref()
+    }
+    pub fn cohort_cpu7_binding(&self) -> Option<[u8; 32]> {
+        self.cohort_cpu7_binding
+    }
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -303,6 +371,26 @@ impl ReviewView {
         }
         for source in self.source_snapshots.iter() {
             bytes = bytes.checked_add(source.retained_history_bytes()?)?;
+        }
+        if let Some(original) = &self.cohort_cpu7 {
+            bytes = bytes.checked_add(std::mem::size_of::<CohortCpu7OriginalBundle>())?;
+            bytes = bytes.checked_add(
+                original
+                    .records
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CohortCpu7OriginalRecord>())?,
+            )?;
+            for record in &original.records {
+                bytes = bytes.checked_add(
+                    record
+                        .record
+                        .line
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<BoardMove>())?,
+                )?;
+            }
+            bytes = bytes.checked_add(original.anchor.retained_history_bytes()?)?;
+            bytes = bytes.checked_add(original.root_snapshot.retained_history_bytes()?)?;
         }
         u64::try_from(bytes).ok()
     }
@@ -712,6 +800,84 @@ impl ReviewContextIndex {
         query: ReviewQuerySequences<'_>,
         policy: ReviewSelectionPolicy,
     ) -> Result<ReviewView, ReviewError> {
+        self.select_inner(stores, root, query, policy, None)
+    }
+
+    /// Experimental cohort-only prefix. The original index and observations
+    /// are untouched; this does not manufacture completion or trial authority.
+    /// The required bundle must contain seven actual CPU verification records.
+    pub fn select_cohort_cpu7(
+        &mut self,
+        stores: &PalsStores,
+        root: StateId,
+        query: ReviewQuerySequences<'_>,
+        policy: ReviewSelectionPolicy,
+    ) -> Result<ReviewView, ReviewError> {
+        if policy.required_bundle.is_none() || policy.mode != ReviewAnchorMode::AnchoredCompact {
+            return Err(ReviewError::InvalidPolicy);
+        }
+        self.select_inner(stores, root, query, policy, Some(7))
+    }
+
+    /// A readiness hint only: selection still validates owner, Rules,
+    /// relations, budget and all original records before issuing any view.
+    pub fn cohort_cpu7_ready(&self, stores: &PalsStores, policy: ReviewSelectionPolicy) -> bool {
+        if policy.mode != ReviewAnchorMode::AnchoredCompact {
+            return false;
+        }
+        let Some(bundle) = policy.required_bundle.and_then(|id| self.bundles.get(&id)) else {
+            return false;
+        };
+        let (mut cpus, mut total) = (0, 0);
+        let mut observations = std::collections::BTreeSet::new();
+        for revision in &bundle.revisions {
+            let Some(entry) = self.records.get(revision) else {
+                return false;
+            };
+            total += 1;
+            if total == 1 && entry.record.kind != RecordKind::Proposal {
+                return false;
+            }
+            if entry.record.kind == RecordKind::CpuVerification {
+                let Some(observation) = entry.record.cpu_observation else {
+                    return false;
+                };
+                if !observations.insert(observation) {
+                    return false;
+                }
+                let Ok(actual) = stores.observations.get(observation) else {
+                    return false;
+                };
+                if !matches!(
+                    (actual.kind, actual.scope),
+                    (
+                        ObservationKind::CpuAnalysis,
+                        EvidenceScope::DepthLimited { .. }
+                    ) | (
+                        ObservationKind::ExternalCpuAnalysis,
+                        EvidenceScope::ProfiledExternalUci { .. }
+                            | EvidenceScope::ExternalUci { .. }
+                    )
+                ) {
+                    return false;
+                }
+                cpus += 1;
+            }
+            if cpus == 7 {
+                return total <= usize::from(policy.max_records);
+            }
+        }
+        false
+    }
+
+    fn select_inner(
+        &mut self,
+        stores: &PalsStores,
+        root: StateId,
+        query: ReviewQuerySequences<'_>,
+        mut policy: ReviewSelectionPolicy,
+        cohort_cpu_prefix: Option<usize>,
+    ) -> Result<ReviewView, ReviewError> {
         self.check_owner(stores)?;
         policy.validate()?;
         if self.owner.is_none() {
@@ -776,6 +942,7 @@ impl ReviewContextIndex {
         let mut metadata = Vec::new();
         let mut source_snapshots = Vec::new();
         let mut selected_bundles = Vec::new();
+        let mut cpu7_original_bundle = None;
         let mut anchors = vec![ReviewAnchor {
             state: root,
             snapshot: root_snapshot.clone(),
@@ -786,6 +953,75 @@ impl ReviewContextIndex {
         for id in ordered {
             let bundle = &self.bundles[&id];
             let required = Some(id) == policy.required_bundle;
+            if cohort_cpu_prefix.is_some() && !required {
+                continue;
+            }
+            let revisions = if required {
+                if let Some(limit) = cohort_cpu_prefix {
+                    let mut observed = 0usize;
+                    let end = bundle.revisions.iter().position(|revision| {
+                        if self.records[revision].record.kind == RecordKind::CpuVerification {
+                            observed += 1;
+                        }
+                        observed == limit
+                    });
+                    let end = end.ok_or(ReviewError::ViewCapacity)?;
+                    let selected = &bundle.revisions[..=end];
+                    if selected.len() > usize::from(policy.max_records)
+                        || self.records[&selected[0]].record.kind != RecordKind::Proposal
+                    {
+                        return Err(ReviewError::ViewCapacity);
+                    }
+                    let mut observations = std::collections::BTreeSet::new();
+                    for revision in selected {
+                        let record = &self.records[revision].record;
+                        if record.kind == RecordKind::CpuVerification {
+                            let observation =
+                                record.cpu_observation.ok_or(ReviewError::ViewCapacity)?;
+                            if !observations.insert(observation) {
+                                return Err(ReviewError::RelationMismatch);
+                            }
+                            let actual = stores.observations.get(observation)?;
+                            if !matches!(
+                                (actual.kind, actual.scope),
+                                (
+                                    ObservationKind::CpuAnalysis,
+                                    EvidenceScope::DepthLimited { .. }
+                                ) | (
+                                    ObservationKind::ExternalCpuAnalysis,
+                                    EvidenceScope::ProfiledExternalUci { .. }
+                                        | EvidenceScope::ExternalUci { .. }
+                                )
+                            ) {
+                                return Err(ReviewError::ViewCapacity);
+                            }
+                        }
+                    }
+                    // Bind the actual prefix length into the existing context
+                    // policy digest, without exceeding the registered cap.
+                    policy.max_records = selected.len() as u16;
+                    selected
+                } else {
+                    bundle.revisions.as_slice()
+                }
+            } else {
+                bundle.revisions.as_slice()
+            };
+            // A prefix is valid only when every included parent/supersedes
+            // really belongs to the same retained prefix, never a missing tail.
+            if required && cohort_cpu_prefix.is_some() {
+                for revision in revisions {
+                    let record = &self.records[revision].record;
+                    for parent in [record.parent_revision, record.supersedes_revision]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if !revisions.contains(&parent) {
+                            return Err(ReviewError::MissingRelation(parent));
+                        }
+                    }
+                }
+            }
             let anchor = match stores.states.get(bundle.anchor) {
                 Ok(anchor) => anchor,
                 Err(error) => {
@@ -795,9 +1031,47 @@ impl ReviewContextIndex {
                     continue;
                 }
             };
-            let mut offsets = Vec::with_capacity(bundle.revisions.len());
+            if required && cohort_cpu_prefix.is_some() {
+                let mut original = Vec::with_capacity(bundle.revisions.len());
+                for revision in &bundle.revisions {
+                    let entry = self
+                        .records
+                        .get(revision)
+                        .ok_or(ReviewError::MissingRelation(*revision))?;
+                    if entry.bundle != id || entry.record.origin_state != bundle.anchor {
+                        return Err(ReviewError::RelationMismatch);
+                    }
+                    pins.states.insert(entry.record.origin_state);
+                    pins.observations.extend(entry.evidence);
+                    pins.observations.extend(entry.record.cpu_observation);
+                    original.push(CohortCpu7OriginalRecord {
+                        record: entry.record.clone(),
+                        evidence: entry.evidence,
+                    });
+                }
+                let digest = cohort_cpu7_original_digest(
+                    id,
+                    stores.generation(),
+                    root,
+                    root_snapshot,
+                    anchor,
+                    &original,
+                    revisions.len(),
+                )?;
+                cpu7_original_bundle = Some(Arc::new(CohortCpu7OriginalBundle {
+                    bundle_id: id,
+                    generation: stores.generation(),
+                    root,
+                    root_snapshot: root_snapshot.clone(),
+                    anchor: anchor.clone(),
+                    records: original,
+                    selected_len: revisions.len(),
+                    digest,
+                }));
+            }
+            let mut offsets = Vec::with_capacity(revisions.len());
             let mut all_rebased = true;
-            for revision in &bundle.revisions {
+            for revision in revisions {
                 let line = &self.records[revision].record.line;
                 match checked_rebase_offset(anchor, root_snapshot, line)? {
                     Some(offset) => offsets.push(offset),
@@ -833,13 +1107,12 @@ impl ReviewContextIndex {
             if !all_rebased {
                 offsets.fill(0);
             }
-            let additional: usize = bundle
-                .revisions
+            let additional: usize = revisions
                 .iter()
                 .zip(&offsets)
                 .map(|(rev, offset)| self.records[rev].record.line.len() - offset)
                 .sum();
-            if records.len() + bundle.revisions.len() > usize::from(policy.max_records)
+            if records.len() + revisions.len() > usize::from(policy.max_records)
                 || tokens + additional > usize::from(policy.token_budget)
             {
                 if required {
@@ -853,13 +1126,12 @@ impl ReviewContextIndex {
                     snapshot: anchor.clone(),
                 });
             }
-            let local: BTreeMap<_, _> = bundle
-                .revisions
+            let local: BTreeMap<_, _> = revisions
                 .iter()
                 .enumerate()
                 .map(|(index, revision)| (*revision, (records.len() + index) as u16))
                 .collect();
-            for (revision, offset) in bundle.revisions.iter().zip(offsets) {
+            for (revision, offset) in revisions.iter().zip(offsets) {
                 let entry = &self.records[revision];
                 let mut selected = entry.record.clone();
                 selected.line = selected.line[offset..].to_vec();
@@ -916,6 +1188,9 @@ impl ReviewContextIndex {
             bucket,
         )?;
         let seal = view_seal_digest(digest, sequence, stores.generation(), root, &metadata);
+        let cohort_cpu7_binding = cpu7_original_bundle
+            .as_ref()
+            .map(|source| cohort_cpu7_view_binding(source.digest(), policy.digest(), digest, seal));
         let pin = stores.pin_review(pins)?;
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
@@ -923,6 +1198,8 @@ impl ReviewContextIndex {
             root_state: root,
             generation: stores.generation(),
             policy,
+            cohort_cpu7: cpu7_original_bundle,
+            cohort_cpu7_binding,
             records,
             metadata,
             anchors,
@@ -1097,12 +1374,17 @@ impl ReviewContextIndex {
             source.root_state,
             &source.metadata,
         );
+        let cohort_cpu7_binding = source.cohort_cpu7.as_ref().map(|original| {
+            cohort_cpu7_view_binding(original.digest(), source.policy.digest(), digest, seal)
+        });
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
             sequence,
             root_state: source.root_state,
             generation: source.generation,
             policy: source.policy,
+            cohort_cpu7: source.cohort_cpu7.clone(),
+            cohort_cpu7_binding,
             records: source.records.clone(),
             metadata: source.metadata.clone(),
             anchors: source.anchors.clone(),
@@ -1180,6 +1462,78 @@ fn write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), ReviewError
     }
     Ok(())
 }
+/// Link an original index snapshot to this exact selected query view. This
+/// remains per-root metadata, not a substitute for trial or model authority.
+fn cohort_cpu7_view_binding(
+    original: [u8; 32],
+    policy: [u8; 32],
+    input: [u8; 32],
+    view_seal: [u8; 32],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-cohort-cpu7-view-binding/1\0");
+    hash.update(original);
+    hash.update(policy);
+    hash.update(input);
+    hash.update(view_seal);
+    hash.finalize().into()
+}
+
+/// Hash original index records and observation handles independently from the
+/// selected model input. Observation/line payloads are not hashed here. Each
+/// root has its own evidence digest and identity; this is not historical proof.
+fn cohort_cpu7_original_digest(
+    bundle_id: u64,
+    generation: u64,
+    root: StateId,
+    root_snapshot: &PositionSnapshot,
+    anchor: &PositionSnapshot,
+    records: &[CohortCpu7OriginalRecord],
+    selected_len: usize,
+) -> Result<[u8; 32], ReviewError> {
+    fn optional(hash: &mut Sha256, value: Option<u64>) {
+        hash.update([u8::from(value.is_some())]);
+        hash.update(value.unwrap_or_default().to_le_bytes());
+    }
+    if selected_len == 0 || selected_len > records.len() || records.len() > 64 {
+        return Err(ReviewError::ViewCapacity);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-cohort-cpu7-original-bundle/1\0");
+    hash.update(bundle_id.to_le_bytes());
+    hash.update(generation.to_le_bytes());
+    hash.update((root.0 as u64).to_le_bytes());
+    hash.update(snapshot_digest(root_snapshot)?);
+    hash.update(snapshot_digest(anchor)?);
+    hash.update((selected_len as u16).to_le_bytes());
+    hash.update((records.len() as u16).to_le_bytes());
+    for item in records {
+        let record = &item.record;
+        hash.update(record.revision.to_le_bytes());
+        optional(&mut hash, record.parent_revision);
+        optional(&mut hash, record.supersedes_revision);
+        hash.update((record.origin_state.0 as u64).to_le_bytes());
+        hash.update([
+            record.kind as u8,
+            u8::from(record.perspective == Color::Black),
+            u8::from(record.critical),
+        ]);
+        write_moves(&mut hash, &record.line)?;
+        hash.update([u8::from(record.value.is_some())]);
+        hash.update(record.value.unwrap_or_default().to_le_bytes());
+        hash.update(record.completed_depth.to_le_bytes());
+        hash.update([match record.score_scope {
+            None => 0,
+            Some(crate::cpu::CpuScoreScope::FrontierOnly) => 1,
+            Some(crate::cpu::CpuScoreScope::CompletedIteration) => 2,
+            Some(crate::cpu::CpuScoreScope::RulesTerminal) => 3,
+        }]);
+        optional(&mut hash, record.cpu_observation.map(|id| id.0 as u64));
+        optional(&mut hash, item.evidence.map(|id| id.0 as u64));
+    }
+    Ok(hash.finalize().into())
+}
+
 pub(in crate::pals) fn snapshot_digest(
     snapshot: &PositionSnapshot,
 ) -> Result<[u8; 32], ReviewError> {
@@ -1366,6 +1720,50 @@ mod tests {
         }
     }
 
+    // Typed fixture evidence, not a claim that a physical CPU worker ran.
+    fn cpu_fixture_observation(
+        stores: &mut PalsStores,
+        state: StateId,
+        sequence: u64,
+    ) -> ObservationId {
+        use super::super::store::{BoundKind, Observation, RawScore};
+        stores
+            .observations
+            .append(Observation {
+                state,
+                line: None,
+                source: sequence,
+                epoch: 1,
+                value_identity: Some(crate::cpu_value::CpuValueIdentity {
+                    semantics: crate::cpu::BOOTSTRAP_SCORE_VERSION.into(),
+                    weights_sha256: None,
+                    training: crate::cpu_value::CpuTrainingState::Bootstrap,
+                }),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: Some("cpu7-fixture-conditions".into()),
+                cpu_pv: None,
+                scope: EvidenceScope::DepthLimited {
+                    depth: 1,
+                    profile: 1,
+                    condition: 1,
+                },
+                score: RawScore::Cpu {
+                    value: 0,
+                    perspective: Color::White,
+                    bound: BoundKind::ExactWithinSearch,
+                },
+                budget: 1,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: None,
+            })
+            .unwrap()
+    }
+
     #[test]
     fn selected_bundle_keeps_parent_supersedes_and_query_duplicates_are_charged() {
         let (stores, state) = stores(&Position::startpos());
@@ -1408,6 +1806,248 @@ mod tests {
         assert_eq!(view.records_metadata()[2].supersedes, Some(0));
         assert_eq!(view.length_bucket(), 8);
         assert_eq!(stores.review_pin_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn cohort_cpu_prefix_requires_seven_and_preserves_later_observations() {
+        let (mut stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let p = record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None);
+        let c = record(
+            state,
+            2,
+            RecordKind::Counterexample,
+            "e2e4 e7e5 g1f3",
+            Some(1),
+        );
+        let bundle = index.publish(&stores, &p, None).unwrap();
+        index.publish(&stores, &c, None).unwrap();
+        for revision in 3..=8 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(if revision == 3 { 1 } else { revision - 1 }),
+            );
+            cpu.supersedes_revision = (revision > 3).then_some(revision - 1);
+            cpu.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, revision));
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), policy),
+            Err(ReviewError::ViewCapacity)
+        ));
+        let mut seventh = record(state, 9, RecordKind::CpuVerification, "e2e4 e7e5", Some(8));
+        seventh.supersedes_revision = Some(8);
+        seventh.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, 9));
+        index.publish(&stores, &seventh, None).unwrap();
+        let limited = ReviewSelectionPolicy {
+            max_records: 8,
+            ..policy
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, limited));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), limited),
+            Err(ReviewError::ViewCapacity)
+        ));
+        let legacy = ReviewSelectionPolicy {
+            mode: ReviewAnchorMode::CurrentRootOnly,
+            ..policy
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, legacy));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), legacy),
+            Err(ReviewError::InvalidPolicy)
+        ));
+        let first = index
+            .select_cohort_cpu7(&stores, state, empty_query(), policy)
+            .unwrap();
+        assert_eq!(first.records().len(), 9);
+        assert!(first.is_cohort_cpu7());
+        assert_eq!(
+            first.cohort_cpu7_original_bundle().unwrap().records().len(),
+            9
+        );
+        assert_ne!(first.selection_policy().digest(), policy.digest());
+        // Keep the actual pinned source while later observations arrive.
+        let first_scope = first.record_scope_digest();
+        for extra in 10..=12 {
+            let mut later = record(
+                state,
+                extra,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(extra - 1),
+            );
+            later.supersedes_revision = Some(extra - 1);
+            later.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, extra));
+            index.publish(&stores, &later, None).unwrap();
+        }
+        let again = index
+            .select_cohort_cpu7(&stores, state, empty_query(), policy)
+            .unwrap();
+        assert_eq!(again.record_scope_digest(), first_scope);
+        assert_eq!(again.records_metadata()[8].supersedes, Some(7));
+        let original = again.cohort_cpu7_original_bundle().unwrap();
+        assert_eq!(original.records().len(), 12);
+        assert_eq!(original.selected_len(), 9);
+        assert_eq!(
+            original.records()[8].record().revision,
+            again.records_metadata()[8].source_revision
+        );
+        assert_eq!(
+            first.cohort_cpu7_original_bundle().unwrap().records().len(),
+            9
+        );
+        assert_ne!(
+            original.digest(),
+            first.cohort_cpu7_original_bundle().unwrap().digest()
+        );
+        assert_ne!(again.cohort_cpu7_binding(), first.cohort_cpu7_binding());
+        let ordinary = index.select(&stores, state, empty_query(), policy).unwrap();
+        assert_eq!(ordinary.records().len(), 12);
+        assert!(!ordinary.is_cohort_cpu7());
+    }
+
+    #[test]
+    fn cohort_cpu_prefix_keeps_required_repair_and_excludes_other_bundle() {
+        let (mut stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let proposal = record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None);
+        let bundle = index.publish(&stores, &proposal, None).unwrap();
+        index
+            .publish(
+                &stores,
+                &record(
+                    state,
+                    2,
+                    RecordKind::Counterexample,
+                    "e2e4 e7e5 g1f3",
+                    Some(1),
+                ),
+                None,
+            )
+            .unwrap();
+        index
+            .publish(
+                &stores,
+                &record(state, 3, RecordKind::Repair, "e2e4 e7e5 b1c3", Some(2)),
+                None,
+            )
+            .unwrap();
+        for revision in 4..=10 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(revision - 1),
+            );
+            if revision > 4 {
+                cpu.supersedes_revision = Some(revision - 1);
+            }
+            cpu.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, revision));
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        index
+            .publish(
+                &stores,
+                &record(state, 11, RecordKind::Proposal, "d2d4", None),
+                None,
+            )
+            .unwrap();
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        let view = index
+            .select_cohort_cpu7(&stores, state, empty_query(), policy)
+            .unwrap();
+        assert_eq!(view.records().len(), 10);
+        assert_eq!(view.selection_policy().max_records, 10);
+        assert_eq!(view.records()[2].kind, RecordKind::Repair);
+        assert_eq!(view.records_metadata()[2].parent, Some(1));
+        assert!(
+            view.records()
+                .iter()
+                .all(|record| record.line.first() == Some(&BoardMove::from_uci("e2e4").unwrap()))
+        );
+    }
+
+    #[test]
+    fn cohort_cpu_prefix_rejects_kind_without_original_observation() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let proposal = record(state, 1, RecordKind::Proposal, "e2e4", None);
+        let bundle = index.publish(&stores, &proposal, None).unwrap();
+        for revision in 2..=8 {
+            let cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4",
+                Some(revision - 1),
+            );
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, policy));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), policy),
+            Err(ReviewError::ViewCapacity)
+        ));
+    }
+
+    #[test]
+    fn cohort_cpu_prefix_does_not_count_rules_terminal_as_cpu_search() {
+        let root = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1").unwrap();
+        let (mut stores, state) = stores(&root);
+        let mut terminal = root;
+        terminal.make_uci("f7g7").unwrap();
+        let exact = stores.append_rules_terminal(&terminal, 1, 1).unwrap();
+        let mut index = ReviewContextIndex::default();
+        let bundle = index
+            .publish(
+                &stores,
+                &record(state, 1, RecordKind::Proposal, "f7g7", None),
+                None,
+            )
+            .unwrap();
+        let mut first = record(state, 2, RecordKind::CpuVerification, "f7g7", Some(1));
+        first.cpu_observation = Some(exact);
+        index.publish(&stores, &first, None).unwrap();
+        for revision in 3..=8 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "f7g7",
+                Some(revision - 1),
+            );
+            cpu.cpu_observation = Some(cpu_fixture_observation(&mut stores, state, revision));
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        assert!(!index.cohort_cpu7_ready(&stores, policy));
+        assert!(matches!(
+            index.select_cohort_cpu7(&stores, state, empty_query(), policy),
+            Err(ReviewError::ViewCapacity)
+        ));
     }
 
     #[test]

@@ -127,8 +127,32 @@ pub(super) fn verify_trial(
         "/2 comparable/unknown observation",
     )?;
     let preparation = &wire["preparation"];
-    let prelude = shared::verify_prelude(preparation, &root)?;
-    let source_offer = context::original_source_offer(preparation)?;
+    let cpu7 = matches!(
+        profile.policy,
+        rz_experiments::rovent_utility_cohort::RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
+    );
+    let mut original_prelude = preparation.clone();
+    let selected_frame = if cpu7 {
+        let object = original_prelude
+            .as_object_mut()
+            .ok_or_else(|| error("/2 CPU7 preparation object"))?;
+        Some(
+            object
+                .remove("selected_source_frame")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| error("/2 CPU7 selected source frame missing"))?,
+        )
+    } else {
+        None
+    };
+    // CPU7 records the entire bounded Ready snapshot, including repeated
+    // recipients; legacy /2 keeps its original stricter reader unchanged.
+    let prelude = if cpu7 {
+        shared::verify_cpu7_prelude(&original_prelude, &root)?
+    } else {
+        shared::verify_prelude(&original_prelude, &root)?
+    };
+    let source_offer = context::original_source_offer(preparation, selected_frame)?;
     let raw_cost = &wire["cost"];
     let opened = number(raw_cost, "started_tick")?.checked_add(profile.input.action_ns)
         == Some(number(raw_cost, "cohort_action_cutoff_tick")?)

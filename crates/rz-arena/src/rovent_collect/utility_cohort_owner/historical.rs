@@ -595,6 +595,23 @@ pub(in crate::rovent_collect) fn verify_prelude(
     value: &Value,
     root: &RoventRootAdmissionEvidence,
 ) -> Result<Prelude, ArenaError> {
+    verify_prelude_inner(value, root, false)
+}
+
+/// CPU7 preserves every actual Ready frame, including multiple frames for a
+/// recipient. The legacy /1 and /2 readers retain their stricter contract.
+pub(in crate::rovent_collect) fn verify_cpu7_prelude(
+    value: &Value,
+    root: &RoventRootAdmissionEvidence,
+) -> Result<Prelude, ArenaError> {
+    verify_prelude_inner(value, root, true)
+}
+
+fn verify_prelude_inner(
+    value: &Value,
+    root: &RoventRootAdmissionEvidence,
+    cpu7: bool,
+) -> Result<Prelude, ArenaError> {
     fields(
         value,
         &[
@@ -691,7 +708,9 @@ pub(in crate::rovent_collect) fn verify_prelude(
         "original common position visit quota",
     )?;
     let mut offers = BTreeMap::new();
-    for offer in array(value, "offers", 3)? {
+    let mut all_offers = Vec::new();
+    let mut frame_ids = BTreeSet::new();
+    for offer in array(value, "offers", if cpu7 { 64 } else { 3 })? {
         fields(
             offer,
             &[
@@ -710,13 +729,23 @@ pub(in crate::rovent_collect) fn verify_prelude(
             ],
         )?;
         let route = route(string(offer, "recipient")?)?;
+        let semantic = hash_field(offer, "semantic_sha256")?.to_owned();
+        let frame = number(offer, "frame_sequence")?;
+        let previous = offers.insert(route, semantic.clone());
         ensure(
-            offers
-                .insert(route, hash_field(offer, "semantic_sha256")?.to_owned())
-                .is_none()
-                && number(offer, "frame_sequence")? > 0,
-            "unique ready route",
+            frame > 0
+                && if cpu7 {
+                    frame_ids.insert(frame)
+                } else {
+                    previous.is_none()
+                },
+            if cpu7 {
+                "unique ready frame"
+            } else {
+                "unique ready route"
+            },
         )?;
+        all_offers.push((route, semantic));
         let stage = string(offer, "stage")?;
         let stage_ok = match route {
             4 => matches!(
@@ -781,8 +810,9 @@ pub(in crate::rovent_collect) fn verify_prelude(
     string(value, "own_thread_readbacks")?;
     let mut h = Sha256::new();
     h.update(b"rz-rovent-utility-cohort-ready-offer-group/1\0");
-    h.update((offers.len() as u64).to_le_bytes());
-    for (role, digest) in &offers {
+    all_offers.sort_unstable();
+    h.update((all_offers.len() as u64).to_le_bytes());
+    for (role, digest) in &all_offers {
         h.update([*role]);
         h.update(unhex(digest)?);
     }

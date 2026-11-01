@@ -639,6 +639,16 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    fn enable_cohort_cpu7(&mut self) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .enable_cohort_cpu7()
+            .map_err(|error| match error {
+                PalsError::Role(rz_search::pals::engine::RoleError::Unsupported(reason)) => {
+                    AdaptiveManagerError::CohortCpu7Unsupported(reason)
+                }
+                other => semantic(other),
+            })
+    }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn utility_cohort_common_work(
         &self,

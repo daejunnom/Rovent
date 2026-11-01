@@ -143,6 +143,10 @@ where
             Box<dyn UtilityInterventionSourceObserver<Q>>,
         ),
     > {
+        let cpu7 = matches!(
+            profile.policy,
+            rz_experiments::rovent_utility_cohort::RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
+        );
         let checked = (|| {
             self.check_running()?;
             profile
@@ -216,6 +220,11 @@ where
         })();
         match checked {
             Ok((profile, prelude_cutoff, maximum_cleanup)) => {
+                if cpu7 {
+                    if let Err(error) = self.driver.enable_cohort_cpu7() {
+                        return Err((error, observer));
+                    }
+                }
                 self.utility_intervention = Some(UtilityInterventionState::awaiting_source(
                     profile,
                     prelude_cutoff,

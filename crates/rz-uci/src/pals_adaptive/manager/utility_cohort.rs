@@ -129,6 +129,11 @@ pub struct UtilityCohortReadyOffer<Q> {
     semantic: UtilityCohortOfferSemanticSource<Q>,
 }
 impl<Q> UtilityCohortReadyOffer<Q> {
+    pub(in crate::pals_adaptive) fn intervention_uses_cpu7(&self) -> bool {
+        self.selected
+            .upgrade()
+            .is_some_and(|view| view.is_cohort_cpu7())
+    }
     /// Read-only source eligibility, not an alternative recipient offer.
     pub(in crate::pals_adaptive) fn intervention_target_matches(&self, target: u16) -> bool {
         self.selected.upgrade().is_some_and(|view| {
