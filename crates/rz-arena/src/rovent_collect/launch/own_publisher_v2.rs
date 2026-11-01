@@ -372,7 +372,11 @@ impl OwnPumpConsumerV2 {
             }
         };
         Ok(Some(
-            !state.failed_items.is_empty()
+            state
+                .items
+                .iter()
+                .any(|item| matches!(item, PumpItemV2::Failed { .. }))
+                || !state.failed_items.is_empty()
                 || !state.commit_failures.is_empty()
                 || state.overflow_item.is_some(),
         ))
