@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use rz_position::{
-    BoardMove, Color, Position, PositionLimits, PositionSnapshot, MAX_UCI_REPLAY_PLIES,
+    BoardMove, Color, MAX_UCI_REPLAY_PLIES, Position, PositionLimits, PositionSnapshot,
 };
 use sha2::{Digest, Sha256};
 
@@ -2046,10 +2046,11 @@ mod tests {
         assert_eq!(view.selection_policy().max_records, 10);
         assert_eq!(view.records()[2].kind, RecordKind::Repair);
         assert_eq!(view.records_metadata()[2].parent, Some(1));
-        assert!(view
-            .records()
-            .iter()
-            .all(|record| record.line.first() == Some(&BoardMove::from_uci("e2e4").unwrap())));
+        assert!(
+            view.records()
+                .iter()
+                .all(|record| record.line.first() == Some(&BoardMove::from_uci("e2e4").unwrap()))
+        );
     }
 
     #[test]
@@ -2150,12 +2151,14 @@ mod tests {
         assert_eq!(view.token_count(), 1);
         assert_eq!(view.records_metadata()[0].source_line_offset, 2);
         assert_eq!(view.source_snapshots().len(), view.records_metadata().len());
-        assert!(stores
-            .states
-            .get(origin)
-            .unwrap()
-            .weak_position_identity()
-            .matches(&view.source_snapshots()[0]));
+        assert!(
+            stores
+                .states
+                .get(origin)
+                .unwrap()
+                .weak_position_identity()
+                .matches(&view.source_snapshots()[0])
+        );
         assert!(!view.source_snapshots()[0].same_state(&actual.snapshot()));
         assert_eq!(
             view.records_metadata()[0].original_first_move,
@@ -2213,10 +2216,12 @@ mod tests {
         assert_eq!(view.records_metadata()[0].anchor, 1);
         assert!(view.anchors()[1].snapshot.same_state(&actual.snapshot()));
         assert_eq!(view.source_snapshots().len(), 1);
-        assert!(actual
-            .snapshot()
-            .weak_position_identity()
-            .matches(&view.source_snapshots()[0]));
+        assert!(
+            actual
+                .snapshot()
+                .weak_position_identity()
+                .matches(&view.source_snapshots()[0])
+        );
     }
 
     #[test]
