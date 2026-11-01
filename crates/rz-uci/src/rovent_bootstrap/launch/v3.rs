@@ -2344,18 +2344,17 @@ pub(super) fn run_native_admitted(
         Box<dyn Fn() -> Option<crate::pals_adaptive::NativeSessionReleaseObservation>>;
     // Research-only observation uses the very same model owner and physical
     // ticket path. It is never enabled by the normal engine configuration.
-    let mut numeric_observer: Option<
-        Box<dyn crate::pals_native::ticketed::VirtualReviewCollectionObserver>,
-    > = None;
+    let mut numeric_observer: Option<super::super::V3SystemNumericObserver> = None;
     #[cfg(feature = "native-validation-diagnostics")]
     let numeric_handle = if std::env::var_os("RZ_V3_SYSTEM_NUMERIC_CAPTURE").as_deref()
         == Some(std::ffi::OsStr::new("1"))
+        && lock.manifest.purpose == rz_experiments::RoventPurpose::Validation
         && matches!(
             &lock.manifest.system_runtime_lock.runtime,
             NativeRuntimeSourceV6::SystemCuda(_)
         ) {
         let (observer, handle) = super::system_numeric_observation::attach();
-        numeric_observer = Some(observer);
+        numeric_observer = Some(super::super::V3SystemNumericObserver(observer));
         Some(handle)
     } else {
         None

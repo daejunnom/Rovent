@@ -849,7 +849,55 @@ pub fn prepare_native_v3_retaining<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
-    prepare_native_v3_inner(sources, resources.into(), clock, control, None, None)
+    prepare_native_v3_inner(
+        sources,
+        resources.into(),
+        clock,
+        control,
+        None,
+        None,
+        V3ObserverIntent::None,
+    )
+}
+
+/// Collection captures training input. The system numeric observer is an
+/// independent, opt-in diagnostic and must not grant Collection authority.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V3ObserverIntent {
+    None,
+    Collection,
+    SystemNumeric,
+}
+
+/// A diagnostic observer currently constructed only at the explicit
+/// system-CUDA validation opt-in branch. The private field limits its
+/// construction to this module and its descendants.
+#[cfg(target_os = "linux")]
+pub(crate) struct V3SystemNumericObserver(Box<dyn VirtualReviewCollectionObserver>);
+
+#[cfg(target_os = "linux")]
+fn permits_v3_observer(
+    purpose: RoventPurpose,
+    has_collection_preload: bool,
+    observer_present: bool,
+    intent: V3ObserverIntent,
+    system_cuda: bool,
+    numeric_opt_in: bool,
+) -> bool {
+    match (purpose, has_collection_preload, observer_present, intent) {
+        (RoventPurpose::Collection, true, true, V3ObserverIntent::Collection) => true,
+        (
+            RoventPurpose::Validation | RoventPurpose::Deployment,
+            false,
+            false,
+            V3ObserverIntent::None,
+        ) => true,
+        (RoventPurpose::Validation, false, true, V3ObserverIntent::SystemNumeric) => {
+            system_cuda && numeric_opt_in
+        }
+        _ => false,
+    }
 }
 
 /// The parent connection is created only by the controlled V3 launch after
@@ -861,9 +909,23 @@ pub(crate) fn prepare_native_v3_retaining_with_parent<Q: NativeQuestionProjectio
     clock: ContractSystemClock,
     control: RoventStartupControl,
     parent: Option<Arc<launch::ConnectedParent>>,
-    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    observer: Option<V3SystemNumericObserver>,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
-    prepare_native_v3_inner(sources, resources.into(), clock, control, observer, parent)
+    let intent = if observer.is_some() {
+        V3ObserverIntent::SystemNumeric
+    } else {
+        V3ObserverIntent::None
+    };
+    let observer = observer.map(|numeric| numeric.0);
+    prepare_native_v3_inner(
+        sources,
+        resources.into(),
+        clock,
+        control,
+        observer,
+        parent,
+        intent,
+    )
 }
 
 /// Prepare the single original /3 Collection worker with its input observer.
@@ -890,7 +952,15 @@ pub fn prepare_native_v3_collection_retaining<Q: NativeQuestionProjection>(
     control: RoventStartupControl,
     observer: Box<dyn VirtualReviewCollectionObserver>,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
-    prepare_native_v3_inner(sources, resources, clock, control, Some(observer), None)
+    prepare_native_v3_inner(
+        sources,
+        resources,
+        clock,
+        control,
+        Some(observer),
+        None,
+        V3ObserverIntent::Collection,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -901,6 +971,7 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
     control: RoventStartupControl,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
     parent: Option<Arc<launch::ConnectedParent>>,
+    observer_intent: V3ObserverIntent,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
     let admission = || -> Result<(), BackendError> {
         control.check()?;
@@ -918,24 +989,28 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
                 "V3 startup owner or deadline differs",
             ));
         }
-        match (observer.is_some(), sources.collection_preload_sources()) {
-            (true, Some(_))
-                if sources.lock().manifest.purpose == rz_experiments::RoventPurpose::Collection =>
-            {
-                sources.verify_collection_v3_origin()?;
-            }
-            (false, None)
-                if matches!(
-                    sources.lock().manifest.purpose,
-                    rz_experiments::RoventPurpose::Validation
-                        | rz_experiments::RoventPurpose::Deployment
-                ) => {}
-            _ => {
-                return Err(fail(
-                    K::IdentityMismatch,
-                    "V3 Collection preload and input observer differ",
-                ));
-            }
+        let system_cuda = matches!(
+            &sources.lock().manifest.system_runtime_lock.runtime,
+            NativeRuntimeSourceV6::SystemCuda(_)
+        );
+        // SystemNumeric can only be constructed at the opt-in branch in the
+        // launch, so admission does not reread mutable process environment.
+        let numeric_opt_in = cfg!(feature = "native-validation-diagnostics");
+        if !permits_v3_observer(
+            sources.lock().manifest.purpose,
+            sources.collection_preload_sources().is_some(),
+            observer.is_some(),
+            observer_intent,
+            system_cuda,
+            numeric_opt_in,
+        ) {
+            return Err(fail(
+                K::IdentityMismatch,
+                "V3 observer intent differs from purpose, preload or diagnostic configuration",
+            ));
+        }
+        if observer_intent == V3ObserverIntent::Collection {
+            sources.verify_collection_v3_origin()?;
         }
         match (
             &sources.lock().manifest.system_runtime_lock.runtime,

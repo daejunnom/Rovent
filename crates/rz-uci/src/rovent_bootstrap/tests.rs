@@ -5,6 +5,80 @@ use rz_experiments::{
 };
 use serde_json::{Value, json};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn v3_numeric_observer_is_separate_from_collection_authority() {
+    use RoventPurpose::{Collection as Collect, Deployment, Validation};
+    use V3ObserverIntent::{Collection, None as NoObserver, SystemNumeric};
+
+    assert!(permits_v3_observer(
+        Validation,
+        false,
+        true,
+        SystemNumeric,
+        true,
+        true
+    ));
+    assert!(!permits_v3_observer(
+        Validation,
+        false,
+        true,
+        SystemNumeric,
+        true,
+        false
+    ));
+    assert!(!permits_v3_observer(
+        Validation,
+        false,
+        true,
+        SystemNumeric,
+        false,
+        true
+    ));
+    assert!(!permits_v3_observer(
+        Deployment,
+        false,
+        true,
+        SystemNumeric,
+        true,
+        true
+    ));
+    assert!(!permits_v3_observer(
+        Collect,
+        true,
+        true,
+        SystemNumeric,
+        true,
+        true
+    ));
+    assert!(!permits_v3_observer(
+        Validation,
+        true,
+        true,
+        SystemNumeric,
+        true,
+        true
+    ));
+    assert!(permits_v3_observer(
+        Collect, true, true, Collection, false, false
+    ));
+    assert!(!permits_v3_observer(
+        Collect, false, true, Collection, false, false
+    ));
+    assert!(!permits_v3_observer(
+        Collect, true, false, Collection, false, false
+    ));
+    assert!(permits_v3_observer(
+        Validation, false, false, NoObserver, false, false
+    ));
+    assert!(permits_v3_observer(
+        Deployment, false, false, NoObserver, true, false
+    ));
+    assert!(!permits_v3_observer(
+        Validation, false, true, NoObserver, true, true
+    ));
+}
+
 fn artifact(name: &str) -> Value {
     json!({"path":format!("fixture/{name}"), "sha256":"a".repeat(64),
         "bytes":32, "source":"https://example.org/source-only-fixture", "license":"MIT"})
