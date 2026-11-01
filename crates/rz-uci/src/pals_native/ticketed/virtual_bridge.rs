@@ -2249,13 +2249,11 @@ mod tests {
             &[("a2a1q", None)],
             false,
         );
-        emit(
-            registered[5],
-            Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap(),
-            &[],
-            &[("e5d6", None)],
-            false,
-        );
+        let mut en_passant = Position::startpos();
+        en_passant
+            .apply_uci_moves(&["e2e4", "a7a6", "e4e5", "d7d5"])
+            .unwrap();
+        emit(registered[5], en_passant, &[], &[("e5d6", None)], false);
         emit(
             registered[6],
             Position::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap(),
