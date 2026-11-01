@@ -6,11 +6,11 @@
 
 use crate::asset;
 use crate::error::{BackendError, FailureKind, FailureStage};
-pub use crate::model_adapter::{backend_error, PhysicalFailure};
-use crate::{output, RawOutput};
+pub use crate::model_adapter::{PhysicalFailure, backend_error};
+use crate::{RawOutput, output};
 use rz_contracts::*;
-use rz_encoding::classical::{self, EncodedInput, HistoryFill, Input, INPUT_VALUES};
-use rz_encoding::{policy, POLICY_SIZE};
+use rz_encoding::classical::{self, EncodedInput, HistoryFill, INPUT_VALUES, Input};
+use rz_encoding::{POLICY_SIZE, policy};
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 
@@ -459,91 +459,140 @@ pub fn spawn_onnx_worker_profiled<P: Send + Sync + 'static>(
     mut backend: crate::onnx::OnnxBackend,
     trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
 ) -> Result<OnnxWorker<P>, ContractError> {
-    use rz_telemetry::source::SourceStage;
-    use std::time::Instant;
-    if trace.is_some() && !backend.config().source_profile_supported() {
+    validate_onnx_worker_trace(&backend, trace.is_some())?;
+    crate::worker::SingleWorker::spawn_with_outcome(move |batch: &PreparedBatch<P>| {
+        run_onnx_worker_batch(&mut backend, batch, trace.as_ref())
+    })
+    .map_err(|failure| backend_error(&failure))
+}
+
+/// Opt-in owner-preserving path. A successful session-release proof belongs
+/// only to this backend and is neither a device-wide fence nor recovery from
+/// an unconfirmed native failure. The caller keeps `original` on admission
+/// failure and owns the corresponding recovery reservation. If native entry
+/// already occurred, the caller must keep both and its original startup scope
+/// alive on failure; dropping an unpublished reservation is not a fence.
+#[cfg(feature = "onnx")]
+pub fn spawn_onnx_worker_retained_profiled<P: Send + Sync + 'static>(
+    original: &mut Option<crate::onnx::OnnxBackend>,
+    reservation: &mut crate::worker::PhysicalRecoveryReservation,
+    trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
+) -> Result<OnnxWorker<P>, ContractError> {
+    let backend = original.as_ref().ok_or_else(|| {
+        error(
+            ErrorCode::InvalidInput,
+            Stage::Admission,
+            "missing original ONNX backend",
+        )
+    })?;
+    validate_onnx_worker_trace(backend, trace.is_some())?;
+    crate::worker::SingleWorker::spawn_with_retained_synchronous_owner(
+        original,
+        reservation,
+        move |backend, batch: &PreparedBatch<P>| {
+            run_onnx_worker_batch(backend, batch, trace.as_ref())
+        },
+        |backend, _until| backend.synchronous_shutdown_proof(),
+    )
+    .map_err(|failure| backend_error(&failure))
+}
+
+#[cfg(feature = "onnx")]
+fn validate_onnx_worker_trace(
+    backend: &crate::onnx::OnnxBackend,
+    requested: bool,
+) -> Result<(), ContractError> {
+    if requested && !backend.config().source_profile_supported() {
         return Err(error(
             ErrorCode::UnsupportedContract,
             Stage::Contract,
             "source profiling requires default B1 native execution",
         ));
     }
-    crate::worker::SingleWorker::spawn_with_outcome(move |batch: &PreparedBatch<P>| {
-        let started = trace.as_ref().map(|_| Instant::now());
-        let completed = (|| {
-            for item in batch.requests() {
-                if item.backend.0 != backend.identity()
-                    || item.request.context().model.manifest.0 != backend.asset_identity()
-                {
-                    return Err(error(
-                        ErrorCode::IdentityMismatch,
-                        Stage::Admission,
-                        "batch does not belong to this physical backend",
-                    )
-                    .into());
-                }
+    Ok(())
+}
+
+#[cfg(feature = "onnx")]
+fn run_onnx_worker_batch<P: Send + Sync + 'static>(
+    backend: &mut crate::onnx::OnnxBackend,
+    batch: &PreparedBatch<P>,
+    trace: Option<&rz_telemetry::source::SourceJournal<CompletionContext>>,
+) -> crate::worker::PhysicalRun<Result<Vec<EvalOutput>, PhysicalFailure>> {
+    use rz_telemetry::source::SourceStage;
+    use std::time::Instant;
+    let started = trace.map(|_| Instant::now());
+    let completed = (|| {
+        for item in batch.requests() {
+            if item.backend.0 != backend.identity()
+                || item.request.context().model.manifest.0 != backend.asset_identity()
+            {
+                return Err(error(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Admission,
+                    "batch does not belong to this physical backend",
+                )
+                .into());
             }
-            let inputs = batch
-                .requests()
-                .iter()
-                .map(PreparedRequest::encoded)
-                .collect::<Vec<_>>();
-            let raw = if let Some(trace) = &trace {
-                let (result, timing) = backend.run_profiled(&inputs);
-                let key = batch.requests().first().map(|item| CompletionContext {
-                    request: item.request.context(),
-                    execution: Some(batch.execution()),
-                });
-                for (stage, span, succeeded) in [
-                    (SourceStage::NativePreparation, timing.preparation, true),
-                    (
-                        SourceStage::NativeInvocation,
-                        timing.invocation,
-                        timing.completion_attested,
-                    ),
-                    (SourceStage::NativeOutput, timing.output, result.is_ok()),
-                ] {
-                    if let Some((start, end)) = span {
-                        trace.record(key, stage, start, end, succeeded);
-                    }
-                }
-                result
-            } else {
-                backend.run(&inputs)
-            }
-            .map_err(PhysicalFailure::from)?;
-            let completed = batch
-                .requests()
-                .iter()
-                .zip(&raw)
-                .map(|(request, raw)| request.physical_output(raw, batch.execution()))
-                .collect();
-            backend.recycle_outputs(raw);
-            completed
-        })();
-        if let (Some(trace), Some(start)) = (&trace, started) {
+        }
+        let inputs = batch
+            .requests()
+            .iter()
+            .map(PreparedRequest::encoded)
+            .collect::<Vec<_>>();
+        let raw = if let Some(trace) = trace {
+            let (result, timing) = backend.run_profiled(&inputs);
             let key = batch.requests().first().map(|item| CompletionContext {
                 request: item.request.context(),
                 execution: Some(batch.execution()),
             });
-            trace.record(
-                key,
-                SourceStage::PhysicalWorker,
-                start,
-                Instant::now(),
-                completed.is_ok() && backend.physical_quarantine_cause().is_none(),
-            );
-        }
-        if let Some(cause) = backend.physical_quarantine_cause() {
-            // CUDA Run returned an error without a completion fence. No
-            // physical_output/ActualCompute or completed error may escape as
-            // Ready; the worker retains this batch and backend until exit.
-            crate::worker::PhysicalRun::Quarantined(cause.clone())
+            for (stage, span, succeeded) in [
+                (SourceStage::NativePreparation, timing.preparation, true),
+                (
+                    SourceStage::NativeInvocation,
+                    timing.invocation,
+                    timing.completion_attested,
+                ),
+                (SourceStage::NativeOutput, timing.output, result.is_ok()),
+            ] {
+                if let Some((start, end)) = span {
+                    trace.record(key, stage, start, end, succeeded);
+                }
+            }
+            result
         } else {
-            crate::worker::PhysicalRun::Complete(completed)
+            backend.run(&inputs)
         }
-    })
-    .map_err(|failure| backend_error(&failure))
+        .map_err(PhysicalFailure::from)?;
+        let completed = batch
+            .requests()
+            .iter()
+            .zip(&raw)
+            .map(|(request, raw)| request.physical_output(raw, batch.execution()))
+            .collect();
+        backend.recycle_outputs(raw);
+        completed
+    })();
+    if let (Some(trace), Some(start)) = (trace, started) {
+        let key = batch.requests().first().map(|item| CompletionContext {
+            request: item.request.context(),
+            execution: Some(batch.execution()),
+        });
+        trace.record(
+            key,
+            SourceStage::PhysicalWorker,
+            start,
+            Instant::now(),
+            completed.is_ok() && backend.physical_quarantine_cause().is_none(),
+        );
+    }
+    if let Some(cause) = backend.physical_quarantine_cause() {
+        // CUDA Run returned an error without a completion fence. No
+        // physical_output/ActualCompute or completed error may escape as
+        // Ready; the worker retains this batch and backend until exit.
+        crate::worker::PhysicalRun::Quarantined(cause.clone())
+    } else {
+        crate::worker::PhysicalRun::Complete(completed)
+    }
 }
 
 fn ordered_indices(

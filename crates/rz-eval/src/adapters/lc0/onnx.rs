@@ -241,6 +241,29 @@ fn with_system_ort_entry<T>(
     initialize(path)
 }
 
+#[cfg(target_os = "linux")]
+fn with_checked_system_ort_entry<T>(
+    path: Option<&str>,
+    before_native: impl FnOnce() -> Result<(), BackendError>,
+    entered: &std::cell::Cell<bool>,
+    initialize: impl FnOnce(&str) -> Result<T, BackendError>,
+) -> Result<T, BackendError> {
+    with_system_ort_entry(
+        path,
+        || {},
+        |path| {
+            before_native()?;
+            entered.set(true);
+            initialize(path)
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn should_latch_system_attempt(entered: bool, latch_before_entry_failure: bool) -> bool {
+    entered || latch_before_entry_failure
+}
+
 impl OrtRuntime {
     /// Bootstrap must be the sole initializer of the process-global `ort`
     /// library. Refuse prior initialization, path changes and failed retries.
@@ -434,6 +457,35 @@ impl OrtRuntime {
         runtime: &SystemRuntime,
         before_native: impl FnOnce(),
     ) -> Result<Self, BackendError> {
+        Self::load_system_cuda_with_entry_impl(
+            runtime,
+            || {
+                before_native();
+                Ok(())
+            },
+            true,
+        )
+    }
+
+    /// Check the caller's live capability immediately before first native
+    /// initialization. Rejection or unwind before entry does not install a
+    /// process latch. On same-owner latch reuse this hook is not called: the
+    /// caller must independently recheck its parent and scope in that branch.
+    /// The check runs under the runtime mutex and must not reenter this loader.
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda_with_checked_entry(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<Self, BackendError> {
+        Self::load_system_cuda_with_entry_impl(runtime, before_native, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_system_cuda_with_entry_impl(
+        runtime: &SystemRuntime,
+        before_native: impl FnOnce() -> Result<(), BackendError>,
+        latch_before_entry_failure: bool,
+    ) -> Result<Self, BackendError> {
         let unavailable = system_runtime_unavailable;
         let libraries = runtime.libraries();
         let core = libraries
@@ -481,8 +533,9 @@ impl OrtRuntime {
         // entry and must not install a latch for an unattempted initialization.
         // Existing latch reuse retains its historical validation order.
         let core_path = core.canonical_path.to_str().ok_or_else(unavailable)?;
+        let entered = std::cell::Cell::new(false);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_system_ort_entry(Some(core_path), before_native, |path| {
+            with_checked_system_ort_entry(Some(core_path), before_native, &entered, |path| {
                 if !ort::init_from(path)
                     .with_name("RoveZero-C-system")
                     .commit()
@@ -533,6 +586,9 @@ impl OrtRuntime {
             };
             Err(error)
         });
+        if !should_latch_system_attempt(entered.get(), latch_before_entry_failure) {
+            return result;
+        }
         *guard = Some(RuntimeLatch {
             owner,
             loading_profile: None,
@@ -870,6 +926,56 @@ mod native_loading_profile_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn checked_system_entry_distinguishes_rejection_panic_and_entered_failure() {
+        let entered = std::cell::Cell::new(false);
+        let called = std::cell::Cell::new(false);
+        let rejected = with_checked_system_ort_entry(
+            Some("/not-opened"),
+            || Err(BackendError::new(K::InvalidInput, S::Admission, "denied")),
+            &entered,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        );
+        assert!(rejected.is_err());
+        assert!(!entered.get() && !called.get());
+        assert!(!should_latch_system_attempt(entered.get(), false));
+        assert!(should_latch_system_attempt(entered.get(), true));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_checked_system_ort_entry(
+                Some("/not-opened"),
+                || panic!("admission panic"),
+                &entered,
+                |_| {
+                    called.set(true);
+                    Ok(())
+                },
+            );
+        }));
+        assert!(panic.is_err());
+        assert!(!entered.get() && !called.get());
+        assert!(!should_latch_system_attempt(entered.get(), false));
+
+        let native_error = with_checked_system_ort_entry(
+            Some("/not-opened"),
+            || Ok(()),
+            &entered,
+            |_| {
+                Err::<(), _>(BackendError::new(
+                    K::BackendFailure,
+                    S::Backend,
+                    "native failure",
+                ))
+            },
+        );
+        assert!(native_error.is_err() && entered.get());
+        assert!(should_latch_system_attempt(entered.get(), false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn system_ort_entry_rejects_bad_path_before_native_callback() {
         let entered = std::cell::Cell::new(false);
         let called = std::cell::Cell::new(false);
@@ -1158,6 +1264,167 @@ impl AsRef<[u8]> for VerifiedModel<'_> {
     }
 }
 
+/// Status of this exact opt-in startup, not a device-wide completion claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lc0StartupState {
+    BeforeSessionEntry,
+    NativeEnteredUnknown,
+    Ready,
+    Transferred,
+}
+
+#[derive(Default)]
+struct Lc0StartupSlots {
+    session: Option<SessionStorage>,
+    backend: Option<OnnxBackend>,
+}
+
+fn enter_lc0_session(
+    state: &mut Lc0StartupState,
+    before_native: &mut impl FnMut() -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    before_native()?;
+    *state = Lc0StartupState::NativeEnteredUnknown;
+    Ok(())
+}
+
+fn take_ready_pair<A, B>(
+    state: &mut Lc0StartupState,
+    metadata: &mut Option<A>,
+    backend: &mut Option<B>,
+) -> Option<(A, B)> {
+    if *state != Lc0StartupState::Ready || metadata.is_none() || backend.is_none() {
+        return None;
+    }
+    let metadata = metadata.take().expect("checked metadata");
+    let backend = backend.take().expect("checked backend");
+    *state = Lc0StartupState::Transferred;
+    Some((metadata, backend))
+}
+
+/// Caller-owned custody for one LC0 startup attempt.  The original serialized
+/// model, runtime and any session/backend returned by ORT stay in this owner on
+/// errors and unwinds.  An entered but failed attempt is not a completion
+/// fence, including when ORT never returned a partial session to Rust.
+pub struct Lc0StartupCustody {
+    runtime: Option<OrtRuntime>,
+    metadata: Option<AssetMetadata>,
+    serialized: Option<Vec<u8>>,
+    slots: Lc0StartupSlots,
+    state: Lc0StartupState,
+    attempted: bool,
+}
+
+impl Lc0StartupCustody {
+    pub fn new(runtime: OrtRuntime, asset: MaiaAsset) -> Self {
+        let (metadata, bytes) = asset.into_parts();
+        Self {
+            runtime: Some(runtime),
+            metadata: Some(metadata),
+            serialized: Some(bytes),
+            slots: Lc0StartupSlots::default(),
+            state: Lc0StartupState::BeforeSessionEntry,
+            attempted: false,
+        }
+    }
+    pub fn state(&self) -> Lc0StartupState {
+        self.state
+    }
+    pub fn metadata(&self) -> Option<&AssetMetadata> {
+        self.metadata.as_ref()
+    }
+
+    /// Callback is invoked immediately before the first session-builder entry,
+    /// after admission. It must enforce the caller's original parent scope.
+    pub fn load(
+        &mut self,
+        config: BackendConfig,
+        mut before_native: impl FnMut() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        if self.attempted {
+            return Err(BackendError::new(
+                K::InvalidInput,
+                S::Admission,
+                "LC0 startup owner has already been used",
+            ));
+        }
+        self.attempted = true;
+        let runtime = self.runtime.as_ref().expect("original runtime");
+        let bytes = self.serialized.as_deref().expect("original model");
+        let state = &mut self.state;
+        let mut entry = || enter_lc0_session(state, &mut before_native);
+        let backend = OnnxBackend::load_model(
+            runtime,
+            self.metadata.as_ref().expect("original metadata"),
+            VerifiedModel::BorrowedOnnx(bytes),
+            config,
+            &mut |_| {},
+            None,
+            Some(&mut self.slots),
+            Some(&mut entry),
+        )?;
+        self.slots.backend = Some(backend);
+        self.serialized = None;
+        self.state = Lc0StartupState::Ready;
+        Ok(())
+    }
+    pub fn take_backend(&mut self) -> Option<OnnxBackend> {
+        if self.state != Lc0StartupState::Ready {
+            return None;
+        }
+        let backend = self.slots.backend.take()?;
+        self.state = Lc0StartupState::Transferred;
+        Some(backend)
+    }
+
+    /// Transfer the exact original metadata and completed backend together.
+    /// A failed or incomplete startup leaves every custody field untouched.
+    pub fn take_ready(&mut self) -> Option<(AssetMetadata, OnnxBackend)> {
+        take_ready_pair(&mut self.state, &mut self.metadata, &mut self.slots.backend)
+    }
+}
+
+impl Drop for Lc0StartupCustody {
+    fn drop(&mut self) {
+        if self.state == Lc0StartupState::NativeEnteredUnknown {
+            // No destructor or owner disconnect can manufacture a fence.
+            std::mem::forget((
+                self.runtime.take(),
+                self.serialized.take(),
+                self.slots.session.take(),
+                self.slots.backend.take(),
+            ));
+        }
+    }
+}
+
+struct SynchronousRunTracker {
+    clean: bool,
+    completed: u64,
+}
+impl SynchronousRunTracker {
+    fn new() -> Self {
+        Self {
+            clean: true,
+            completed: 0,
+        }
+    }
+    fn enter(&mut self) -> bool {
+        std::mem::replace(&mut self.clean, false)
+    }
+    fn returned(&mut self, was_clean: bool, success: bool) {
+        let next = if success {
+            self.completed.checked_add(1)
+        } else {
+            None
+        };
+        if let Some(count) = next {
+            self.completed = count;
+        }
+        self.clean = was_clean && next.is_some();
+    }
+}
+
 pub struct OnnxBackend {
     session: Option<SessionStorage>,
     // Kept outside the Run stack so worker quarantine also pins tensor storage
@@ -1181,6 +1448,9 @@ pub struct OnnxBackend {
     // The loaded CUDA session can re-audit its actual nineteen-library maps
     // without accepting a caller-selected runtime or private mutable pathname.
     cuda_runtime: Option<OrtRuntime>,
+    synchronous_identity: Arc<()>,
+    synchronous_runs: SynchronousRunTracker,
+    startup_complete: bool,
 }
 
 impl Drop for OnnxBackend {
@@ -1211,6 +1481,8 @@ impl OnnxBackend {
             config,
             &mut |_| {},
             None,
+            None,
+            None,
         )
     }
 
@@ -1240,6 +1512,8 @@ impl OnnxBackend {
             VerifiedModel::OwnedOnnx(bytes),
             config,
             &mut observe,
+            None,
+            None,
             None,
         )?;
         Ok((metadata, backend))
@@ -1272,6 +1546,8 @@ impl OnnxBackend {
             },
             config,
             &mut observe,
+            None,
+            None,
             None,
         )?;
         Ok((asset.source, backend))
@@ -1309,6 +1585,8 @@ impl OnnxBackend {
             config,
             &mut |_| {},
             Some(output),
+            None,
+            None,
         )?;
         Ok((metadata, backend))
     }
@@ -1320,6 +1598,8 @@ impl OnnxBackend {
         config: BackendConfig,
         observe: &mut impl FnMut(StartupPhase),
         export: Option<&std::fs::File>,
+        custody: Option<&mut Lc0StartupSlots>,
+        before_session: Option<&mut dyn FnMut() -> Result<(), BackendError>>,
     ) -> Result<Self, BackendError> {
         let setup_started = Instant::now();
         config.validate()?;
@@ -1363,6 +1643,9 @@ impl OnnxBackend {
             )
             .with_ort_cause(code, error)
         };
+        if let Some(before_session) = before_session {
+            before_session()?;
+        }
         let mut builder = Session::builder()
             .map_err(|error| setup_error(CauseCode::SessionBuilder, error))?
             .with_no_environment_execution_providers()
@@ -1525,7 +1808,13 @@ impl OnnxBackend {
             ),
         };
         let model_commit = commit_started.elapsed();
-        validate_interface(&session, asset.profile())?;
+        let mut local_slots = Lc0StartupSlots::default();
+        let slots = custody.unwrap_or(&mut local_slots);
+        slots.session = Some(session);
+        validate_interface(
+            slots.session.as_ref().expect("returned session"),
+            asset.profile(),
+        )?;
         // This is a versioned C backend identity, not a new global wire codec.
         let mut identity = declared_backend_identity(
             runtime.binary_digest(),
@@ -1551,8 +1840,8 @@ impl OnnxBackend {
         }
         let cuda_runtime =
             matches!(config.provider, Provider::Cuda { .. }).then(|| runtime.clone());
-        let mut result = Self {
-            session: Some(session),
+        slots.backend = Some(Self {
+            session: slots.session.take(),
             active_input: None,
             #[cfg(feature = "experimental-io-buffers")]
             spare_input: None,
@@ -1573,7 +1862,11 @@ impl OnnxBackend {
             cuda_evidence: None,
             quarantine_cause: None,
             cuda_runtime,
-        };
+            synchronous_identity: Arc::new(()),
+            synchronous_runs: SynchronousRunTracker::new(),
+            startup_complete: false,
+        });
+        let result = slots.backend.as_mut().expect("installed LC0 backend");
         if matches!(result.config.provider, Provider::Cuda { .. }) {
             let probe_started = Instant::now();
             runtime.verify_cuda_mappings(false)?;
@@ -1667,7 +1960,8 @@ impl OnnxBackend {
             result.startup_timings.cuda_probe_validation = Some(probe_started.elapsed());
         }
         observe(StartupPhase::ProviderReady);
-        Ok(result)
+        result.startup_complete = true;
+        Ok(slots.backend.take().expect("completed LC0 backend"))
     }
 
     /// Owned model storage, not total ORT or GPU memory.
@@ -1692,6 +1986,28 @@ impl OnnxBackend {
     }
     pub fn cuda_evidence(&self) -> Option<&CudaEvidence> {
         self.cuda_evidence.as_ref()
+    }
+
+    /// Identity of this exact session owner; it is not a completion fence.
+    pub fn synchronous_owner_identity(&self) -> Arc<()> {
+        Arc::clone(&self.synchronous_identity)
+    }
+
+    /// Same-owner normal session release only. Zero completed Runs is not GPU
+    /// execution evidence, and this proof is not a device-wide fence.
+    pub fn synchronous_shutdown_proof(&self) -> Option<crate::worker::SynchronousOwnerProof> {
+        if !self.startup_complete
+            || !self.synchronous_runs.clean
+            || self.session.is_none()
+            || self.active_input.is_some()
+            || self.quarantine_cause.is_some()
+        {
+            return None;
+        }
+        Some(crate::worker::SynchronousOwnerProof::new(
+            Arc::clone(&self.synchronous_identity),
+            self.synchronous_runs.completed,
+        ))
     }
 
     /// Actual loaded runtime metadata, not a caller-issued provider claim.
@@ -1976,12 +2292,17 @@ impl OnnxBackend {
                 };
                 self.bound = Some(buffers);
             }
+            let was_clean = self.synchronous_runs.enter();
             let result = self.bound.as_mut().expect("fixed binding").run(
                 self.session.as_mut().expect("loaded session"),
                 self.active_input.as_ref().expect("input pin"),
                 &mut self.raw_pool,
                 self.config.experiments.reuse_buffers,
                 self.timings.as_mut(),
+            );
+            self.synchronous_runs.returned(
+                was_clean,
+                matches!(&result, Ok(_) | Err(io::BoundFailure::Output(_))),
             );
             match result {
                 Ok(outputs) => {
@@ -2020,6 +2341,7 @@ impl OnnxBackend {
         {
             timing.preparation = Some((start, end));
         }
+        let was_clean = self.synchronous_runs.enter();
         let run_result = self
             .session
             .as_mut()
@@ -2028,6 +2350,8 @@ impl OnnxBackend {
             })?
             .run(ort::inputs![INPUT_NAME => self.active_input.as_ref()
             .ok_or(BackendError::new(K::BackendFailure, S::Backend, "input pin is missing"))?]);
+        self.synchronous_runs
+            .returned(was_clean, run_result.is_ok());
         if let (Some(timing), Some(started)) = (&mut self.timings, run_started) {
             timing.run = started.elapsed();
         }
@@ -2094,6 +2418,13 @@ impl OnnxBackend {
             timing.output = Some((start, Instant::now()));
         }
         result
+    }
+}
+
+impl crate::worker::synchronous_owner_sealed::Sealed for OnnxBackend {}
+impl crate::worker::SynchronousPhysicalOwner for OnnxBackend {
+    fn synchronous_owner_identity(&self) -> Arc<()> {
+        OnnxBackend::synchronous_owner_identity(self)
     }
 }
 
@@ -2238,6 +2569,82 @@ pub fn verify_cuda_profile(bytes: &[u8]) -> Result<usize, BackendError> {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+    #[test]
+    fn ready_pair_transfer_is_atomic_and_preserves_owner_values() {
+        let mut state = Lc0StartupState::NativeEnteredUnknown;
+        let mut metadata = Some(Box::new(7_u8));
+        let mut backend = Some(Box::new(9_u8));
+        let original_metadata = &**metadata.as_ref().unwrap() as *const u8;
+        let original_backend = &**backend.as_ref().unwrap() as *const u8;
+        assert!(take_ready_pair(&mut state, &mut metadata, &mut backend).is_none());
+        assert!(metadata.is_some() && backend.is_some());
+        state = Lc0StartupState::Ready;
+        let (moved_metadata, moved_backend) =
+            take_ready_pair(&mut state, &mut metadata, &mut backend).unwrap();
+        assert_eq!(&*moved_metadata as *const u8, original_metadata);
+        assert_eq!(&*moved_backend as *const u8, original_backend);
+        assert_eq!(state, Lc0StartupState::Transferred);
+        assert!(metadata.is_none() && backend.is_none());
+        assert!(take_ready_pair(&mut state, &mut metadata, &mut backend).is_none());
+
+        let mut state = Lc0StartupState::Ready;
+        let mut metadata = Some(7_u8);
+        let mut backend: Option<u8> = None;
+        assert!(take_ready_pair(&mut state, &mut metadata, &mut backend).is_none());
+        assert_eq!(state, Lc0StartupState::Ready);
+        assert_eq!(metadata, Some(7));
+    }
+    #[test]
+    fn rejected_or_unwound_admission_does_not_claim_native_entry() {
+        let mut state = Lc0StartupState::BeforeSessionEntry;
+        let result = enter_lc0_session(&mut state, &mut || {
+            Err(BackendError::new(K::InvalidInput, S::Admission, "rejected"))
+        });
+        assert!(result.is_err());
+        assert_eq!(state, Lc0StartupState::BeforeSessionEntry);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = enter_lc0_session(&mut state, &mut || panic!("admission panic"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(state, Lc0StartupState::BeforeSessionEntry);
+
+        enter_lc0_session(&mut state, &mut || Ok(())).expect("admitted");
+        assert_eq!(state, Lc0StartupState::NativeEnteredUnknown);
+    }
+
+    #[test]
+    fn synchronous_tracker_requires_success_and_never_clears_taint() {
+        let mut tracker = SynchronousRunTracker::new();
+        assert!(tracker.clean);
+        let entry = tracker.enter();
+        assert!(!tracker.clean);
+        tracker.returned(entry, true);
+        assert!(tracker.clean);
+        assert_eq!(tracker.completed, 1);
+        let entry = tracker.enter();
+        tracker.returned(entry, false);
+        assert!(!tracker.clean);
+        let entry = tracker.enter();
+        tracker.returned(entry, true);
+        assert!(!tracker.clean);
+        assert_eq!(tracker.completed, 2);
+    }
+
+    #[test]
+    fn synchronous_tracker_unwind_and_count_overflow_remain_dirty() {
+        let mut tracker = SynchronousRunTracker::new();
+        let _ = tracker.enter(); // an unwind skips returned()
+        assert!(!tracker.clean);
+        let mut tracker = SynchronousRunTracker {
+            clean: true,
+            completed: u64::MAX,
+        };
+        let entry = tracker.enter();
+        tracker.returned(entry, true);
+        assert!(!tracker.clean);
+        assert_eq!(tracker.completed, u64::MAX);
+    }
     #[test]
     fn native_storage_drops_before_borrowed_model_on_success_error_and_unwind() {
         use std::sync::atomic::{AtomicBool, Ordering};

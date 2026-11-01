@@ -50,6 +50,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+#[allow(dead_code)]
+mod system_cuda;
+
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_FATAL_RECEIPTS: usize = 32;
 const NATIVE_DIAGNOSTIC_CAPACITY: usize = 32;
@@ -92,6 +96,8 @@ pub struct NativeConfig {
     provider: NativeProvider,
     cuda_bundle: Option<PathBuf>,
     cuda_bundle_sha256: Option<[u8; 32]>,
+    system_cuda_lock: Option<PathBuf>,
+    system_cuda_lock_sha256: Option<[u8; 32]>,
 }
 impl fmt::Debug for NativeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -114,6 +120,8 @@ impl fmt::Debug for NativeConfig {
                 "bundle",
                 &(self.cuda_bundle.is_some(), &self.cuda_bundle_sha256),
             )
+            .field("system_cuda_lock", &self.system_cuda_lock.is_some())
+            .field("system_cuda_lock_sha256", &self.system_cuda_lock_sha256)
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +178,8 @@ impl NativeConfig {
         let mut profiling = false;
         let mut cuda_bundle = None;
         let mut cuda_bundle_sha256 = None;
+        let mut system_cuda_lock = None;
+        let mut system_cuda_lock_sha256 = None;
         for argument in arguments {
             let experiment = match argument.as_str() {
                 "--experimental-io-buffers" => Some(&mut execution_experiments.reuse_buffers),
@@ -293,6 +303,8 @@ impl NativeConfig {
                 "--runtime-cache-root" => set_path(&mut runtime_cache_root, value)?,
                 "--cuda-bundle" => set_path(&mut cuda_bundle, value)?,
                 "--cuda-bundle-sha256" => set_hash(&mut cuda_bundle_sha256, value)?,
+                "--system-cuda-lock" => set_path(&mut system_cuda_lock, value)?,
+                "--system-cuda-lock-sha256" => set_hash(&mut system_cuda_lock_sha256, value)?,
                 _ => {
                     return Err(NativeBootstrapError::Config(
                         "unsupported or mixed native provider argument",
@@ -303,13 +315,35 @@ impl NativeConfig {
         let provider = provider.ok_or(NativeBootstrapError::Config(
             "explicit --onnx-cpu or --onnx-cuda selection is required",
         ))?;
+        let system_requested = system_cuda_lock.is_some() || system_cuda_lock_sha256.is_some();
+        if system_requested
+            && (provider != NativeProvider::Cuda
+                || system_cuda_lock.is_none()
+                || system_cuda_lock_sha256.is_none()
+                || cuda_bundle.is_some()
+                || cuda_bundle_sha256.is_some()
+                || runtime_cache_root.is_some()
+                || attestation
+                || batch_attestation
+                || !cfg!(all(
+                    feature = "pals-adaptive",
+                    feature = "onnx-cuda",
+                    target_os = "linux"
+                )))
+        {
+            return Err(NativeBootstrapError::Config(
+                "system CUDA requires its lock and SHA, Linux system support and no bundle, runtime cache or legacy attestation",
+            ));
+        }
         match provider {
             NativeProvider::Cpu if cuda_bundle.is_some() || cuda_bundle_sha256.is_some() => {
                 return Err(NativeBootstrapError::Config(
                     "CPU provider rejects CUDA bundle arguments",
                 ));
             }
-            NativeProvider::Cuda if cuda_bundle.is_none() || cuda_bundle_sha256.is_none() => {
+            NativeProvider::Cuda
+                if !system_requested && (cuda_bundle.is_none() || cuda_bundle_sha256.is_none()) =>
+            {
                 return Err(NativeBootstrapError::Config(
                     "CUDA provider requires the bundle file and its explicit SHA256",
                 ));
@@ -393,6 +427,8 @@ impl NativeConfig {
             provider,
             cuda_bundle,
             cuda_bundle_sha256,
+            system_cuda_lock,
+            system_cuda_lock_sha256,
         })
     }
     pub fn attestation_requested(&self) -> bool {
@@ -1150,6 +1186,7 @@ struct NativeSessionFactory {
     #[cfg(feature = "onnx-cuda")]
     loaded_cuda_profile: Option<CudaProfileV1>,
 }
+
 impl NativeSessionFactory {
     fn load_cpu(
         owners: &OwnerRegistry,
@@ -1200,6 +1237,15 @@ impl NativeSessionFactory {
         config: &NativeConfig,
     ) -> Result<(AssetMetadata, OrtRuntime, OnnxBackend, ClassicalProjection), NativeBootstrapError>
     {
+        if config.system_cuda_lock.is_some() {
+            // The system loader and worker support this runtime identity, but
+            // this legacy entry point has no original native-entry/failure
+            // custody yet. Reject before opening assets or creating an output
+            // until that owner can retain unknown physical completion.
+            return Err(NativeBootstrapError::Config(
+                "system CUDA native entry requires lifecycle custody; no runtime was started",
+            ));
+        }
         let parts_started = Instant::now();
         let asset = MaiaAsset::load(
             &config.source_weights,

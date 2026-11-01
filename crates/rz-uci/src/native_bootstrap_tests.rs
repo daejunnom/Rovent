@@ -844,6 +844,50 @@ fn cuda_selection_requires_two_pins_and_rejects_mixed_or_mutable_profiles() {
 }
 
 #[test]
+fn system_cuda_selection_is_explicit_and_never_accepts_legacy_receipts_or_cache() {
+    let mut system = valid_arguments();
+    system[0] = "--onnx-cuda".into();
+    system.push(format!(
+        "--system-cuda-lock={PRIVATE_MARKER}/system-lock.json"
+    ));
+    system.push(format!("--system-cuda-lock-sha256={}", "ef".repeat(32)));
+    if cfg!(all(
+        feature = "pals-adaptive",
+        feature = "onnx-cuda",
+        target_os = "linux"
+    )) {
+        let parsed = NativeConfig::parse(system.clone()).unwrap();
+        assert!(parsed.system_cuda_lock.is_some());
+        assert!(!format!("{parsed:?}").contains(PRIVATE_MARKER));
+        let failure = NativeSessionFactory::load_parts(&OwnerRegistry::default(), &parsed)
+            .err()
+            .expect("unsupported system custody must fail before reading the fake assets");
+        assert!(matches!(failure, NativeBootstrapError::Config(_)));
+    } else {
+        assert_private_config_rejection(system.clone());
+    }
+    for extra in [
+        "--attestation",
+        "--batch-attestation",
+        "--cuda-bundle=old/bundle.json",
+        "--cuda-bundle-sha256=efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "--runtime-cache-root=old/cache",
+    ] {
+        let mut arguments = system.clone();
+        arguments.push(extra.into());
+        assert_private_config_rejection(arguments);
+    }
+    for index in [system.len() - 2, system.len() - 1] {
+        let mut arguments = system.clone();
+        arguments.remove(index);
+        assert_private_config_rejection(arguments);
+    }
+    let mut cpu = system;
+    cpu[0] = "--onnx-cpu".into();
+    assert_private_config_rejection(cpu);
+}
+
+#[test]
 fn cpu_v1_typed_projection_rejects_cuda_origin_without_loading_native_assets() {
     let fixture = Fixture::new();
     let report = NativeRunReport::new(&fixture.profile, NativeWorkerOrigin::CudaOnnx).unwrap();
