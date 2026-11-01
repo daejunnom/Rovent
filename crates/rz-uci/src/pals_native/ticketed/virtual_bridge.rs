@@ -163,6 +163,24 @@ pub trait VirtualReviewCollectionObserver: Send + 'static {
         self.completed(ticket, physical, output, evidence, invocation)
             .map_err(VirtualReviewCaptureFailure::Required)
     }
+    /// Optionally observe the raw result of the same physically completed
+    /// ticket, before policy/WDL projection discards model-specific values.
+    ///
+    /// `raw` is present only when that ticket returned successfully and its
+    /// physical completion is confirmed. It does not imply search acceptance
+    /// or consumption. Existing collection observers retain their original
+    /// callback and failure classification through this default method.
+    fn completed_with_raw_classified(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        physical: PhysicalRoleCompletion,
+        output: Option<&RoleOutput>,
+        evidence: Option<TicketExecutionEvidence>,
+        invocation: Option<VirtualReviewPhysicalInvocationEvidence>,
+        _raw: Option<&PalsRawOutput>,
+    ) -> Result<(), VirtualReviewCaptureFailure> {
+        self.completed_classified(ticket, physical, output, evidence, invocation)
+    }
     fn retired(&mut self, ticket: &RoleTicketEnvelope, accepted: bool) -> Result<(), RoleFailure>;
     fn retired_classified(
         &mut self,
@@ -897,12 +915,20 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 .evidence
                 .as_ref()
                 .and_then(|(id, value)| (*id == ticket.id).then_some(*value));
-            if let Err(failure) = observer.completed_classified(
+            if let Err(failure) = observer.completed_with_raw_classified(
                 ticket,
                 physical,
                 result.as_ref().ok().map(|value| &value.output),
                 evidence,
                 completed_invocation,
+                if physical == PhysicalRoleCompletion::Confirmed {
+                    result
+                        .as_ref()
+                        .ok()
+                        .map(VirtualReviewTicketOutput::raw_output)
+                } else {
+                    None
+                },
             ) {
                 let cause = failure.clone().into_cause();
                 let classification = isolate_capture_failure(
@@ -1771,6 +1797,73 @@ mod tests {
             }
             self.preserve
         }
+    }
+
+    #[test]
+    fn raw_completion_default_preserves_existing_observer_and_error_classification() {
+        struct LegacyObserver {
+            calls: usize,
+            seen_physical: Option<PhysicalRoleCompletion>,
+        }
+        impl VirtualReviewCollectionObserver for LegacyObserver {
+            fn submitted(
+                &mut self,
+                _: &RoleTicketEnvelope,
+                _: &TicketPreparation<ReviewView, NativeTicketQuestion>,
+                _: &VirtualReviewPreparedTicket,
+            ) -> Result<(), RoleFailure> {
+                unreachable!()
+            }
+            fn completed(
+                &mut self,
+                _: &RoleTicketEnvelope,
+                physical: PhysicalRoleCompletion,
+                _: Option<&RoleOutput>,
+                _: Option<TicketExecutionEvidence>,
+                _: Option<VirtualReviewPhysicalInvocationEvidence>,
+            ) -> Result<(), RoleFailure> {
+                self.calls += 1;
+                self.seen_physical = Some(physical);
+                Err(RoleFailure::InvalidOutput)
+            }
+            fn retired(&mut self, _: &RoleTicketEnvelope, _: bool) -> Result<(), RoleFailure> {
+                unreachable!()
+            }
+        }
+        let (_store, question) = question(Position::startpos(), &[], &[]);
+        let (input, identity) = encode_view(&question, [1; 32], [2; 32]).unwrap();
+        let ticket = RoleTicketEnvelope {
+            id: RequestId::new(question.seal.authority.epoch, 1),
+            authority: question.seal.authority,
+            question: question.question,
+            view: question.seal,
+            representation: representation(&input, &identity, identity.rules_history, 0).unwrap(),
+            role: question.role,
+            original_deadline: question.deadline,
+        };
+        let mut observer = LegacyObserver {
+            calls: 0,
+            seen_physical: None,
+        };
+        let result = observer.completed_with_raw_classified(
+            &ticket,
+            PhysicalRoleCompletion::Unknown,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            result,
+            Err(VirtualReviewCaptureFailure::Required(
+                RoleFailure::InvalidOutput
+            ))
+        );
+        assert_eq!(observer.calls, 1);
+        assert_eq!(
+            observer.seen_physical,
+            Some(PhysicalRoleCompletion::Unknown)
+        );
     }
 
     #[test]

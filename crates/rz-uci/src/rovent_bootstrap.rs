@@ -861,8 +861,9 @@ pub(crate) fn prepare_native_v3_retaining_with_parent<Q: NativeQuestionProjectio
     clock: ContractSystemClock,
     control: RoventStartupControl,
     parent: Option<Arc<launch::ConnectedParent>>,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
-    prepare_native_v3_inner(sources, resources.into(), clock, control, None, parent)
+    prepare_native_v3_inner(sources, resources.into(), clock, control, observer, parent)
 }
 
 /// Prepare the single original /3 Collection worker with its input observer.

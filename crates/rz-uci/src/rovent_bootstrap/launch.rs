@@ -66,6 +66,8 @@ mod evidence;
 #[cfg(feature = "native-validation-diagnostics")]
 mod selected_view_observation;
 pub mod storage;
+#[cfg(all(target_os = "linux", feature = "native-validation-diagnostics"))]
+mod system_numeric_observation;
 #[cfg(target_os = "linux")]
 mod system_parent;
 mod v2_external;

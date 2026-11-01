@@ -2280,6 +2280,24 @@ pub(super) fn run_native_admitted(
     scope.arm();
     type SessionReleaseProbe =
         Box<dyn Fn() -> Option<crate::pals_adaptive::NativeSessionReleaseObservation>>;
+    // Research-only observation uses the very same model owner and physical
+    // ticket path. It is never enabled by the normal engine configuration.
+    let mut numeric_observer: Option<
+        Box<dyn crate::pals_native::ticketed::VirtualReviewCollectionObserver>,
+    > = None;
+    #[cfg(feature = "native-validation-diagnostics")]
+    let numeric_handle = if std::env::var_os("RZ_V3_SYSTEM_NUMERIC_CAPTURE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && matches!(
+            &lock.manifest.system_runtime_lock.runtime,
+            NativeRuntimeSourceV6::SystemCuda(_)
+        ) {
+        let (observer, handle) = super::system_numeric_observation::attach();
+        numeric_observer = Some(observer);
+        Some(handle)
+    } else {
+        None
+    };
     let (driver, completion, observation, observe_release): (
         Arc<dyn SearchSessionDriver>,
         _,
@@ -2301,6 +2319,7 @@ pub(super) fn run_native_admitted(
                 clock.runtime_clock(),
                 control.clone(),
                 connected_parent.clone(),
+                numeric_observer.take(),
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -2537,6 +2556,7 @@ pub(super) fn run_native_admitted(
                 clock.runtime_clock(),
                 control.clone(),
                 connected_parent.clone(),
+                numeric_observer.take(),
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -2787,6 +2807,7 @@ pub(super) fn run_native_admitted(
                 clock.runtime_clock(),
                 control.clone(),
                 connected_parent.clone(),
+                numeric_observer.take(),
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -3018,6 +3039,29 @@ pub(super) fn run_native_admitted(
     let (result, panic_payload) =
         serve_driver_retaining(&driver, clock, Arc::clone(&owners), settings);
     let physical_confirmed = completion.is_confirmed();
+    #[cfg(feature = "native-validation-diagnostics")]
+    if let Some(handle) = numeric_handle {
+        match (
+            receipt_writer.as_deref(),
+            handle.to_json(
+                &lock.canonical_sha256,
+                arguments.process_epoch,
+                physical_confirmed,
+            ),
+        ) {
+            (Some(writer), Ok(bytes)) => {
+                if let Err(failure) =
+                    writer.write_bytes("system-numeric-observation.v1.json", &bytes)
+                {
+                    eprintln!("system numeric observation warning: {failure}");
+                }
+            }
+            (None, _) => {
+                eprintln!("system numeric observation unavailable: no original receipt writer")
+            }
+            (_, Err(failure)) => eprintln!("system numeric observation warning: {failure}"),
+        }
+    }
     let session_release = observe_release.and_then(|probe| probe());
     if session_release.is_some() {
         scope.mark_session_released();
