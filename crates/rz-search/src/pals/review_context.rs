@@ -215,6 +215,9 @@ pub struct ReviewView {
     policy: ReviewSelectionPolicy,
     cohort_cpu7: Option<Arc<CohortCpu7OriginalBundle>>,
     cohort_cpu7_binding: Option<[u8; 32]>,
+    // Selection-local diagnostic only. Never carried to another query/view.
+    cpu7_raw_capture:
+        Option<Result<cpu7_capture::SelectedCpuRawCapture, cpu7_capture::CaptureUnavailable>>,
     records: Vec<RoleRecord>,
     metadata: Vec<ReviewRecordMetadata>,
     // Optional diagnostic evidence, aligned with selected records if present.
@@ -245,6 +248,21 @@ impl ReviewView {
     }
     pub fn cohort_cpu7_binding(&self) -> Option<[u8; 32]> {
         self.cohort_cpu7_binding
+    }
+    pub fn cpu7_raw_capture(
+        &self,
+    ) -> Option<&Result<cpu7_capture::SelectedCpuRawCapture, cpu7_capture::CaptureUnavailable>>
+    {
+        self.cpu7_raw_capture.as_ref()
+    }
+    pub(in crate::pals) fn capture_cpu7_on_original_view(
+        &mut self,
+        stores: &PalsStores,
+        control: Result<cpu7_capture::CaptureControl<'_>, cpu7_capture::CaptureUnavailable>,
+    ) {
+        self.cpu7_raw_capture = Some(control.and_then(|control| {
+            cpu7_capture::capture_selected_cpu_raw(self, stores, Some(&control))
+        }));
     }
     pub fn sequence(&self) -> u64 {
         self.sequence
@@ -1344,6 +1362,7 @@ impl ReviewContextIndex {
             policy,
             cohort_cpu7: cpu7_original_bundle,
             cohort_cpu7_binding,
+            cpu7_raw_capture: None,
             records,
             metadata,
             #[cfg(feature = "archive-origin-diagnostics")]
@@ -1547,6 +1566,7 @@ impl ReviewContextIndex {
             policy: source.policy,
             cohort_cpu7: source.cohort_cpu7.clone(),
             cohort_cpu7_binding,
+            cpu7_raw_capture: None,
             records: source.records.clone(),
             metadata: source.metadata.clone(),
             #[cfg(feature = "archive-origin-diagnostics")]

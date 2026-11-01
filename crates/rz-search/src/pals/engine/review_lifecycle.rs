@@ -269,6 +269,9 @@ impl<M: RoleModel> PalsSemanticState<M> {
         node: usize,
         question: RoleQuestion<'_>,
         legal: &[BoardMove],
+        grant: Option<&crate::pals::review_context::cpu7_capture::RootCaptureGrant>,
+        original_cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+        original_deadline: std::time::Instant,
     ) -> Result<Option<Arc<ReviewView>>, PalsError> {
         match (&self.review_index, self.review_policy) {
             (None, None) => return Ok(None),
@@ -306,7 +309,12 @@ impl<M: RoleModel> PalsSemanticState<M> {
         }
         let index = self.review_index.as_mut().ok_or(PalsError::InvalidConfig)?;
         let view = if index.cohort_cpu7_ready(&self.stores, policy) {
-            index.select_cohort_cpu7(&self.stores, root, query, policy)?
+            let mut view = index.select_cohort_cpu7(&self.stores, root, query, policy)?;
+            let control = grant
+                .ok_or(crate::pals::review_context::cpu7_capture::CaptureUnavailable::MissingOriginalControl)
+                .and_then(|grant| grant.control(original_cancel, original_deadline));
+            view.capture_cpu7_on_original_view(&self.stores, control);
+            view
         } else {
             index.select(&self.stores, root, query, base_policy)?
         };
@@ -417,10 +425,20 @@ impl<M: RoleModel> PalsEngine<M> {
         node: usize,
         question: RoleQuestion<'_>,
         legal: &[BoardMove],
+        grant: Option<&crate::pals::review_context::cpu7_capture::RootCaptureGrant>,
+        original_cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+        original_deadline: std::time::Instant,
     ) -> Result<Option<Arc<ReviewView>>, PalsError> {
         let config = self.semantic_sequence_config();
-        self.semantic
-            .prepare_cohort_cpu7_review_view(&config, node, question, legal)
+        self.semantic.prepare_cohort_cpu7_review_view(
+            &config,
+            node,
+            question,
+            legal,
+            grant,
+            original_cancel,
+            original_deadline,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_frozen_review_views(

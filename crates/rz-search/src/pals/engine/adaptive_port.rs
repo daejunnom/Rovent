@@ -557,6 +557,8 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     goal_lanes: goal_hooks::AdaptiveGoalLanes,
     utility_continuations: utility_dependencies::UtilityContinuationRegistry,
     cohort_cpu7: bool,
+    cohort_cpu7_original_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    cohort_cpu7_capture_grant: Option<crate::pals::review_context::cpu7_capture::RootCaptureGrant>,
 }
 #[derive(Clone)]
 struct CpuPortAdmission {
@@ -829,6 +831,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             goal_lanes: goal_hooks::AdaptiveGoalLanes::default(),
             utility_continuations: utility_dependencies::UtilityContinuationRegistry::default(),
             cohort_cpu7: false,
+            cohort_cpu7_original_cancel: None,
+            cohort_cpu7_capture_grant: None,
         }
     }
 
@@ -848,6 +852,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         self.cohort_cpu7 = true;
         Ok(())
+    }
+    /// Attaches a diagnostic control carrier, never an admission or receipt.
+    /// The original handoff is checked again at each actual selection.
+    pub fn install_cpu7_capture_grant(
+        &mut self,
+        grant: crate::pals::review_context::cpu7_capture::RootCaptureGrant,
+    ) {
+        self.cohort_cpu7_capture_grant = Some(grant);
     }
     /// Explicit root-local diagnostic opt-in before the first observed call.
     /// No callback, worker, acceptance or coordinator-transition authority.
@@ -2053,8 +2065,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             None => {
                 let view = if self.cohort_cpu7 && stage == RefinementStage::ProposalContinuation {
-                    self.engine
-                        .prepare_cohort_cpu7_review_view(node, question, &legal)?
+                    self.engine.prepare_cohort_cpu7_review_view(
+                        node,
+                        question,
+                        &legal,
+                        self.cohort_cpu7_capture_grant.as_ref(),
+                        self.cohort_cpu7_original_cancel.as_ref(),
+                        self.limits.deadline,
+                    )?
                 } else {
                     self.engine.prepare_review_view(node, question, &legal)?
                 };

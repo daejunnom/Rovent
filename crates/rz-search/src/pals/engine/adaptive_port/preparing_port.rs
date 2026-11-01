@@ -45,7 +45,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         handoff: PreparingRootHandoff<M>,
     ) -> AdaptivePreparingRootAdmission<M> {
         let parts = handoff.into_parts();
-        let port = Self::from_admitted_root(
+        let original_cancel = Arc::clone(&parts.cancellation);
+        let mut port = Self::from_admitted_root(
             parts.engine,
             parts.root,
             parts.rules,
@@ -56,6 +57,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             parts.started,
             parts.root_rules_scanned,
         );
+        port.cohort_cpu7_original_cancel = Some(original_cancel);
         AdaptivePreparingRootAdmission {
             port,
             custody: AdaptivePreparingRootCustody {

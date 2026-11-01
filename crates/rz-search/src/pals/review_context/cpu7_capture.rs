@@ -29,9 +29,62 @@ pub struct CaptureControl<'a> {
     pub canceled: &'a AtomicBool,
     pub limits: CaptureLimits,
 }
+
+/// Opaque diagnostic control carrier. Construction alone is not proof of an
+/// original root: the Search port also compares its preparing-handoff owner,
+/// and the UCI caller must supply the original admission's scope check.
+pub struct RootCaptureGrant {
+    canceled: Arc<AtomicBool>,
+    root_deadline: Instant,
+    capture_deadline: Instant,
+    scope_check: Arc<dyn Fn() -> Result<(), CaptureUnavailable> + Send + Sync>,
+}
+impl RootCaptureGrant {
+    pub fn unverified_diagnostic(
+        canceled: Arc<AtomicBool>,
+        root_deadline: Instant,
+        capture_deadline: Instant,
+        scope_check: Arc<dyn Fn() -> Result<(), CaptureUnavailable> + Send + Sync>,
+    ) -> Self {
+        Self {
+            canceled,
+            root_deadline,
+            capture_deadline,
+            scope_check,
+        }
+    }
+    pub(crate) fn control<'a>(
+        &'a self,
+        original_cancel: Option<&Arc<AtomicBool>>,
+        original_deadline: Instant,
+    ) -> Result<CaptureControl<'a>, CaptureUnavailable> {
+        let original = original_cancel.ok_or(CaptureUnavailable::MissingOriginalControl)?;
+        if !Arc::ptr_eq(original, &self.canceled)
+            || self.root_deadline != original_deadline
+            || self.capture_deadline > original_deadline
+        {
+            return Err(CaptureUnavailable::OriginalControlMismatch);
+        }
+        if self.canceled.load(Ordering::Acquire) {
+            return Err(CaptureUnavailable::Canceled);
+        }
+        if Instant::now() >= self.capture_deadline {
+            return Err(CaptureUnavailable::Deadline);
+        }
+        (self.scope_check)()?;
+        // The existing cohort profile has no registered capture budget. Do
+        // not accept caller-provided numbers as an invented registration.
+        Err(CaptureUnavailable::MissingRegisteredLimits)
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CaptureUnavailable {
     MissingOriginalControl,
+    MissingRegisteredLimits,
+    OriginalControlMismatch,
+    ScopeBusy,
+    ScopeRevoked,
+    ScopeUnavailable,
     InvalidLimits,
     Canceled,
     Deadline,
@@ -46,6 +99,7 @@ pub enum CaptureUnavailable {
 
 /// Detached raw data only; no selection authority, replay acceptance, CPU
 /// physical-completion claim, or right to publish is constructed here.
+#[derive(Debug)]
 pub struct SelectedCpuRawCapture {
     source: Arc<CohortCpu7OriginalBundle>,
     binding: [u8; 32],

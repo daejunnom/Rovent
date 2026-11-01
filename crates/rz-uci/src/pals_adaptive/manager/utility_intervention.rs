@@ -224,6 +224,34 @@ where
                     if let Err(error) = self.driver.enable_cohort_cpu7() {
                         return Err((error, observer));
                     }
+                    if let Some(admission) = self.collection_admission.as_ref() {
+                        use rz_search::pals::review_context::cpu7_capture::{
+                            CaptureUnavailable, RootCaptureGrant,
+                        };
+                        let root = Arc::clone(admission.root_admission());
+                        let original = root.original_context();
+                        let cancel = Arc::clone(&original.control.cancellation);
+                        let root_deadline = original.control.deadline;
+                        let scope = Arc::new(move || match root.original_context().try_accepts() {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(CaptureUnavailable::ScopeRevoked),
+                            Err(error)
+                                if error.code == rz_contracts::ErrorCode::ResourceExhausted =>
+                            {
+                                Err(CaptureUnavailable::ScopeBusy)
+                            }
+                            Err(_) => Err(CaptureUnavailable::ScopeUnavailable),
+                        });
+                        // Existing /2 has no registered capture resource budget.
+                        // Preserve normal search and report this view unavailable.
+                        let grant = RootCaptureGrant::unverified_diagnostic(
+                            cancel,
+                            root_deadline,
+                            prelude_cutoff.min(root_deadline),
+                            scope,
+                        );
+                        self.driver.install_cpu7_capture_grant(grant);
+                    }
                 }
                 self.utility_intervention = Some(UtilityInterventionState::awaiting_source(
                     profile,

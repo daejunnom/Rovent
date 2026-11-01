@@ -377,6 +377,12 @@ pub type UtilityInterventionTargetBinding<Q> = Result<
 >;
 
 pub trait AdaptiveSearchDriver<Q> {
+    /// Diagnostic only: default drivers never claim capture support.
+    fn install_cpu7_capture_grant(
+        &mut self,
+        _grant: rz_search::pals::review_context::cpu7_capture::RootCaptureGrant,
+    ) {
+    }
     /// Install a cohort-only source-view policy on the original search owner.
     /// Drivers without this explicit support must reject it before admission.
     fn enable_cohort_cpu7(&mut self) -> Result<(), AdaptiveManagerError> {

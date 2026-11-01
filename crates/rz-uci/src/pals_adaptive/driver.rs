@@ -639,6 +639,15 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    fn install_cpu7_capture_grant(
+        &mut self,
+        grant: rz_search::pals::review_context::cpu7_capture::RootCaptureGrant,
+    ) {
+        // A cold/unavailable port cannot capture. This opt-in never prevents search.
+        if let Ok(port) = self.hot() {
+            port.install_cpu7_capture_grant(grant);
+        }
+    }
     fn enable_cohort_cpu7(&mut self) -> Result<(), AdaptiveManagerError> {
         self.hot()?
             .enable_cohort_cpu7()
