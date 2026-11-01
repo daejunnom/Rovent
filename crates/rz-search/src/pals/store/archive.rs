@@ -13,6 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod codec;
 mod foreign_permit;
+mod review_projection;
 use codec::{Bundle, LineWire, ObservationWire, RoleRecordWire, StateWire};
 pub use foreign_permit::{
     ForeignAppendPermit, ForeignGoIssuedProof, ProfiledForeignAppendPermit,

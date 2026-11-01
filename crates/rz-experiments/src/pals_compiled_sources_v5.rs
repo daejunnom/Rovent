@@ -53,6 +53,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/store/archive.rs"),
             source!("crates/rz-search/src/pals/store/archive/codec.rs"),
             source!("crates/rz-search/src/pals/store/archive/foreign_permit.rs"),
+            source!("crates/rz-search/src/pals/store/archive/review_projection.rs"),
             source!("crates/rz-search/src/pals/store/hot.rs"),
             source!("crates/rz-search/src/pals/store/hot_commit.rs"),
             source!("crates/rz-search/src/pals/store/hot_commit/registered_root.rs"),

@@ -27,6 +27,7 @@
       "crates/rz-search/src/pals/store/archive.rs",
       "crates/rz-search/src/pals/store/archive/codec.rs",
       "crates/rz-search/src/pals/store/archive/foreign_permit.rs",
+      "crates/rz-search/src/pals/store/archive/review_projection.rs",
       "crates/rz-search/src/pals/store/hot.rs",
       "crates/rz-search/src/pals/store/hot_commit.rs",
       "crates/rz-search/src/pals/store/hot_commit/registered_root.rs",

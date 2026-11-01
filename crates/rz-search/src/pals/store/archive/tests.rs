@@ -1815,6 +1815,101 @@ fn live_profiled_fixture(
 }
 
 #[test]
+fn review_projection_keeps_pinned_observation_closure_and_rejects_limits() {
+    let mut store = PalsStores::new(limits());
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    );
+    let observation = store.append_observation(raw.clone()).unwrap();
+    let mut seed = StorePins::default();
+    seed.observations.insert(observation);
+    let pin = store.pin_review(seed).unwrap();
+    let before = store.hot_stats();
+    let bytes = store
+        .project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(()))
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["schema"], "rz-pals-review-store-projection/1");
+    assert_eq!(value["observations"][0][0], observation.0);
+    assert_eq!(
+        value["observations"][0][1],
+        serde_json::to_value(ObservationWire::encode(&raw).unwrap()).unwrap()
+    );
+    assert!(!value["states"].as_array().unwrap().is_empty());
+    assert!(!value["lines"].as_array().unwrap().is_empty());
+    assert!(!value["executions"].as_array().unwrap().is_empty());
+    assert_eq!(before, store.hot_stats());
+    assert_eq!(
+        store.project_review_store_closure(&pin, 128, 1, &mut || Ok(())),
+        Err(StoreError::ArchiveByteBudget)
+    );
+    assert!(matches!(
+        store.project_review_store_closure(&pin, 1, 1 << 20, &mut || Ok(())),
+        Err(StoreError::Capacity(_))
+    ));
+    assert_eq!(
+        store.project_review_store_closure(&pin, 128, 1 << 20, &mut || Err(
+            StoreError::ArchiveDeadline
+        )),
+        Err(StoreError::ArchiveDeadline)
+    );
+    let other = PalsStores::new(limits());
+    assert_eq!(
+        other.project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(())),
+        Err(StoreError::StaleConsumer)
+    );
+    {
+        let _busy = store.review_pins.lock().unwrap();
+        assert_eq!(
+            store.project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(())),
+            Err(StoreError::ArchiveIo {
+                stage: "review projection pin registry busy",
+                kind: std::io::ErrorKind::WouldBlock
+            })
+        );
+    }
+    let mut calls = 0_usize;
+    store
+        .project_review_store_closure(&pin, 128, 1 << 20, &mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    let final_call = calls;
+    calls = 0;
+    assert_eq!(
+        store.project_review_store_closure(&pin, 128, 1 << 20, &mut || {
+            calls += 1;
+            if calls == final_call {
+                Err(StoreError::CancelledConsumer)
+            } else {
+                Ok(())
+            }
+        }),
+        Err(StoreError::CancelledConsumer)
+    );
+    let mut calls = 0;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.project_review_store_closure(&pin, 128, 1 << 20, &mut || {
+            calls += 1;
+            if calls == 3 {
+                panic!("control callback panic while registry is held");
+            }
+            Ok(())
+        });
+    }));
+    assert!(panic.is_err());
+    assert!(!store.review_pins.is_poisoned());
+    assert!(pin.validates(&store));
+    assert!(
+        store
+            .project_review_store_closure(&pin, 128, 1 << 20, &mut || Ok(()))
+            .is_ok()
+    );
+}
+
+#[test]
 fn retirement_writers_preserve_existing_wire_bytes_and_unpublished_source_values() {
     let mut store = PalsStores::new(limits());
     let raw = live_profiled_fixture(

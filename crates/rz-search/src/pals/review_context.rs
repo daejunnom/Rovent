@@ -311,6 +311,25 @@ impl ReviewView {
     pub fn validates(&self, stores: &PalsStores) -> bool {
         self.pin.validates(stores)
     }
+    /// Project the original CPU7 view's pinned Store dependency closure.
+    /// The result is historical data only: it grants no execution authority,
+    /// physical completion, or proof that any observation was actually run.
+    /// `check` must enforce the caller's original finite deadline and cancel
+    /// state without re-entering the Store or blocking. Output is discarded on
+    /// any error, including an unavailable hot
+    /// record, owner change, exhausted record/byte limit, deadline or cancel.
+    pub fn project_cohort_cpu7_store(
+        &self,
+        stores: &PalsStores,
+        max_records: usize,
+        max_bytes: usize,
+        check: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<Vec<u8>, StoreError> {
+        if self.cohort_cpu7.is_none() {
+            return Err(StoreError::InvalidConditions("CPU7 view required"));
+        }
+        stores.project_review_store_closure(&self.pin, max_records, max_bytes, check)
+    }
     /// Known owned host backing, not a measured peak. Shared Rules history
     /// chains are conservatively charged once per retained anchor/source;
     /// physical sharing is deliberately not guessed from Arc identities.
