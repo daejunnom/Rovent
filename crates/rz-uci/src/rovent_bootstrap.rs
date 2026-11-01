@@ -308,6 +308,7 @@ pub struct RoventNativeResources {
 /// per-run copy; the host installation remains the runtime owner.
 pub struct RoventSystemNativeResourcesV3 {
     pub configuration: PalsOnnxConfig,
+    pub cuda_profile: Option<VirtualReviewProfileDirectory>,
     pub drain_limit: Duration,
     pub tickets: TicketServiceLimits,
     pub command_capacity: usize,
@@ -848,7 +849,20 @@ pub fn prepare_native_v3_retaining<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
-    prepare_native_v3_inner(sources, resources.into(), clock, control, None)
+    prepare_native_v3_inner(sources, resources.into(), clock, control, None, None)
+}
+
+/// The parent connection is created only by the controlled V3 launch after
+/// the original endpoint has accepted and authenticated its actual parent.
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_native_v3_retaining_with_parent<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    resources: impl Into<RoventNativeResourcesV3>,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+    parent: Option<Arc<launch::ConnectedParent>>,
+) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
+    prepare_native_v3_inner(sources, resources.into(), clock, control, None, parent)
 }
 
 /// Prepare the single original /3 Collection worker with its input observer.
@@ -875,7 +889,7 @@ pub fn prepare_native_v3_collection_retaining<Q: NativeQuestionProjection>(
     control: RoventStartupControl,
     observer: Box<dyn VirtualReviewCollectionObserver>,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
-    prepare_native_v3_inner(sources, resources, clock, control, Some(observer))
+    prepare_native_v3_inner(sources, resources, clock, control, Some(observer), None)
 }
 
 #[cfg(target_os = "linux")]
@@ -885,6 +899,7 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    parent: Option<Arc<launch::ConnectedParent>>,
 ) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejectionV3<Q>> {
     let admission = || -> Result<(), BackendError> {
         control.check()?;
@@ -984,6 +999,7 @@ fn prepare_native_v3_inner<Q: NativeQuestionProjection>(
             factory_clock,
             factory_control,
             observer,
+            parent,
             &control,
             &diagnostic,
         )?,
@@ -1278,6 +1294,7 @@ fn spawn_system_native_factory_v3<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     factory_control: RoventStartupControl,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    parent: Option<Arc<launch::ConnectedParent>>,
     control: &RoventStartupControl,
     diagnostic: &NativeStartupDiagnostic,
 ) -> Result<
@@ -1291,7 +1308,7 @@ fn spawn_system_native_factory_v3<Q: NativeQuestionProjection>(
         sources: Arc::clone(&sources),
         review: VirtualReviewStartupCustody::new(
             Arc::clone(&sources) as Arc<dyn VirtualReviewOwnedSources>,
-            None,
+            resources.cuda_profile.clone(),
         ),
         system_owner: None,
         rejected_runtime: None,
@@ -1328,6 +1345,7 @@ fn spawn_system_native_factory_v3<Q: NativeQuestionProjection>(
                     factory_clock,
                     &factory_control,
                     &factory_diagnostic,
+                    parent,
                     owner,
                     entry,
                 )
@@ -1392,6 +1410,28 @@ pub fn system_configuration_digest_v3(
     Ok(hash.finalize().into())
 }
 
+/// An explicit control-graph inventory changes the CUDA placement policy and
+/// therefore has a separate identity. Preserve the historical strict digest.
+#[cfg(target_os = "linux")]
+pub fn system_configuration_digest_v3_with_inventory(
+    configuration: PalsOnnxConfig,
+    runtime_binary: [u8; 32],
+    system_identity: [u8; 32],
+    inventory: Option<[u8; 32]>,
+) -> Result<[u8; 32], BackendError> {
+    let strict = system_configuration_digest_v3(configuration, runtime_binary, system_identity)?;
+    match inventory {
+        None => Ok(strict),
+        Some(inventory) => {
+            let mut hash = Sha256::new();
+            hash.update(b"rz-rovent-native-system-inventory-configuration/1");
+            hash.update(strict);
+            hash.update(inventory);
+            Ok(hash.finalize().into())
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn validate_system_native_resources_v3(
     sources: &RoventPinnedNativeSources<RoventInputLockV3>,
@@ -1447,7 +1487,7 @@ fn validate_system_native_resources_v3(
         || resources.configuration.device_public_memory
         || !(1..=8).contains(&resources.command_capacity)
         || lock.role_tickets_max() > 16
-        || sources.cuda_inventory_digest().is_some()
+        || sources.cuda_inventory_digest().is_some() != resources.cuda_profile.is_some()
     {
         return Err(fail(
             K::IdentityMismatch,
@@ -1459,10 +1499,11 @@ fn validate_system_native_resources_v3(
         .iter()
         .find(|item| item.role == "ort-core")
         .ok_or_else(|| fail(K::IdentityMismatch, "V3 system ORT core was not registered"))?;
-    let actual = system_configuration_digest_v3(
+    let actual = system_configuration_digest_v3_with_inventory(
         resources.configuration,
         parse_sha256(&core.sha256)?,
         parse_sha256(&spec.system_identity_sha256)?,
+        sources.cuda_inventory_digest(),
     )?;
     if parse_sha256(&pc.backend_configuration_sha256)? != actual {
         return Err(fail(
@@ -1480,18 +1521,29 @@ fn validate_system_native_resources_v3(
 /// runtime-file preflight and before the first native runtime/provider call.
 /// This is an admission error, not a physical-completion observation.
 #[cfg(target_os = "linux")]
-fn require_system_cuda_supervisor_capability() -> Result<(), BackendError> {
-    Err(fail(
-        K::BackendUnavailable,
-        "authenticated system CUDA supervisor capability unavailable",
-    ))
+fn require_system_cuda_supervisor_capability(
+    parent: Option<&launch::ConnectedParent>,
+) -> Result<(), BackendError> {
+    let parent = parent.ok_or_else(|| {
+        fail(
+            K::BackendUnavailable,
+            "authenticated system CUDA supervisor capability unavailable",
+        )
+    })?;
+    parent.ensure_live().map_err(|_| {
+        fail(
+            K::BackendUnavailable,
+            "original parent connection is no longer live",
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn enter_supervised_system_cuda<T>(
+    parent: Option<&launch::ConnectedParent>,
     native: impl FnOnce() -> Result<T, BackendError>,
 ) -> Result<T, BackendError> {
-    require_system_cuda_supervisor_capability()?;
+    require_system_cuda_supervisor_capability(parent)?;
     native()
 }
 
@@ -1500,9 +1552,27 @@ mod system_cuda_supervisor_entry_tests {
     use super::*;
 
     #[test]
+    fn control_inventory_has_distinct_identity_and_preserves_strict_digest() {
+        let config = PalsOnnxConfig::cpu();
+        let strict = system_configuration_digest_v3(config, [1; 32], [2; 32]).unwrap();
+        assert_eq!(
+            strict,
+            system_configuration_digest_v3_with_inventory(config, [1; 32], [2; 32], None).unwrap()
+        );
+        let a =
+            system_configuration_digest_v3_with_inventory(config, [1; 32], [2; 32], Some([3; 32]))
+                .unwrap();
+        let b =
+            system_configuration_digest_v3_with_inventory(config, [1; 32], [2; 32], Some([4; 32]))
+                .unwrap();
+        assert_ne!(strict, a);
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn missing_supervisor_rejects_before_native_callback() {
         let called = std::cell::Cell::new(false);
-        let result = enter_supervised_system_cuda(|| {
+        let result = enter_supervised_system_cuda(None, || {
             called.set(true);
             Ok(())
         });
@@ -1518,18 +1588,49 @@ fn load_native_system_v3(
     clock: ContractSystemClock,
     control: &RoventStartupControl,
     diagnostic: &NativeStartupDiagnostic,
+    parent: Option<Arc<launch::ConnectedParent>>,
     custody: &mut RoventSystemFactoryCustodyV3,
     entry: &mut crate::pals_native::ticketed::FactoryNativeEntry,
 ) -> Result<RoventNativeStartupSnapshot, BackendError> {
     control.check()?;
     sources.validate_lock()?;
     validate_system_native_resources_v3(&sources, &resources)?;
+    let policy = diagnostic.trace(NativeStartupDiagnosticStage::CudaInventory, || {
+        sources
+            .cuda_inventory_bytes()?
+            .map(|(raw, expected)| {
+                PalsCudaControlPolicy::from_virtual_review_inventory_bytes(&raw, &hex(expected))
+            })
+            .transpose()
+    })?;
+    if let Some(parent) = parent.as_ref() {
+        let ordinal = match &sources.lock().manifest.engine.pc.device {
+            rz_experiments::RoventDevice::Cuda { ordinal, .. } => i32::try_from(*ordinal)
+                .map_err(|_| fail(K::IdentityMismatch, "CUDA ordinal is out of range"))?,
+            _ => {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    "system CUDA device declaration missing",
+                ));
+            }
+        };
+        if !parent.matches(
+            clock.domain().0.0,
+            &sources.lock().canonical_sha256,
+            ordinal,
+        ) {
+            return Err(fail(
+                K::IdentityMismatch,
+                "parent connection differs from original V3 launch",
+            ));
+        }
+    }
     let startup = diagnostic.trace(NativeStartupDiagnosticStage::OrtRuntime, || {
         sources.load_system_cuda_with(control, |system| {
             // The pinned original lives in this factory even if the native
             // initializer fails, times out or unwinds without a Session.
             custody.system_owner = Some(system.clone());
-            enter_supervised_system_cuda(|| {
+            enter_supervised_system_cuda(parent.as_deref(), || {
                 let runtime = OrtRuntime::load_system_cuda_with_entry(system, || {
                     entry.mark_native_entered()
                 })?;
@@ -1556,8 +1657,12 @@ fn load_native_system_v3(
             "system CUDA owner identity unavailable",
         )
     })?;
-    let config_digest =
-        system_configuration_digest_v3(resources.configuration, runtime.binary_digest(), identity)?;
+    let config_digest = system_configuration_digest_v3_with_inventory(
+        resources.configuration,
+        runtime.binary_digest(),
+        identity,
+        sources.cuda_inventory_digest(),
+    )?;
     let collection = sources.lock().manifest.purpose == RoventPurpose::Collection;
     let execution_mode = if collection {
         VirtualReviewExecutionMode::Collection
@@ -1571,7 +1676,7 @@ fn load_native_system_v3(
             resources.configuration,
             execution_mode,
             VirtualReviewArtifactKind::Fresh,
-            None,
+            policy,
             &mut || entry.mark_native_entered(),
         )
     })?;

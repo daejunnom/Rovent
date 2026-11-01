@@ -2,6 +2,8 @@
 //! the shared launch loads any model, and retains it after physical shutdown
 //! or any failure. UCI parsing, native tickets and engine assembly stay in UCI.
 use super::*;
+#[cfg(target_os = "linux")]
+use rz_experiments::NativeRuntimeSourceV6;
 use rz_uci::rovent_bootstrap::launch::{RoventLaunchError, run_with_resource_admission};
 use std::{
     io::{Read, Write},
@@ -1382,6 +1384,8 @@ fn run_native_with_resources_v3_inner(
     let callback = Arc::clone(&custody);
     let control_slot: Arc<OnceLock<Arc<Mutex<super::direct_control::BoundDirectControl>>>> =
         Arc::new(OnceLock::new());
+    let parent_stream = Arc::new(Mutex::new(None));
+    let callback_parent_stream = Arc::clone(&parent_stream);
     let mut control_panic = None;
     let mut control_panic_may_be_native = false;
     let mut control_scope_marker = None;
@@ -1393,9 +1397,10 @@ fn run_native_with_resources_v3_inner(
             RoventRetainingLaunchError,
         };
         let controlled =
-            rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_control_slot(
+            rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_connected_control_slot(
                 arguments,
                 Arc::clone(&control_slot),
+                parent_stream,
                 move |lock, _root, _file, _startup_until, cleanup_until, directory, path, slot| {
                     let mut state = callback.lock().map_err(|_| RoventLaunchError {
                         stage: "ResourceAdmission",
@@ -1433,11 +1438,20 @@ fn run_native_with_resources_v3_inner(
                         detail: error.to_string(),
                     })?;
                     let control_path = shell.path();
+                    let ordinal = match &lock.manifest.system_runtime_lock.runtime {
+                        NativeRuntimeSourceV6::SystemCuda(_) => match &lock.manifest.engine.pc.device {
+                            rz_experiments::RoventDevice::Cuda { ordinal, .. } => Some(*ordinal),
+                            _ => return Err(RoventLaunchError { stage: "ControlAdmission", detail: "CUDA device declaration missing".into() }),
+                        },
+                        _ => None,
+                    };
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "{}",
                         json!({"schema":"rz-rovent-direct-custody-startup/1",
-                "process_id":std::process::id(),"control_path":control_path,
+                "process_id":std::process::id(),"process_epoch":epoch,
+                "lock_sha256":lock.canonical_sha256,"cuda_ordinal":ordinal,
+                "control_path":control_path,
                 "physical_completion":"unknown_until_original_owner_confirms"})
                     );
                     drop(shell);
@@ -1453,6 +1467,21 @@ fn run_native_with_resources_v3_inner(
                             detail: "original control slot already installed".into(),
                         })?;
                     state.bound_control = Some(bound);
+                    let original_bound = Arc::clone(state.bound_control.as_ref().expect("bound control retained"));
+                    drop(state);
+                    if ordinal.is_some() {
+                        let stream = original_bound.lock().map_err(|_| RoventLaunchError {
+                            stage: "ControlAdmission", detail: "bound control owner poisoned".into(),
+                        })?.accept_parent_until(_startup_until).map_err(|error| RoventLaunchError {
+                            stage: "ControlAdmission", detail: error.to_string(),
+                        })?;
+                        let mut parent = callback_parent_stream.lock().map_err(|_| RoventLaunchError {
+                            stage: "ControlAdmission", detail: "parent stream owner poisoned".into(),
+                        })?;
+                        if parent.replace(stream).is_some() {
+                            return Err(RoventLaunchError { stage: "ControlAdmission", detail: "parent stream already installed".into() });
+                        }
+                    }
                     Ok(())
                 },
             );

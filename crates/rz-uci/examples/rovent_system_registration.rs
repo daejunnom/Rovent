@@ -34,7 +34,7 @@ mod registration {
         configuration::v5::{RoventStartupConfigurationV5, RoventTypedStartupV5},
         configuration_digest_from_metadata,
         process_boundary::compiled_process_source_components_v3,
-        system_configuration_digest_v3,
+        system_configuration_digest_v3_with_inventory,
     };
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
@@ -213,6 +213,10 @@ mod registration {
     struct Request {
         #[serde(default)]
         source_verification: SourceVerification,
+        /// Optional exact-flow metadata; actual bytes are verified by the
+        /// original pinned native source before any session is created.
+        #[serde(default)]
+        cuda_control_inventory: Option<ArtifactRef>,
         contract_revision: String,
         /// Exact UCI position and history; this is not a live root authority.
         position_command: String,
@@ -234,6 +238,68 @@ mod registration {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Bind the opt-in policy to one declaration in the original lock. This
+    /// checks metadata only; it does not attest bytes or provider placement.
+    fn declared_cuda_inventory_digest(
+        inventory: Option<&ArtifactRef>,
+        provenance: &[ArtifactRef],
+        cuda: bool,
+    ) -> Result<Option<[u8; 32]>, String> {
+        let Some(inventory) = inventory else {
+            return Ok(None);
+        };
+        if !cuda {
+            return Err("CUDA control inventory requires system CUDA".into());
+        }
+        inventory
+            .validate()
+            .map_err(|e| format!("CUDA control inventory declaration: {e:?}"))?;
+        if inventory.bytes == 0 || inventory.bytes > 4 * 1024 * 1024 {
+            return Err("CUDA control inventory exceeds the admitted bound".into());
+        }
+        let mut same_path = provenance.iter().filter(|item| item.path == inventory.path);
+        if same_path.next() != Some(inventory) || same_path.next().is_some() {
+            return Err("CUDA control inventory must match one original provenance entry".into());
+        }
+        rz_eval::asset::parse_sha256(&inventory.sha256)
+            .map(Some)
+            .map_err(|e| format!("CUDA control inventory digest: {e:?}"))
+    }
+
+    #[cfg(test)]
+    mod cuda_inventory_registration_tests {
+        use super::*;
+
+        fn inventory() -> ArtifactRef {
+            ArtifactRef {
+                path: "inputs/control.json".into(),
+                sha256: "42".repeat(32),
+                bytes: 512,
+                source: "https://example.invalid/control".into(),
+                license: "MIT".into(),
+            }
+        }
+
+        #[test]
+        fn inventory_is_optional_cuda_metadata_bound_to_unique_provenance() {
+            assert_eq!(declared_cuda_inventory_digest(None, &[], false).unwrap(), None);
+            let item = inventory();
+            let digest = declared_cuda_inventory_digest(Some(&item), &[item.clone()], true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(digest, [0x42; 32]);
+            assert!(declared_cuda_inventory_digest(Some(&item), &[item.clone()], false).is_err());
+            assert!(declared_cuda_inventory_digest(Some(&item), &[], true).is_err());
+            assert!(declared_cuda_inventory_digest(Some(&item), &[item.clone(), item.clone()], true).is_err());
+            let mut changed = item.clone();
+            changed.sha256 = "43".repeat(32);
+            assert!(declared_cuda_inventory_digest(Some(&item), &[changed], true).is_err());
+            let mut oversized = item;
+            oversized.bytes = 4 * 1024 * 1024 + 1;
+            assert!(declared_cuda_inventory_digest(Some(&oversized), &[oversized.clone()], true).is_err());
+        }
     }
     /// Use the same bounded parser and Rules primitives as the real UCI
     /// source seal. This prepares only semantic identity, not a live root,
@@ -456,6 +522,11 @@ mod registration {
             (_, Some(_)) => return Err("V-free execution cannot declare a validator model".into()),
             (_, None) => {}
         }
+        let inventory_digest = declared_cuda_inventory_digest(
+            req.cuda_control_inventory.as_ref(),
+            &req.provenance,
+            matches!(&req.system_runtime, RuntimeSelection::Cuda(_)),
+        )?;
         let (sys_lock, system_spec, runtime_binary, system_identity) = match &req.system_runtime {
             RuntimeSelection::Cpu(cpu) => {
                 match cpu.kind {
@@ -600,7 +671,9 @@ mod registration {
                         format!("native configuration and system selection disagree: {e:?}")
                     })?;
                 hex(
-                    &system_configuration_digest_v3(onnx, runtime_binary, identity)
+                    &system_configuration_digest_v3_with_inventory(
+                        onnx, runtime_binary, identity, inventory_digest,
+                    )
                         .map_err(|e| format!("native configuration identity: {e:?}"))?,
                 )
             }

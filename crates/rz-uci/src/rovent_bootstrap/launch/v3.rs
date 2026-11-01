@@ -1574,6 +1574,7 @@ pub(super) struct OriginalV3Inputs<'a> {
     lock_file: Arc<File>,
     receipt_writer: Option<Arc<SystemReceiptWriter>>,
     control_scope_pin: Option<Box<dyn std::any::Any + Send>>,
+    connected_parent: Option<Arc<super::ConnectedParent>>,
     scope_reserved:
         Option<Box<dyn FnOnce(&v3_scope::RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
 }
@@ -1679,12 +1680,14 @@ pub(super) fn admit_original<'a>(
     };
     let mut control_scope_pin = None;
     let mut scope_reserved = None;
+    let mut connected_parent = None;
     if let Some(admit_resource) = resource {
         let ResourceAdmissionV3 {
             require_control_dir,
             scope_pin,
             is_installed,
             scope_reserved: reserved_callback,
+            parent_stream,
             callback,
         } = admit_resource;
         control
@@ -1693,6 +1696,20 @@ pub(super) fn admit_original<'a>(
         let control_route = early_writer
             .as_ref()
             .map(|writer| cwd.join(&writer.relative_path));
+        // Capture before callback publishes the control endpoint. A later
+        // reparented process cannot become the original supervisor.
+        let original_parent_pid = if parent_stream.is_some()
+            && matches!(
+                &lock.manifest.system_runtime_lock.runtime,
+                NativeRuntimeSourceV6::SystemCuda(_)
+            ) {
+            Some(
+                super::ConnectedParent::capture_original_parent()
+                    .map_err(|failure| error("ControlAdmission", failure))?,
+            )
+        } else {
+            None
+        };
         callback(
             &lock,
             root,
@@ -1709,6 +1726,34 @@ pub(super) fn admit_original<'a>(
                 "ControlAdmission",
                 "original control owner was not installed",
             ));
+        }
+        if let Some(parent_stream) = parent_stream {
+            if let NativeRuntimeSourceV6::SystemCuda(_) = &lock.manifest.system_runtime_lock.runtime
+            {
+                let ordinal = match &lock.manifest.engine.pc.device {
+                    RoventDevice::Cuda { ordinal, .. } => i32::try_from(*ordinal)
+                        .map_err(|_| error("ControlAdmission", "CUDA ordinal is out of range"))?,
+                    _ => return Err(error("ControlAdmission", "CUDA device declaration missing")),
+                };
+                let stream = parent_stream
+                    .lock()
+                    .map_err(|_| error("ControlAdmission", "parent stream owner poisoned"))?
+                    .take()
+                    .ok_or_else(|| error("ControlAdmission", "original parent stream missing"))?;
+                connected_parent = Some(Arc::new(
+                    super::ConnectedParent::authenticate(
+                        stream,
+                        std::process::id(),
+                        original_parent_pid
+                            .ok_or_else(|| error("ControlAdmission", "original parent missing"))?,
+                        arguments.process_epoch,
+                        &lock.canonical_sha256,
+                        ordinal,
+                        control.until,
+                    )
+                    .map_err(|failure| error("ControlAdmission", failure))?,
+                ));
+            }
         }
         control_scope_pin = scope_pin;
         scope_reserved = reserved_callback;
@@ -1832,6 +1877,7 @@ pub(super) fn admit_original<'a>(
         lock_file: Arc::new(lock_file),
         receipt_writer: receipt_writer.map(Arc::new),
         control_scope_pin,
+        connected_parent,
         scope_reserved,
     })
 }
@@ -1935,6 +1981,7 @@ pub(super) fn run_native_admitted(
         lock_file,
         receipt_writer,
         control_scope_pin,
+        connected_parent,
         scope_reserved,
     } = original;
     // Each selected product receives its own original V3 owner. Collection
@@ -2091,11 +2138,34 @@ pub(super) fn run_native_admitted(
         .map_err(|failure| error("Configuration", failure))?;
     let resources = match &lock.manifest.system_runtime_lock.runtime {
         NativeRuntimeSourceV6::SystemCuda(system) => {
+            let cuda_profile = if sources.cuda_inventory_digest().is_some() {
+                control
+                    .check()
+                    .map_err(|failure| error("ProfileDirectory", failure))?;
+                let name = format!(
+                    "rovent-cuda-profile-{}-{}",
+                    std::process::id(),
+                    arguments.process_epoch
+                );
+                let root = boundary.original_root();
+                root.create_dir(&name)
+                    .map_err(|failure| error("ProfileDirectory", failure))?;
+                let directory = root
+                    .open_dir_nofollow(&name)
+                    .map_err(|failure| error("ProfileDirectory", failure))?;
+                Some(
+                    VirtualReviewProfileDirectory::from_owned_directory(directory.into_std_file())
+                        .map_err(|failure| error("ProfileDirectory", failure))?,
+                )
+            } else {
+                None
+            };
             super::super::RoventNativeResourcesV3::SystemCuda(
                 super::super::RoventSystemNativeResourcesV3 {
                     configuration: native
                         .onnx_system(&lock.manifest.engine.pc.device, system)
                         .map_err(|failure| error("Configuration", failure))?,
+                    cuda_profile,
                     drain_limit: Duration::from_millis(native.drain_ms),
                     tickets,
                     command_capacity: native.command_capacity,
@@ -2156,6 +2226,9 @@ pub(super) fn run_native_admitted(
     if let Some(pin) = control_scope_pin {
         scope.attach_pin(pin);
     }
+    if let Some(parent) = connected_parent.as_ref() {
+        scope.attach_pin(Box::new(Arc::clone(parent)));
+    }
     scope.arm();
     type SessionReleaseProbe =
         Box<dyn Fn() -> Option<crate::pals_adaptive::NativeSessionReleaseObservation>>;
@@ -2172,11 +2245,14 @@ pub(super) fn run_native_admitted(
                 super::super::product::RoventOwnNnuecAssemblyV3::new(loaded, Arc::clone(&boundary)),
             ));
             scope.attach_pin(Box::new(Arc::clone(&custody)));
-            let prepared = match super::super::prepare_native_v3_retaining::<AdaptivePortQuestion>(
+            let prepared = match super::super::prepare_native_v3_retaining_with_parent::<
+                AdaptivePortQuestion,
+            >(
                 Arc::clone(&sources),
                 resources,
                 clock.runtime_clock(),
                 control.clone(),
+                connected_parent.clone(),
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -2405,11 +2481,14 @@ pub(super) fn run_native_admitted(
                 ),
             ));
             scope.attach_pin(Box::new(Arc::clone(&custody)));
-            let prepared = match super::super::prepare_native_v3_retaining::<AdaptivePortQuestion>(
+            let prepared = match super::super::prepare_native_v3_retaining_with_parent::<
+                AdaptivePortQuestion,
+            >(
                 Arc::clone(&sources),
                 resources,
                 clock.runtime_clock(),
                 control.clone(),
+                connected_parent.clone(),
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -2652,11 +2731,14 @@ pub(super) fn run_native_admitted(
                 ),
             ));
             scope.attach_pin(Box::new(Arc::clone(&custody)));
-            let prepared = match super::super::prepare_native_v3_retaining::<PcPortQuestion>(
+            let prepared = match super::super::prepare_native_v3_retaining_with_parent::<
+                PcPortQuestion,
+            >(
                 Arc::clone(&sources),
                 resources,
                 clock.runtime_clock(),
                 control.clone(),
+                connected_parent.clone(),
             ) {
                 Ok(prepared) => prepared,
                 Err(failure) => {

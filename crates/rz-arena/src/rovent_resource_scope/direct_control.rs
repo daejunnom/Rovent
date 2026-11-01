@@ -17,6 +17,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::fs::MetadataExt,
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -127,6 +128,38 @@ impl BoundDirectControl {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .observe_bound_identity()
+    }
+
+    /// Accept the original supervisor connection from this already-bound
+    /// endpoint. Peer identity and launch values are checked by UCI against
+    /// the original lock before this stream can authorize native entry.
+    pub(super) fn accept_parent_until(&self, until: Instant) -> io::Result<UnixStream> {
+        let owner = self
+            .original
+            .lock()
+            .map_err(|_| io::Error::other("original control owner poisoned"))?;
+        owner.observe_bound_identity().map_err(io::Error::other)?;
+        let listener = owner
+            .listener
+            .as_ref()
+            .ok_or_else(|| io::Error::other("original listener unavailable"))?;
+        listener.set_nonblocking(true)?;
+        loop {
+            if Instant::now() >= until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "parent connection deadline expired",
+                ));
+            }
+            match listener.accept() {
+                Ok((stream, _)) => return Ok(stream),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
