@@ -35,6 +35,8 @@ MONITOR_REGISTRY_KEY = r'Software\RoveZero\StorageMonitor'
 SOURCE_ROOTS_SCHEMA = 'rovezero.storage-source-roots.v1'
 MAX_SOURCE_ROOTS = 64
 SHARED_MONITOR_FILE = 'monitor-configuration.json'
+PARTIAL_CAUSES = frozenset({'threshold_short_circuit', 'deadline', 'entry_limit',
+                            'unvisited_roots', 'other_observation_limit', 'custom_scope_unknown'})
 
 
 def _package_roots():
@@ -349,6 +351,26 @@ def discover_windows_roots(*, source_config=None, load_config=True):
     if load_config:
         source_config = _read_source_roots_config()
     return _distinct_windows_roots(_windows_root_candidates() + _checked_source_roots(source_config))
+
+
+def _priority_managed_roots(roots):
+    """Prioritize only selected roots proven identical to a managed root."""
+    identities = set()
+    for path in _windows_root_candidates():
+        try:
+            item = _identity_nofollow(path, directory=True)
+            identities.add((item['volume_serial'], item['file_index']))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    preferred = []
+    for path in roots:
+        try:
+            item = _identity_nofollow(path, directory=True)
+            if (item['volume_serial'], item['file_index']) in identities:
+                preferred.append(path)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return preferred
 
 
 def _distinct_windows_roots(roots):
@@ -747,6 +769,10 @@ def combine(windows, linux, *, proven_disjoint=False, now=None, threshold=THRESH
             revision = value.get('source_roots_revision') if label == 'windows' else None
             if isinstance(revision, str) and len(revision) <= 36:
                 parts[label]['source_roots_revision'] = revision
+            causes = value.get('partial_causes') if label == 'windows' else None
+            if isinstance(causes, list):
+                parts[label]['partial_causes'] = sorted({cause for cause in causes
+                                                        if isinstance(cause, str) and cause in PARTIAL_CAUSES})
             proof = value.get('origin_proof') if label == 'linux' else None
             if (isinstance(proof, dict)
                     and all(_hex_tag(proof.get(k)) for k in ('pair_tag', 'machine_tag', 'boot_tag'))
@@ -894,12 +920,21 @@ def scan_once(*, max_entries=2_000_000, max_seconds=120.0, threshold_bytes=THRES
             roots = discover_windows_roots(source_config=None, load_config=False)
         result = module.scan_total_usage(roots, threshold_bytes=threshold_bytes,
                                          max_entries=max_entries, max_seconds=max_seconds,
-                                         stop_when_exceeded=True)
+                                         stop_when_exceeded=True,
+                                         priority_roots=_priority_managed_roots(roots))
         windows = {key: result[key] for key in ('observed_at_utc', 'decision', 'coverage',
                    'threshold_bytes', 'allocated_bytes_lower_bound', 'logical_bytes_lower_bound')}
         windows.update(schema=WINDOWS_SCHEMA, scope='windows_standard_codex_and_configured_sources_custom_unknown',
                        host_physical_bytes='unknown', consistency='best_effort_non_atomic',
                        allocated_measure=ALLOCATED_MEASURE, source_roots_revision=revision)
+        reasons = result.get('partial_reasons', {})
+        causes = {key for key in ('threshold_short_circuit', 'deadline', 'entry_limit') if reasons.get(key)}
+        if any(value for key, value in reasons.items() if key not in causes):
+            causes.add('other_observation_limit')
+        if result.get('unvisited_roots'):
+            causes.add('unvisited_roots')
+        causes.add('custom_scope_unknown')
+        windows['partial_causes'] = sorted(causes)
         # Other package identities and user-selected locations may exist even
         # if both discovered roots were scanned without an error.
         windows['coverage'] = 'partial'

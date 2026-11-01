@@ -195,7 +195,7 @@ def _open_directory(path: Path, expected: os.stat_result):
 
 def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRESHOLD,
                      max_entries=1_000_000, max_seconds=60.0,
-                     stop_when_exceeded=False):
+                     stop_when_exceeded=False, priority_roots=()):
     """Observe explicitly scoped roots, without deleting or modifying any file.
 
     The global inode set covers overlapping roots and hardlinks across roots on
@@ -308,6 +308,12 @@ def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRE
             stats["overlapping_roots_excluded"] += 1
         else:
             selected.append(candidate)
+
+    # Reorder only after parent/alias selection. Priority cannot add an
+    # unregistered path or change deduplication; it is a hint, not evidence.
+    priority = {os.path.normcase(os.path.abspath(os.fspath(path))) for path in priority_roots}
+    if priority:
+        selected.sort(key=lambda path: os.path.normcase(os.fspath(path)) not in priority)
 
     for root in selected:
         if not bounded():

@@ -68,6 +68,14 @@ class CombinedTests(unittest.TestCase):
         self.assertEqual(result['decision'], 'exceeded')
         self.assertEqual(result['coverage'], 'partial')
 
+    def test_partial_causes_preserve_only_public_allowlisted_reasons(self):
+        windows = sample(usage.WINDOWS_SCHEMA, 19, coverage='partial')
+        windows['partial_causes'] = ['threshold_short_circuit', 'unvisited_roots', 'private/path']
+        result = usage.combine(windows, None, proven_disjoint=False, now=1001, threshold=18)
+        self.assertEqual(result['components']['windows']['partial_causes'],
+                         ['threshold_short_circuit', 'unvisited_roots'])
+        self.assertEqual(result['decision'], 'exceeded')
+
     def test_paired_partial_observations_can_still_exceed(self):
         windows = sample(usage.WINDOWS_SCHEMA, 10 * usage.GIB, coverage='partial')
         linux = sample(usage.LINUX_SCHEMA, 10 * usage.GIB, coverage='partial')
@@ -330,6 +338,16 @@ class WindowsHandleTests(unittest.TestCase):
             self.assertEqual(len(redirected_roots), 1)
             self.assertEqual(usage._normalize_windows_path(normal_roots[0]),
                              usage._normalize_windows_path(redirected_roots[0]))
+
+    def test_managed_priority_matches_identity_not_path_spelling(self):
+        configured = Path('C:/fixture/Roaming/RoveZero')
+        alias = Path('C:/fixture/Package/RoveZero')
+        checkout = Path('C:/fixture/Checkout/RoveZero')
+        def identity(path, *, directory):
+            return {'volume_serial': 1, 'file_index': 5 if path in (configured, alias) else 6}
+        with mock.patch.object(usage, '_windows_root_candidates', return_value=[configured]), \
+             mock.patch.object(usage, '_identity_nofollow', side_effect=identity):
+            self.assertEqual(usage._priority_managed_roots([checkout, alias]), [alias])
 
     def test_root_overlap_is_distinct_from_alias_and_preserves_other_volumes(self):
         with tempfile.TemporaryDirectory() as directory:

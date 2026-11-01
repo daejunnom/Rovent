@@ -269,6 +269,27 @@ class TotalUsageTests(unittest.TestCase):
         self.assertEqual(below["logical_bytes_lower_bound"], len(b"firstsecond"))
         self.assertEqual(below["unvisited_roots"], [])
 
+    def test_priority_reorders_only_selected_roots_and_keeps_partial_honest(self):
+        first = self.root("a-priority")
+        preferred = self.root("z-priority")
+        (first / "data").write_bytes(b"first")
+        chosen = preferred / "data"
+        chosen.write_bytes(b"second")
+        allocated = usage._allocated_bytes(chosen, chosen.stat())
+        if allocated is None or allocated <= 1:
+            self.skipTest("fixture filesystem does not expose nonzero allocation")
+        stopped = usage.scan_total_usage([first, preferred], threshold_bytes=allocated - 1,
+                                        stop_when_exceeded=True, priority_roots=[preferred])
+        self.assertEqual(stopped["roots"][0]["root"], str(preferred))
+        self.assertEqual(stopped["unvisited_roots"], [str(first)])
+        self.assertEqual(stopped["coverage"], "partial")
+        self.assertEqual(stopped["decision"], "exceeded")
+        full = usage.scan_total_usage([first, preferred], threshold_bytes=10**12,
+                                     stop_when_exceeded=True, priority_roots=[preferred])
+        baseline = usage.scan_total_usage([first, preferred], threshold_bytes=10**12)
+        self.assertEqual(full["allocated_bytes_lower_bound"], baseline["allocated_bytes_lower_bound"])
+        self.assertEqual(full["unvisited_roots"], [])
+
     def test_symlink_is_not_followed(self):
         root = self.root("scope")
         outside = self.root("outside")
