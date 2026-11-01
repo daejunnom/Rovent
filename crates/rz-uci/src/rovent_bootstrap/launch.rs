@@ -2389,8 +2389,28 @@ fn drain_native<Q: NativeQuestionProjection>(
             }
         }
         let joined = native.try_join();
-        if matches!(joined, Ok(true)) && finished == Some(true) {
-            return true;
+        if matches!(joined, Ok(true)) {
+            // The worker is the sole event producer. It may have sent its
+            // final event between the first poll and the join, so drain once
+            // more after joining before deciding whether physical completion
+            // was confirmed. No new event can arrive from that worker now.
+            while let Some(event) = native.poll() {
+                match event {
+                    TicketNativeEvent::Finished {
+                        physical_shutdown_confirmed,
+                    } => finished = Some(finished.unwrap_or(true) && physical_shutdown_confirmed),
+                    TicketNativeEvent::Ready { .. } | TicketNativeEvent::RootQuiesced(_) => {}
+                    other => retained.push(other),
+                }
+            }
+            if finished == Some(true) {
+                return true;
+            }
+            // A joined worker without a positive completion report cannot
+            // produce one later. Preserve every unexpected payload exactly as
+            // on timeout and keep physical completion unknown.
+            std::mem::forget(retained);
+            return false;
         }
         if joined.is_err() || finished == Some(false) || Instant::now() >= until {
             // Unexpected payloads retain their original leases on unknown

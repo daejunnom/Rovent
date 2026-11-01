@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn failed_native_factory_drain_returns_unknown_after_worker_exits() {
+    use crate::pals_native::ticketed::TicketServiceLimits;
+    use rz_search::pals::coordinator::RoleFailure;
+    use std::sync::mpsc;
+
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut native = RoventNativeService::<AdaptivePortQuestion>::spawn(
+            || Err(RoleFailure::Canceled),
+            TicketServiceLimits::default(),
+        )
+        .expect("mock native service must start");
+        // The long cleanup deadline exposes accidental waiting after the
+        // factory thread is already gone. An unknown fence remains false.
+        let confirmed = drain_native(&mut native, Instant::now() + Duration::from_secs(60));
+        let _ = result_tx.send(confirmed);
+    });
+    assert_eq!(result_rx.recv_timeout(Duration::from_secs(5)), Ok(false));
+}
+
+#[test]
 fn launch_retains_the_original_lock_version_without_projecting_it() {
     use rz_contracts::rovent::ExecutionMode;
     use rz_experiments::{
