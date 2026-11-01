@@ -274,6 +274,42 @@ mod tests {
     }
 
     #[test]
+    fn retained_answer_proves_only_its_original_consumed_role() {
+        let (mut port, work, accepted, output) = source();
+        pending(&mut port, &work);
+        assert!(!port.reciprocal_answer_consumed(&work, &accepted, &output));
+        let _answer = port
+            .consume_cpu_reciprocal(&work, &accepted, &output, None)
+            .unwrap();
+        assert!(!port.reciprocal_source_consumed(&work, accepted.ticket(), &output));
+        assert!(port.reciprocal_answer_consumed(&work, &accepted, &output));
+        assert!(port.reciprocal_answer_consumed(&work, &accepted, &output));
+        assert_eq!(port.counters.consumed_role_outputs, 1);
+
+        let mut changed_output = output.clone();
+        let RolePayload::Proposal { candidate_logits, .. } = &mut changed_output.payload else {
+            panic!("expected proposer head");
+        };
+        candidate_logits[0] = 1.0;
+        assert!(!port.reciprocal_answer_consumed(&work, &accepted, &changed_output));
+        let mut changed = work.clone();
+        changed.frame.sequence += 1;
+        assert!(!port.reciprocal_answer_consumed(&changed, &accepted, &output));
+        let mut changed = work.clone();
+        changed.input.question = Arc::new(changed.input.question.as_ref().clone());
+        assert!(!port.reciprocal_answer_consumed(&changed, &accepted, &output));
+        let (_, other, _, _) = source();
+        let mut changed = work.clone();
+        changed.input.view = other.input.view;
+        assert!(!port.reciprocal_answer_consumed(&changed, &accepted, &output));
+        port.accepted.remove(&accepted.ticket().id);
+        assert!(!port.reciprocal_answer_consumed(&work, &accepted, &output));
+        port.accepted.insert(accepted.ticket().id);
+        port.reciprocal.answers.clear();
+        assert!(!port.reciprocal_answer_consumed(&work, &accepted, &output));
+    }
+
+    #[test]
     fn accepted_source_consumption_is_charged_once_before_final_legacy_commit() {
         let (mut port, work, accepted, output) = source();
         port.accept_accepted_role_source(&work, &accepted, &output)
@@ -836,6 +872,30 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     && self
                         .role_consumption_recorded(ticket, &work.input.view)
                         .unwrap_or(false)
+            })
+    }
+
+    /// A reciprocal answer has replaced its earlier consumed-source entry.
+    /// Accept only the original retained answer and its recorded head use;
+    /// this observation neither consumes the answer again nor extends its life.
+    pub(super) fn reciprocal_answer_consumed(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> bool {
+        let ticket = accepted.ticket();
+        accepted.validates_output(output)
+            && self.reciprocal.answers.iter().any(|answer| {
+                answer.ticket == *ticket
+                    && answer.evidence == accepted.output_digest()
+                    && answer.frame == work.frame
+                    && answer.question.original_first_move == Some(work.original_first_move)
+                    && answer.question.question_digest == work.input.question_digest
+                    && answer.question.view == work.input.view_seal
+                    && Arc::ptr_eq(&answer.view, &work.input.view)
+                    && Arc::ptr_eq(&answer.query, &work.input.question)
+                    && self.role_consumption_recorded(ticket, &work.input.view).unwrap_or(false)
             })
     }
 

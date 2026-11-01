@@ -1093,6 +1093,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 guard.first_observation,
                 end,
             ) || self.reciprocal_source_consumed(work, ticket, output)
+                || self.reciprocal_answer_consumed(work, accepted, output)
                 || previous.as_ref().is_some_and(|source| {
                     source.origin.matches(accepted)
                         && source.question == work.input.question_digest
