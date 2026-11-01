@@ -261,6 +261,10 @@ pub struct RoventNativeSystemResourceRunReceiptV3 {
     pub control_cleanup_error: Option<String>,
     startup: Option<rz_experiments::SystemRuntimeReceiptV6>,
     termination: Option<rz_experiments::SystemRuntimeReceiptV6>,
+    startup_receipt_error: Option<String>,
+    termination_receipt_error: Option<String>,
+    startup_registered_identity: &'static str,
+    termination_registered_identity: &'static str,
     system_runtime_evidence_error: Option<String>,
     system_lock_sha256: String,
     process_id: u32,
@@ -269,6 +273,12 @@ pub struct RoventNativeSystemResourceRunReceiptV3 {
     custody: Arc<Mutex<NativeResourceCustody>>,
 }
 impl RoventNativeSystemResourceRunReceiptV3 {
+    pub fn startup_receipt(&self) -> Option<&rz_experiments::SystemRuntimeReceiptV6> {
+        self.startup.as_ref()
+    }
+    pub fn termination_receipt(&self) -> Option<&rz_experiments::SystemRuntimeReceiptV6> {
+        self.termination.as_ref()
+    }
     pub fn child_system_runtime_receipts_validated(&self) -> bool {
         self.startup.is_some()
             && self.termination.is_some()
@@ -284,10 +294,24 @@ impl RoventNativeSystemResourceRunReceiptV3 {
             "system_lock_sha256":self.system_lock_sha256,
             "process_id":self.process_id,"process_generation":self.process_generation,
             "product_finish":self.product_finish.as_ref().map(product_finish_json),
-            "startup_provider_ready":self.startup.as_ref().map(|r|r.provider_ready),
-            "child_terminal_physical_completion":self.termination.as_ref().map(|r|&r.physical_completion),
+            "startup_provider_ready":if self.child_system_runtime_receipts_validated() {self.startup.as_ref().map(|r|r.provider_ready)} else {None},
+            "child_terminal_physical_completion":if self.child_system_runtime_receipts_validated() {self.termination.as_ref().map(|r|&r.physical_completion)} else {None},
             "child_system_runtime_receipts_validated":self.child_system_runtime_receipts_validated(),
             "system_runtime_evidence_error":self.system_runtime_evidence_error,
+            "system_runtime_receipt_observation":{
+                "startup":{"child_bound":self.startup.is_some(),"read_error":self.startup_receipt_error,
+                    "captured_registered_identity":self.startup_registered_identity,
+                    "provider_ready_child_claim":self.startup.as_ref().map(|r|r.provider_ready),
+                    "unregistered_native_mapping_count":self.startup.as_ref().and_then(|r|r.unregistered_native_mappings.as_ref().map(Vec::len)),
+                    "mapping_unknown_roles":self.startup.as_ref().map(|r|r.observed_libraries.iter().filter(|item|item.mapped.is_none()).count())},
+                "termination":{"child_bound":self.termination.is_some(),"read_error":self.termination_receipt_error,
+                    "captured_registered_identity":self.termination_registered_identity,
+                    "physical_completion_child_claim":self.termination.as_ref().map(|r|&r.physical_completion),
+                    "unregistered_native_mapping_count":self.termination.as_ref().and_then(|r|r.unregistered_native_mappings.as_ref().map(Vec::len)),
+                    "mapping_unknown_roles":self.termination.as_ref().map(|r|r.observed_libraries.iter().filter(|item|item.mapped.is_none()).count())},
+                "strict_pair":if self.child_system_runtime_receipts_validated() {"confirmed"} else {"unconfirmed"},
+                "strict_pair_error":self.system_runtime_evidence_error,
+                "scope":"child receipt claims; complete parsed receipts retained by owner; captured identity is not mapped execution or a GPU fence"},
             "original_resource_owner_retained":self.custody.lock().ok().is_some_and(|state|state.scope_v3.is_some()),
             "independent_post_exit_process_observation":false,
             "independent_gpu_fence_observation":false,
@@ -1224,16 +1248,102 @@ fn read_system_v3_receipt(
     )?)
 }
 
-fn verify_system_v3_child_receipts(
+struct SystemV3ReceiptObservations {
+    startup: Option<rz_experiments::SystemRuntimeReceiptV6>,
+    termination: Option<rz_experiments::SystemRuntimeReceiptV6>,
+    startup_error: Option<String>,
+    termination_error: Option<String>,
+    startup_identity: &'static str,
+    termination_identity: &'static str,
+    strict_pair_error: Option<String>,
+}
+
+/// Report captured file identity independently from provider mappings. A
+/// missing observation stays unknown; a concrete mismatch stays a conflict.
+fn captured_system_identity_status(
+    lock: &rz_experiments::SystemRuntimeLockV6,
+    receipt: Option<&rz_experiments::SystemRuntimeReceiptV6>,
+) -> &'static str {
+    use rz_experiments::NativeRuntimeSourceV6;
+    let Some(receipt) = receipt else {
+        return "unavailable";
+    };
+    let NativeRuntimeSourceV6::SystemCuda(spec) = &lock.runtime else {
+        return if receipt.observed_identity_sha256.is_none()
+            && receipt.observed_libraries.is_empty()
+        {
+            "not_applicable"
+        } else {
+            "conflict"
+        };
+    };
+    let identity = receipt.observed_identity_sha256.as_deref();
+    if identity.is_some_and(|value| value != spec.system_identity_sha256.as_str()) {
+        return "conflict";
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for actual in &receipt.observed_libraries {
+        if !seen.insert(actual.role.as_str()) {
+            return "conflict";
+        }
+        let Some(expected) = spec.libraries.iter().find(|item| item.role == actual.role) else {
+            return "conflict";
+        };
+        if actual.canonical_path != expected.canonical_path
+            || actual.sha256 != expected.sha256
+            || actual.bytes != expected.bytes
+            || actual.device != expected.device
+            || actual.inode != expected.inode
+        {
+            return "conflict";
+        }
+    }
+    if identity.is_none() || seen.len() != spec.libraries.len() {
+        return "unknown";
+    }
+    "matched_captured_files"
+}
+
+fn classify_system_v3_child_receipts(
+    lock: &rz_experiments::SystemRuntimeLockV6,
+    pid: u32,
+    epoch: u64,
+    startup: Result<rz_experiments::SystemRuntimeReceiptV6, String>,
+    termination: Result<rz_experiments::SystemRuntimeReceiptV6, String>,
+) -> SystemV3ReceiptObservations {
+    let (startup, startup_error) = match startup {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error)),
+    };
+    let (termination, termination_error) = match termination {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error)),
+    };
+    let startup_identity = captured_system_identity_status(lock, startup.as_ref());
+    let termination_identity = captured_system_identity_status(lock, termination.as_ref());
+    let strict_pair_error = match (&startup, &termination) {
+        (Some(startup), Some(termination)) => {
+            validate_system_v3_receipt_pair(lock, pid, epoch, startup, termination)
+                .err()
+                .map(|error| error.to_string())
+        }
+        _ => Some("one or both original child-bound system receipts are unavailable".into()),
+    };
+    SystemV3ReceiptObservations {
+        startup,
+        termination,
+        startup_error,
+        termination_error,
+        startup_identity,
+        termination_identity,
+        strict_pair_error,
+    }
+}
+
+fn observe_system_v3_child_receipts(
     state: &NativeResourceCustody,
     epoch: u64,
-) -> Result<
-    (
-        rz_experiments::SystemRuntimeReceiptV6,
-        rz_experiments::SystemRuntimeReceiptV6,
-    ),
-    ArenaError,
-> {
+) -> Result<SystemV3ReceiptObservations, ArenaError> {
     let scope = state.original_v3_scope()?;
     let lock = &scope.input_lock().manifest.system_runtime_lock;
     let pid = std::process::id();
@@ -1242,16 +1352,23 @@ fn verify_system_v3_child_receipts(
         .open_dir_nofollow(format!("native-process-{pid}"))
         .map_err(|_| invalid("original V3 process receipt directory unavailable"))?;
     let startup =
-        read_system_v3_receipt(&session, "system-runtime-startup.v6.json", lock, pid, epoch)?;
+        read_system_v3_receipt(&session, "system-runtime-startup.v6.json", lock, pid, epoch)
+            .map_err(|error| error.to_string());
     let termination = read_system_v3_receipt(
         &session,
         "system-runtime-termination.v6.json",
         lock,
         pid,
         epoch,
-    )?;
-    validate_system_v3_receipt_pair(lock, pid, epoch, &startup, &termination)?;
-    Ok((startup, termination))
+    )
+    .map_err(|error| error.to_string());
+    Ok(classify_system_v3_child_receipts(
+        lock,
+        pid,
+        epoch,
+        startup,
+        termination,
+    ))
 }
 
 /// Validate the original child's claims. This does not independently attest
@@ -1803,11 +1920,21 @@ fn run_native_with_resources_v3_inner(
         .clone();
     // A missing or malformed diagnostic is not an engine failure. Preserve
     // the original files and mark acceptance unknown rather than hiding it.
-    let (startup, termination, system_runtime_evidence_error) =
-        match verify_system_v3_child_receipts(&state, epoch) {
-            Ok((startup, termination)) => (Some(startup), Some(termination), None),
-            Err(error) => (None, None, Some(error.to_string())),
-        };
+    let observations = match observe_system_v3_child_receipts(&state, epoch) {
+        Ok(observations) => observations,
+        Err(error) => {
+            let detail = error.to_string();
+            SystemV3ReceiptObservations {
+                startup: None,
+                termination: None,
+                startup_error: Some(detail.clone()),
+                termination_error: Some(detail.clone()),
+                startup_identity: "unavailable",
+                termination_identity: "unavailable",
+                strict_pair_error: Some(detail),
+            }
+        }
+    };
     let admission = state.admission.clone();
     let finished_live = state.finished_live.clone();
     let admission_evidence_error = state.admission_evidence_error.clone();
@@ -1822,9 +1949,13 @@ fn run_native_with_resources_v3_inner(
         finished_evidence_error,
         finished_policy_observation_error,
         control_cleanup_error,
-        startup,
-        termination,
-        system_runtime_evidence_error,
+        startup: observations.startup,
+        termination: observations.termination,
+        startup_receipt_error: observations.startup_error,
+        termination_receipt_error: observations.termination_error,
+        startup_registered_identity: observations.startup_identity,
+        termination_registered_identity: observations.termination_identity,
+        system_runtime_evidence_error: observations.strict_pair_error,
         system_lock_sha256,
         process_id: std::process::id(),
         process_generation: epoch,
@@ -2105,6 +2236,108 @@ mod tests {
         };
         assert!(
             validate_system_v3_receipt_pair(&lock, pid, epoch, &startup, &termination).is_err()
+        );
+    }
+
+    #[test]
+    fn child_receipts_survive_independent_evidence_failure_without_strict_success() {
+        use rz_experiments::{
+            NativeRuntimeSourceV6, PhysicalCompletionV6, ProviderReadinessV6,
+            SYSTEM_RUNTIME_RECEIPT_V6_DOMAIN, SystemLibraryObservationV6, SystemLibrarySpecV6,
+            SystemPlatformV6, SystemRuntimeLockV6, SystemRuntimeReceiptV6, SystemRuntimeSpecV6,
+        };
+        let pid = std::process::id();
+        let epoch = u64::from(pid) + 1;
+        let libraries: Vec<_> = ["ort-core", "ort-provider-cuda"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let path = format!("/synthetic/{role}.so");
+                SystemLibrarySpecV6 {
+                    role: role.into(),
+                    requested_path: path.clone(),
+                    canonical_path: path,
+                    version: None,
+                    sha256: format!("{:064x}", u64::from(pid) + index as u64 + 1),
+                    bytes: 1,
+                    device: 1,
+                    inode: index as u64 + 1,
+                    required_mapping: true,
+                }
+            })
+            .collect();
+        let identity = format!("{:064x}", u64::from(pid) + 20);
+        let spec = SystemRuntimeSpecV6 {
+            platform: SystemPlatformV6::Linux,
+            libraries: libraries.clone(),
+            system_identity_sha256: identity.clone(),
+            cuda_device_id: 0,
+            cuda_arena_bytes: 1024,
+            startup_ms: 1000,
+            drain_ms: 200,
+            capture_max_libraries: 2,
+            capture_max_file_bytes: 2,
+            capture_max_total_bytes: 3,
+            capture_timeout_ms: 100,
+        };
+        let lock = SystemRuntimeLockV6::new(NativeRuntimeSourceV6::SystemCuda(spec)).unwrap();
+        let observed_libraries = libraries
+            .iter()
+            .map(|item| SystemLibraryObservationV6 {
+                role: item.role.clone(),
+                canonical_path: item.canonical_path.clone(),
+                sha256: item.sha256.clone(),
+                bytes: item.bytes,
+                device: item.device,
+                inode: item.inode,
+                mapped: None,
+            })
+            .collect();
+        let startup = SystemRuntimeReceiptV6 {
+            domain: SYSTEM_RUNTIME_RECEIPT_V6_DOMAIN.into(),
+            lock_sha256: lock.canonical_sha256.clone(),
+            process_id: pid,
+            process_generation: epoch,
+            observed_identity_sha256: Some(identity),
+            observed_libraries,
+            unregistered_native_mappings: Some(vec!["libsynthetic_dependency.so".into()]),
+            provider_ready: ProviderReadinessV6::Ready,
+            physical_completion: PhysicalCompletionV6::Unknown,
+        };
+        let mut termination = startup.clone();
+        termination.physical_completion = PhysicalCompletionV6::Confirmed {
+            completion_id: format!("session_finish_confirmed/1:{pid}:{epoch}"),
+        };
+        let observations = classify_system_v3_child_receipts(
+            &lock,
+            pid,
+            epoch,
+            Ok(startup.clone()),
+            Ok(termination.clone()),
+        );
+        assert!(observations.startup.is_some() && observations.termination.is_some());
+        assert_eq!(observations.startup_identity, "matched_captured_files");
+        assert!(observations.strict_pair_error.is_some());
+        let observations = classify_system_v3_child_receipts(
+            &lock,
+            pid,
+            epoch,
+            Err("injected independent read error".into()),
+            Ok(termination),
+        );
+        assert!(observations.startup.is_none() && observations.termination.is_some());
+        assert_eq!(observations.startup_identity, "unavailable");
+        assert!(observations.strict_pair_error.is_some());
+        let mut conflicting = startup;
+        conflicting.observed_libraries[0].inode += 1;
+        assert_eq!(
+            captured_system_identity_status(&lock, Some(&conflicting)),
+            "conflict"
+        );
+        conflicting.observed_identity_sha256 = None;
+        assert_eq!(
+            captured_system_identity_status(&lock, Some(&conflicting)),
+            "conflict"
         );
     }
 
