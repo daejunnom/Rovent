@@ -514,6 +514,7 @@ pub struct RoventCorpusProducerLockV2 {
     native_retirements: BTreeMap<RequestId, RoleTicketEnvelope>,
     // Original callback-owned cancellation observations, never deserialized
     // or synthesized from a ticket ID. Bounded by the existing pending cap.
+    #[cfg(feature = "experimental-teacher-exact-observation")]
     diagnostic_ticket_guards: BTreeMap<RequestId, super::native_capture::OriginalTicketGuardV2>,
     native_observation_failures:
         BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
@@ -574,6 +575,7 @@ impl RoventCorpusProducerLockV2 {
             producer_owner: std::sync::Arc::new(()),
             original,
             native_retirements: BTreeMap::new(),
+            #[cfg(feature = "experimental-teacher-exact-observation")]
             diagnostic_ticket_guards: BTreeMap::new(),
             native_observation_failures: BTreeMap::new(),
         })
@@ -654,6 +656,7 @@ impl RoventCorpusProducerLockV2 {
                 !self.original.inputs.contains_key(&key) && self.original.inputs.len() < 16,
                 "lock-v2 original input duplicate/cap",
             )?;
+            #[cfg(feature = "experimental-teacher-exact-observation")]
             check(
                 !self
                     .diagnostic_ticket_guards
@@ -677,7 +680,11 @@ impl RoventCorpusProducerLockV2 {
         }
         // Validation happens before moving the input; commit has no fallible
         // operations and preserves the original owner and reservation.
+        #[cfg(feature = "experimental-teacher-exact-observation")]
         let (captured, _, diagnostic_guard) = input.into_original();
+        #[cfg(not(feature = "experimental-teacher-exact-observation"))]
+        let (captured, _) = input.into_original();
+        #[cfg(feature = "experimental-teacher-exact-observation")]
         let ticket_id = captured.original.pending.ticket.id;
         let key = (
             captured.original.pending.ticket.id.epoch.0,
@@ -692,6 +699,7 @@ impl RoventCorpusProducerLockV2 {
             .pending
             .insert(key, captured.original.pending);
         self.original.inputs.insert(key, captured.input);
+        #[cfg(feature = "experimental-teacher-exact-observation")]
         if let Some(guard) = diagnostic_guard {
             self.diagnostic_ticket_guards.insert(ticket_id, guard);
         }
@@ -764,6 +772,7 @@ impl RoventCorpusProducerLockV2 {
 
     pub fn discard_unpublished(&mut self, id: RequestId) -> bool {
         let discarded = self.original.discard_unpublished(id);
+        #[cfg(feature = "experimental-teacher-exact-observation")]
         if discarded {
             self.diagnostic_ticket_guards.remove(&id);
         }
@@ -885,6 +894,7 @@ impl RoventCorpusProducerLockV2 {
             producer_owner: std::sync::Arc::clone(&self.producer_owner),
             ticket,
             admission: self.admission.clone(),
+            #[cfg(feature = "experimental-teacher-exact-observation")]
             diagnostic_ticket_guard: self.diagnostic_ticket_guards.remove(&ticket.id),
             record: rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2(
                 RoventTrainingRecordV2 {

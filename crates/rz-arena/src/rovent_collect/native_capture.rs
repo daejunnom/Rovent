@@ -64,6 +64,7 @@ struct SpeculativeRouteV2 {
 }
 /// Read-only view of this callback's original ticket and route flags. It
 /// grants neither an issuance claim nor publication/physical authority.
+#[cfg(feature = "experimental-teacher-exact-observation")]
 pub(super) struct OriginalTicketGuardV2 {
     route: Arc<SpeculativeRouteV2>,
     ticket: Arc<SpeculativeTicketV2>,
@@ -210,6 +211,7 @@ pub(super) enum LockV2RegistrationAttempt {
 pub(super) struct RoventCapturedLockInputV2 {
     captured: RoventCapturedInputV2,
     admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    #[cfg(feature = "experimental-teacher-exact-observation")]
     diagnostic_ticket_guard: Option<OriginalTicketGuardV2>,
 }
 impl RoventCapturedLockInputV2 {
@@ -219,6 +221,7 @@ impl RoventCapturedLockInputV2 {
     pub(super) fn admission(&self) -> &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2 {
         &self.admission
     }
+    #[cfg(feature = "experimental-teacher-exact-observation")]
     pub(super) fn into_original(
         self,
     ) -> (
@@ -227,6 +230,15 @@ impl RoventCapturedLockInputV2 {
         Option<OriginalTicketGuardV2>,
     ) {
         (self.captured, self.admission, self.diagnostic_ticket_guard)
+    }
+    #[cfg(not(feature = "experimental-teacher-exact-observation"))]
+    pub(super) fn into_original(
+        self,
+    ) -> (
+        RoventCapturedInputV2,
+        rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    ) {
+        (self.captured, self.admission)
     }
 }
 type Registrations = Arc<Mutex<BTreeMap<RequestId, RegisteredInputCapture>>>;
@@ -1189,21 +1201,13 @@ impl RoventNativeInputObserver {
                 let input = RoventCapturedLockInputV2 {
                     captured,
                     admission,
-                    diagnostic_ticket_guard: {
-                        #[cfg(feature = "experimental-teacher-exact-observation")]
-                        {
-                            speculative.as_ref().filter(|_| teacher_required).map(
-                                |(route, ticket)| OriginalTicketGuardV2 {
-                                    route: Arc::clone(route),
-                                    ticket: Arc::clone(ticket),
-                                },
-                            )
-                        }
-                        #[cfg(not(feature = "experimental-teacher-exact-observation"))]
-                        {
-                            None
-                        }
-                    },
+                    #[cfg(feature = "experimental-teacher-exact-observation")]
+                    diagnostic_ticket_guard: speculative.as_ref().filter(|_| teacher_required).map(
+                        |(route, ticket)| OriginalTicketGuardV2 {
+                            route: Arc::clone(route),
+                            ticket: Arc::clone(ticket),
+                        },
+                    ),
                 };
                 match self.lock_v2_sender.try_send(input) {
                     Ok(()) => {

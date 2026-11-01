@@ -22,6 +22,7 @@ pub struct RoventRetiredLockV2Record {
     pub(super) ticket: RoleTicketEnvelope,
     // Original callback-owned cancellation state, if one was actually
     // captured. This is not serialized and grants no target authority.
+    #[cfg(feature = "experimental-teacher-exact-observation")]
     pub(super) diagnostic_ticket_guard: Option<super::native_capture::OriginalTicketGuardV2>,
 }
 
