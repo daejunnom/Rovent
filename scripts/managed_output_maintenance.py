@@ -59,6 +59,9 @@ def _remove_snapshot(root: Path, snapshot, tick):
     parent_fd = os.open(root.parent, directory_flags)
     root_fd = None
     removed_bytes = 0
+    # Only a successful unlink by this operation may advance an inode's
+    # expected ctime/link count for a later name of the same hard-linked file.
+    after_own_unlink = {}
     try:
         root_fd = os.open(root.name, directory_flags, dir_fd=parent_fd)
         info = os.fstat(root_fd)
@@ -89,10 +92,38 @@ def _remove_snapshot(root: Path, snapshot, tick):
                 if stat.S_ISDIR(info.st_mode):
                     os.rmdir(parts[-1], dir_fd=current)
                 elif stat.S_ISREG(info.st_mode):
-                    if (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != expected[2:]:
+                    inode = (info.st_dev, info.st_ino)
+                    prior = after_own_unlink.get(inode)
+                    expected_ctime = expected[4] if prior is None else prior.st_ctime_ns
+                    if (info.st_mode != expected[1]
+                            or (info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                            != (expected[2], expected[3], expected_ctime)
+                            or (prior is not None and info.st_nlink != prior.st_nlink)):
                         raise StorageError("cache file changed during cleanup")
-                    os.unlink(parts[-1], dir_fd=current)
-                    removed_bytes += info.st_size
+                    # O_PATH holds the inode without requiring read permission.
+                    # The FD lets us verify the precise effect of our unlink
+                    # before accepting its ctime for another hard link.
+                    file_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_NOFOLLOW
+                    fd = os.open(parts[-1], file_flags, dir_fd=current)
+                    try:
+                        opened_info = os.fstat(fd)
+                        if ((opened_info.st_dev, opened_info.st_ino, opened_info.st_mode,
+                             opened_info.st_size, opened_info.st_mtime_ns, opened_info.st_ctime_ns,
+                             opened_info.st_nlink)
+                                != (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                                    info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+                                or info.st_nlink < 1):
+                            raise StorageError("cache file changed before unlink")
+                        os.unlink(parts[-1], dir_fd=current)
+                        removed_bytes += info.st_size
+                        after = os.fstat(fd)
+                        if ((after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns)
+                                != (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+                                or after.st_nlink != info.st_nlink - 1):
+                            raise StorageError("cache file changed during unlink")
+                        after_own_unlink[inode] = after
+                    finally:
+                        os.close(fd)
                 else:
                     raise StorageError("unknown cache entry during cleanup")
             finally:

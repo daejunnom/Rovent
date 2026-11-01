@@ -409,6 +409,12 @@ class ManagedBuild:
             raise StorageError("slot limit cannot be met without deleting active/unknown data")
 
     def acquire(self) -> "ManagedBuild":
+        # Diagnostic only: a single bounded cached read before any catalog lock.
+        try:
+            from rovezero_usage_snapshot import warn_cached_total_usage
+            warn_cached_total_usage()
+        except Exception:
+            pass
         checked(self.root)
         if self.output_preservation is not None:
             from managed_output_unattributed_preservation import assert_manager_preservation_scope

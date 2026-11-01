@@ -131,6 +131,12 @@ def main(*, output_preservation=None) -> int:
 
         def check_budget():
             nonlocal budget_failure, next_build_warning
+            # Bounded, throttled cached read outside catalog ownership gates.
+            try:
+                from rovezero_usage_snapshot import warn_cached_total_usage
+                warn_cached_total_usage()
+            except Exception:
+                pass
             try:
                 if output_preservation is None:
                     note_output_total(sample_output_budget(supervisor_scope=output_scope,

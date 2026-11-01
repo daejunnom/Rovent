@@ -1,8 +1,11 @@
 """After-run cache cleanup tests use only temporary owned fixture trees."""
 from pathlib import Path
 from unittest.mock import Mock, patch
+import os
+import stat
 import sys
 import tempfile
+import time
 import unittest
 
 sys.dont_write_bytecode = True
@@ -136,6 +139,45 @@ class OutputMaintenanceTests(unittest.TestCase):
         self.assertGreater(caught.exception.regenerable_removed_bytes, 0)
         self.assertTrue(target.is_dir())
         self.assertEqual(len(list(target.iterdir())), 1)
+
+    def test_cache_deletion_accepts_its_own_hardlink_ctime_change(self):
+        target = self.candidate.slot / "cargo-target"
+        original = target / "cache.o"
+        sibling = target / "cache-copy.o"
+        outside = Path(self.temp.name) / "outside-copy.o"
+        os.link(original, sibling)
+        os.link(original, outside)
+        original_bytes = outside.read_bytes()
+        snapshot, _ = maintenance._snapshot(target, lambda: None)
+        # Ensure the filesystem's next ctime tick differs from the snapshot;
+        # otherwise the old implementation could pass by timestamp coincidence.
+        time.sleep(0.05)
+        removed = maintenance._remove_snapshot(target, snapshot, lambda: None)
+        self.assertEqual(removed, 2 * len(original_bytes))
+        self.assertFalse(target.exists())
+        self.assertEqual(outside.read_bytes(), original_bytes)
+        self.assertEqual(outside.stat().st_nlink, 1)
+
+    def test_cache_deletion_rejects_external_change_during_own_unlink(self):
+        target = self.candidate.slot / "cargo-target"
+        original = target / "cache.o"
+        os.link(original, target / "cache-copy.o")
+        outside = Path(self.temp.name) / "outside-copy.o"
+        os.link(original, outside)
+        snapshot, _ = maintenance._snapshot(target, lambda: None)
+        unlink = os.unlink
+
+        def unlink_then_external_change(path, *, dir_fd=None):
+            unlink(path, dir_fd=dir_fd)
+            os.chmod(outside, stat.S_IMODE(outside.stat().st_mode) ^ stat.S_IXUSR)
+
+        with patch.object(maintenance.os, "unlink", side_effect=unlink_then_external_change):
+            with self.assertRaisesRegex(maintenance.StorageError, "changed during unlink") as caught:
+                maintenance._remove_snapshot(target, snapshot, lambda: None)
+        self.assertEqual(caught.exception.regenerable_removed_bytes, len(outside.read_bytes()))
+        self.assertTrue(target.exists())
+        self.assertEqual(len(list(target.iterdir())), 1)
+        self.assertTrue(outside.exists())
 
     def test_unfinished_original_or_new_owner_blocks_cleanup(self):
         self.current.finished = False

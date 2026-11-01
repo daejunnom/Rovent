@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic RoveZero aggregate storage observation
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=rovezero-total-usage.service
+
+[Install]
+WantedBy=timers.target

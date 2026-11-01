@@ -404,6 +404,13 @@ class OutputLease:
         return own_total + sum(value for value in self._foreign_usage_snapshot.values() if value is not None)
 
     def acquire(self):
+        # Observe the cached aggregate before taking any catalog lock; never
+        # run a filesystem walk or turn monitoring failure into admission failure.
+        try:
+            from rovezero_usage_snapshot import warn_cached_total_usage
+            warn_cached_total_usage()
+        except Exception:
+            pass
         owner_lifetime = lifetime() if not self.deferred else None
         published = False
         self.catalog.mkdir(parents=True, exist_ok=True)
