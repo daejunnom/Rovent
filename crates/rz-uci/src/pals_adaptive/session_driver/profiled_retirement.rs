@@ -157,6 +157,18 @@ where
                             })
                     })
                     .map(|root| root.original_context().shutdown_deadline),
+                SessionResearcherSource::ProfiledExternalV3(source) => source
+                    .retained_root_admission_v3()
+                    .filter(|root| {
+                        source
+                            .retained_root_source()
+                            .is_some_and(|actual| actual.same_source(retirement.source()))
+                            && root.authority() == retirement.authority()
+                            && self.rovent.as_ref().is_some_and(|profile| {
+                                root.startup_lock_digest() == profile.input_lock
+                            })
+                    })
+                    .map(|root| root.original_context().shutdown_deadline),
                 SessionResearcherSource::Legacy => None,
             };
         let Some(original_cleanup) = original_cleanup else {

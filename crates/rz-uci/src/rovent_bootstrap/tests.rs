@@ -139,6 +139,7 @@ fn native_snapshot_uses_original_model_namespace_without_claiming_first_inferenc
         runtime_library: Digest([5; 32]),
         runtime_bundle: None,
         native_configuration: Digest([6; 32]),
+        system_runtime: None,
         startup_configuration: Digest([7; 32]),
         search_configuration: Digest([8; 32]),
         validator_loaded: false,
@@ -165,6 +166,21 @@ fn native_snapshot_uses_original_model_namespace_without_claiming_first_inferenc
     );
     assert!(snapshot.model_namespace().is_ok());
     assert!(!snapshot.neural_service_executed && !snapshot.validator_loaded);
+}
+
+#[test]
+fn system_configuration_identity_is_separate_from_retained_bundle_identity() {
+    let mut config = PalsOnnxConfig::cpu();
+    config.provider = Provider::Cuda {
+        device_id: 0,
+        arena_bytes: 1 << 30,
+    };
+    let core = [1; 32];
+    let first = system_configuration_digest_v3(config, core, [2; 32]).unwrap();
+    let second = system_configuration_digest_v3(config, core, [3; 32]).unwrap();
+    let legacy = configuration_digest_from_metadata(config, None, core, None, None).unwrap();
+    assert_ne!(first, second);
+    assert_ne!(first, legacy);
 }
 
 #[test]

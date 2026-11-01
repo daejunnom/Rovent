@@ -10,17 +10,19 @@ use super::external_session::{
 use super::launch::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use super::nnuec_session::{
     RoventNnuecCollectionHooks, RoventNnuecCollectionHooksV2, RoventNnuecSessionDriver,
-    RoventNnuecSessionRejection, RoventNnuecSessionV2Rejection,
+    RoventNnuecSessionRejection, RoventNnuecSessionV2Rejection, RoventNnuecSessionV3Rejection,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::pc_session::{
     RoventPcCollectionHooks, RoventPcCollectionHooksV2, RoventPcSessionDriver,
-    RoventPcSessionV2Rejection,
+    RoventPcSessionV2Rejection, RoventPcSessionV3Rejection,
 };
-use super::process_boundary::VerifiedOwnedRoventProcessBoundaryV2;
+use super::process_boundary::{
+    VerifiedOwnedRoventProcessBoundaryV2, VerifiedOwnedRoventProcessBoundaryV3,
+};
 use super::{
-    PreparedRoventNative, PreparedRoventNativeV2, RoventNativeBackend, RoventPinnedExternalRSource,
-    RoventPinnedNativeSources,
+    PreparedRoventNative, PreparedRoventNativeV2, PreparedRoventNativeV3, RoventNativeBackend,
+    RoventPinnedExternalRSource, RoventPinnedNativeSources,
 };
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
@@ -1166,6 +1168,157 @@ impl Drop for RoventNativeProductDriverV2 {
     }
 }
 
+/// V3 system CUDA P/C owner. The original source and process remain held
+/// until an actual session finish confirms physical completion.
+pub struct RoventNativeProductDriverV3 {
+    inner: Arc<RoventPcSessionDriver>,
+    sources: Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV3>>,
+    process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    physically_closed: Arc<AtomicBool>,
+}
+
+pub type RoventProductV3StartupRejection = RoventPcSessionV3Rejection;
+
+impl RoventNativeProductDriverV3 {
+    #[allow(clippy::result_large_err)]
+    pub fn pc(
+        prepared: PreparedRoventNativeV3<PcPortQuestion>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventProductV3StartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventPcSessionDriver::new_v3(
+            prepared,
+            Arc::clone(&process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+        .map_err(|mut rejected| {
+            rejected.failure.physical_completion = DriverPhysicalCompletion::Unknown;
+            rejected
+        })?;
+        Ok(Self {
+            inner: Arc::new(driver),
+            sources,
+            process,
+            physically_closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Reuse the exact V3 loaded helper owner. It is retained with the native
+    /// and process owners if construction fails or physical finish is unknown.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn pc_with_shared_nnuec(
+        prepared: PreparedRoventNativeV3<PcPortQuestion>,
+        loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventProductV3StartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventPcSessionDriver::new_v3_with_shared_nnuec(
+            prepared,
+            loaded,
+            Arc::clone(&process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+        .map_err(|mut rejected| {
+            rejected.failure.physical_completion = DriverPhysicalCompletion::Unknown;
+            rejected
+        })?;
+        Ok(Self {
+            inner: Arc::new(driver),
+            sources,
+            process,
+            physically_closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub(crate) fn physical_close_observation(&self) -> RoventProductPhysicalClose {
+        RoventProductPhysicalClose {
+            closed: Arc::clone(&self.physically_closed),
+        }
+    }
+}
+
+impl SearchSessionDriver for RoventNativeProductDriverV3 {
+    fn supports_ponder_clock(&self) -> bool {
+        self.inner.supports_ponder_clock()
+    }
+    fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
+        self.inner.node_budget_semantics()
+    }
+    fn validate_go(
+        &self,
+        position: &Position,
+        go: &crate::parser::GoLimits,
+    ) -> Result<(), ContractError> {
+        self.inner.validate_go(position, go)
+    }
+    fn kind(&self) -> SearchKind {
+        SearchKind::Rovent
+    }
+    fn identity(&self) -> EngineIdentity {
+        self.inner.identity()
+    }
+    fn implementation(&self) -> Digest {
+        self.inner.implementation()
+    }
+    fn search_goal_capability(&self) -> Option<NonZeroU16> {
+        self.inner.search_goal_capability()
+    }
+    fn reset_game(&self) -> Result<(), ContractError> {
+        self.inner.reset_game()
+    }
+    fn finish_session(
+        &self,
+        until: Instant,
+    ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
+        let result = self.inner.finish_session(until);
+        if matches!(result, Ok(Some(DriverPhysicalCompletion::Confirmed))) {
+            self.physically_closed.store(true, Ordering::Release);
+        }
+        result
+    }
+    fn accept_uci_output(
+        &self,
+        authority: rz_contracts::pals::SearchAuthority,
+        bestmove: &str,
+        from_report: bool,
+    ) -> Result<(), ContractError> {
+        self.inner
+            .accept_uci_output(authority, bestmove, from_report)
+    }
+    fn run(
+        &self,
+        position: &Position,
+        context: &SearchSessionContext,
+        progress: &mut dyn FnMut(BoardMove),
+    ) -> Result<SearchSessionReport, SearchSessionFailure> {
+        self.inner.run(position, context, progress)
+    }
+}
+
+impl Drop for RoventNativeProductDriverV3 {
+    fn drop(&mut self) {
+        if !self.physically_closed.load(Ordering::Acquire) {
+            std::mem::forget(Arc::clone(&self.inner));
+            std::mem::forget(Arc::clone(&self.sources));
+            std::mem::forget(Arc::clone(&self.process));
+        }
+    }
+}
+
 /// V2 own-R product retains the actual prepared worker, original input lock,
 /// process boundary and CPU owners through the same session physical finish.
 /// Collection, NNUEC, storage and diagnostic registrations require their own
@@ -1885,6 +2038,138 @@ impl SearchSessionDriver for RoventOwnNnuecProductDriverV2 {
 }
 
 impl Drop for RoventOwnNnuecProductDriverV2 {
+    fn drop(&mut self) {
+        if !self.physically_closed.load(Ordering::Acquire) {
+            std::mem::forget(Arc::clone(&self.inner));
+            std::mem::forget(Arc::clone(&self.sources));
+            std::mem::forget(Arc::clone(&self.process));
+        }
+    }
+}
+
+/// V3 system-CUDA P/C and own NNUEC researcher owner. The original pinned
+/// source and process remain in custody until the complete native/CPU session
+/// explicitly confirms physical shutdown.
+pub struct RoventOwnNnuecProductDriverV3 {
+    inner: Arc<RoventNnuecSessionDriver>,
+    sources: Arc<RoventPinnedNativeSources<rz_experiments::RoventInputLockV3>>,
+    process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+    physically_closed: Arc<AtomicBool>,
+}
+
+/// Failed assembly returns the original loaded model, prepared native owner
+/// and process boundary through the versioned session rejection.
+pub struct RoventOwnNnuecV3StartupRejection {
+    pub failure: SearchSessionFailure,
+    pub rejected: RoventNnuecSessionV3Rejection,
+}
+
+impl RoventOwnNnuecProductDriverV3 {
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn own_nnuec_pcr(
+        prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+        loaded: LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventOwnNnuecV3StartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventNnuecSessionDriver::new_v3(
+            prepared,
+            loaded,
+            Arc::clone(&process),
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+        .map_err(|rejected| {
+            let mut failure = rejected.failure.clone();
+            failure.physical_completion = DriverPhysicalCompletion::Unknown;
+            RoventOwnNnuecV3StartupRejection { failure, rejected }
+        })?;
+        Ok(Self {
+            inner: Arc::new(driver),
+            sources,
+            process,
+            physically_closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub(crate) fn physical_close_observation(&self) -> RoventProductPhysicalClose {
+        RoventProductPhysicalClose {
+            closed: Arc::clone(&self.physically_closed),
+        }
+    }
+}
+
+impl SearchSessionDriver for RoventOwnNnuecProductDriverV3 {
+    fn supports_ponder_clock(&self) -> bool {
+        self.inner.supports_ponder_clock()
+    }
+    fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
+        self.inner.node_budget_semantics()
+    }
+    fn validate_go(
+        &self,
+        position: &Position,
+        go: &crate::parser::GoLimits,
+    ) -> Result<(), ContractError> {
+        self.inner.validate_go(position, go)
+    }
+    fn kind(&self) -> SearchKind {
+        SearchKind::Rovent
+    }
+    fn identity(&self) -> EngineIdentity {
+        self.inner.identity()
+    }
+    fn pals_checker_registration(&self) -> Option<PalsCheckerRegistration> {
+        self.inner.pals_checker_registration()
+    }
+    fn checker_started(&self) -> Option<bool> {
+        self.inner.checker_started()
+    }
+    fn implementation(&self) -> Digest {
+        self.inner.implementation()
+    }
+    fn search_goal_capability(&self) -> Option<NonZeroU16> {
+        self.inner.search_goal_capability()
+    }
+    fn reset_game(&self) -> Result<(), ContractError> {
+        self.inner.reset_game()
+    }
+    fn finish_session(
+        &self,
+        until: Instant,
+    ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
+        let result = self.inner.finish_session(until);
+        if matches!(result, Ok(Some(DriverPhysicalCompletion::Confirmed))) {
+            self.physically_closed.store(true, Ordering::Release);
+        }
+        result
+    }
+    fn accept_uci_output(
+        &self,
+        authority: rz_contracts::pals::SearchAuthority,
+        bestmove: &str,
+        from_report: bool,
+    ) -> Result<(), ContractError> {
+        self.inner
+            .accept_uci_output(authority, bestmove, from_report)
+    }
+    fn run(
+        &self,
+        position: &Position,
+        context: &SearchSessionContext,
+        progress: &mut dyn FnMut(BoardMove),
+    ) -> Result<SearchSessionReport, SearchSessionFailure> {
+        self.inner.run(position, context, progress)
+    }
+}
+
+impl Drop for RoventOwnNnuecProductDriverV3 {
     fn drop(&mut self) {
         if !self.physically_closed.load(Ordering::Acquire) {
             std::mem::forget(Arc::clone(&self.inner));

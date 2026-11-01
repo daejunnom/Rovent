@@ -11,7 +11,7 @@ use super::{
 };
 use crate::parser::GoLimits;
 use rz_contracts::{Digest, rovent::SearchGoal};
-use rz_experiments::{RoventInputLock, RoventInputLockV2, RoventSearchDeclaration};
+use rz_experiments::{RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventSearchDeclaration};
 use rz_position::{BoardMove, Position, PositionSnapshot};
 use std::{num::NonZeroU16, sync::Arc};
 
@@ -103,6 +103,31 @@ pub fn validate_go_v2(
         fail(
             RoventRootAdmissionFailure::InvalidLock,
             "original startup input lock before go",
+        )
+    })?;
+    validate_go_for_search(
+        position,
+        go,
+        &lock.manifest.engine.search,
+        &lock.canonical_sha256,
+        policy,
+        max_goal_plies,
+    )
+}
+
+/// Apply the same pure Rules and workload checks to the original /3 lock.
+/// No legacy lock is synthesized and no live root authority is issued.
+pub fn validate_go_v3(
+    position: &Position,
+    go: &GoLimits,
+    lock: &RoventInputLockV3,
+    policy: RoventRootAdmissionPolicy,
+    max_goal_plies: NonZeroU16,
+) -> Result<RoventGoPrevalidation, RoventRootAdmissionError> {
+    lock.validate().map_err(|_| {
+        fail(
+            RoventRootAdmissionFailure::InvalidLock,
+            "original /3 startup input lock before go",
         )
     })?;
     validate_go_for_search(

@@ -8,13 +8,15 @@
 use crate::rovent_bootstrap::RoventExternalRSourceCustody;
 use crate::rovent_external_launch::{RoventExternalOwner, VerifiedRoventExternalStartup};
 use crate::rovent_root_admission::RoventRootAdmission;
-use crate::rovent_root_admission::source_seal::RoventRootAdmissionV2;
+use crate::rovent_root_admission::source_seal::{RoventRootAdmissionV2, RoventRootAdmissionV3};
 use crate::search_driver::SearchSessionContext;
 use rz_contracts::Digest;
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_eval::error::FailureKind;
-use rz_experiments::{RoventExternalPurpose, RoventInputLock, RoventInputLockV2};
+use rz_experiments::{
+    RoventExternalPurpose, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
+};
 use rz_runtime::CompletionSignal;
 use rz_runtime::adaptive::ControlMailbox;
 use rz_runtime::contracts::ContractClock;
@@ -36,6 +38,7 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::RoventInputLock {}
     impl Sealed for super::RoventInputLockV2 {}
+    impl Sealed for super::RoventInputLockV3 {}
 }
 pub trait ExternalManagerLock: sealed::Sealed + Send + Sync + 'static {
     type Root: ExternalManagerRoot;
@@ -75,6 +78,7 @@ macro_rules! impl_manager_root {
 }
 impl_manager_root!(RoventRootAdmission);
 impl_manager_root!(RoventRootAdmissionV2);
+impl_manager_root!(RoventRootAdmissionV3);
 
 macro_rules! impl_manager_lock {
     ($lock:ty, $root:ty, $matches:expr, $admit:ident, $current:ident) => {
@@ -122,6 +126,17 @@ impl_manager_lock!(
     },
     admit_actual_root_v2,
     actual_root_admission_v2
+);
+impl_manager_lock!(
+    RoventInputLockV3,
+    RoventRootAdmissionV3,
+    |c: &RoventExternalRSourceCustody<RoventInputLockV3>, r: &Arc<RoventRootAdmissionV3>| {
+        r.owner()
+            .v3()
+            .is_some_and(|owner| Arc::ptr_eq(c.original_lock_owner(), owner))
+    },
+    admit_actual_root_v3,
+    actual_root_admission_v3
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

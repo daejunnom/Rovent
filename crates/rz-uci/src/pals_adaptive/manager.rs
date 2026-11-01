@@ -843,6 +843,18 @@ pub trait AdaptiveSearchDriver<Q> {
         ))
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration_v3(
+        &self,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV3>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no original V3 profiled external source registration",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn profiled_external_work(
         &self,
     ) -> Option<rz_search::pals::rovent_frontier::FrontierExternalWork> {
@@ -3630,6 +3642,9 @@ where
             } else if let Some(root) = source.root_admission_v2() {
                 self.driver
                     .validate_profiled_external_registration_v2(source.current_source(), root)?;
+            } else if let Some(root) = source.root_admission_v3() {
+                self.driver
+                    .validate_profiled_external_registration_v3(source.current_source(), root)?;
             } else {
                 return Err(AdaptiveManagerError::Invalid(
                     "profiled external original root absent",

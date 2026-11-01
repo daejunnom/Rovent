@@ -3,23 +3,24 @@
 
 use super::configuration::{ExecutionConfiguration, StartupConfigurationDocument};
 use super::{
-    PreparedRoventNative, PreparedRoventNativeV2, RoventNativeBackend, RoventPinnedExternalRSource,
-    RoventPinnedNativeSources,
+    PreparedRoventNative, PreparedRoventNativeV2, PreparedRoventNativeV3, RoventNativeBackend,
+    RoventPinnedExternalRSource, RoventPinnedNativeSources,
 };
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
     AdaptiveSessionCollectionHooks, AdaptiveSessionDriver, AdaptiveSessionOptions,
     AdaptiveSessionSources, RoventExternalSessionAdmissionRejection,
-    RoventExternalSessionAdmissionRejectionV2, RoventExternalSessionSource,
-    RoventExternalSessionSources, RoventExternalSessionSourcesV2,
-    RoventExternalSourcePreparationRejection, RoventPcrSessionProfile,
+    RoventExternalSessionAdmissionRejectionV2, RoventExternalSessionAdmissionRejectionV3,
+    RoventExternalSessionSource, RoventExternalSessionSources, RoventExternalSessionSourcesV2,
+    RoventExternalSessionSourcesV3, RoventExternalSourcePreparationRejection,
+    RoventPcrSessionProfile,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::{PalsCheckerRegistration, SearchSessionFailure};
 use rz_contracts::Digest;
 use rz_eval::error::{BackendError, FailureKind};
-use rz_experiments::{RoventInputLock, RoventInputLockV2};
+use rz_experiments::{RoventInputLock, RoventInputLockV2, RoventInputLockV3};
 use rz_runtime::adaptive::ControllerConfig;
 use rz_runtime::contracts::ContractClock;
 use rz_search::external_cpu::{CpuEndpoint, CpuEndpointSelection};
@@ -596,6 +597,174 @@ pub(crate) fn external_researcher_session_v2(
         return Err(RoventExternalProductStartupRejectionV2 {
             failure,
             owners: RoventExternalProductStartupOwnersV2::Driver(Box::new(driver)),
+            sources: pins,
+            retirement_sink: None,
+        });
+    }
+    Ok(driver)
+}
+
+/// A /3 startup rejection retains each actual owner until the caller has
+/// drained it. Public metadata cannot reconstitute a native service or FDs.
+#[allow(clippy::large_enum_variant)]
+pub enum RoventExternalProductStartupOwnersV3 {
+    Prepared {
+        prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+        external: RoventPinnedExternalRSource<RoventInputLockV3>,
+    },
+    SourcePreparation {
+        prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+        rejection: RoventExternalSourcePreparationRejection<RoventInputLockV3>,
+    },
+    PreparedSource {
+        prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+        external: RoventExternalSessionSource<RoventInputLockV3>,
+    },
+    Session(RoventExternalSessionAdmissionRejectionV3<RoventNativeBackend<AdaptivePortQuestion>>),
+    Driver(Box<RoventExternalProductSession>),
+}
+
+pub struct RoventExternalProductStartupRejectionV3 {
+    pub failure: SearchSessionFailure,
+    pub owners: RoventExternalProductStartupOwnersV3,
+    pub sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    pub retirement_sink: Option<RegisteredProfiledRetirementSink>,
+}
+
+/// Assemble an external researcher from the same original /3 native source.
+/// The process itself is started only after the live root admission. The
+/// product wrapper must additionally retain the verified process boundary.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+pub(crate) fn external_researcher_session_v3(
+    prepared: PreparedRoventNativeV3<AdaptivePortQuestion>,
+    external: RoventPinnedExternalRSource<RoventInputLockV3>,
+    retirement_sink: RegisteredProfiledRetirementSink,
+    clock: ProcessClock,
+    owners: Arc<OwnerRegistry>,
+    identity: EngineIdentity,
+    root_policy: RoventRootAdmissionPolicy,
+) -> Result<RoventExternalProductSession, RoventExternalProductStartupRejectionV3> {
+    use crate::search_driver::DriverPhysicalCompletion;
+    let pins = Arc::clone(prepared.sources());
+    let checked = (|| -> Result<(), SearchSessionFailure> {
+        if !Arc::ptr_eq(external.original_sources(), &pins)
+            || external.input_lock_digest() != prepared.snapshot().input_lock
+            || external.source_purpose() != rz_experiments::RoventExternalPurpose::ResearchChecker
+            || !prepared.snapshot().mode.has_native_r()
+            || prepared.snapshot().process_epoch != clock.epoch().0
+            || !matches!(
+                pins.configuration().fields().execution,
+                ExecutionConfiguration::ExternalResearcher { .. }
+            )
+            || !matches!(
+                pins.lock().manifest.purpose,
+                rz_experiments::RoventPurpose::Validation
+                    | rz_experiments::RoventPurpose::Deployment
+            )
+            || pins.collection_preload_sources().is_some()
+        {
+            return Err(failure(
+                "RoventExternalProductSourcesV3",
+                "original /3 native and external sources or purpose differ",
+            ));
+        }
+        let ready = prepared
+            .service
+            .ready_clock()
+            .ok_or_else(|| failure("RoventExternalReadyV3", "native Ready clock is absent"))?;
+        let expected = clock.runtime_clock();
+        if prepared.service.is_quarantined()
+            || prepared.service.native_acceptance_verifier().is_none()
+            || ready.domain() != expected.domain()
+            || ready.origin() != expected.origin()
+        {
+            return Err(failure(
+                "RoventExternalReadyV3",
+                "native physical owner or clock differs",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(mut failure) = checked {
+        failure.physical_completion = DriverPhysicalCompletion::Unknown;
+        return Err(RoventExternalProductStartupRejectionV3 {
+            failure,
+            owners: RoventExternalProductStartupOwnersV3::Prepared { prepared, external },
+            sources: pins,
+            retirement_sink: Some(retirement_sink),
+        });
+    }
+    let external = match RoventExternalSessionSource::from_pinned(external) {
+        Ok(source) => source,
+        Err(rejection) => {
+            let mut failure =
+                SearchSessionFailure::debug("RoventExternalDeclarationV3", &rejection.error);
+            failure.physical_completion = DriverPhysicalCompletion::Unknown;
+            return Err(RoventExternalProductStartupRejectionV3 {
+                failure,
+                owners: RoventExternalProductStartupOwnersV3::SourcePreparation {
+                    prepared,
+                    rejection,
+                },
+                sources: pins,
+                retirement_sink: Some(retirement_sink),
+            });
+        }
+    };
+    let build = build_external_profile!(&pins, &prepared, &external, identity);
+    let (engine, metadata, registration, options, limits, profile) = match build {
+        Ok(built) => built,
+        Err(mut failure) => {
+            failure.physical_completion = DriverPhysicalCompletion::Unknown;
+            return Err(RoventExternalProductStartupRejectionV3 {
+                failure,
+                owners: RoventExternalProductStartupOwnersV3::PreparedSource { prepared, external },
+                sources: pins,
+                retirement_sink: Some(retirement_sink),
+            });
+        }
+    };
+    let (native, _, _) = prepared.into_parts();
+    let sources = RoventExternalSessionSourcesV3 {
+        common: AdaptiveSessionSources {
+            native,
+            engine,
+            cpu: Vec::new(),
+            external: None,
+            checker_metadata: metadata,
+        },
+        external,
+    };
+    let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
+    let mut driver = AdaptiveSessionDriver::new_rovent_external_v3_with_resource_limits(
+        options,
+        limits,
+        sources,
+        clock,
+        issuer,
+        registration,
+        profile,
+        retirement_sink,
+        None,
+        AdaptiveSessionCollectionHooks::default(),
+    )
+    .map_err(|rejected| {
+        let mut failure = rejected.failure.clone();
+        failure.physical_completion = DriverPhysicalCompletion::Unknown;
+        RoventExternalProductStartupRejectionV3 {
+            failure,
+            owners: RoventExternalProductStartupOwnersV3::Session(rejected),
+            sources: Arc::clone(&pins),
+            retirement_sink: None,
+        }
+    })?;
+    if let Err(mut failure) =
+        driver.register_rovent_root_policy_v3(Arc::clone(pins.lock_owner()), root_policy)
+    {
+        failure.physical_completion = DriverPhysicalCompletion::Unknown;
+        return Err(RoventExternalProductStartupRejectionV3 {
+            failure,
+            owners: RoventExternalProductStartupOwnersV3::Driver(Box::new(driver)),
             sources: pins,
             retirement_sink: None,
         });

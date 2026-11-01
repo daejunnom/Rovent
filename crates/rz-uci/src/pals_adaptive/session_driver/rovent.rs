@@ -20,10 +20,14 @@ use std::num::NonZeroU16;
 pub const ROVENT_NATIVE_ROOT_DOMAIN: &str = "rz-rovent-native-root/1";
 #[cfg(feature = "pals-adaptive")]
 pub const ROVENT_NATIVE_ROOT_V2_DOMAIN: &str = "rz-rovent-native-root/2";
+#[cfg(feature = "pals-adaptive")]
+pub const ROVENT_NATIVE_ROOT_V3_DOMAIN: &str = "rz-rovent-native-root/3";
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub const ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN: &str = "rz-rovent-profiled-external-root/1";
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 const ROVENT_PROFILED_EXTERNAL_ROOT_V2_DOMAIN: &str = "rz-rovent-profiled-external-root/2";
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+const ROVENT_PROFILED_EXTERNAL_ROOT_V3_DOMAIN: &str = "rz-rovent-profiled-external-root/3";
 
 /// Admitted alongside the actual native/CPU sources, never inferred from a
 /// SearchKind label. PC uses its distinct typed role-only owner instead.
@@ -214,10 +218,33 @@ pub struct RoventNativeRootReceiptV2 {
     pub profiled_physical: Option<crate::pals_adaptive::ProfiledExternalShutdownReceipt>,
 }
 
+/// Actual /3 capability and root observations. The physical observations are
+/// sampled before the manager's owner return and are not the final root or
+/// process fence; missing evidence never certifies process completion.
+#[cfg(feature = "pals-adaptive")]
+#[derive(Clone, Debug)]
+pub struct RoventNativeRootReceiptV3 {
+    pub domain: &'static str,
+    pub authority: SearchAuthority,
+    pub mode: ExecutionMode,
+    pub input_lock: Digest,
+    pub root_budget: Digest,
+    pub root_admission: Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV3>,
+    pub frontier: Option<FrontierSnapshot>,
+    pub counters: AdaptiveManagerCounters,
+    pub native_accounting: Option<AdaptiveNativeAccountingSnapshot>,
+    pub native_reservations: crate::pals_adaptive::RoventNativeAccountingObservation,
+    pub physical: Option<AdaptiveShutdownReceipt>,
+    #[cfg(feature = "onnx-cpu")]
+    pub profiled_physical: Option<crate::pals_adaptive::ProfiledExternalShutdownReceipt>,
+}
+
 pub(super) enum RoventRootObservation {
     V1(Arc<RoventNativeRootReceipt>),
     #[cfg(feature = "pals-adaptive")]
     V2(Arc<RoventNativeRootReceiptV2>),
+    #[cfg(feature = "pals-adaptive")]
+    V3(Arc<RoventNativeRootReceiptV3>),
 }
 impl RoventRootObservation {
     pub(super) fn frontier(&self) -> Option<&FrontierSnapshot> {
@@ -225,6 +252,8 @@ impl RoventRootObservation {
             Self::V1(receipt) => receipt.frontier.as_ref(),
             #[cfg(feature = "pals-adaptive")]
             Self::V2(receipt) => receipt.frontier.as_ref(),
+            #[cfg(feature = "pals-adaptive")]
+            Self::V3(receipt) => receipt.frontier.as_ref(),
         }
     }
     pub(super) fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
@@ -232,6 +261,8 @@ impl RoventRootObservation {
             Self::V1(receipt) => receipt.work(),
             #[cfg(feature = "pals-adaptive")]
             Self::V2(receipt) => receipt.work(),
+            #[cfg(feature = "pals-adaptive")]
+            Self::V3(receipt) => receipt.work(),
         }
     }
 }
@@ -242,6 +273,12 @@ impl RoventNativeRootReceipt {
 }
 #[cfg(feature = "pals-adaptive")]
 impl RoventNativeRootReceiptV2 {
+    pub fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
+        root_work(self.frontier.as_ref(), &self.counters)
+    }
+}
+#[cfg(feature = "pals-adaptive")]
+impl RoventNativeRootReceiptV3 {
     pub fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
         root_work(self.frontier.as_ref(), &self.counters)
     }
@@ -442,6 +479,25 @@ where
             .map(|receipt| receipt.clone())
             .map_err(|_| "adaptive_v2_root_busy_or_poisoned")
     }
+    #[cfg(feature = "pals-adaptive")]
+    pub fn latest_rovent_root_v3(
+        &self,
+    ) -> Result<Option<Arc<RoventNativeRootReceiptV3>>, ContractError> {
+        self.latest_rovent_root_v3
+            .lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| poisoned("Rovent V3 root observation mutex poisoned"))
+    }
+    /// Best-effort observation never waits for the original receipt owner.
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn try_observe_rovent_root_v3(
+        &self,
+    ) -> Result<Option<Arc<RoventNativeRootReceiptV3>>, &'static str> {
+        self.latest_rovent_root_v3
+            .try_lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| "adaptive_v3_root_busy_or_poisoned")
+    }
     pub(super) fn observe_rovent_root(
         &self,
         manager: &SessionManager<B>,
@@ -458,8 +514,56 @@ where
             .rovent_frontier_receipt()
             .map_err(|error| SearchSessionFailure::debug("RoventFrontierObservation", &error))?;
         #[cfg(feature = "pals-adaptive")]
+        if let Some(original) = &admission.original_v3 {
+            if admission.original.is_some() || admission.original_v2.is_some() {
+                return Err(failure(
+                    "RoventRootObservation",
+                    "multiple original root capabilities",
+                ));
+            }
+            let receipt = Arc::new(RoventNativeRootReceiptV3 {
+                domain: match self.researcher_class {
+                    SessionResearcherClass::Legacy => ROVENT_NATIVE_ROOT_V3_DOMAIN,
+                    #[cfg(feature = "onnx-cpu")]
+                    SessionResearcherClass::ProfiledExternalV3 => {
+                        ROVENT_PROFILED_EXTERNAL_ROOT_V3_DOMAIN
+                    }
+                    #[cfg(feature = "onnx-cpu")]
+                    SessionResearcherClass::ProfiledExternal
+                    | SessionResearcherClass::ProfiledExternalV2 => {
+                        return Err(failure(
+                            "RoventRootObservation",
+                            "other external researcher cannot own a V3 root",
+                        ));
+                    }
+                },
+                authority: context.authority,
+                mode: profile.mode,
+                input_lock: profile.input_lock,
+                root_budget: admission.budget,
+                root_admission: Arc::clone(original),
+                frontier: actual.map(|receipt| receipt.snapshot),
+                counters: manager.counters(),
+                native_accounting: manager
+                    .root_observation_snapshot()
+                    .ok()
+                    .map(|observation| observation.native_accounting()),
+                native_reservations: manager.rovent_native_accounting(),
+                physical: manager.shutdown_receipt().ok(),
+                #[cfg(feature = "onnx-cpu")]
+                profiled_physical: manager.profiled_shutdown_receipt().ok(),
+            });
+            *self.latest_rovent_root_v3.lock().map_err(|_| {
+                failure(
+                    "RoventRootObservation",
+                    "Rovent V3 observation mutex poisoned",
+                )
+            })? = Some(Arc::clone(&receipt));
+            return Ok(Some(RoventRootObservation::V3(receipt)));
+        }
+        #[cfg(feature = "pals-adaptive")]
         if let Some(original) = &admission.original_v2 {
-            if admission.original.is_some() {
+            if admission.original.is_some() || admission.original_v3.is_some() {
                 return Err(failure(
                     "RoventRootObservation",
                     "multiple original root capabilities",
@@ -473,10 +577,11 @@ where
                         ROVENT_PROFILED_EXTERNAL_ROOT_V2_DOMAIN
                     }
                     #[cfg(feature = "onnx-cpu")]
-                    SessionResearcherClass::ProfiledExternal => {
+                    SessionResearcherClass::ProfiledExternal
+                    | SessionResearcherClass::ProfiledExternalV3 => {
                         return Err(failure(
                             "RoventRootObservation",
-                            "V1 external researcher cannot own a V2 root",
+                            "different external researcher version cannot own a V2 root",
                         ));
                     }
                 },
@@ -514,6 +619,13 @@ where
                     return Err(failure(
                         "RoventRootObservation",
                         "V2 external researcher cannot own a V1 root",
+                    ));
+                }
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                SessionResearcherClass::ProfiledExternalV3 => {
+                    return Err(failure(
+                        "RoventRootObservation",
+                        "V3 external researcher cannot own a V1 root",
                     ));
                 }
             },

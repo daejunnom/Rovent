@@ -86,6 +86,62 @@ fn invalid(message: &'static str) -> AdaptiveManagerError {
     AdaptiveManagerError::ProfiledExternal(CheckerError::Invalid(message))
 }
 
+// V2 and V3 retain distinct original root types, but apply exactly the same
+// runtime and frontier invariants. The V2 diagnostic strings stay unchanged.
+macro_rules! versioned_profile_validation {
+    ($method:ident, $root:ty, $revoked:literal, $clock:literal, $invalid_budget:literal, $domain:literal) => {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        pub(super) fn $method(
+            &self,
+            source: &ProfiledExternalRootSource,
+            root: &Arc<$root>,
+        ) -> Result<(), AdaptiveManagerError> {
+            use rz_runtime::contracts::ContractClock;
+            self.profile_source(source)?;
+            if !root
+                .original_context()
+                .accepts()
+                .map_err(|_| invalid($revoked))?
+                || root.authority() != self.authority
+                || source.clock().domain != root.runtime_clock().domain()
+                || source.clock().origin != root.runtime_clock().origin()
+                || self.hard_deadline != root.original_context().control.deadline
+            {
+                return Err(invalid($clock));
+            }
+            let budget = root
+                .descriptor()
+                .root_budget_digest()
+                .map_err(|_| invalid($invalid_budget))?;
+            let port = self
+                .port
+                .as_deref()
+                .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+            let frontier = port
+                .rovent_frontier()
+                .ok_or(invalid("profiled frontier absent"))?;
+            let registered = frontier.registration();
+            if !Arc::ptr_eq(&registered.root_rules, &self.rules)
+                || !self
+                    .rules
+                    .rules()
+                    .snapshot()
+                    .same_state(root.root_snapshot())
+                || registered.original_deadline != root.hard_deadline()
+                || registered.root_budget != budget
+                || registered.goal != root.goal()
+                || registered.nodes != root.requested_nodes()
+                || registered.root_moves.allowed().as_ref() != root.allowed_root_moves().as_ref()
+                || registered.native_ledger.is_some()
+            {
+                return Err(invalid($domain));
+            }
+            port.validate_profiled_external_registration(source, registered.mode, budget)
+                .map_err(profile_error)
+        }
+    };
+}
+
 impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
     pub fn attach_rovent_external_frontier(
         &mut self,
@@ -421,59 +477,22 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         .map_err(profile_error)
     }
 
-    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-    pub(super) fn profile_validate_v2(
-        &self,
-        source: &ProfiledExternalRootSource,
-        root: &Arc<crate::rovent_root_admission::source_seal::RoventRootAdmissionV2>,
-    ) -> Result<(), AdaptiveManagerError> {
-        use rz_runtime::contracts::ContractClock;
-        self.profile_source(source)?;
-        if !root
-            .original_context()
-            .accepts()
-            .map_err(|_| invalid("profiled V2 root revoked"))?
-            || root.authority() != self.authority
-            || source.clock().domain != root.runtime_clock().domain()
-            || source.clock().origin != root.runtime_clock().origin()
-            || self.hard_deadline != root.original_context().control.deadline
-        {
-            return Err(invalid(
-                "profiled V2 manager registration differs from original root clock",
-            ));
-        }
-        let budget = root
-            .descriptor()
-            .root_budget_digest()
-            .map_err(|_| invalid("profiled V2 original root budget invalid"))?;
-        let port = self
-            .port
-            .as_deref()
-            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
-        let frontier = port
-            .rovent_frontier()
-            .ok_or(invalid("profiled frontier absent"))?;
-        let registered = frontier.registration();
-        if !Arc::ptr_eq(&registered.root_rules, &self.rules)
-            || !self
-                .rules
-                .rules()
-                .snapshot()
-                .same_state(root.root_snapshot())
-            || registered.original_deadline != root.hard_deadline()
-            || registered.root_budget != budget
-            || registered.goal != root.goal()
-            || registered.nodes != root.requested_nodes()
-            || registered.root_moves.allowed().as_ref() != root.allowed_root_moves().as_ref()
-            || registered.native_ledger.is_some()
-        {
-            return Err(invalid(
-                "profiled V2 original Rules, root domain or budget differs",
-            ));
-        }
-        port.validate_profiled_external_registration(source, registered.mode, budget)
-            .map_err(profile_error)
-    }
+    versioned_profile_validation!(
+        profile_validate_v2,
+        crate::rovent_root_admission::source_seal::RoventRootAdmissionV2,
+        "profiled V2 root revoked",
+        "profiled V2 manager registration differs from original root clock",
+        "profiled V2 original root budget invalid",
+        "profiled V2 original Rules, root domain or budget differs"
+    );
+    versioned_profile_validation!(
+        profile_validate_v3,
+        crate::rovent_root_admission::source_seal::RoventRootAdmissionV3,
+        "profiled V3 root revoked",
+        "profiled V3 manager registration differs from original root clock",
+        "profiled V3 original root budget invalid",
+        "profiled V3 original Rules, root domain or budget differs"
+    );
 
     pub(super) fn profile_release(
         &mut self,

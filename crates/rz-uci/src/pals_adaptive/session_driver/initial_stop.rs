@@ -6,11 +6,14 @@
 //! model reset, selected view, CPU thread or ledger is made here.
 
 use super::*;
-use crate::rovent_root_admission::source_seal::{StoppedInitial, StoppedInitialV2};
+use crate::rovent_root_admission::source_seal::{
+    StoppedInitial, StoppedInitialV2, StoppedInitialV3,
+};
 use rz_runtime::contracts::ContractClock as _;
 
 pub const ROVENT_PCR_INITIAL_DOMAIN: &str = "rz-rovent-pcr-native-initial-stop/1";
 pub const ROVENT_PCR_INITIAL_DOMAIN_V2: &str = "rz-rovent-pcr-native-initial-stop/2";
+pub const ROVENT_PCR_INITIAL_DOMAIN_V3: &str = "rz-rovent-pcr-native-initial-stop/3";
 
 // One idle-custody slot per session retains its actual previous root receipt.
 // A larger variant does not add a queue or grant a new physical fence.
@@ -49,6 +52,44 @@ impl RoventPcrInitialReceiptV2 {
         self.authority
     }
     pub fn source(&self) -> &Arc<StoppedInitialV2> {
+        &self.source
+    }
+    pub fn previous_clean_root(&self) -> Option<&AdaptiveShutdownReceipt> {
+        match &self.idle_custody {
+            RoventPcrIdleCustody::RetiredRoot(receipt) => Some(receipt),
+            _ => None,
+        }
+    }
+    /// Previous physical external-root evidence, not evidence for this stop.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn previous_clean_profiled_root(
+        &self,
+    ) -> Option<&super::super::ProfiledExternalShutdownReceipt> {
+        match &self.idle_custody {
+            RoventPcrIdleCustody::RetiredProfiledRoot(receipt) => Some(receipt),
+            _ => None,
+        }
+    }
+    pub fn used_original_startup_ready(&self) -> bool {
+        matches!(self.idle_custody, RoventPcrIdleCustody::StartupReady)
+    }
+}
+/// Producer-only /3 initial stop. Its source owns the original V3 lock and
+/// the idle custody retains the actual preceding physical receipt, if any.
+#[derive(Clone, Debug)]
+pub struct RoventPcrInitialReceiptV3 {
+    authority: SearchAuthority,
+    source: Arc<StoppedInitialV3>,
+    idle_custody: RoventPcrIdleCustody,
+}
+impl RoventPcrInitialReceiptV3 {
+    pub fn domain(&self) -> &'static str {
+        ROVENT_PCR_INITIAL_DOMAIN_V3
+    }
+    pub fn authority(&self) -> SearchAuthority {
+        self.authority
+    }
+    pub fn source(&self) -> &Arc<StoppedInitialV3> {
         &self.source
     }
     pub fn previous_clean_root(&self) -> Option<&AdaptiveShutdownReceipt> {
@@ -147,6 +188,24 @@ where
             .try_lock()
             .map(|receipt| receipt.clone())
             .map_err(|_| "adaptive_v2_initial_busy_or_poisoned")
+    }
+
+    pub fn latest_rovent_initial_v3(
+        &self,
+    ) -> Result<Option<Arc<RoventPcrInitialReceiptV3>>, ContractError> {
+        self.latest_rovent_initial_v3
+            .lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| poisoned("Rovent V3 initial receipt owner poisoned"))
+    }
+    /// Best-effort observation never waits for the original receipt owner.
+    pub(crate) fn try_observe_rovent_initial_v3(
+        &self,
+    ) -> Result<Option<Arc<RoventPcrInitialReceiptV3>>, &'static str> {
+        self.latest_rovent_initial_v3
+            .try_lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| "adaptive_v3_initial_busy_or_poisoned")
     }
 
     pub fn latest_rovent_initial(
@@ -261,6 +320,79 @@ where
             });
         *self
             .latest_rovent_initial_v2
+            .lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())? = Some(receipt);
+        Ok(report)
+    }
+
+    /// /3 uses the exact original owner and the same idle physical custody;
+    /// the stopped source must not be reconstructed from metadata or a /1 or /2 lock.
+    pub(super) fn finish_rovent_initial_v3(
+        &self,
+        owners: &IdleOwners<B>,
+        context: &SearchSessionContext,
+        stopped: StoppedInitialV3,
+    ) -> Result<SearchSessionReport, SearchSessionFailure> {
+        let same_owner = self
+            .rovent_root_policy_v3
+            .as_ref()
+            .is_some_and(|policy| policy.owner.same_original_owner(stopped.owner()));
+        self.validate_initial_idle(owners, same_owner)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(policy) = &self.rovent_root_policy_v3 {
+            let lock = policy
+                .owner
+                .v3()
+                .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+            if matches!(
+                lock.manifest.engine.researcher.as_ref(),
+                Some(rz_experiments::RoventResearcher::External { .. })
+            ) {
+                let SessionResearcherSource::ProfiledExternalV3(source) = &owners.researcher_source
+                else {
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                };
+                let same_idle_custody = match &owners.rovent_idle_custody {
+                    RoventPcrIdleCustody::StartupReady => {
+                        source.ready_for_root_policy_registration()
+                    }
+                    RoventPcrIdleCustody::RetiredProfiledRoot(receipt) => {
+                        receipt.permits_root_reuse()
+                            && source
+                                .retained_root_admission_v3()
+                                .is_some_and(|root| root.authority() == receipt.authority())
+                            && source.retained_root_source().is_some_and(|worker_source| {
+                                worker_source.same_source(receipt.source())
+                            })
+                    }
+                    RoventPcrIdleCustody::RetiredRoot(_) => false,
+                };
+                if !source.same_original_lock(lock)
+                    || !source.permits_initial_idle()
+                    || !same_idle_custody
+                {
+                    return Err(SearchSessionFailure::physical_completion_unknown());
+                }
+            }
+        }
+        let receipt = Arc::new(RoventPcrInitialReceiptV3 {
+            authority: context.authority,
+            source: Arc::new(stopped),
+            idle_custody: owners.rovent_idle_custody.clone(),
+        });
+        let report = stopped_report(receipt.source.fallback());
+        let legal = receipt.source.allowed_root_moves().to_vec();
+        *self
+            .pending_output
+            .lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())? =
+            Some(PendingOutput {
+                authority: context.authority,
+                report: report.best_move,
+                legal,
+            });
+        *self
+            .latest_rovent_initial_v3
             .lock()
             .map_err(|_| SearchSessionFailure::physical_completion_unknown())? = Some(receipt);
         Ok(report)

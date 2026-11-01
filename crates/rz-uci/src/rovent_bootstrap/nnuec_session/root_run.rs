@@ -433,10 +433,18 @@ impl RoventNnuecSessionDriver {
         }
         if let Some(storage) = storage.as_mut() {
             let Some(admission) = run.admission.v1() else {
-                return Err(run.fail(
-                    "RoventNnuecStorageV2Unsupported",
-                    "V2 storage has no original admission consumer",
-                ));
+                let (code, detail) = if matches!(&run.admission, NnuecRootAdmission::V3(_)) {
+                    (
+                        "RoventNnuecStorageV3Unsupported",
+                        "V3 storage has no original admission consumer",
+                    )
+                } else {
+                    (
+                        "RoventNnuecStorageV2Unsupported",
+                        "V2 storage has no original admission consumer",
+                    )
+                };
+                return Err(run.fail(code, detail));
             };
             let admission = Arc::clone(admission);
             let owner = idle.owner.take().expect("original semantic owner");
@@ -703,24 +711,39 @@ impl RoventNnuecSessionDriver {
         run.actor = Some(actor);
         run.metadata = Some(metadata);
         let metadata = run.metadata.as_ref().expect("actual metadata");
-        if let Some(admission) = run.admission.v2() {
-            let lock = admission.owner().v2().expect("original V2 owner");
+        // The actual own-R worker must be bound to the original versioned
+        // declaration.  V3 has a different input-lock and runtime domain;
+        // never project it into a V2 owner merely to reuse this check.
+        let original_tie = match &run.admission {
+            NnuecRootAdmission::V1(_) => None,
+            NnuecRootAdmission::V2(admission) => {
+                let lock = admission.owner().v2().expect("original V2 owner");
+                Some((
+                    &lock.manifest.own_r_root_tie,
+                    "RoventNnuecV2WorkerIdentity",
+                    "actual own worker differs from original V2 lock",
+                ))
+            }
+            NnuecRootAdmission::V3(admission) => {
+                let lock = admission.owner().v3().expect("original V3 owner");
+                Some((
+                    &lock.manifest.own_r_root_tie,
+                    "RoventNnuecV3WorkerIdentity",
+                    "actual own worker differs from original V3 lock",
+                ))
+            }
+        };
+        if let Some((original_tie, code, mismatch)) = original_tie {
             let rz_experiments::RoventRootTieDeclarationV2::Own {
                 expected_search_identity,
                 expected_worker_conditions_sha256,
                 ..
-            } = &lock.manifest.own_r_root_tie
+            } = original_tie
             else {
-                return Err(run.fail(
-                    "RoventNnuecV2WorkerIdentity",
-                    "actual own worker declaration is absent",
-                ));
+                return Err(run.fail(code, "actual own worker declaration is absent"));
             };
             let Some(actual) = metadata.owned_descriptor() else {
-                return Err(run.fail(
-                    "RoventNnuecV2WorkerIdentity",
-                    "actual own worker metadata is absent",
-                ));
+                return Err(run.fail(code, "actual own worker metadata is absent"));
             };
             let mut hash = Sha256::new();
             hash.update(b"rz-cpu-search-conditions/1");
@@ -731,10 +754,7 @@ impl RoventNnuecSessionDriver {
             if actual.search_identity != expected_search_identity.as_str()
                 || expected.ok() != Some(conditions)
             {
-                return Err(run.fail(
-                    "RoventNnuecV2WorkerIdentity",
-                    "actual own worker differs from original V2 lock",
-                ));
+                return Err(run.fail(code, mismatch));
             }
         }
         let metadata = run.metadata.as_ref().expect("actual metadata");
@@ -1519,6 +1539,26 @@ impl RoventNnuecSessionDriver {
                     }
                 }
             }
+        }
+        // Handle execution failures and revoke any original hooks first so
+        // their actual errors/owners cannot be lost. The V3 deployment owner
+        // cannot represent Collection observations; retain the manager and
+        // those observations rather than discarding them in a V3 receipt.
+        if matches!(&run.admission, NnuecRootAdmission::V3(_))
+            && (run.collection_admitted
+                || run.collection_failure.is_some()
+                || run.no_capture_v2.is_some()
+                || run.pending_collection_v2.is_some()
+                || run.pending_collection_event_v2.is_some()
+                || run.pending_collection_journal_v2.is_some()
+                || run.deferred_preflight_cause.is_some()
+                || run.collection_escrow_v2.is_some()
+                || v2_hook_started)
+        {
+            return Err(run.fail(
+                "RoventNnuecV3CollectionUnsupported",
+                "actual collection observation cannot be represented by the V3 deployment owner",
+            ));
         }
         let physical = {
             let manager = run.manager.as_ref().expect("same manager after execution");

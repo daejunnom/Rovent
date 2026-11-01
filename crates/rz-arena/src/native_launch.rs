@@ -48,6 +48,22 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
         role: rz_experiments::NativeEngineRole,
     ) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError>;
     fn provider_name(&self) -> &'static str;
+    /// V6 declarations explicitly select the host runtime for each endpoint.
+    /// Historical declarations return `None` and retain their original
+    /// CPU/bundle semantics.  This declaration is not evidence of provider
+    /// readiness, child mappings, or physical GPU completion.
+    fn runtime_source_v6(
+        &self,
+        _role: rz_experiments::NativeEngineRole,
+    ) -> Option<&rz_experiments::NativeRuntimeSourceV6> {
+        None
+    }
+    /// A system CUDA endpoint may be admitted only when its launcher consumes
+    /// the explicit V6 configuration and verifies the child-owned receipt.
+    /// Merely supplying a runtime source does not enable this capability.
+    fn verifies_system_runtime_receipt_v6(&self, _role: rz_experiments::NativeEngineRole) -> bool {
+        false
+    }
     /// V4 has independently typed model/resolver/recheck/stack selections.
     /// Historical declarations retain their original 32-token codec limit.
     fn argument_limit(&self) -> usize {
@@ -186,6 +202,48 @@ impl<'a> NativeEngineView<'a> {
         }
         Ok(&first.artifact)
     }
+}
+
+/// Check the explicit V6 selection before creating any private snapshot or
+/// child.  A caller may not turn a system-runtime registration into another
+/// copy of the registered system libraries.
+#[cfg(target_os = "linux")]
+fn validate_v6_runtime_snapshot_boundary(
+    runtime: &rz_experiments::NativeRuntimeSourceV6,
+    has_bundle: bool,
+    has_external_launcher: bool,
+    verifies_child_receipt: bool,
+    inputs: &[&ArtifactRef],
+) -> Result<(), ArenaError> {
+    runtime.validate()?;
+    if has_bundle {
+        return Err(ArenaError::Invalid(
+            "V6 runtime selection cannot inherit a CUDA bundle".into(),
+        ));
+    }
+    if let rz_experiments::NativeRuntimeSourceV6::SystemCuda(system) = runtime {
+        if system.platform != rz_experiments::SystemPlatformV6::Linux {
+            return Err(ArenaError::Invalid(
+                "V6 system CUDA platform differs from the Linux launcher".into(),
+            ));
+        }
+        if !has_external_launcher || !verifies_child_receipt {
+            return Err(ArenaError::Invalid(
+                "V6 system CUDA requires an explicit child receipt consumer".into(),
+            ));
+        }
+        if inputs.iter().any(|artifact| {
+            system
+                .libraries
+                .iter()
+                .any(|library| artifact.bytes == library.bytes && artifact.sha256 == library.sha256)
+        }) {
+            return Err(ArenaError::Invalid(
+                "V6 system runtime libraries cannot be snapshotted as native inputs".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 #[doc(hidden)]
 pub struct NativePairView<'a> {
@@ -1098,8 +1156,21 @@ pub(crate) mod linux {
                 ));
             }
         }
+        let declared_inputs = spec.declared_inputs();
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            if let Some(runtime) = spec.runtime_source_v6(role) {
+                let engine = spec.engine_view(role)?;
+                validate_v6_runtime_snapshot_boundary(
+                    runtime,
+                    engine.cuda_bundle.is_some(),
+                    engine.external.is_some(),
+                    spec.verifies_system_runtime_receipt_v6(role),
+                    &declared_inputs,
+                )?;
+            }
+        }
         let mut unique = BTreeMap::new();
-        for artifact in spec.declared_inputs() {
+        for artifact in declared_inputs {
             if let Some(prior) = unique.insert(artifact.path.clone(), artifact.clone())
                 && prior != *artifact
             {
@@ -1761,6 +1832,100 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn v6_system_runtime_needs_child_receipt_and_never_snapshots_libraries() {
+            use rz_experiments::{
+                NativeRuntimeSourceV6, SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeSpecV6,
+            };
+            let library = |role: &str, inode: u64, hash: char| SystemLibrarySpecV6 {
+                role: role.into(),
+                requested_path: format!("/system/{role}.so"),
+                canonical_path: format!("/system/{role}.so"),
+                version: None,
+                sha256: hash.to_string().repeat(64),
+                bytes: 100 + inode,
+                device: 1,
+                inode,
+                required_mapping: true,
+            };
+            let source = NativeRuntimeSourceV6::SystemCuda(SystemRuntimeSpecV6 {
+                platform: SystemPlatformV6::Linux,
+                libraries: vec![
+                    library("ort-core", 1, 'a'),
+                    library("ort-provider-cuda", 2, 'b'),
+                ],
+                system_identity_sha256: "c".repeat(64),
+                cuda_device_id: 0,
+                cuda_arena_bytes: 1024,
+                startup_ms: 100,
+                drain_ms: 100,
+                capture_max_libraries: 2,
+                capture_max_file_bytes: 1024,
+                capture_max_total_bytes: 2048,
+                capture_timeout_ms: 100,
+            });
+            let model = ArtifactRef {
+                path: "model.onnx".into(),
+                sha256: "d".repeat(64),
+                bytes: 900,
+                source: "fixture".into(),
+                license: "fixture".into(),
+            };
+            let copied_provider = ArtifactRef {
+                path: "copied-provider.so".into(),
+                sha256: "b".repeat(64),
+                bytes: 102,
+                source: "fixture".into(),
+                license: "fixture".into(),
+            };
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, false, true, true, &[&model])
+                    .is_ok()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, true, true, true, &[&model])
+                    .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, false, false, true, &[&model])
+                    .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(&source, false, true, false, &[&model])
+                    .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(
+                    &source,
+                    false,
+                    true,
+                    true,
+                    &[&model, &copied_provider]
+                )
+                .is_err()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(
+                    &NativeRuntimeSourceV6::Cpu,
+                    false,
+                    false,
+                    false,
+                    &[&model]
+                )
+                .is_ok()
+            );
+            assert!(
+                validate_v6_runtime_snapshot_boundary(
+                    &NativeRuntimeSourceV6::Cpu,
+                    true,
+                    false,
+                    false,
+                    &[&model]
+                )
+                .is_err()
+            );
+        }
 
         #[test]
         fn native_runner_registration_preserves_clean_movetime_and_pairs_reap_pins() {

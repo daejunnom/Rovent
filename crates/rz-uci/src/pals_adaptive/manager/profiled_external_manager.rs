@@ -39,6 +39,16 @@ type V2ExternalAdmissionResult<Q, B, D> = Result<
     ProfiledExternalExecutionManager<Q, B, D>,
     ProfiledExternalManagerAdmissionRejection<Q, B, D, rz_experiments::RoventInputLockV2>,
 >;
+type V3ExternalParts<Q, B, D> =
+    ProfiledExternalPersistentParts<Q, B, D, rz_experiments::RoventInputLockV3>;
+type V3FacadePartsResult<Q, B, D> =
+    Result<V3ExternalParts<Q, B, D>, ProfiledExternalPersistentRejection<Q, B, D>>;
+type V3ManagerPartsResult<Q, B, D> =
+    Result<V3ExternalParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>>;
+type V3ExternalAdmissionResult<Q, B, D> = Result<
+    ProfiledExternalExecutionManager<Q, B, D>,
+    ProfiledExternalManagerAdmissionRejection<Q, B, D, rz_experiments::RoventInputLockV3>,
+>;
 
 impl<Q, B, D> ProfiledExternalExecutionManager<Q, B, D>
 where
@@ -164,11 +174,35 @@ where
             })
     }
 
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v3_persistent_parts(self) -> V3FacadePartsResult<Q, B, D> {
+        self.inner
+            .into_profiled_v3_persistent_parts()
+            .map_err(|rejected| ProfiledExternalPersistentRejection {
+                error: rejected.error,
+                manager: Self {
+                    inner: rejected.manager,
+                },
+            })
+    }
+
     /// Return the original V2 source only after the process-close proof.
     #[allow(clippy::result_large_err)]
     pub fn into_profiled_v2_process_parts(self) -> V2FacadePartsResult<Q, B, D> {
         self.inner
             .into_profiled_v2_process_parts()
+            .map_err(|rejected| ProfiledExternalPersistentRejection {
+                error: rejected.error,
+                manager: Self {
+                    inner: rejected.manager,
+                },
+            })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v3_process_parts(self) -> V3FacadePartsResult<Q, B, D> {
+        self.inner
+            .into_profiled_v3_process_parts()
             .map_err(|rejected| ProfiledExternalPersistentRejection {
                 error: rejected.error,
                 manager: Self {
@@ -394,9 +428,19 @@ where
     pub fn into_profiled_v2_persistent_parts(self) -> V2ManagerPartsResult<Q, B, D> {
         self.into_profiled_v2_settled_parts(AdaptiveCloseMode::RootQuiesce)
     }
+
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v3_persistent_parts(self) -> V3ManagerPartsResult<Q, B, D> {
+        self.into_profiled_v3_settled_parts(AdaptiveCloseMode::RootQuiesce)
+    }
     #[allow(clippy::result_large_err)]
     pub fn into_profiled_v2_process_parts(self) -> V2ManagerPartsResult<Q, B, D> {
         self.into_profiled_v2_settled_parts(AdaptiveCloseMode::ProcessShutdown)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_v3_process_parts(self) -> V3ManagerPartsResult<Q, B, D> {
+        self.into_profiled_v3_settled_parts(AdaptiveCloseMode::ProcessShutdown)
     }
     #[allow(clippy::result_large_err)]
     fn into_profiled_v2_settled_parts(
@@ -445,6 +489,64 @@ where
             unreachable!("receipt checked exact profiled source kind")
         };
         let researcher_resources::ProfiledExternalSource::V2(external) = *external else {
+            unreachable!("version checked before extraction")
+        };
+        Ok(ProfiledExternalPersistentParts {
+            native: self.native,
+            external,
+            driver: self.driver,
+            continuation,
+            receipt,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn into_profiled_v3_settled_parts(
+        self,
+        mode: AdaptiveCloseMode,
+    ) -> V3ManagerPartsResult<Q, B, D> {
+        if !matches!(&self.researcher, ResearcherResources::ProfiledExternal(source) if matches!(source.as_ref(), researcher_resources::ProfiledExternalSource::V3(_)))
+        {
+            return Err(AdaptivePersistentRejection {
+                error: AdaptiveManagerError::Invalid("profiled owner is not V3"),
+                manager: self,
+            });
+        }
+        let receipt = match self.profiled_shutdown_receipt() {
+            Ok(receipt)
+                if self.phase == ManagerPhase::Finished
+                    && self.close_mode == mode
+                    && match mode {
+                        AdaptiveCloseMode::RootQuiesce => receipt.permits_root_reuse(),
+                        AdaptiveCloseMode::ProcessShutdown => receipt.permits_archive_close(),
+                    } =>
+            {
+                receipt
+            }
+            Ok(_) => {
+                return Err(AdaptivePersistentRejection {
+                    error: AdaptiveManagerError::PhysicalUnknown,
+                    manager: self,
+                });
+            }
+            Err(error) => {
+                return Err(AdaptivePersistentRejection {
+                    error,
+                    manager: self,
+                });
+            }
+        };
+        let continuation = AdaptiveSequenceContinuation {
+            authority: self.registration.authority,
+            next_request: self.registry.next_request_sequence(),
+            next_job: self.next_job,
+            next_execution: self.next_execution,
+            next_control: self.next_control,
+        };
+        let ResearcherResources::ProfiledExternal(external) = self.researcher else {
+            unreachable!("receipt checked exact profiled source kind")
+        };
+        let researcher_resources::ProfiledExternalSource::V3(external) = *external else {
             unreachable!("version checked before extraction")
         };
         Ok(ProfiledExternalPersistentParts {
@@ -509,6 +611,36 @@ where
         .map_err(|(error, sources, external, continuation)| {
             let researcher_resources::ProfiledExternalSource::V2(external) = external else {
                 unreachable!("original V2 source retained")
+            };
+            ProfiledExternalManagerAdmissionRejection {
+                error,
+                sources,
+                external,
+                continuation,
+            }
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn new_profiled_external_v3_retaining(
+        registration: AdaptiveManagerRegistration,
+        clock: ContractSystemClock,
+        limits: AdaptiveExecutionLimits,
+        sources: AdaptiveManagerSources<Q, B, D>,
+        external: ProfiledExternalManagerSource<rz_experiments::RoventInputLockV3>,
+        continuation: Option<AdaptiveSequenceContinuation>,
+    ) -> V3ExternalAdmissionResult<Q, B, D> {
+        Self::new_profiled_external_any_retaining(
+            registration,
+            clock,
+            limits,
+            sources,
+            researcher_resources::ProfiledExternalSource::V3(external),
+            continuation,
+        )
+        .map_err(|(error, sources, external, continuation)| {
+            let researcher_resources::ProfiledExternalSource::V3(external) = external else {
+                unreachable!("original V3 source retained")
             };
             ProfiledExternalManagerAdmissionRejection {
                 error,

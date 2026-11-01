@@ -2,7 +2,7 @@
 //! 공개 profile·PID·fence 사본으로 이 결합을 재구성할 수 없다.
 use super::*;
 use crate::rovent_root_admission::RoventRootAdmission;
-use crate::rovent_root_admission::source_seal::RoventRootAdmissionV2;
+use crate::rovent_root_admission::source_seal::{RoventRootAdmissionV2, RoventRootAdmissionV3};
 use rz_runtime::contracts::{ContractClock, ContractSystemClock};
 use rz_search::external_cpu::{
     ProfiledExternalCurrentRootFence, ProfiledExternalResetProof, ProfiledExternalRootSource,
@@ -83,6 +83,40 @@ impl RoventAdmittedExternalRootSourceV2 {
         Ok(())
     }
 }
+
+/// The /3 root remains the same live allocation owned by the external worker.
+#[derive(Clone)]
+pub struct RoventAdmittedExternalRootSourceV3 {
+    root: Arc<RoventRootAdmissionV3>,
+    source: ProfiledExternalRootSource,
+    collection_evidence: Arc<serde_json::Value>,
+}
+impl RoventAdmittedExternalRootSourceV3 {
+    pub fn root_admission(&self) -> &Arc<RoventRootAdmissionV3> {
+        &self.root
+    }
+    pub fn worker_source(&self) -> &ProfiledExternalRootSource {
+        &self.source
+    }
+    pub fn collection_evidence(&self) -> &serde_json::Value {
+        &self.collection_evidence
+    }
+    pub fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.root, &other.root) && self.source.same_source(&other.source)
+    }
+    pub fn validate_current(&self) -> Result<(), CheckerError> {
+        self.source.validate_current()?;
+        if !self
+            .root
+            .original_context()
+            .accepts()
+            .map_err(|_| invalid("original external root unavailable"))?
+        {
+            return Err(invalid("original external root no longer admits work"));
+        }
+        Ok(())
+    }
+}
 impl RoventExternalOwner {
     /// Startup 대기 중에는 None이다. 실제 worker source, 원 process/profile,
     /// root authority·clock·startup lock이 모두 같은 경우만 결합한다.
@@ -126,6 +160,30 @@ impl RoventExternalOwner {
             return Ok(None);
         };
         let joined = RoventAdmittedExternalRootSourceV2 {
+            root: Arc::clone(root),
+            source,
+            collection_evidence,
+        };
+        joined.validate_current()?;
+        Ok(Some(joined))
+    }
+
+    /// Join the physical worker to its original live /3 root.
+    pub fn frontier_root_source_v3(
+        &self,
+    ) -> Result<Option<RoventAdmittedExternalRootSourceV3>, CheckerError> {
+        let root = self
+            .actual_root_admission_v3()
+            .ok_or(invalid("actual /3 root not admitted"))?;
+        let Some((source, collection_evidence)) = self.join_frontier_source(
+            root.authority(),
+            root.runtime_clock(),
+            root.startup_lock_digest(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let joined = RoventAdmittedExternalRootSourceV3 {
             root: Arc::clone(root),
             source,
             collection_evidence,
@@ -203,6 +261,12 @@ impl RoventExternalOwner {
                 root.authority(),
             )
         } else if let Some(root) = self.actual_root_admission_v2() {
+            (
+                root.runtime_clock(),
+                root.cleanup_deadline(),
+                root.authority(),
+            )
+        } else if let Some(root) = self.actual_root_admission_v3() {
             (
                 root.runtime_clock(),
                 root.cleanup_deadline(),

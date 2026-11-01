@@ -689,6 +689,9 @@ where
         } else if let Some(root) = source.root_admission_v2() {
             self.driver
                 .validate_profiled_external_registration_v2(source.current_source(), root)?;
+        } else if let Some(root) = source.root_admission_v3() {
+            self.driver
+                .validate_profiled_external_registration_v3(source.current_source(), root)?;
         } else {
             return Err(AdaptiveManagerError::Invalid(
                 "profiled external original root absent",

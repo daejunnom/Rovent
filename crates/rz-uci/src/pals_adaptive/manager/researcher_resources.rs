@@ -3,9 +3,12 @@
 use super::*;
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-use crate::rovent_root_admission::{RoventRootAdmission, source_seal::RoventRootAdmissionV2};
+use crate::rovent_root_admission::{
+    RoventRootAdmission,
+    source_seal::{RoventRootAdmissionV2, RoventRootAdmissionV3},
+};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-use rz_experiments::RoventInputLockV2;
+use rz_experiments::{RoventInputLockV2, RoventInputLockV3};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use rz_search::cpu_checker::{CheckerError, CheckerShutdown};
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -21,6 +24,7 @@ use rz_search::external_cpu::{
 pub(super) enum ProfiledExternalSource {
     V1(profiled_external_source::ProfiledExternalManagerSource),
     V2(profiled_external_source::ProfiledExternalManagerSource<RoventInputLockV2>),
+    V3(profiled_external_source::ProfiledExternalManagerSource<RoventInputLockV3>),
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -30,6 +34,7 @@ macro_rules! delegate_profiled {
             match self {
                 Self::V1(source) => source.$name($($arg),*),
                 Self::V2(source) => source.$name($($arg),*),
+                Self::V3(source) => source.$name($($arg),*),
             }
         }
     };
@@ -38,6 +43,7 @@ macro_rules! delegate_profiled {
             match self {
                 Self::V1(source) => source.$name($($arg),*),
                 Self::V2(source) => source.$name($($arg),*),
+                Self::V3(source) => source.$name($($arg),*),
             }
         }
     };
@@ -48,37 +54,48 @@ impl ProfiledExternalSource {
     pub(super) fn root_admission_v1(&self) -> Option<&Arc<RoventRootAdmission>> {
         match self {
             Self::V1(source) => Some(source.root_admission()),
-            Self::V2(_) => None,
+            Self::V2(_) | Self::V3(_) => None,
         }
     }
     pub(super) fn root_admission_v2(&self) -> Option<&Arc<RoventRootAdmissionV2>> {
         match self {
             Self::V1(_) => None,
             Self::V2(source) => Some(source.root_admission()),
+            Self::V3(_) => None,
+        }
+    }
+    pub(super) fn root_admission_v3(&self) -> Option<&Arc<RoventRootAdmissionV3>> {
+        match self {
+            Self::V3(source) => Some(source.root_admission()),
+            Self::V1(_) | Self::V2(_) => None,
         }
     }
     pub(super) fn root_authority(&self) -> rz_contracts::pals::SearchAuthority {
         match self {
             Self::V1(s) => s.root_admission().authority(),
             Self::V2(s) => s.root_admission().authority(),
+            Self::V3(s) => s.root_admission().authority(),
         }
     }
     pub(super) fn root_hard_deadline(&self) -> rz_contracts::Deadline {
         match self {
             Self::V1(s) => s.root_admission().hard_deadline(),
             Self::V2(s) => s.root_admission().hard_deadline(),
+            Self::V3(s) => s.root_admission().hard_deadline(),
         }
     }
     pub(super) fn root_original_context(&self) -> &crate::search_driver::SearchSessionContext {
         match self {
             Self::V1(s) => s.root_admission().original_context(),
             Self::V2(s) => s.root_admission().original_context(),
+            Self::V3(s) => s.root_admission().original_context(),
         }
     }
     pub(super) fn root_runtime_clock(&self) -> &rz_runtime::contracts::ContractSystemClock {
         match self {
             Self::V1(s) => s.root_admission().runtime_clock(),
             Self::V2(s) => s.root_admission().runtime_clock(),
+            Self::V3(s) => s.root_admission().runtime_clock(),
         }
     }
     pub(super) fn root_budget_digest(&self) -> Result<rz_contracts::Digest, CheckerError> {
@@ -89,6 +106,11 @@ impl ProfiledExternalSource {
                 .descriptor()
                 .root_budget_digest()
                 .map_err(|_| CheckerError::Invalid("invalid original V2 root budget")),
+            Self::V3(s) => s
+                .root_admission()
+                .descriptor()
+                .root_budget_digest()
+                .map_err(|_| CheckerError::Invalid("invalid original V3 root budget")),
         }
     }
     delegate_profiled!(current_source(&self) -> &ProfiledExternalRootSource);

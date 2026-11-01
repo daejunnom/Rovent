@@ -35,7 +35,9 @@ use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use rz_contracts::ProcessEpoch;
 use rz_eval::pals_onnx::virtual_review::VirtualReviewProfileDirectory;
-use rz_experiments::{ArtifactRef, RoventDevice, RoventInputLock, RoventInputLockV2};
+use rz_experiments::{
+    ArtifactRef, RoventDevice, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
+};
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
 use serde::Deserialize;
 use std::{
@@ -65,6 +67,7 @@ mod selected_view_observation;
 pub mod storage;
 mod v2_external;
 mod v2_rejections;
+mod v3;
 pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
@@ -114,6 +117,8 @@ struct Arguments {
     external_r_sources: Option<String>,
     retirement_sink: Option<String>,
     evidence_root: Option<PathBuf>,
+    system_runtime_receipt_root: Option<PathBuf>,
+    strict_source: Option<bool>,
     process_epoch: u64,
     startup_ms: u64,
     root_policy: RoventRootAdmissionPolicy,
@@ -143,6 +148,8 @@ impl Arguments {
         let mut external_r_sources = None;
         let mut retirement_sink = None;
         let mut evidence_root = None;
+        let mut system_runtime_receipt_root = None;
+        let mut strict_source = None;
         let mut process_epoch = None;
         let mut startup_ms = None;
         let mut root_policy = None;
@@ -173,6 +180,21 @@ impl Arguments {
                 }
                 "--evidence-root" if evidence_root.is_none() => {
                     evidence_root = Some(managed_path(value)?)
+                }
+                "--system-runtime-receipt-root" if system_runtime_receipt_root.is_none() => {
+                    system_runtime_receipt_root = Some(relative_output_path(value)?)
+                }
+                "--source-verification" if strict_source.is_none() => {
+                    strict_source = Some(match value {
+                        "strict" => true,
+                        "observe" => false,
+                        _ => {
+                            return Err(error(
+                                "Arguments",
+                                "source verification must be strict or observe",
+                            ));
+                        }
+                    });
                 }
                 "--storage-profile" if storage_profile.is_none() => {
                     storage_profile = Some(private_path(value)?)
@@ -306,6 +328,8 @@ impl Arguments {
             external_r_sources,
             retirement_sink,
             evidence_root,
+            system_runtime_receipt_root,
+            strict_source,
             process_epoch: process_epoch
                 .ok_or_else(|| error("Arguments", "--process-epoch is required"))?,
             startup_ms: startup_ms.ok_or_else(|| error("Arguments", "--startup-ms is required"))?,
@@ -328,6 +352,23 @@ fn private_path(value: &str) -> Result<String, RoventLaunchError> {
     }
     Ok(value.into())
 }
+fn relative_output_path(value: &str) -> Result<PathBuf, RoventLaunchError> {
+    let path = PathBuf::from(value);
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\0')
+        || !path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err(error(
+            "Arguments",
+            "bounded relative system receipt root required",
+        ));
+    }
+    Ok(path)
+}
+
 fn managed_path(value: &str) -> Result<PathBuf, RoventLaunchError> {
     let path = PathBuf::from(value);
     if value.is_empty()
@@ -627,11 +668,54 @@ pub fn run_with_resource_admission<'a>(
 type ResourceAdmission<'a> =
     Box<dyn FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a>;
 
+/// V3 uses its original lock and a distinct callback, never a V1/V2 projection.
+/// The caller retains its OS resource owner and failure custody for the whole
+/// child execution. Capability queries do not start or invoke the callback.
+pub fn run_with_v3_resource_admission<'a>(
+    arguments: Vec<String>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLockV3>) -> Result<(), RoventLaunchError> + 'a,
+) -> Result<(), RoventLaunchError> {
+    if arguments == ["--build-capabilities-json"]
+        || arguments == ["--build-system-runtime-capabilities-json"]
+    {
+        return run(arguments);
+    }
+    let arguments = Arguments::parse(&arguments)?;
+    let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
+    let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
+        .map_err(|failure| error("Cwd", failure))?;
+    let lock_file = root
+        .open_with(
+            &arguments.input_lock,
+            cap_std::fs::OpenOptions::new().read(true),
+        )
+        .map_err(|failure| error("InputLock", failure))?
+        .into_std();
+    let bytes = read_bounded(&lock_file, MAX_LOCK_BYTES)?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| error("InputLock", "UTF-8 input required"))?;
+    let lock = Arc::new(
+        RoventInputLockV3::from_json(text).map_err(|failure| error("InputLock", failure))?,
+    );
+    v3::run_native_with_resource(
+        arguments,
+        lock,
+        root,
+        cwd,
+        lock_file,
+        Box::new(admit_resource),
+    )
+}
+
+type ResourceAdmissionV3<'a> =
+    Box<dyn FnOnce(&Arc<RoventInputLockV3>) -> Result<(), RoventLaunchError> + 'a>;
+
 /// The parser retains the actual version and never projects a /2 lock to /1.
 #[derive(Debug)]
 enum LaunchInputLock {
     V1(Arc<RoventInputLock>),
     V2(Arc<RoventInputLockV2>),
+    V3(Arc<RoventInputLockV3>),
 }
 fn parse_launch_lock(bytes: &[u8]) -> Result<LaunchInputLock, RoventLaunchError> {
     let input =
@@ -640,7 +724,26 @@ fn parse_launch_lock(bytes: &[u8]) -> Result<LaunchInputLock, RoventLaunchError>
         Ok(lock) => Ok(LaunchInputLock::V1(Arc::new(lock))),
         Err(original_failure) => match RoventInputLockV2::from_json(input) {
             Ok(lock) => Ok(LaunchInputLock::V2(Arc::new(lock))),
-            Err(_) => Err(error("InputLock", original_failure)),
+            Err(_) => match RoventInputLockV3::from_json(input) {
+                Ok(lock) => Ok(LaunchInputLock::V3(Arc::new(lock))),
+                Err(v3_failure) => {
+                    // Version probing only chooses which typed error to show.
+                    // The original strict parser remains the sole admission authority.
+                    let domain = serde_json::from_str::<serde_json::Value>(input)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("domain")
+                                .and_then(|item| item.as_str())
+                                .map(str::to_owned)
+                        });
+                    if domain.as_deref() == Some(rz_experiments::ROVENT_LOCK_V3_DOMAIN) {
+                        Err(error("InputLock", v3_failure))
+                    } else {
+                        Err(error("InputLock", original_failure))
+                    }
+                }
+            },
         },
     }
 }
@@ -661,6 +764,25 @@ fn run_inner<'a>(
     resource_admission: Option<ResourceAdmission<'a>>,
     product_runner: Option<ProductRunner<'a>>,
 ) -> Result<(), RoventLaunchError> {
+    if arguments == ["--build-system-runtime-capabilities-json"] {
+        let sources = super::process_boundary::compiled_process_source_components_v3()
+            .map_err(|failure| error("CompiledSources", failure))?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "domain":"rz-rovent-system-runtime-capabilities/1",
+                "source_commit":env!("RZ_PALS_COMPILED_SOURCE_COMMIT"),
+                "source_components":sources,
+                "target_os":std::env::consts::OS,
+                "target_arch":std::env::consts::ARCH,
+                "onnx_cuda_compiled":cfg!(feature="onnx-cuda"),
+                "native_runtime_loaded":false,
+                "native_model_loaded":false,
+                "neural_execution_observed":false,
+            })
+        );
+        return Ok(());
+    }
     if arguments == ["--build-capabilities-json"] {
         let sources = super::process_boundary::compiled_process_source_components()
             .map_err(|failure| error("CompiledSources", failure))?;
@@ -704,6 +826,13 @@ fn run_inner<'a>(
     let lock = match parse_launch_lock(&lock_bytes)? {
         LaunchInputLock::V1(lock) => lock,
         LaunchInputLock::V2(lock) => {
+            if arguments.system_runtime_receipt_root.is_some() || arguments.strict_source.is_some()
+            {
+                return Err(error(
+                    "InputLockUnsupportedV2",
+                    "system receipt root requires an original /3 lock",
+                ));
+            }
             if teacher_selections.is_some()
                 || collection_observer.is_some()
                 || collection_assemble.is_some()
@@ -717,7 +846,27 @@ fn run_inner<'a>(
             }
             return run_v2_native(arguments, lock, root, cwd, lock_file, None);
         }
+        LaunchInputLock::V3(lock) => {
+            if teacher_selections.is_some()
+                || collection_observer.is_some()
+                || collection_assemble.is_some()
+                || resource_admission.is_some()
+                || product_runner.is_some()
+            {
+                return Err(error(
+                    "InputLockUnsupportedV3",
+                    "legacy callbacks cannot consume a /3 lock",
+                ));
+            }
+            return v3::run_native(arguments, lock, root, cwd, lock_file);
+        }
     };
+    if arguments.system_runtime_receipt_root.is_some() || arguments.strict_source.is_some() {
+        return Err(error(
+            "InputLockUnsupportedV1",
+            "system receipt root requires an original /3 lock",
+        ));
+    }
     if arguments.lifecycle_diagnostics_v2 {
         return Err(error(
             "InputLockUnsupportedV1",
@@ -1219,6 +1368,12 @@ fn run_pc_collection_v2_inner<'a>(
                 "V2 collection requires an original /2 lock",
             ));
         }
+        LaunchInputLock::V3(_) => {
+            return Err(error(
+                "InputLockUnsupportedV3",
+                "V2 collection cannot consume an original /3 lock",
+            ));
+        }
     };
     run_v2_native(arguments, lock, root, cwd, lock_file, Some(collection))
 }
@@ -1233,7 +1388,9 @@ fn run_v2_native<'a>(
     lock_file: File,
     collection: Option<CollectionLaunchV2<'a>>,
 ) -> Result<(), RoventLaunchError> {
-    if arguments.storage.is_some()
+    if arguments.system_runtime_receipt_root.is_some()
+        || arguments.strict_source.is_some()
+        || arguments.storage.is_some()
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
         || arguments.initial_stop_source_diagnostics

@@ -20,7 +20,10 @@ use rz_eval::pals_onnx::virtual_review::{
     validate_virtual_review_export_manifest_kind,
 };
 use rz_eval::runtime_pin::{RuntimeBundleFileRole, RuntimeLibraryPin};
-use rz_experiments::{ArtifactRef, RoventInputLock, RoventInputLockV2};
+use rz_experiments::{
+    ArtifactRef, NativeRuntimeSourceV6, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
+    SystemRuntimeLockV6,
+};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeSet,
@@ -165,6 +168,27 @@ mod native_lock_sealed {
 #[doc(hidden)]
 pub trait NativeInputLock: native_lock_sealed::Sealed + Send + Sync + 'static {
     fn validate_original(&self) -> Result<(), rz_experiments::ManifestError>;
+    fn system_runtime_lock(&self) -> Option<&SystemRuntimeLockV6> {
+        None
+    }
+    fn bootstrap_source_identity(&self) -> Result<(&'static str, [u8; 32]), BackendError> {
+        Ok(("rovent_bootstrap", compiled_bootstrap_source_digest()))
+    }
+    fn model_source_identity(&self) -> Result<(&'static str, String), BackendError> {
+        let components = rz_experiments::compiled_source_components_v5().map_err(|_| {
+            fail(
+                K::IdentityMismatch,
+                "compiled native source inventory unavailable",
+            )
+        })?;
+        let digest = components.get("model_native").ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                "compiled native model identity unavailable",
+            )
+        })?;
+        Ok(("model_native", digest.clone()))
+    }
     fn engine(&self) -> &rz_experiments::RoventEngineDeclaration;
     fn provenance(&self) -> &[ArtifactRef];
     fn canonical_sha256(&self) -> &str;
@@ -313,13 +337,113 @@ impl NativeInputLock for RoventInputLockV2 {
     }
 }
 
+impl native_lock_sealed::Sealed for RoventInputLockV3 {}
+impl NativeInputLock for RoventInputLockV3 {
+    fn model_source_identity(&self) -> Result<(&'static str, String), BackendError> {
+        let digest =
+            super::source_inventory_v3::compiled_system_model_native_digest_v3().map_err(|_| {
+                fail(
+                    K::IdentityMismatch,
+                    "compiled V3 native model identity unavailable",
+                )
+            })?;
+        Ok(("model_native_v3", hex(digest)))
+    }
+    fn bootstrap_source_identity(&self) -> Result<(&'static str, [u8; 32]), BackendError> {
+        let digest =
+            super::source_inventory_v3::compiled_system_source_digest_v3().map_err(|_| {
+                fail(
+                    K::IdentityMismatch,
+                    "compiled system source inventory unavailable",
+                )
+            })?;
+        Ok(("rovent_system_source_v3", digest))
+    }
+    fn validate_original(&self) -> Result<(), rz_experiments::ManifestError> {
+        self.validate()
+    }
+    fn system_runtime_lock(&self) -> Option<&SystemRuntimeLockV6> {
+        match &self.manifest.system_runtime_lock.runtime {
+            NativeRuntimeSourceV6::SystemCuda(_) => Some(&self.manifest.system_runtime_lock),
+            NativeRuntimeSourceV6::Cpu => None,
+        }
+    }
+    fn engine(&self) -> &rz_experiments::RoventEngineDeclaration {
+        &self.manifest.engine
+    }
+    fn provenance(&self) -> &[ArtifactRef] {
+        &self.manifest.provenance
+    }
+    fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+    fn cleanup_max_ms(&self) -> u64 {
+        self.manifest.cleanup_max_ms
+    }
+    fn role_tickets_max(&self) -> u32 {
+        self.manifest.coordinator.role_tickets_max
+    }
+    fn retain_startup_control(
+        &self,
+        control: &RoventStartupControl,
+    ) -> Option<RoventStartupControl> {
+        Some(control.clone())
+    }
+    fn topology(
+        &self,
+        collection: Option<&RoventCollectionPreloadSources>,
+    ) -> Result<RoventStartupTopology, BackendError> {
+        self.validate()
+            .map_err(|_| fail(K::IdentityMismatch, "Rovent /3 lock validation failed"))?;
+        if collection.is_some() {
+            return Err(fail(
+                K::UnsupportedModel,
+                "Rovent /3 collection source owner is not connected",
+            ));
+        }
+        let explicit_purpose = matches!(
+            self.manifest.purpose,
+            rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment
+        ) && self.manifest.engine.teachers.is_empty();
+        super::admitted_native_topology_fields(
+            &self.manifest.engine,
+            &self.manifest.coordinator,
+            explicit_purpose,
+        )
+    }
+    fn admit_configuration(
+        &self,
+        config: &StartupConfigurationDocument,
+    ) -> Result<(), BackendError> {
+        config.admit_against_v3(self)
+    }
+    fn admit_startup_artifact(&self, artifact: &ArtifactRef) -> Result<(), BackendError> {
+        if *artifact == self.manifest.startup_document {
+            Ok(())
+        } else {
+            Err(fail(
+                K::IdentityMismatch,
+                "selected startup differs from the V3 lock",
+            ))
+        }
+    }
+}
+
 /// Descriptors remain bound to the exact new lock. Path replacement cannot
 /// redirect a later read. Participating owners must still prevent mutation of
 /// these private files; metadata checks are not a hostile same-UID sandbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSourceEvidence {
+    Verified,
+    Mismatch,
+    Unavailable,
+}
+
 pub struct RoventPinnedNativeSources<L = RoventInputLock> {
     lock: Arc<L>,
     original_v2_control: Option<RoventStartupControl>,
     topology: RoventStartupTopology,
+    source_evidence: NativeSourceEvidence,
     _root: Dir,
     private_root_path: PathBuf,
     configuration_blob: PinnedBlob,
@@ -344,7 +468,15 @@ impl RoventPinnedNativeSources {
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
-        Self::open_selected(lock, root, private_root_path, selection, control, None)
+        Self::open_selected(
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            None,
+            true,
+        )
     }
     /// Explicit source-only Collection preload. The same full lock and all
     /// original teacher source descriptors are retained; no target is granted.
@@ -369,6 +501,7 @@ impl RoventPinnedNativeSources {
             selection,
             control,
             Some(collection),
+            true,
         )
     }
 }
@@ -445,6 +578,7 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
             selection,
             control,
             Some(collection),
+            true,
         )?;
         owner.verify_collection_v2_origin()?;
         Ok(owner)
@@ -459,7 +593,94 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
-        Self::open_selected(lock, root, private_root_path, selection, control, None)
+        Self::open_selected(
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            None,
+            true,
+        )
+    }
+}
+
+impl RoventPinnedNativeSources<RoventInputLockV3> {
+    /// Compare retained original directory capabilities without reopening a path.
+    pub(crate) fn same_original_root(&self, other: &Dir) -> Result<bool, BackendError> {
+        same_directory_identity(&self._root, other)
+    }
+
+    /// V3 must retain the exact original cancellation and both deadlines.
+    pub(crate) fn matches_startup_control(&self, control: &RoventStartupControl) -> bool {
+        self.original_v2_control
+            .as_ref()
+            .is_some_and(|original| same_startup_control(original, control))
+    }
+
+    /// Source admission uses the original /3 lock, root capability and control.
+    /// Collection/teacher support requires a separate original /3 owner.
+    pub fn open_v3(
+        lock: Arc<RoventInputLockV3>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+    ) -> Result<Self, BackendError> {
+        Self::open_selected(
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            None,
+            true,
+        )
+    }
+
+    /// Functional startup retains actual artifact checks, but records source
+    /// provenance uncertainty rather than treating it as a model failure.
+    pub fn open_v3_observational(
+        lock: Arc<RoventInputLockV3>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+    ) -> Result<Self, BackendError> {
+        Self::open_selected(
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            None,
+            false,
+        )
+    }
+
+    pub fn source_evidence(&self) -> NativeSourceEvidence {
+        self.source_evidence
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn load_system_cuda(
+        &self,
+        control: &RoventStartupControl,
+    ) -> Result<
+        crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup,
+        BackendError,
+    > {
+        self.validate_lock()?;
+        control.check()?;
+        if !self.admits_original_startup_control(control) {
+            return Err(fail(
+                K::IdentityMismatch,
+                "system CUDA startup control differs from original owner",
+            ));
+        }
+        crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup::capture_and_load_until(
+            &self.lock.manifest.system_runtime_lock, control.until, control.cancellation.as_ref(),
+        )
     }
 }
 
@@ -504,6 +725,7 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
         collection: Option<Arc<RoventCollectionPreloadSources>>,
+        strict_source: bool,
     ) -> Result<Self, BackendError> {
         control.check()?;
         let topology = lock.topology(collection.as_deref())?;
@@ -520,23 +742,43 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
                 "Fresh V-free native startup needs exactly two original graphs",
             ));
         }
-        let compiled = rz_experiments::compiled_source_components_v5().map_err(|_| {
-            fail(
-                K::IdentityMismatch,
-                "compiled native source inventory unavailable",
-            )
-        })?;
         let model = &lock.engine().pc.proposer;
-        if lock.engine().source_components.get("rovent_bootstrap")
-            != Some(&hex(compiled_bootstrap_source_digest()))
-            || compiled.get("model_native") != Some(&model.implementation_sha256)
-            || lock.engine().source_components.get("model_native")
-                != Some(&model.implementation_sha256)
-        {
-            return Err(fail(
-                K::IdentityMismatch,
-                "native and bootstrap source pins differ from compiled bytes",
-            ));
+        let source_evidence = if strict_source {
+            // Preserve historical V1/V2 error ordering and error types.
+            let (source_key, source_digest) = lock.bootstrap_source_identity()?;
+            let (model_source_key, model_source_digest) = lock.model_source_identity()?;
+            if lock.engine().source_components.get(source_key) != Some(&hex(source_digest))
+                || model_source_digest != model.implementation_sha256
+                || lock.engine().source_components.get(model_source_key)
+                    != Some(&model.implementation_sha256)
+            {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    "native and bootstrap source pins differ from compiled bytes",
+                ));
+            }
+            NativeSourceEvidence::Verified
+        } else {
+            match (
+                lock.bootstrap_source_identity(),
+                lock.model_source_identity(),
+            ) {
+                (Ok((source_key, source_digest)), Ok((model_source_key, model_source_digest))) => {
+                    if lock.engine().source_components.get(source_key) == Some(&hex(source_digest))
+                        && model_source_digest == model.implementation_sha256
+                        && lock.engine().source_components.get(model_source_key)
+                            == Some(&model.implementation_sha256)
+                    {
+                        NativeSourceEvidence::Verified
+                    } else {
+                        NativeSourceEvidence::Mismatch
+                    }
+                }
+                _ => NativeSourceEvidence::Unavailable,
+            }
+        };
+        if source_evidence != NativeSourceEvidence::Verified {
+            eprintln!("native source provenance warning: {source_evidence:?}");
         }
         let mut selected_paths = BTreeSet::new();
         lock.admit_startup_artifact(&selection.startup_configuration)?;
@@ -627,7 +869,14 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
             runtime.push(open_blob(&root, artifact.clone(), 1 << 30)?);
             control.check()?;
         }
-        if matches!(lock.engine().pc.device, rz_experiments::RoventDevice::Cpu)
+        if lock.system_runtime_lock().is_some() {
+            if runtime_bundle_manifest.is_some() || !runtime.is_empty() || control_blob.is_some() {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    "system CUDA cannot own copied native bundle or control inventory",
+                ));
+            }
+        } else if matches!(lock.engine().pc.device, rz_experiments::RoventDevice::Cpu)
             != runtime_bundle_manifest.is_none()
         {
             return Err(fail(
@@ -640,6 +889,7 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
             lock,
             original_v2_control,
             topology,
+            source_evidence,
             _root: root,
             private_root_path,
             configuration_blob,
@@ -697,6 +947,12 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
     /// or verified flag that could bypass the root/named-file guards.
     pub fn pin_runtime(&self) -> Result<RuntimeLibraryPin, BackendError> {
         self.validate_lock()?;
+        if self.lock.system_runtime_lock().is_some() {
+            return Err(fail(
+                K::UnsupportedModel,
+                "system CUDA must not create a retained runtime copy",
+            ));
+        }
         let backend = match self.lock.engine().pc.backend {
             rz_experiments::RoventBackend::OrtCpu => RuntimeBackend::OrtCpu,
             rz_experiments::RoventBackend::OrtCuda => RuntimeBackend::OrtCuda,

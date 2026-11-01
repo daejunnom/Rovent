@@ -4,6 +4,7 @@
 pub mod v2;
 pub mod v3;
 pub mod v4;
+pub mod v5;
 
 use super::{fail, hex};
 use crate::pals_adaptive::{
@@ -17,8 +18,8 @@ use rz_eval::onnx::{NativeLoadingProfile, Provider};
 use rz_eval::pals_onnx::{PalsCuDnnConvSearch, PalsOnnxConfig};
 use rz_experiments::{
     ArtifactRef, RoventCoordinatorDeclaration, RoventDevice, RoventEngineDeclaration,
-    RoventInputLock, RoventInputLockV2, RoventResearcher, RoventRootTieDeclarationV2,
-    RoventRootTiePolicyV2,
+    RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventResearcher,
+    RoventRootTieDeclarationV2, RoventRootTiePolicyV2, SystemPlatformV6, SystemRuntimeSpecV6,
 };
 use rz_runtime::adaptive::{AdaptiveController, ControllerConfig, CoordinatorPolicy, LogicalCpu};
 use rz_search::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile};
@@ -56,6 +57,7 @@ pub enum StartupConfigurationDocument {
     V2(v2::RoventStartupConfigurationV2),
     V3(v3::RoventStartupConfigurationV3),
     V4(v4::RoventStartupConfigurationV4),
+    V5(v5::RoventTypedStartupV5),
 }
 impl StartupConfigurationDocument {
     pub fn from_json(bytes: &[u8]) -> Result<Self, BackendError> {
@@ -81,6 +83,9 @@ impl StartupConfigurationDocument {
             v4::ROVENT_STARTUP_CONFIGURATION_V4_DOMAIN => {
                 v4::RoventStartupConfigurationV4::from_json(bytes).map(Self::V4)
             }
+            rz_experiments::ROVENT_STARTUP_DOCUMENT_V5_DOMAIN => {
+                v5::RoventTypedStartupV5::from_json(bytes).map(Self::V5)
+            }
             _ => Err(invalid("startup configuration version domain")),
         }
     }
@@ -90,6 +95,7 @@ impl StartupConfigurationDocument {
             Self::V2(config) => config.fields(),
             Self::V3(config) => config.fields(),
             Self::V4(config) => config.fields(),
+            Self::V5(config) => config.fields(),
         }
     }
     pub fn validate(&self) -> Result<(), BackendError> {
@@ -98,6 +104,7 @@ impl StartupConfigurationDocument {
             Self::V2(config) => config.validate(),
             Self::V3(config) => config.validate(),
             Self::V4(config) => config.validate(),
+            Self::V5(config) => config.validate(),
         }
     }
     pub fn admit_against(&self, lock: &RoventInputLock) -> Result<(), BackendError> {
@@ -110,6 +117,7 @@ impl StartupConfigurationDocument {
             Self::V4(_) => Err(invalid(
                 "startup configuration /4 requires policy-aware lock",
             )),
+            Self::V5(_) => Err(invalid("startup document /5 requires /3 input lock")),
         }
     }
     /// Validate a /4 startup declaration against a policy-aware /2 lock.
@@ -178,12 +186,20 @@ impl StartupConfigurationDocument {
         }
         Ok(())
     }
+    /// Admit the original /5 envelope and independently pinned system runtime.
+    pub fn admit_against_v3(&self, lock: &RoventInputLockV3) -> Result<(), BackendError> {
+        match self {
+            Self::V5(config) => config.admit_against_v3(lock),
+            _ => Err(invalid("Rovent input lock /3 requires startup document /5")),
+        }
+    }
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, BackendError> {
         match self {
             Self::V1(config) => config.canonical_bytes(),
             Self::V2(config) => config.canonical_bytes(),
             Self::V3(config) => config.canonical_bytes(),
             Self::V4(config) => config.canonical_bytes(),
+            Self::V5(config) => config.canonical_bytes(),
         }
     }
     pub fn configuration_digest(&self) -> Result<[u8; 32], BackendError> {
@@ -192,6 +208,7 @@ impl StartupConfigurationDocument {
             Self::V2(config) => config.configuration_digest(),
             Self::V3(config) => config.configuration_digest(),
             Self::V4(config) => config.configuration_digest(),
+            Self::V5(config) => config.configuration_digest(),
         }
     }
     pub fn search_configuration_digest(&self) -> Result<[u8; 32], BackendError> {
@@ -200,6 +217,7 @@ impl StartupConfigurationDocument {
             Self::V2(config) => config.search_configuration_digest(),
             Self::V3(config) => config.search_configuration_digest(),
             Self::V4(config) => config.search_configuration_digest(),
+            Self::V5(config) => config.search_configuration_digest(),
         }
     }
     pub fn nnuec_conditions_digest(&self) -> Result<Option<[u8; 32]>, BackendError> {
@@ -208,6 +226,7 @@ impl StartupConfigurationDocument {
             Self::V2(config) => config.nnuec_search_conditions_digest(),
             Self::V3(config) => config.nnuec_search_conditions_digest(),
             Self::V4(config) => config.nnuec_search_conditions_digest(),
+            Self::V5(config) => config.nnuec_search_conditions_digest(),
         }
     }
     pub fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
@@ -216,6 +235,7 @@ impl StartupConfigurationDocument {
             Self::V2(config) => config.require_supported_native_capabilities(),
             Self::V3(config) => config.require_supported_native_capabilities(),
             Self::V4(config) => config.require_supported_native_capabilities(),
+            Self::V5(config) => config.require_supported_native_capabilities(),
         }
     }
     /// The historical versions declare the historical own-R policy. /4
@@ -226,6 +246,7 @@ impl StartupConfigurationDocument {
         self.validate()?;
         match self {
             Self::V4(config) => config.own_r_root_tie_policy(),
+            Self::V5(config) => config.own_r_root_tie_policy(),
             Self::V1(_) | Self::V2(_) | Self::V3(_) => Ok(match self.fields().execution {
                 ExecutionConfiguration::OwnResearcher { .. } => {
                     Some(rz_search::cpu::CpuRootTiePolicy::LegacyFirstSearched)
@@ -247,6 +268,7 @@ impl StartupConfigurationDocument {
             Self::V2(config) => config.post_repair_policy(),
             Self::V3(config) => config.post_repair_policy(),
             Self::V4(config) => config.post_repair_policy(),
+            Self::V5(config) => config.post_repair_policy(),
         }
     }
     /// Legacy external declarations carry no explicit query selection. They
@@ -255,6 +277,7 @@ impl StartupConfigurationDocument {
         match self {
             Self::V3(config) => config.external_question_limit(),
             Self::V4(config) => config.external_question_limit(),
+            Self::V5(config) => config.external_question_limit(),
             Self::V1(_) | Self::V2(_) => {
                 self.validate()?;
                 if matches!(
@@ -430,6 +453,48 @@ impl NativeConfiguration {
             output_host_bytes_per_ticket: self.output_host_bytes_per_ticket,
         })
     }
+    /// Explicit /5 system-CUDA configuration; no copied runtime is implied.
+    pub fn onnx_system(
+        &self,
+        device: &RoventDevice,
+        system: &SystemRuntimeSpecV6,
+    ) -> Result<PalsOnnxConfig, BackendError> {
+        system
+            .validate()
+            .map_err(|_| invalid("system CUDA runtime declaration"))?;
+        let RoventDevice::Cuda { ordinal, .. } = device else {
+            return Err(invalid("system CUDA requires an explicit CUDA device"));
+        };
+        if system.platform != SystemPlatformV6::Linux
+            || i32::try_from(*ordinal).ok() != Some(system.cuda_device_id)
+            || self.cuda_arena_bytes != Some(system.cuda_arena_bytes)
+            || self.drain_ms != system.drain_ms
+            || self.loading_profile.is_some()
+        {
+            return Err(invalid(
+                "system CUDA selection differs from registered runtime",
+            ));
+        }
+        let actual = PalsOnnxConfig {
+            provider: Provider::Cuda {
+                device_id: system.cuda_device_id,
+                arena_bytes: usize::try_from(system.cuda_arena_bytes)
+                    .map_err(|_| invalid("system CUDA arena address space"))?,
+            },
+            intra_threads: 1,
+            cache_public_memory: self.cache_public_memory,
+            device_public_memory: self.device_public_memory,
+            cudnn_conv_search: match self.cudnn_conv_search {
+                CuDnnSearch::LegacyImplicitExhaustive => {
+                    PalsCuDnnConvSearch::LegacyImplicitExhaustive
+                }
+                CuDnnSearch::ExperimentalDefault => PalsCuDnnConvSearch::ExperimentalDefault,
+            },
+        };
+        actual.validate_system_execution_selection()?;
+        Ok(actual)
+    }
+
     pub fn onnx(
         &self,
         device: &RoventDevice,
@@ -1018,6 +1083,29 @@ impl ConfigurationFields<'_> {
         search_configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
         nnuec_conditions_digest: impl Fn() -> Result<Option<[u8; 32]>, BackendError>,
     ) -> Result<(), BackendError> {
+        self.admit_shared_with_system(
+            engine,
+            declaration,
+            cleanup_max_ms,
+            None,
+            configuration_digest,
+            search_configuration_digest,
+            nnuec_conditions_digest,
+        )
+    }
+
+    // Keep the existing admission inputs explicit across both runtime profiles.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_shared_with_system(
+        &self,
+        engine: &RoventEngineDeclaration,
+        declaration: &RoventCoordinatorDeclaration,
+        cleanup_max_ms: u64,
+        system: Option<&SystemRuntimeSpecV6>,
+        configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
+        search_configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
+        nnuec_conditions_digest: impl Fn() -> Result<Option<[u8; 32]>, BackendError>,
+    ) -> Result<(), BackendError> {
         if declaration.policy_sha256 != hex(configuration_digest()?)
             || engine.search.search_configuration_sha256 != hex(search_configuration_digest()?)
             || engine.search.registered_max_chess_plies.get() != self.frontier.maximum_goal_plies
@@ -1027,10 +1115,17 @@ impl ConfigurationFields<'_> {
         {
             return Err(invalid("locked startup configuration differs"));
         }
-        self.native.onnx(
-            &engine.pc.device,
-            matches!(engine.pc.device, RoventDevice::Cuda { .. }),
-        )?;
+        match system {
+            Some(spec) => {
+                self.native.onnx_system(&engine.pc.device, spec)?;
+            }
+            None => {
+                self.native.onnx(
+                    &engine.pc.device,
+                    matches!(engine.pc.device, RoventDevice::Cuda { .. }),
+                )?;
+            }
+        }
         match (self.execution, &engine.researcher) {
             (
                 ExecutionConfiguration::RolesOnly {

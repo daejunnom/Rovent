@@ -12,7 +12,8 @@ use crate::rovent_external_launch::{PreparedRoventExternalLaunch, RoventExternal
 use rz_contracts::Digest;
 use rz_eval::error::{BackendError, FailureKind as K};
 use rz_experiments::{
-    ArtifactRef, RoventExternalPurpose, RoventInputLock, RoventInputLockV2, RoventResearcher,
+    ArtifactRef, RoventExternalPurpose, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
+    RoventResearcher,
 };
 use rz_search::cpu_checker::CheckerError;
 use rz_search::external_cpu::{
@@ -66,7 +67,7 @@ pub struct RoventExternalRSourceCustody<L = RoventInputLock> {
     _assets: Vec<(String, PinnedBlob)>,
 }
 
-/// Implementations are restricted by `NativeInputLock` to the exact /1 or /2
+/// Implementations are restricted by `NativeInputLock` to an exact original
 /// lock; no alternate declaration can be substituted for the original owner.
 #[doc(hidden)]
 pub trait ExternalNativeInputLock: NativeInputLock {
@@ -95,6 +96,22 @@ impl ExternalNativeInputLock for RoventInputLockV2 {
         profile_bytes: &[u8],
     ) -> Result<PreparedRoventExternalLaunch, CheckerError> {
         PreparedRoventExternalLaunch::from_lock_v2(
+            self,
+            RoventExternalSlot::Researcher,
+            profile_bytes,
+        )
+    }
+    fn original_wall_time_max_ms(&self) -> u64 {
+        self.manifest.wall_time_max_ms
+    }
+}
+
+impl ExternalNativeInputLock for RoventInputLockV3 {
+    fn prepare_external_r(
+        self: &Arc<Self>,
+        profile_bytes: &[u8],
+    ) -> Result<PreparedRoventExternalLaunch, CheckerError> {
+        PreparedRoventExternalLaunch::from_lock_v3(
             self,
             RoventExternalSlot::Researcher,
             profile_bytes,

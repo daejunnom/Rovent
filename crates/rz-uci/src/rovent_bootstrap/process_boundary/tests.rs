@@ -43,6 +43,33 @@ fn exact_embedded_components_accept_and_unknown_or_changed_bytes_reject() {
 }
 
 #[test]
+fn v3_system_source_is_required_and_not_a_historical_bootstrap_alias() {
+    let mut registered = compiled_process_source_components_v3().unwrap();
+    assert_eq!(
+        registered.get("rovent_system_source_v3"),
+        Some(&hex(
+            super::super::source_inventory_v3::compiled_system_source_digest_v3().unwrap()
+        ))
+    );
+    registered.remove("rovent_bootstrap");
+    verify_component_declaration_v3(&registered, None, false).unwrap();
+    assert!(verify_component_declaration(&registered, None, false).is_err());
+    assert!(registered.contains_key("model_native_v3"));
+    assert!(!registered.contains_key("model_native"));
+    let mut missing = registered.clone();
+    missing.remove("rovent_system_source_v3");
+    assert!(verify_component_declaration_v3(&missing, None, false).is_err());
+    let mut missing_native = registered.clone();
+    missing_native.remove("model_native_v3");
+    assert!(verify_component_declaration_v3(&missing_native, None, false).is_err());
+    let mut legacy_native = registered.clone();
+    legacy_native.insert("model_native".into(), "0".repeat(64));
+    assert!(verify_component_declaration_v3(&legacy_native, None, false).is_err());
+    let mut changed = registered;
+    changed.insert("rovent_system_source_v3".into(), "0".repeat(64));
+    assert!(verify_component_declaration_v3(&changed, None, false).is_err());
+}
+#[test]
 fn own_researcher_sources_are_required_without_requiring_r_for_pc_only() {
     let mut declared = compiled_process_source_components().unwrap();
     for key in ["cpu_search", "cpu_worker", "cpu_credit"] {
@@ -273,6 +300,36 @@ mod linux {
             private_cwd: fixture.root.clone(),
             control,
         }
+    }
+
+    #[test]
+    fn v3_observational_source_status_separates_missing_and_mismatch() {
+        let binary = ArtifactRef {
+            path: "inputs/engine".into(),
+            sha256: "b".repeat(64),
+            bytes: 1,
+            source: "https://example.org/fixture".into(),
+            license: "fixture-only".into(),
+        };
+        let lock = unexecuted_lock(binary);
+        let mut engine = lock.manifest.engine.clone();
+        engine.source_components = compiled_process_source_components_v3().unwrap();
+        let policy = SourceEvidencePolicy::FunctionalWithSourceObservation;
+        let observed = observe_v3_source_evidence(&engine, policy, Digest([3; 32]));
+        assert_eq!(observed.component_status, SourceEvidenceStatus::Verified);
+        assert_eq!(observed.declared_aggregate, Digest([3; 32]));
+        engine.source_components.remove("model_native_v3");
+        assert_eq!(
+            observe_v3_source_evidence(&engine, policy, Digest([3; 32])).component_status,
+            SourceEvidenceStatus::Missing
+        );
+        engine
+            .source_components
+            .insert("model_native_v3".into(), "0".repeat(64));
+        assert_eq!(
+            observe_v3_source_evidence(&engine, policy, Digest([3; 32])).component_status,
+            SourceEvidenceStatus::Mismatch
+        );
     }
 
     // Declaration-only /2 fixture: no observation or live proof is fabricated.
@@ -565,6 +622,7 @@ mod linux {
             },
             input_lock: Digest([1; 32]),
             source_aggregate: Digest([2; 32]),
+            source_evidence_v3: None,
         };
         let original = Arc::new(values());
         let shared = Arc::clone(&original);

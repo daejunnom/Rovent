@@ -12,6 +12,9 @@
 //! filesystem sandbox or an assertion that every transient pathname race can
 //! be observed.
 
+#[cfg(target_os = "linux")]
+pub mod system_cuda;
+
 use crate::pals_adaptive_startup::PinnedPalsStartupV5;
 use cap_std::fs::Dir;
 use rz_eval::{

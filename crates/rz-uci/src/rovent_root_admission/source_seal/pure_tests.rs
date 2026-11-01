@@ -87,6 +87,108 @@ fn input_lock_v2(position: &Position) -> rz_experiments::RoventOriginalInputLock
     rz_experiments::RoventOriginalInputLock::from_v2(Arc::new(lock)).unwrap()
 }
 
+fn input_lock_v3(position: &Position) -> rz_experiments::RoventOriginalInputLock {
+    let base = input_lock_v2(position);
+    let mut wire = serde_json::to_value(&base.v2().unwrap().manifest).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.insert(
+        "domain".into(),
+        json!(rz_experiments::ROVENT_EXECUTION_V3_DOMAIN),
+    );
+    object.insert(
+        "system_runtime_lock".into(),
+        serde_json::to_value(
+            rz_experiments::SystemRuntimeLockV6::new(rz_experiments::NativeRuntimeSourceV6::Cpu)
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    let lock = rz_experiments::RoventExecutionManifestV3::from_json(&wire.to_string())
+        .unwrap()
+        .lock()
+        .unwrap();
+    rz_experiments::RoventOriginalInputLock::from_v3(Arc::new(lock)).unwrap()
+}
+
+#[test]
+fn v3_source_preserves_actual_owner_and_rejects_original_cancel_and_expiry() {
+    let position = Position::startpos();
+    let clock = ProcessClock::new(ProcessEpoch(7511));
+    let ctx = context(&clock, false);
+    let owner = input_lock_v3(&position);
+    let prevalidation = crate::rovent_root_admission::preadmission::validate_go_v3(
+        &position,
+        ctx.original_go.as_deref().unwrap(),
+        owner.v3().unwrap(),
+        RoventRootAdmissionPolicy::DynamicGo,
+        NonZeroU16::new(64).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        prevalidation.startup_lock_digest(),
+        parse_digest(&owner.v3().unwrap().canonical_sha256).unwrap()
+    );
+    let prepare = || {
+        PreparedSourceV3::prepare(
+            &owner,
+            RoventRootAdmissionPolicy::DynamicGo,
+            &position,
+            &ctx,
+            &clock,
+        )
+        .unwrap()
+    };
+
+    let admitted = prepare().try_into_live().unwrap();
+    assert!(admitted.owner().same_original_owner(&owner));
+    assert_eq!(admitted.original_context().authority, ctx.authority);
+    assert!(admitted.root_snapshot().same_state(&position.snapshot()));
+    admitted
+        .allocation_clock()
+        .verify_against(admitted.descriptor(), owner.v3().unwrap())
+        .unwrap();
+
+    let canceled = prepare();
+    ctx.control.cancel();
+    match canceled.into_initial().unwrap() {
+        InitialAdmissionOutcomeV3::StoppedInitial(stopped) => {
+            assert_eq!(stopped.stop_reason(), InitialStopReason::Canceled);
+            assert!(stopped.owner().same_original_owner(&owner));
+        }
+        InitialAdmissionOutcomeV3::Admitted(_) => panic!("canceled /3 source became live"),
+    }
+    let expired = context(&clock, true);
+    match PreparedSourceV3::prepare(
+        &owner,
+        RoventRootAdmissionPolicy::DynamicGo,
+        &position,
+        &expired,
+        &clock,
+    )
+    .unwrap()
+    .into_initial()
+    .unwrap()
+    {
+        InitialAdmissionOutcomeV3::StoppedInitial(stopped) => {
+            assert_eq!(stopped.stop_reason(), InitialStopReason::Deadline)
+        }
+        InitialAdmissionOutcomeV3::Admitted(_) => panic!("expired /3 source became live"),
+    }
+    let old = input_lock_v2(&position);
+    assert_eq!(
+        PreparedSourceV3::prepare(
+            &old,
+            RoventRootAdmissionPolicy::DynamicGo,
+            &position,
+            &ctx,
+            &clock
+        )
+        .unwrap_err()
+        .kind,
+        RoventRootAdmissionFailure::InvalidLock
+    );
+}
+
 #[test]
 fn v2_prepared_source_uses_actual_start_and_preserves_original_owner_without_live_authority() {
     let position = Position::startpos();

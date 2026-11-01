@@ -20,6 +20,7 @@ mod pinned;
 use pinned::NativeInputLock;
 pub mod process_boundary;
 pub mod product;
+pub mod source_inventory_v3;
 pub(crate) mod storage_lifecycle;
 
 pub use pinned::{
@@ -48,11 +49,16 @@ use rz_eval::pals_onnx::virtual_review::{
     PalsVirtualReviewOnnxBackend, VirtualReviewArtifactKind, VirtualReviewExecutionMode,
     VirtualReviewOwnedSources, VirtualReviewProfileDirectory,
 };
-use rz_eval::pals_onnx::{PalsCudaControlPolicy, PalsOnnxConfig, PalsSessionResidency};
+use rz_eval::pals_onnx::{
+    PalsAppliedSessionSettings, PalsCudaControlPolicy, PalsOnnxConfig, PalsSessionResidency,
+};
 use rz_eval::runtime_pin::RuntimeLibraryPin;
+#[cfg(target_os = "linux")]
+use rz_experiments::NativeRuntimeSourceV6;
 use rz_experiments::{
     RoventBackend, RoventCoordinatorDeclaration, RoventDevice, RoventEngineDeclaration,
-    RoventInputLock, RoventInputLockV2, RoventPcConfiguration, RoventPurpose, RoventResearcher,
+    RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventPcConfiguration, RoventPurpose,
+    RoventResearcher, SystemLibraryObservationV6,
 };
 use rz_runtime::contracts::{ContractClock, ContractSystemClock};
 use rz_search::pals::coordinator::RoleFailure;
@@ -295,6 +301,31 @@ pub struct RoventNativeResources {
     pub command_capacity: usize,
 }
 
+/// System CUDA is selected by the retained V3 lock and is loaded on the
+/// native owner thread.  Unlike the legacy input it contains no CUDA bundle or
+/// per-run copy; the host installation remains the runtime owner.
+pub struct RoventSystemNativeResourcesV3 {
+    pub configuration: PalsOnnxConfig,
+    pub drain_limit: Duration,
+    pub tickets: TicketServiceLimits,
+    pub command_capacity: usize,
+}
+
+/// Session setup and actual mapping observations from the original worker.
+/// This is not an inference result or proof of GPU physical completion.
+#[derive(Clone, Debug)]
+pub struct RoventSystemReadyObservationV3 {
+    pub runtime_identity: Digest,
+    pub libraries: Vec<SystemLibraryObservationV6>,
+    /// True only after every actual model session accepted CUDA registration,
+    /// reported the provider available, and completed session construction.
+    /// This does not attest a GPU inference or its physical completion.
+    pub provider_ready: bool,
+    /// Original successful session-builder observations, not requested
+    /// configuration or model execution evidence.
+    pub session_settings: Arc<[PalsAppliedSessionSettings]>,
+}
+
 /// Observations from the original successful constructor, not first Run.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -310,6 +341,9 @@ pub struct RoventNativeStartupSnapshot {
     pub runtime_library: Digest,
     pub runtime_bundle: Option<Digest>,
     pub native_configuration: Digest,
+    /// Populated only by the original V3 system-CUDA factory after sessions
+    /// and mapping checks complete. Physical completion remains separate.
+    pub system_runtime: Option<RoventSystemReadyObservationV3>,
     pub startup_configuration: Digest,
     pub search_configuration: Digest,
     pub validator_loaded: bool,
@@ -654,6 +688,131 @@ fn prepare_native_v2_inner<Q: NativeQuestionProjection>(
     })
 }
 
+/// The original V3 system-CUDA source and its single Ready physical worker.
+/// Collection authority and physical-completion receipts are not implied.
+pub struct PreparedRoventNativeV3<Q: NativeQuestionProjection = AdaptivePortQuestion> {
+    service: RoventNativeService<Q>,
+    snapshot: RoventNativeStartupSnapshot,
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    _verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+    control: RoventStartupControl,
+}
+
+impl<Q: NativeQuestionProjection> PreparedRoventNativeV3<Q> {
+    pub fn snapshot(&self) -> &RoventNativeStartupSnapshot {
+        &self.snapshot
+    }
+    pub fn sources(&self) -> &Arc<RoventPinnedNativeSources<RoventInputLockV3>> {
+        &self.sources
+    }
+    pub(crate) fn startup_control(&self) -> &RoventStartupControl {
+        &self.control
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        RoventNativeService<Q>,
+        RoventNativeStartupSnapshot,
+        Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    ) {
+        (self.service, self.snapshot, self.sources)
+    }
+}
+
+/// Prepare the admitted system-CUDA configuration on one physical worker.
+/// A Ready result is not an inference, GPU fence, or Collection receipt.
+#[cfg(target_os = "linux")]
+pub fn prepare_native_v3<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    resources: RoventSystemNativeResourcesV3,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+) -> Result<PreparedRoventNativeV3<Q>, RoventNativeStartupRejection<Q>> {
+    let admission = || -> Result<(), BackendError> {
+        control.check()?;
+        sources.validate_lock()?;
+        if !sources.admits_original_startup_control(&control)
+            || sources.collection_preload_sources().is_some()
+            || clock.domain().0.0 == 0
+            || control.cleanup_until < control.until
+            || control
+                .cleanup_until
+                .saturating_duration_since(control.until)
+                > Duration::from_millis(sources.lock().cleanup_max_ms())
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                "V3 startup owner or deadline differs",
+            ));
+        }
+        validate_system_native_resources_v3(&sources, &resources)
+    };
+    if let Err(error) = admission() {
+        return Err(RoventNativeStartupRejection {
+            error,
+            native: None,
+        });
+    }
+    let pending_capacity = sources.lock().role_tickets_max() as usize;
+    let limits = resources.tickets;
+    let commands = resources.command_capacity;
+    let factory_sources = Arc::clone(&sources);
+    let factory_clock = clock.clone();
+    let factory_control = control.clone();
+    let diagnostic = NativeStartupDiagnostic::default();
+    let factory_diagnostic = diagnostic.clone();
+    let (native, snapshot) = spawn_native_factory(
+        pending_capacity,
+        limits,
+        commands,
+        clock.clone(),
+        &control,
+        &diagnostic,
+        move || {
+            load_native_system_v3(
+                factory_sources,
+                resources,
+                factory_clock,
+                &factory_control,
+                &factory_diagnostic,
+            )
+        },
+    )?;
+    let ready_clock_matches = native
+        .ready_clock()
+        .is_some_and(|ready| ready.domain() == clock.domain() && ready.origin() == clock.origin());
+    let verifier = match native.native_acceptance_verifier() {
+        Some(verifier)
+            if snapshot.input_lock == sources.lock_digest()
+                && snapshot.process_epoch == clock.domain().0.0
+                && ready_clock_matches
+                && snapshot.model_namespace().is_ok()
+                && snapshot.system_runtime.is_some()
+                && snapshot.physical_workers_created == 1
+                && !snapshot.neural_service_executed =>
+        {
+            verifier
+        }
+        _ => {
+            return Err(rejected_native(
+                fail(
+                    K::IdentityMismatch,
+                    "original V3 Ready service/source differs",
+                ),
+                Some(native),
+                control.cleanup_until,
+            ));
+        }
+    };
+    Ok(PreparedRoventNativeV3 {
+        service: *native,
+        snapshot,
+        sources,
+        _verifier: verifier,
+        control,
+    })
+}
+
 fn spawn_native_owner<Q: NativeQuestionProjection, L: NativeInputLock>(
     sources: Arc<RoventPinnedNativeSources<L>>,
     resources: RoventNativeResources,
@@ -701,21 +860,58 @@ fn spawn_native_owner<Q: NativeQuestionProjection, L: NativeInputLock>(
     let factory_sources = Arc::clone(&sources);
     let factory_control = control.clone();
     let factory_clock = clock.clone();
+    let load_diagnostic = diagnostic.clone();
+    spawn_native_factory(
+        pending_capacity,
+        limits,
+        commands,
+        clock,
+        control,
+        diagnostic,
+        move || {
+            load_native(
+                factory_sources,
+                resources,
+                factory_clock,
+                &factory_control,
+                observer,
+                &load_diagnostic,
+            )
+        },
+    )
+}
+
+/// Shared ticket owner and Ready/drain protocol for retained and system
+/// runtimes. The supplied factory always executes on the physical owner.
+fn spawn_native_factory<Q, F>(
+    pending_capacity: usize,
+    limits: TicketServiceLimits,
+    commands: usize,
+    clock: ContractSystemClock,
+    control: &RoventStartupControl,
+    diagnostic: &NativeStartupDiagnostic,
+    factory: F,
+) -> Result<
+    (Box<RoventNativeService<Q>>, RoventNativeStartupSnapshot),
+    RoventNativeStartupRejection<Q>,
+>
+where
+    Q: NativeQuestionProjection,
+    F: FnOnce() -> Result<
+            (
+                NativeVirtualReviewTicketBackend,
+                RoventNativeStartupSnapshot,
+            ),
+            BackendError,
+        > + Send
+        + 'static,
+{
     let factory_diagnostic = diagnostic.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     let native = TicketedNativeService::spawn_with_capacity(
         move || {
             let loaded =
-                factory_diagnostic.trace(NativeStartupDiagnosticStage::NativeFactory, || {
-                    load_native(
-                        factory_sources,
-                        resources,
-                        factory_clock,
-                        &factory_control,
-                        observer,
-                        &factory_diagnostic,
-                    )
-                });
+                factory_diagnostic.trace(NativeStartupDiagnosticStage::NativeFactory, || factory());
             let observation = loaded
                 .as_ref()
                 .map(|(_, snapshot)| snapshot.clone())
@@ -811,6 +1007,237 @@ fn rejected_native<Q: NativeQuestionProjection>(
     RoventNativeStartupRejection { error, native }
 }
 
+/// Configuration identity for system CUDA, separate from legacy bundle and
+/// control-inventory identity. The registration uses actual observed hashes,
+/// not a built-in digest of a particular CUDA library distribution.
+pub fn system_configuration_digest_v3(
+    configuration: PalsOnnxConfig,
+    runtime_binary: [u8; 32],
+    system_identity: [u8; 32],
+) -> Result<[u8; 32], BackendError> {
+    let common =
+        configuration_digest_from_metadata(configuration, None, runtime_binary, None, None)?;
+    let mut hash = Sha256::new();
+    hash.update(b"rz-rovent-native-system-configuration/1");
+    hash.update(common);
+    hash.update(system_identity);
+    Ok(hash.finalize().into())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_system_native_resources_v3(
+    sources: &RoventPinnedNativeSources<RoventInputLockV3>,
+    resources: &RoventSystemNativeResourcesV3,
+) -> Result<(), BackendError> {
+    let lock = sources.lock();
+    let spec = match &lock.manifest.system_runtime_lock.runtime {
+        NativeRuntimeSourceV6::SystemCuda(spec) => spec,
+        NativeRuntimeSourceV6::Cpu => {
+            return Err(fail(
+                K::IdentityMismatch,
+                "V3 system CUDA cannot select CPU",
+            ));
+        }
+    };
+    let startup = sources.configuration();
+    let pc = &lock.engine().pc;
+    let expected = startup.fields().native.onnx_system(&pc.device, spec)?;
+    let tickets = startup
+        .fields()
+        .native
+        .tickets(startup.fields().review.token_budget)?;
+    let matches_provider = match (expected.provider, resources.configuration.provider) {
+        (
+            Provider::Cuda {
+                device_id: a,
+                arena_bytes: b,
+            },
+            Provider::Cuda {
+                device_id: c,
+                arena_bytes: d,
+            },
+        ) => a == c && b == d,
+        _ => false,
+    };
+    if !matches_provider
+        || expected.intra_threads != resources.configuration.intra_threads
+        || expected.cache_public_memory != resources.configuration.cache_public_memory
+        || expected.device_public_memory != resources.configuration.device_public_memory
+        || expected.cudnn_conv_search != resources.configuration.cudnn_conv_search
+        || startup.fields().native.command_capacity != resources.command_capacity
+        || Duration::from_millis(startup.fields().native.drain_ms) != resources.drain_limit
+        || tickets.review_token_budget != resources.tickets.review_token_budget
+        || tickets.prepared_host_bytes_per_ticket
+            != resources.tickets.prepared_host_bytes_per_ticket
+        || tickets.output_host_bytes_per_ticket != resources.tickets.output_host_bytes_per_ticket
+        || resources.drain_limit.is_zero()
+        || resources.drain_limit > Duration::from_millis(lock.cleanup_max_ms())
+        || resources.configuration.intra_threads != 1
+        || pc.ort_intra_threads != Some(1)
+        || pc.ort_inter_threads != Some(1)
+        || pc.ort_spinning != Some(false)
+        || resources.configuration.device_public_memory
+        || !(1..=8).contains(&resources.command_capacity)
+        || lock.role_tickets_max() > 16
+        || sources.cuda_inventory_digest().is_some()
+    {
+        return Err(fail(
+            K::IdentityMismatch,
+            "V3 system native resources differ from the lock",
+        ));
+    }
+    let core = spec
+        .libraries
+        .iter()
+        .find(|item| item.role == "ort-core")
+        .ok_or_else(|| fail(K::IdentityMismatch, "V3 system ORT core was not registered"))?;
+    let actual = system_configuration_digest_v3(
+        resources.configuration,
+        parse_sha256(&core.sha256)?,
+        parse_sha256(&spec.system_identity_sha256)?,
+    )?;
+    if parse_sha256(&pc.backend_configuration_sha256)? != actual {
+        return Err(fail(
+            K::IdentityMismatch,
+            "V3 system native configuration digest differs",
+        ));
+    }
+    resources
+        .configuration
+        .validate_system_execution_selection()
+}
+
+#[cfg(target_os = "linux")]
+fn load_native_system_v3(
+    sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
+    resources: RoventSystemNativeResourcesV3,
+    clock: ContractSystemClock,
+    control: &RoventStartupControl,
+    diagnostic: &NativeStartupDiagnostic,
+) -> Result<
+    (
+        NativeVirtualReviewTicketBackend,
+        RoventNativeStartupSnapshot,
+    ),
+    BackendError,
+> {
+    control.check()?;
+    sources.validate_lock()?;
+    validate_system_native_resources_v3(&sources, &resources)?;
+    let startup = diagnostic.trace(NativeStartupDiagnosticStage::OrtRuntime, || {
+        sources.load_system_cuda(control)
+    })?;
+    control.check()?;
+    let runtime = startup.runtime();
+    let identity = runtime.cuda_runtime_identity().ok_or_else(|| {
+        fail(
+            K::IdentityMismatch,
+            "system CUDA owner identity unavailable",
+        )
+    })?;
+    let config_digest =
+        system_configuration_digest_v3(resources.configuration, runtime.binary_digest(), identity)?;
+    let backend = diagnostic.trace(NativeStartupDiagnosticStage::ModelSessions, || {
+        PalsVirtualReviewOnnxBackend::load_owned_sources_with_profile(
+            sources.clone() as Arc<dyn VirtualReviewOwnedSources>,
+            &sources.export_digest_text(),
+            runtime,
+            resources.configuration,
+            VirtualReviewExecutionMode::Deployment,
+            VirtualReviewArtifactKind::Fresh,
+            None,
+        )
+    })?;
+    control.check()?;
+    if backend.validator_present()
+        || backend.approximate_warm_capable()
+        || backend.model_epoch() != sources.weights_digest()
+        || backend.rules_input_semantic_digest()
+            != crate::pals_native::virtual_encoding::pals_virtual_rules_semantic_digest()
+    {
+        return Err(fail(K::IdentityMismatch, "loaded V3 P/C namespace differs"));
+    }
+    let session_settings = backend.applied_session_settings();
+    let residency = backend.residency();
+    if session_settings.is_empty()
+        || session_settings.len() != residency.native_sessions
+        || session_settings.len() != residency.graphs.len()
+        || session_settings.iter().any(|session| {
+            let selected_provider = match (session.provider(), resources.configuration.provider) {
+                (
+                    Provider::Cuda {
+                        device_id: actual,
+                        arena_bytes: actual_bytes,
+                    },
+                    Provider::Cuda {
+                        device_id: expected,
+                        arena_bytes: expected_bytes,
+                    },
+                ) => actual == expected && actual_bytes == expected_bytes,
+                _ => false,
+            };
+            !selected_provider
+                || session.cuda_provider_available() != Some(true)
+                || residency
+                    .graphs
+                    .iter()
+                    .filter(|graph| graph.role == session.role())
+                    .count()
+                    != 1
+                || session_settings
+                    .iter()
+                    .filter(|other| other.role() == session.role())
+                    .count()
+                    != 1
+        })
+    {
+        return Err(fail(
+            K::IdentityMismatch,
+            "actual V3 model sessions did not all confirm the selected CUDA provider",
+        ));
+    }
+    let libraries = startup.observe_ready_mappings()?;
+    control.check()?;
+    let snapshot = RoventNativeStartupSnapshot {
+        domain: "rz-rovent-native-system-startup/1",
+        input_lock: sources.lock_digest(),
+        process_epoch: clock.domain().0.0,
+        mode: sources.lock().engine().mode,
+        topology: sources.topology(),
+        weights: Digest(backend.model_epoch()),
+        export_manifest: Digest(backend.manifest_digest()),
+        backend: Digest(backend.backend_digest()),
+        runtime_library: Digest(backend.runtime_binary_digest()),
+        runtime_bundle: None,
+        native_configuration: Digest(config_digest),
+        system_runtime: Some(RoventSystemReadyObservationV3 {
+            runtime_identity: Digest(identity),
+            libraries,
+            provider_ready: true,
+            session_settings,
+        }),
+        startup_configuration: Digest(sources.configuration().configuration_digest()?),
+        search_configuration: Digest(sources.configuration().search_configuration_digest()?),
+        validator_loaded: false,
+        physical_workers_created: 1,
+        session_residency: backend.residency().clone(),
+        neural_service_executed: false,
+    };
+    let backend = NativeVirtualReviewTicketBackend::new_with_collection_observer(
+        backend,
+        clock,
+        resources.drain_limit,
+        None,
+    )
+    .map_err(|_| {
+        fail(
+            K::BackendFailure,
+            "V3 system ticket backend creation failed",
+        )
+    })?;
+    Ok((backend, snapshot))
+}
+
 fn load_native<L: NativeInputLock>(
     sources: Arc<RoventPinnedNativeSources<L>>,
     resources: RoventNativeResources,
@@ -883,6 +1310,7 @@ fn load_native<L: NativeInputLock>(
         runtime_library: Digest(backend.runtime_binary_digest()),
         runtime_bundle: backend.runtime_bundle_digest().map(Digest),
         native_configuration: Digest(config_digest),
+        system_runtime: None,
         startup_configuration: Digest(sources.configuration().configuration_digest()?),
         search_configuration: Digest(sources.configuration().search_configuration_digest()?),
         validator_loaded: backend.validator_present(),

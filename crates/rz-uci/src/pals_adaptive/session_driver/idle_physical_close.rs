@@ -23,6 +23,9 @@ where
             SessionResearcherSource::ProfiledExternalV2(source) => {
                 source.begin_process_finish(until)
             }
+            SessionResearcherSource::ProfiledExternalV3(source) => {
+                source.begin_process_finish(until)
+            }
             SessionResearcherSource::Legacy => {}
         }
         loop {
@@ -60,6 +63,13 @@ where
                     match &mut owners.researcher_source {
                         SessionResearcherSource::Legacy => true,
                         SessionResearcherSource::ProfiledExternal(source) => {
+                            let complete = source
+                                .try_process_finish()
+                                .map_err(SearchSessionFailure::unknown_if_unclosed)?;
+                            owners.external_finished = source.shutdown_receipt();
+                            complete
+                        }
+                        SessionResearcherSource::ProfiledExternalV3(source) => {
                             let complete = source
                                 .try_process_finish()
                                 .map_err(SearchSessionFailure::unknown_if_unclosed)?;

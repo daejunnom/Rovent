@@ -3,7 +3,7 @@
 //! live root cap이나 worker dispatch/completion을 구성하지 못한다.
 use super::*;
 use crate::rovent_root_admission::RoventRootAdmission;
-use crate::rovent_root_admission::source_seal::RoventRootAdmissionV2;
+use crate::rovent_root_admission::source_seal::{RoventRootAdmissionV2, RoventRootAdmissionV3};
 use crate::search_driver::SearchSessionContext;
 use rz_contracts::Deadline;
 use rz_position::BoardMove;
@@ -14,12 +14,14 @@ use std::sync::Arc;
 enum OriginalExternalAdmission {
     V1(Arc<RoventRootAdmission>),
     V2(Arc<RoventRootAdmissionV2>),
+    V3(Arc<RoventRootAdmissionV3>),
 }
 impl OriginalExternalAdmission {
     fn same_owner(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::V1(a), Self::V1(b)) => Arc::ptr_eq(a, b),
             (Self::V2(a), Self::V2(b)) => Arc::ptr_eq(a, b),
+            (Self::V3(a), Self::V3(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -27,42 +29,49 @@ impl OriginalExternalAdmission {
         match self {
             Self::V1(a) => a.startup_lock_digest(),
             Self::V2(a) => a.startup_lock_digest(),
+            Self::V3(a) => a.startup_lock_digest(),
         }
     }
     fn original_context(&self) -> &SearchSessionContext {
         match self {
             Self::V1(a) => a.original_context(),
             Self::V2(a) => a.original_context(),
+            Self::V3(a) => a.original_context(),
         }
     }
     fn runtime_clock(&self) -> &ContractSystemClock {
         match self {
             Self::V1(a) => a.runtime_clock(),
             Self::V2(a) => a.runtime_clock(),
+            Self::V3(a) => a.runtime_clock(),
         }
     }
     fn authority(&self) -> SearchAuthority {
         match self {
             Self::V1(a) => a.authority(),
             Self::V2(a) => a.authority(),
+            Self::V3(a) => a.authority(),
         }
     }
     fn requested_nodes(&self) -> Option<u64> {
         match self {
             Self::V1(a) => a.requested_nodes(),
             Self::V2(a) => a.requested_nodes(),
+            Self::V3(a) => a.requested_nodes(),
         }
     }
     fn hard_deadline(&self) -> Deadline {
         match self {
             Self::V1(a) => a.hard_deadline(),
             Self::V2(a) => a.hard_deadline(),
+            Self::V3(a) => a.hard_deadline(),
         }
     }
     fn allowed_root_moves(&self) -> &[BoardMove] {
         match self {
             Self::V1(a) => a.allowed_root_moves(),
             Self::V2(a) => a.allowed_root_moves(),
+            Self::V3(a) => a.allowed_root_moves(),
         }
     }
     fn budget(&self) -> Result<Digest, CheckerError> {
@@ -72,6 +81,10 @@ impl OriginalExternalAdmission {
                 .descriptor()
                 .root_budget_digest()
                 .map_err(|_| invalid("actual /2 root budget is invalid")),
+            Self::V3(a) => a
+                .descriptor()
+                .root_budget_digest()
+                .map_err(|_| invalid("actual /3 root budget is invalid")),
         }
     }
 }
@@ -92,6 +105,9 @@ impl RoventExternalOwner {
     ) -> Result<(), CheckerError> {
         if self.launch.original_lock_owner_v2().is_some() {
             return Err(invalid("external /2 owner requires a /2 root"));
+        }
+        if self.launch.original_lock_owner_v3().is_some() {
+            return Err(invalid("external /3 owner requires a /3 root"));
         }
         self.admit_original_root(OriginalExternalAdmission::V1(admission))
     }
@@ -114,6 +130,25 @@ impl RoventExternalOwner {
             return Err(invalid("actual /2 root belongs to another lock owner"));
         }
         self.admit_original_root(OriginalExternalAdmission::V2(admission))
+    }
+
+    /// Require the same original /3 lock allocation and live root authority.
+    pub fn admit_actual_root_v3(
+        &mut self,
+        admission: Arc<RoventRootAdmissionV3>,
+    ) -> Result<(), CheckerError> {
+        let original = self
+            .launch
+            .original_lock_owner_v3()
+            .ok_or(invalid("external /3 original lock owner is missing"))?;
+        let root_owner = admission
+            .owner()
+            .v3()
+            .ok_or(invalid("actual /3 root lock owner is missing"))?;
+        if !Arc::ptr_eq(original, root_owner) {
+            return Err(invalid("actual /3 root belongs to another lock owner"));
+        }
+        self.admit_original_root(OriginalExternalAdmission::V3(admission))
     }
 
     fn admit_original_root(
@@ -197,14 +232,21 @@ impl RoventExternalOwner {
     pub fn actual_root_admission(&self) -> Option<&Arc<RoventRootAdmission>> {
         match &self.active_root.as_ref()?.admission {
             OriginalExternalAdmission::V1(admission) => Some(admission),
-            OriginalExternalAdmission::V2(_) => None,
+            OriginalExternalAdmission::V2(_) | OriginalExternalAdmission::V3(_) => None,
         }
     }
 
     pub fn actual_root_admission_v2(&self) -> Option<&Arc<RoventRootAdmissionV2>> {
         match &self.active_root.as_ref()?.admission {
-            OriginalExternalAdmission::V1(_) => None,
+            OriginalExternalAdmission::V1(_) | OriginalExternalAdmission::V3(_) => None,
             OriginalExternalAdmission::V2(admission) => Some(admission),
+        }
+    }
+
+    pub fn actual_root_admission_v3(&self) -> Option<&Arc<RoventRootAdmissionV3>> {
+        match &self.active_root.as_ref()?.admission {
+            OriginalExternalAdmission::V3(admission) => Some(admission),
+            OriginalExternalAdmission::V1(_) | OriginalExternalAdmission::V2(_) => None,
         }
     }
 

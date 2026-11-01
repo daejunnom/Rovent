@@ -13,7 +13,7 @@ use rz_contracts::rovent::ExecutionMode;
 use rz_experiments::{
     ArtifactRef, ExternalSourceV2, ExternalUciEndpointV2, NativeEngineRole,
     ROVENT_EXTERNAL_PROFILE_DOMAIN, RoventEngineDeclaration, RoventExternalProfilePin,
-    RoventExternalPurpose, RoventInputLock, RoventInputLockV2, RoventResearcher,
+    RoventExternalPurpose, RoventInputLock, RoventInputLockV2, RoventInputLockV3, RoventResearcher,
 };
 use rz_search::cpu_checker::{
     CheckerError, CheckerShutdown, ExternalProcessIdentity, ExternalUciIdentity,
@@ -34,7 +34,10 @@ use std::time::Instant;
 
 mod actual_root;
 mod frontier_source;
-pub use frontier_source::{RoventAdmittedExternalRootSource, RoventAdmittedExternalRootSourceV2};
+pub use frontier_source::{
+    RoventAdmittedExternalRootSource, RoventAdmittedExternalRootSourceV2,
+    RoventAdmittedExternalRootSourceV3,
+};
 mod collection_teacher;
 pub use collection_teacher::RoventCollectionTeacherOwner;
 #[cfg(feature = "onnx-cpu")]
@@ -69,6 +72,7 @@ pub struct PreparedRoventExternalLaunch {
     capability_sha256: String,
     input_lock_sha256: Option<String>,
     original_lock_v2: Option<Arc<RoventInputLockV2>>,
+    original_lock_v3: Option<Arc<RoventInputLockV3>>,
     mode: Option<ExecutionMode>,
     root_budget: Option<Digest>,
 }
@@ -166,6 +170,30 @@ impl PreparedRoventExternalLaunch {
         Ok(launch)
     }
 
+    /// Retain the actual /3 system-runtime lock. A digest alone grants no owner.
+    pub fn from_lock_v3(
+        lock: &Arc<RoventInputLockV3>,
+        slot: RoventExternalSlot,
+        profile_bytes: &[u8],
+    ) -> Result<Self, CheckerError> {
+        if slot != RoventExternalSlot::Researcher {
+            return Err(CheckerError::Unsupported(
+                "external /3 teacher ownership is not implemented",
+            ));
+        }
+        lock.validate()
+            .map_err(|_| invalid("invalid Rovent input lock"))?;
+        let mut launch = Self::from_validated_fields(
+            &lock.manifest.engine,
+            &lock.canonical_sha256,
+            &lock.manifest.coordinator.original_root_budget_sha256,
+            slot,
+            profile_bytes,
+        )?;
+        launch.original_lock_v3 = Some(Arc::clone(lock));
+        Ok(launch)
+    }
+
     fn from_validated_fields(
         engine: &RoventEngineDeclaration,
         lock_sha256: &str,
@@ -227,6 +255,7 @@ impl PreparedRoventExternalLaunch {
             binary: pin.binary.clone(),
             input_lock_sha256: None,
             original_lock_v2: None,
+            original_lock_v3: None,
             mode: None,
             root_budget: None,
         })
@@ -239,6 +268,10 @@ impl PreparedRoventExternalLaunch {
     /// not establish a worker, root admission or physical-completion witness.
     pub fn original_lock_owner_v2(&self) -> Option<&Arc<RoventInputLockV2>> {
         self.original_lock_v2.as_ref()
+    }
+    /// Original /3 owner, not evidence of external process startup.
+    pub fn original_lock_owner_v3(&self) -> Option<&Arc<RoventInputLockV3>> {
+        self.original_lock_v3.as_ref()
     }
     pub fn canonical_sha256(&self) -> &str {
         &self.canonical_sha256
@@ -505,6 +538,11 @@ impl RoventExternalOwner {
         &mut self,
         job: ProfiledExternalJob,
     ) -> Result<ProfiledExternalDispatch, CheckerError> {
+        if self.launch.original_lock_v3.is_some() {
+            return Err(CheckerError::Unsupported(
+                "V3 external dispatch and completion require actual-root admission",
+            ));
+        }
         require_v1_legacy_external_access(self.launch.original_lock_v2.is_some())?;
         if self.active_root.is_some() {
             return Err(CheckerError::Unsupported(
@@ -530,6 +568,11 @@ impl RoventExternalOwner {
         completion: &ProfiledExternalCompletion,
         dispatch: &ProfiledExternalDispatch,
     ) -> Result<(), CheckerError> {
+        if self.launch.original_lock_v3.is_some() {
+            return Err(CheckerError::Unsupported(
+                "V3 external dispatch and completion require actual-root admission",
+            ));
+        }
         require_v1_legacy_external_access(self.launch.original_lock_v2.is_some())?;
         if self.active_root.is_some() {
             return Err(CheckerError::Unsupported(
