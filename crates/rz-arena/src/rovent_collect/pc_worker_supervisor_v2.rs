@@ -4,6 +4,7 @@
 //! original secondary bridges, workers and consumer queues together; publishing
 //! a prepared root is not corpus publication or physical completion.
 use super::launch::own_publisher_v2::{OwnPumpConsumerV2, OwnPumpPollV2};
+use super::own_worker_supervisor_v2::run_preparation_loop_v2;
 use super::pc_hooks_lock_v2::{
     PcRootSeparationV2, PcWorkerExitKindV2, PcWorkerStartErrorV2, RoventPcCollectionBridgeV2,
     RoventPcCollectionWorkerV2,
@@ -117,10 +118,10 @@ impl PcWorkerSupervisorV2 {
         let thread = thread::Builder::new()
             .name("rovent-pc-root-supervisor-v2".into())
             .spawn(move || {
-                while !thread_stop.load(Ordering::Acquire) && Instant::now() < worker_deadline {
+                run_preparation_loop_v2(&thread_stop, worker_deadline, || {
                     let mut guard = match thread_state.lock() {
                         Ok(guard) => guard,
-                        Err(_) => break,
+                        Err(_) => return false,
                     };
                     // The same supervisor drains each bounded receiver.  It does
                     // not hold a manager or producer lock while doing so.
@@ -166,12 +167,14 @@ impl PcWorkerSupervisorV2 {
                             guard.error = Some(error);
                         }
                     }
+                    if guard.error.is_some() {
+                        return false;
+                    }
                     if speculative_teacher && !separation_attempted {
                         retry_one_original_route(&mut guard, &router);
                     }
-                    drop(guard);
-                    thread::sleep(Duration::from_millis(2));
-                }
+                    true
+                });
                 // Once the original stop/deadline is reached, stop the secondary
                 // workers and drain only until the already registered cleanup
                 // ceiling. Empty is final only after that same worker joined.

@@ -25,6 +25,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Run only while this supervisor's preparation can still make progress.
+/// Returning false leaves cleanup to the original owner and its deadline.
+pub(super) fn run_preparation_loop_v2(
+    stop: &AtomicBool,
+    deadline: Instant,
+    mut tick: impl FnMut() -> bool,
+) {
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        if !tick() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// These are the actual objects created for a secondary root.  A returned
 /// entry is custody, not a receipt or proof that its rows were published.
 pub(crate) struct OwnSecondarySlotV2 {
@@ -111,10 +126,10 @@ impl OwnWorkerSupervisorV2 {
         let thread = thread::Builder::new()
             .name("rovent-own-root-supervisor-v2".into())
             .spawn(move || {
-                while !thread_stop.load(Ordering::Acquire) && Instant::now() < worker_deadline {
+                run_preparation_loop_v2(&thread_stop, worker_deadline, || {
                     let mut guard = match thread_state.lock() {
                         Ok(guard) => guard,
-                        Err(_) => break,
+                        Err(_) => return false,
                     };
                     // The same supervisor drains each bounded receiver.  It does
                     // not hold a manager or producer lock while doing so.
@@ -157,9 +172,9 @@ impl OwnWorkerSupervisorV2 {
                             guard.error = Some(error);
                         }
                     }
-                    drop(guard);
-                    thread::sleep(Duration::from_millis(2));
-                }
+                    // Keep the original error for the owner's cleanup receipt.
+                    guard.error.is_none()
+                });
                 // Once the original stop/deadline is reached, stop the secondary
                 // workers and drain only until the already registered cleanup
                 // ceiling. Empty is final only after that same worker joined.
@@ -480,5 +495,34 @@ fn supervisor_step(
             state.slots.push(pending);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fatal_preparation_error_exits_without_waiting_for_deadline_or_stopping_another_owner() {
+        let failed_stop = AtomicBool::new(false);
+        let other_stop = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut attempts = 0;
+        let mut original_error = None;
+        run_preparation_loop_v2(&failed_stop, deadline, || {
+            attempts += 1;
+            original_error = Some("secondary worker failed");
+            false
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(original_error, Some("secondary worker failed"));
+        assert!(!other_stop.load(Ordering::Acquire));
+
+        let mut other_attempts = 0;
+        run_preparation_loop_v2(&other_stop, deadline, || {
+            other_attempts += 1;
+            false
+        });
+        assert_eq!(other_attempts, 1);
     }
 }
