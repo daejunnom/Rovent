@@ -302,6 +302,31 @@ class LifecycleTests(unittest.TestCase):
         owner.finish(status="completed", tree_gone=True)
 
     @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_guard_state_separates_previous_failure_from_current_release(self):
+        owner = self.lease("live-guard-state", reserve=8192)
+        owner.prepare_live_handoff()
+        self.assertEqual(owner.live_handoff_observation()["guard_state"], "held")
+        release = owner.guard.release
+        attempts = []
+        def fail_once():
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise OSError("initial release failed")
+            release()
+        with patch.object(owner.guard, "release", side_effect=fail_once):
+            with self.assertRaisesRegex(OSError, "initial release failed"):
+                owner.suspend_live()
+        observation = owner.live_handoff_observation()
+        self.assertEqual(observation["guard_state"], "released")
+        self.assertEqual(observation["guard_release_error"]["type"], "OSError")
+        owner.resume_live()
+        observation = owner.live_handoff_observation()
+        self.assertEqual(observation["guard_state"], "held")
+        self.assertEqual(observation["guard_release_error"]["type"], "OSError")
+        owner.finish(status="completed", tree_gone=True)
+        self.assertEqual(owner.live_finish_observation()["guard_state"], "released")
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
     def test_live_resume_retries_busy_guard_within_original_deadline(self):
         owner = self.lease("live", reserve=8192)
         owner.prepare_live_handoff()

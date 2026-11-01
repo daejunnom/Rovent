@@ -319,6 +319,7 @@ class OutputLease:
         self._live_finish_receipt = None
         self._live_finish_close_error = None
         self._live_descriptor_close_receipt = None
+        self._live_guard_proof = "unknown"
         self._live_guard_release_error = None
         self._live_suspend_error = None
         self._live_resume_error = None
@@ -484,6 +485,7 @@ class OutputLease:
                 "record": copy.deepcopy(self.record),
             }
             self._check_live_handoff()
+            self._live_guard_proof = "held"
             key = object()
             self._live_key = key
             with _live_handoff_guard:
@@ -497,6 +499,7 @@ class OutputLease:
                     del _live_handoffs[self._live_key]
             self._live_key = None
             self._live_anchor = None
+            self._live_guard_proof = "unknown"
             for fd in (output_fd, source_fd):
                 if fd is not None:
                     try:
@@ -564,7 +567,9 @@ class OutputLease:
             self._check_live_handoff()
             self._live_suspended = True
             release_started = True
+            self._live_guard_proof = "unknown"
             self.guard.release()
+            self._live_guard_proof = "released"
         except BaseException as error:
             self._live_suspended = True
             if self._live_suspend_error is None:
@@ -601,7 +606,9 @@ class OutputLease:
             if self.guard.stream is None:
                 while True:
                     try:
+                        self._live_guard_proof = "unknown"
                         self.guard.acquire()
+                        self._live_guard_proof = "held"
                         break
                     except CatalogBusy as busy:
                         remaining = deadline - time.monotonic()
@@ -651,7 +658,12 @@ class OutputLease:
 
     def _release_live_guard_preserving(self, primary):
         try:
+            had_stream = self.guard.stream is not None
+            prior_proof = self._live_guard_proof
+            self._live_guard_proof = "unknown"
             self.guard.release()
+            if had_stream or prior_proof == "released":
+                self._live_guard_proof = "released"
             return True
         except BaseException as release_error:
             if self._live_guard_release_error is None:
@@ -672,6 +684,7 @@ class OutputLease:
             return
         if closed is True:
             self.guard.stream = None
+            self._live_guard_proof = "released"
 
     def recover_live_terminal(self):
         """Finish releasing only this same already-published terminal owner."""
@@ -682,7 +695,9 @@ class OutputLease:
             try:
                 self._normalize_closed_live_guard()
                 if self.guard.stream is None:
+                    self._live_guard_proof = "unknown"
                     self.guard.acquire()
+                    self._live_guard_proof = "held"
                 else:
                     self.guard.assert_held()
                 # Intent is recorded before either the in-memory assignment or
@@ -710,7 +725,9 @@ class OutputLease:
                     self._write()
                     self._check_live_handoff(terminal=True)
                 release_started = True
+                self._live_guard_proof = "unknown"
                 self.guard.release()
+                self._live_guard_proof = "released"
             except BaseException as error:
                 if release_started and self._live_guard_release_error is None:
                     self._live_guard_release_error = error
@@ -737,6 +754,23 @@ class OutputLease:
                     self._live_suspended = False
             return receipt
 
+    def _live_guard_observation(self):
+        """Use only this owner's completed guard operations and open descriptor."""
+        try:
+            stream = self.guard.stream
+            if self._live_guard_proof == "released" and stream is None:
+                return "released"
+            if self._live_guard_proof == "held" and stream is not None and stream.closed is False:
+                self.guard.assert_held()
+                if self._live_anchor is not None:
+                    info = os.fstat(stream.fileno())
+                    if (info.st_dev, info.st_ino) != self._live_anchor["lock_id"]:
+                        return "unknown"
+                return "held"
+        except Exception:
+            pass
+        return "unknown"
+
     def live_finish_observation(self):
         """Observe this original object's finish progress, never physical GPU completion.
 
@@ -753,6 +787,7 @@ class OutputLease:
             else:
                 phase = "unknown"
             return {"phase": phase,
+                    "guard_state": self._live_guard_observation(),
                     "receipt": copy.deepcopy(self._live_finish_receipt),
                     "preterminal_error": _live_error_summary(self._live_preterminal_error),
                     "original_error": _live_error_summary(self._live_terminal_error),
@@ -768,6 +803,7 @@ class OutputLease:
             if self._live_anchor is None:
                 raise StorageError("original live output owner is unavailable")
             return {"state": "suspended" if self._live_suspended else "held",
+                    "guard_state": self._live_guard_observation(),
                     "foreign_accounting": "unknown" if self._live_foreign_error else "observed",
                     "foreign_error": self._live_foreign_error,
                     "resume_deadline_scope": "catalog_lock_wait_only",
@@ -1233,8 +1269,12 @@ class OutputLease:
                                 guard_released = self._release_live_guard_preserving(primary)
                             else:
                                 try:
+                                    if self._live_anchor is not None:
+                                        self._live_guard_proof = "unknown"
                                     self._release_guard(primary)
                                     guard_released = True
+                                    if self._live_anchor is not None:
+                                        self._live_guard_proof = "released"
                                 except BaseException as release_error:
                                     if self._live_anchor is not None and self._live_guard_release_error is None:
                                         self._live_guard_release_error = release_error
