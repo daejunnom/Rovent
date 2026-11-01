@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
 import time
 
 from managed_storage import StorageError, checked, read_record_snapshot, write_record
-from storage_guard import lifetime, owner_proven_dead, reboot_proves_dead
+from storage_guard import CatalogGuard, lifetime, owner_proven_dead, reboot_proves_dead
 
 SCHEMA = "rovezero.cpu-static-packing-reclamation.v1"
 RELATIVE = Path("device-packing/device_public_pack.onnx")
 MAX_GRAPH = 2 * 1024 * 1024
+# Keep a maintenance pass shorter than the producer's two-second catalog retry.
+# This is cooperative: one blocking filesystem call cannot be preempted.
+MAX_CATALOG_HOLD_SECONDS = 0.5
 
 
 def _append_journal(fd, value):
@@ -36,6 +40,7 @@ def _append_journal(fd, value):
 
 def _file_pin(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    primary = None
     try:
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
@@ -53,8 +58,30 @@ def _file_pin(path):
             raise StorageError("CPU graph changed during observation")
         return {"bytes": before.st_size, "sha256": digest.hexdigest(),
                 "identity": [before.st_dev, before.st_ino], "stamp": list(stamp(before))}
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as error:
+            # A close failure after a successful pin is itself a failure; with
+            # an existing read/identity failure it is only secondary evidence.
+            # Never retry: this FD number may already have been closed/reused.
+            if primary is None:
+                raise
+            if hasattr(primary, "add_note"):
+                primary.add_note(
+                    f"file_pin_close_unconfirmed: {type(error).__name__}: {str(error)[:128]}")
+
+
+def _record_warning(result, error):
+    result["warnings"].append(f"{type(error).__name__}: {str(error)[:128]}")
+    # Exception notes normally do not appear in str(error). Surface our
+    # bounded close note separately without replacing the original failure.
+    for note in getattr(error, "__notes__", ()):
+        if isinstance(note, str) and note.startswith("file_pin_close_unconfirmed:"):
+            result["warnings"].append(note[:256])
 
 
 def register_cpu_static_packing_artifact(lease, pin):
@@ -87,10 +114,122 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
     CPU validator's receipt supplies the completion evidence.  This is not a
     general physical-GPU-completion assertion. Any uncertainty is skipped.
     """
-    result = {"removed_files": 0, "removed_bytes": 0, "protected": 0,
+    result = {"removed_files": 0, "removed_bytes": 0, "removed_bytes_scope": "logical_file_size", "protected": 0,
+              "directory_sync_unconfirmed": 0,
               "warnings": [], "output_total_changed": False,
-              "observation_limit": "current-visible-proc-namespace-only; census is not atomic with deletion"}
-    until = time.monotonic() + seconds
+              "observation_limit": "current-visible-proc-namespace-only; active worker mount namespaces and aliases may be unknown; lock hold deadline is cooperative and cannot preempt blocking filesystem I/O"}
+    if (type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0):
+        result["warnings"].append("StorageError: finite positive maintenance deadline required")
+        return result
+    until = time.monotonic() + min(seconds, MAX_CATALOG_HOLD_SECONDS)
+
+    # A suspended direct lease leaves an active row while releasing this same
+    # lock. Hold the original catalog gate throughout source census, final
+    # validation and unlink: no participating producer can register a new
+    # source between the census and deletion.
+    guard = None
+    try:
+        guard = CatalogGuard(checked(Path(catalog)) / "catalog.lock")
+        guard.acquire()
+        _cleanup_registered_cpu_graphs_locked(
+            manager, catalog, until=until, own_lease=own_lease,
+            guard=guard, result=result)
+    except (OSError, StorageError, RuntimeError, ValueError, TypeError) as error:
+        _record_warning(result, error)
+    finally:
+        if guard is not None and guard.stream is not None:
+            try:
+                guard.release()
+            except OSError as error:
+                # Retain prior validation/deletion results and distinguish a
+                # failure to release the original catalog descriptor.
+                result["warnings"].append(
+                    f"catalog_guard_release_unconfirmed: {type(error).__name__}: {str(error)[:128]}")
+    return result
+
+
+def _active_sources(catalog, tick):
+    """Observe active source directories, retaining same-process anchor IDs.
+
+    Historical rows have no persisted source inode. Their present identity is
+    an observation only; do not call it the original producer's source pin.
+    """
+    from managed_outputs import _read, _live_handoff_guard, _live_handoffs
+    result = []
+    entries = list(catalog.iterdir())
+    from managed_outputs import MAX_RUNS
+    if len(entries) > MAX_RUNS + 1:
+        raise StorageError("output catalog entry bound exceeded")
+    for entry in entries:
+        tick()
+        if entry.name == "catalog.lock":
+            continue
+        row = _read(entry)
+        output_raw = row.get("output")
+        if (not isinstance(output_raw, str) or not Path(output_raw).is_absolute()
+                or row.get("state") not in {"active", "retained", "interrupted_retained"}):
+            raise StorageError("output catalog row identity unavailable")
+        output = checked(Path(output_raw))
+        expected_key = hashlib.sha256(os.path.normcase(str(output)).encode()).hexdigest()
+        if row.get("key") != expected_key or entry.name != expected_key + ".json":
+            raise StorageError("output catalog row identity changed")
+        if row.get("state") != "active":
+            continue
+        source_raw = row.get("source")
+        if not isinstance(source_raw, str) or not Path(source_raw).is_absolute():
+            raise StorageError("active source path unavailable")
+        # A malformed or removed source may still have a lexical relationship
+        # to this candidate. Preserve that scope without turning a disjoint
+        # source observation failure into an unrelated producer failure.
+        source = Path(os.path.abspath(source_raw))
+        try:
+            source = checked(source)
+            info = source.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise StorageError("active source is not a directory")
+            observed = (info.st_dev, info.st_ino)
+        except (OSError, StorageError):
+            observed = None
+        original = None
+        with _live_handoff_guard:
+            for owner in _live_handoffs.values():
+                if owner.record == row and owner._live_anchor is not None:
+                    anchor = owner._live_anchor
+                    info = os.fstat(anchor["source_fd"])
+                    original = tuple(anchor["source_id"])
+                    if (info.st_dev, info.st_ino) != original:
+                        raise StorageError("active original source descriptor changed")
+                    break
+        result.append((source, observed, original))
+    return result
+
+
+def _candidate_protected_by_active_source(target, sources):
+    # Check only this candidate's own ancestor chain. No source-tree scan is
+    # permitted here: maintenance remains bounded and independent candidates
+    # can still be reclaimed.
+    if not sources:
+        return False
+    ancestors = set()
+    for path in (target.parent, *target.parent.parents):
+        info = path.stat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise StorageError("candidate ancestor is not a directory")
+        ancestors.add((info.st_dev, info.st_ino))
+    for source, observed, original in sources:
+        if target == source or target.is_relative_to(source) or source.is_relative_to(target):
+            return True
+        if observed in ancestors or original in ancestors:
+            return True
+        # A v1 row and even a same-process source FD do not prove the mount
+        # namespace of every worker or exclude a later bind under that source.
+        # A same-namespace /proc snapshot or differing device cannot supply
+        # that proof. Protect this candidate while such an active row exists.
+        return True
+    return False
+
+
+def _cleanup_registered_cpu_graphs_locked(manager, catalog, *, until, own_lease, guard, result):
 
     def tick():
         if time.monotonic() >= until:
@@ -105,10 +244,13 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
             raise StorageError("completed Linux supervisor required")
         from managed_outputs import _read, identity
         from storage_code_retirement import _process_census
+        guard.assert_held()
+        sources = _active_sources(catalog, tick)
         for entry in catalog.iterdir():
             tick()
             if not entry.name.endswith(".json"):
                 continue
+            unlinked = False
             try:
                 row = _read(entry)
                 output = checked(Path(row["output"]))
@@ -172,6 +314,10 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
                         or asset != {"bytes": mark.get("bytes"), "sha256": mark.get("sha256")}):
                     raise StorageError("CPU static validation evidence missing")
                 target = checked(output / RELATIVE)
+                if _candidate_protected_by_active_source(target, sources):
+                    result["protected"] += 1
+                    result["warnings"].append("active_source_scope_unresolved: candidate retained")
+                    continue
                 pin = _file_pin(target)
                 if pin != {key: mark[key] for key in ("bytes", "sha256", "identity", "stamp")}:
                     raise StorageError("CPU static graph changed")
@@ -209,12 +355,16 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
                     record = {"schema": SCHEMA, "status": "unlink_pending",
                               "relative": RELATIVE.as_posix(), "pin": pin,
                               "physical_gpu_completion_attested": False}
+                    # Do not start a durable retirement transaction once the
+                    # cooperative window has elapsed. Once the journal is
+                    # opened, complete this one transaction without a fresh
+                    # deadline check; an interrupted transaction is preserved.
+                    tick()
                     journal_fd = os.open(".rovezero-cpu-static-packing-retirement.jsonl",
                                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                          0o600, dir_fd=root_fd)
                     _append_journal(journal_fd, record)
                     os.fsync(root_fd)
-                    tick()
                     if (_read(entry) != row or _read(output / ".rovezero-output.json") != row
                             or read_record_snapshot(registration, schema=SCHEMA) != registration_snapshot):
                         raise StorageError("CPU validator output changed after journal")
@@ -229,23 +379,49 @@ def cleanup_registered_cpu_graphs(manager, catalog, *, seconds=2, own_lease=None
                                 named.st_mtime_ns, named.st_ctime_ns] != pin["stamp"]
                             or identity(output) != row["identity"]):
                         raise StorageError("CPU graph path changed after journal")
+                    guard.assert_held()
+                    if _candidate_protected_by_active_source(target, sources):
+                        raise StorageError("CPU graph overlaps an active source")
                     os.unlink(target.name, dir_fd=parent_fd)
-                    os.fsync(parent_fd)
+                    unlinked = True
+                    # The namespace changed at unlink, independently of
+                    # whether the directory durability barrier succeeds.
                     result["removed_files"] += 1
                     result["removed_bytes"] += pin["bytes"]
                     result["output_total_changed"] = True
+                    try:
+                        os.fsync(parent_fd)
+                    except OSError as error:
+                        result["directory_sync_unconfirmed"] += 1
+                        result["warnings"].append(
+                            f"directory_fsync_unconfirmed: {type(error).__name__}: {str(error)[:128]}")
+                        try:
+                            _append_journal(journal_fd, {**record, "status": "unlinked_directory_sync_unconfirmed"})
+                        except (OSError, StorageError) as journal_error:
+                            result["warnings"].append(
+                                f"retirement_journal_unconfirmed: {type(journal_error).__name__}: {str(journal_error)[:128]}")
+                        continue
                     _append_journal(journal_fd, {**record, "status": "unlinked"})
                 finally:
-                    if journal_fd is not None:
-                        os.close(journal_fd)
-                    if parent_fd is not None:
-                        os.close(parent_fd)
-                    os.close(root_fd)
+                    # A failed close must not prevent closing the other actual
+                    # descriptors or replace a primary validation/journal
+                    # failure. Never retry an uncertain close: the descriptor
+                    # number may already have been reused by the OS.
+                    for label, fd in (("journal", journal_fd),
+                                      ("graph_parent", parent_fd),
+                                      ("output_root", root_fd)):
+                        if fd is not None:
+                            try:
+                                os.close(fd)
+                            except OSError as error:
+                                result["warnings"].append(
+                                    f"{label}_close_unconfirmed: {type(error).__name__}: {str(error)[:128]}")
             except (OSError, StorageError, ValueError, KeyError, TypeError) as error:
-                result["protected"] += 1
-                result["warnings"].append(f"{type(error).__name__}: {str(error)[:128]}")
+                if not unlinked:
+                    result["protected"] += 1
+                _record_warning(result, error)
     except (OSError, StorageError, RuntimeError) as error:
-        result["warnings"].append(f"{type(error).__name__}: {str(error)[:128]}")
+        _record_warning(result, error)
     return result
 
 
