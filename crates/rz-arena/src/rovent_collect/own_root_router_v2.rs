@@ -38,6 +38,17 @@ const PREPARING: u8 = 6;
 const PREINSTALL_FAILED: u8 = 7;
 const UNCERTAIN: u8 = 8;
 
+// A slot in preparation, reservation, or uncertain recovery cannot be
+// treated as proof that the original capture was never started.
+fn has_pending_slot(states: &[AtomicU8]) -> bool {
+    states.iter().any(|state| {
+        matches!(
+            state.load(Ordering::Acquire),
+            READY | RESERVING | PREPARING | UNCERTAIN
+        )
+    })
+}
+
 struct PreparationGuard<'a> {
     state: &'a AtomicU8,
     published: bool,
@@ -790,11 +801,7 @@ impl RoventNnuecCollectionHooksV2 for RoventOwnRootRouterV2 {
                 }
             };
         }
-        if self
-            .states
-            .iter()
-            .any(|state| matches!(state.load(Ordering::Acquire), READY | RESERVING | UNCERTAIN))
-        {
+        if has_pending_slot(&self.states) {
             return Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission });
         }
         if self
@@ -992,5 +999,47 @@ impl RoventNnuecCollectionHooksV2 for RoventOwnRootRouterV2 {
     > {
         self.original_slot(admission)?
             .handoff_sender_root(admission)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preparing_slot_stays_pending_until_worker_can_be_reserved() {
+        let states = [AtomicU8::new(EMPTY)];
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let slot = &states[0];
+            scope.spawn(move || {
+                slot.compare_exchange(EMPTY, PREPARING, Ordering::AcqRel, Ordering::Acquire)
+                    .expect("prepare unclaimed slot");
+                let mut guard = PreparationGuard {
+                    state: slot,
+                    published: false,
+                };
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                slot.store(READY, Ordering::Release);
+                guard.published = true;
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                has_pending_slot(&states),
+                "preparation must not defer capture"
+            );
+            finish_tx.send(()).unwrap();
+        });
+        assert!(has_pending_slot(&states));
+        assert_eq!(
+            states[0].compare_exchange(READY, RESERVING, Ordering::AcqRel, Ordering::Acquire),
+            Ok(READY),
+            "published worker remains eligible for the normal reservation path"
+        );
+        assert!(has_pending_slot(&states));
+        states[0].store(INSTALLED, Ordering::Release);
+        assert!(!has_pending_slot(&states));
     }
 }

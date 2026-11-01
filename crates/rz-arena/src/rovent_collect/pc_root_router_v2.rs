@@ -34,6 +34,16 @@ const SLOT_FAILED: u8 = 4;
 const SLOT_UNAVAILABLE_BEFORE_INSTALL: u8 = 5;
 const SLOT_PREPARING: u8 = 6;
 
+// A busy or prepared slot still has authority to attempt installation.
+fn has_pending_slot(states: &[AtomicU8]) -> bool {
+    states.iter().any(|state| {
+        matches!(
+            state.load(Ordering::Acquire),
+            SLOT_READY | SLOT_RESERVED | SLOT_PREPARING
+        )
+    })
+}
+
 struct SlotPreparationGuard<'a> {
     state: &'a AtomicU8,
     published: bool,
@@ -477,12 +487,9 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
         }
         // A first pre-install worker may have ended, leaving no installed
         // predecessor. The original marker path can still explicitly defer
-        // later roots. A concurrently reserved slot is not proof of no-start.
-        if self
-            .states
-            .iter()
-            .any(|state| matches!(state.load(Ordering::Acquire), SLOT_READY | SLOT_RESERVED))
-        {
+        // later roots. A slot being prepared or reserved may still publish
+        // the original worker, so neither state proves that capture is absent.
+        if has_pending_slot(&self.states) {
             return Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission });
         }
         if self
@@ -613,5 +620,57 @@ impl RoventPcCollectionHooksV2 for RoventPcRootRouterV2 {
             }
         };
         self.original_slot(&root)?.return_root_custody(custody)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preparing_slot_stays_pending_until_worker_can_be_reserved() {
+        let states = [AtomicU8::new(SLOT_UNPREPARED)];
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let slot = &states[0];
+            scope.spawn(move || {
+                slot.compare_exchange(
+                    SLOT_UNPREPARED,
+                    SLOT_PREPARING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .expect("prepare unclaimed slot");
+                let mut guard = SlotPreparationGuard {
+                    state: slot,
+                    published: false,
+                };
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                slot.store(SLOT_READY, Ordering::Release);
+                guard.published = true;
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                has_pending_slot(&states),
+                "preparation must not defer capture"
+            );
+            finish_tx.send(()).unwrap();
+        });
+        assert!(has_pending_slot(&states));
+        assert_eq!(
+            states[0].compare_exchange(
+                SLOT_READY,
+                SLOT_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(SLOT_READY),
+            "published worker remains eligible for the normal reservation path"
+        );
+        assert!(has_pending_slot(&states));
+        states[0].store(SLOT_INSTALLED, Ordering::Release);
+        assert!(!has_pending_slot(&states));
     }
 }
