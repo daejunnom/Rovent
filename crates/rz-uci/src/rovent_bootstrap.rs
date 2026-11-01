@@ -1516,10 +1516,9 @@ fn validate_system_native_resources_v3(
         .validate_system_execution_selection()
 }
 
-/// The authenticated, device-bound original supervisor capability has no
-/// provider yet. Reject only this system-CUDA entry point, after source and
-/// runtime-file preflight and before the first native runtime/provider call.
-/// This is an admission error, not a physical-completion observation.
+/// Require a live connection to the original parent immediately before native
+/// system-CUDA entry. This does not prove GPU identity, device exclusivity,
+/// future parent liveness or physical completion.
 #[cfg(target_os = "linux")]
 fn require_system_cuda_supervisor_capability(
     parent: Option<&launch::ConnectedParent>,

@@ -1392,6 +1392,8 @@ fn run_native_with_resources_v3_inner(
     let mut before_control = false;
     let mut controlled_bound = None;
     let result = if custody_control {
+        // Capture before the callback binds or publishes the endpoint.
+        let original_parent_pid = nix::unistd::getppid().as_raw();
         use rz_uci::rovent_bootstrap::launch::{
             BeforeControlV3Outcome, ControlledV3Outcome, ControlledV3Result,
             RoventRetainingLaunchError,
@@ -1472,7 +1474,7 @@ fn run_native_with_resources_v3_inner(
                     if ordinal.is_some() {
                         let stream = original_bound.lock().map_err(|_| RoventLaunchError {
                             stage: "ControlAdmission", detail: "bound control owner poisoned".into(),
-                        })?.accept_parent_until(_startup_until).map_err(|error| RoventLaunchError {
+                        })?.accept_parent_until(_startup_until, original_parent_pid).map_err(|error| RoventLaunchError {
                             stage: "ControlAdmission", detail: error.to_string(),
                         })?;
                         let mut parent = callback_parent_stream.lock().map_err(|_| RoventLaunchError {

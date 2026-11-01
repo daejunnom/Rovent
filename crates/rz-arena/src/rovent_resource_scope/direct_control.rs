@@ -27,6 +27,12 @@ fn invalid(detail: impl std::fmt::Display) -> ArenaError {
     ArenaError::Integrity(format!("direct custody endpoint: {detail}"))
 }
 
+fn is_original_parent_peer(stream: &UnixStream, original_parent_pid: i32) -> io::Result<bool> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let peer = getsockopt(stream, PeerCredentials).map_err(io::Error::other)?;
+    Ok(peer.pid() == original_parent_pid && peer.uid() == nix::unistd::geteuid().as_raw())
+}
+
 /// The exact writer directory, endpoint and listener belong to one run. The
 /// caller stores this before native entry and keeps it while completion is
 /// unknown. Only explicit, proven normal/pre-native closure may call cleanup.
@@ -133,7 +139,11 @@ impl BoundDirectControl {
     /// Accept the original supervisor connection from this already-bound
     /// endpoint. Peer identity and launch values are checked by UCI against
     /// the original lock before this stream can authorize native entry.
-    pub(super) fn accept_parent_until(&self, until: Instant) -> io::Result<UnixStream> {
+    pub(super) fn accept_parent_until(
+        &self,
+        until: Instant,
+        original_parent_pid: i32,
+    ) -> io::Result<UnixStream> {
         let owner = self
             .original
             .lock()
@@ -145,16 +155,33 @@ impl BoundDirectControl {
             .ok_or_else(|| io::Error::other("original listener unavailable"))?;
         listener.set_nonblocking(true)?;
         loop {
-            if Instant::now() >= until {
+            let Some(remaining) = until
+                .checked_duration_since(Instant::now())
+                .filter(|time| !time.is_zero())
+            else {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "parent connection deadline expired",
                 ));
+            };
+            if original_parent_pid <= 0 || nix::unistd::getppid().as_raw() != original_parent_pid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "original parent changed",
+                ));
             }
             match listener.accept() {
-                Ok((stream, _)) => return Ok(stream),
+                Ok((stream, _)) => {
+                    if is_original_parent_peer(&stream, original_parent_pid).unwrap_or(false) {
+                        return Ok(stream);
+                    }
+                    // A competing connection is not the launch owner. Closing
+                    // only that stream preserves the original deadline.
+                    drop(stream);
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
@@ -458,6 +485,14 @@ impl DirectControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_parent_peer_filter_uses_kernel_pid_and_uid() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let this_pid = i32::try_from(std::process::id()).unwrap();
+        assert!(is_original_parent_peer(&a, this_pid).unwrap());
+        assert!(!is_original_parent_peer(&a, -1).unwrap());
+    }
 
     fn serve_when_ready(control: &DirectControl) -> io::Result<()> {
         let until = Instant::now() + Duration::from_secs(2);
