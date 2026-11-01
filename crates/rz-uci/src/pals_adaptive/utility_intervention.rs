@@ -1290,11 +1290,54 @@ fn compare_neutral_targets(
             expected,
             actual,
             reference_matches,
+            reference_difference: neutral_reference_difference(
+                &previous["reference_json"],
+                &current["reference_json"],
+            ),
             model_matches,
         })
     } else {
         Ok(())
     }
+}
+
+// This bounded diagnostic is computed only after a mismatch. It never changes
+// admission, discloses board/move data, or turns an unequal input into a match.
+fn neutral_reference_difference(previous: &Value, current: &Value) -> &'static str {
+    if previous == current {
+        return "identical";
+    }
+    let (Some(previous), Some(current)) = (previous.as_str(), current.as_str()) else {
+        return "unavailable";
+    };
+    if previous.len() > 256 * 1024 || current.len() > 256 * 1024 {
+        return "too_large_for_diagnostic";
+    }
+    let (Ok(previous), Ok(current)) = (
+        serde_json::from_str::<Value>(previous),
+        serde_json::from_str::<Value>(current),
+    ) else {
+        return "unparseable";
+    };
+    if previous["schema"] != current["schema"] {
+        return "schema";
+    }
+    for (key, label) in [
+        ("schema", "base_schema"),
+        ("board_features", "board_features"),
+        ("side_to_move", "side_to_move"),
+        ("context_lines", "context_lines"),
+        ("context_edges", "context_edges"),
+        ("local_line", "local_line"),
+    ] {
+        if previous["base_input"][key] != current["base_input"][key] {
+            return label;
+        }
+    }
+    if previous["target_ids"] != current["target_ids"] {
+        return "target_ids";
+    }
+    "other_or_serialization"
 }
 #[cfg(test)]
 mod tests {
@@ -1309,7 +1352,7 @@ mod tests {
         assert!(
             matches!(compare_neutral_targets(first, &original, other, &changed),
             Err(AdaptiveManagerError::InterventionNeutralMismatch {
-                expected, actual, reference_matches: false, model_matches: true,
+                expected, actual, reference_matches: false, model_matches: true, reference_difference: "unparseable",
             }) if expected == first && actual == other)
         );
         let changed = json!({"reference_json":"original", "model_identity":"other"});
@@ -1321,6 +1364,15 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn neutral_difference_classifies_context_without_exposing_values() {
+        let first = json!({"schema":"test", "base_input":{"context_lines":[1]}}).to_string();
+        let changed = json!({"schema":"test", "base_input":{"context_lines":[2]}}).to_string();
+        assert_eq!(
+            neutral_reference_difference(&json!(first), &json!(changed)),
+            "context_lines"
+        );
     }
     #[test]
     fn utility_requires_a_witness_and_does_not_trade_cost_for_more_discovery() {

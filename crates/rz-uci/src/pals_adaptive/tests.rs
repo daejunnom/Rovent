@@ -1329,6 +1329,7 @@ fn neutral_mismatch_keeps_failure_and_closes_original_admission() {
                 expected,
                 actual,
                 reference_matches: false,
+                reference_difference: "context_lines",
                 model_matches: true,
             },)
             .unwrap()
@@ -1336,7 +1337,7 @@ fn neutral_mismatch_keeps_failure_and_closes_original_admission() {
     assert_ne!(manager.phase(), ManagerPhase::Running);
     assert!(manager.failures().any(|failure| matches!(failure,
         AdaptiveManagerError::InterventionNeutralMismatch {
-            expected: first, actual: second, reference_matches: false, model_matches: true,
+            expected: first, actual: second, reference_matches: false, reference_difference: "context_lines", model_matches: true,
         } if *first == expected && *second == actual)));
     // Drain the original mock owners; never fabricate a physical receipt.
     pump(&mut manager, until, |m| m.phase() == ManagerPhase::Finished);

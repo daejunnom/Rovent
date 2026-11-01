@@ -296,6 +296,7 @@ pub enum AdaptiveManagerError {
         expected: Digest,
         actual: Digest,
         reference_matches: bool,
+        reference_difference: &'static str,
         model_matches: bool,
     },
     Semantic(String),
