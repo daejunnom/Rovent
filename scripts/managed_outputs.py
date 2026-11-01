@@ -7,11 +7,14 @@ review/archival is due, not permission to delete evidence or mapped GPU inputs.
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
+import math
 import os
 from pathlib import Path
 import stat
 import sys
+import threading
 import time
 import uuid
 
@@ -21,6 +24,32 @@ from storage_guard import CatalogGuard, lifetime, reboot_proves_dead
 
 SCHEMA = "rovezero.managed-output.v1"
 MAX_RUNS = 1024
+
+# Holds the actual live lease objects, never a reissued path/PID capability.
+# Entries do not own the catalog guard while suspended and are removed only
+# when that same owner's normal finish completes.
+_live_handoff_guard = threading.Lock()
+_live_handoffs = {}
+
+
+def _live_error_summary(error):
+    if error is None:
+        return None
+    return {"type": type(error).__name__, "message": str(error)[:512],
+            "notes": [str(note)[:512] for note in getattr(error, "__notes__", ())]}
+
+
+def original_live_handoff(key):
+    """Return only a same-process lease for its original opaque key."""
+    with _live_handoff_guard:
+        owner = _live_handoffs.get(key)
+    if owner is None:
+        raise StorageError("original live output owner is unavailable")
+    with owner._live_gate:
+        if (owner._live_anchor is None or owner.record.get("pid") != os.getpid()
+                or owner.record.get("lifetime") != lifetime()):
+            raise StorageError("original live output process differs")
+    return owner
 
 
 class OutputBudgetError(StorageError):
@@ -269,6 +298,18 @@ class OutputLease:
         self._plain_usage_snapshot_ready = False
         self._foreign_estimate_reported = False
         self._last_own_usage = None
+        self._live_anchor = None
+        self._live_suspended = False
+        self._live_key = None
+        self._live_gate = threading.RLock()
+        self._live_foreign_error = None
+        self._live_terminal_intents = []
+        self._live_terminal_error = None
+        self._live_terminal_secondary_error = None
+        self._live_preterminal_error = None
+        self._live_guard_release_error = None
+        self._live_suspend_error = None
+        self._live_resume_error = None
         self.deferred = deferred
         self.quarantine_receipts = None if quarantine_receipts is None else tuple(dict(pin) for pin in quarantine_receipts)
         self.quarantine_transition_receipts = (None if quarantine_transition_receipts is None
@@ -388,6 +429,329 @@ class OutputLease:
                 raise
             if hasattr(primary, "add_note"):
                 primary.add_note("custody output catalog gate release also failed")
+
+    def prepare_live_handoff(self):
+        with self._live_gate:
+            return self._prepare_live_handoff()
+
+    def _prepare_live_handoff(self):
+        """Pin this ordinary Linux lease before dispatching its live child.
+
+        The guard may later be suspended without closing the original output
+        and source descriptors or changing the active catalog row. This is
+        not a process-exit, physical-completion, or deletion authority.
+        Special custody/journal and deferred leases keep their existing rules.
+        """
+        self.guard.assert_held()
+        if (sys.platform != "linux" or self._live_anchor is not None
+                or self.record is None or self.deferred or self.outer is not None
+                or self.quarantine_receipts is not None
+                or self.quarantine_transition_receipts is not None
+                or self._preservation_enabled or self._created_directory is not None):
+            raise StorageError("ordinary acquired Linux output lease required for live handoff")
+        if (self.record.get("state") != "active" or self.record.get("pid") != os.getpid()
+                or self.record.get("lifetime") != lifetime()):
+            raise StorageError("original live lease owner differs")
+        output_fd = source_fd = None
+        try:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            output_fd = os.open(checked(self.output), flags)
+            source_fd = os.open(checked(self.source), flags)
+            output_info, source_info = os.fstat(output_fd), os.fstat(source_fd)
+            if (not stat.S_ISDIR(output_info.st_mode) or not stat.S_ISDIR(source_info.st_mode)
+                    or [output_info.st_dev, output_info.st_ino] != self.record.get("identity")):
+                raise StorageError("original live output or source directory differs")
+            lock_info = os.fstat(self.guard.stream.fileno())
+            catalog_info = self.catalog.stat()
+            self._live_anchor = {
+                "output_fd": output_fd, "source_fd": source_fd,
+                "output_id": (output_info.st_dev, output_info.st_ino),
+                "source_id": (source_info.st_dev, source_info.st_ino),
+                "catalog_id": (catalog_info.st_dev, catalog_info.st_ino),
+                "lock_id": (lock_info.st_dev, lock_info.st_ino),
+                "record": copy.deepcopy(self.record),
+            }
+            self._check_live_handoff()
+            key = object()
+            self._live_key = key
+            with _live_handoff_guard:
+                if any(owner.output == self.output for owner in _live_handoffs.values()):
+                    raise StorageError("original live output is already registered")
+                _live_handoffs[key] = self
+            return key
+        except BaseException as error:
+            with _live_handoff_guard:
+                if self._live_key is not None and _live_handoffs.get(self._live_key) is self:
+                    del _live_handoffs[self._live_key]
+            self._live_key = None
+            self._live_anchor = None
+            for fd in (output_fd, source_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError as close_error:
+                        if hasattr(error, "add_note"):
+                            error.add_note("live handoff descriptor close also failed: " + str(close_error))
+            raise
+
+    def _check_live_handoff(self, *, terminal=False, allow_partial=False):
+        self.guard.assert_held()
+        anchor = self._live_anchor
+        if anchor is None:
+            raise StorageError("original live lease record differs")
+        if terminal:
+            if (self.record.get("state") != "retained" or self.record.get("tree_gone") is not True
+                    or any(self.record.get(key) != value for key, value in anchor["record"].items()
+                           if key != "state") or not self._live_terminal_intents
+                    or self.record != self._live_terminal_intents[-1]):
+                raise StorageError("original live lease terminal record differs")
+            expected = self.record
+        else:
+            if self.record != anchor["record"] or self.record.get("state") != "active":
+                raise StorageError("original live lease record differs")
+            expected = anchor["record"]
+        if (self.record.get("pid") != os.getpid()
+                or self.record.get("lifetime") != lifetime()):
+            raise StorageError("original live lease process differs")
+        lock_info, catalog_info = os.fstat(self.guard.stream.fileno()), self.catalog.stat()
+        if ((lock_info.st_dev, lock_info.st_ino) != anchor["lock_id"]
+                or (catalog_info.st_dev, catalog_info.st_ino) != anchor["catalog_id"]):
+            raise StorageError("original live lease catalog identity differs")
+        for path, key in ((self.output, "output"), (self.source, "source")):
+            opened = os.fstat(anchor[key + "_fd"])
+            named = checked(path).lstat()
+            if (not stat.S_ISDIR(opened.st_mode) or not stat.S_ISDIR(named.st_mode)
+                    or (opened.st_dev, opened.st_ino) != anchor[key + "_id"]
+                    or (named.st_dev, named.st_ino) != anchor[key + "_id"]):
+                raise StorageError("original live lease " + key + " directory differs")
+        row = _read(self.catalog / (self.key + ".json"))
+        marker = _read(self.output / ".rovezero-output.json")
+        if terminal and allow_partial:
+            possible = [(anchor["record"], anchor["record"])]
+            previous = anchor["record"]
+            for intent in self._live_terminal_intents:
+                possible.extend(((previous, intent), (intent, intent)))
+                previous = intent
+            if not any(row == prior and marker == written for prior, written in possible):
+                raise StorageError("original live lease partial terminal publication differs")
+            return row != expected or marker != expected
+        if row != expected or marker != expected:
+            raise StorageError("original live lease row or marker differs")
+        return False
+
+    def suspend_live(self):
+        with self._live_gate:
+            return self._suspend_live()
+
+    def _suspend_live(self):
+        """Release only this live owner's catalog guard; keep its active row."""
+        if self._live_suspended:
+            raise StorageError("original live lease already suspended")
+        release_started = False
+        try:
+            self._check_live_handoff()
+            self._live_suspended = True
+            release_started = True
+            self.guard.release()
+        except BaseException as error:
+            self._live_suspended = True
+            if self._live_suspend_error is None:
+                self._live_suspend_error = error
+            if release_started and self._live_guard_release_error is None:
+                self._live_guard_release_error = error
+            self._release_live_guard_preserving(error)
+            raise
+        finally:
+            self._plain_usage_snapshot_ready = False
+            self._foreign_usage_snapshot = {}
+
+    def _append_live_terminal_intent(self, record):
+        if len(self._live_terminal_intents) >= 2:
+            raise StorageError("original live terminal intent bound exceeded")
+        self._live_terminal_intents.append(copy.deepcopy(record))
+
+    def resume_live(self, *, deadline=None):
+        with self._live_gate:
+            return self._resume_live(deadline=deadline)
+
+    def _resume_live(self, *, deadline=None):
+        """Bound catalog-lock waiting; synchronous revalidation I/O is not preempted."""
+        if not self._live_suspended or self._live_anchor is None:
+            raise StorageError("original live lease is not suspended")
+        if deadline is None:
+            deadline = time.monotonic() + 2.0  # Same finite default as acquire().
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+            raise StorageError("finite monotonic live resume deadline required")
+        try:
+            if time.monotonic() >= deadline:
+                raise CatalogBusy("original live lease resume deadline expired")
+            self._normalize_closed_live_guard()
+            if self.guard.stream is None:
+                while True:
+                    try:
+                        self.guard.acquire()
+                        break
+                    except CatalogBusy as busy:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise CatalogBusy("original live lease resume deadline expired") from busy
+                        time.sleep(min(0.1, remaining))
+            else:
+                # A previous release itself may have failed. Never replace that
+                # original descriptor by blindly acquiring a second guard.
+                self.guard.assert_held()
+            if time.monotonic() >= deadline:
+                raise CatalogBusy("original live lease resume deadline expired")
+            self._check_live_handoff()
+            # Other producers may have registered while suspended. Never use
+            # the old accounting snapshot after releasing the catalog guard.
+            self._plain_usage_snapshot_ready = False
+            self._foreign_usage_snapshot = {}
+            try:
+                rows = self._rows()
+                for _, row, target in rows:
+                    if target != self.output and (type(row.get("reserved_bytes")) is not int
+                                                   or row["reserved_bytes"] < 0):
+                        raise StorageError("foreign reservation accounting is invalid")
+            except (StorageError, OSError, ValueError, KeyError, TypeError) as error:
+                # Only tolerate a failed foreign census after the actual own
+                # row, owner and original FDs are independently rechecked.
+                self._check_live_handoff()
+                self._last_own_usage = tree_size(self.output, allow_disappearing=True)
+                self._foreign_usage_snapshot = {}
+                self._live_foreign_error = (type(error).__name__ + ": " + str(error))[:512]
+                _warn_unrelated_output("live owner resumed; foreign accounting unknown: " + self._live_foreign_error)
+            else:
+                # Own tree I/O failures are not reclassified as foreign.
+                used = self._output_usage(rows, allow_disappearing=True)
+                self._live_foreign_error = None
+                warn_output_threshold(used, self.total_limit, scope="output_live_resume")
+            self._plain_usage_snapshot_ready = True
+            self._live_suspended = False
+        except BaseException as error:
+            self._live_suspended = True
+            if self._live_resume_error is None:
+                self._live_resume_error = error
+            self._plain_usage_snapshot_ready = False
+            self._foreign_usage_snapshot = {}
+            self._release_live_guard_preserving(error)
+            raise
+
+    def _release_live_guard_preserving(self, primary):
+        try:
+            self.guard.release()
+            return True
+        except BaseException as release_error:
+            if self._live_guard_release_error is None:
+                self._live_guard_release_error = release_error
+            self._normalize_closed_live_guard()
+            if hasattr(primary, "add_note"):
+                primary.add_note("live output catalog guard release also failed: " + str(release_error))
+            return False
+
+    def _normalize_closed_live_guard(self):
+        """Forget only an observed-closed descriptor, never an uncertain one."""
+        stream = self.guard.stream
+        if stream is None:
+            return
+        try:
+            closed = stream.closed
+        except BaseException:
+            return
+        if closed is True:
+            self.guard.stream = None
+
+    def recover_live_terminal(self):
+        """Finish releasing only this same already-published terminal owner."""
+        with self._live_gate:
+            if not self._live_suspended or self._live_anchor is None:
+                raise StorageError("original terminal live owner is unavailable")
+            release_started = False
+            try:
+                self._normalize_closed_live_guard()
+                if self.guard.stream is None:
+                    self.guard.acquire()
+                else:
+                    self.guard.assert_held()
+                # Intent is recorded before either the in-memory assignment or
+                # the two durable writes. An interruption between those steps
+                # may leave the prior in-memory value; only our exact original
+                # active record or one of our own bounded intents is eligible.
+                if (not self._live_terminal_intents or
+                        not any(self.record == value for value in
+                                (self._live_anchor["record"], *self._live_terminal_intents))):
+                    raise StorageError("original live terminal intent is unavailable")
+                self.record = copy.deepcopy(self._live_terminal_intents[-1])
+                partial = self._check_live_handoff(terminal=True, allow_partial=True)
+                if partial:
+                    self._write()
+                self._check_live_handoff(terminal=True)
+                own_usage = tree_size(self.output, allow_disappearing=True)
+                if own_usage > self.reserve and self.record.get("status") != "failed_output_budget":
+                    # A delayed recovery must not hide a newly exceeded own
+                    # reservation. Publish the original terminal state first,
+                    # then preserve the normal budget failure as the next intent.
+                    updated = {**self.record, "status": "failed_output_budget",
+                               "budget_error": "managed output byte budget exceeded; evidence retained"}
+                    self._append_live_terminal_intent(updated)
+                    self.record = updated
+                    self._write()
+                    self._check_live_handoff(terminal=True)
+                release_started = True
+                self.guard.release()
+            except BaseException as error:
+                if release_started and self._live_guard_release_error is None:
+                    self._live_guard_release_error = error
+                self._release_live_guard_preserving(error)
+                raise
+            receipt = {"terminal_recovered": True,
+                       "preterminal_error": _live_error_summary(self._live_preterminal_error),
+                       "original_error": _live_error_summary(self._live_terminal_error),
+                       "secondary_error": _live_error_summary(self._live_terminal_secondary_error),
+                       "guard_release_error": _live_error_summary(self._live_guard_release_error),
+                       "status": self.record.get("status"),
+                       "physical_completion": "not_inferred"}
+            try:
+                self._close_live_anchor()
+            finally:
+                if self._live_anchor is None:
+                    self._live_suspended = False
+            return receipt
+
+    def live_handoff_observation(self):
+        """Report accounting uncertainty without asserting GPU completion."""
+        with self._live_gate:
+            if self._live_anchor is None:
+                raise StorageError("original live output owner is unavailable")
+            return {"state": "suspended" if self._live_suspended else "held",
+                    "foreign_accounting": "unknown" if self._live_foreign_error else "observed",
+                    "foreign_error": self._live_foreign_error,
+                    "resume_deadline_scope": "catalog_lock_wait_only",
+                    "terminal_error": _live_error_summary(self._live_terminal_error),
+                    "preterminal_error": _live_error_summary(self._live_preterminal_error),
+                    "terminal_secondary_error": _live_error_summary(self._live_terminal_secondary_error),
+                    "suspend_error": _live_error_summary(self._live_suspend_error),
+                    "resume_error": _live_error_summary(self._live_resume_error),
+                    "guard_release_error": _live_error_summary(self._live_guard_release_error),
+                    "physical_completion": "not_inferred"}
+
+    def _close_live_anchor(self):
+        anchor = self._live_anchor
+        if anchor is not None:
+            first = None
+            for key in ("output_fd", "source_fd"):
+                try:
+                    os.close(anchor[key])
+                except OSError as error:
+                    if first is None:
+                        first = error
+            self._live_anchor = None
+            with _live_handoff_guard:
+                if self._live_key is not None and _live_handoffs.get(self._live_key) is self:
+                    del _live_handoffs[self._live_key]
+            self._live_key = None
+            if first is not None:
+                raise first
 
     def _output_usage(self, rows, *, allow_disappearing=False):
         if self._quarantine_view is not None:
@@ -672,6 +1036,10 @@ class OutputLease:
             pass
 
     def _write(self):
+        with self._live_gate:
+            return self._write_locked()
+
+    def _write_locked(self):
         self.guard.assert_held()
         self._check_created_directory()
         self._check_quarantine_view()
@@ -683,6 +1051,10 @@ class OutputLease:
             self._check_quarantine_view()  # A late error keeps written metadata; no payload permission.
 
     def check_budget(self):
+        with self._live_gate:
+            return self._check_budget_locked()
+
+    def _check_budget_locked(self):
         self.guard.assert_held()
         self._check_created_directory()
         if self.record is None:
@@ -713,25 +1085,52 @@ class OutputLease:
                      if self._quarantine_view is not None else self._last_own_usage)
         if own_usage > self.reserve:
             raise OutputBudgetError("managed output byte budget exceeded; evidence retained")
-        warn_output_threshold(actual, self.total_limit, scope="output_accounted",
+        scope = "output_accounted_lower_bound" if self._live_foreign_error is not None else "output_accounted"
+        warn_output_threshold(actual, self.total_limit, scope=scope,
                               observed_bytes=own_usage)
         self._check_created_directory()
         self._check_quarantine_view()
 
     def finish(self, *, status, tree_gone):
+        with self._live_gate:
+            return self._finish_locked(status=status, tree_gone=tree_gone)
+
+    def _finish_locked(self, *, status, tree_gone):
         # No file cleanup is implied by this method. In particular OS exit is
         # never promoted to a provider's physical completion fence.
+        if self._live_suspended:
+            raise StorageError("resume the original live lease before finishing")
+        if self._live_anchor is not None:
+            if tree_gone is not True:
+                raise StorageError("suspend the live lease while its original process tree remains")
+            # Keep the original descriptors on a failed identity check; the
+            # caller must not replace them with a freshly reopened owner.
+            try:
+                self._check_live_handoff()
+            except BaseException as error:
+                if self._live_preterminal_error is None:
+                    self._live_preterminal_error = error
+                self._live_suspended = True
+                self._release_live_guard_preserving(error)
+                raise
         error = None
+        terminal_verified = False
+        guard_released = False
         try:
             try:
                 self.check_budget()
             except OutputBudgetError as exc:
                 error = exc
-            self.record = {**self.record, "state": "retained" if tree_gone is True else "active",
+                if self._live_anchor is not None and self._live_terminal_error is None:
+                    self._live_terminal_error = exc
+            terminal_record = {**self.record, "state": "retained" if tree_gone is True else "active",
                            "status": "failed_output_budget" if error else str(status), "producer_status": str(status),
                            "tree_gone": tree_gone, "finished_ns": time.time_ns(),
                            "budget_error": str(error) if error else None,
                            "physical_completion": "not_inferred_from_output_lifecycle"}
+            if self._live_anchor is not None:
+                self._append_live_terminal_intent(terminal_record)
+            self.record = terminal_record
             if self.deferred and self._created_directory is None and self.output.exists():
                 self.record["identity"] = identity(self.output)
             self._write()
@@ -739,8 +1138,29 @@ class OutputLease:
                 self.check_budget()  # Terminal metadata itself consumes bytes.
             except OutputBudgetError as late_error:
                 error = late_error
-                self.record.update(status="failed_output_budget", budget_error=str(late_error))
+                if self._live_anchor is not None and self._live_terminal_error is None:
+                    self._live_terminal_error = late_error
+                terminal_record = {**self.record, "status": "failed_output_budget", "budget_error": str(late_error)}
+                if self._live_anchor is not None:
+                    self._append_live_terminal_intent(terminal_record)
+                self.record = terminal_record
                 self._write()
+            if self._live_anchor is not None:
+                # Even when an own output budget error must be returned, the
+                # same owner may have successfully published its terminal row.
+                # Release its registry only after checking that exact result.
+                self._check_live_handoff(terminal=True)
+                terminal_verified = True
+        except BaseException as failure:
+            if self._live_anchor is not None:
+                if self._live_terminal_intents:
+                    if self._live_terminal_error is None:
+                        self._live_terminal_error = failure
+                    elif self._live_terminal_secondary_error is None:
+                        self._live_terminal_secondary_error = failure
+                elif self._live_preterminal_error is None:
+                    self._live_preterminal_error = failure
+            raise
         finally:
             try:
                 self._close_preservation_journal(sys.exc_info()[1] or error)
@@ -751,7 +1171,31 @@ class OutputLease:
                     try:
                         self._close_quarantine_view(sys.exc_info()[1] or error)
                     finally:
-                        self._release_guard(sys.exc_info()[1] or error)
+                        try:
+                            primary = sys.exc_info()[1] or error
+                            if self._live_anchor is not None and primary is not None:
+                                guard_released = self._release_live_guard_preserving(primary)
+                            else:
+                                try:
+                                    self._release_guard(primary)
+                                    guard_released = True
+                                except BaseException as release_error:
+                                    if self._live_anchor is not None and self._live_guard_release_error is None:
+                                        self._live_guard_release_error = release_error
+                                    raise
+                        finally:
+                            if self._live_anchor is not None:
+                                self._live_suspended = True
+        if terminal_verified and guard_released:
+            try:
+                self._close_live_anchor()
+            except BaseException as close_error:
+                if error is None:
+                    raise
+                if hasattr(error, "add_note"):
+                    error.add_note("live output descriptor close also failed: " + str(close_error))
+        if self._live_anchor is None:
+            self._live_suspended = False
         if error:
             raise error
         # Reservation accounting is not physical disk usage. Recheck the

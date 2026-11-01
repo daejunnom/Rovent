@@ -10,13 +10,14 @@ import sys
 import stat
 from types import SimpleNamespace
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from managed_storage import CatalogBusy, ManagedBuild, StorageError, recover_build, tree_size, write_record
-from managed_outputs import (OutputLease, OutputBudgetError, publish_runtime,
+from managed_outputs import (OutputLease, OutputBudgetError, original_live_handoff, publish_runtime,
                              recover_output, sample_output_budget)
 from storage_guard import CatalogGuard, lifetime
 from storage_maintenance import inventory
@@ -118,6 +119,340 @@ class LifecycleTests(unittest.TestCase):
             owner.check_budget()
         marker.write_bytes(original)
         owner.finish(status="closed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_handoff_allows_independent_output_and_refreshes_accounting(self):
+        owner = self.lease("live", reserve=8192)
+        key = owner.prepare_live_handoff()
+        original = copy.deepcopy(owner.record)
+        owner.suspend_live()
+        self.assertIs(original_live_handoff(key), owner)
+        self.assertEqual(owner.record, original)
+        with self.assertRaises(StorageError):
+            owner.finish(status="wrong", tree_gone=True)
+        other = self.lease("independent", reserve=4096)
+        other.finish(status="completed", tree_gone=True)
+        owner.resume_live()
+        self.assertEqual(owner.record, original)
+        self.assertIn(other.key, owner._foreign_usage_snapshot)
+        owner.finish(status="completed", tree_gone=True)
+        self.assertIsNone(owner._live_anchor)
+        with self.assertRaises(StorageError):
+            original_live_handoff(key)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_handoff_rejects_replaced_directory_preserves_original_owner(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        original_id = owner._live_anchor["output_id"]
+        owner.suspend_live()
+        moved = owner.output.with_name("original-live-output")
+        owner.output.rename(moved)
+        owner.output.mkdir()
+        (owner.output / ".rovezero-output.json").write_bytes((moved / ".rovezero-output.json").read_bytes())
+        try:
+            with self.assertRaises(StorageError):
+                owner.resume_live()
+            self.assertTrue(owner._live_suspended)
+            info = os.fstat(owner._live_anchor["output_fd"])
+            self.assertEqual((info.st_dev, info.st_ino), original_id)
+            self.assertIsNone(owner.guard.stream)
+        finally:
+            (owner.output / ".rovezero-output.json").unlink()
+            owner.output.rmdir()
+            moved.rename(owner.output)
+        owner.resume_live()
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_handoff_keeps_independent_foreign_census_failure_unknown(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        owner.suspend_live()
+        broken = self.catalog / "unrelated-broken.json"
+        broken.write_text("not-json", encoding="utf-8")
+        try:
+            owner.resume_live()
+            observation = owner.live_handoff_observation()
+            self.assertEqual(observation["foreign_accounting"], "unknown")
+            self.assertTrue(observation["foreign_error"])
+            self.assertEqual(observation["physical_completion"], "not_inferred")
+            owner.finish(status="completed", tree_gone=True)
+            self.assertTrue(broken.exists())
+        finally:
+            broken.unlink()
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_handoff_recovers_guard_after_interrupted_transitions(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        release = owner.guard.release
+        def interrupted_release():
+            release()
+            raise KeyboardInterrupt("after guard release")
+        with patch.object(owner.guard, "release", side_effect=interrupted_release):
+            with self.assertRaises(KeyboardInterrupt):
+                owner.suspend_live()
+        self.assertTrue(owner._live_suspended)
+        self.assertIsNone(owner.guard.stream)
+        acquire = owner.guard.acquire
+        def interrupted_acquire():
+            acquire()
+            raise KeyboardInterrupt("after guard acquisition")
+        with patch.object(owner.guard, "acquire", side_effect=interrupted_acquire):
+            with self.assertRaises(KeyboardInterrupt):
+                owner.resume_live()
+        self.assertTrue(owner._live_suspended)
+        self.assertIsNone(owner.guard.stream)
+        owner.resume_live()
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_handoff_terminal_budget_error_releases_only_original_owner(self):
+        owner = self.lease("live", reserve=8192)
+        key = owner.prepare_live_handoff()
+        owner.suspend_live()
+        owner.resume_live()
+        (owner.output / "large-output").write_bytes(b"x" * 10000)
+        with self.assertRaises(OutputBudgetError):
+            owner.finish(status="completed", tree_gone=True)
+        with self.assertRaises(StorageError):
+            original_live_handoff(key)
+        self.assertEqual(owner.record["state"], "retained")
+        self.assertEqual(owner.record["status"], "failed_output_budget")
+        self.assertIsNone(owner.guard.stream)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_handoff_terminal_guard_failure_keeps_exact_owner_for_recovery(self):
+        owner = self.lease("live", reserve=8192)
+        key = owner.prepare_live_handoff()
+        with patch.object(owner.guard, "release", side_effect=OSError("guard release failed")):
+            with self.assertRaisesRegex(OSError, "guard release failed"):
+                owner.finish(status="completed", tree_gone=True)
+        self.assertIs(original_live_handoff(key), owner)
+        self.assertEqual(owner.record["state"], "retained")
+        owner.recover_live_terminal()
+        with self.assertRaises(StorageError):
+            original_live_handoff(key)
+        self.assertIsNone(owner.guard.stream)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_terminal_budget_and_guard_errors_both_survive_recovery(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        (owner.output / "large-output").write_bytes(b"x" * 10000)
+        with patch.object(owner.guard, "release", side_effect=OSError("guard release failed")):
+            with self.assertRaises(OutputBudgetError):
+                owner.finish(status="completed", tree_gone=True)
+        receipt = owner.recover_live_terminal()
+        self.assertEqual(receipt["original_error"]["type"], "OutputBudgetError")
+        self.assertEqual(receipt["guard_release_error"]["type"], "OSError")
+        self.assertEqual(receipt["physical_completion"], "not_inferred")
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_suspend_identity_failure_releases_guard_and_preserves_owner(self):
+        owner = self.lease("live", reserve=8192)
+        key = owner.prepare_live_handoff()
+        moved = self.source.with_name("source-original")
+        self.source.rename(moved)
+        self.source.mkdir()
+        try:
+            with self.assertRaisesRegex(StorageError, "source directory differs"):
+                owner.suspend_live()
+            self.assertTrue(owner._live_suspended)
+            self.assertIsNone(owner.guard.stream)
+            self.assertIs(original_live_handoff(key), owner)
+            self.assertEqual(owner.live_handoff_observation()["suspend_error"]["type"], "StorageError")
+            other = self.lease("independent", reserve=4096)
+            other.finish(status="completed", tree_gone=True)
+        finally:
+            self.source.rmdir()
+            moved.rename(self.source)
+        owner.resume_live()
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_suspend_preserves_identity_and_guard_release_failures(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        moved = self.source.with_name("source-original")
+        self.source.rename(moved)
+        self.source.mkdir()
+        try:
+            with patch.object(owner.guard, "release", side_effect=OSError("guard release failed")):
+                with self.assertRaises(StorageError) as caught:
+                    owner.suspend_live()
+            self.assertIn("source directory differs", str(caught.exception))
+            self.assertTrue(any("guard release failed" in note for note in caught.exception.__notes__))
+            self.assertTrue(owner._live_suspended)
+            self.assertIsNotNone(owner.guard.stream)
+            self.assertEqual(owner.live_handoff_observation()["guard_release_error"]["type"], "OSError")
+        finally:
+            self.source.rmdir()
+            moved.rename(self.source)
+        owner.resume_live()
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_resume_retries_busy_guard_within_original_deadline(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        owner.suspend_live()
+        other = self.lease("independent", reserve=4096)
+        def finish_other():
+            time.sleep(0.15)
+            other.finish(status="completed", tree_gone=True)
+        thread = threading.Thread(target=finish_other)
+        thread.start()
+        try:
+            with patch.object(owner.guard, "acquire", wraps=owner.guard.acquire) as acquire:
+                owner.resume_live(deadline=time.monotonic() + 2.0)
+                self.assertGreaterEqual(acquire.call_count, 2)
+        finally:
+            thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive())
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_resume_deadline_preserves_busy_owner_and_original_error(self):
+        owner = self.lease("live", reserve=8192)
+        key = owner.prepare_live_handoff()
+        owner.suspend_live()
+        other = self.lease("independent", reserve=4096)
+        with self.assertRaises(CatalogBusy) as caught:
+            owner.resume_live(deadline=time.monotonic() + 0.03)
+        self.assertIsNotNone(caught.exception.__cause__)
+        self.assertIs(original_live_handoff(key), owner)
+        self.assertTrue(owner._live_suspended)
+        self.assertIsNone(owner.guard.stream)
+        self.assertEqual(owner.live_handoff_observation()["resume_error"]["type"], "CatalogBusy")
+        other.finish(status="completed", tree_gone=True)
+        owner.resume_live(deadline=time.monotonic() + 2.0)
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_terminal_partial_publication_recovers_same_owner(self):
+        for failure_target in ("marker", "catalog"):
+            owner = self.lease("live-" + failure_target, reserve=8192)
+            key = owner.prepare_live_handoff()
+            marker = owner.output / ".rovezero-output.json"
+            catalog = self.catalog / (owner.key + ".json")
+            def fail_write(path, record):
+                if path == (marker if failure_target == "marker" else catalog):
+                    raise OSError("injected " + failure_target + " write failure")
+                return write_record(path, record)
+            with patch("managed_outputs.write_record", side_effect=fail_write):
+                with self.assertRaisesRegex(OSError, "injected .* write failure"):
+                    owner.finish(status="completed", tree_gone=True)
+            self.assertIsNone(owner.guard.stream)
+            self.assertIs(original_live_handoff(key), owner)
+            receipt = owner.recover_live_terminal()
+            self.assertEqual(receipt["original_error"]["type"], "OSError")
+            self.assertIn(failure_target, receipt["original_error"]["message"])
+            self.assertEqual(receipt["physical_completion"], "not_inferred")
+            self.assertEqual(owner.record["state"], "retained")
+            with self.assertRaises(StorageError):
+                original_live_handoff(key)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_terminal_partial_rejects_third_state(self):
+        owner = self.lease("live", reserve=8192)
+        key = owner.prepare_live_handoff()
+        marker = owner.output / ".rovezero-output.json"
+        catalog = self.catalog / (owner.key + ".json")
+        def fail_catalog(path, record):
+            if path == catalog:
+                raise OSError("injected catalog failure")
+            return write_record(path, record)
+        with patch("managed_outputs.write_record", side_effect=fail_catalog):
+            with self.assertRaises(OSError):
+                owner.finish(status="completed", tree_gone=True)
+        third = copy.deepcopy(owner._live_terminal_intents[-1])
+        third["status"] = "unrelated-third-state"
+        write_record(marker, third)
+        with self.assertRaisesRegex(StorageError, "partial terminal publication differs"):
+            owner.recover_live_terminal()
+        self.assertIs(original_live_handoff(key), owner)
+        self.assertIsNone(owner.guard.stream)
+        write_record(marker, owner._live_terminal_intents[-1])
+        owner.recover_live_terminal()
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_terminal_budget_and_publish_errors_both_survive_recovery(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        (owner.output / "large-output").write_bytes(b"x" * 10000)
+        marker = owner.output / ".rovezero-output.json"
+        def fail_marker(path, record):
+            if path == marker:
+                raise OSError("terminal marker write failed")
+            return write_record(path, record)
+        with patch("managed_outputs.write_record", side_effect=fail_marker):
+            with self.assertRaisesRegex(OSError, "terminal marker write failed"):
+                owner.finish(status="completed", tree_gone=True)
+        receipt = owner.recover_live_terminal()
+        self.assertEqual(receipt["original_error"]["type"], "OutputBudgetError")
+        self.assertEqual(receipt["secondary_error"]["type"], "OSError")
+        self.assertEqual(receipt["status"], "failed_output_budget")
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_finish_preterminal_budget_io_error_is_reobservable(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        with patch.object(owner, "check_budget", side_effect=OSError("budget I/O failed")):
+            with self.assertRaisesRegex(OSError, "budget I/O failed"):
+                owner.finish(status="completed", tree_gone=True)
+        observation = owner.live_handoff_observation()
+        self.assertEqual(observation["preterminal_error"]["type"], "OSError")
+        self.assertIn("budget I/O failed", observation["preterminal_error"]["message"])
+        self.assertTrue(owner._live_suspended)
+        self.assertIsNone(owner.guard.stream)
+        self.assertEqual(owner.record["state"], "active")
+        owner.resume_live()
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_finish_preterminal_identity_and_release_errors_are_distinct(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        moved = self.source.with_name("source-original")
+        self.source.rename(moved)
+        self.source.mkdir()
+        try:
+            with patch.object(owner.guard, "release", side_effect=OSError("guard release failed")):
+                with self.assertRaises(StorageError):
+                    owner.finish(status="completed", tree_gone=True)
+            observation = owner.live_handoff_observation()
+            self.assertEqual(observation["preterminal_error"]["type"], "StorageError")
+            self.assertIn("source directory differs", observation["preterminal_error"]["message"])
+            self.assertEqual(observation["guard_release_error"]["type"], "OSError")
+            self.assertTrue(owner._live_suspended)
+        finally:
+            self.source.rmdir()
+            moved.rename(self.source)
+        owner.resume_live()
+        owner.finish(status="completed", tree_gone=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "live owner FD handoff requires Linux")
+    def test_live_guard_close_error_after_closed_can_reacquire_original(self):
+        owner = self.lease("live", reserve=8192)
+        owner.prepare_live_handoff()
+        original_stream = owner.guard.stream
+        def close_then_fail():
+            original_stream.close()
+            raise OSError("close failed after descriptor closed")
+        with patch.object(owner.guard, "release", side_effect=close_then_fail):
+            with self.assertRaisesRegex(OSError, "close failed after descriptor closed"):
+                owner.suspend_live()
+        self.assertTrue(original_stream.closed)
+        self.assertIsNone(owner.guard.stream)
+        self.assertTrue(owner._live_suspended)
+        observation = owner.live_handoff_observation()
+        self.assertEqual(observation["suspend_error"]["type"], "OSError")
+        self.assertEqual(observation["guard_release_error"]["type"], "OSError")
+        owner.resume_live()
+        self.assertIsNot(owner.guard.stream, original_stream)
+        owner.finish(status="completed", tree_gone=True)
 
     def test_live_and_interrupted_output_owner_never_stolen(self):
         owner = self.lease()
