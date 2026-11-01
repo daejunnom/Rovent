@@ -666,22 +666,32 @@ def pairing_matches(manifest, linux, roots, *, now=None):
 
 
 def _scan_roots_match_handles(result, roots):
-    """Bind each scanned root's observed identity to its current Win32 handle."""
+    """Bind visited roots to handles; account explicitly for unvisited roots.
+
+    An unvisited root contributes zero to the scanner's lower bound.  It is
+    not evidence of complete coverage; the caller separately verifies every
+    configured root and the VHD through ``pairing_matches``.
+    """
     try:
         if not isinstance(result, dict):
             return False
         rows = result.get('roots')
-        if not isinstance(rows, list) or len(rows) != len(roots) or not roots:
+        unvisited = result.get('unvisited_roots')
+        if (not isinstance(rows, list) or not rows or not roots
+                or not isinstance(unvisited, list)):
             return False
         expected = {_normalize_windows_path(root): root for root in roots}
         if len(expected) != len(roots):
             return False
         observed = set()
+        allocated = logical = 0
         for row in rows:
             if (not isinstance(row, dict) or not isinstance(row.get('root'), str)
                     or row.get('identity_unchanged') is not True
                     or type(row.get('scan_device')) is not int
-                    or type(row.get('scan_inode')) is not int):
+                    or type(row.get('scan_inode')) is not int
+                    or any(type(row.get(k)) is not int or row[k] < 0
+                           for k in ('allocated_bytes', 'logical_bytes'))):
                 return False
             key = _normalize_windows_path(row['root'])
             if key not in expected or key in observed:
@@ -690,7 +700,20 @@ def _scan_roots_match_handles(result, roots):
             if (identity['volume_serial'], identity['file_index']) != (row['scan_device'], row['scan_inode']):
                 return False
             observed.add(key)
-        return observed == set(expected)
+            allocated += row['allocated_bytes']
+            logical += row['logical_bytes']
+        for root in unvisited:
+            if not isinstance(root, str):
+                return False
+            key = _normalize_windows_path(root)
+            if key not in expected or key in observed:
+                return False
+            observed.add(key)
+        return (observed == set(expected)
+                and type(result.get('allocated_bytes_lower_bound')) is int
+                and type(result.get('logical_bytes_lower_bound')) is int
+                and allocated == result['allocated_bytes_lower_bound']
+                and logical == result['logical_bytes_lower_bound'])
     except (OSError, ValueError, KeyError, TypeError):
         return False
 

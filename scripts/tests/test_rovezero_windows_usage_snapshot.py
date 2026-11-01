@@ -84,6 +84,36 @@ class CombinedTests(unittest.TestCase):
         self.assertEqual((result['allocated_bytes_lower_bound'], result['decision'], result['coverage']),
                          (20 * usage.GIB, 'exceeded', 'partial'))
 
+    def test_unvisited_registered_roots_contribute_zero_only_with_matching_proofs(self):
+        visited = Path('fixture') / 'visited'
+        unvisited = Path('fixture') / 'unvisited'
+        roots = [visited, unvisited]
+        row = {'root': str(visited), 'identity_unchanged': True,
+               'scan_device': 11, 'scan_inode': 22,
+               'allocated_bytes': 10, 'logical_bytes': 12, 'partial': True}
+        result = {'roots': [row], 'unvisited_roots': [str(unvisited)],
+                  'allocated_bytes_lower_bound': 10, 'logical_bytes_lower_bound': 12}
+        identity = {'volume_serial': 11, 'file_index': 22}
+        with mock.patch.object(usage, '_identity_nofollow', return_value=identity):
+            self.assertTrue(usage._scan_roots_match_handles(result, roots))
+            invalid = [
+                dict(result, unvisited_roots=[]),
+                dict(result, unvisited_roots=[str(unvisited), str(unvisited)]),
+                dict(result, unvisited_roots=[str(visited), str(unvisited)]),
+                dict(result, unvisited_roots=[str(Path('fixture') / 'unknown')]),
+                dict(result, roots=[row, row]),
+                dict(result, roots=[dict(row, identity_unchanged=False)]),
+                dict(result, roots=[dict(row, scan_inode=23)]),
+                dict(result, allocated_bytes_lower_bound=11),
+                dict(result, logical_bytes_lower_bound=13),
+                dict(result, roots=[]),
+            ]
+            for candidate in invalid:
+                with self.subTest(candidate=candidate):
+                    self.assertFalse(usage._scan_roots_match_handles(candidate, roots))
+        with mock.patch.object(usage, '_identity_nofollow', side_effect=OSError('unavailable')):
+            self.assertFalse(usage._scan_roots_match_handles(result, roots))
+
     def test_fresh_combined_file_rechecks_component_ages_at_consumption(self):
         original = usage.combine(sample(usage.WINDOWS_SCHEMA, 10, observed=1400),
                                  sample(usage.LINUX_SCHEMA, 9, observed=1000),
