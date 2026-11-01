@@ -82,8 +82,17 @@ pub struct PalsNormalizedPairReceiptV5 {
 /// continues to own its process/input/physical quarantine scope; this DTO is
 /// only a diagnostic projection. A missing stored receipt stays unknown.
 #[derive(Clone, Debug, Serialize)]
+pub struct PalsFailedExecutionPolicyIdentityV1 {
+    pub domain: String,
+    pub base_v5_launch_sha256: String,
+    pub execution_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct PalsNormalizedFailedPairReceiptV5 {
     pub domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_policy: Option<PalsFailedExecutionPolicyIdentityV1>,
     pub normalized: PalsRunReceiptV5,
     pub original_cause: String,
     pub raw_native_receipt: Option<crate::NativePairReceipt<PalsAdaptiveSessionAuditV5>>,
@@ -140,6 +149,25 @@ fn failure_parts(
             failure.process(),
             false,
         )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn failed_execution_policy_identity(
+    policy: PalsOwnedStoragePolicy,
+    base_sha: &str,
+    execution_sha: Option<&str>,
+) -> Result<Option<PalsFailedExecutionPolicyIdentityV1>, ArenaError> {
+    match (policy, execution_sha) {
+        (PalsOwnedStoragePolicy::StrictV5, None) => Ok(None),
+        (PalsOwnedStoragePolicy::AdvisoryV1, Some(execution_sha)) => Ok(Some(
+            PalsFailedExecutionPolicyIdentityV1 {
+                domain: "rz-pals-failure-storage-advisory-v1/1".into(),
+                base_v5_launch_sha256: base_sha.into(),
+                execution_sha256: execution_sha.into(),
+            },
+        )),
+        _ => Err(invalid("failure storage policy identity mismatch")),
     }
 }
 
@@ -364,7 +392,9 @@ pub fn build_pals_failed_run_receipt_v5(
     }
     receipt.validate_against(lock)?;
     Ok(PalsNormalizedFailedPairReceiptV5 {
-        domain:match owner.spec.storage_policy { PalsOwnedStoragePolicy::StrictV5 => "rz-pals-normalized-pair-failure-v5/1", PalsOwnedStoragePolicy::AdvisoryV1 => "rz-pals-normalized-pair-failure-storage-advisory-v1/1" }.into(), normalized:receipt,
+        domain:match owner.spec.storage_policy { PalsOwnedStoragePolicy::StrictV5 => "rz-pals-normalized-pair-failure-v5/1", PalsOwnedStoragePolicy::AdvisoryV1 => "rz-pals-normalized-pair-failure-storage-advisory-v1/1" }.into(),
+        execution_policy: failed_execution_policy_identity(owner.spec.storage_policy, &owner.spec.sha256,
+            owner.spec.execution_sha256.as_deref())?, normalized:receipt,
         original_cause:cause.to_string(),raw_native_receipt:native.cloned(),native_receipt_proof:proof,
         supervisor_process:process.map(|p|PalsObservedV3::Observed { value:p.receipt.clone(),method:"passive observation of original retained supervisor output; no cleanup operation performed".into() }).unwrap_or(PalsObservedV3::Unknown),
         observed_run_time_ms:elapsed,observed_cleanup_time_ms:cleanup,artifacts:artifacts.into_values().collect(),
@@ -1055,6 +1085,43 @@ pub fn build_pals_run_receipt_v5(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failure_without_source_or_native_receipt_keeps_advisory_identity() {
+        let base = "a".repeat(64);
+        let execution = "b".repeat(64);
+        let pending = PalsRunReceiptV5 {
+            schema_version: 5, domain: PALS_RECEIPT_V5_DOMAIN.into(), run_id: "fixture".into(),
+            lock_sha256: "c".repeat(64), source_verification: PalsObservedV3::Unknown,
+            wall_time_ms: 0, cleanup_time_ms: 0, output_bytes: PalsObservedV3::Unknown,
+            training_executed: false, training: PalsObservedV3::Unknown, accepted: false,
+            performance_eligible: false, strength_eligible: false, full_gc_requested: false,
+            memory_contention: false, failures: BTreeSet::new(), endpoints: Vec::new(), games: Vec::new(),
+        };
+        let mut wrapper = PalsNormalizedFailedPairReceiptV5 {
+            domain: "rz-pals-normalized-pair-failure-v5/1".into(),
+            execution_policy: failed_execution_policy_identity(PalsOwnedStoragePolicy::StrictV5, &base, None).unwrap(),
+            normalized: pending, original_cause: "fixture admission failure".into(), raw_native_receipt: None,
+            native_receipt_proof: PalsObservedV3::Unknown, supervisor_process: PalsObservedV3::Unknown,
+            observed_run_time_ms: PalsObservedV3::Unknown, observed_cleanup_time_ms: PalsObservedV3::Unknown,
+            artifacts: Vec::new(), original_owner_not_consumed: true, physical_disposition: "no child".into(),
+            normalization_notes: Vec::new(), persistence_not_permitted_reason: None, training_executed: false,
+        };
+        let strict = serde_json::to_value(&wrapper).unwrap();
+        assert!(strict.get("execution_policy").is_none());
+        wrapper.domain = "rz-pals-normalized-pair-failure-storage-advisory-v1/1".into();
+        wrapper.execution_policy = failed_execution_policy_identity(
+            PalsOwnedStoragePolicy::AdvisoryV1, &base, Some(&execution),
+        ).unwrap();
+        let advisory = serde_json::to_value(&wrapper).unwrap();
+        assert_eq!(advisory["execution_policy"]["domain"], "rz-pals-failure-storage-advisory-v1/1");
+        assert_eq!(advisory["execution_policy"]["base_v5_launch_sha256"], base);
+        assert_eq!(advisory["execution_policy"]["execution_sha256"], execution);
+        assert!(wrapper.raw_native_receipt.is_none() && wrapper.artifacts.is_empty());
+        assert!(failed_execution_policy_identity(PalsOwnedStoragePolicy::AdvisoryV1, &base, None).is_err());
+        assert!(failed_execution_policy_identity(PalsOwnedStoragePolicy::StrictV5, &base, Some(&execution)).is_err());
+    }
+
     #[test]
     fn peak_merge_preserves_unknown_and_distinguishes_sum() {
         assert_eq!(
