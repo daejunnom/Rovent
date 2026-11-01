@@ -25,6 +25,10 @@ def run_group(argv, cwd, env, timeout, admission_check):
             now = time.monotonic()
             if now >= next_check:
                 admission_check()
+                # A full custody observation may itself exceed the sampling
+                # interval. Schedule from completion to avoid a scan hot loop,
+                # and count its elapsed time toward the original deadline.
+                now = time.monotonic()
                 next_check = now + 5
             if now - started > timeout:
                 requested_exit = 124
@@ -227,6 +231,7 @@ def _run_windows(argv, cwd, env, timeout, admission_check):
                 now = time.monotonic()
                 if now >= next_check:
                     admission_check()
+                    now = time.monotonic()
                     next_check = now + 5
                 if now - started > timeout:
                     requested_exit = 124

@@ -912,6 +912,41 @@ class StorageTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "waitid"), "POSIX supervisor")
+    def test_slow_admission_uses_completion_time_for_sampling_and_timeout(self):
+        # Simulate a costly scan without spending seconds or starting a real child.
+        for timeout, expected_calls, expected_code in ((30, 2, 125), (1, 1, 124)):
+            with self.subTest(timeout=timeout):
+                clock = [0.0]
+                calls = []
+                child = SimpleNamespace(pid=12345, wait=lambda: 0)
+
+                def advance(seconds):
+                    clock[0] += seconds
+
+                def admission():
+                    calls.append(clock[0])
+                    if len(calls) == 2:
+                        raise StorageError("stop after second sample")
+                    advance(6)
+
+                with patch("managed_process.subprocess.Popen", return_value=child), \
+                     patch("managed_process.os.waitid", return_value=None), \
+                     patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+                     patch("managed_process.os.scandir", return_value=[]), \
+                     patch("managed_process.time.monotonic", side_effect=lambda: clock[0]), \
+                     patch("managed_process.time.sleep", side_effect=advance):
+                    code, gone, failure = run_group(["fake"], Path.cwd(), {}, timeout, admission)
+                self.assertEqual(code, expected_code)
+                self.assertTrue(gone)
+                self.assertEqual(len(calls), expected_calls)
+                if expected_calls == 2:
+                    self.assertGreaterEqual(calls[1] - calls[0], 11)
+                    self.assertEqual(failure, "stop after second sample")
+                else:
+                    self.assertEqual(clock[0], 6)
+                    self.assertIsNone(failure)
+
     @unittest.skipUnless(os.name == "nt", "Windows CreateProcessW start boundary")
     def test_invalid_windows_executable_is_definitely_not_started(self):
         with tempfile.TemporaryDirectory(prefix="rovezero-invalid-process-") as directory:
