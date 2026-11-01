@@ -1041,6 +1041,41 @@ fn idle_archive_worker_keeps_actual_pc_projection_and_restores_original_relation
             .protected_consumptions(),
         2
     );
+    // The restored records and the next root share the same semantic owner.
+    // Isolate the public-record guard before asking the normal acceptance
+    // path to consume the very same prepared question.  Changing this one
+    // limit is a diagnostic boundary check, not a claim about a production
+    // run whose original Capacity source was not recorded.
+    let mut port = registered_port(*owner, original.clone(), next);
+    let input = port.next_role().unwrap().expect("restored root question");
+    assert_ne!(input.question.context.purpose, RoleQueryPurpose::ValueFresh);
+    assert!(input.question.repair.is_none());
+    let (accepted, output) = accepted(&mut port, &input, 99);
+    let physical = evidence(&port, &input, 99);
+    let previous_limit = port.owner.config.max_records;
+    let records_before = port.owner.records().to_vec();
+    let node_count_before = port.owner.semantic.nodes.len();
+    let pins_before = port.owner.stores().review_pin_count().unwrap();
+    port.owner.config.max_records = records_before.len();
+    assert!(matches!(
+        port.consume_once(&input, &accepted, &output, Some(physical)),
+        Err(PalsError::Capacity)
+    ));
+    assert_eq!(port.owner.semantic.nodes.len(), node_count_before);
+    assert_eq!(port.owner.stores().review_pin_count().unwrap(), pins_before);
+    assert!(input.view.validates(port.owner.stores()));
+    assert_eq!(
+        port.owner.records().iter().map(record_identity).collect::<Vec<_>>(),
+        records_before.iter().map(record_identity).collect::<Vec<_>>()
+    );
+    assert!(original_owner.matches(port.owner.stores()));
+    port.owner.config.max_records = previous_limit;
+    port.consume_accepted(&input, &accepted, &output, Some(physical))
+        .unwrap();
+    drop(input);
+    port.revoke();
+    let _ = port.take_repair_report();
+    let owner = Box::new(port.into_owner());
     let idle = owner
         .into_idle_archive()
         .unwrap_or_else(|_| panic!("restored idle"));
