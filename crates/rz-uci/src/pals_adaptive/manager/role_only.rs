@@ -821,8 +821,13 @@ where
     /// Read-only logical admission accounting; this does not count completed
     /// native evaluations or grant authority to submit new work.
     pub fn role_call_budget_usage(&self) -> (u64, u64) {
-        (self.registry.cumulative_observation().admitted,
-         self.bindings.iter().filter(|binding| binding.ticket.is_none()).count() as u64)
+        (
+            self.registry.cumulative_observation().admitted,
+            self.bindings
+                .iter()
+                .filter(|binding| binding.ticket.is_none())
+                .count() as u64,
+        )
     }
     pub fn role_call_limit(&self) -> u64 {
         self.registration.role_call_limit
@@ -924,24 +929,41 @@ where
         &self,
         admission: &RoventCollectionRootAdmissionV2,
     ) -> Result<super::collection::RoventNoCaptureRootCapabilityV2, AdaptiveManagerError> {
-        if self.collection.is_some() || self.collection_admission.is_some()
-            || self.has_collection_v2() || self.phase != ManagerPhase::Running
+        if self.collection.is_some()
+            || self.collection_admission.is_some()
+            || self.has_collection_v2()
+            || self.phase != ManagerPhase::Running
             || self.registry.cumulative_observation().admitted != 0
-            || !self.bindings.is_empty() || self.pending_input.is_some()
+            || !self.bindings.is_empty()
+            || self.pending_input.is_some()
             || admission.root_admission().authority() != self.registration.authority
             || admission.root_admission().hard_deadline() != self.deadline
             || admission.root_budget() != self.registration.root_budget
-            || admission.native_origin().sources().lock().manifest.engine.mode != self.registration.mode
+            || admission
+                .native_origin()
+                .sources()
+                .lock()
+                .manifest
+                .engine
+                .mode
+                != self.registration.mode
         {
-            return Err(AdaptiveManagerError::Invalid("P/C no-capture root scope or admission order"));
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C no-capture root scope or admission order",
+            ));
         }
         self.driver.validate_collection_admission_v2(admission)?;
-        let verifier = self.native.native_acceptance_verifier().ok_or(
-            AdaptiveManagerError::Invalid("P/C no-capture native verifier unavailable"),
-        )?;
+        let verifier =
+            self.native
+                .native_acceptance_verifier()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "P/C no-capture native verifier unavailable",
+                ))?;
         super::collection::RoventNoCaptureRootCapabilityV2::new(admission.clone(), verifier)
             .map_err(|error| match error {
-                super::collection::RoventNoCaptureIssueErrorV2::Busy(_) => AdaptiveManagerError::AuxiliaryPending,
+                super::collection::RoventNoCaptureIssueErrorV2::Busy(_) => {
+                    AdaptiveManagerError::AuxiliaryPending
+                }
                 super::collection::RoventNoCaptureIssueErrorV2::Rejected(error) => error.into(),
             })
     }

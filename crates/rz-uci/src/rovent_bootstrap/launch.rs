@@ -57,11 +57,11 @@ const MAX_SELECTION_BYTES: u64 = 64 << 10;
 mod cohort_prepare;
 mod collection;
 mod collection_v2_observer;
-#[cfg(feature = "native-validation-diagnostics")]
-mod selected_view_observation;
 #[cfg(test)]
 mod collection_v2_tests;
 mod evidence;
+#[cfg(feature = "native-validation-diagnostics")]
+mod selected_view_observation;
 pub mod storage;
 mod v2_external;
 mod v2_rejections;

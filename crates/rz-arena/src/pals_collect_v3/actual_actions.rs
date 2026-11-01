@@ -445,7 +445,9 @@ impl ActualGenerationActionOutcomeFactoryV3 {
         &mut self,
         until: Instant,
     ) -> Result<Option<Vec<AdaptiveSessionProcessReceipt>>, ArenaError> {
-        let Some(owner) = self.context.as_ref() else { return Ok(None); };
+        let Some(owner) = self.context.as_ref() else {
+            return Ok(None);
+        };
         let original_bound = until.min(owner.original_deadline);
         self.close_owned(original_bound).map(Some)
     }

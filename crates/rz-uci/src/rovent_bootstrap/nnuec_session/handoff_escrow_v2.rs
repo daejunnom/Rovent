@@ -5,8 +5,8 @@
 //! with their original owners and must be checked by the outer consumer.
 
 use super::{RoventCollectionRootAdmissionV2, RoventNnuecCollectionHandoffV2};
-use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 /// Process-local maximum, not a limit on games or searches. Full capacity can
 /// be reported separately from NN execution by the caller.
@@ -27,9 +27,11 @@ struct Registry {
 
 fn registry() -> &'static Mutex<Registry> {
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Registry {
-        slots: std::array::from_fn(|_| None),
-    }))
+    REGISTRY.get_or_init(|| {
+        Mutex::new(Registry {
+            slots: std::array::from_fn(|_| None),
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,16 +80,19 @@ fn lock_registry() -> Result<std::sync::MutexGuard<'static, Registry>, HandoffEs
 }
 
 fn entry_is_original(registry: &Registry, key: &HandoffEscrowKeyV2) -> bool {
-    registry.slots.get(key.index).and_then(Option::as_ref)
+    registry
+        .slots
+        .get(key.index)
+        .and_then(Option::as_ref)
         .is_some_and(|entry| Arc::ptr_eq(entry, &key.entry))
 }
 
 impl HandoffEscrowReservationV2 {
     /// Reserve before ownership may need recovery. A full or busy registry
     /// neither starts a worker nor changes the original admission.
-    pub fn try_reserve(admission: &RoventCollectionRootAdmissionV2)
-        -> Result<Self, HandoffEscrowErrorV2>
-    {
+    pub fn try_reserve(
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<Self, HandoffEscrowErrorV2> {
         let entry = Arc::new(Entry {
             admission: admission.clone(),
             original: Mutex::new(None),
@@ -95,26 +100,42 @@ impl HandoffEscrowReservationV2 {
             session_detached: AtomicBool::new(false),
         });
         let mut guard = lock_registry()?;
-        if guard.slots.iter().flatten().any(|existing| {
-            existing.admission.same_original_admission(admission)
-        }) {
+        if guard
+            .slots
+            .iter()
+            .flatten()
+            .any(|existing| existing.admission.same_original_admission(admission))
+        {
             return Err(HandoffEscrowErrorV2::DuplicateAdmission);
         }
-        let index = guard.slots.iter().position(Option::is_none)
+        let index = guard
+            .slots
+            .iter()
+            .position(Option::is_none)
             .ok_or(HandoffEscrowErrorV2::Capacity)?;
         guard.slots[index] = Some(Arc::clone(&entry));
-        Ok(Self { key: HandoffEscrowKeyV2 { index, entry } })
+        Ok(Self {
+            key: HandoffEscrowKeyV2 { index, entry },
+        })
     }
 
-    pub fn key(&self) -> HandoffEscrowKeyV2 { self.key.clone() }
+    pub fn key(&self) -> HandoffEscrowKeyV2 {
+        self.key.clone()
+    }
 
     /// Install exactly the supplied original. Failure returns that original;
     /// this check does not imply a native fence or worker termination.
-    pub fn try_install(&self, original: OriginalHandoff)
-        -> Result<(), (HandoffEscrowErrorV2, OriginalHandoff)>
-    {
-        let same_admission = original.try_lock()
-            .map(|handoff| handoff.admission.same_original_admission(&self.key.entry.admission))
+    pub fn try_install(
+        &self,
+        original: OriginalHandoff,
+    ) -> Result<(), (HandoffEscrowErrorV2, OriginalHandoff)> {
+        let same_admission = original
+            .try_lock()
+            .map(|handoff| {
+                handoff
+                    .admission
+                    .same_original_admission(&self.key.entry.admission)
+            })
             .map_err(|error| match error {
                 TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
                 TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
@@ -123,7 +144,9 @@ impl HandoffEscrowReservationV2 {
             Ok(same) => same,
             Err(error) => return Err((error, original)),
         };
-        if !same_admission { return Err((HandoffEscrowErrorV2::DifferentAdmission, original)); }
+        if !same_admission {
+            return Err((HandoffEscrowErrorV2::DifferentAdmission, original));
+        }
         let registry = match lock_registry() {
             Ok(registry) => registry,
             Err(error) => return Err((error, original)),
@@ -134,9 +157,13 @@ impl HandoffEscrowReservationV2 {
         let mut slot = match self.key.entry.original.try_lock() {
             Ok(slot) => slot,
             Err(TryLockError::WouldBlock) => return Err((HandoffEscrowErrorV2::Busy, original)),
-            Err(TryLockError::Poisoned(_)) => return Err((HandoffEscrowErrorV2::Poisoned, original)),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err((HandoffEscrowErrorV2::Poisoned, original));
+            }
         };
-        if slot.is_some() { return Err((HandoffEscrowErrorV2::AlreadyInstalled, original)); }
+        if slot.is_some() {
+            return Err((HandoffEscrowErrorV2::AlreadyInstalled, original));
+        }
         *slot = Some(original);
         Ok(())
     }
@@ -149,7 +176,12 @@ impl HandoffEscrowReservationV2 {
 }
 
 impl Drop for HandoffEscrowReservationV2 {
-    fn drop(&mut self) { self.key.entry.session_detached.store(true, Ordering::Release); }
+    fn drop(&mut self) {
+        self.key
+            .entry
+            .session_detached
+            .store(true, Ordering::Release);
+    }
 }
 
 impl HandoffEscrowKeyV2 {
@@ -170,16 +202,25 @@ impl HandoffEscrowKeyV2 {
                 matched = Some((index, Arc::clone(entry)));
             }
         }
-        let Some((index, entry)) = matched else { return Ok(None) };
+        let Some((index, entry)) = matched else {
+            return Ok(None);
+        };
         let slot = entry.original.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
             TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
         })?;
-        let Some(original) = slot.as_ref() else { return Ok(None) };
-        entry.leased.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        let Some(original) = slot.as_ref() else {
+            return Ok(None);
+        };
+        entry
+            .leased
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| HandoffEscrowErrorV2::AlreadyLeased)?;
         Ok(Some(HandoffEscrowLeaseV2 {
-            key: HandoffEscrowKeyV2 { index, entry: Arc::clone(&entry) },
+            key: HandoffEscrowKeyV2 {
+                index,
+                entry: Arc::clone(&entry),
+            },
             original: Arc::clone(original),
             armed: true,
         }))
@@ -199,14 +240,20 @@ impl HandoffEscrowKeyV2 {
 
     fn try_cancel_empty_inner(&self, detached_required: bool) -> Result<(), HandoffEscrowErrorV2> {
         let mut registry = lock_registry()?;
-        if !entry_is_original(&registry, self) { return Err(HandoffEscrowErrorV2::Stale); }
+        if !entry_is_original(&registry, self) {
+            return Err(HandoffEscrowErrorV2::Stale);
+        }
         if detached_required && !self.entry.session_detached.load(Ordering::Acquire) {
             return Err(HandoffEscrowErrorV2::LiveReservation);
         }
-        let slot = self.entry.original.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
-            TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
-        })?;
+        let slot = self
+            .entry
+            .original
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
+                TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
+            })?;
         if slot.is_some() || self.entry.leased.load(Ordering::Acquire) {
             return Err(HandoffEscrowErrorV2::NotEmpty);
         }
@@ -217,52 +264,92 @@ impl HandoffEscrowKeyV2 {
     /// and require matching admission and handoff before leasing.
     pub fn try_recoverable_keys() -> Result<Vec<Self>, HandoffEscrowErrorV2> {
         let registry = lock_registry()?;
-        Ok(registry.slots.iter().enumerate().filter_map(|(index, slot)|
-            slot.as_ref().map(|entry| Self { index, entry: Arc::clone(entry) })
-        ).collect())
+        Ok(registry
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().map(|entry| Self {
+                    index,
+                    entry: Arc::clone(entry),
+                })
+            })
+            .collect())
     }
 
-    pub fn session_detached(&self) -> bool { self.entry.session_detached.load(Ordering::Acquire) }
+    pub fn session_detached(&self) -> bool {
+        self.entry.session_detached.load(Ordering::Acquire)
+    }
 
     /// Recover the same registered original by its opaque key after an owner
     /// was dropped. This grants custody only, not authority or completion.
     pub fn try_recover_lease(&self) -> Result<HandoffEscrowLeaseV2, HandoffEscrowErrorV2> {
         let registry = lock_registry()?;
-        if !entry_is_original(&registry, self) { return Err(HandoffEscrowErrorV2::Stale); }
-        let slot = self.entry.original.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
-            TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
-        })?;
+        if !entry_is_original(&registry, self) {
+            return Err(HandoffEscrowErrorV2::Stale);
+        }
+        let slot = self
+            .entry
+            .original
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
+                TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
+            })?;
         let held = slot.as_ref().ok_or(HandoffEscrowErrorV2::MissingHandoff)?;
-        self.entry.leased.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        self.entry
+            .leased
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| HandoffEscrowErrorV2::AlreadyLeased)?;
-        Ok(HandoffEscrowLeaseV2 { key: self.clone(), original: Arc::clone(held), armed: true })
+        Ok(HandoffEscrowLeaseV2 {
+            key: self.clone(),
+            original: Arc::clone(held),
+            armed: true,
+        })
     }
 
     /// Both the source admission and original Arc must match. The registry
     /// keeps the same Arc throughout the lease and after an abandoned lease.
-    pub fn try_lease(&self, admission: &RoventCollectionRootAdmissionV2, original: &OriginalHandoff)
-        -> Result<HandoffEscrowLeaseV2, HandoffEscrowErrorV2>
-    {
+    pub fn try_lease(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+        original: &OriginalHandoff,
+    ) -> Result<HandoffEscrowLeaseV2, HandoffEscrowErrorV2> {
         if !self.entry.admission.same_original_admission(admission) {
             return Err(HandoffEscrowErrorV2::DifferentAdmission);
         }
         let registry = lock_registry()?;
-        if !entry_is_original(&registry, self) { return Err(HandoffEscrowErrorV2::Stale); }
-        let slot = self.entry.original.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
-            TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
-        })?;
+        if !entry_is_original(&registry, self) {
+            return Err(HandoffEscrowErrorV2::Stale);
+        }
+        let slot = self
+            .entry
+            .original
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => HandoffEscrowErrorV2::Busy,
+                TryLockError::Poisoned(_) => HandoffEscrowErrorV2::Poisoned,
+            })?;
         let held = slot.as_ref().ok_or(HandoffEscrowErrorV2::MissingHandoff)?;
-        if !Arc::ptr_eq(held, original) { return Err(HandoffEscrowErrorV2::DifferentHandoff); }
-        self.entry.leased.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        if !Arc::ptr_eq(held, original) {
+            return Err(HandoffEscrowErrorV2::DifferentHandoff);
+        }
+        self.entry
+            .leased
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| HandoffEscrowErrorV2::AlreadyLeased)?;
-        Ok(HandoffEscrowLeaseV2 { key: self.clone(), original: Arc::clone(held), armed: true })
+        Ok(HandoffEscrowLeaseV2 {
+            key: self.clone(),
+            original: Arc::clone(held),
+            armed: true,
+        })
     }
 }
 
 impl HandoffEscrowLeaseV2 {
-    pub fn original(&self) -> &OriginalHandoff { &self.original }
+    pub fn original(&self) -> &OriginalHandoff {
+        &self.original
+    }
 
     /// Release this escrow's ownership only after the outer owner has taken
     /// responsibility for the original handoff and its dependent evidence.
@@ -270,9 +357,11 @@ impl HandoffEscrowLeaseV2 {
     /// completion; those remain the Arena owner's separate responsibility.
     /// On error the identical lease is returned and the registry keeps the
     /// original, so lock contention is retryable without losing custody.
-    pub fn try_release_custody(mut self, admission: &RoventCollectionRootAdmissionV2, outer_original: &OriginalHandoff)
-        -> Result<(), (HandoffEscrowErrorV2, Self)>
-    {
+    pub fn try_release_custody(
+        mut self,
+        admission: &RoventCollectionRootAdmissionV2,
+        outer_original: &OriginalHandoff,
+    ) -> Result<(), (HandoffEscrowErrorV2, Self)> {
         if !self.key.entry.admission.same_original_admission(admission) {
             return Err((HandoffEscrowErrorV2::DifferentAdmission, self));
         }
@@ -294,7 +383,10 @@ impl HandoffEscrowLeaseV2 {
             Err(TryLockError::WouldBlock) => return Err((HandoffEscrowErrorV2::Busy, self)),
             Err(TryLockError::Poisoned(_)) => return Err((HandoffEscrowErrorV2::Poisoned, self)),
         };
-        if !slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &self.original)) {
+        if !slot
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, &self.original))
+        {
             return Err((HandoffEscrowErrorV2::DifferentHandoff, self));
         }
         slot.take();
@@ -307,6 +399,8 @@ impl HandoffEscrowLeaseV2 {
 
 impl Drop for HandoffEscrowLeaseV2 {
     fn drop(&mut self) {
-        if self.armed { self.key.entry.leased.store(false, Ordering::Release); }
+        if self.armed {
+            self.key.entry.leased.store(false, Ordering::Release);
+        }
     }
 }

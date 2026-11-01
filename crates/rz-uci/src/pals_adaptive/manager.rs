@@ -273,10 +273,14 @@ fn semantic_stage_preserves_original_cause_and_typed_failures() {
         .at_semantic_stage("retire_role.commit_role");
     assert!(matches!(nested, AdaptiveManagerError::Semantic(cause)
         if cause == "retire_role.commit_role: driver.commit_role.materialize: PALS: Role(InvalidOutput)"));
-    assert!(matches!(AdaptiveManagerError::PhysicalUnknown.at_semantic_stage("deliver_roles"),
-        AdaptiveManagerError::PhysicalUnknown));
-    assert!(matches!(AdaptiveManagerError::AdmissionClosed.at_semantic_stage("schedule"),
-        AdaptiveManagerError::AdmissionClosed));
+    assert!(matches!(
+        AdaptiveManagerError::PhysicalUnknown.at_semantic_stage("deliver_roles"),
+        AdaptiveManagerError::PhysicalUnknown
+    ));
+    assert!(matches!(
+        AdaptiveManagerError::AdmissionClosed.at_semantic_stage("schedule"),
+        AdaptiveManagerError::AdmissionClosed
+    ));
 }
 impl From<CoordinatorError> for AdaptiveManagerError {
     fn from(error: CoordinatorError) -> Self {
@@ -961,7 +965,10 @@ pub trait AdaptiveSearchDriver<Q> {
     /// its acceptance and consumption paths. This does not establish that the
     /// separately owned teacher started, finished, or physically retired.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-    fn collection_v2_observation_complete(&self, _admission: &RoventCollectionRootAdmissionV2) -> bool {
+    fn collection_v2_observation_complete(
+        &self,
+        _admission: &RoventCollectionRootAdmissionV2,
+    ) -> bool {
         false
     }
     fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
@@ -2997,23 +3004,35 @@ where
         &self,
         admission: &RoventCollectionRootAdmissionV2,
     ) -> Result<collection::RoventNoCaptureRootCapabilityV2, AdaptiveManagerError> {
-        if self.root_started || !self.roles.is_empty() || self.phase != ManagerPhase::Running
-            || self.collection_observer_v2.is_some() || self.collection_admission_v2.is_some()
-            || self.collection_observer.is_some() || self.collection_admission.is_some()
+        if self.root_started
+            || !self.roles.is_empty()
+            || self.phase != ManagerPhase::Running
+            || self.collection_observer_v2.is_some()
+            || self.collection_admission_v2.is_some()
+            || self.collection_observer.is_some()
+            || self.collection_admission.is_some()
             || admission.root_admission().authority() != self.registration.authority
             || admission.root_admission().hard_deadline() != self.deadline
             || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
         {
-            return Err(AdaptiveManagerError::Invalid("no-capture root scope or admission order"));
+            return Err(AdaptiveManagerError::Invalid(
+                "no-capture root scope or admission order",
+            ));
         }
-        let verifier = self.native.native_acceptance_verifier().ok_or(
-            AdaptiveManagerError::Invalid("no-capture native verifier unavailable"),
-        )?;
-        collection::RoventNoCaptureRootCapabilityV2::new(admission.clone(), verifier)
-            .map_err(|error| match error {
-                collection::RoventNoCaptureIssueErrorV2::Busy(_original) => AdaptiveManagerError::AuxiliaryPending,
+        let verifier =
+            self.native
+                .native_acceptance_verifier()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "no-capture native verifier unavailable",
+                ))?;
+        collection::RoventNoCaptureRootCapabilityV2::new(admission.clone(), verifier).map_err(
+            |error| match error {
+                collection::RoventNoCaptureIssueErrorV2::Busy(_original) => {
+                    AdaptiveManagerError::AuxiliaryPending
+                }
                 collection::RoventNoCaptureIssueErrorV2::Rejected(error) => error.into(),
-            })
+            },
+        )
     }
 
     /// Install an observation-only V2 owner at the actual attached root.
@@ -5152,7 +5171,8 @@ where
                         &ticket,
                         output.proposer_ranking_output(),
                         physical,
-                    ).map_err(|error| error.at_semantic_stage("retire_role.goal_local"))?;
+                    )
+                    .map_err(|error| error.at_semantic_stage("retire_role.goal_local"))?;
                 } else if purpose == RolePurpose::Reciprocal {
                     let work = work.ok_or(AdaptiveManagerError::Invalid(
                         "reciprocal role lost its exact child frame",
@@ -5163,7 +5183,8 @@ where
                         &ticket,
                         output.proposer_ranking_output(),
                         physical,
-                    ).map_err(|error| error.at_semantic_stage("retire_role.reciprocal"))?;
+                    )
+                    .map_err(|error| error.at_semantic_stage("retire_role.reciprocal"))?;
                 } else if let Some(work) = work {
                     if purpose == RolePurpose::RoventFresh {
                         let accepted = self.roles[index].reciprocal_acceptance.as_ref().ok_or(
@@ -5171,22 +5192,25 @@ where
                                 "Fresh endpoint lost original retired native proof",
                             ),
                         )?;
-                        self.driver.rovent_fresh_accepted(
-                            &work,
-                            accepted,
-                            output.proposer_ranking_output(),
-                            physical,
-                            self.clock.domain(),
-                            self.check_running()?,
-                        ).map_err(|error| error.at_semantic_stage("retire_role.fresh_accepted"))?;
+                        self.driver
+                            .rovent_fresh_accepted(
+                                &work,
+                                accepted,
+                                output.proposer_ranking_output(),
+                                physical,
+                                self.clock.domain(),
+                                self.check_running()?,
+                            )
+                            .map_err(|error| {
+                                error.at_semantic_stage("retire_role.fresh_accepted")
+                            })?;
                     }
-                    let committed = self.driver.commit_role(
-                        &work,
-                        &ticket,
-                        output.proposer_ranking_output(),
-                        physical,
-                    ).map_err(|error| error.at_semantic_stage("retire_role.commit_role"))?;
-                    self.driver.role_consumed(&ticket, &input.view)
+                    let committed = self
+                        .driver
+                        .commit_role(&work, &ticket, output.proposer_ranking_output(), physical)
+                        .map_err(|error| error.at_semantic_stage("retire_role.commit_role"))?;
+                    self.driver
+                        .role_consumed(&ticket, &input.view)
                         .map_err(|error| error.at_semantic_stage("retire_role.role_consumed"))?;
                     if purpose != RolePurpose::RoventFresh
                         && !(purpose == RolePurpose::Refinement
@@ -5431,7 +5455,9 @@ where
                         if let Err(observation) =
                             self.utility_role_at(index, work, output.proposer_ranking_output())
                         {
-                            self.record_failure(observation.at_semantic_stage("utility_role_after_error"));
+                            self.record_failure(
+                                observation.at_semantic_stage("utility_role_after_error"),
+                            );
                         }
                     }
                 }
@@ -5451,7 +5477,10 @@ where
             }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             if !consumed && self.roles[index].v2_capture_possible {
-                let result = self.collection_observer_v2.as_mut().map(|observer| observer.abandoned(&ticket));
+                let result = self
+                    .collection_observer_v2
+                    .as_mut()
+                    .map(|observer| observer.abandoned(&ticket));
                 if let Some(Err(error)) = result {
                     // Keep the same ticket even when observer cleanup fails;
                     // settlement can retry only after the actual root fence.
@@ -5459,12 +5488,18 @@ where
                     // the first failure disables new captured dispatches.
                     if self.collection_v2_abandon_custody.len() >= self.limits.role_tickets_max {
                         self.record_failure(error.into());
-                        return Err(AdaptiveManagerError::Capacity("V2 abandoned ticket custody"));
+                        return Err(AdaptiveManagerError::Capacity(
+                            "V2 abandoned ticket custody",
+                        ));
                     }
-                    self.collection_v2_abandon_custody.try_reserve(1)
-                        .map_err(|_| AdaptiveManagerError::Capacity("V2 abandoned ticket custody"))?;
+                    self.collection_v2_abandon_custody
+                        .try_reserve(1)
+                        .map_err(|_| {
+                            AdaptiveManagerError::Capacity("V2 abandoned ticket custody")
+                        })?;
                     self.collection_v2_abandon_custody.push(ticket);
-                    self.collection_v2_first_failure.get_or_insert_with(|| error.clone());
+                    self.collection_v2_first_failure
+                        .get_or_insert_with(|| error.clone());
                     self.record_failure(error.into());
                 }
             }
@@ -5641,7 +5676,8 @@ where
                 DeferredCommit::ProfiledExternal { binding, packet } => {
                     self.commit_profiled_packet(binding, packet)
                 }
-                DeferredCommit::Role { ticket, accepted } => self.retire_role(*ticket, *accepted)
+                DeferredCommit::Role { ticket, accepted } => self
+                    .retire_role(*ticket, *accepted)
                     .map_err(|error| error.at_semantic_stage("deferred.role")),
                 DeferredCommit::Own { binding, report } => {
                     if self.phase == ManagerPhase::Running {
@@ -6027,7 +6063,8 @@ where
                         | RolePurpose::RoventFresh
                         | RolePurpose::RoventGoalLocal
                 ) || (self.roles[index].purpose == RolePurpose::Refinement
-                    && self.has_collection_v2())) {
+                    && self.has_collection_v2()))
+            {
                 Some(self.registry.issue_reciprocal_native_acceptance(
                     &ticket,
                     self.clock.domain(),

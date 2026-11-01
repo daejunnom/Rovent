@@ -28,8 +28,12 @@ struct CollectionAbortHook {
 }
 impl CollectionAbortHook {
     fn abort(&self) {
-        self.game_gate.fetch_or(crate::search_driver::ROVENT_COLLECTION_ABORT_BIT, std::sync::atomic::Ordering::AcqRel);
-        self.root_targets_revoked.store(true, std::sync::atomic::Ordering::Release);
+        self.game_gate.fetch_or(
+            crate::search_driver::ROVENT_COLLECTION_ABORT_BIT,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        self.root_targets_revoked
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 impl std::fmt::Debug for CollectionAbortHook {
@@ -120,34 +124,63 @@ impl DriverStartSource {
     ) -> Result<(), ContractError> {
         if self.authority != context.authority
             || !Arc::ptr_eq(&self.control.cancellation, &context.control.cancellation)
-            || !self.cancellation.shares_cancellation_with(&context.cancellation)
+            || !self
+                .cancellation
+                .shares_cancellation_with(&context.cancellation)
             || !Arc::ptr_eq(&self.current, &context.current)
         {
             return Err(invalid("collection abort hook differs from original Start"));
         }
-        self.collection_abort_hook.set(CollectionAbortHook { game_gate, root_targets_revoked })
+        self.collection_abort_hook
+            .set(CollectionAbortHook {
+                game_gate,
+                root_targets_revoked,
+            })
             .map_err(|_| invalid("collection abort hook already installed"))?;
         // One atomic word makes registration and actual owner cancellation
         // mutually ordered: if cancel wins, this installer performs the abort;
         // if install wins, the owner sees the already-initialized hook.
         let aborted = match self.collection_abort_state.compare_exchange(
-            0, 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire,
+            0,
+            1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
         ) {
             Ok(_) => false,
             Err(2) => true,
             Err(3) => {
-                self.collection_abort_hook.get().expect("hook just installed").abort();
-                return Err(self.collection_owner_binding_error.get().copied()
-                    .unwrap_or_else(|| invalid("original Start owner binding failure unavailable")));
+                self.collection_abort_hook
+                    .get()
+                    .expect("hook just installed")
+                    .abort();
+                return Err(self
+                    .collection_owner_binding_error
+                    .get()
+                    .copied()
+                    .unwrap_or_else(|| {
+                        invalid("original Start owner binding failure unavailable")
+                    }));
             }
             Err(_) => return Err(invalid("collection abort registration state unknown")),
         };
-        if aborted || self.control.cancellation.load(std::sync::atomic::Ordering::Acquire)
+        if aborted
+            || self
+                .control
+                .cancellation
+                .load(std::sync::atomic::Ordering::Acquire)
             || self.cancellation.is_canceled()
         {
-            self.collection_abort_hook.get().expect("hook just installed").abort();
-            return Err(self.collection_owner_binding_error.get().copied()
-                .unwrap_or_else(|| invalid("original Start already canceled before Collection binding")));
+            self.collection_abort_hook
+                .get()
+                .expect("hook just installed")
+                .abort();
+            return Err(self
+                .collection_owner_binding_error
+                .get()
+                .copied()
+                .unwrap_or_else(|| {
+                    invalid("original Start already canceled before Collection binding")
+                }));
         }
         Ok(())
     }
@@ -156,15 +189,20 @@ impl DriverStartSource {
     /// otherwise valid search. A later Collection binding is still rejected.
     pub(crate) fn mark_collection_owner_binding_failed(&self, error: ContractError) {
         let _ = self.collection_owner_binding_error.set(error);
-        self.collection_abort_state.store(3, std::sync::atomic::Ordering::Release);
+        self.collection_abort_state
+            .store(3, std::sync::atomic::Ordering::Release);
     }
 
     /// Called by the actual UCI owner before its regular cancel. The hook is
     /// optional and must perform only nonblocking atomic state transitions.
     pub(crate) fn abort_collection(&self) {
-        let previous = self.collection_abort_state.swap(2, std::sync::atomic::Ordering::AcqRel);
+        let previous = self
+            .collection_abort_state
+            .swap(2, std::sync::atomic::Ordering::AcqRel);
         if previous == 1 {
-            if let Some(hook) = self.collection_abort_hook.get() { hook.abort(); }
+            if let Some(hook) = self.collection_abort_hook.get() {
+                hook.abort();
+            }
         }
     }
 

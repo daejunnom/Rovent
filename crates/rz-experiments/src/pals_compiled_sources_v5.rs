@@ -1925,7 +1925,8 @@ mod tests {
     fn selected_view_observer_bytes_are_pinned_by_both_consumers() {
         let inventory = compiled_source_inventory_v5().unwrap();
         let path = "crates/rz-uci/src/rovent_bootstrap/launch/selected_view_observation.rs";
-        let bytes = include_bytes!("../../rz-uci/src/rovent_bootstrap/launch/selected_view_observation.rs");
+        let bytes =
+            include_bytes!("../../rz-uci/src/rovent_bootstrap/launch/selected_view_observation.rs");
         let actual: [u8; 32] = Sha256::digest(bytes).into();
         let mut changed_bytes = bytes.to_vec();
         changed_bytes.push(0);

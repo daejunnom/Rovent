@@ -73,7 +73,10 @@ struct RootRunCustody {
     next_request_sequence: u64,
     game: Option<u64>,
     collection_admitted: bool,
-    no_capture_v2: Option<(RoventNoCaptureRootCapabilityV2, crate::pals_adaptive::AdaptiveCollectionError)>,
+    no_capture_v2: Option<(
+        RoventNoCaptureRootCapabilityV2,
+        crate::pals_adaptive::AdaptiveCollectionError,
+    )>,
     pending_collection_v2: Option<crate::pals_adaptive::AdaptiveCollectionError>,
     pending_collection_event_v2: Option<Arc<RoventNnuecPendingCollectionV2>>,
     pending_collection_journal_v2: Option<RoventPendingJournalObservationV2>,
@@ -994,25 +997,45 @@ impl RoventNnuecSessionDriver {
                         // abort an otherwise valid NNUEC root before search.
                         // The normal no-capture capability proves that no
                         // observer or teacher was started for this admission.
-                        let escrow_error = if !manager.driver().collection_v2_observation_complete(&cap) {
+                        let escrow_error = if !manager
+                            .driver()
+                            .collection_v2_observation_complete(&cap)
+                        {
                             Some(crate::pals_adaptive::AdaptiveCollectionError::new(
                                 crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
                                 "RoventCollectionObservationIncomplete",
-                                "V2 adaptive collection observation is not fully connected"))
-                        } else { match handoff_escrow_v2::HandoffEscrowReservationV2::try_reserve(&cap) {
-                            Ok(reservation) => { collection_escrow_v2 = Some(reservation); None }
-                            Err(error @ (handoff_escrow_v2::HandoffEscrowErrorV2::Busy | handoff_escrow_v2::HandoffEscrowErrorV2::Capacity | handoff_escrow_v2::HandoffEscrowErrorV2::Poisoned)) => Some(crate::pals_adaptive::AdaptiveCollectionError::new(
-                                crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
-                                "RoventHandoffEscrowUnavailable", format!("{error:?}"))),
-                            Err(error) => {
-                                v2_admission_failure = Some(RoventNnuecCollectionAdmissionFailureV2 {
-                                    error: AdaptiveManagerError::Invalid("V2 escrow reservation failed"),
-                                    admission: cap.clone(),
-                                    owners: Box::new(error),
-                                });
-                                return Err(AdaptiveManagerError::Invalid("V2 escrow reservation failed"));
+                                "V2 adaptive collection observation is not fully connected",
+                            ))
+                        } else {
+                            match handoff_escrow_v2::HandoffEscrowReservationV2::try_reserve(&cap) {
+                                Ok(reservation) => {
+                                    collection_escrow_v2 = Some(reservation);
+                                    None
+                                }
+                                Err(
+                                    error @ (handoff_escrow_v2::HandoffEscrowErrorV2::Busy
+                                    | handoff_escrow_v2::HandoffEscrowErrorV2::Capacity
+                                    | handoff_escrow_v2::HandoffEscrowErrorV2::Poisoned),
+                                ) => Some(crate::pals_adaptive::AdaptiveCollectionError::new(
+                                    crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
+                                    "RoventHandoffEscrowUnavailable",
+                                    format!("{error:?}"),
+                                )),
+                                Err(error) => {
+                                    v2_admission_failure =
+                                        Some(RoventNnuecCollectionAdmissionFailureV2 {
+                                            error: AdaptiveManagerError::Invalid(
+                                                "V2 escrow reservation failed",
+                                            ),
+                                            admission: cap.clone(),
+                                            owners: Box::new(error),
+                                        });
+                                    return Err(AdaptiveManagerError::Invalid(
+                                        "V2 escrow reservation failed",
+                                    ));
+                                }
                             }
-                        }};
+                        };
                         // Preserve the actual Busy/Capacity/Poisoned source
                         // even if a later Pending ends at the root deadline.
                         deferred_preflight_cause = escrow_error.clone();
@@ -1025,7 +1048,11 @@ impl RoventNnuecSessionDriver {
                                 manager: &mut *manager,
                             };
                             let outcome = if let Some(reason) = &escrow_error {
-                                hooks.defer_no_capture(&mut port, expected_cap.clone(), reason.clone())
+                                hooks.defer_no_capture(
+                                    &mut port,
+                                    expected_cap.clone(),
+                                    reason.clone(),
+                                )
                             } else {
                                 hooks.admit(&mut port, expected_cap.clone())
                             };
@@ -1037,25 +1064,40 @@ impl RoventNnuecSessionDriver {
                                         ));
                                     }
                                     let installed = manager.collection_root_admission_v2().ok_or(
-                                        AdaptiveManagerError::Invalid("V2 collection observer was not installed"),
+                                        AdaptiveManagerError::Invalid(
+                                            "V2 collection observer was not installed",
+                                        ),
                                     )?;
                                     if !installed.same_original_admission(&expected_cap) {
-                                        return Err(AdaptiveManagerError::Invalid("V2 installed collection admission has a different root owner"));
+                                        return Err(AdaptiveManagerError::Invalid(
+                                            "V2 installed collection admission has a different root owner",
+                                        ));
                                     }
                                     pending_collection_v2 = None;
                                     pending_collection_admission_v2 = None;
                                     collection_admitted = true;
                                     break;
                                 }
-                                Ok(RoventNnuecCollectionAdmissionOutcomeV2::DeferredNoCapture { capability, reason }) => {
+                                Ok(
+                                    RoventNnuecCollectionAdmissionOutcomeV2::DeferredNoCapture {
+                                        capability,
+                                        reason,
+                                    },
+                                ) => {
                                     if !capability.same_original_admission(&expected_cap)
-                                        || manager.collection_root_admission_v2().is_some() {
-                                        v2_admission_failure = Some(RoventNnuecCollectionAdmissionFailureV2 {
-                                            error: AdaptiveManagerError::Invalid("deferred collection owner mismatch"),
-                                            admission: expected_cap.clone(),
-                                            owners: Box::new((capability, reason)),
-                                        });
-                                        return Err(AdaptiveManagerError::Invalid("deferred collection owner mismatch"));
+                                        || manager.collection_root_admission_v2().is_some()
+                                    {
+                                        v2_admission_failure =
+                                            Some(RoventNnuecCollectionAdmissionFailureV2 {
+                                                error: AdaptiveManagerError::Invalid(
+                                                    "deferred collection owner mismatch",
+                                                ),
+                                                admission: expected_cap.clone(),
+                                                owners: Box::new((capability, reason)),
+                                            });
+                                        return Err(AdaptiveManagerError::Invalid(
+                                            "deferred collection owner mismatch",
+                                        ));
                                     }
                                     pending_collection_v2 = None;
                                     pending_collection_admission_v2 = None;
@@ -1063,13 +1105,21 @@ impl RoventNnuecSessionDriver {
                                     v2_hook_started = false;
                                     break;
                                 }
-                                Ok(RoventNnuecCollectionAdmissionOutcomeV2::PendingUncertain { admission }) => {
+                                Ok(RoventNnuecCollectionAdmissionOutcomeV2::PendingUncertain {
+                                    admission,
+                                }) => {
                                     if !admission.same_original_admission(&expected_cap) {
-                                        v2_admission_failure = Some(RoventNnuecCollectionAdmissionFailureV2 {
-                                            error: AdaptiveManagerError::Invalid("uncertain collection owner mismatch"),
-                                            admission, owners: Box::new(()),
-                                        });
-                                        return Err(AdaptiveManagerError::Invalid("uncertain collection owner mismatch"));
+                                        v2_admission_failure =
+                                            Some(RoventNnuecCollectionAdmissionFailureV2 {
+                                                error: AdaptiveManagerError::Invalid(
+                                                    "uncertain collection owner mismatch",
+                                                ),
+                                                admission,
+                                                owners: Box::new(()),
+                                            });
+                                        return Err(AdaptiveManagerError::Invalid(
+                                            "uncertain collection owner mismatch",
+                                        ));
                                     }
                                     // Do not reclaim the escrow or claim a no-start
                                     // boundary while this root's install is unknown.
@@ -1077,37 +1127,59 @@ impl RoventNnuecSessionDriver {
                                     let accepts = context.accepts();
                                     if !accepts.as_ref().copied().unwrap_or(false)
                                         || context.soft_expired(Instant::now())
-                                        || manager.phase() != ManagerPhase::Running {
-                                        v2_admission_failure = Some(RoventNnuecCollectionAdmissionFailureV2 {
-                                            error: AdaptiveManagerError::Invalid("collection admission remained uncertain at its original boundary"),
-                                            admission, owners: Box::new(()),
-                                        });
-                                        return Err(AdaptiveManagerError::Invalid("collection admission remained uncertain at its original boundary"));
+                                        || manager.phase() != ManagerPhase::Running
+                                    {
+                                        v2_admission_failure = Some(
+                                            RoventNnuecCollectionAdmissionFailureV2 {
+                                                error: AdaptiveManagerError::Invalid(
+                                                    "collection admission remained uncertain at its original boundary",
+                                                ),
+                                                admission,
+                                                owners: Box::new(()),
+                                            },
+                                        );
+                                        return Err(AdaptiveManagerError::Invalid(
+                                            "collection admission remained uncertain at its original boundary",
+                                        ));
                                     }
                                     manager.tick()?;
                                     std::thread::sleep(Duration::from_millis(1));
                                 }
-                                Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission }) => {
+                                Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending {
+                                    admission,
+                                }) => {
                                     if !admission.same_original_admission(&expected_cap)
-                                        || manager.collection_root_admission_v2().is_some() {
-                                        v2_admission_failure = Some(RoventNnuecCollectionAdmissionFailureV2 {
-                                            error: AdaptiveManagerError::Invalid("pending collection owner mismatch"),
-                                            admission,
-                                            owners: Box::new(()),
-                                        });
-                                        return Err(AdaptiveManagerError::Invalid("pending collection owner mismatch"));
+                                        || manager.collection_root_admission_v2().is_some()
+                                    {
+                                        v2_admission_failure =
+                                            Some(RoventNnuecCollectionAdmissionFailureV2 {
+                                                error: AdaptiveManagerError::Invalid(
+                                                    "pending collection owner mismatch",
+                                                ),
+                                                admission,
+                                                owners: Box::new(()),
+                                            });
+                                        return Err(AdaptiveManagerError::Invalid(
+                                            "pending collection owner mismatch",
+                                        ));
                                     }
                                     v2_hook_started = false;
                                     pending_collection_admission_v2 = Some(expected_cap.clone());
-                                    pending_collection_v2 = Some(crate::pals_adaptive::AdaptiveCollectionError::new(
-                                        crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
-                                        "CollectionAdmissionPending", "collection did not start while its original owner was busy"));
+                                    pending_collection_v2 = Some(
+                                        crate::pals_adaptive::AdaptiveCollectionError::new(
+                                            crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
+                                            "CollectionAdmissionPending",
+                                            "collection did not start while its original owner was busy",
+                                        ),
+                                    );
                                     let accepts = context.accepts();
                                     if !accepts.as_ref().copied().unwrap_or(false)
                                         || context.soft_expired(Instant::now())
-                                        || manager.phase() != ManagerPhase::Running {
+                                        || manager.phase() != ManagerPhase::Running
+                                    {
                                         let reason = if context.cancellation.is_canceled()
-                                            || context.control.cancellation.load(Ordering::Acquire) {
+                                            || context.control.cancellation.load(Ordering::Acquire)
+                                        {
                                             "original root was canceled while Collection admission was pending"
                                         } else if context.soft_expired(Instant::now()) {
                                             "original root soft deadline expired while Collection admission was pending"
@@ -1121,7 +1193,8 @@ impl RoventNnuecSessionDriver {
                                         pending_collection_v2 = Some(crate::pals_adaptive::AdaptiveCollectionError::new(
                                             crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
                                             "CollectionAdmissionPendingStopped", reason));
-                                        pending_collection_admission_v2 = Some(expected_cap.clone());
+                                        pending_collection_admission_v2 =
+                                            Some(expected_cap.clone());
                                         break;
                                     }
                                     // Let already-owned native/CPU events drain;
@@ -1130,10 +1203,15 @@ impl RoventNnuecSessionDriver {
                                     std::thread::sleep(Duration::from_millis(1));
                                 }
                                 Err(rejected) => {
-                                    let error = if rejected.admission.same_original_admission(&expected_cap) {
+                                    let error = if rejected
+                                        .admission
+                                        .same_original_admission(&expected_cap)
+                                    {
                                         rejected.error.clone()
                                     } else {
-                                        AdaptiveManagerError::Invalid("V2 rejected collection admission has a different root owner")
+                                        AdaptiveManagerError::Invalid(
+                                            "V2 rejected collection admission has a different root owner",
+                                        )
                                     };
                                     v2_admission_failure = Some(rejected);
                                     return Err(error);
@@ -1170,8 +1248,15 @@ impl RoventNnuecSessionDriver {
                                 || manager.phase() != ManagerPhase::Running)
                         {
                             if let Some(hooks) = &self.collection_hooks_v2 {
-                                hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission"))
-                                    .map_err(|failure| { let error = failure.error.clone(); v2_root_hook_failure.get_or_insert(failure); error })?;
+                                hooks
+                                    .revoke_root(
+                                        v2_hook_admission.as_ref().expect("root hook admission"),
+                                    )
+                                    .map_err(|failure| {
+                                        let error = failure.error.clone();
+                                        v2_root_hook_failure.get_or_insert(failure);
+                                        error
+                                    })?;
                             }
                             v2_revoked = true;
                         }
@@ -1202,13 +1287,29 @@ impl RoventNnuecSessionDriver {
                                 .as_ref()
                                 .filter(|_| collection_failure.is_none())
                             {
-                                match hooks.pump_root(v2_hook_admission.as_ref().expect("root hook admission"))
-                                    .map_err(|failure| { let error = failure.error.clone(); v2_root_hook_failure.get_or_insert(failure); error }) {
+                                match hooks
+                                    .pump_root(
+                                        v2_hook_admission.as_ref().expect("root hook admission"),
+                                    )
+                                    .map_err(|failure| {
+                                        let error = failure.error.clone();
+                                        v2_root_hook_failure.get_or_insert(failure);
+                                        error
+                                    }) {
                                     Ok(()) => {}
                                     Err(AdaptiveManagerError::Collection(error)) => {
                                         if !v2_revoked {
-                                            hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission"))
-                                                .map_err(|failure| { let error = failure.error.clone(); v2_root_hook_failure.get_or_insert(failure); error })?;
+                                            hooks
+                                                .revoke_root(
+                                                    v2_hook_admission
+                                                        .as_ref()
+                                                        .expect("root hook admission"),
+                                                )
+                                                .map_err(|failure| {
+                                                    let error = failure.error.clone();
+                                                    v2_root_hook_failure.get_or_insert(failure);
+                                                    error
+                                                })?;
                                             v2_revoked = true;
                                         }
                                         if collection_failure.is_none() {
@@ -1264,17 +1365,31 @@ impl RoventNnuecSessionDriver {
                         Err(_) => break false,
                     }
                 }
-            } else { false };
-            if cancelled { collection_escrow_v2 = None; }
+            } else {
+                false
+            };
+            if cancelled {
+                collection_escrow_v2 = None;
+            }
         }
         if pending_collection_admission_v2.is_some() {
             match &execution {
-                Ok(Err(error)) => pending_collection_v2 = Some(crate::pals_adaptive::AdaptiveCollectionError::new(
-                    crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
-                    "CollectionAdmissionPendingFailed", error.to_string())),
-                Err(_) => pending_collection_v2 = Some(crate::pals_adaptive::AdaptiveCollectionError::new(
-                    crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
-                    "CollectionAdmissionPendingPanic", "root execution panicked while collection admission was pending")),
+                Ok(Err(error)) => {
+                    pending_collection_v2 =
+                        Some(crate::pals_adaptive::AdaptiveCollectionError::new(
+                            crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
+                            "CollectionAdmissionPendingFailed",
+                            error.to_string(),
+                        ))
+                }
+                Err(_) => {
+                    pending_collection_v2 =
+                        Some(crate::pals_adaptive::AdaptiveCollectionError::new(
+                            crate::pals_adaptive::AdaptiveCollectionStage::Dispatch,
+                            "CollectionAdmissionPendingPanic",
+                            "root execution panicked while collection admission was pending",
+                        ))
+                }
                 Ok(Ok(())) => {}
             }
         }
@@ -1284,9 +1399,10 @@ impl RoventNnuecSessionDriver {
         run.no_capture_v2 = no_capture_v2;
         run.pending_collection_v2 = pending_collection_v2;
         run.deferred_preflight_cause = deferred_preflight_cause;
-        if let (Some(admission), Some(reason)) =
-            (pending_collection_admission_v2, run.pending_collection_v2.as_ref())
-        {
+        if let (Some(admission), Some(reason)) = (
+            pending_collection_admission_v2,
+            run.pending_collection_v2.as_ref(),
+        ) {
             let event = Arc::new(RoventNnuecPendingCollectionV2 {
                 admission,
                 cause: run.deferred_preflight_cause.clone(),
@@ -1294,14 +1410,26 @@ impl RoventNnuecSessionDriver {
             });
             run.pending_collection_event_v2 = Some(Arc::clone(&event));
             run.pending_collection_journal_v2 = Some(match self.collection_hooks_v2.as_ref() {
-                Some(hooks) => match catch_unwind(AssertUnwindSafe(|| hooks.try_record_pending_stopped(&event))) {
-                    Ok(Ok(RoventPendingEvidenceDispositionV2::OriginalRetained)) => RoventPendingJournalObservationV2::OriginalRetained,
-                    Ok(Ok(RoventPendingEvidenceDispositionV2::Summarized)) => RoventPendingJournalObservationV2::Summarized,
-                    Ok(Ok(RoventPendingEvidenceDispositionV2::Busy)) => RoventPendingJournalObservationV2::Busy,
+                Some(hooks) => match catch_unwind(AssertUnwindSafe(|| {
+                    hooks.try_record_pending_stopped(&event)
+                })) {
+                    Ok(Ok(RoventPendingEvidenceDispositionV2::OriginalRetained)) => {
+                        RoventPendingJournalObservationV2::OriginalRetained
+                    }
+                    Ok(Ok(RoventPendingEvidenceDispositionV2::Summarized)) => {
+                        RoventPendingJournalObservationV2::Summarized
+                    }
+                    Ok(Ok(RoventPendingEvidenceDispositionV2::Busy)) => {
+                        RoventPendingJournalObservationV2::Busy
+                    }
                     Ok(Err(error)) => RoventPendingJournalObservationV2::Failed(error),
-                    Err(payload) => RoventPendingJournalObservationV2::Panicked(Arc::new(RoventPendingJournalPanicV2::new(payload))),
+                    Err(payload) => RoventPendingJournalObservationV2::Panicked(Arc::new(
+                        RoventPendingJournalPanicV2::new(payload),
+                    )),
                 },
-                None => RoventPendingJournalObservationV2::Failed(AdaptiveManagerError::Invalid("pending collection hook absent")),
+                None => RoventPendingJournalObservationV2::Failed(AdaptiveManagerError::Invalid(
+                    "pending collection hook absent",
+                )),
             });
         }
         match execution {
@@ -1309,15 +1437,29 @@ impl RoventNnuecSessionDriver {
             Ok(Err(error)) => {
                 if v2_hook_started {
                     if let Some(hooks) = &self.collection_hooks_v2 {
-                        match catch_unwind(AssertUnwindSafe(|| hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission")))) {
-                            Ok(Ok(())) => {},
-                            Ok(Err(failure)) => return Err(run.retain_failure("RoventNnuecV2Revoke", "original root revoke failed", (error, v2_admission_failure, v2_root_hook_failure, failure))),
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            hooks.revoke_root(
+                                v2_hook_admission.as_ref().expect("root hook admission"),
+                            )
+                        })) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(failure)) => {
+                                return Err(run.retain_failure(
+                                    "RoventNnuecV2Revoke",
+                                    "original root revoke failed",
+                                    (error, v2_admission_failure, v2_root_hook_failure, failure),
+                                ));
+                            }
                             Err(payload) => self.retain_v2_revoke_panic(payload),
                         }
                     }
                 }
                 if let Some(original) = v2_root_hook_failure {
-                    return Err(run.retain_failure("RoventNnuecExecution", error.to_string(), (error, v2_admission_failure, original)));
+                    return Err(run.retain_failure(
+                        "RoventNnuecExecution",
+                        error.to_string(),
+                        (error, v2_admission_failure, original),
+                    ));
                 }
                 if let Some(rejected) = v2_admission_failure {
                     return Err(run.retain_failure(
@@ -1331,9 +1473,19 @@ impl RoventNnuecSessionDriver {
             Err(payload) => {
                 if v2_hook_started {
                     if let Some(hooks) = &self.collection_hooks_v2 {
-                        match catch_unwind(AssertUnwindSafe(|| hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission")))) {
-                            Ok(Ok(())) => {},
-                            Ok(Err(failure)) => return Err(run.retain_failure("RoventNnuecV2Revoke", "original root revoke failed after execution panic", (payload, v2_root_hook_failure, failure))),
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            hooks.revoke_root(
+                                v2_hook_admission.as_ref().expect("root hook admission"),
+                            )
+                        })) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(failure)) => {
+                                return Err(run.retain_failure(
+                                    "RoventNnuecV2Revoke",
+                                    "original root revoke failed after execution panic",
+                                    (payload, v2_root_hook_failure, failure),
+                                ));
+                            }
                             Err(revoke_payload) => self.retain_v2_revoke_panic(revoke_payload),
                         }
                     }
@@ -1347,14 +1499,24 @@ impl RoventNnuecSessionDriver {
         }
         if v2_hook_started && !v2_revoked {
             if let Some(hooks) = &self.collection_hooks_v2 {
-                match catch_unwind(AssertUnwindSafe(|| hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission")))) {
-                    Ok(Ok(())) => {},
-                    Ok(Err(failure)) => return Err(run.retain_failure("RoventNnuecV2Revoke", "original root revoke failed", failure)),
-                    Err(payload) => return Err(run.retain_panic(
-                        "RoventNnuecV2CollectionRevokePanic",
-                        "V2 collection revoke panicked; original hook and owners retained",
-                        payload,
-                    )),
+                match catch_unwind(AssertUnwindSafe(|| {
+                    hooks.revoke_root(v2_hook_admission.as_ref().expect("root hook admission"))
+                })) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failure)) => {
+                        return Err(run.retain_failure(
+                            "RoventNnuecV2Revoke",
+                            "original root revoke failed",
+                            failure,
+                        ));
+                    }
+                    Err(payload) => {
+                        return Err(run.retain_panic(
+                            "RoventNnuecV2CollectionRevokePanic",
+                            "V2 collection revoke panicked; original hook and owners retained",
+                            payload,
+                        ));
+                    }
                 }
             }
         }
@@ -1370,18 +1532,29 @@ impl RoventNnuecSessionDriver {
                 _ => return Err(run.fail("RoventNnuecFence", "actual root fence absent")),
             }
         };
-        let deferred_reason = run.no_capture_v2.as_ref().map(|(_, reason)| reason.clone())
+        let deferred_reason = run
+            .no_capture_v2
+            .as_ref()
+            .map(|(_, reason)| reason.clone())
             .or_else(|| run.pending_collection_v2.clone());
         if let Some((capability, _)) = run.no_capture_v2.as_ref() {
             let capability = capability.clone();
             if !capability.matches_shutdown_receipt(&physical) {
-                return Err(run.fail("RoventNnuecNoCaptureFence", "same-root native fence unavailable"));
+                return Err(run.fail(
+                    "RoventNnuecNoCaptureFence",
+                    "same-root native fence unavailable",
+                ));
             }
             let Some(hooks) = self.collection_hooks_v2.as_ref() else {
-                return Err(run.fail("RoventNnuecNoCaptureOwner", "original collection hook unavailable"));
+                return Err(run.fail(
+                    "RoventNnuecNoCaptureOwner",
+                    "original collection hook unavailable",
+                ));
             };
             loop {
-                match catch_unwind(AssertUnwindSafe(|| hooks.finish_deferred(&capability, &physical))) {
+                match catch_unwind(AssertUnwindSafe(|| {
+                    hooks.finish_deferred(&capability, &physical)
+                })) {
                     Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready)) => break,
                     Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy))
                         if Instant::now() < context.shutdown_deadline =>
@@ -1389,12 +1562,25 @@ impl RoventNnuecSessionDriver {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) => {
-                        return Err(run.fail("RoventNnuecNoCaptureBusy", "original marker remained busy through cleanup deadline"));
+                        return Err(run.fail(
+                            "RoventNnuecNoCaptureBusy",
+                            "original marker remained busy through cleanup deadline",
+                        ));
                     }
-                    Ok(Err(error)) => return Err(run.retain_failure(
-                        "RoventNnuecNoCaptureCleanup", error.to_string(), error)),
-                    Err(payload) => return Err(run.retain_panic(
-                        "RoventNnuecNoCaptureCleanupPanic", "original no-capture owner retained", payload)),
+                    Ok(Err(error)) => {
+                        return Err(run.retain_failure(
+                            "RoventNnuecNoCaptureCleanup",
+                            error.to_string(),
+                            error,
+                        ));
+                    }
+                    Err(payload) => {
+                        return Err(run.retain_panic(
+                            "RoventNnuecNoCaptureCleanupPanic",
+                            "original no-capture owner retained",
+                            payload,
+                        ));
+                    }
                 }
             }
             run.no_capture_v2.take();
@@ -1477,7 +1663,12 @@ impl RoventNnuecSessionDriver {
             if self.collection_hooks_v2.is_some() {
                 let escrow_key = match run.collection_escrow_v2.as_ref() {
                     Some(reservation) => reservation.key(),
-                    None => return Err(run.fail("RoventNnuecV2EscrowMissing", "original observer remains in the fenced manager")),
+                    None => {
+                        return Err(run.fail(
+                            "RoventNnuecV2EscrowMissing",
+                            "original observer remains in the fenced manager",
+                        ));
+                    }
                 };
                 // Obtain the bounded sender before removing the original
                 // observer from the fenced manager. A panic leaves it there.
@@ -1485,11 +1676,18 @@ impl RoventNnuecSessionDriver {
                     self.collection_hooks_v2
                         .as_ref()
                         .expect("started hook")
-                        .handoff_sender_root(v2_hook_admission.as_ref().expect("root hook admission"))
+                        .handoff_sender_root(
+                            v2_hook_admission.as_ref().expect("root hook admission"),
+                        )
                 })) {
                     Ok(Ok(sender)) => sender,
-                    Ok(Err(failure)) => return Err(run.retain_failure(
-                        "RoventNnuecV2HandoffSender", "original root handoff sender unavailable", failure)),
+                    Ok(Err(failure)) => {
+                        return Err(run.retain_failure(
+                            "RoventNnuecV2HandoffSender",
+                            "original root handoff sender unavailable",
+                            failure,
+                        ));
+                    }
                     Err(payload) => {
                         return Err(run.retain_panic(
                             "RoventNnuecV2HandoffSenderPanic",
@@ -1546,38 +1744,52 @@ impl RoventNnuecSessionDriver {
                 // The pre-reserved registry owns the original before any
                 // channel delivery; dropping a receiver cannot lose it.
                 loop {
-                    let reservation = run.collection_escrow_v2.as_ref().expect("original escrow reservation");
+                    let reservation = run
+                        .collection_escrow_v2
+                        .as_ref()
+                        .expect("original escrow reservation");
                     match reservation.try_install(Arc::clone(&handoff)) {
                         Ok(()) => break,
                         Err((handoff_escrow_v2::HandoffEscrowErrorV2::Busy, _))
                             if Instant::now() < context.shutdown_deadline =>
-                        { std::thread::sleep(Duration::from_millis(1)); }
-                        Err((error, original)) => return Err(run.retain_failure(
-                            "RoventNnuecV2EscrowInstall", format!("{error:?}"), (error, original))),
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err((error, original)) => {
+                            return Err(run.retain_failure(
+                                "RoventNnuecV2EscrowInstall",
+                                format!("{error:?}"),
+                                (error, original),
+                            ));
+                        }
                     }
                 }
                 match sender.try_send(Arc::clone(&handoff)) {
-                Ok(()) => { let _ = delivery.set(Ok(())); }
-                Err(error) => {
-                    let (code, detail) = match error {
-                        std::sync::mpsc::TrySendError::Full(_) => (
-                            "RoventNnuecV2HandoffFull",
-                            "collection handoff channel is full; original remains in escrow",
-                        ),
-                        std::sync::mpsc::TrySendError::Disconnected(_) => (
-                            "RoventNnuecV2HandoffDisconnected",
-                            "collection handoff receiver is disconnected; original remains in escrow",
-                        ),
-                    };
-                    let error = crate::pals_adaptive::AdaptiveCollectionError::new(
-                        crate::pals_adaptive::AdaptiveCollectionStage::Settled, code, detail,
-                    );
-                    // The original handoff remains owned by escrow. This
-                    // records a partial Collection outcome, not a native or
-                    // teacher physical-completion claim.
-                    let _ = delivery.set(Err(error.clone()));
-                    run.collection_handoff_failure = Some(error);
-                }
+                    Ok(()) => {
+                        let _ = delivery.set(Ok(()));
+                    }
+                    Err(error) => {
+                        let (code, detail) = match error {
+                            std::sync::mpsc::TrySendError::Full(_) => (
+                                "RoventNnuecV2HandoffFull",
+                                "collection handoff channel is full; original remains in escrow",
+                            ),
+                            std::sync::mpsc::TrySendError::Disconnected(_) => (
+                                "RoventNnuecV2HandoffDisconnected",
+                                "collection handoff receiver is disconnected; original remains in escrow",
+                            ),
+                        };
+                        let error = crate::pals_adaptive::AdaptiveCollectionError::new(
+                            crate::pals_adaptive::AdaptiveCollectionStage::Settled,
+                            code,
+                            detail,
+                        );
+                        // The original handoff remains owned by escrow. This
+                        // records a partial Collection outcome, not a native or
+                        // teacher physical-completion claim.
+                        let _ = delivery.set(Err(error.clone()));
+                        run.collection_handoff_failure = Some(error);
+                    }
                 }
                 // Escrow retains the original whether delivery succeeds or
                 // fails. A successful send is only a channel observation;

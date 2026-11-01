@@ -3,9 +3,9 @@ use rz_experiments::rovent_corpus_lock_v2::record::{
 };
 use rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2;
 use rz_experiments::{
-    LockedManifest, MAX_MANIFEST_BYTES, RoventExecutionManifest, RoventExecutionManifestV2,
-    RoventExecutionReceipt, RoventInputLock, RoventInputLockV2, RunManifest,
-    PalsRunManifestV5, PalsInputLockV5, PalsAdaptiveStartupConfigV5,
+    LockedManifest, MAX_MANIFEST_BYTES, PalsAdaptiveStartupConfigV5, PalsInputLockV5,
+    PalsRunManifestV5, RoventExecutionManifest, RoventExecutionManifestV2, RoventExecutionReceipt,
+    RoventInputLock, RoventInputLockV2, RunManifest,
 };
 use std::env;
 use std::ffi::OsString;
@@ -49,8 +49,14 @@ enum Command {
         input_lock: PathBuf,
         receipt: PathBuf,
     },
-    PalsLockV5 { input: PathBuf, output: PathBuf },
-    PalsValidateStartupV5 { input_lock: PathBuf, config: PathBuf },
+    PalsLockV5 {
+        input: PathBuf,
+        output: PathBuf,
+    },
+    PalsValidateStartupV5 {
+        input_lock: PathBuf,
+        config: PathBuf,
+    },
     PalsVerifyNumericalScope(numerical_scope_cli::Request),
 }
 
@@ -98,10 +104,12 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
             receipt: PathBuf::from(&args[2]),
         }),
         Some("pals-lock-v5") if args.len() == 3 => Ok(Command::PalsLockV5 {
-            input: PathBuf::from(&args[1]), output: PathBuf::from(&args[2]),
+            input: PathBuf::from(&args[1]),
+            output: PathBuf::from(&args[2]),
         }),
         Some("pals-validate-startup-v5") if args.len() == 3 => Ok(Command::PalsValidateStartupV5 {
-            input_lock: PathBuf::from(&args[1]), config: PathBuf::from(&args[2]),
+            input_lock: PathBuf::from(&args[1]),
+            config: PathBuf::from(&args[2]),
         }),
         Some("pals-verify-numerical-scope") => {
             numerical_scope_cli::parse(&args).map(Command::PalsVerifyNumericalScope)

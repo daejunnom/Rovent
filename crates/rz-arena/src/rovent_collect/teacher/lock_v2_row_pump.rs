@@ -1,6 +1,6 @@
 //! Bounded custody for original retired rows and actual teacher evidence.
 //! This worker does not publish rows or infer physical retirement.
-use super::lock_v2_policy::{prepare_teacher_policy_lock_v2, PreparedTeacherPolicyLockV2};
+use super::lock_v2_policy::{PreparedTeacherPolicyLockV2, prepare_teacher_policy_lock_v2};
 use super::v2_session::{
     CompletedTeacherV2, RoventCollectionTeacherSessionV2, SealedTeacherPolicyV2,
     TeacherPolicyQuarantineV2, TeacherPolicySealFailureV2, TeacherPolicySealRejectionV2,
@@ -8,7 +8,7 @@ use super::v2_session::{
 };
 use super::*;
 use rz_search::external_cpu::collection_teacher::TeacherJobId;
-use rz_search::external_cpu::{ExternalGoConstraint, EXTERNAL_MIN_QUANTUM};
+use rz_search::external_cpu::{EXTERNAL_MIN_QUANTUM, ExternalGoConstraint};
 use rz_uci::rovent_external_launch::RoventTeacherPolicySealFailureKindV2;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -38,7 +38,10 @@ pub(crate) enum FailedEvidence {
     /// No teacher request was issued before the original root closed.
     /// This is retained as a failure, never an unlabeled success or target.
     UnissuedRootRevoked,
-    Captured { capsule: super::super::producer_v2::SubmittedTeacherQueryV2, failure: Box<FailedEvidence> },
+    Captured {
+        capsule: super::super::producer_v2::SubmittedTeacherQueryV2,
+        failure: Box<FailedEvidence>,
+    },
     SubmitPending(TeacherSubmitPendingV2),
     // The session may still own the pending worker job.
     Pending {
@@ -55,7 +58,10 @@ pub(crate) enum FailedEvidence {
     },
     Completion(CompletedTeacherV2),
     CapturedMismatch(super::v2_session::SpeculativeSealedTeacherPolicyV2),
-    CapturedJoinPanicked { sealed: super::v2_session::SpeculativeSealedTeacherPolicyV2, panic: Box<dyn std::any::Any + Send> },
+    CapturedJoinPanicked {
+        sealed: super::v2_session::SpeculativeSealedTeacherPolicyV2,
+        panic: Box<dyn std::any::Any + Send>,
+    },
     SealRejected {
         cause: TeacherPolicySealFailureV2,
         completed: CompletedTeacherV2,
@@ -74,15 +80,27 @@ impl FailedEvidence {
     pub(crate) fn has_uncertain_cleanup(&self) -> bool {
         match self {
             Self::Captured { failure, .. } => failure.has_uncertain_cleanup(),
-            Self::Pending { .. } | Self::PendingMismatched { .. } | Self::Quarantined(_) | Self::CapturedMismatch(_)
-            | Self::PreparationPanicked { .. } | Self::CapturedJoinPanicked { .. } => true,
+            Self::Pending { .. }
+            | Self::PendingMismatched { .. }
+            | Self::Quarantined(_)
+            | Self::CapturedMismatch(_)
+            | Self::PreparationPanicked { .. }
+            | Self::CapturedJoinPanicked { .. } => true,
             Self::SealRejected { cause, .. } => match cause {
-                TeacherPolicySealFailureV2::Panicked(_) | TeacherPolicySealFailureV2::Validation(_) => true,
-                TeacherPolicySealFailureV2::Native { kind, .. } => matches!(kind,
-                    RoventTeacherPolicySealFailureKindV2::Poisoned | RoventTeacherPolicySealFailureKindV2::Invalid),
+                TeacherPolicySealFailureV2::Panicked(_)
+                | TeacherPolicySealFailureV2::Validation(_) => true,
+                TeacherPolicySealFailureV2::Native { kind, .. } => matches!(
+                    kind,
+                    RoventTeacherPolicySealFailureKindV2::Poisoned
+                        | RoventTeacherPolicySealFailureKindV2::Invalid
+                ),
             },
-            Self::BeforeCompletion | Self::UnissuedRootRevoked | Self::SubmitPending(_) | Self::PendingCompleted { .. }
-            | Self::Completion(_) | Self::Sealed(_) => false,
+            Self::BeforeCompletion
+            | Self::UnissuedRootRevoked
+            | Self::SubmitPending(_)
+            | Self::PendingCompleted { .. }
+            | Self::Completion(_)
+            | Self::Sealed(_) => false,
         }
     }
     /// Read-only description. The actual completion and authority remain
@@ -100,8 +118,12 @@ impl FailedEvidence {
             Self::CapturedMismatch(_) => "captured_retirement_mismatch".into(),
             Self::CapturedJoinPanicked { .. } => "captured_retirement_join_panicked".into(),
             Self::SealRejected { cause, .. } => match cause {
-                TeacherPolicySealFailureV2::Validation(error) => format!("seal_validation: {error}"),
-                TeacherPolicySealFailureV2::Native { kind, error } => format!("seal_native {kind:?}: {error:?}"),
+                TeacherPolicySealFailureV2::Validation(error) => {
+                    format!("seal_validation: {error}")
+                }
+                TeacherPolicySealFailureV2::Native { kind, error } => {
+                    format!("seal_native {kind:?}: {error:?}")
+                }
                 TeacherPolicySealFailureV2::Panicked(_) => "seal_panicked".into(),
             },
             Self::Quarantined(_) => "seal_quarantined".into(),
@@ -131,11 +153,17 @@ enum CapturedStage {
     Queued,
     Unlabeled,
     TransitionUnknown,
-    Pending { actor: String, id: TeacherJobId },
+    Pending {
+        actor: String,
+        id: TeacherJobId,
+    },
     Completed(CompletedTeacherV2),
     Sealed(super::v2_session::SpeculativeSealedTeacherPolicyV2),
     Prepared(PreparedTeacherPolicyLockV2),
-    Failed { error: ArenaError, evidence: FailedEvidence },
+    Failed {
+        error: ArenaError,
+        evidence: FailedEvidence,
+    },
 }
 
 /// Observations only; stage counts grant no completion or target authority.
@@ -158,8 +186,15 @@ pub(crate) struct RetiredRowPumpV2 {
     capacity: usize,
     entries: VecDeque<Entry>,
     captured: VecDeque<CapturedEntry>,
-    seen_retired: BTreeMap<rz_contracts::RequestId, (rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
-        std::sync::Arc<()>, super::super::RoventSubmittedInputSeal, bool)>,
+    seen_retired: BTreeMap<
+        rz_contracts::RequestId,
+        (
+            rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+            std::sync::Arc<()>,
+            super::super::RoventSubmittedInputSeal,
+            bool,
+        ),
+    >,
     constraint: ExternalGoConstraint,
     soft_quantum: Duration,
     overflow_count: u64,
@@ -235,23 +270,44 @@ impl PumpCustodyV2 {
             match &mut entry.stage {
                 CapturedStage::Pending { actor, id } => {
                     let expected = *id;
-                    let Some(completed) = session.take_completed_actor(&self.permit, actor)? else { return Ok(false); };
-                    entry.stage = CapturedStage::Failed { error: invalid("captured terminal retained during custody drain"),
+                    let Some(completed) = session.take_completed_actor(&self.permit, actor)? else {
+                        return Ok(false);
+                    };
+                    entry.stage = CapturedStage::Failed {
+                        error: invalid("captured terminal retained during custody drain"),
                         evidence: if completed.dispatch.id() == expected {
-                            FailedEvidence::PendingCompleted { id: expected, completed }
+                            FailedEvidence::PendingCompleted {
+                                id: expected,
+                                completed,
+                            }
                         } else {
-                            FailedEvidence::PendingMismatched { expected, completed }
-                        } };
+                            FailedEvidence::PendingMismatched {
+                                expected,
+                                completed,
+                            }
+                        },
+                    };
                     return Ok(true);
                 }
-                CapturedStage::Failed { evidence: FailedEvidence::Pending { actor, id }, .. } => {
+                CapturedStage::Failed {
+                    evidence: FailedEvidence::Pending { actor, id },
+                    ..
+                } => {
                     let expected = *id;
-                    let Some(completed) = session.take_completed_actor(&self.permit, actor)? else { return Ok(false); };
+                    let Some(completed) = session.take_completed_actor(&self.permit, actor)? else {
+                        return Ok(false);
+                    };
                     if let CapturedStage::Failed { evidence, .. } = &mut entry.stage {
                         *evidence = if completed.dispatch.id() == expected {
-                            FailedEvidence::PendingCompleted { id: expected, completed }
+                            FailedEvidence::PendingCompleted {
+                                id: expected,
+                                completed,
+                            }
                         } else {
-                            FailedEvidence::PendingMismatched { expected, completed }
+                            FailedEvidence::PendingMismatched {
+                                expected,
+                                completed,
+                            }
                         };
                     }
                     return Ok(true);
@@ -280,7 +336,10 @@ impl PumpCustodyV2 {
                         *evidence = if completed.dispatch.id() == id {
                             FailedEvidence::PendingCompleted { id, completed }
                         } else {
-                            FailedEvidence::PendingMismatched { expected: id, completed }
+                            FailedEvidence::PendingMismatched {
+                                expected: id,
+                                completed,
+                            }
                         };
                     }
                     return Ok(true);
@@ -341,15 +400,37 @@ impl RetiredRowPumpV2 {
         row: RoventRetiredLockV2Record,
     ) -> Result<(), Box<(ArenaError, RoventRetiredLockV2Record)>> {
         if self.seen_retired.len() >= 65_536 || self.seen_retired.contains_key(&row.ticket().id) {
-            return Err(Box::new((invalid("retired teacher ticket repeated or ledger full"), row)));
+            return Err(Box::new((
+                invalid("retired teacher ticket repeated or ledger full"),
+                row,
+            )));
         }
-        if let Some(captured) = self.captured.iter_mut().find(|captured| captured.ticket.id == row.ticket().id) {
-            if captured.row.is_some() || captured.ticket != *row.ticket()
-                || captured.capsule.as_ref().is_some_and(|capsule| capsule.matches_original_row(&row).is_err()) {
-                return Err(Box::new((invalid("captured teacher input and retired row differ or repeat"), row)));
+        if let Some(captured) = self
+            .captured
+            .iter_mut()
+            .find(|captured| captured.ticket.id == row.ticket().id)
+        {
+            if captured.row.is_some()
+                || captured.ticket != *row.ticket()
+                || captured
+                    .capsule
+                    .as_ref()
+                    .is_some_and(|capsule| capsule.matches_original_row(&row).is_err())
+            {
+                return Err(Box::new((
+                    invalid("captured teacher input and retired row differ or repeat"),
+                    row,
+                )));
             }
-            self.seen_retired.insert(row.ticket().id,
-                (row.admission.clone(), std::sync::Arc::clone(&row.producer_owner), row.submitted_input_seal(), true));
+            self.seen_retired.insert(
+                row.ticket().id,
+                (
+                    row.admission.clone(),
+                    std::sync::Arc::clone(&row.producer_owner),
+                    row.submitted_input_seal(),
+                    true,
+                ),
+            );
             captured.row = Some(row);
             return Ok(());
         }
@@ -376,8 +457,15 @@ impl RetiredRowPumpV2 {
             )));
         };
         let deadline = deadline.min(self.observation_deadline);
-        self.seen_retired.insert(row.ticket().id,
-            (row.admission.clone(), std::sync::Arc::clone(&row.producer_owner), row.submitted_input_seal(), false));
+        self.seen_retired.insert(
+            row.ticket().id,
+            (
+                row.admission.clone(),
+                std::sync::Arc::clone(&row.producer_owner),
+                row.submitted_input_seal(),
+                false,
+            ),
+        );
         self.entries.push_back(Entry {
             row,
             deadline,
@@ -390,15 +478,26 @@ impl RetiredRowPumpV2 {
     /// retired path already retained the exact original producer identity.
     /// This never dispatches a teacher or establishes completion.
     pub(crate) fn is_exact_retired_duplicate(
-        &self, capsule: &super::super::producer_v2::SubmittedTeacherQueryV2,
+        &self,
+        capsule: &super::super::producer_v2::SubmittedTeacherQueryV2,
     ) -> bool {
         let ticket = capsule.ticket();
-        self.seen_retired.get(&ticket.id).is_some_and(|(admission, producer, seal, via_captured)|
-            !*via_captured && capsule.matches_original_identity(admission, producer, seal).is_ok())
+        self.seen_retired.get(&ticket.id).is_some_and(
+            |(admission, producer, seal, via_captured)| {
+                !*via_captured
+                    && capsule
+                        .matches_original_identity(admission, producer, seal)
+                        .is_ok()
+            },
+        )
     }
 
     pub(crate) fn can_enqueue_row(&self, row: &RoventRetiredLockV2Record) -> bool {
-        self.entries.len() < self.capacity || self.captured.iter().any(|entry| entry.row.is_none() && entry.ticket.id == row.ticket().id)
+        self.entries.len() < self.capacity
+            || self
+                .captured
+                .iter()
+                .any(|entry| entry.row.is_none() && entry.ticket.id == row.ticket().id)
     }
 
     pub(crate) fn overflow_count(&self) -> u64 {
@@ -413,13 +512,24 @@ impl RetiredRowPumpV2 {
     pub(crate) fn enqueue_captured(
         &mut self,
         capsule: super::super::producer_v2::SubmittedTeacherQueryV2,
-    ) -> Result<(), Box<(ArenaError, super::super::producer_v2::SubmittedTeacherQueryV2)>> {
+    ) -> Result<
+        (),
+        Box<(
+            ArenaError,
+            super::super::producer_v2::SubmittedTeacherQueryV2,
+        )>,
+    > {
         let seal = capsule.input_seal();
-        if let Some((admission, producer, original, via_captured)) = self.seen_retired.get(&seal.ticket.id) {
+        if let Some((admission, producer, original, via_captured)) =
+            self.seen_retired.get(&seal.ticket.id)
+        {
             // A captured-path job could be active: keep the duplicate as
             // unknown rather than discarding possible physical evidence.
             if *via_captured {
-                return Err(Box::new((invalid("captured-path duplicate remains in custody"), capsule)));
+                return Err(Box::new((
+                    invalid("captured-path duplicate remains in custody"),
+                    capsule,
+                )));
             }
             // The legacy retired path owns this exact input. Avoid a duplicate
             // teacher job; no new target or completion is claimed.
@@ -428,47 +538,82 @@ impl RetiredRowPumpV2 {
                 Err(error) => Err(Box::new((error, capsule))),
             };
         }
-        if self.captured.len() >= self.capacity || !capsule.admission().same_original_admission(&self.admission)
+        if self.captured.len() >= self.capacity
+            || !capsule.admission().same_original_admission(&self.admission)
             || seal.ticket.original_deadline.clock != self.clock_domain
-            || self.captured.iter().any(|entry| entry.ticket.id == seal.ticket.id) {
-            return Err(Box::new((invalid("captured teacher query capacity/root/duplicate"), capsule)));
+            || self
+                .captured
+                .iter()
+                .any(|entry| entry.ticket.id == seal.ticket.id)
+        {
+            return Err(Box::new((
+                invalid("captured teacher query capacity/root/duplicate"),
+                capsule,
+            )));
         }
-        let Some(deadline) = self.clock_origin.checked_add(Duration::from_nanos(seal.ticket.original_deadline.at.0)) else {
-            return Err(Box::new((invalid("captured teacher query deadline overflow"), capsule)));
+        let Some(deadline) = self
+            .clock_origin
+            .checked_add(Duration::from_nanos(seal.ticket.original_deadline.at.0))
+        else {
+            return Err(Box::new((
+                invalid("captured teacher query deadline overflow"),
+                capsule,
+            )));
         };
         if self.captured.try_reserve(1).is_err() {
-            return Err(Box::new((invalid("captured teacher query allocation failed"), capsule)));
+            return Err(Box::new((
+                invalid("captured teacher query allocation failed"),
+                capsule,
+            )));
         }
-        self.captured.push_back(CapturedEntry { capsule: Some(capsule), ticket: seal.ticket, row: None, deadline: deadline.min(self.observation_deadline), stage: CapturedStage::Queued });
+        self.captured.push_back(CapturedEntry {
+            capsule: Some(capsule),
+            ticket: seal.ticket,
+            row: None,
+            deadline: deadline.min(self.observation_deadline),
+            stage: CapturedStage::Queued,
+        });
         Ok(())
     }
 
     /// Observe transitions of the same original front item without moving it.
     pub(crate) fn has_uncertain_failure(&self) -> bool {
-        self.pending_failure || self.entries.iter().any(|entry| match &entry.stage {
-            Stage::TransitionUnknown | Stage::Pending { .. } => true,
-            Stage::Failed { evidence, .. } => evidence.has_uncertain_cleanup(),
-            _ => false,
-        }) || self.captured.iter().any(|entry| match &entry.stage {
-            CapturedStage::TransitionUnknown | CapturedStage::Pending { .. } => true,
-            CapturedStage::Failed { evidence, .. } => evidence.has_uncertain_cleanup(),
-            _ => false,
-        })
+        self.pending_failure
+            || self.entries.iter().any(|entry| match &entry.stage {
+                Stage::TransitionUnknown | Stage::Pending { .. } => true,
+                Stage::Failed { evidence, .. } => evidence.has_uncertain_cleanup(),
+                _ => false,
+            })
+            || self.captured.iter().any(|entry| match &entry.stage {
+                CapturedStage::TransitionUnknown | CapturedStage::Pending { .. } => true,
+                CapturedStage::Failed { evidence, .. } => evidence.has_uncertain_cleanup(),
+                _ => false,
+            })
     }
 
-    pub(crate) fn captured_len(&self) -> usize { self.captured.len() }
-    pub(crate) fn retired_len(&self) -> usize { self.entries.len() }
+    pub(crate) fn captured_len(&self) -> usize {
+        self.captured.len()
+    }
+    pub(crate) fn retired_len(&self) -> usize {
+        self.entries.len()
+    }
 
     pub(crate) fn has_captured_completed(&self) -> bool {
-        self.captured.iter().any(|entry| matches!(entry.stage, CapturedStage::Completed(_)))
+        self.captured
+            .iter()
+            .any(|entry| matches!(entry.stage, CapturedStage::Completed(_)))
     }
 
     pub(crate) fn front_pending(&self) -> bool {
-        self.entries.front().is_some_and(|entry| matches!(entry.stage, Stage::Pending { .. }))
+        self.entries
+            .front()
+            .is_some_and(|entry| matches!(entry.stage, Stage::Pending { .. }))
     }
 
     pub(crate) fn front_completed(&self) -> bool {
-        self.entries.front().is_some_and(|entry| matches!(entry.stage, Stage::Completed(_)))
+        self.entries
+            .front()
+            .is_some_and(|entry| matches!(entry.stage, Stage::Completed(_)))
     }
 
     pub(crate) fn stage_counts(&self) -> PumpStageCountsV2 {
@@ -646,16 +791,33 @@ impl RetiredRowPumpV2 {
         session.validate_pump_owner(&self.session_owner)?;
         // Terminal cleanup is independent of root admission. Never seal or
         // dispatch a new question from a failed pending entry.
-        if let Some(entry) = self.captured.iter_mut().find(|entry| matches!(entry.stage,
-            CapturedStage::Failed { evidence: FailedEvidence::Pending { .. }, .. })) {
-            if let CapturedStage::Failed { evidence: FailedEvidence::Pending { actor, id }, .. } = &mut entry.stage {
+        if let Some(entry) = self.captured.iter_mut().find(|entry| {
+            matches!(
+                entry.stage,
+                CapturedStage::Failed {
+                    evidence: FailedEvidence::Pending { .. },
+                    ..
+                }
+            )
+        }) {
+            if let CapturedStage::Failed {
+                evidence: FailedEvidence::Pending { actor, id },
+                ..
+            } = &mut entry.stage
+            {
                 let expected = *id;
                 if let Some(completed) = session.take_completed_actor(&self.session_owner, actor)? {
                     if let CapturedStage::Failed { evidence, .. } = &mut entry.stage {
                         *evidence = if completed.dispatch.id() == expected {
-                            FailedEvidence::PendingCompleted { id: expected, completed }
+                            FailedEvidence::PendingCompleted {
+                                id: expected,
+                                completed,
+                            }
                         } else {
-                            FailedEvidence::PendingMismatched { expected, completed }
+                            FailedEvidence::PendingMismatched {
+                                expected,
+                                completed,
+                            }
                         };
                     }
                 }
@@ -664,19 +826,44 @@ impl RetiredRowPumpV2 {
         }
         let allow_submission = allow_submission && !self.pending_failure;
         let index = if self.pending_failure {
-            self.captured.iter().position(|entry| matches!(entry.stage, CapturedStage::Pending { .. }))
+            self.captured
+                .iter()
+                .position(|entry| matches!(entry.stage, CapturedStage::Pending { .. }))
         } else {
-            self.captured.iter().position(|entry| matches!(entry.stage, CapturedStage::Completed(_)))
-                .or_else(|| self.captured.iter().position(|entry| entry.row.is_some() && matches!(entry.stage, CapturedStage::Sealed(_))))
-                .or_else(|| self.captured.iter().position(|entry| matches!(entry.stage, CapturedStage::Pending { .. })))
-                .or_else(|| if allow_submission { self.captured.iter().position(|entry| matches!(entry.stage, CapturedStage::Queued)) } else { None })
+            self.captured
+                .iter()
+                .position(|entry| matches!(entry.stage, CapturedStage::Completed(_)))
+                .or_else(|| {
+                    self.captured.iter().position(|entry| {
+                        entry.row.is_some() && matches!(entry.stage, CapturedStage::Sealed(_))
+                    })
+                })
+                .or_else(|| {
+                    self.captured
+                        .iter()
+                        .position(|entry| matches!(entry.stage, CapturedStage::Pending { .. }))
+                })
+                .or_else(|| {
+                    if allow_submission {
+                        self.captured
+                            .iter()
+                            .position(|entry| matches!(entry.stage, CapturedStage::Queued))
+                    } else {
+                        None
+                    }
+                })
         };
-        let Some(index) = index else { return Ok(()); };
+        let Some(index) = index else {
+            return Ok(());
+        };
         let entry = &mut self.captured[index];
         let stage = std::mem::replace(&mut entry.stage, CapturedStage::TransitionUnknown);
         entry.stage = match stage {
             CapturedStage::Queued => {
-                let capsule = entry.capsule.as_ref().expect("queued capture retains capsule");
+                let capsule = entry
+                    .capsule
+                    .as_ref()
+                    .expect("queued capture retains capsule");
                 let actor = capsule.input_seal().teacher_actor_id;
                 match actor {
                     None => CapturedStage::Unlabeled,
@@ -687,28 +874,51 @@ impl RetiredRowPumpV2 {
                     },
                     Some(_) if !allow_submission => CapturedStage::Queued,
                     Some(_) if Instant::now() >= entry.deadline => CapturedStage::Failed {
-                        error: invalid("captured teacher deadline expired before submission"), evidence: FailedEvidence::BeforeCompletion,
+                        error: invalid("captured teacher deadline expired before submission"),
+                        evidence: FailedEvidence::BeforeCompletion,
                     },
-                    Some(actor) => match session.submit_captured_query(&self.session_owner, capsule, self.constraint, self.soft_quantum) {
-                        Ok(TeacherSubmitOutcomeV2::Submitted(id)) => CapturedStage::Pending { actor, id },
+                    Some(actor) => match session.submit_captured_query(
+                        &self.session_owner,
+                        capsule,
+                        self.constraint,
+                        self.soft_quantum,
+                    ) {
+                        Ok(TeacherSubmitOutcomeV2::Submitted(id)) => {
+                            CapturedStage::Pending { actor, id }
+                        }
                         Ok(TeacherSubmitOutcomeV2::Pending(_)) => CapturedStage::Queued,
-                        Err(error) => CapturedStage::Failed { error, evidence: FailedEvidence::BeforeCompletion },
+                        Err(error) => CapturedStage::Failed {
+                            error,
+                            evidence: FailedEvidence::BeforeCompletion,
+                        },
                     },
                 }
             }
             CapturedStage::Pending { actor, id } => {
-                let canceled = entry.capsule.as_ref().is_some_and(|capsule| capsule.is_canceled());
+                let canceled = entry
+                    .capsule
+                    .as_ref()
+                    .is_some_and(|capsule| capsule.is_canceled());
                 if canceled {
                     match session.cancel_pending_ticket(&self.session_owner, &entry.ticket) {
-                        Ok(super::v2_session::TeacherTicketCancelOutcomeV2::Requested
-                            | super::v2_session::TeacherTicketCancelOutcomeV2::AlreadyRequested) => {},
+                        Ok(
+                            super::v2_session::TeacherTicketCancelOutcomeV2::Requested
+                            | super::v2_session::TeacherTicketCancelOutcomeV2::AlreadyRequested,
+                        ) => {}
                         Ok(super::v2_session::TeacherTicketCancelOutcomeV2::NotPending) => {
-                            entry.stage = CapturedStage::Failed { error: invalid("captured canceled teacher original pending missing"),
-                                evidence: FailedEvidence::Pending { actor, id } };
+                            entry.stage = CapturedStage::Failed {
+                                error: invalid(
+                                    "captured canceled teacher original pending missing",
+                                ),
+                                evidence: FailedEvidence::Pending { actor, id },
+                            };
                             return Ok(());
-                        },
+                        }
                         Err(error) => {
-                            entry.stage = CapturedStage::Failed { error, evidence: FailedEvidence::Pending { actor, id } };
+                            entry.stage = CapturedStage::Failed {
+                                error,
+                                evidence: FailedEvidence::Pending { actor, id },
+                            };
                             return Ok(());
                         }
                     }
@@ -716,28 +926,51 @@ impl RetiredRowPumpV2 {
                 match session.take_completed_actor(&self.session_owner, &actor) {
                     Ok(Some(completed)) if completed.dispatch.id() != id => CapturedStage::Failed {
                         error: invalid("captured teacher terminal identity mismatch"),
-                        evidence: FailedEvidence::PendingMismatched { expected: id, completed },
+                        evidence: FailedEvidence::PendingMismatched {
+                            expected: id,
+                            completed,
+                        },
                     },
-                    Ok(Some(completed)) if canceled || !allow_submission || Instant::now() >= entry.deadline => CapturedStage::Failed {
-                        error: invalid("captured teacher terminal arrived after closure or deadline"),
-                        evidence: FailedEvidence::PendingCompleted { id, completed },
-                    },
+                    Ok(Some(completed))
+                        if canceled || !allow_submission || Instant::now() >= entry.deadline =>
+                    {
+                        CapturedStage::Failed {
+                            error: invalid(
+                                "captured teacher terminal arrived after closure or deadline",
+                            ),
+                            evidence: FailedEvidence::PendingCompleted { id, completed },
+                        }
+                    }
                     Ok(Some(completed)) => CapturedStage::Completed(completed),
                     Ok(None) if Instant::now() >= entry.deadline => CapturedStage::Failed {
                         error: invalid("captured teacher terminal missing at deadline"),
                         evidence: FailedEvidence::Pending { actor, id },
                     },
                     Ok(None) => CapturedStage::Pending { actor, id },
-                    Err(error) => CapturedStage::Failed { error, evidence: FailedEvidence::Pending { actor, id } },
+                    Err(error) => CapturedStage::Failed {
+                        error,
+                        evidence: FailedEvidence::Pending { actor, id },
+                    },
                 }
             }
-            CapturedStage::Completed(completed) if entry.capsule.as_ref().is_some_and(|capsule| capsule.is_canceled())
-                || !allow_submission || Instant::now() >= entry.deadline => CapturedStage::Failed {
-                error: invalid("captured teacher completion not sealed before closure"),
-                evidence: FailedEvidence::Completion(completed),
-            },
+            CapturedStage::Completed(completed)
+                if entry
+                    .capsule
+                    .as_ref()
+                    .is_some_and(|capsule| capsule.is_canceled())
+                    || !allow_submission
+                    || Instant::now() >= entry.deadline =>
+            {
+                CapturedStage::Failed {
+                    error: invalid("captured teacher completion not sealed before closure"),
+                    evidence: FailedEvidence::Completion(completed),
+                }
+            }
             CapturedStage::Completed(completed) => {
-                let capsule = entry.capsule.take().expect("completed capture retains capsule");
+                let capsule = entry
+                    .capsule
+                    .take()
+                    .expect("completed capture retains capsule");
                 match session.seal_captured_completion(&self.session_owner, capsule, completed) {
                     Ok(sealed) => CapturedStage::Sealed(sealed),
                     Err(rejected) => {
@@ -745,18 +978,32 @@ impl RetiredRowPumpV2 {
                         entry.capsule = Some(capsule);
                         match rejection {
                             TeacherPolicySealRejectionV2::Rejected { cause, completed } => {
-                                if matches!(&cause, TeacherPolicySealFailureV2::Native { kind: RoventTeacherPolicySealFailureKindV2::Busy, .. })
-                                    && Instant::now() < entry.deadline {
+                                if matches!(
+                                    &cause,
+                                    TeacherPolicySealFailureV2::Native {
+                                        kind: RoventTeacherPolicySealFailureKindV2::Busy,
+                                        ..
+                                    }
+                                ) && Instant::now() < entry.deadline
+                                {
                                     CapturedStage::Completed(completed)
                                 } else {
-                                    if matches!(&cause, TeacherPolicySealFailureV2::Panicked(_)) { self.pending_failure = true; }
-                                    CapturedStage::Failed { error: invalid("captured teacher seal rejected"), evidence: FailedEvidence::SealRejected { cause, completed } }
+                                    if matches!(&cause, TeacherPolicySealFailureV2::Panicked(_)) {
+                                        self.pending_failure = true;
+                                    }
+                                    CapturedStage::Failed {
+                                        error: invalid("captured teacher seal rejected"),
+                                        evidence: FailedEvidence::SealRejected { cause, completed },
+                                    }
                                 }
                             }
                             TeacherPolicySealRejectionV2::Quarantined(custody) => {
                                 self.pending_failure = true;
-                                CapturedStage::Failed { error: invalid("captured teacher seal quarantined"), evidence: FailedEvidence::Quarantined(custody) }
-                            },
+                                CapturedStage::Failed {
+                                    error: invalid("captured teacher seal quarantined"),
+                                    evidence: FailedEvidence::Quarantined(custody),
+                                }
+                            }
                         }
                     }
                 }
@@ -767,22 +1014,41 @@ impl RetiredRowPumpV2 {
                     Ok(sealed) => match prepare_teacher_policy_lock_v2(row, sealed) {
                         Ok(prepared) => CapturedStage::Prepared(prepared),
                         Err(rejected) => {
-                            let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 { error, sealed, panic } = *rejected;
-                            CapturedStage::Failed { error, evidence: match panic {
-                                Some(panic) => { self.pending_failure = true; FailedEvidence::PreparationPanicked { sealed, panic } },
-                                None => FailedEvidence::Sealed(sealed),
-                            }}
+                            let super::lock_v2_policy::PrepareTeacherPolicyFailureV2 {
+                                error,
+                                sealed,
+                                panic,
+                            } = *rejected;
+                            CapturedStage::Failed {
+                                error,
+                                evidence: match panic {
+                                    Some(panic) => {
+                                        self.pending_failure = true;
+                                        FailedEvidence::PreparationPanicked { sealed, panic }
+                                    }
+                                    None => FailedEvidence::Sealed(sealed),
+                                },
+                            }
                         }
                     },
                     Err(rejected) => {
                         let (cause, sealed) = *rejected;
                         match cause {
-                            super::v2_session::SpeculativeTeacherJoinFailureV2::Validation(error) =>
-                                CapturedStage::Failed { error, evidence: FailedEvidence::CapturedMismatch(sealed) },
+                            super::v2_session::SpeculativeTeacherJoinFailureV2::Validation(
+                                error,
+                            ) => CapturedStage::Failed {
+                                error,
+                                evidence: FailedEvidence::CapturedMismatch(sealed),
+                            },
                             super::v2_session::SpeculativeTeacherJoinFailureV2::Panicked(panic) => {
                                 self.pending_failure = true;
-                                CapturedStage::Failed { error: invalid("captured teacher join panicked"),
-                                    evidence: FailedEvidence::CapturedJoinPanicked { sealed, panic } }
+                                CapturedStage::Failed {
+                                    error: invalid("captured teacher join panicked"),
+                                    evidence: FailedEvidence::CapturedJoinPanicked {
+                                        sealed,
+                                        panic,
+                                    },
+                                }
                             }
                         }
                     }
@@ -801,11 +1067,16 @@ impl RetiredRowPumpV2 {
         session: &mut RoventCollectionTeacherSessionV2,
     ) -> Result<bool, ArenaError> {
         session.validate_pump_owner(&self.session_owner)?;
-        let Some(entry) = self.entries.front_mut() else { return Ok(false); };
+        let Some(entry) = self.entries.front_mut() else {
+            return Ok(false);
+        };
         match &mut entry.stage {
             Stage::Pending { actor, id } => {
                 let expected = *id;
-                let Some(completed) = session.take_completed_actor(&self.session_owner, actor)? else { return Ok(false); };
+                let Some(completed) = session.take_completed_actor(&self.session_owner, actor)?
+                else {
+                    return Ok(false);
+                };
                 let matched = completed.dispatch.id() == expected;
                 entry.stage = Stage::Failed {
                     error: invalid(if matched {
@@ -814,21 +1085,39 @@ impl RetiredRowPumpV2 {
                         "V2 pending teacher dispatch identity mismatch"
                     }),
                     evidence: if matched {
-                        FailedEvidence::PendingCompleted { id: expected, completed }
+                        FailedEvidence::PendingCompleted {
+                            id: expected,
+                            completed,
+                        }
                     } else {
-                        FailedEvidence::PendingMismatched { expected, completed }
+                        FailedEvidence::PendingMismatched {
+                            expected,
+                            completed,
+                        }
                     },
                 };
                 Ok(true)
             }
-            Stage::Failed { evidence: FailedEvidence::Pending { actor, id }, .. } => {
+            Stage::Failed {
+                evidence: FailedEvidence::Pending { actor, id },
+                ..
+            } => {
                 let expected = *id;
-                let Some(completed) = session.take_completed_actor(&self.session_owner, actor)? else { return Ok(false); };
+                let Some(completed) = session.take_completed_actor(&self.session_owner, actor)?
+                else {
+                    return Ok(false);
+                };
                 if let Stage::Failed { evidence, .. } = &mut entry.stage {
                     *evidence = if completed.dispatch.id() == expected {
-                        FailedEvidence::PendingCompleted { id: expected, completed }
+                        FailedEvidence::PendingCompleted {
+                            id: expected,
+                            completed,
+                        }
                     } else {
-                        FailedEvidence::PendingMismatched { expected, completed }
+                        FailedEvidence::PendingMismatched {
+                            expected,
+                            completed,
+                        }
                     };
                 }
                 Ok(true)
@@ -842,19 +1131,24 @@ impl RetiredRowPumpV2 {
     pub(crate) fn retire_unissued_after_revoke(&mut self) {
         for entry in &mut self.captured {
             if matches!(entry.stage, CapturedStage::Queued) {
-                entry.stage = if entry.capsule.as_ref().is_some_and(|capsule|
-                    capsule.input_seal().teacher_actor_id.is_none() || !capsule.has_policy_candidates()) {
+                entry.stage = if entry.capsule.as_ref().is_some_and(|capsule| {
+                    capsule.input_seal().teacher_actor_id.is_none()
+                        || !capsule.has_policy_candidates()
+                }) {
                     CapturedStage::Unlabeled
                 } else {
-                    CapturedStage::Failed { error: invalid("captured teacher request unissued after root revoke"),
-                        evidence: FailedEvidence::UnissuedRootRevoked }
+                    CapturedStage::Failed {
+                        error: invalid("captured teacher request unissued after root revoke"),
+                        evidence: FailedEvidence::UnissuedRootRevoked,
+                    }
                 };
             }
         }
         if let Some(entry) = self.entries.front_mut() {
             if matches!(entry.stage, Stage::Queued) {
                 entry.stage = if entry.row.submitted_input_seal().teacher_actor_id.is_none()
-                    || entry.row.record.0.input.legal_moves.is_empty() {
+                    || entry.row.record.0.input.legal_moves.is_empty()
+                {
                     Stage::Unlabeled
                 } else {
                     Stage::Failed {
@@ -872,19 +1166,42 @@ impl RetiredRowPumpV2 {
     pub(crate) fn take_ready(&mut self) -> Option<PumpItemV2> {
         // A captured query is useful only after the exact NN result retired.
         // Retain missing rows and unfinished evidence with this pump owner.
-        if let Some(index) = self.captured.iter().position(|entry| entry.row.is_some()
-            && matches!(entry.stage, CapturedStage::Unlabeled | CapturedStage::Prepared(_) | CapturedStage::Failed { .. })
-            && !matches!(entry.stage, CapturedStage::Failed { evidence: FailedEvidence::Pending { .. }, .. })) {
+        if let Some(index) = self.captured.iter().position(|entry| {
+            entry.row.is_some()
+                && matches!(
+                    entry.stage,
+                    CapturedStage::Unlabeled
+                        | CapturedStage::Prepared(_)
+                        | CapturedStage::Failed { .. }
+                )
+                && !matches!(
+                    entry.stage,
+                    CapturedStage::Failed {
+                        evidence: FailedEvidence::Pending { .. },
+                        ..
+                    }
+                )
+        }) {
             let entry = self.captured.remove(index).expect("captured item checked");
             let row = entry.row.expect("retired row checked");
             return Some(match entry.stage {
                 CapturedStage::Unlabeled => PumpItemV2::Unlabeled { row },
-                CapturedStage::Prepared(evidence) => PumpItemV2::Prepared { row, evidence: Some(evidence), sealed: None },
-                CapturedStage::Failed { error, evidence } => PumpItemV2::Failed { row, error,
+                CapturedStage::Prepared(evidence) => PumpItemV2::Prepared {
+                    row,
+                    evidence: Some(evidence),
+                    sealed: None,
+                },
+                CapturedStage::Failed { error, evidence } => PumpItemV2::Failed {
+                    row,
+                    error,
                     evidence: match entry.capsule {
-                        Some(capsule) => FailedEvidence::Captured { capsule, failure: Box::new(evidence) },
+                        Some(capsule) => FailedEvidence::Captured {
+                            capsule,
+                            failure: Box::new(evidence),
+                        },
                         None => evidence,
-                    } },
+                    },
+                },
                 _ => unreachable!("captured readiness checked"),
             });
         }

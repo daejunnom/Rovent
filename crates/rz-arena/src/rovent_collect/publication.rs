@@ -495,7 +495,10 @@ pub(super) fn publish_original_payloads<P: serde::Serialize, S: PublicationSourc
 /// synced and immediately before the publication hard-link. Failure leaves
 /// the original pending files; it never creates a success receipt.
 #[cfg(target_os = "linux")]
-pub(super) fn publish_original_payloads_authorized<P: serde::Serialize, S: PublicationSourceBytes>(
+pub(super) fn publish_original_payloads_authorized<
+    P: serde::Serialize,
+    S: PublicationSourceBytes,
+>(
     directory: &cap_std::fs::Dir,
     until: std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,

@@ -57,8 +57,12 @@ pub struct SealedExecutionProbe {
 #[cfg(target_os = "linux")]
 impl SealedExecutionProbe {
     pub fn execution_observations(&self) -> (u64, u64) {
-        (self.counters.sealed_spawn_returned.load(Ordering::Acquire),
-         self.counters.original_fallback_attempted.load(Ordering::Acquire))
+        (
+            self.counters.sealed_spawn_returned.load(Ordering::Acquire),
+            self.counters
+                .original_fallback_attempted
+                .load(Ordering::Acquire),
+        )
     }
 }
 
@@ -116,7 +120,10 @@ impl VerifiedSealedExecutable {
         )
         .map_err(|_| error("sealed_prepare", "memfd_create"))?;
         let mut file = File::from(fd);
-        if !file.metadata().is_ok_and(|metadata| metadata.mode() & 0o111 != 0) {
+        if !file
+            .metadata()
+            .is_ok_and(|metadata| metadata.mode() & 0o111 != 0)
+        {
             return Err(error("sealed_prepare", "memfd_not_executable"));
         }
         let mut total = 0u64;
@@ -190,7 +197,9 @@ impl VerifiedSealedExecutable {
             return Err(error("sealed_prepare", "hash_mismatch"));
         }
         check()?;
-        let original = original.try_clone().map_err(|_| error("sealed_prepare", "original_clone"))?;
+        let original = original
+            .try_clone()
+            .map_err(|_| error("sealed_prepare", "original_clone"))?;
         Ok(Self {
             file: Arc::new(file),
             original: Arc::new(original),
@@ -201,13 +210,19 @@ impl VerifiedSealedExecutable {
 
     /// Cumulative source-slot observations, not process completion evidence.
     pub fn execution_observations(&self) -> (u64, u64) {
-        (self.counters.sealed_spawn_returned.load(Ordering::Acquire),
-         self.counters.original_fallback_attempted.load(Ordering::Acquire))
+        (
+            self.counters.sealed_spawn_returned.load(Ordering::Acquire),
+            self.counters
+                .original_fallback_attempted
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Retain counters without extending the sealed file's memory lifetime.
     pub fn execution_probe(&self) -> SealedExecutionProbe {
-        SealedExecutionProbe { counters: Arc::clone(&self.counters) }
+        SealedExecutionProbe {
+            counters: Arc::clone(&self.counters),
+        }
     }
 }
 
@@ -1780,9 +1795,15 @@ impl ExternalUciCpuChecker {
     /// Record exact, legal tuples as reported; a bounded or incomplete next
     /// depth never replaces the most recent complete equal-depth set.
     fn observe_exact_policy_iteration(&mut self, opinion: &ExternalPolicyOpinion, width: u16) {
-        if opinion.rank == 0 || opinion.rank > width { return; }
+        if opinion.rank == 0 || opinion.rank > width {
+            return;
+        }
         if opinion.bound != ExternalBound::ExactReported || opinion.pv.is_empty() {
-            if self.cooperative_exact_candidates.first().is_some_and(|first| first.depth == opinion.depth) {
+            if self
+                .cooperative_exact_candidates
+                .first()
+                .is_some_and(|first| first.depth == opinion.depth)
+            {
                 self.cooperative_exact_candidates.clear();
             }
             return;
@@ -1792,27 +1813,42 @@ impl ExternalUciCpuChecker {
         if opinion.rank == 1 {
             self.cooperative_exact_candidates.clear();
             self.cooperative_exact_candidates.push(opinion.clone());
-        } else if self.cooperative_exact_candidates.last().is_some_and(|last|
-            last.rank + 1 == opinion.rank && last.depth == opinion.depth)
+        } else if self
+            .cooperative_exact_candidates
+            .last()
+            .is_some_and(|last| last.rank + 1 == opinion.rank && last.depth == opinion.depth)
         {
             self.cooperative_exact_candidates.push(opinion.clone());
         } else {
             self.cooperative_exact_candidates.clear();
             return;
         }
-        if self.cooperative_exact_candidates.len() != usize::from(width) { return; }
+        if self.cooperative_exact_candidates.len() != usize::from(width) {
+            return;
+        }
         let depth = self.cooperative_exact_candidates[0].depth;
-        if self.cooperative_exact_candidates.iter().enumerate().all(|(index, item)|
-            item.rank == index as u16 + 1 && item.depth == depth
-                && !self.cooperative_exact_candidates[..index].iter().any(|prior| prior.pv.first() == item.pv.first()))
+        if self
+            .cooperative_exact_candidates
+            .iter()
+            .enumerate()
+            .all(|(index, item)| {
+                item.rank == index as u16 + 1
+                    && item.depth == depth
+                    && !self.cooperative_exact_candidates[..index]
+                        .iter()
+                        .any(|prior| prior.pv.first() == item.pv.first())
+            })
         {
             let first = self.cooperative_exact_candidates[0].pv[0];
-            if let Some(old) = self.cooperative_exact_completed.iter_mut().find(|set|
-                set.first().and_then(|opinion| opinion.pv.first()).copied() == Some(first))
-            {
-                if old[0].depth < depth { old.clone_from(&self.cooperative_exact_candidates); }
+            if let Some(old) = self.cooperative_exact_completed.iter_mut().find(|set| {
+                set.first().and_then(|opinion| opinion.pv.first()).copied() == Some(first)
+            }) {
+                if old[0].depth < depth {
+                    old.clone_from(&self.cooperative_exact_candidates);
+                }
             } else if self.cooperative_exact_completed.len() < self.cooperative_exact_limit {
-                self.cooperative_exact_completed.push(self.cooperative_exact_candidates.clone());
+                self.cooperative_exact_completed
+                    .push(self.cooperative_exact_candidates.clone());
             }
         }
     }
@@ -1822,10 +1858,10 @@ impl ExternalUciCpuChecker {
     /// a stopped/cancelled execution into a completed policy observation.
     fn select_completed_exact_policy(&mut self, report: &ExternalCheckerReport, width: u16) {
         if report.completion == ExternalCompletion::BestMove {
-            if let Some(exact) = self.cooperative_exact_completed.iter().find(|set|
+            if let Some(exact) = self.cooperative_exact_completed.iter().find(|set| {
                 set.len() == usize::from(width)
-                    && set.first().and_then(|item| item.pv.first()).copied() == report.best_move)
-            {
+                    && set.first().and_then(|item| item.pv.first()).copied() == report.best_move
+            }) {
                 self.cooperative_opinions.clone_from(exact);
             }
         }
@@ -2359,21 +2395,29 @@ mod process {
             lease.ensure_spawn_allowed()?;
             let mut child = match command.spawn() {
                 Ok(child) => {
-                    if let Some(counters) = launch_pin.and_then(|pin| pin.sealed_counters.as_ref()) {
+                    if let Some(counters) = launch_pin.and_then(|pin| pin.sealed_counters.as_ref())
+                    {
                         if launch_pin.is_some_and(|pin| pin.sealed_sha256.is_some()) {
                             let _ = counters.sealed_spawn_returned.fetch_update(
-                                Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                                |n| Some(n.saturating_add(1)),
+                            );
                         }
                     }
                     child
                 }
                 Err(failure)
                     if launch_pin.is_some_and(|pin| pin.sealed_sha256.is_some())
-                        && matches!(failure.raw_os_error(),
-                            Some(nix::libc::EACCES | nix::libc::EPERM | nix::libc::ETXTBSY)) =>
+                        && matches!(
+                            failure.raw_os_error(),
+                            Some(nix::libc::EACCES | nix::libc::EPERM | nix::libc::ETXTBSY)
+                        ) =>
                 {
                     let pin = launch_pin.expect("sealed pin checked above");
-                    let original = pin.fallback_executable.as_ref()
+                    let original = pin
+                        .fallback_executable
+                        .as_ref()
                         .ok_or_else(|| error("spawn", "sealed_fallback_missing"))?;
                     let mut fallback = pin.clone();
                     fallback.executable = Arc::clone(original);
@@ -2381,14 +2425,23 @@ mod process {
                     fallback.fallback_executable = None;
                     if let Some(counters) = pin.sealed_counters.as_ref() {
                         let _ = counters.original_fallback_attempted.fetch_update(
-                            Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |n| Some(n.saturating_add(1)),
+                        );
                     }
                     // No child was returned: transfer the *same* reservation to
                     // the ordinary original-FD hash path, without extending its
                     // deadline or reacquiring a one-shot collection permit.
                     *process_slot = Some(lease);
-                    return Self::spawn_owned(config, deadline, cancel, Some(&fallback),
-                        failure_evidence, process_slot);
+                    return Self::spawn_owned(
+                        config,
+                        deadline,
+                        cancel,
+                        Some(&fallback),
+                        failure_evidence,
+                        process_slot,
+                    );
                 }
                 Err(_) => return Err(error("spawn", "native_spawn")),
             };
@@ -3044,26 +3097,44 @@ mod tests {
         let token = VerifiedSealedExecutable::prepare(&original, expected, || {
             checks += 1;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         let probe = token.execution_probe();
         let sealed_file = Arc::downgrade(&token.file);
         assert!(checks > 1);
         assert!(token.file.write_at(b"changed", 0).is_err());
         assert!(VerifiedSealedExecutable::prepare(&original, &"0".repeat(64), || Ok(())).is_err());
-        assert!(VerifiedSealedExecutable::prepare(&original, expected, || {
-            Err(CheckerError::Invalid("cancelled preparation"))
-        }).is_err());
+        assert!(
+            VerifiedSealedExecutable::prepare(&original, expected, || {
+                Err(CheckerError::Invalid("cancelled preparation"))
+            })
+            .is_err()
+        );
         let cwd = File::open(&config.working_directory).unwrap();
         let pin = ExternalLaunchPin::from_verified_sealed(token.clone(), cwd).unwrap();
         let mut wrong = config.clone();
         wrong.identity.binary_sha256 = "0".repeat(64);
         let mut denied = ExternalUciCpuChecker::create(wrong).unwrap();
         denied.launch_pin = Some(pin.clone());
-        assert!(denied.start(Instant::now() + Duration::from_secs(10), &AtomicBool::new(false)).is_err());
+        assert!(
+            denied
+                .start(
+                    Instant::now() + Duration::from_secs(10),
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
         let mut checker = ExternalUciCpuChecker::create(config).unwrap();
         checker.launch_pin = Some(pin);
-        checker.start(Instant::now() + Duration::from_secs(10), &AtomicBool::new(false)).unwrap();
-        let closed = checker.shutdown(Instant::now() + Duration::from_secs(3)).unwrap();
+        checker
+            .start(
+                Instant::now() + Duration::from_secs(10),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let closed = checker
+            .shutdown(Instant::now() + Duration::from_secs(3))
+            .unwrap();
         assert!(closed.exit_observed && closed.stdout_drained && closed.stderr_drained);
         assert!(closed.cleanup_complete);
         assert_eq!(token.execution_observations(), (1, 0));
@@ -3081,15 +3152,26 @@ mod tests {
         use std::os::unix::fs::{FileExt, PermissionsExt};
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
         }
-        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("rz-sealed-mutation-{}-{nonce}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("rz-sealed-mutation-{}-{nonce}", std::process::id()));
         let _cleanup = Cleanup(path.clone());
         let bytes = std::fs::read("/bin/true").unwrap();
-        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
         out.write_all(&bytes).unwrap();
-        out.set_permissions(std::fs::Permissions::from_mode(0o700)).unwrap();
+        out.set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         drop(out);
         let original = File::open(&path).unwrap();
         let expected = format!("{:x}", Sha256::digest(&bytes));
@@ -3170,14 +3252,22 @@ mod tests {
                     moves.extend(position.legal_moves().into_iter().filter(|mv| *mv != best));
                     let older = depth.parse::<u16>().unwrap().saturating_sub(1).max(1);
                     for rank in 1..=multipv {
-                        println!("info depth {older} multipv {rank} nodes {nodes} score cp 21 pv {}", moves[usize::from(rank - 1)]);
+                        println!(
+                            "info depth {older} multipv {rank} nodes {nodes} score cp 21 pv {}",
+                            moves[usize::from(rank - 1)]
+                        );
                     }
                     moves.swap(0, 1);
                     for rank in 1..=multipv {
-                        println!("info depth {depth} multipv {rank} nodes {nodes} score cp 22 pv {}", moves[usize::from(rank - 1)]);
+                        println!(
+                            "info depth {depth} multipv {rank} nodes {nodes} score cp 22 pv {}",
+                            moves[usize::from(rank - 1)]
+                        );
                     }
                     let later = depth.parse::<u16>().unwrap() + 1;
-                    println!("info depth {later} multipv 1 nodes {nodes} score cp 23 lowerbound pv {best}");
+                    println!(
+                        "info depth {later} multipv 1 nodes {nodes} score cp 23 lowerbound pv {best}"
+                    );
                     println!("bestmove {best}");
                     std::io::stdout().flush().unwrap();
                     continue;
@@ -3202,13 +3292,19 @@ mod tests {
                     }
                     if matches!(mode, 8 | 9) {
                         let next_depth = depth.parse::<u16>().unwrap() + 1;
-                        println!("info depth {next_depth} multipv 1 nodes {nodes} score cp 32 lowerbound pv {best}");
+                        println!(
+                            "info depth {next_depth} multipv 1 nodes {nodes} score cp 32 lowerbound pv {best}"
+                        );
                     }
                 }
                 if mode == 4 || mode == 5 {
                     pending_best = Some(best);
                 } else if mode == 9 {
-                    let other = position.legal_moves().into_iter().find(|mv| *mv != best).unwrap();
+                    let other = position
+                        .legal_moves()
+                        .into_iter()
+                        .find(|mv| *mv != best)
+                        .unwrap();
                     println!("bestmove {other}");
                 } else {
                     println!("bestmove {best}");
@@ -3293,19 +3389,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fake_uci_final_bound() {
-        if fixture_mode("external_cpu::tests::fake_uci_final_bound") { fixture_loop(8); }
+        if fixture_mode("external_cpu::tests::fake_uci_final_bound") {
+            fixture_loop(8);
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn fake_uci_final_bound_changed_best() {
-        if fixture_mode("external_cpu::tests::fake_uci_final_bound_changed_best") { fixture_loop(9); }
+        if fixture_mode("external_cpu::tests::fake_uci_final_bound_changed_best") {
+            fixture_loop(9);
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn fake_uci_prior_exact_matching_best() {
-        if fixture_mode("external_cpu::tests::fake_uci_prior_exact_matching_best") { fixture_loop(10); }
+        if fixture_mode("external_cpu::tests::fake_uci_prior_exact_matching_best") {
+            fixture_loop(10);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3550,27 +3652,57 @@ mod tests {
         ] {
             let mut checker = cooperative_fixture(name);
             let control = FixtureControl(rz_runtime::adaptive::ControlMailbox::new(
-                1, rz_runtime::CompletionSignal::default()));
-            let report = checker.analyze_cooperative(
-                &Position::startpos(), None,
-                CpuLimits { max_depth: 8, max_nodes: 100, deadline: Some(Instant::now() + Duration::from_secs(2)) },
-                &AtomicBool::new(false), &control,
-                ExternalSlicePolicy { multipv: width, ..ExternalSlicePolicy::default() },
-            ).unwrap();
+                1,
+                rz_runtime::CompletionSignal::default(),
+            ));
+            let report = checker
+                .analyze_cooperative(
+                    &Position::startpos(),
+                    None,
+                    CpuLimits {
+                        max_depth: 8,
+                        max_nodes: 100,
+                        deadline: Some(Instant::now() + Duration::from_secs(2)),
+                    },
+                    &AtomicBool::new(false),
+                    &control,
+                    ExternalSlicePolicy {
+                        multipv: width,
+                        ..ExternalSlicePolicy::default()
+                    },
+                )
+                .unwrap();
             assert_eq!(report.policy_target_known, expected, "{name} width={width}");
             if name == "fake_uci_final_bound" {
                 assert_eq!(report.report.bound, ExternalBound::Lower);
-                assert!(report.opinions.iter().all(|opinion| opinion.bound == ExternalBound::ExactReported && opinion.depth == 8));
+                assert!(
+                    report
+                        .opinions
+                        .iter()
+                        .all(|opinion| opinion.bound == ExternalBound::ExactReported
+                            && opinion.depth == 8)
+                );
             }
             if name == "fake_uci_prior_exact_matching_best" {
                 assert_eq!(report.report.bound, ExternalBound::Lower);
-                assert!(report.opinions.iter().all(|opinion| opinion.bound == ExternalBound::ExactReported && opinion.depth == 7));
-                assert_eq!(report.opinions[0].pv.first().copied(), report.report.best_move);
+                assert!(
+                    report
+                        .opinions
+                        .iter()
+                        .all(|opinion| opinion.bound == ExternalBound::ExactReported
+                            && opinion.depth == 7)
+                );
+                assert_eq!(
+                    report.opinions[0].pv.first().copied(),
+                    report.report.best_move
+                );
             }
             if name == "fake_uci_waits_for_stop" {
                 assert_ne!(report.report.completion, ExternalCompletion::BestMove);
             }
-            checker.shutdown(Instant::now() + Duration::from_secs(2)).unwrap();
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .unwrap();
         }
     }
 

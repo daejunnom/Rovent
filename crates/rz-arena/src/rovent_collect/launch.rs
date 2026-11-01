@@ -40,12 +40,12 @@ pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
 /// It cannot reconstruct a root admission or claim teacher completion.
 pub const ROVENT_COLLECTION_LOCK_V2_LAUNCH_PLAN: &str = "rz-rovent-collection-lock-v2-launch/1";
 mod cohort;
-pub(crate) mod own_publisher_v2;
 mod cohort_audit;
 mod cohort_driver;
 mod cohort_prepare;
 mod intervention;
 mod own_nnuec_lock_v2;
+pub(crate) mod own_publisher_v2;
 mod pc_lock_v2;
 mod r_stream;
 mod resources;
@@ -64,9 +64,11 @@ pub use intervention::{
 pub use own_nnuec_lock_v2::{RoventNnuecCollectionRunV2, run_rovent_own_nnuec_collection_lock_v2};
 #[cfg(feature = "test-fixtures")]
 pub use pc_lock_v2::run_rovent_pc_collection_lock_v2_with_test_owner;
-pub use pc_lock_v2::{RoventPcCollectionRunV2, run_rovent_pc_collection_lock_v2,
+pub use pc_lock_v2::{
+    RoventPcCollectionRunV2, run_rovent_pc_collection_lock_v2,
     run_rovent_pc_collection_lock_v2_with_sealed_policy,
-    run_rovent_pc_collection_lock_v2_with_speculative_teacher};
+    run_rovent_pc_collection_lock_v2_with_speculative_teacher,
+};
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 

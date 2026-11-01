@@ -1589,7 +1589,14 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         // teacher still reports its own startup and physical retirement.
         let origin = admission.native_origin();
         !self.closing
-            && origin.sources().lock().manifest.engine.pc.validator.is_none()
+            && origin
+                .sources()
+                .lock()
+                .manifest
+                .engine
+                .pc
+                .validator
+                .is_none()
             && !origin.startup_snapshot().validator_loaded
             && self.validate_collection_admission_v2(admission).is_ok()
     }
@@ -1993,7 +2000,8 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         output: &RoleOutput,
         physical: Option<TicketExecutionEvidence>,
     ) -> Result<CheckedStep<AdaptivePortQuestion>, AdaptiveManagerError> {
-        let guard = self.action_before(work, StepExecution::Role(ticket.id))
+        let guard = self
+            .action_before(work, StepExecution::Role(ticket.id))
             .map_err(|error| error.at_semantic_stage("driver.commit_role.action_before"))?;
         let physical = physical.map(|evidence| AdaptivePortRoleEvidence {
             execution: evidence.execution,
@@ -2014,7 +2022,10 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             .map_err(|error| error.at_semantic_stage("driver.commit_role.view_consume"))?;
         self.action_after(work, guard)
             .map_err(|error| error.at_semantic_stage("driver.commit_role.action_after"))?;
-        let materialized = self.hot()?.materialize_step(step).map_err(semantic)
+        let materialized = self
+            .hot()?
+            .materialize_step(step)
+            .map_err(semantic)
             .map_err(|error| error.at_semantic_stage("driver.commit_role.materialize"))?;
         Ok(checked(materialized))
     }

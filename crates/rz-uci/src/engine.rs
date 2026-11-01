@@ -1688,7 +1688,9 @@ impl Owner {
         if let Some(active) = &self.active {
             // The original Start's optional Collection gate closes before
             // signaling its physical search cancellation; neither waits.
-            if let Some(start) = &active.driver_start { start.abort_collection(); }
+            if let Some(start) = &active.driver_start {
+                start.abort_collection();
+            }
             active.control.cancel();
             if let Some(clock) = &active.ponder_clock {
                 clock.close();
@@ -1937,7 +1939,10 @@ impl Owner {
                         &self.clock,
                     )?;
                     context.original_start = Some(Arc::clone(&original_start));
-                    if let Err(error) = self.session_owner.bind_original_start(&ticket, Arc::clone(&original_start)) {
+                    if let Err(error) = self
+                        .session_owner
+                        .bind_original_start(&ticket, Arc::clone(&original_start))
+                    {
                         // This optional Collection association is not part of
                         // driver admission; retain the failure for its later
                         // binding and leave the existing search path intact.

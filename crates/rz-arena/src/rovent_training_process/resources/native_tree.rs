@@ -56,40 +56,66 @@ enum NativeTreeAttemptError {
     Other(ArenaError),
 }
 impl From<ArenaError> for NativeTreeAttemptError {
-    fn from(value: ArenaError) -> Self { Self::Other(value) }
+    fn from(value: ArenaError) -> Self {
+        Self::Other(value)
+    }
 }
 
 fn task_open_failure(
-    pid: u32, tid: u32, error: std::io::Error,
+    pid: u32,
+    tid: u32,
+    error: std::io::Error,
     recheck: impl FnOnce() -> Result<bool, ArenaError>,
 ) -> NativeTreeAttemptError {
     let errno = error.raw_os_error();
-    let detail = || format!("rovent_training_resources.native_tree_thread pid={pid} tid={tid} kind={:?} errno={errno:?}", error.kind());
+    let detail = || {
+        format!(
+            "rovent_training_resources.native_tree_thread pid={pid} tid={tid} kind={:?} errno={errno:?}",
+            error.kind()
+        )
+    };
     if error.kind() == std::io::ErrorKind::NotFound {
         match recheck() {
-            Ok(true) => return NativeTreeAttemptError::ExitedThread(RoventExitedThreadObservation { pid, tid, errno }),
-            Ok(false) => {},
-            Err(recheck_error) => return NativeTreeAttemptError::Other(ArenaError::Io(format!(
-                "{}; identity recheck: {recheck_error}", detail()))),
+            Ok(true) => {
+                return NativeTreeAttemptError::ExitedThread(RoventExitedThreadObservation {
+                    pid,
+                    tid,
+                    errno,
+                });
+            }
+            Ok(false) => {}
+            Err(recheck_error) => {
+                return NativeTreeAttemptError::Other(ArenaError::Io(format!(
+                    "{}; identity recheck: {recheck_error}",
+                    detail()
+                )));
+            }
         }
     }
     NativeTreeAttemptError::Other(ArenaError::Io(detail()))
 }
 
-fn retry_exited_threads<T>(mut attempt: impl FnMut() -> Result<T, NativeTreeAttemptError>)
-    -> Result<(T, Vec<RoventExitedThreadObservation>), ArenaError> {
+fn retry_exited_threads<T>(
+    mut attempt: impl FnMut() -> Result<T, NativeTreeAttemptError>,
+) -> Result<(T, Vec<RoventExitedThreadObservation>), ArenaError> {
     let mut exited = Vec::new();
     for _ in 0..3 {
         match attempt() {
             Ok(value) => return Ok((value, exited)),
             Err(NativeTreeAttemptError::ExitedThread(detail)) => exited.push(detail),
             Err(NativeTreeAttemptError::Other(error)) => {
-                if exited.is_empty() { return Err(error); }
-                return Err(ArenaError::Io(format!("native tree failed after exited-thread observations {exited:?}: {error}")));
+                if exited.is_empty() {
+                    return Err(error);
+                }
+                return Err(ArenaError::Io(format!(
+                    "native tree failed after exited-thread observations {exited:?}: {error}"
+                )));
             }
         }
     }
-    Err(ArenaError::Io(format!("native tree exited-thread reobservation exhausted: {exited:?}")))
+    Err(ArenaError::Io(format!(
+        "native tree exited-thread reobservation exhausted: {exited:?}"
+    )))
 }
 
 impl RoventTrainingResources {
@@ -204,7 +230,8 @@ impl RoventTrainingResources {
     ) -> Result<RoventNativeTreeObservation, ArenaError> {
         // A vanished task can race enumeration. Reobserve the *whole* tree,
         // never just accept the incomplete snapshot. Keep original evidence.
-        let (mut observation, exited) = retry_exited_threads(|| self.observe_native_process_tree_attempt(entry))?;
+        let (mut observation, exited) =
+            retry_exited_threads(|| self.observe_native_process_tree_attempt(entry))?;
         observation.exited_threads_reobserved = exited;
         Ok(observation)
     }
@@ -263,15 +290,23 @@ mod reobservation_tests {
     #[test]
     fn task_open_retries_only_verified_missing_thread() {
         let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert!(matches!(task_open_failure(10, 11, missing(), || Ok(true)),
-            NativeTreeAttemptError::ExitedThread(_)));
-        assert!(matches!(task_open_failure(10, 11, missing(), || Ok(false)),
-            NativeTreeAttemptError::Other(_)));
-        assert!(matches!(task_open_failure(10, 11, missing(), || Err(ArenaError::Io("identity".into()))),
-            NativeTreeAttemptError::Other(_)));
+        assert!(matches!(
+            task_open_failure(10, 11, missing(), || Ok(true)),
+            NativeTreeAttemptError::ExitedThread(_)
+        ));
+        assert!(matches!(
+            task_open_failure(10, 11, missing(), || Ok(false)),
+            NativeTreeAttemptError::Other(_)
+        ));
+        assert!(matches!(
+            task_open_failure(10, 11, missing(), || Err(ArenaError::Io("identity".into()))),
+            NativeTreeAttemptError::Other(_)
+        ));
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let failure = task_open_failure(10, 11, denied, || panic!("permission is never retried"));
-        let NativeTreeAttemptError::Other(error) = failure else { panic!("permission must fail"); };
+        let NativeTreeAttemptError::Other(error) = failure else {
+            panic!("permission must fail");
+        };
         assert!(error.to_string().contains("pid=10 tid=11"));
         assert!(error.to_string().contains("PermissionDenied"));
     }
@@ -282,18 +317,30 @@ mod reobservation_tests {
         let (value, exited) = retry_exited_threads(|| {
             calls += 1;
             if calls == 1 {
-                Err(NativeTreeAttemptError::ExitedThread(RoventExitedThreadObservation {
-                    pid: 10, tid: 11, errno: Some(2),
-                }))
-            } else { Ok(42) }
-        }).unwrap();
+                Err(NativeTreeAttemptError::ExitedThread(
+                    RoventExitedThreadObservation {
+                        pid: 10,
+                        tid: 11,
+                        errno: Some(2),
+                    },
+                ))
+            } else {
+                Ok(42)
+            }
+        })
+        .unwrap();
         assert_eq!((value, calls, exited.len()), (42, 2, 1));
-        assert_eq!((exited[0].pid, exited[0].tid, exited[0].errno), (10, 11, Some(2)));
+        assert_eq!(
+            (exited[0].pid, exited[0].tid, exited[0].errno),
+            (10, 11, Some(2))
+        );
 
         let mut failures = 0;
         let result = retry_exited_threads::<()>(|| {
             failures += 1;
-            Err(NativeTreeAttemptError::Other(ArenaError::Io("permission".into())))
+            Err(NativeTreeAttemptError::Other(ArenaError::Io(
+                "permission".into(),
+            )))
         });
         assert!(result.is_err());
         assert_eq!(failures, 1);
@@ -301,9 +348,13 @@ mod reobservation_tests {
         let mut disappeared = 0;
         let result = retry_exited_threads::<()>(|| {
             disappeared += 1;
-            Err(NativeTreeAttemptError::ExitedThread(RoventExitedThreadObservation {
-                pid: 10, tid: 11, errno: Some(2),
-            }))
+            Err(NativeTreeAttemptError::ExitedThread(
+                RoventExitedThreadObservation {
+                    pid: 10,
+                    tid: 11,
+                    errno: Some(2),
+                },
+            ))
         });
         assert!(result.is_err());
         assert_eq!(disappeared, 3);
@@ -375,7 +426,9 @@ fn native_tree(
                     // Only ENOENT invokes this original-identity recheck.
                     return Err(task_open_failure(pid, tid, error, || {
                         let now = parse_process_identity(
-                            &read_kernel(&process, "stat", MAX_PROC_TEXT, true)?, pid)?;
+                            &read_kernel(&process, "stat", MAX_PROC_TEXT, true)?,
+                            pid,
+                        )?;
                         Ok(now.start_ticks == start_ticks
                             && !task_ids(&tasks, resources.policy.pids_max)?.contains(&tid))
                     }));

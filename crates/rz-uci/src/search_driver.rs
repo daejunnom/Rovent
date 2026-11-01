@@ -75,8 +75,15 @@ impl SearchSessionContext {
         game_gate: Arc<std::sync::atomic::AtomicU64>,
         root_targets_revoked: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), ContractError> {
-        self.original_start.as_ref()
-            .ok_or_else(|| ContractError::new(ErrorCode::IdentityMismatch, Stage::Admission, "original UCI Start absent"))?
+        self.original_start
+            .as_ref()
+            .ok_or_else(|| {
+                ContractError::new(
+                    ErrorCode::IdentityMismatch,
+                    Stage::Admission,
+                    "original UCI Start absent",
+                )
+            })?
             .bind_collection_abort(self, game_gate, root_targets_revoked)
     }
 

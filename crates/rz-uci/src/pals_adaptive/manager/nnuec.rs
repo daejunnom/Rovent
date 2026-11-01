@@ -723,7 +723,10 @@ where
         &mut self,
         error: AdaptiveManagerError,
     ) -> Result<bool, AdaptiveManagerError> {
-        if !matches!(error, AdaptiveManagerError::InterventionNeutralMismatch { .. }) {
+        if !matches!(
+            error,
+            AdaptiveManagerError::InterventionNeutralMismatch { .. }
+        ) {
             return Err(error);
         }
         // A non-comparable target is an actual failed trial, not a physical

@@ -38,8 +38,7 @@ use crate::pals_adaptive::{
     AdaptiveManagerSources, AdaptiveNnuecRetiredOwner, AdaptivePortDriver,
     AdaptiveRegisteredLedgerSources, AdaptiveSessionCollectionHooks, AdaptiveShutdownReceipt,
     ManagerPhase, RoventCollectionRootAdmission, RoventCollectionRootAdmissionV2,
-    RoventNoCaptureRootCapabilityV2,
-    RoventNativeCollectionOrigin, RoventNativeCollectionOriginV2,
+    RoventNativeCollectionOrigin, RoventNativeCollectionOriginV2, RoventNoCaptureRootCapabilityV2,
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
@@ -123,7 +122,11 @@ pub struct RoventNnuecTransferredHandoffV2 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoventNnuecHandoffTransferErrorV2 {
-    Busy, Poisoned, DifferentHandoff, AlreadyTransferred, SessionUnavailable,
+    Busy,
+    Poisoned,
+    DifferentHandoff,
+    AlreadyTransferred,
+    SessionUnavailable,
 }
 
 impl RoventNnuecTransferredHandoffV2 {
@@ -157,7 +160,9 @@ impl RoventNnuecTransferredHandoffV2 {
 impl RoventNnuecCollectionHandoffV2 {
     /// None means the send has not been observed. Even successful channel
     /// delivery is not teacher retirement or publication evidence.
-    pub fn handoff_delivery(&self) -> Option<&Result<(), crate::pals_adaptive::AdaptiveCollectionError>> {
+    pub fn handoff_delivery(
+        &self,
+    ) -> Option<&Result<(), crate::pals_adaptive::AdaptiveCollectionError>> {
         self.handoff_delivery.get()
     }
     /// Lease the same original handoff. This transfers custody only; the
@@ -167,17 +172,32 @@ impl RoventNnuecCollectionHandoffV2 {
         original: &Arc<Mutex<Self>>,
         admission: &RoventCollectionRootAdmissionV2,
     ) -> Result<RoventNnuecTransferredHandoffV2, RoventNnuecHandoffTransferErrorV2> {
-        let key = original.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => RoventNnuecHandoffTransferErrorV2::Busy,
-            TryLockError::Poisoned(_) => RoventNnuecHandoffTransferErrorV2::Poisoned,
-        })?.escrow_key.clone();
-        let lease = key.try_lease(admission, original).map_err(|error| match error {
-            handoff_escrow_v2::HandoffEscrowErrorV2::Busy => RoventNnuecHandoffTransferErrorV2::Busy,
-            handoff_escrow_v2::HandoffEscrowErrorV2::Poisoned => RoventNnuecHandoffTransferErrorV2::Poisoned,
-            handoff_escrow_v2::HandoffEscrowErrorV2::AlreadyLeased => RoventNnuecHandoffTransferErrorV2::AlreadyTransferred,
-            handoff_escrow_v2::HandoffEscrowErrorV2::DifferentAdmission | handoff_escrow_v2::HandoffEscrowErrorV2::DifferentHandoff => RoventNnuecHandoffTransferErrorV2::DifferentHandoff,
-            _ => RoventNnuecHandoffTransferErrorV2::SessionUnavailable,
-        })?;
+        let key = original
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => RoventNnuecHandoffTransferErrorV2::Busy,
+                TryLockError::Poisoned(_) => RoventNnuecHandoffTransferErrorV2::Poisoned,
+            })?
+            .escrow_key
+            .clone();
+        let lease = key
+            .try_lease(admission, original)
+            .map_err(|error| match error {
+                handoff_escrow_v2::HandoffEscrowErrorV2::Busy => {
+                    RoventNnuecHandoffTransferErrorV2::Busy
+                }
+                handoff_escrow_v2::HandoffEscrowErrorV2::Poisoned => {
+                    RoventNnuecHandoffTransferErrorV2::Poisoned
+                }
+                handoff_escrow_v2::HandoffEscrowErrorV2::AlreadyLeased => {
+                    RoventNnuecHandoffTransferErrorV2::AlreadyTransferred
+                }
+                handoff_escrow_v2::HandoffEscrowErrorV2::DifferentAdmission
+                | handoff_escrow_v2::HandoffEscrowErrorV2::DifferentHandoff => {
+                    RoventNnuecHandoffTransferErrorV2::DifferentHandoff
+                }
+                _ => RoventNnuecHandoffTransferErrorV2::SessionUnavailable,
+            })?;
         Ok(RoventNnuecTransferredHandoffV2 { lease })
     }
     /// Collection diagnostics do not imply a failure of the native search.
@@ -309,26 +329,38 @@ pub struct RoventPendingJournalPanicV2 {
 }
 
 impl RoventPendingJournalPanicV2 {
-    fn new(payload: Box<dyn Any + Send>) -> Self { Self { payload: Mutex::new(Some(payload)) } }
+    fn new(payload: Box<dyn Any + Send>) -> Self {
+        Self {
+            payload: Mutex::new(Some(payload)),
+        }
+    }
 
     pub fn try_take_payload(&self) -> Result<Option<Box<dyn Any + Send>>, AdaptiveManagerError> {
         match self.payload.try_lock() {
             Ok(mut payload) => Ok(payload.take()),
             Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Poisoned(_)) => Err(AdaptiveManagerError::Invalid("pending callback panic custody poisoned")),
+            Err(TryLockError::Poisoned(_)) => Err(AdaptiveManagerError::Invalid(
+                "pending callback panic custody poisoned",
+            )),
         }
     }
 }
 
 impl std::fmt::Debug for RoventPendingJournalPanicV2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoventPendingJournalPanicV2").finish_non_exhaustive()
+        f.debug_struct("RoventPendingJournalPanicV2")
+            .finish_non_exhaustive()
     }
 }
 
 impl Drop for RoventPendingJournalPanicV2 {
     fn drop(&mut self) {
-        if let Some(payload) = self.payload.get_mut().unwrap_or_else(|poison| poison.into_inner()).take() {
+        if let Some(payload) = self
+            .payload
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
             std::mem::forget(payload);
         }
     }
@@ -352,7 +384,8 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
         _port: &mut RoventNnuecCollectionAdmissionPortV2<'_>,
         admission: RoventCollectionRootAdmissionV2,
         reason: crate::pals_adaptive::AdaptiveCollectionError,
-    ) -> Result<RoventNnuecCollectionAdmissionOutcomeV2, RoventNnuecCollectionAdmissionFailureV2> {
+    ) -> Result<RoventNnuecCollectionAdmissionOutcomeV2, RoventNnuecCollectionAdmissionFailureV2>
+    {
         Err(RoventNnuecCollectionAdmissionFailureV2 {
             error: AdaptiveManagerError::Collection(reason),
             admission,
@@ -366,7 +399,9 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
         _capability: &RoventNoCaptureRootCapabilityV2,
         _fence: &AdaptiveShutdownReceipt,
     ) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("no-capture root cleanup unsupported"))
+        Err(AdaptiveManagerError::Invalid(
+            "no-capture root cleanup unsupported",
+        ))
     }
     /// Nonblocking: distinguish original retention, bounded summarization,
     /// and Busy. No outcome claims durable storage or physical completion.
@@ -374,15 +409,21 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
         &self,
         _event: &Arc<RoventNnuecPendingCollectionV2>,
     ) -> Result<RoventPendingEvidenceDispositionV2, AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("pending collection journal unsupported"))
+        Err(AdaptiveManagerError::Invalid(
+            "pending collection journal unsupported",
+        ))
     }
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
     /// Request and observe termination of this hook's original physical
     /// collection workers.  Implementations must report Ready only with
     /// evidence from the same owners; the default grants no completion.
-    fn finish_physical(&self) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("V2 physical completion observation unavailable"))
+    fn finish_physical(
+        &self,
+    ) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "V2 physical completion observation unavailable",
+        ))
     }
     /// A bounded nonblocking handoff; delivery is not teacher retirement.
     fn handoff_sender(
@@ -392,15 +433,29 @@ pub trait RoventNnuecCollectionHooksV2: Send + Sync {
     /// Compatibility forwarding is for the existing single-root hook only.
     /// A multi-root implementation must override all three methods and
     /// route using this same original admission, never a latest-root slot.
-    fn pump_root(&self, _admission: &RoventCollectionRootAdmissionV2) -> Result<(), RoventNnuecRootHookFailureV2> {
-        self.pump().map_err(|error| RoventNnuecRootHookFailureV2 { admission: _admission.clone(), error })
+    fn pump_root(
+        &self,
+        _admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), RoventNnuecRootHookFailureV2> {
+        self.pump().map_err(|error| RoventNnuecRootHookFailureV2 {
+            admission: _admission.clone(),
+            error,
+        })
     }
-    fn revoke_root(&self, _admission: &RoventCollectionRootAdmissionV2) -> Result<(), RoventNnuecRootHookFailureV2> {
+    fn revoke_root(
+        &self,
+        _admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), RoventNnuecRootHookFailureV2> {
         self.revoke();
         Ok(())
     }
-    fn handoff_sender_root(&self, _admission: &RoventCollectionRootAdmissionV2)
-        -> Result<std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>, RoventNnuecRootHookFailureV2> {
+    fn handoff_sender_root(
+        &self,
+        _admission: &RoventCollectionRootAdmissionV2,
+    ) -> Result<
+        std::sync::mpsc::SyncSender<Arc<Mutex<RoventNnuecCollectionHandoffV2>>>,
+        RoventNnuecRootHookFailureV2,
+    > {
         Ok(self.handoff_sender())
     }
 }
@@ -418,10 +473,14 @@ pub enum RoventNnuecCollectionAdmissionOutcomeV2 {
     Installed,
     /// The original admission has not started a collector, teacher or
     /// marker. Retain and retry it only within its original deadline.
-    Pending { admission: RoventCollectionRootAdmissionV2 },
+    Pending {
+        admission: RoventCollectionRootAdmissionV2,
+    },
     /// The same root is busy but an in-flight install cannot yet be ruled
     /// out. Its hook and escrow must remain in custody while retrying.
-    PendingUncertain { admission: RoventCollectionRootAdmissionV2 },
+    PendingUncertain {
+        admission: RoventCollectionRootAdmissionV2,
+    },
     DeferredNoCapture {
         capability: RoventNoCaptureRootCapabilityV2,
         reason: crate::pals_adaptive::AdaptiveCollectionError,
@@ -2517,7 +2576,11 @@ impl RoventNnuecSessionDriver {
         if matches!(*state, State::Closed) {
             // Closed is installed only after this same hook's physical
             // completion (when present) and native cleanup have succeeded.
-            return if revoke_panicked { Err(teacher_unknown()) } else { Ok(()) };
+            return if revoke_panicked {
+                Err(teacher_unknown())
+            } else {
+                Ok(())
+            };
         }
         let idle = match &mut *state {
             State::Idle(idle) => idle,
@@ -2568,18 +2631,33 @@ impl RoventNnuecSessionDriver {
                 // Root/native/storage completion is independent of the
                 // collection worker. Only the original hook may establish
                 // that worker's completion, under this same cleanup deadline.
-                if revoke_panicked { return Err(teacher_unknown()); }
+                if revoke_panicked {
+                    return Err(teacher_unknown());
+                }
                 let hooks = self.collection_hooks_v2.as_ref().expect("original V2 hook");
                 loop {
                     match catch_unwind(AssertUnwindSafe(|| hooks.finish_physical())) {
                         Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready)) => break,
                         Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy))
-                            if Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
-                        Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) => return Err(teacher_unknown()),
-                        Ok(Err(error)) => return Err(unknown("RoventNnuecV2PhysicalObservation", &format!("{error:?}"))),
+                            if Instant::now() < until =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) => {
+                            return Err(teacher_unknown());
+                        }
+                        Ok(Err(error)) => {
+                            return Err(unknown(
+                                "RoventNnuecV2PhysicalObservation",
+                                &format!("{error:?}"),
+                            ));
+                        }
                         Err(payload) => {
                             self.retain_v2_revoke_panic(payload);
-                            return Err(unknown("RoventNnuecV2PhysicalPanic", "original V2 physical observation panicked; payload and owners retained"));
+                            return Err(unknown(
+                                "RoventNnuecV2PhysicalPanic",
+                                "original V2 physical observation panicked; payload and owners retained",
+                            ));
                         }
                     }
                 }

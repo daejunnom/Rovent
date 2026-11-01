@@ -71,7 +71,10 @@ struct State {
     producer_root: Option<String>,
     prior_producers: Vec<(String, RoventCorpusProducerLockV2)>,
     current_admission: Option<RoventCollectionRootAdmissionV2>,
-    speculative_pending: Vec<(RoventCollectionRootAdmissionV2, super::native_capture::SpeculativeRootV2)>,
+    speculative_pending: Vec<(
+        RoventCollectionRootAdmissionV2,
+        super::native_capture::SpeculativeRootV2,
+    )>,
     speculative_current: Option<super::native_capture::SpeculativeRootV2>,
     settled_roots: Vec<RoventCollectionRootAdmissionV2>,
     registration: RoventNativeCaptureRegistration,
@@ -126,21 +129,39 @@ impl RoventCollectionOwnerLockV2 {
         admission: &RoventCollectionRootAdmissionV2,
         route: &super::native_capture::SpeculativeRootV2,
     ) -> Result<Option<bool>, ArenaError> {
-        check(route.matches_admission(admission) && self.registration.owns_route(route),
-            "speculative route root or registration owner mismatch")?;
+        check(
+            route.matches_admission(admission) && self.registration.owns_route(route),
+            "speculative route root or registration owner mismatch",
+        )?;
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("collection owner poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("collection owner poisoned"));
+            }
         };
-        if let Some((_, existing_route)) = state.speculative_pending.iter().find(|(previous, _)|
-            previous.same_original_admission(admission)) {
-            check(existing_route.same_original_route(route), "different original speculative route")?;
+        if let Some((_, existing_route)) = state
+            .speculative_pending
+            .iter()
+            .find(|(previous, _)| previous.same_original_admission(admission))
+        {
+            check(
+                existing_route.same_original_route(route),
+                "different original speculative route",
+            )?;
             return Ok(Some(true));
         }
-        check(state.speculative_pending.len() < RETAINED_ROOT_CAPACITY, "pending speculative root capacity")?;
-        state.speculative_pending.try_reserve(1).map_err(|_| invalid("pending speculative root allocation"))?;
-        state.speculative_pending.push((admission.clone(), route.clone()));
+        check(
+            state.speculative_pending.len() < RETAINED_ROOT_CAPACITY,
+            "pending speculative root capacity",
+        )?;
+        state
+            .speculative_pending
+            .try_reserve(1)
+            .map_err(|_| invalid("pending speculative root allocation"))?;
+        state
+            .speculative_pending
+            .push((admission.clone(), route.clone()));
         Ok(Some(true))
     }
 
@@ -154,13 +175,22 @@ impl RoventCollectionOwnerLockV2 {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("collection owner poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("collection owner poisoned"));
+            }
         };
-        if let Some(index) = state.speculative_pending.iter().position(|(original, existing)|
-            original.same_original_admission(admission) && existing.same_original_route(route)) {
+        if let Some(index) = state
+            .speculative_pending
+            .iter()
+            .position(|(original, existing)| {
+                original.same_original_admission(admission) && existing.same_original_route(route)
+            })
+        {
             state.speculative_pending.remove(index);
             Ok(Some(true))
-        } else { Ok(Some(false)) }
+        } else {
+            Ok(Some(false))
+        }
     }
 
     /// Called with the shared game install guard held, before `port.install`.
@@ -172,48 +202,87 @@ impl RoventCollectionOwnerLockV2 {
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v2 collection owner poisoned"));
+            }
         };
-        let blocked = |detail: &'static str| OwnerInstallReadinessV2::Blocked(
-            AdaptiveCollectionError::new(AdaptiveCollectionStage::Dispatch, "CollectionOwnerNotReady", detail));
+        let blocked = |detail: &'static str| {
+            OwnerInstallReadinessV2::Blocked(AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Dispatch,
+                "CollectionOwnerNotReady",
+                detail,
+            ))
+        };
         if let Some(error) = &state.failure {
             return Ok(Some(OwnerInstallReadinessV2::Blocked(error.clone())));
         }
         if self.callback_lock_failure.load(Ordering::Acquire) {
-            return Ok(Some(blocked("original collection callback lock failure is retained")));
+            return Ok(Some(blocked(
+                "original collection callback lock failure is retained",
+            )));
         }
-        check(state.admitted == state.current_admission.is_some()
-            && state.admitted == state.producer.is_some(),
-            "lock-v2 original owner admission/producer state is inconsistent")?;
-        if (state.admitted && !state.settled) || !state.pending.is_empty() || !state.staged.is_empty()
-            || !state.disabled_prior.is_empty() || !state.retired.is_empty()
-            || self.retired_queued.load(Ordering::Acquire) != 0 {
-            return Ok(Some(blocked("previous root still has unsettled or undrained original work")));
+        check(
+            state.admitted == state.current_admission.is_some()
+                && state.admitted == state.producer.is_some(),
+            "lock-v2 original owner admission/producer state is inconsistent",
+        )?;
+        if (state.admitted && !state.settled)
+            || !state.pending.is_empty()
+            || !state.staged.is_empty()
+            || !state.disabled_prior.is_empty()
+            || !state.retired.is_empty()
+            || self.retired_queued.load(Ordering::Acquire) != 0
+        {
+            return Ok(Some(blocked(
+                "previous root still has unsettled or undrained original work",
+            )));
         }
-        if state.disabled.is_some() || !state.prior_disabled.is_empty()
-            || !state.failed_staged.is_empty() || !state.failed_captures.is_empty()
-            || state.producer.as_ref().is_some_and(|producer| producer.incomplete_capture_count() != 0) {
-            return Ok(Some(blocked("previous root has retained disabled, failed or incomplete capture")));
+        if state.disabled.is_some()
+            || !state.prior_disabled.is_empty()
+            || !state.failed_staged.is_empty()
+            || !state.failed_captures.is_empty()
+            || state
+                .producer
+                .as_ref()
+                .is_some_and(|producer| producer.incomplete_capture_count() != 0)
+        {
+            return Ok(Some(blocked(
+                "previous root has retained disabled, failed or incomplete capture",
+            )));
         }
         if state.producer.is_some() && state.prior_producers.len() >= RETAINED_ROOT_CAPACITY {
-            return Ok(Some(blocked("original producer retention capacity reached")));
+            return Ok(Some(blocked(
+                "original producer retention capacity reached",
+            )));
         }
         if state.game_used_and_reserved()? >= state.game_record_limit {
-            return Ok(Some(blocked("game record limit or retained reservations exhausted")));
+            return Ok(Some(blocked(
+                "game record limit or retained reservations exhausted",
+            )));
         }
         match self.registration.try_disabled_root_count()? {
-            Some(0) => {},
-            Some(_) => return Ok(Some(blocked("original no-capture marker has not been settled"))),
+            Some(0) => {}
+            Some(_) => {
+                return Ok(Some(blocked(
+                    "original no-capture marker has not been settled",
+                )));
+            }
             None => return Ok(None),
         }
         if let Some(previous) = &state.current_admission {
             let old = previous.root_admission().authority();
             let next = admission.root_admission().authority();
-            check(!previous.same_original_admission(admission)
-                && previous.native_origin().same_original_origin(admission.native_origin())
-                && old.epoch == next.epoch && old.implementation == next.implementation
-                && next.game == old.game && next.root > old.root,
-                "lock-v2 next root does not follow the original collection owner")?;
+            check(
+                !previous.same_original_admission(admission)
+                    && previous
+                        .native_origin()
+                        .same_original_origin(admission.native_origin())
+                    && old.epoch == next.epoch
+                    && old.implementation == next.implementation
+                    && next.game == old.game
+                    && next.root > old.root,
+                "lock-v2 next root does not follow the original collection owner",
+            )?;
         }
         Ok(Some(OwnerInstallReadinessV2::Ready))
     }
@@ -238,8 +307,12 @@ impl RoventCollectionOwnerLockV2 {
         manifest: Arc<rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2>,
         metadata: RoventCollectionMetadata,
     ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
-        Self::new_shared_with_capacity(manifest, metadata,
-            rz_experiments::rovent_corpus::MAX_CORPUS_ROWS as u64, CAPACITY)
+        Self::new_shared_with_capacity(
+            manifest,
+            metadata,
+            rz_experiments::rovent_corpus::MAX_CORPUS_ROWS as u64,
+            CAPACITY,
+        )
     }
 
     /// An explicitly registered game limit may also admit a larger finite
@@ -249,7 +322,12 @@ impl RoventCollectionOwnerLockV2 {
         metadata: RoventCollectionMetadata,
         maximum_records: u64,
     ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
-        Self::new_shared_with_capacity(manifest, metadata, maximum_records, MAX_RETIRED_OUTBOX_CAPACITY)
+        Self::new_shared_with_capacity(
+            manifest,
+            metadata,
+            maximum_records,
+            MAX_RETIRED_OUTBOX_CAPACITY,
+        )
     }
 
     fn new_shared_with_capacity(
@@ -260,8 +338,11 @@ impl RoventCollectionOwnerLockV2 {
     ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
         let game_record_limit = usize::try_from(maximum_records)
             .map_err(|_| invalid("lock-v2 game record limit exceeds platform capacity"))?;
-        check(game_record_limit > 0 && game_record_limit <= rz_experiments::rovent_corpus::MAX_CORPUS_ROWS,
-            "lock-v2 game record limit is invalid")?;
+        check(
+            game_record_limit > 0
+                && game_record_limit <= rz_experiments::rovent_corpus::MAX_CORPUS_ROWS,
+            "lock-v2 game record limit is invalid",
+        )?;
         check(
             generation_identifier(&metadata.game_id)
                 && generation_identifier(&metadata.opening_id)
@@ -319,7 +400,7 @@ impl RoventCollectionOwnerLockV2 {
                     test_started: BTreeMap::new(),
                 })),
                 callback_lock_failure: Arc::new(AtomicBool::new(false)),
-            registration: registration_for_owner,
+                registration: registration_for_owner,
                 retired_receiver: Arc::new(Mutex::new(retired_receiver)),
                 retired_queued,
             },
@@ -342,7 +423,8 @@ impl RoventCollectionOwnerLockV2 {
         &self,
         capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
     ) -> Result<bool, ArenaError> {
-        self.registration.try_install_whole_root_no_capture(capability)
+        self.registration
+            .try_install_whole_root_no_capture(capability)
     }
 
     /// Only the same original UCI root-run owner supplies the receipt here.
@@ -351,7 +433,8 @@ impl RoventCollectionOwnerLockV2 {
         capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         receipt: &rz_uci::pals_adaptive::AdaptiveShutdownReceipt,
     ) -> Result<bool, ArenaError> {
-        self.registration.try_finish_whole_root_no_capture(capability, receipt)
+        self.registration
+            .try_finish_whole_root_no_capture(capability, receipt)
     }
 
     pub(crate) fn try_finish_whole_root_no_capture_role_only(
@@ -359,7 +442,8 @@ impl RoventCollectionOwnerLockV2 {
         capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         receipt: &rz_uci::pals_adaptive::RoleOnlyShutdownReceipt,
     ) -> Result<bool, ArenaError> {
-        self.registration.try_finish_whole_root_no_capture_role_only(capability, receipt)
+        self.registration
+            .try_finish_whole_root_no_capture_role_only(capability, receipt)
     }
 
     /// Exercise the real registration mutex without holding the manager
@@ -526,32 +610,53 @@ impl RoventCollectionOwnerLockV2 {
         &self,
         row: &mut RoventRetiredLockV2Record,
         gate: &super::collection_hooks_core_v2::RoventCollectionCommitGateV2<
-            '_, rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2,
+            '_,
+            rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2,
         >,
         handoff: &mut rz_uci::rovent_bootstrap::RoventNnuecCollectionHandoffV2,
         action: impl FnOnce(&mut RoventCorpusProducerLockV2, &mut RoventRetiredLockV2Record) -> T,
     ) -> Result<Option<T>, ArenaError> {
         let (admission, _, settlement, fence) = handoff.parts_mut();
-        check(self.same_original_owner(gate.owner()) && gate.matches_admission(admission)
-            && row.admission.same_original_admission(admission)
-            && settlement.is_ok() && fence.authority == admission.root_admission().authority()
-            && fence.permits_semantic_closure(),
-            "lock-v2 commit gate/original handoff/physical fence mismatch")?;
+        check(
+            self.same_original_owner(gate.owner())
+                && gate.matches_admission(admission)
+                && row.admission.same_original_admission(admission)
+                && settlement.is_ok()
+                && fence.authority == admission.root_admission().authority()
+                && fence.permits_semantic_closure(),
+            "lock-v2 commit gate/original handoff/physical fence mismatch",
+        )?;
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v2 collection owner poisoned"));
+            }
         };
-        check(gate.matches_admission(admission)
-            && state.settled_roots.iter().any(|original| original.same_original_admission(admission))
-            && (!state.admitted || state.settled) && state.pending.is_empty() && state.staged.is_empty(),
-            "lock-v2 original root not settled or observer callbacks still active")?;
+        check(
+            gate.matches_admission(admission)
+                && state
+                    .settled_roots
+                    .iter()
+                    .any(|original| original.same_original_admission(admission))
+                && (!state.admitted || state.settled)
+                && state.pending.is_empty()
+                && state.staged.is_empty(),
+            "lock-v2 original root not settled or observer callbacks still active",
+        )?;
         let root = row.admission.raw_sha256();
         let producer = if state.producer_root.as_deref() == Some(root) {
-            state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?
+            state
+                .producer
+                .as_mut()
+                .ok_or_else(|| invalid("lock-v2 active producer missing"))?
         } else {
-            &mut state.prior_producers.iter_mut().find(|(id, _)| id == root)
-                .ok_or_else(|| invalid("lock-v2 retired row original producer missing"))?.1
+            &mut state
+                .prior_producers
+                .iter_mut()
+                .find(|(id, _)| id == root)
+                .ok_or_else(|| invalid("lock-v2 retired row original producer missing"))?
+                .1
         };
         producer.validate_admission(admission)?;
         producer.validate_teacher_row(row)?;
@@ -564,32 +669,54 @@ impl RoventCollectionOwnerLockV2 {
         &self,
         row: &mut RoventRetiredLockV2Record,
         gate: &super::collection_hooks_core_v2::RoventCollectionCommitGateV2<
-            '_, rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
+            '_,
+            rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
         >,
         handoff: &mut rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHandoffV2,
         action: impl FnOnce(&mut RoventCorpusProducerLockV2, &mut RoventRetiredLockV2Record) -> T,
     ) -> Result<Option<T>, ArenaError> {
         let (admission, _, settlement, fence) = handoff.parts_mut();
-        check(self.same_original_owner(gate.owner()) && gate.matches_admission(admission)
-            && row.admission.same_original_admission(admission)
-            && settlement.is_ok() && fence.authority == admission.root_admission().authority()
-            && fence.root_budget == admission.root_budget() && fence.permits_semantic_closure(),
-            "lock-v2 P/C commit gate/original handoff/physical fence mismatch")?;
+        check(
+            self.same_original_owner(gate.owner())
+                && gate.matches_admission(admission)
+                && row.admission.same_original_admission(admission)
+                && settlement.is_ok()
+                && fence.authority == admission.root_admission().authority()
+                && fence.root_budget == admission.root_budget()
+                && fence.permits_semantic_closure(),
+            "lock-v2 P/C commit gate/original handoff/physical fence mismatch",
+        )?;
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v2 collection owner poisoned"));
+            }
         };
-        check(gate.matches_admission(admission)
-            && state.settled_roots.iter().any(|original| original.same_original_admission(admission))
-            && (!state.admitted || state.settled) && state.pending.is_empty() && state.staged.is_empty(),
-            "lock-v2 P/C original root not settled or observer callbacks still active")?;
+        check(
+            gate.matches_admission(admission)
+                && state
+                    .settled_roots
+                    .iter()
+                    .any(|original| original.same_original_admission(admission))
+                && (!state.admitted || state.settled)
+                && state.pending.is_empty()
+                && state.staged.is_empty(),
+            "lock-v2 P/C original root not settled or observer callbacks still active",
+        )?;
         let root = row.admission.raw_sha256();
         let producer = if state.producer_root.as_deref() == Some(root) {
-            state.producer.as_mut().ok_or_else(|| invalid("lock-v2 active producer missing"))?
+            state
+                .producer
+                .as_mut()
+                .ok_or_else(|| invalid("lock-v2 active producer missing"))?
         } else {
-            &mut state.prior_producers.iter_mut().find(|(id, _)| id == root)
-                .ok_or_else(|| invalid("lock-v2 retired row original producer missing"))?.1
+            &mut state
+                .prior_producers
+                .iter_mut()
+                .find(|(id, _)| id == root)
+                .ok_or_else(|| invalid("lock-v2 retired row original producer missing"))?
+                .1
         };
         producer.validate_admission(admission)?;
         producer.validate_teacher_row(row)?;
@@ -619,19 +746,28 @@ impl RoventCollectionOwnerLockV2 {
         let receiver = match self.retired_receiver.try_lock() {
             Ok(receiver) => receiver,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 retired receiver poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v2 retired receiver poisoned"));
+            }
         };
         if let Ok(row) = receiver.try_recv() {
             self.retired_queued.fetch_sub(1, Ordering::AcqRel);
             return Ok(Some(Some(row)));
         }
-        if self.retired_queued.load(Ordering::Acquire) != 0 { return Ok(None); }
+        if self.retired_queued.load(Ordering::Acquire) != 0 {
+            return Ok(None);
+        }
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("lock-v2 collection owner poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v2 collection owner poisoned"));
+            }
         };
-        check(state.settled, "lock-v2 retained recovery requires a settled root")?;
+        check(
+            state.settled,
+            "lock-v2 retained recovery requires a settled root",
+        )?;
         Ok(Some(state.retired.pop_front()))
     }
 
@@ -803,20 +939,28 @@ impl State {
     /// row. Failed staged inputs keep their reservation until explicit
     /// recovery; a row already retired is counted monotonically instead.
     fn game_reserved_slots(&self) -> Result<usize, ArenaError> {
-        self.pending.len().checked_add(self.staged.len())
+        self.pending
+            .len()
+            .checked_add(self.staged.len())
             .and_then(|value| value.checked_add(self.failed_staged.len()))
             .ok_or_else(|| invalid("lock-v2 game record reservation overflow"))
     }
 
     fn game_used_and_reserved(&self) -> Result<usize, ArenaError> {
-        self.game_retired_total.checked_add(self.game_reserved_slots()?)
+        self.game_retired_total
+            .checked_add(self.game_reserved_slots()?)
             .ok_or_else(|| invalid("lock-v2 game record total overflow"))
     }
 
     fn next_retired_record_count(&self) -> Result<usize, ArenaError> {
-        let next = self.game_retired_total.checked_add(1)
+        let next = self
+            .game_retired_total
+            .checked_add(1)
             .ok_or_else(|| invalid("lock-v2 game retired record overflow"))?;
-        check(next <= self.game_record_limit, "lock-v2 game retired record limit exceeded")?;
+        check(
+            next <= self.game_record_limit,
+            "lock-v2 game retired record limit exceeded",
+        )?;
         Ok(next)
     }
     fn is_disabled_ticket(&self, ticket: &RoleTicketEnvelope) -> Result<bool, ArenaError> {
@@ -920,7 +1064,9 @@ impl State {
         }
         if self.is_disabled_ticket(ticket)? {
             if self.disabled_prior.contains_key(&ticket.id) {
-                if let Some(route) = &self.speculative_current { route.cancel_ticket(ticket); }
+                if let Some(route) = &self.speculative_current {
+                    route.cancel_ticket(ticket);
+                }
                 self.registration.cancel_sequence(ticket.id)?;
             }
             return Ok(());
@@ -941,7 +1087,9 @@ impl State {
         )?;
         // A request can be abandoned after speculative teacher admission.
         // Signal only its original root/ticket; this is not terminal evidence.
-        if let Some(route) = &self.speculative_current { route.cancel_ticket(ticket); }
+        if let Some(route) = &self.speculative_current {
+            route.cancel_ticket(ticket);
+        }
         if let Some(sequence) = self.registration.cancel_sequence(ticket.id)? {
             self.producer_mut()?.discard_reserved_input(sequence);
         }
@@ -1075,7 +1223,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
             state.producer = Some(producer);
             state.producer_root = Some(admission.raw_sha256().to_owned());
             state.current_admission = Some(admission.clone());
-            state.speculative_current = state.speculative_pending.iter()
+            state.speculative_current = state
+                .speculative_pending
+                .iter()
                 .position(|(original, _)| original.same_original_admission(&admission))
                 .map(|index| state.speculative_pending.remove(index).1);
             state.handled_tickets.clear();
@@ -1123,13 +1273,15 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
             let game_limit_reached = state.game_retired_total >= state.game_record_limit;
             if !state.staged.contains_key(&ticket.id)
                 && !game_limit_reached
-                && state.game_used_and_reserved()? >= state.game_record_limit {
+                && state.game_used_and_reserved()? >= state.game_record_limit
+            {
                 // Existing reservations can still retire or be cancelled;
                 // a transient full reservation is not a permanent boundary.
                 return Ok(AdaptiveCollectionDispatchV2::Busy);
             }
             if !state.staged.contains_key(&ticket.id)
-                && (game_limit_reached || state.outstanding_rows() >= state.retired_outbox_capacity
+                && (game_limit_reached
+                    || state.outstanding_rows() >= state.retired_outbox_capacity
                     || state.handled_tickets.len() + state.pending.len()
                         >= rz_experiments::rovent_corpus::MAX_CORPUS_ROWS)
             {
@@ -1631,7 +1783,9 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                 "lock-v2 fenced root retains unresolved inputs",
             )?;
             if let Some(disabled) = state.disabled.as_ref() {
-                state.registration.clear_disabled_lock_v2_root(&disabled.admission)?;
+                state
+                    .registration
+                    .clear_disabled_lock_v2_root(&disabled.admission)?;
             }
             state.settled = true;
             if let Some(failure) = capture_failure {
@@ -1639,12 +1793,20 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV2<Q, O> for Observe
                     "native input capture failed before fenced cleanup: {failure:?}"
                 )));
             }
-            let admission = state.current_admission.as_ref()
-                .ok_or_else(|| invalid("lock-v2 settled root original admission missing"))?.clone();
+            let admission = state
+                .current_admission
+                .as_ref()
+                .ok_or_else(|| invalid("lock-v2 settled root original admission missing"))?
+                .clone();
             state.producer()?.validate_admission(&admission)?;
-            check(state.settled_roots.len() <= RETAINED_ROOT_CAPACITY
-                && !state.settled_roots.iter().any(|original| original.same_original_admission(&admission)),
-                "lock-v2 settled root evidence duplicate/capacity")?;
+            check(
+                state.settled_roots.len() <= RETAINED_ROOT_CAPACITY
+                    && !state
+                        .settled_roots
+                        .iter()
+                        .any(|original| original.same_original_admission(&admission)),
+                "lock-v2 settled root evidence duplicate/capacity",
+            )?;
             state.settled_roots.push(admission);
             Ok(())
         })

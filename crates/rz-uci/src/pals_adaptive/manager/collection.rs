@@ -190,22 +190,37 @@ impl RoventNoCaptureRootCapabilityV2 {
         admission: RoventCollectionRootAdmissionV2,
         verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
     ) -> Result<Self, RoventNoCaptureIssueErrorV2> {
-        admission.validate_native_identity(&verifier)
+        admission
+            .validate_native_identity(&verifier)
             .map_err(RoventNoCaptureIssueErrorV2::Rejected)?;
-        if !admission.root_admission().original_context().try_accepts()
+        if !admission
+            .root_admission()
+            .original_context()
+            .try_accepts()
             .map_err(|error| {
                 if error.code == rz_contracts::ErrorCode::ResourceExhausted {
                     RoventNoCaptureIssueErrorV2::Busy(error)
                 } else {
                     RoventNoCaptureIssueErrorV2::Rejected(AdaptiveCollectionError::new(
-                        AdaptiveCollectionStage::Dispatch, "NoCaptureRootUnavailable", error.to_string()))
+                        AdaptiveCollectionStage::Dispatch,
+                        "NoCaptureRootUnavailable",
+                        error.to_string(),
+                    ))
                 }
             })?
         {
-            return Err(RoventNoCaptureIssueErrorV2::Rejected(AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Dispatch, "NoCaptureRootRevoked", "original root is not live")));
+            return Err(RoventNoCaptureIssueErrorV2::Rejected(
+                AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Dispatch,
+                    "NoCaptureRootRevoked",
+                    "original root is not live",
+                ),
+            ));
         }
-        Ok(Self { admission, verifier })
+        Ok(Self {
+            admission,
+            verifier,
+        })
     }
 
     pub fn same_original_admission(&self, other: &RoventCollectionRootAdmissionV2) -> bool {
@@ -215,7 +230,10 @@ impl RoventNoCaptureRootCapabilityV2 {
     /// Root identity is checked independently of the worker identity so a
     /// duplicate root cannot be hidden by presenting a different worker.
     pub fn same_original_root(&self, other: &Self) -> bool {
-        Arc::ptr_eq(self.admission.root_admission(), other.admission.root_admission())
+        Arc::ptr_eq(
+            self.admission.root_admission(),
+            other.admission.root_admission(),
+        )
     }
 
     pub fn same_root_admission(&self, other: &RoventCollectionRootAdmissionV2) -> bool {
@@ -239,7 +257,10 @@ impl RoventNoCaptureRootCapabilityV2 {
     ) -> Result<(), AdaptiveCollectionError> {
         if !context.same_owner(&self.verifier) {
             return Err(AdaptiveCollectionError::new(
-                AdaptiveCollectionStage::Dispatch, "NoCaptureWorkerMismatch", "different native owner"));
+                AdaptiveCollectionStage::Dispatch,
+                "NoCaptureWorkerMismatch",
+                "different native owner",
+            ));
         }
         self.admission.validate_native_discard_owner(context)
     }

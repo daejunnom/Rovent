@@ -233,9 +233,18 @@ impl ContractSessionOwner {
         ticket: &SearchTicket,
         source: Arc<crate::engine::DriverStartSource>,
     ) -> Result<(), ContractError> {
-        let current = self.current.as_mut().ok_or_else(|| error(ErrorCode::Stale, "original Start has no active owner"))?;
-        if current.binding.ticket() != ticket || source.ticket() != ticket || current.original_start.is_some() {
-            return Err(error(ErrorCode::IdentityMismatch, "original Start differs from active owner"));
+        let current = self
+            .current
+            .as_mut()
+            .ok_or_else(|| error(ErrorCode::Stale, "original Start has no active owner"))?;
+        if current.binding.ticket() != ticket
+            || source.ticket() != ticket
+            || current.original_start.is_some()
+        {
+            return Err(error(
+                ErrorCode::IdentityMismatch,
+                "original Start differs from active owner",
+            ));
         }
         current.original_start = Some(source);
         Ok(())
@@ -434,9 +443,15 @@ impl ContractSessionOwner {
         // effects. Close the exact original Start's optional Collection gate
         // before its common cancel token, never for a rejected command or a
         // natural completion lacking a matching Cancel effect.
-        if out.session.effects.iter().any(|effect| matches!(effect,
-            Effect::Cancel { ticket, .. } if previous_ticket.as_ref() == Some(ticket))) {
-            if let Some(start) = self.current.as_ref().and_then(|current| current.original_start.as_ref()) {
+        if out.session.effects.iter().any(|effect| {
+            matches!(effect,
+            Effect::Cancel { ticket, .. } if previous_ticket.as_ref() == Some(ticket))
+        }) {
+            if let Some(start) = self
+                .current
+                .as_ref()
+                .and_then(|current| current.original_start.as_ref())
+            {
                 start.abort_collection();
             }
         }
@@ -598,7 +613,11 @@ impl ContractSessionOwner {
                 ));
             }
             Event::EndOfInput => {
-                if let Some(start) = self.current.as_ref().and_then(|current| current.original_start.as_ref()) {
+                if let Some(start) = self
+                    .current
+                    .as_ref()
+                    .and_then(|current| current.original_start.as_ref())
+                {
                     start.abort_collection();
                 }
                 self.close_current();
@@ -706,7 +725,9 @@ impl ContractSessionOwner {
             Err(err) if err.code == ErrorCode::Expired && current.work_completed => {
                 // Only a reached timer may close passive infinite authority.
                 // Completed output waiting never becomes a new resource failure.
-                if let Some(start) = &current.original_start { start.abort_collection(); }
+                if let Some(start) = &current.original_start {
+                    start.abort_collection();
+                }
                 current.cancellation.cancel();
                 SessionResult::default().into()
             }
@@ -834,7 +855,11 @@ impl Drop for ContractSessionOwner {
     fn drop(&mut self) {
         // An owner dropped with an active Start is an abort, not a natural
         // synchronization close; preserve its optional Collection failure.
-        if let Some(start) = self.current.as_ref().and_then(|current| current.original_start.as_ref()) {
+        if let Some(start) = self
+            .current
+            .as_ref()
+            .and_then(|current| current.original_start.as_ref())
+        {
             start.abort_collection();
         }
         self.close_current();
@@ -959,7 +984,9 @@ fn expire_current<P: PositionPort>(
     current: &mut CurrentSearch,
     err: ContractError,
 ) -> ContractSessionOutcome<P::Snapshot> {
-    if let Some(start) = &current.original_start { start.abort_collection(); }
+    if let Some(start) = &current.original_start {
+        start.abort_collection();
+    }
     current.cancellation.cancel();
     let mut out = if current.infinite && current.binding.budget_kind() == BudgetKind::ResourceWall {
         session.complete(

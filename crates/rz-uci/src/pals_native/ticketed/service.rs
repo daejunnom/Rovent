@@ -43,11 +43,15 @@ pub struct NativeTicketCancelObservation {
     original: Arc<AtomicBool>,
 }
 impl NativeTicketCancelObservation {
-    pub fn is_canceled(&self) -> bool { self.original.load(Ordering::Acquire) }
+    pub fn is_canceled(&self) -> bool {
+        self.original.load(Ordering::Acquire)
+    }
     /// Establish the ordering of an optional submission against cancellation.
     /// A successful claim does not dispatch, accept or complete any work.
     pub fn try_claim_submission(&self) -> bool {
-        self.original.compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        self.original
+            .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -76,7 +80,9 @@ impl<'a, V, Q, P> TicketOwnerDispatchContext<'a, V, Q, P> {
     /// Retain the same original native cancellation observation, not a new
     /// cancel authority or evidence that the NN request was accepted.
     pub fn original_cancellation(&self) -> NativeTicketCancelObservation {
-        NativeTicketCancelObservation { original: Arc::clone(self.canceled) }
+        NativeTicketCancelObservation {
+            original: Arc::clone(self.canceled),
+        }
     }
     pub fn same_owner(&self, verifier: &NativeAcceptanceVerifier) -> bool {
         self.verifier.same_owner(verifier)

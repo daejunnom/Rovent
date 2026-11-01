@@ -2,10 +2,11 @@
 //! published corpus or a claim of native/teacher physical completion.
 use super::*;
 use crate::rovent_collect::pc_hooks_lock_v2::{
-    RoventPcCollectionBridgeV2, RoventPcCollectionWorkerV2, PcWorkerExitKindV2, PcWorkerStartErrorV2,
+    PcWorkerExitKindV2, PcWorkerStartErrorV2, RoventPcCollectionBridgeV2,
+    RoventPcCollectionWorkerV2,
 };
-use crate::rovent_collect::teacher::v2_session::RoventTeacherRosterEntryV2;
 use crate::rovent_collect::pc_worker_supervisor_v2::{PcSecondarySlotV2, PcWorkerSupervisorV2};
+use crate::rovent_collect::teacher::v2_session::RoventTeacherRosterEntryV2;
 use rz_experiments::RoventInputLockV2;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
 use rz_uci::rovent_bootstrap::launch::{
@@ -22,53 +23,97 @@ const WORKER_START_FAILED: u8 = 3;
 /// Write only failure-domain payloads, never a corpus publication receipt.
 /// The caller owns the already-created directory and retains source custody.
 fn write_pc_failure_payloads(
-    directory: &Dir, evidence: &[u8], writer_buffer: Option<&[u8]>,
-    pending_chunk: Option<&[u8]>, raw: Vec<(String, Vec<u8>)>,
+    directory: &Dir,
+    evidence: &[u8],
+    writer_buffer: Option<&[u8]>,
+    pending_chunk: Option<&[u8]>,
+    raw: Vec<(String, Vec<u8>)>,
 ) -> Result<(), ArenaError> {
     let mut options = cap_std::fs::OpenOptions::new();
-    options.write(true).create_new(true).follow(FollowSymlinks::No);
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
     let mut planned = directory.open_with("planned.json", &options).map_err(io)?;
-    planned.write_all(evidence).and_then(|_| planned.sync_all()).map_err(io)?;
+    planned
+        .write_all(evidence)
+        .and_then(|_| planned.sync_all())
+        .map_err(io)?;
     if let Some(bytes) = writer_buffer {
-        let mut file = directory.open_with("assembly-writer-buffer.jsonl", &options).map_err(io)?;
-        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(io)?;
+        let mut file = directory
+            .open_with("assembly-writer-buffer.jsonl", &options)
+            .map_err(io)?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(io)?;
     }
     if let Some(bytes) = pending_chunk {
-        let mut file = directory.open_with("assembly-pending-chunk.bin", &options).map_err(io)?;
-        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(io)?;
+        let mut file = directory
+            .open_with("assembly-pending-chunk.bin", &options)
+            .map_err(io)?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(io)?;
     }
     for (name, bytes) in raw {
         let mut file = directory.open_with(name, &options).map_err(io)?;
-        file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(io)?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(io)?;
     }
     let mut file = directory.open_with("receipt.json", &options).map_err(io)?;
-    file.write_all(evidence).and_then(|_| file.sync_all()).map_err(io)?;
+    file.write_all(evidence)
+        .and_then(|_| file.sync_all())
+        .map_err(io)?;
     Ok(())
 }
 
 /// Small failure-only identity index survives the existing large-metadata
 /// fallback. It never reconstructs an original row or grants authority.
-fn compact_failure_identities(primary: &serde_json::Value, secondary: &[serde_json::Value]) -> serde_json::Value {
+fn compact_failure_identities(
+    primary: &serde_json::Value,
+    secondary: &[serde_json::Value],
+) -> serde_json::Value {
     let mut entries = Vec::new();
     let mut total = 0u64;
     let mut sources_unknown = 0usize;
-    for (slot, consumer) in std::iter::once((0usize, primary))
-        .chain(secondary.iter().filter_map(|value| {
-            Some((usize::try_from(value.get("slot")?.as_u64()?).ok()?, value.get("consumer")?))
+    for (slot, consumer) in
+        std::iter::once((0usize, primary)).chain(secondary.iter().filter_map(|value| {
+            Some((
+                usize::try_from(value.get("slot")?.as_u64()?).ok()?,
+                value.get("consumer")?,
+            ))
         }))
     {
-        let Some(failures) = consumer.get("failure_observations") else { sources_unknown += 1; continue; };
-        let Some(count) = failures.get("count").and_then(serde_json::Value::as_u64) else { sources_unknown += 1; continue; };
+        let Some(failures) = consumer.get("failure_observations") else {
+            sources_unknown += 1;
+            continue;
+        };
+        let Some(count) = failures.get("count").and_then(serde_json::Value::as_u64) else {
+            sources_unknown += 1;
+            continue;
+        };
         total = total.saturating_add(count);
-        if let Some(reported) = failures.get("reported").and_then(serde_json::Value::as_array) {
+        if let Some(reported) = failures
+            .get("reported")
+            .and_then(serde_json::Value::as_array)
+        {
             for item in reported {
-                if entries.len() >= 64 { break; }
-                let bounded = |key: &str| item.get(key).and_then(serde_json::Value::as_str)
-                    .map(|s| json!({"value":s.chars().take(256).collect::<String>(),"truncated":s.chars().count()>256}));
-                entries.push(json!({"slot":slot, "question_id":bounded("original_question_id"),
-                    "job_id":bounded("original_job_id"), "slice_id":bounded("original_slice_id")}));
+                if entries.len() >= 64 {
+                    break;
+                }
+                let bounded = |key: &str| {
+                    item.get(key).and_then(serde_json::Value::as_str)
+                    .map(|s| json!({"value":s.chars().take(256).collect::<String>(),"truncated":s.chars().count()>256}))
+                };
+                entries.push(
+                    json!({"slot":slot, "question_id":bounded("original_question_id"),
+                    "job_id":bounded("original_job_id"), "slice_id":bounded("original_slice_id")}),
+                );
             }
-        } else { sources_unknown += 1; }
+        } else {
+            sources_unknown += 1;
+        }
     }
     let omitted = total.saturating_sub(entries.len() as u64);
     json!({"total":total,"reported":entries,"omitted":omitted,
@@ -83,29 +128,46 @@ mod failure_identity_tests {
     fn failure_writer_bytes_are_exact_and_receipt_requires_all_writes() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!("rovent-failure-buffer-{}-{}",
-            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let root = std::env::temp_dir().join(format!(
+            "rovent-failure-buffer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&root).unwrap();
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
         let evidence = br#"{"status":"partial","training_eligible":false}"#;
         let original = b"{\"record\":1}\n{\"record\":2}\n";
         write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).unwrap();
-        assert_eq!(std::fs::read(root.join("assembly-writer-buffer.jsonl")).unwrap(), original);
+        assert_eq!(
+            std::fs::read(root.join("assembly-writer-buffer.jsonl")).unwrap(),
+            original
+        );
         assert_eq!(std::fs::read(root.join("receipt.json")).unwrap(), evidence);
         let receipt: serde_json::Value = serde_json::from_slice(evidence).unwrap();
         assert_eq!(receipt["status"], "partial");
         assert_eq!(receipt["training_eligible"], false);
         assert!(!root.join("publication.json").exists());
-        assert!(write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).is_err());
-        for name in ["planned.json", "assembly-writer-buffer.jsonl", "receipt.json"] {
+        assert!(
+            write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).is_err()
+        );
+        for name in [
+            "planned.json",
+            "assembly-writer-buffer.jsonl",
+            "receipt.json",
+        ] {
             std::fs::remove_file(root.join(name)).unwrap();
         }
         // An existing payload makes the write fail after planned.json. It may
         // not be overwritten or followed by a new completion receipt.
         std::fs::write(root.join("assembly-writer-buffer.jsonl"), b"original").unwrap();
-        assert!(write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).is_err());
+        assert!(
+            write_pc_failure_payloads(&dir, evidence, Some(original), None, Vec::new()).is_err()
+        );
         assert!(!root.join("receipt.json").exists());
-        assert_eq!(std::fs::read(root.join("assembly-writer-buffer.jsonl")).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(root.join("assembly-writer-buffer.jsonl")).unwrap(),
+            b"original"
+        );
         std::fs::remove_file(root.join("planned.json")).unwrap();
         std::fs::remove_file(root.join("assembly-writer-buffer.jsonl")).unwrap();
         drop(dir);
@@ -117,8 +179,10 @@ mod failure_identity_tests {
         let primary = json!({"record_projections":{"omitted_rows":150},"failure_observations":{
             "count":1,"reported":[{"original_question_id":"q1","original_job_id":"j1","original_slice_id":"s1"}]
         }});
-        let secondary = vec![json!({"slot":1,"consumer":{"record_projections":{"omitted_rows":59},
-            "failure_observations":{"count":2,"reported":[{"original_question_id":"q2","original_job_id":"j2","original_slice_id":"s2"}]}}})];
+        let secondary = vec![
+            json!({"slot":1,"consumer":{"record_projections":{"omitted_rows":59},
+            "failure_observations":{"count":2,"reported":[{"original_question_id":"q2","original_job_id":"j2","original_slice_id":"s2"}]}}}),
+        ];
         let result = compact_failure_identities(&primary, &secondary);
         assert_eq!(result["total"], 3);
         assert_eq!(result["omitted"], 1);
@@ -155,7 +219,8 @@ pub struct RoventPcCollectionRunV2 {
     publication_assembly: Option<RoventCorpusAssemblyLockV2>,
     publication_dir: Option<Dir>,
     publication_attempted: bool,
-    publication: Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
+    publication:
+        Option<rz_experiments::rovent_corpus_lock_v2::publication::RoventLockV2Publication>,
     late_rows: std::collections::VecDeque<RoventRetiredLockV2Record>,
     supervisor: Option<PcWorkerSupervisorV2>,
     secondary_slots: Vec<PcSecondarySlotV2>,
@@ -172,17 +237,29 @@ impl RoventPcCollectionRunV2 {
     /// Additional failure-only stream. A completed diagnostic receipt never
     /// grants corpus, training, or original process authority.
     fn write_retained_consumer_evidence(&self, parent: &Dir) -> Result<(), ArenaError> {
-        let byte_limit = self.original_lock.try_lock()
+        let byte_limit = self
+            .original_lock
+            .try_lock()
             .map_err(|_| invalid("P/C original lock unavailable for failure stream"))?
-            .as_ref().ok_or_else(|| invalid("P/C original lock absent for failure stream"))?
-            .manifest.output_bytes_max.min(rz_experiments::rovent_corpus::MAX_CORPUS_BYTES);
+            .as_ref()
+            .ok_or_else(|| invalid("P/C original lock absent for failure stream"))?
+            .manifest
+            .output_bytes_max
+            .min(rz_experiments::rovent_corpus::MAX_CORPUS_BYTES);
         let mut budget = byte_limit;
         let mut rows_remaining = usize::try_from(self.publication_maximum_records)
             .map_err(|_| invalid("P/C failure stream record limit overflow"))?;
-        parent.create_dir("consumer-retained-evidence").map_err(io)?;
-        let directory = parent.open_dir_nofollow("consumer-retained-evidence").map_err(io)?;
+        parent
+            .create_dir("consumer-retained-evidence")
+            .map_err(io)?;
+        let directory = parent
+            .open_dir_nofollow("consumer-retained-evidence")
+            .map_err(io)?;
         let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true).follow(FollowSymlinks::No);
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
         let planned = json!({"schema":"rz-rovent-retained-consumer-failure-evidence/1",
             "status":"writing","stream_byte_limit":byte_limit,
             "record_limit":self.publication_maximum_records,"training_eligible":false,
@@ -191,24 +268,45 @@ impl RoventPcCollectionRunV2 {
         serde_json::to_writer(&mut file, &planned).map_err(|error| invalid(error.to_string()))?;
         file.sync_all().map_err(io)?;
         let mut streams = Vec::new();
-        let all = std::iter::once((0usize, &self.pump_consumer,
-            self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked))
-            .chain(self.secondary_slots.iter().enumerate().map(|(index, slot)|
-                (index + 1, &slot.consumer, slot.worker_join_observed && slot.consumer_drained_after_join)));
+        let all = std::iter::once((
+            0usize,
+            &self.pump_consumer,
+            self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked,
+        ))
+        .chain(
+            self.secondary_slots
+                .iter()
+                .enumerate()
+                .map(|(index, slot)| {
+                    (
+                        index + 1,
+                        &slot.consumer,
+                        slot.worker_join_observed && slot.consumer_drained_after_join,
+                    )
+                }),
+        );
         for (slot, consumer, joined) in all {
-            if !joined { streams.push(json!({"slot":slot,"status":"sender_not_joined"})); continue; }
+            if !joined {
+                streams.push(json!({"slot":slot,"status":"sender_not_joined"}));
+                continue;
+            }
             let name = format!("root-{slot}-consumer.jsonl");
             let mut file = directory.open_with(&name, &options).map_err(io)?;
-            let result = consumer.try_stream_failure_rows(&mut file, &mut budget, rows_remaining)?;
+            let result =
+                consumer.try_stream_failure_rows(&mut file, &mut budget, rows_remaining)?;
             file.sync_all().map_err(io)?;
             match result {
                 Some(value) => {
-                    let rows = value.get("rows").and_then(serde_json::Value::as_u64)
+                    let rows = value
+                        .get("rows")
+                        .and_then(serde_json::Value::as_u64)
                         .and_then(|n| usize::try_from(n).ok())
                         .ok_or_else(|| invalid("P/C failure stream row count unavailable"))?;
-                    rows_remaining = rows_remaining.checked_sub(rows)
+                    rows_remaining = rows_remaining
+                        .checked_sub(rows)
                         .ok_or_else(|| invalid("P/C failure stream row limit exceeded"))?;
-                    streams.push(json!({"slot":slot,"path":name,"status":"observed","detail":value}));
+                    streams
+                        .push(json!({"slot":slot,"path":name,"status":"observed","detail":value}));
                 }
                 None => streams.push(json!({"slot":slot,"path":name,"status":"consumer_busy"})),
             }
@@ -222,11 +320,15 @@ impl RoventPcCollectionRunV2 {
         file.sync_all().map_err(io)?;
         Ok(())
     }
-    fn failure_projection(failure: &crate::rovent_collect::collection_hooks_core_v2::WorkerFailure)
-        -> (serde_json::Value, bool) {
+    fn failure_projection(
+        failure: &crate::rovent_collect::collection_hooks_core_v2::WorkerFailure,
+    ) -> (serde_json::Value, bool) {
         let (detail, original_chars, truncated) = failure.diagnostic_projection();
-        (json!({"kind":failure.kind(), "detail":detail, "original_chars":original_chars,
-            "detail_truncated":truncated}), truncated)
+        (
+            json!({"kind":failure.kind(), "detail":detail, "original_chars":original_chars,
+            "detail_truncated":truncated}),
+            truncated,
+        )
     }
     /// Drain only an already stopped sender into its original bounded
     /// consumer. Empty counts alone do not prove its receiver was drained.
@@ -237,26 +339,47 @@ impl RoventPcCollectionRunV2 {
         slot_index: usize,
     ) -> (serde_json::Value, bool) {
         use super::own_publisher_v2::OwnPumpPollV2;
-        if !sender_stopped { return (json!({"status":"sender_not_joined"}), false); }
+        if !sender_stopped {
+            return (json!({"status":"sender_not_joined"}), false);
+        }
         let mut drained = false;
         let mut problem = None;
         for _ in 0..self.publication_maximum_records.saturating_add(17) {
             match consumer.poll() {
                 Ok(OwnPumpPollV2::Received) => continue,
-                Ok(OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected) => { drained = true; break; }
-                Ok(OwnPumpPollV2::Full) => { problem = Some("consumer_capacity".to_owned()); break; }
-                Err(error) => { problem = Some(error.to_string()); break; }
+                Ok(OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected) => {
+                    drained = true;
+                    break;
+                }
+                Ok(OwnPumpPollV2::Full) => {
+                    problem = Some("consumer_capacity".to_owned());
+                    break;
+                }
+                Err(error) => {
+                    problem = Some(error.to_string());
+                    break;
+                }
             }
         }
         let counts = match consumer.try_counts() {
             Ok(Some(counts)) => counts,
             Ok(None) => return (json!({"status":"busy", "receiver_drained":drained}), false),
-            Err(error) => return (json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}), false),
+            Err(error) => {
+                return (
+                    json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}),
+                    false,
+                );
+            }
         };
         let failures = match consumer.try_has_failures() {
             Ok(Some(value)) => value,
             Ok(None) => return (json!({"status":"busy", "receiver_drained":drained}), false),
-            Err(error) => return (json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}), false),
+            Err(error) => {
+                return (
+                    json!({"status":"error", "detail":error.to_string(), "receiver_drained":drained}),
+                    false,
+                );
+            }
         };
         let projections = json!({"status":"separate_failure_stream",
             "path":format!("consumer-retained-evidence/root-{slot_index}-consumer.jsonl"),
@@ -268,25 +391,35 @@ impl RoventPcCollectionRunV2 {
             Err(error) => json!({"status":"error", "detail":error.to_string()}),
         };
         let complete = drained && problem.is_none() && counts.0 == 0 && counts.1 == 0 && !failures;
-        (json!({"status":if complete { "drained_empty" } else { "retained_or_unknown" },
+        (
+            json!({"status":if complete { "drained_empty" } else { "retained_or_unknown" },
             "receiver_drained":drained, "items":counts.0, "failed_items":counts.1,
             "teacher_evidence":counts.2, "disconnected":counts.3,
             "failure_or_overflow":failures, "detail":problem, "record_projections":projections,
-            "failure_observations":failure_observations}), complete)
+            "failure_observations":failure_observations}),
+            complete,
+        )
     }
     /// Write serializable failure observations and original recovered teacher
     /// byte streams without consuming their owners. A partial write is left
     /// in place and a later attempt cannot silently replace it.
-    pub fn write_failure_evidence(&self, publication_failure: Option<&str>) -> Result<bool, ArenaError> {
+    pub fn write_failure_evidence(
+        &self,
+        publication_failure: Option<&str>,
+    ) -> Result<bool, ArenaError> {
         use sha2::{Digest as _, Sha256};
         let mut raw = Vec::<(String, Vec<u8>)>::new();
         let observation = self.observation();
-        let (worker_evidence, mut complete) = if self.worker_exit.is_some() && !self.worker_thread_panicked {
+        let (worker_evidence, mut complete) = if self.worker_exit.is_some()
+            && !self.worker_thread_panicked
+        {
             match self.worker.try_lock() {
                 Ok(worker) => {
                     let diagnostics = worker.diagnostics();
                     let bytes = diagnostics.values().try_fold(0usize, |total, value| {
-                        total.checked_add(value.stdout().len())?.checked_add(value.stderr().len())
+                        total
+                            .checked_add(value.stdout().len())?
+                            .checked_add(value.stderr().len())
                     });
                     if !bytes.is_some_and(|n| n <= 4 * 1024 * 1024) {
                         (json!({"status":"diagnostics_over_limit"}), false)
@@ -303,74 +436,120 @@ impl RoventPcCollectionRunV2 {
                         }
                         let failure = worker.failure_observation();
                         let primary = failure.primary.map(Self::failure_projection);
-                        let additional: Vec<_> = failure.additional.iter().map(Self::failure_projection).collect();
+                        let additional: Vec<_> = failure
+                            .additional
+                            .iter()
+                            .map(Self::failure_projection)
+                            .collect();
                         let truncated = primary.as_ref().is_some_and(|(_, truncated)| *truncated)
                             || additional.iter().any(|(_, truncated)| *truncated);
                         let retirement = format!("{:?}", worker.teacher_observations());
                         if retirement.len() > 256 * 1024 {
-                            (json!({"status":"retirement_observation_over_limit", "teacher_diagnostics":entries,
+                            (
+                                json!({"status":"retirement_observation_over_limit", "teacher_diagnostics":entries,
                                 "primary_failure":primary.map(|(value, _)| value),
                                 "additional_failures":additional.into_iter().map(|(value, _)| value).collect::<Vec<_>>(),
-                                "omitted_failures":failure.omitted}), false)
+                                "omitted_failures":failure.omitted}),
+                                false,
+                            )
                         } else {
-                            (json!({"status":"observed", "primary_failure":primary.map(|(value, _)| value),
+                            (
+                                json!({"status":"observed", "primary_failure":primary.map(|(value, _)| value),
                                 "additional_failures":additional.into_iter().map(|(value, _)| value).collect::<Vec<_>>(),
                                 "omitted_failures":failure.omitted, "teacher_retirement_observation_debug":retirement,
                                 "pending_pump_rows":worker.pending_pump_rows(), "teacher_diagnostics":entries}),
-                                failure.omitted == 0 && worker.pending_pump_rows() == 0 && !truncated)
+                                failure.omitted == 0
+                                    && worker.pending_pump_rows() == 0
+                                    && !truncated,
+                            )
                         }
                     }
                 }
-                Err(std::sync::TryLockError::WouldBlock) => (json!({"status":"worker_busy"}), false),
-                Err(std::sync::TryLockError::Poisoned(_)) => (json!({"status":"worker_poisoned"}), false),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    (json!({"status":"worker_busy"}), false)
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    (json!({"status":"worker_poisoned"}), false)
+                }
             }
-        } else { (json!({"status":"worker_not_joined_or_panicked"}), false) };
+        } else {
+            (json!({"status":"worker_not_joined_or_panicked"}), false)
+        };
         // A serialized late record is diagnostic data only; it cannot
         // reconstruct the original in-process admission or producer owner.
         let mut late_entries = Vec::new();
         let mut late_bytes = 0usize;
         for (index, row) in self.late_rows.iter().enumerate() {
             let bytes = serde_json::to_vec(&row.record).map_err(|e| invalid(e.to_string()))?;
-            let Some(next) = late_bytes.checked_add(bytes.len()) else { complete = false; break; };
-            if next > 4 * 1024 * 1024 { complete = false; break; }
+            let Some(next) = late_bytes.checked_add(bytes.len()) else {
+                complete = false;
+                break;
+            };
+            if next > 4 * 1024 * 1024 {
+                complete = false;
+                break;
+            }
             late_bytes = next;
             let name = format!("late-row-{index}.json");
             late_entries.push(json!({"path":&name, "bytes":bytes.len(),
                 "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
             raw.push((name, bytes));
         }
-        let writer_buffer = self.publication_assembly.as_ref()
+        let writer_buffer = self
+            .publication_assembly
+            .as_ref()
             .and_then(|assembly| assembly.failure_writer_buffer())
             .filter(|(bytes, _)| !bytes.is_empty());
-        let writer_buffer_evidence = writer_buffer.map(|(bytes, rows)| json!({
-            "status":"planned_failure_only", "path":"assembly-writer-buffer.jsonl",
-            "bytes":bytes.len(), "rows":rows, "sha256":format!("{:x}", Sha256::digest(bytes)),
-            "authority":"not_reconstructable", "training_eligible":false,
-        }));
-        let pending_chunk = self.publication_assembly.as_ref()
+        let writer_buffer_evidence = writer_buffer.map(|(bytes, rows)| {
+            json!({
+                "status":"planned_failure_only", "path":"assembly-writer-buffer.jsonl",
+                "bytes":bytes.len(), "rows":rows, "sha256":format!("{:x}", Sha256::digest(bytes)),
+                "authority":"not_reconstructable", "training_eligible":false,
+            })
+        });
+        let pending_chunk = self
+            .publication_assembly
+            .as_ref()
             .and_then(|assembly| assembly.pending_chunk());
-        let pending_chunk_evidence = pending_chunk.map(|packet| json!({
-            "status":"planned_failure_only", "path":"assembly-pending-chunk.bin",
-            "bytes":packet.bytes.len(), "sha256":format!("{:x}", Sha256::digest(&packet.bytes)),
-            "authority":"not_reconstructable", "training_eligible":false,
-        }));
+        let pending_chunk_evidence = pending_chunk.map(|packet| {
+            json!({
+                "status":"planned_failure_only", "path":"assembly-pending-chunk.bin",
+                "bytes":packet.bytes.len(), "sha256":format!("{:x}", Sha256::digest(&packet.bytes)),
+                "authority":"not_reconstructable", "training_eligible":false,
+            })
+        });
         let mut assembly_evidence = json!({"status":"not_created"});
         if let Some(assembly) = &self.publication_assembly {
             let pending = assembly.pending_row().map(|row| &row.record);
             let sealed = assembly.sealed_row().map(|row| row.record());
             let mut records = Vec::new();
-            for (name, record) in [("assembly-pending.json", pending), ("assembly-sealed.json", sealed)] {
-                let Some(record) = record else { continue; };
-                let bytes = serde_json::to_vec(record).map_err(|error| invalid(error.to_string()))?;
-                if late_bytes.checked_add(bytes.len()).is_none_or(|next| next > 4 * 1024 * 1024) {
-                    complete = false; continue;
+            for (name, record) in [
+                ("assembly-pending.json", pending),
+                ("assembly-sealed.json", sealed),
+            ] {
+                let Some(record) = record else {
+                    continue;
+                };
+                let bytes =
+                    serde_json::to_vec(record).map_err(|error| invalid(error.to_string()))?;
+                if late_bytes
+                    .checked_add(bytes.len())
+                    .is_none_or(|next| next > 4 * 1024 * 1024)
+                {
+                    complete = false;
+                    continue;
                 }
                 late_bytes += bytes.len();
                 records.push(json!({"path":name, "bytes":bytes.len(),
                     "sha256":format!("{:x}", Sha256::digest(&bytes)), "authority":"not_reconstructable"}));
                 raw.push((name.to_owned(), bytes));
             }
-            if !self.pump_published && (assembly.records() != 0 || pending.is_some() || sealed.is_some() || pending_chunk.is_some()) {
+            if !self.pump_published
+                && (assembly.records() != 0
+                    || pending.is_some()
+                    || sealed.is_some()
+                    || pending_chunk.is_some())
+            {
                 complete = false;
             }
             assembly_evidence = json!({"status":"retained", "records":assembly.records(),
@@ -379,22 +558,33 @@ impl RoventPcCollectionRunV2 {
                 "writer_buffer":writer_buffer_evidence});
         }
         let (primary_consumer, primary_consumer_complete) = self.failure_consumer_observation(
-            &self.pump_consumer, self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked,
+            &self.pump_consumer,
+            self.pump_thread_joined && self.worker_exit.is_some() && !self.worker_thread_panicked,
             0,
         );
         complete &= primary_consumer_complete;
         match self.bridge.try_revoke_observations() {
-            Ok(Some(value)) if value.get("omitted").and_then(serde_json::Value::as_u64) == Some(0) => {},
+            Ok(Some(value))
+                if value.get("omitted").and_then(serde_json::Value::as_u64) == Some(0) => {}
             _ => complete = false,
         }
         let mut secondary_evidence = Vec::new();
-        let mut teacher_bytes = raw.iter().filter(|(name, _)| name.starts_with("teacher-"))
-            .map(|(_, bytes)| bytes.len()).sum::<usize>();
+        let mut teacher_bytes = raw
+            .iter()
+            .filter(|(name, _)| name.starts_with("teacher-"))
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>();
         let mut bridges = Vec::with_capacity(self.secondary_slots.len() + 1);
         bridges.push(Arc::clone(&self.bridge));
-        bridges.extend(self.secondary_slots.iter().map(|slot| Arc::clone(&slot.bridge)));
+        bridges.extend(
+            self.secondary_slots
+                .iter()
+                .map(|slot| Arc::clone(&slot.bridge)),
+        );
         for (slot_index, bridge) in bridges.iter().enumerate() {
-            let admission = bridge.installed_admission_for_recovery().map(|root| root.raw_sha256().to_owned());
+            let admission = bridge
+                .installed_admission_for_recovery()
+                .map(|root| root.raw_sha256().to_owned());
             if slot_index > 0 {
                 let slot = &self.secondary_slots[slot_index - 1];
                 if admission.is_none() && slot.worker_start == crate::rovent_collect::pc_worker_supervisor_v2::PcSecondaryWorkerStartV2::FailedBeforeStart
@@ -409,11 +599,18 @@ impl RoventPcCollectionRunV2 {
                     continue;
                 }
             }
-            let (projections, separated_status) = match bridge.try_snapshot_separated_rows(4 * 1024 * 1024 - late_bytes) {
-                Ok(Some(rows)) => (Some(rows), json!({"status":"observed"})),
-                Ok(None) => { complete = false; (None, json!({"status":"busy"})) },
-                Err(error) => { complete = false; (None, json!({"status":"error","detail":error.to_string()})) }
-            };
+            let (projections, separated_status) =
+                match bridge.try_snapshot_separated_rows(4 * 1024 * 1024 - late_bytes) {
+                    Ok(Some(rows)) => (Some(rows), json!({"status":"observed"})),
+                    Ok(None) => {
+                        complete = false;
+                        (None, json!({"status":"busy"}))
+                    }
+                    Err(error) => {
+                        complete = false;
+                        (None, json!({"status":"error","detail":error.to_string()}))
+                    }
+                };
             let mut separated = Vec::new();
             if let Some(projections) = projections {
                 for (row_index, bytes) in projections.into_iter().enumerate() {
@@ -429,25 +626,52 @@ impl RoventPcCollectionRunV2 {
                 continue;
             }
             let slot = &self.secondary_slots[slot_index - 1];
-            if admission.is_some() && slot.speculative_setup_error.is_some() { complete = false; }
+            if admission.is_some() && slot.speculative_setup_error.is_some() {
+                complete = false;
+            }
             let revokes = match bridge.try_revoke_observations() {
                 Ok(Some(value)) => {
-                    if value.get("omitted").and_then(serde_json::Value::as_u64) != Some(0) { complete = false; }
+                    if value.get("omitted").and_then(serde_json::Value::as_u64) != Some(0) {
+                        complete = false;
+                    }
                     json!({"status":"observed","detail":value})
-                },
-                Ok(None) => { complete = false; json!({"status":"busy"}) },
-                Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
+                }
+                Ok(None) => {
+                    complete = false;
+                    json!({"status":"busy"})
+                }
+                Err(error) => {
+                    complete = false;
+                    json!({"status":"error","detail":error.to_string()})
+                }
             };
-            let (consumer, consumer_complete) = self.failure_consumer_observation(&slot.consumer,
-                slot.worker_join_observed && slot.consumer_drained_after_join, slot_index);
+            let (consumer, consumer_complete) = self.failure_consumer_observation(
+                &slot.consumer,
+                slot.worker_join_observed && slot.consumer_drained_after_join,
+                slot_index,
+            );
             complete &= consumer_complete;
             let deferred = match bridge.try_deferred_observation() {
                 Ok(Some(value)) => json!({"status":"observed","detail":value}),
-                Ok(None) => { complete = false; json!({"status":"busy"}) },
-                Err(error) => { complete = false; json!({"status":"error","detail":error.to_string()}) },
+                Ok(None) => {
+                    complete = false;
+                    json!({"status":"busy"})
+                }
+                Err(error) => {
+                    complete = false;
+                    json!({"status":"error","detail":error.to_string()})
+                }
             };
-            if !slot.consumer_drained_after_join || !matches!(slot.worker_exit_kind,
-                Some(PcWorkerExitKindV2::NoAdmission | PcWorkerExitKindV2::Retirement | PcWorkerExitKindV2::Aggregate)) {
+            if !slot.consumer_drained_after_join
+                || !matches!(
+                    slot.worker_exit_kind,
+                    Some(
+                        PcWorkerExitKindV2::NoAdmission
+                            | PcWorkerExitKindV2::Retirement
+                            | PcWorkerExitKindV2::Aggregate
+                    )
+                )
+            {
                 complete = false;
             }
             let detail = if !slot.worker_join_observed {
@@ -458,15 +682,30 @@ impl RoventPcCollectionRunV2 {
                     Ok(worker) => {
                         let failure = worker.failure_observation();
                         let primary = failure.primary.map(Self::failure_projection);
-                        let additional: Vec<_> = failure.additional.iter().map(Self::failure_projection).collect();
+                        let additional: Vec<_> = failure
+                            .additional
+                            .iter()
+                            .map(Self::failure_projection)
+                            .collect();
                         if primary.as_ref().is_some_and(|(_, truncated)| *truncated)
-                            || additional.iter().any(|(_, truncated)| *truncated) { complete = false; }
-                        if failure.omitted != 0 || worker.pending_pump_rows() != 0 { complete = false; }
+                            || additional.iter().any(|(_, truncated)| *truncated)
+                        {
+                            complete = false;
+                        }
+                        if failure.omitted != 0 || worker.pending_pump_rows() != 0 {
+                            complete = false;
+                        }
                         let mut diagnostics = Vec::new();
                         for (index, (actor, value)) in worker.diagnostics().iter().enumerate() {
                             let size = value.stdout().len().saturating_add(value.stderr().len());
-                            if teacher_bytes.checked_add(size).is_none_or(|total| total > 4 * 1024 * 1024) {
-                                complete = false; diagnostics.push(json!({"actor":actor,"status":"diagnostic_over_limit"})); continue;
+                            if teacher_bytes
+                                .checked_add(size)
+                                .is_none_or(|total| total > 4 * 1024 * 1024)
+                            {
+                                complete = false;
+                                diagnostics
+                                    .push(json!({"actor":actor,"status":"diagnostic_over_limit"}));
+                                continue;
                             }
                             teacher_bytes += size;
                             let stdout = format!("root-{slot_index}-teacher-{index}-stdout.bin");
@@ -474,10 +713,13 @@ impl RoventPcCollectionRunV2 {
                             diagnostics.push(json!({"actor":actor,
                                 "stdout":{"path":&stdout,"bytes":value.stdout().len(),"sha256":format!("{:x}",Sha256::digest(value.stdout()))},
                                 "stderr":{"path":&stderr,"bytes":value.stderr().len(),"sha256":format!("{:x}",Sha256::digest(value.stderr()))}}));
-                            raw.push((stdout, value.stdout().to_vec())); raw.push((stderr, value.stderr().to_vec()));
+                            raw.push((stdout, value.stdout().to_vec()));
+                            raw.push((stderr, value.stderr().to_vec()));
                         }
                         let retirement = format!("{:?}", worker.teacher_observations());
-                        if retirement.len() > 256 * 1024 { complete = false; }
+                        if retirement.len() > 256 * 1024 {
+                            complete = false;
+                        }
                         json!({"status":"observed", "exit":slot.worker_exit_kind.map(PcWorkerExitKindV2::label),
                             "consumer_drained_after_join":slot.consumer_drained_after_join,
                             "pending_pump_rows":worker.pending_pump_rows(),
@@ -487,17 +729,25 @@ impl RoventPcCollectionRunV2 {
                             "teacher_retirement_observation_debug":if retirement.len() <= 256 * 1024 { Some(retirement) } else { None },
                             "teacher_diagnostics":diagnostics})
                     }
-                    Err(_) => { complete = false; json!({"status":"worker_busy_or_poisoned"}) }
+                    Err(_) => {
+                        complete = false;
+                        json!({"status":"worker_busy_or_poisoned"})
+                    }
                 }
             };
             secondary_evidence.push(json!({"slot":slot_index,"admission":admission,"separated":separated,
                 "separated_status":separated_status,"deferred":deferred,"revokes":revokes,"consumer":consumer,"worker":detail,
                 "speculative_setup_error":slot.speculative_setup_error}));
         }
-        if self.supervisor.is_some() { complete = false; }
+        if self.supervisor.is_some() {
+            complete = false;
+        }
         let publication_failure_chars = publication_failure.map(|s| s.chars().count());
-        let publication_failure_truncated = publication_failure_chars.is_some_and(|count| count > 4096);
-        if publication_failure_truncated { complete = false; }
+        let publication_failure_truncated =
+            publication_failure_chars.is_some_and(|count| count > 4096);
+        if publication_failure_truncated {
+            complete = false;
+        }
         let failure_identities = compact_failure_identities(&primary_consumer, &secondary_evidence);
         let mut evidence = serde_json::to_vec(&json!({"schema":"rz-rovent-pc-failure-evidence/1",
             "raw_files_complete_only_when_receipt_exists":true,
@@ -530,8 +780,14 @@ impl RoventPcCollectionRunV2 {
                 "detail":"Detailed metadata exceeded 1 MiB; original in-process authority cannot be reconstructed from these files"}))
                 .map_err(|e| invalid(e.to_string()))?;
         }
-        let parent = self.publication_directory.parent().ok_or_else(|| invalid("P/C output parent"))?;
-        let leaf = self.publication_directory.file_name().ok_or_else(|| invalid("P/C output leaf"))?;
+        let parent = self
+            .publication_directory
+            .parent()
+            .ok_or_else(|| invalid("P/C output parent"))?;
+        let leaf = self
+            .publication_directory
+            .file_name()
+            .ok_or_else(|| invalid("P/C output leaf"))?;
         let root = Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?;
         let directory = match root.open_dir_nofollow(leaf) {
             Ok(directory) => directory,
@@ -542,11 +798,18 @@ impl RoventPcCollectionRunV2 {
             Err(error) => return Err(io(error)),
         };
         directory.create_dir("pc-failure-evidence").map_err(io)?;
-        let directory = directory.open_dir_nofollow("pc-failure-evidence").map_err(io)?;
+        let directory = directory
+            .open_dir_nofollow("pc-failure-evidence")
+            .map_err(io)?;
         // Preserve the planned metadata even if a later raw byte write fails;
         // only receipt.json records completion of all listed writes.
-        write_pc_failure_payloads(&directory, &evidence, writer_buffer.map(|(bytes, _)| bytes),
-            pending_chunk.map(|packet| packet.bytes.as_slice()), raw)?;
+        write_pc_failure_payloads(
+            &directory,
+            &evidence,
+            writer_buffer.map(|(bytes, _)| bytes),
+            pending_chunk.map(|packet| packet.bytes.as_slice()),
+            raw,
+        )?;
         self.write_retained_consumer_evidence(&directory)?;
         Ok(complete)
     }
@@ -554,34 +817,61 @@ impl RoventPcCollectionRunV2 {
     /// worker, settled handoff and received rows. Failures retain the owner,
     /// consumer and any assembly; they never imply physical completion.
     pub fn publish_single_root(&mut self, until: Instant) -> Result<bool, ArenaError> {
-        check(!self.speculative_teacher_requested || self.speculative_teacher_enabled,
-            "P/C optional speculative teacher setup was unavailable")?;
+        check(
+            !self.speculative_teacher_requested || self.speculative_teacher_enabled,
+            "P/C optional speculative teacher setup was unavailable",
+        )?;
         use super::own_publisher_v2::{OwnOfferOutcomeV2, OwnPumpPollV2};
-        check(self.supervisor.is_none() && self.supervisor_error.is_none(),
-            "P/C game supervisor or secondary custody remains unresolved")?;
+        check(
+            self.supervisor.is_none() && self.supervisor_error.is_none(),
+            "P/C game supervisor or secondary custody remains unresolved",
+        )?;
         if !self.secondary_slots.is_empty() {
             return self.publish_collected_game(until);
         }
-        if self.pump_published { return Ok(true); }
-        check(!self.publication_attempted, "P/C previous publication attempt requires explicit recovery")?;
-        check(self.pump_thread_joined && self.pump_thread_failure.is_none()
-            && matches!(self.worker_exit, Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement))
-            && self.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C handoff: {e:?}")))?,
-            "P/C original worker, native fence or teacher aggregate unavailable")?;
+        if self.pump_published {
+            return Ok(true);
+        }
+        check(
+            !self.publication_attempted,
+            "P/C previous publication attempt requires explicit recovery",
+        )?;
+        check(
+            self.pump_thread_joined
+                && self.pump_thread_failure.is_none()
+                && matches!(
+                    self.worker_exit,
+                    Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement)
+                )
+                && self
+                    .bridge
+                    .returned_handoff_settled()
+                    .map_err(|e| invalid(format!("P/C handoff: {e:?}")))?,
+            "P/C original worker, native fence or teacher aggregate unavailable",
+        )?;
         self.closed_owner()?;
         // The original observer may retire rows just before its root fence.
         // Recover them after the original worker joined, outside the native
         // manager; never synthesize a teacher result for those late rows.
         loop {
-            check(Instant::now() < until, "P/C late retired row recovery deadline reached")?;
+            check(
+                Instant::now() < until,
+                "P/C late retired row recovery deadline reached",
+            )?;
             let Some(status) = self.owner.try_status()? else {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             };
-            if status.pending_retired_count == 0 { break; }
-            check(self.late_rows.len() < self.publication_maximum_records as usize,
-                "P/C late retired row recovery capacity reached")?;
-            self.late_rows.try_reserve(1).map_err(|_| invalid("P/C late row custody capacity"))?;
+            if status.pending_retired_count == 0 {
+                break;
+            }
+            check(
+                self.late_rows.len() < self.publication_maximum_records as usize,
+                "P/C late retired row recovery capacity reached",
+            )?;
+            self.late_rows
+                .try_reserve(1)
+                .map_err(|_| invalid("P/C late row custody capacity"))?;
             match self.owner.try_take_settled_retired()? {
                 Some(Some(row)) => self.late_rows.push_back(row),
                 Some(None) => break,
@@ -591,36 +881,70 @@ impl RoventPcCollectionRunV2 {
         match self.worker.try_lock() {
             Ok(worker) => {
                 check(!worker.has_failure(), "P/C worker has retained failure")?;
-                check(!worker.has_unpublished_pump_rows(), "P/C worker has unpublished pump rows")?;
+                check(
+                    !worker.has_unpublished_pump_rows(),
+                    "P/C worker has unpublished pump rows",
+                )?;
             }
-            Err(std::sync::TryLockError::WouldBlock) => return Err(invalid("P/C worker observation busy")),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C worker observation poisoned")),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(invalid("P/C worker observation busy"));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("P/C worker observation poisoned"));
+            }
         }
-        check(self.late_rows.iter().all(|row| row.submitted_input_seal().teacher_actor_id.is_none()
-            || row.record.0.input.legal_moves.is_empty()),
-            "P/C late retired rows require teacher evidence; originals retained")?;
-        check(self.owner.try_status()?.is_some_and(|status| status.pending_retired_count == 0),
-            "P/C owner still retains or queues retired original rows")?;
-        check(matches!(self.bridge.try_has_deferred()?, Some(false))
-            && self.owner.try_status()?.is_some_and(|status|
-                status.collection_disabled_first_ticket.is_none() && status.prior_disabled_first_tickets.is_empty()),
-            "P/C collection was deferred or capture was disabled")?;
+        check(
+            self.late_rows.iter().all(|row| {
+                row.submitted_input_seal().teacher_actor_id.is_none()
+                    || row.record.0.input.legal_moves.is_empty()
+            }),
+            "P/C late retired rows require teacher evidence; originals retained",
+        )?;
+        check(
+            self.owner
+                .try_status()?
+                .is_some_and(|status| status.pending_retired_count == 0),
+            "P/C owner still retains or queues retired original rows",
+        )?;
+        check(
+            matches!(self.bridge.try_has_deferred()?, Some(false))
+                && self.owner.try_status()?.is_some_and(|status| {
+                    status.collection_disabled_first_ticket.is_none()
+                        && status.prior_disabled_first_tickets.is_empty()
+                }),
+            "P/C collection was deferred or capture was disabled",
+        )?;
         check(Instant::now() < until, "P/C publication deadline expired")?;
-        let admission = self.bridge.installed_admission_for_recovery()
-            .ok_or_else(|| invalid("P/C original publication admission unavailable"))?.clone();
+        let admission = self
+            .bridge
+            .installed_admission_for_recovery()
+            .ok_or_else(|| invalid("P/C original publication admission unavailable"))?
+            .clone();
         // Mark before filesystem mutation; a partial create/write must not be
         // silently retried as a fresh publication.
         self.publication_attempted = true;
-        let parent = self.publication_directory.parent().ok_or_else(|| invalid("P/C output parent"))?;
-        let leaf = self.publication_directory.file_name().ok_or_else(|| invalid("P/C output leaf"))?;
+        let parent = self
+            .publication_directory
+            .parent()
+            .ok_or_else(|| invalid("P/C output parent"))?;
+        let leaf = self
+            .publication_directory
+            .file_name()
+            .ok_or_else(|| invalid("P/C output leaf"))?;
         let root = Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?;
         root.create_dir(leaf).map_err(io)?;
         let directory = root.open_dir_nofollow(leaf).map_err(io)?;
         directory.create_dir("chunks").map_err(io)?;
         self.publication_dir = Some(directory);
         self.publication_assembly = Some(RoventCorpusAssemblyLockV2::new(
-            &self.owner, self.publication_dir.as_ref().expect("original output owner"),
-            &self.publication_manifest, &admission, self.publication_maximum_records)?);
+            &self.owner,
+            self.publication_dir
+                .as_ref()
+                .expect("original output owner"),
+            &self.publication_manifest,
+            &admission,
+            self.publication_maximum_records,
+        )?);
         let mut assembly = self.publication_assembly.take().expect("original assembly");
         let result = (|| -> Result<bool, ArenaError> {
             loop {
@@ -631,7 +955,13 @@ impl RoventPcCollectionRunV2 {
                         let advanced = match self.try_advance_consumer_assembly(&mut assembly) {
                             Err(error) if assembly.chunk_flush_required()? => {
                                 assembly.flush()?;
-                                self.try_advance_consumer_assembly(&mut assembly).map_err(|retry| invalid(format!("P/C append before flush: {error}; retry: {retry}")))?
+                                self.try_advance_consumer_assembly(&mut assembly).map_err(
+                                    |retry| {
+                                        invalid(format!(
+                                            "P/C append before flush: {error}; retry: {retry}"
+                                        ))
+                                    },
+                                )?
                             }
                             other => other?,
                         };
@@ -639,23 +969,37 @@ impl RoventPcCollectionRunV2 {
                             return Err(invalid("P/C original commit gate remained busy"));
                         }
                     }
-                    OwnOfferOutcomeV2::FailedRetained => return Err(invalid("P/C teacher row failed; original retained")),
+                    OwnOfferOutcomeV2::FailedRetained => {
+                        return Err(invalid("P/C teacher row failed; original retained"));
+                    }
                     OwnOfferOutcomeV2::Pending => {
                         let Some((items, failed, _, _)) = self.pump_consumer.try_counts()? else {
-                            std::thread::sleep(Duration::from_millis(1)); continue;
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
                         };
                         check(failed == 0, "P/C consumer retains failed rows")?;
-                        if items != 0 { std::thread::sleep(Duration::from_millis(1)); continue; }
+                        if items != 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
                         match polled {
-                            OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("P/C pump item remained pending")),
+                            OwnPumpPollV2::Received | OwnPumpPollV2::Full => {
+                                return Err(invalid("P/C pump item remained pending"));
+                            }
                             OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
                         }
                     }
                 }
             }
             while !self.late_rows.is_empty() {
-                check(Instant::now() < until, "P/C late row publication deadline expired")?;
-                let row = self.late_rows.pop_front().expect("late original row retained");
+                check(
+                    Instant::now() < until,
+                    "P/C late row publication deadline expired",
+                )?;
+                let row = self
+                    .late_rows
+                    .pop_front()
+                    .expect("late original row retained");
                 if let Err(original) = assembly.offer(row) {
                     let (error, row) = *original;
                     self.late_rows.push_front(row);
@@ -664,26 +1008,50 @@ impl RoventPcCollectionRunV2 {
                 let advanced = match self.try_advance_consumer_assembly(&mut assembly) {
                     Err(error) if assembly.chunk_flush_required()? => {
                         assembly.flush()?;
-                        self.try_advance_consumer_assembly(&mut assembly).map_err(|retry| invalid(format!("P/C append before flush: {error}; retry: {retry}")))?
+                        self.try_advance_consumer_assembly(&mut assembly)
+                            .map_err(|retry| {
+                                invalid(format!("P/C append before flush: {error}; retry: {retry}"))
+                            })?
                     }
                     other => other?,
                 };
                 check(advanced, "P/C late row original commit gate remained busy")?;
             }
-            check(assembly.records() > 0 && matches!(self.pump_consumer.try_has_failures()?, Some(false)),
-                "P/C publication has no valid rows or retains a teacher failure")?;
-            check(self.owner.try_status()?.is_some_and(|status| status.pending_retired_count == 0)
-                && self.worker.try_lock().is_ok_and(|worker| !worker.has_failure() && !worker.has_unpublished_pump_rows()),
-                "P/C original rows remain outside the assembled corpus")?;
-            check(self.owner.try_status()?.is_some_and(|status|
-                status.game_reserved_slots == Some(0) && u64::try_from(status.game_retired_total) == Ok(assembly.records())),
-                "P/C assembled row count does not match the original game owner")?;
+            check(
+                assembly.records() > 0
+                    && matches!(self.pump_consumer.try_has_failures()?, Some(false)),
+                "P/C publication has no valid rows or retains a teacher failure",
+            )?;
+            check(
+                self.owner
+                    .try_status()?
+                    .is_some_and(|status| status.pending_retired_count == 0)
+                    && self.worker.try_lock().is_ok_and(|worker| {
+                        !worker.has_failure() && !worker.has_unpublished_pump_rows()
+                    }),
+                "P/C original rows remain outside the assembled corpus",
+            )?;
+            check(
+                self.owner.try_status()?.is_some_and(|status| {
+                    status.game_reserved_slots == Some(0)
+                        && u64::try_from(status.game_retired_total) == Ok(assembly.records())
+                }),
+                "P/C assembled row count does not match the original game owner",
+            )?;
             assembly.flush()?;
-            let directory = self.publication_dir.as_ref().expect("original output owner");
+            let directory = self
+                .publication_dir
+                .as_ref()
+                .expect("original output owner");
             let finished = assembly.finish()?;
             let publication = if self.speculative_teacher_enabled {
                 let gate = self.owner.game_gate();
-                finished.publish_atomic_speculative(directory, until, &AtomicBool::new(false), &gate)?
+                finished.publish_atomic_speculative(
+                    directory,
+                    until,
+                    &AtomicBool::new(false),
+                    &gate,
+                )?
             } else {
                 finished.publish_atomic(directory, until, &AtomicBool::new(false))?
             };
@@ -691,7 +1059,9 @@ impl RoventPcCollectionRunV2 {
             Ok(true)
         })();
         self.publication_assembly = Some(assembly);
-        if matches!(&result, Ok(true)) { self.pump_published = true; }
+        if matches!(&result, Ok(true)) {
+            self.pump_published = true;
+        }
         result
     }
 
@@ -701,139 +1071,264 @@ impl RoventPcCollectionRunV2 {
     fn publish_collected_game(&mut self, until: Instant) -> Result<bool, ArenaError> {
         use super::own_publisher_v2::{OwnOfferOutcomeV2, OwnPumpPollV2};
         use crate::rovent_collect::pc_hooks_lock_v2::PcRootSeparationV2;
-        check(!self.publication_attempted && self.supervisor.is_none() && self.supervisor_error.is_none(),
-            "P/C game supervisor or prior publication remains unresolved")?;
-        check(self.pump_thread_joined && self.pump_thread_failure.is_none(),
-            "P/C primary root worker or original handoff is unresolved")?;
+        check(
+            !self.publication_attempted
+                && self.supervisor.is_none()
+                && self.supervisor_error.is_none(),
+            "P/C game supervisor or prior publication remains unresolved",
+        )?;
+        check(
+            self.pump_thread_joined && self.pump_thread_failure.is_none(),
+            "P/C primary root worker or original handoff is unresolved",
+        )?;
         // Keep handoff and resource admission failures distinct. Both remain
         // prerequisites for actual publication; neither is inferred from the other.
         self.closed_owner()?;
-        let mut roots = vec![(Arc::clone(&self.bridge), Arc::clone(&self.worker), Arc::clone(&self.pump_consumer))];
-        roots.try_reserve(self.secondary_slots.len()).map_err(|_| invalid("P/C game publisher slot allocation"))?;
+        let mut roots = vec![(
+            Arc::clone(&self.bridge),
+            Arc::clone(&self.worker),
+            Arc::clone(&self.pump_consumer),
+        )];
+        roots
+            .try_reserve(self.secondary_slots.len())
+            .map_err(|_| invalid("P/C game publisher slot allocation"))?;
         for slot in &self.secondary_slots {
-            check(matches!(slot.bridge.try_has_deferred()?, Some(false)),
-                "P/C secondary slot retains deferred collection")?;
+            check(
+                matches!(slot.bridge.try_has_deferred()?, Some(false)),
+                "P/C secondary slot retains deferred collection",
+            )?;
             if slot.bridge.installed_admission_for_recovery().is_none() {
                 let proven_unstarted = (slot.worker_join_observed && slot.consumer_drained_after_join
                     && slot.worker_exit_kind == Some(PcWorkerExitKindV2::NoAdmission))
                     || (slot.worker_start == crate::rovent_collect::pc_worker_supervisor_v2::PcSecondaryWorkerStartV2::FailedBeforeStart
                         && slot.consumer_empty_before_worker_start);
-                check(proven_unstarted, "P/C unused secondary slot start or installation is unknown")?;
+                check(
+                    proven_unstarted,
+                    "P/C unused secondary slot start or installation is unknown",
+                )?;
                 continue;
             }
-            check(slot.speculative_setup_error.is_none(),
-                "P/C secondary optional speculative teacher setup was unavailable")?;
-            check(slot.worker_join_observed && slot.consumer_drained_after_join
-                && matches!(slot.worker_exit_kind, Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement))
-                && slot.bridge.returned_handoff_settled().map_err(|e| invalid(format!("P/C secondary handoff: {e:?}")))?,
-                "P/C secondary original worker, consumer or handoff is unresolved")?;
-            roots.push((Arc::clone(&slot.bridge), Arc::clone(&slot.worker), Arc::clone(&slot.consumer)));
+            check(
+                slot.speculative_setup_error.is_none(),
+                "P/C secondary optional speculative teacher setup was unavailable",
+            )?;
+            check(
+                slot.worker_join_observed
+                    && slot.consumer_drained_after_join
+                    && matches!(
+                        slot.worker_exit_kind,
+                        Some(PcWorkerExitKindV2::Aggregate | PcWorkerExitKindV2::Retirement)
+                    )
+                    && slot
+                        .bridge
+                        .returned_handoff_settled()
+                        .map_err(|e| invalid(format!("P/C secondary handoff: {e:?}")))?,
+                "P/C secondary original worker, consumer or handoff is unresolved",
+            )?;
+            roots.push((
+                Arc::clone(&slot.bridge),
+                Arc::clone(&slot.worker),
+                Arc::clone(&slot.consumer),
+            ));
         }
         for (bridge, worker, _) in &roots {
-            check(matches!(bridge.try_has_deferred()?, Some(false)), "P/C game contains deferred collection")?;
-            let worker = worker.try_lock().map_err(|_| invalid("P/C game worker busy or poisoned"))?;
-            check(!worker.has_failure() && !worker.has_unpublished_pump_rows(),
-                "P/C game worker retains failure or pending original rows")?;
+            check(
+                matches!(bridge.try_has_deferred()?, Some(false)),
+                "P/C game contains deferred collection",
+            )?;
+            let worker = worker
+                .try_lock()
+                .map_err(|_| invalid("P/C game worker busy or poisoned"))?;
+            check(
+                !worker.has_failure() && !worker.has_unpublished_pump_rows(),
+                "P/C game worker retains failure or pending original rows",
+            )?;
         }
-        check(self.owner.try_status()?.is_some_and(|status|
-            status.collection_disabled_first_ticket.is_none() && status.prior_disabled_first_tickets.is_empty()
-                && status.incomplete_capture_count == 0 && status.failure.is_none() && !status.callback_lock_failure),
-            "P/C game owner retains disabled, incomplete or failed collection")?;
+        check(
+            self.owner.try_status()?.is_some_and(|status| {
+                status.collection_disabled_first_ticket.is_none()
+                    && status.prior_disabled_first_tickets.is_empty()
+                    && status.incomplete_capture_count == 0
+                    && status.failure.is_none()
+                    && !status.callback_lock_failure
+            }),
+            "P/C game owner retains disabled, incomplete or failed collection",
+        )?;
         let (last, _, _) = roots.last().expect("primary root retained");
-        let last_admission = last.installed_admission_for_recovery()
-            .ok_or_else(|| invalid("P/C last root admission missing"))?.clone();
+        let last_admission = last
+            .installed_admission_for_recovery()
+            .ok_or_else(|| invalid("P/C last root admission missing"))?
+            .clone();
         loop {
-            check(Instant::now() < until, "P/C game root separation deadline reached")?;
-            match last.try_separate_root_for_next(&last_admission, self.publication_maximum_records as usize)? {
+            check(
+                Instant::now() < until,
+                "P/C game root separation deadline reached",
+            )?;
+            match last.try_separate_root_for_next(
+                &last_admission,
+                self.publication_maximum_records as usize,
+            )? {
                 PcRootSeparationV2::Pending => std::thread::sleep(Duration::from_millis(1)),
                 PcRootSeparationV2::Released { .. } => break,
             }
         }
-        let first_admission = self.bridge.installed_admission_for_recovery()
-            .ok_or_else(|| invalid("P/C first root admission missing"))?.clone();
+        let first_admission = self
+            .bridge
+            .installed_admission_for_recovery()
+            .ok_or_else(|| invalid("P/C first root admission missing"))?
+            .clone();
         self.publication_attempted = true;
-        let parent = self.publication_directory.parent().ok_or_else(|| invalid("P/C output parent"))?;
-        let leaf = self.publication_directory.file_name().ok_or_else(|| invalid("P/C output leaf"))?;
+        let parent = self
+            .publication_directory
+            .parent()
+            .ok_or_else(|| invalid("P/C output parent"))?;
+        let leaf = self
+            .publication_directory
+            .file_name()
+            .ok_or_else(|| invalid("P/C output leaf"))?;
         let root = Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(io)?;
         root.create_dir(leaf).map_err(io)?;
         let directory = root.open_dir_nofollow(leaf).map_err(io)?;
         directory.create_dir("chunks").map_err(io)?;
         self.publication_dir = Some(directory);
         self.publication_assembly = Some(RoventCorpusAssemblyLockV2::new(
-            &self.owner, self.publication_dir.as_ref().expect("original output owner"),
-            &self.publication_manifest, &first_admission, self.publication_maximum_records)?);
+            &self.owner,
+            self.publication_dir
+                .as_ref()
+                .expect("original output owner"),
+            &self.publication_manifest,
+            &first_admission,
+            self.publication_maximum_records,
+        )?);
         let mut assembly = self.publication_assembly.take().expect("original assembly");
         let result = (|| -> Result<bool, ArenaError> {
             for (bridge, worker, consumer) in &roots {
                 loop {
                     check(Instant::now() < until, "P/C game consumer deadline reached")?;
                     let polled = consumer.poll()?;
-                    match self.try_offer_consumer_item_for(bridge, worker, consumer, &mut assembly)? {
-                        OwnOfferOutcomeV2::Offered => self.advance_game_row(bridge, worker, &mut assembly)?,
-                        OwnOfferOutcomeV2::FailedRetained => return Err(invalid("P/C game teacher row failed; original retained")),
+                    match self.try_offer_consumer_item_for(
+                        bridge,
+                        worker,
+                        consumer,
+                        &mut assembly,
+                    )? {
+                        OwnOfferOutcomeV2::Offered => {
+                            self.advance_game_row(bridge, worker, &mut assembly)?
+                        }
+                        OwnOfferOutcomeV2::FailedRetained => {
+                            return Err(invalid("P/C game teacher row failed; original retained"));
+                        }
                         OwnOfferOutcomeV2::Pending => {
                             let Some((items, failed, _, _)) = consumer.try_counts()? else {
-                                std::thread::sleep(Duration::from_millis(1)); continue;
+                                std::thread::sleep(Duration::from_millis(1));
+                                continue;
                             };
                             check(failed == 0, "P/C game consumer retains failed rows")?;
-                            if items != 0 { std::thread::sleep(Duration::from_millis(1)); continue; }
+                            if items != 0 {
+                                std::thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
                             match polled {
-                                OwnPumpPollV2::Received | OwnPumpPollV2::Full => return Err(invalid("P/C game consumer item remains pending")),
+                                OwnPumpPollV2::Received | OwnPumpPollV2::Full => {
+                                    return Err(invalid("P/C game consumer item remains pending"));
+                                }
                                 OwnPumpPollV2::Empty | OwnPumpPollV2::Disconnected => break,
                             }
                         }
                     }
                 }
-                let admission = bridge.installed_admission_for_recovery()
+                let admission = bridge
+                    .installed_admission_for_recovery()
                     .ok_or_else(|| invalid("P/C game original root admission missing"))?;
                 loop {
                     check(Instant::now() < until, "P/C separated row deadline reached")?;
-                    self.late_rows.try_reserve(1).map_err(|_| invalid("P/C separated row custody capacity"))?;
+                    self.late_rows
+                        .try_reserve(1)
+                        .map_err(|_| invalid("P/C separated row custody capacity"))?;
                     let row = match bridge.try_take_separated_row(admission)? {
-                        None => { std::thread::sleep(Duration::from_millis(1)); continue; }
+                        None => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
                         Some(None) => break,
                         Some(Some(row)) => row,
                     };
                     self.late_rows.push_back(row);
-                    let row = self.late_rows.front().expect("original separated row retained");
-                    check(row.submitted_input_seal().teacher_actor_id.is_none() || row.record.0.input.legal_moves.is_empty(),
-                        "P/C separated row requires unobserved teacher evidence; original retained")?;
-                    let row = self.late_rows.pop_front().expect("original separated row retained");
+                    let row = self
+                        .late_rows
+                        .front()
+                        .expect("original separated row retained");
+                    check(
+                        row.submitted_input_seal().teacher_actor_id.is_none()
+                            || row.record.0.input.legal_moves.is_empty(),
+                        "P/C separated row requires unobserved teacher evidence; original retained",
+                    )?;
+                    let row = self
+                        .late_rows
+                        .pop_front()
+                        .expect("original separated row retained");
                     if let Err(original) = assembly.offer(row) {
-                        let (error, row) = *original; self.late_rows.push_front(row); return Err(error);
+                        let (error, row) = *original;
+                        self.late_rows.push_front(row);
+                        return Err(error);
                     }
                     self.advance_game_row(bridge, worker, &mut assembly)?;
                 }
-                check(matches!(consumer.try_has_failures()?, Some(false)), "P/C game consumer retains failure")?;
+                check(
+                    matches!(consumer.try_has_failures()?, Some(false)),
+                    "P/C game consumer retains failure",
+                )?;
             }
-            check(assembly.records() > 0 && self.owner.try_status()?.is_some_and(|status|
-                status.pending_retired_count == 0 && status.game_reserved_slots == Some(0)
-                    && u64::try_from(status.game_retired_total) == Ok(assembly.records())),
-                "P/C game owner and assembled records differ")?;
+            check(
+                assembly.records() > 0
+                    && self.owner.try_status()?.is_some_and(|status| {
+                        status.pending_retired_count == 0
+                            && status.game_reserved_slots == Some(0)
+                            && u64::try_from(status.game_retired_total) == Ok(assembly.records())
+                    }),
+                "P/C game owner and assembled records differ",
+            )?;
             assembly.flush()?;
-            let directory = self.publication_dir.as_ref().expect("original output owner");
+            let directory = self
+                .publication_dir
+                .as_ref()
+                .expect("original output owner");
             let finished = assembly.finish()?;
             self.publication = Some(if self.speculative_teacher_enabled {
                 let gate = self.owner.game_gate();
-                finished.publish_atomic_speculative(directory, until, &AtomicBool::new(false), &gate)?
+                finished.publish_atomic_speculative(
+                    directory,
+                    until,
+                    &AtomicBool::new(false),
+                    &gate,
+                )?
             } else {
                 finished.publish_atomic(directory, until, &AtomicBool::new(false))?
             });
             Ok(true)
         })();
         self.publication_assembly = Some(assembly);
-        if matches!(&result, Ok(true)) { self.pump_published = true; }
+        if matches!(&result, Ok(true)) {
+            self.pump_published = true;
+        }
         result
     }
 
-    fn advance_game_row(&self, bridge: &RoventPcCollectionBridgeV2,
-        worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>, assembly: &mut RoventCorpusAssemblyLockV2,
+    fn advance_game_row(
+        &self,
+        bridge: &RoventPcCollectionBridgeV2,
+        worker: &Arc<Mutex<RoventPcCollectionWorkerV2>>,
+        assembly: &mut RoventCorpusAssemblyLockV2,
     ) -> Result<(), ArenaError> {
         let advanced = match self.try_advance_consumer_assembly_for(bridge, worker, assembly) {
             Err(error) if assembly.chunk_flush_required()? => {
                 assembly.flush()?;
                 self.try_advance_consumer_assembly_for(bridge, worker, assembly)
-                    .map_err(|retry| invalid(format!("P/C game append before flush: {error}; retry: {retry}")))?
+                    .map_err(|retry| {
+                        invalid(format!(
+                            "P/C game append before flush: {error}; retry: {retry}"
+                        ))
+                    })?
             }
             other => other?,
         };
@@ -863,16 +1358,24 @@ impl RoventPcCollectionRunV2 {
         let worker = match worker.try_lock() {
             Ok(worker) => worker,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original collection worker poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("P/C original collection worker poisoned"));
+            }
         };
-        let Some(handoff) = worker.original_handoff() else { return Ok(OwnOfferOutcomeV2::Pending); };
+        let Some(handoff) = worker.original_handoff() else {
+            return Ok(OwnOfferOutcomeV2::Pending);
+        };
         let mut handoff = match handoff.try_lock() {
             Ok(handoff) => handoff,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(OwnOfferOutcomeV2::Pending),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original handoff poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("P/C original handoff poisoned"));
+            }
         };
         let admission = handoff.parts_mut().0.clone();
-        let Some(gate) = bridge.try_begin_commit(&admission)? else { return Ok(OwnOfferOutcomeV2::Pending); };
+        let Some(gate) = bridge.try_begin_commit(&admission)? else {
+            return Ok(OwnOfferOutcomeV2::Pending);
+        };
         consumer.try_offer_front_pc(&self.owner, assembly, &gate, &mut handoff)
     }
 
@@ -880,7 +1383,9 @@ impl RoventPcCollectionRunV2 {
         &self,
         assembly: &mut RoventCorpusAssemblyLockV2,
     ) -> Result<bool, ArenaError> {
-        if self.worker_exit.is_none() || self.worker_thread_panicked { return Ok(false); }
+        if self.worker_exit.is_none() || self.worker_thread_panicked {
+            return Ok(false);
+        }
         self.try_advance_consumer_assembly_for(&self.bridge, &self.worker, assembly)
     }
 
@@ -893,30 +1398,45 @@ impl RoventPcCollectionRunV2 {
         let worker = match worker.try_lock() {
             Ok(worker) => worker,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original collection worker poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("P/C original collection worker poisoned"));
+            }
         };
-        let Some(handoff) = worker.original_handoff() else { return Ok(false); };
+        let Some(handoff) = worker.original_handoff() else {
+            return Ok(false);
+        };
         let mut handoff = match handoff.try_lock() {
             Ok(handoff) => handoff,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(invalid("P/C original handoff poisoned")),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("P/C original handoff poisoned"));
+            }
         };
         let admission = handoff.parts_mut().0.clone();
-        let Some(gate) = bridge.try_begin_commit(&admission)? else { return Ok(false); };
+        let Some(gate) = bridge.try_begin_commit(&admission)? else {
+            return Ok(false);
+        };
         assembly.try_advance_fenced_pc(&gate, &mut handoff)
     }
     /// Collect only a thread that has already exited; never wait indefinitely
     /// or infer that a still-running worker has physically stopped.
     pub fn poll_worker(&mut self) -> bool {
         let start = self.worker_start.load(Ordering::Acquire);
-        if matches!(start, WORKER_NOT_STARTED | WORKER_START_FAILED) { return true; }
+        if matches!(start, WORKER_NOT_STARTED | WORKER_START_FAILED) {
+            return true;
+        }
         match self.bridge.poll_worker() {
             Ok(Some(kind)) => {
                 self.worker_exit = Some(kind);
-                if kind == PcWorkerExitKindV2::OuterPanic { self.worker_thread_panicked = true; }
+                if kind == PcWorkerExitKindV2::OuterPanic {
+                    self.worker_thread_panicked = true;
+                }
             }
             Ok(None) => {}
-            Err(error) => { self.resource_error.get_or_insert_with(|| format!("teacher worker custody: {error:?}")); }
+            Err(error) => {
+                self.resource_error
+                    .get_or_insert_with(|| format!("teacher worker custody: {error:?}"));
+            }
         }
         if self.worker_exit.is_some() && !self.worker_thread_panicked {
             if let Some(admission) = self.bridge.installed_admission_for_recovery() {
@@ -927,7 +1447,9 @@ impl RoventPcCollectionRunV2 {
                 // observation; each call remains nonblocking. Unresolved
                 // contention or custody remains visible in the receipt.
                 for _ in 0..=16 {
-                    if self.bridge.try_unlink_finished_speculative_route(admission) { break; }
+                    if self.bridge.try_unlink_finished_speculative_route(admission) {
+                        break;
+                    }
                 }
             }
         }
@@ -942,10 +1464,15 @@ impl RoventPcCollectionRunV2 {
             Err(_) => ("poisoned", None),
         };
         let start = self.worker_start.load(Ordering::Acquire);
-        let worker_exit = self.worker_exit.map(PcWorkerExitKindV2::label).unwrap_or_else(|| match start {
-            WORKER_NOT_STARTED => "not_started", WORKER_STARTING => "start_unknown",
-            WORKER_START_FAILED => "start_failed", _ => "pending",
-        });
+        let worker_exit = self
+            .worker_exit
+            .map(PcWorkerExitKindV2::label)
+            .unwrap_or_else(|| match start {
+                WORKER_NOT_STARTED => "not_started",
+                WORKER_STARTING => "start_unknown",
+                WORKER_START_FAILED => "start_failed",
+                _ => "pending",
+            });
         let worker_observation = self.worker.try_lock().ok().map(|worker| {
             let failures = worker.failure_observation();
             let (route_unlinked, route_unlink_error) = worker.speculative_route_unlink_observation();
@@ -980,13 +1507,15 @@ impl RoventPcCollectionRunV2 {
             Ok(None) => json!({"status":"busy"}),
             Err(error) => json!({"status":"error", "detail":error.to_string()}),
         };
-        let secondary_revokes: Vec<_> = self.secondary_slots.iter().map(|slot| {
-            match slot.bridge.try_revoke_observations() {
+        let secondary_revokes: Vec<_> = self
+            .secondary_slots
+            .iter()
+            .map(|slot| match slot.bridge.try_revoke_observations() {
                 Ok(Some(value)) => json!({"status":"available", "detail":value}),
                 Ok(None) => json!({"status":"busy"}),
                 Err(error) => json!({"status":"error", "detail":error.to_string()}),
-            }
-        }).collect();
+            })
+            .collect();
         let collection_owner = owner.map(|status| {
             let mut value = json!({"admitted":status.admitted,"settled":status.settled,
                 "pending":status.pending_count,"retired":status.pending_retired_count,
@@ -1040,7 +1569,10 @@ impl RoventPcCollectionRunV2 {
         let serde_json::Value::Object(remaining) = remaining else {
             unreachable!("remaining observation is an object");
         };
-        observation.as_object_mut().expect("observation is an object").extend(remaining);
+        observation
+            .as_object_mut()
+            .expect("observation is an object")
+            .extend(remaining);
         if self.speculative_teacher_requested {
             observation.as_object_mut().expect("P/C observation object").insert(
                 "speculative_teacher".into(), json!({"requested":true,
@@ -1140,12 +1672,18 @@ impl RoventPcCollectionRunV2 {
     pub fn closed_owner(&self) -> Result<RoventCollectionOwnerLockV2, ArenaError> {
         let fenced = self.worker_exit == Some(PcWorkerExitKindV2::Retirement)
             || (self.worker_exit == Some(PcWorkerExitKindV2::Aggregate)
-                && self.bridge.returned_handoff_settled().map_err(|error| invalid(format!("P/C returned handoff: {error:?}")))?);
+                && self
+                    .bridge
+                    .returned_handoff_settled()
+                    .map_err(|error| invalid(format!("P/C returned handoff: {error:?}")))?);
         check(
-            fenced && self.native_failure.is_none() && !self.native_failure_taken && self
-                .worker
-                .try_lock()
-                .is_ok_and(|worker| !worker.has_failure()),
+            fenced
+                && self.native_failure.is_none()
+                && !self.native_failure_taken
+                && self
+                    .worker
+                    .try_lock()
+                    .is_ok_and(|worker| !worker.has_failure()),
             "Collection /2 teacher/worker retirement is not observed",
         )?;
         let status = self
@@ -1164,10 +1702,13 @@ impl RoventPcCollectionRunV2 {
                 && !status.callback_lock_failure,
             "Collection /2 native observer is not settled",
         )?;
-        check(self.resource_error.is_none(), &format!(
-            "Collection /2 resource readback unavailable: {}",
-            self.resource_error.as_deref().unwrap_or("unknown"),
-        ))?;
+        check(
+            self.resource_error.is_none(),
+            &format!(
+                "Collection /2 resource readback unavailable: {}",
+                self.resource_error.as_deref().unwrap_or("unknown"),
+            ),
+        )?;
         Ok(self.owner.clone())
     }
 }
@@ -1217,15 +1758,27 @@ impl Drop for RoventPcCollectionRunV2 {
             std::mem::forget(self.owner.clone());
             std::mem::forget(Arc::clone(&self.bridge));
             std::mem::forget(Arc::clone(&self.worker));
-            if !self.secondary_slots.is_empty() { std::mem::forget(std::mem::take(&mut self.secondary_slots)); }
+            if !self.secondary_slots.is_empty() {
+                std::mem::forget(std::mem::take(&mut self.secondary_slots));
+            }
         }
         if !self.pump_thread_joined || self.pump_thread_failure.is_some() || !self.pump_published {
             std::mem::forget(Arc::clone(&self.pump_consumer));
-            if let Some(thread) = self.pump_thread.take() { std::mem::forget(thread); }
-            if let Some(payload) = self.pump_thread_panic.take() { std::mem::forget(payload); }
-            if let Some(assembly) = self.publication_assembly.take() { std::mem::forget(assembly); }
-            if let Some(directory) = self.publication_dir.take() { std::mem::forget(directory); }
-            if !self.late_rows.is_empty() { std::mem::forget(std::mem::take(&mut self.late_rows)); }
+            if let Some(thread) = self.pump_thread.take() {
+                std::mem::forget(thread);
+            }
+            if let Some(payload) = self.pump_thread_panic.take() {
+                std::mem::forget(payload);
+            }
+            if let Some(assembly) = self.publication_assembly.take() {
+                std::mem::forget(assembly);
+            }
+            if let Some(directory) = self.publication_dir.take() {
+                std::mem::forget(directory);
+            }
+            if !self.late_rows.is_empty() {
+                std::mem::forget(std::mem::take(&mut self.late_rows));
+            }
         }
     }
 }
@@ -1263,8 +1816,14 @@ pub fn run_rovent_pc_collection_lock_v2_with_sealed_policy(
     sealed_teacher_indices: Vec<usize>,
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
     run_rovent_pc_collection_lock_v2_inner(
-        arguments, plan, input_directory, worker_deadline, cleanup_deadline,
-        sealed_teacher_indices, false, |_| Ok(()),
+        arguments,
+        plan,
+        input_directory,
+        worker_deadline,
+        cleanup_deadline,
+        sealed_teacher_indices,
+        false,
+        |_| Ok(()),
     )
 }
 
@@ -1279,8 +1838,16 @@ pub fn run_rovent_pc_collection_lock_v2_with_speculative_teacher(
     sealed_teacher_indices: Vec<usize>,
     speculative_teacher: bool,
 ) -> Result<RoventPcCollectionRunV2, ArenaError> {
-    run_rovent_pc_collection_lock_v2_inner(arguments, plan, input_directory, worker_deadline,
-        cleanup_deadline, sealed_teacher_indices, speculative_teacher, |_| Ok(()))
+    run_rovent_pc_collection_lock_v2_inner(
+        arguments,
+        plan,
+        input_directory,
+        worker_deadline,
+        cleanup_deadline,
+        sealed_teacher_indices,
+        speculative_teacher,
+        |_| Ok(()),
+    )
 }
 
 /// Test harness hook: receive the actual owner created by this launch. This
@@ -1329,12 +1896,22 @@ fn run_rovent_pc_collection_lock_v2_inner(
         std::str::from_utf8(&bytes).map_err(|_| invalid("Collection /2 manifest UTF8"))?,
     )?);
     plan.validate_registration(&manifest)?;
-    let (owner, observer) =
-        RoventCollectionOwnerLockV2::new_shared_with_record_limit(
-            Arc::clone(&manifest), plan.metadata.clone(), plan.maximum_records,
-        )?;
-    let roster_identity: Vec<_> = plan.teacher_slots.iter().map(|entry|
-        (entry.actor_id.clone(), entry.source_index, entry.collection_owner)).collect();
+    let (owner, observer) = RoventCollectionOwnerLockV2::new_shared_with_record_limit(
+        Arc::clone(&manifest),
+        plan.metadata.clone(),
+        plan.maximum_records,
+    )?;
+    let roster_identity: Vec<_> = plan
+        .teacher_slots
+        .iter()
+        .map(|entry| {
+            (
+                entry.actor_id.clone(),
+                entry.source_index,
+                entry.collection_owner,
+            )
+        })
+        .collect();
     let roster = plan
         .teacher_slots
         .iter()
@@ -1348,12 +1925,21 @@ fn run_rovent_pc_collection_lock_v2_inner(
         RoventPcCollectionBridgeV2::new(owner.clone(), Arc::clone(&manifest), roster)?;
     // Optional setup failure only affects collection eligibility, never NN launch.
     let speculative_teacher_setup_error = if speculative_teacher_requested {
-        bridge.enable_speculative_teacher().err().map(|error| error.to_string())
-    } else { None };
-    let speculative_teacher_enabled = speculative_teacher_requested
-        && speculative_teacher_setup_error.is_none();
-    let (pump_consumer, pump_sender) = super::own_publisher_v2::OwnPumpConsumerV2::new(plan.maximum_records as usize);
-    worker.configure_row_pump(plan.teacher_constraint, Duration::from_nanos(plan.teacher_soft_quantum_ns))?;
+        bridge
+            .enable_speculative_teacher()
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        None
+    };
+    let speculative_teacher_enabled =
+        speculative_teacher_requested && speculative_teacher_setup_error.is_none();
+    let (pump_consumer, pump_sender) =
+        super::own_publisher_v2::OwnPumpConsumerV2::new(plan.maximum_records as usize);
+    worker.configure_row_pump(
+        plan.teacher_constraint,
+        Duration::from_nanos(plan.teacher_soft_quantum_ns),
+    )?;
     worker.configure_pump_sender(pump_sender)?;
     let worker = Arc::new(Mutex::new(worker));
     let resource = Arc::new(Mutex::new(resources::CollectionResourceCustody::prepare(
@@ -1380,10 +1966,14 @@ fn run_rovent_pc_collection_lock_v2_inner(
     let publication_maximum_records = plan.maximum_records;
     // Route by the original admission. Additional slots remain unavailable until the
     // supervisor proves the preceding root has released shared custody.
-    let router = Arc::new(crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
-        Arc::clone(&bridge), plan.maximum_roots as usize,
-    )?);
-    let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> = router.clone();
+    let router = Arc::new(
+        crate::rovent_collect::pc_root_router_v2::RoventPcRootRouterV2::new(
+            Arc::clone(&bridge),
+            plan.maximum_roots as usize,
+        )?,
+    );
+    let hooks: Arc<dyn rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooksV2> =
+        router.clone();
     let supervisor_custody = Arc::new(Mutex::new(None));
     let admission_supervisor = Arc::clone(&supervisor_custody);
     let supervisor_router = Arc::clone(&router);
@@ -1437,18 +2027,27 @@ fn run_rovent_pc_collection_lock_v2_inner(
             // cgroup entry applies to the whole process and must happen
             // before test callbacks or the collection worker create threads.
             on_owner(&admission_owner).map_err(|error| RoventLaunchError {
-                stage: "collection_owner_callback", detail: error.to_string(),
+                stage: "collection_owner_callback",
+                detail: error.to_string(),
             })?;
-            let mut pump_slot = admission_pump_thread.lock().map_err(|_| RoventLaunchError {
-                stage: "collection_pump_start", detail: "pump thread custody poisoned".into(),
-            })?;
-            let thread = std::thread::Builder::new().name("rovent-pc-pump-consumer-v2".into())
+            let mut pump_slot = admission_pump_thread
+                .lock()
+                .map_err(|_| RoventLaunchError {
+                    stage: "collection_pump_start",
+                    detail: "pump thread custody poisoned".into(),
+                })?;
+            let thread = std::thread::Builder::new()
+                .name("rovent-pc-pump-consumer-v2".into())
                 .spawn(move || admission_pump_consumer.run(&admission_pump_stop, worker_deadline))
-                .map_err(|error| RoventLaunchError { stage: "collection_pump_start", detail: error.to_string() })?;
+                .map_err(|error| RoventLaunchError {
+                    stage: "collection_pump_start",
+                    detail: error.to_string(),
+                })?;
             *pump_slot = Some(thread);
             drop(pump_slot);
             admission_worker_start.store(WORKER_STARTING, Ordering::Release);
-            match admission_bridge.start_worker(&admission_worker, admission_stop, worker_deadline) {
+            match admission_bridge.start_worker(&admission_worker, admission_stop, worker_deadline)
+            {
                 Ok(()) => admission_worker_start.store(WORKER_STARTED, Ordering::Release),
                 Err(error) => {
                     let error = match error {
@@ -1458,18 +2057,36 @@ fn run_rovent_pc_collection_lock_v2_inner(
                         }
                         PcWorkerStartErrorV2::Unknown(error) => error,
                     };
-                    return Err(RoventLaunchError { stage: "collection_worker_start", detail: error.to_string() });
+                    return Err(RoventLaunchError {
+                        stage: "collection_worker_start",
+                        detail: error.to_string(),
+                    });
                 }
             }
             if supervisor_roots > 1 {
                 let mut custody = admission_supervisor.lock().map_err(|_| RoventLaunchError {
-                    stage: "collection_supervisor_start", detail: "supervisor custody poisoned".into(),
+                    stage: "collection_supervisor_start",
+                    detail: "supervisor custody poisoned".into(),
                 })?;
-                *custody = Some(PcWorkerSupervisorV2::start(
-                    supervisor_router, supervisor_owner, supervisor_manifest, roster_identity,
-                    supervisor_constraint, supervisor_quantum, supervisor_roots, supervisor_records,
-                    speculative_teacher_enabled, worker_deadline, cleanup_deadline,
-                ).map_err(|error| RoventLaunchError { stage: "collection_supervisor_start", detail: error.to_string() })?);
+                *custody = Some(
+                    PcWorkerSupervisorV2::start(
+                        supervisor_router,
+                        supervisor_owner,
+                        supervisor_manifest,
+                        roster_identity,
+                        supervisor_constraint,
+                        supervisor_quantum,
+                        supervisor_roots,
+                        supervisor_records,
+                        speculative_teacher_enabled,
+                        worker_deadline,
+                        cleanup_deadline,
+                    )
+                    .map_err(|error| RoventLaunchError {
+                        stage: "collection_supervisor_start",
+                        detail: error.to_string(),
+                    })?,
+                );
             }
             Ok(())
         },
@@ -1477,7 +2094,10 @@ fn run_rovent_pc_collection_lock_v2_inner(
         Arc::clone(&sealed_teacher_observations),
     );
     stop.store(true, Ordering::Release);
-    let pump_thread = pump_thread.lock().map_err(|_| invalid("P/C pump thread custody poisoned"))?.take();
+    let pump_thread = pump_thread
+        .lock()
+        .map_err(|_| invalid("P/C pump thread custody poisoned"))?
+        .take();
     let mut run = RoventPcCollectionRunV2 {
         speculative_teacher_requested,
         speculative_teacher_enabled,
@@ -1505,7 +2125,10 @@ fn run_rovent_pc_collection_lock_v2_inner(
         publication_attempted: false,
         publication: None,
         late_rows: std::collections::VecDeque::new(),
-        supervisor: supervisor_custody.lock().map_err(|_| invalid("P/C supervisor custody poisoned"))?.take(),
+        supervisor: supervisor_custody
+            .lock()
+            .map_err(|_| invalid("P/C supervisor custody poisoned"))?
+            .take(),
         secondary_slots: Vec::new(),
         supervisor_error: None,
         worker_start,
@@ -1515,19 +2138,26 @@ fn run_rovent_pc_collection_lock_v2_inner(
         native_failure_taken: false,
         resource_error: None,
     };
-    if let Some(supervisor) = &run.supervisor { supervisor.request_stop(); }
+    if let Some(supervisor) = &run.supervisor {
+        supervisor.request_stop();
+    }
     while !run.poll_worker() && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
     pump_stop.store(true, Ordering::Release);
-    while run.pump_thread.as_ref().is_some_and(|thread| !thread.is_finished()) && Instant::now() < cleanup_deadline {
+    while run
+        .pump_thread
+        .as_ref()
+        .is_some_and(|thread| !thread.is_finished())
+        && Instant::now() < cleanup_deadline
+    {
         std::thread::sleep(Duration::from_millis(2));
     }
     match run.pump_thread.take() {
         Some(thread) if thread.is_finished() => {
             run.pump_thread_joined = true;
             match thread.join() {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {}
                 Ok(Err(error)) => run.pump_thread_failure = Some(error.to_string()),
                 Err(payload) => {
                     run.pump_thread_panic = Some(payload);
@@ -1561,12 +2191,18 @@ fn run_rovent_pc_collection_lock_v2_inner(
         if let Err(error) = resource.finish_live() {
             run.resource_error = Some(error.to_string());
         } else if run.native_failure.is_none() {
-            let validated = run.original_lock.lock()
+            let validated = run
+                .original_lock
+                .lock()
                 .map_err(|_| invalid("Collection /2 original lock custody poisoned"))
-                .and_then(|lock| lock.as_ref()
-                    .ok_or_else(|| invalid("Collection /2 original lock missing"))
-                    .and_then(|lock| resource.validate_success_v2(lock)));
-            if let Err(error) = validated { run.resource_error = Some(error.to_string()); }
+                .and_then(|lock| {
+                    lock.as_ref()
+                        .ok_or_else(|| invalid("Collection /2 original lock missing"))
+                        .and_then(|lock| resource.validate_success_v2(lock))
+                });
+            if let Err(error) = validated {
+                run.resource_error = Some(error.to_string());
+            }
         }
     } else {
         run.resource_error = Some("Collection /2 resource custody poisoned".into());

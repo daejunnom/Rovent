@@ -101,7 +101,10 @@ impl SelfplayCliDeclarationV3 {
         )?;
         let mut directories = BTreeSet::new();
         for (ordinal, game) in self.games.iter().enumerate() {
-            check(directories.insert(&game.private_directory), "selfplay duplicate game directory")?;
+            check(
+                directories.insert(&game.private_directory),
+                "selfplay duplicate game directory",
+            )?;
             validate_game_declaration_v3(game, ordinal as u16, self.max_staging_bytes)?;
         }
         self.registered_total_ms()?;
@@ -257,7 +260,9 @@ pub fn run_selfplay_collect_owned_cli_v3(
 /// Shared bounds for an original game declaration. This does not execute or
 /// confer authority on the declaration.
 pub(super) fn validate_game_declaration_v3(
-    game: &SelfplayCliGameDeclarationV3, ordinal: u16, max_staging_bytes: u64,
+    game: &SelfplayCliGameDeclarationV3,
+    ordinal: u16,
+    max_staging_bytes: u64,
 ) -> Result<(), ArenaError> {
     game.request.validate()?;
     check(
@@ -323,9 +328,15 @@ fn run_linux(
     declaration_sha256: &str,
     cancel: &AtomicBool,
 ) -> Result<SelfplayCliVerifiedResultV3, SelfplayCliFailureV3> {
-    let PreparedSelfplayInputsV3 { declaration, run_root, binary, binary_path,
-        mut staging, staging_data_ceiling, publication_until } =
-        prepare_selfplay_inputs_v3(declaration_path, declaration_sha256, cancel)?;
+    let PreparedSelfplayInputsV3 {
+        declaration,
+        run_root,
+        binary,
+        binary_path,
+        mut staging,
+        staging_data_ceiling,
+        publication_until,
+    } = prepare_selfplay_inputs_v3(declaration_path, declaration_sha256, cancel)?;
     let mut collector = GenerationSeriesCollectorV3::new(
         declaration.plan.clone(),
         declaration.run_root.clone(),
@@ -346,9 +357,18 @@ fn run_linux(
         for game in &declaration.games {
             check_live(publication_until, cancel)?;
             let launch = prepare_game_launch_v3(
-                &declaration.plan, &declaration.run_root, declaration.max_staging_bytes,
-                staging_data_ceiling, game, &run_root, &binary, &declaration.binary, &binary_path, &staging,
-                publication_until, cancel,
+                &declaration.plan,
+                &declaration.run_root,
+                declaration.max_staging_bytes,
+                staging_data_ceiling,
+                game,
+                &run_root,
+                &binary,
+                &declaration.binary,
+                &binary_path,
+                &staging,
+                publication_until,
+                cancel,
             )?;
             match series.run_next(launch, Some(cancel)) {
                 Ok(verified) => collector.accept(verified, Some(cancel))?,
@@ -496,8 +516,15 @@ pub(super) fn prepare_selfplay_inputs_v3(
         .open_verified_at(&binary_root, MAX_BINARY_BYTES)?;
     check_live(preflight_until, cancel)?;
     let binary_path = declaration.binary_root.join(&declaration.binary.path);
-    Ok(PreparedSelfplayInputsV3 { declaration, run_root, binary, binary_path,
-        staging, staging_data_ceiling, publication_until })
+    Ok(PreparedSelfplayInputsV3 {
+        declaration,
+        run_root,
+        binary,
+        binary_path,
+        staging,
+        staging_data_ceiling,
+        publication_until,
+    })
 }
 
 /// Shared original descriptor-bound preparation for either the normal series
@@ -558,8 +585,8 @@ pub(super) fn prepare_game_launch_v3(
     }
     let requested_plan = serde_json::to_vec(&request.plan)
         .map_err(|_| invalid("selfplay requested plan serialization"))?;
-    let declared_plan = serde_json::to_vec(plan)
-        .map_err(|_| invalid("selfplay declared plan serialization"))?;
+    let declared_plan =
+        serde_json::to_vec(plan).map_err(|_| invalid("selfplay declared plan serialization"))?;
     check(
         request_bytes.len() as u64 == game.request.bytes
             && format!("{:x}", sha2::Sha256::digest(&request_bytes)) == game.request.sha256
@@ -584,12 +611,7 @@ pub(super) fn prepare_game_launch_v3(
     };
     let pinned = [prepare(0)?, prepare(1)?];
     check_live(execution_deadline, cancel)?;
-    let current = scan_staging(
-        &cwd,
-        max_staging_bytes,
-        execution_deadline,
-        cancel,
-    )?;
+    let current = scan_staging(&cwd, max_staging_bytes, execution_deadline, cancel)?;
     let remaining = staging_data_ceiling
         .checked_sub(staging.unique_inode_bytes)
         .ok_or_else(|| invalid("selfplay staging capacity"))?;

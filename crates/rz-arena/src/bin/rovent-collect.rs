@@ -67,9 +67,13 @@ fn parse_lock_v2(arguments: Vec<String>) -> Result<Option<LockV2Cli>, Box<dyn st
     let sealed_teacher_slots = match fields.remove("--v2-sealed-teacher-slots") {
         None => Vec::new(),
         Some(value) => {
-            let mut slots = value.split(',').map(str::parse::<usize>)
+            let mut slots = value
+                .split(',')
+                .map(str::parse::<usize>)
                 .collect::<Result<Vec<_>, _>>()?;
-            if slots.is_empty() || slots.len() > 16 { return Err("sealed teacher slot count exceeds limit".into()); }
+            if slots.is_empty() || slots.len() > 16 {
+                return Err("sealed teacher slot count exceeds limit".into());
+            }
             slots.sort_unstable();
             slots.dedup();
             slots
@@ -127,10 +131,16 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
     let speculative_requested = cli.speculative_teacher;
     let speculative_effective = speculative_requested && cli.mode == "pc";
     let sealed_requested = cli.sealed_teacher_slots.clone();
-    let sealed_effective: Vec<_> = sealed_requested.iter().copied()
-        .filter(|&index| cli.mode == "pc" && index < plan.teacher_sources.len()).collect();
-    let sealed_fallback: Vec<_> = sealed_requested.iter().copied()
-        .filter(|index| !sealed_effective.contains(index)).collect();
+    let sealed_effective: Vec<_> = sealed_requested
+        .iter()
+        .copied()
+        .filter(|&index| cli.mode == "pc" && index < plan.teacher_sources.len())
+        .collect();
+    let sealed_fallback: Vec<_> = sealed_requested
+        .iter()
+        .copied()
+        .filter(|index| !sealed_effective.contains(index))
+        .collect();
     let (observation, accepted, publication, publication_error) = match cli.mode.as_str() {
         "pc" => {
             let mut run = run_rovent_pc_collection_lock_v2_with_speculative_teacher(
@@ -149,8 +159,10 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                         .min(Duration::from_millis(10)),
                 );
             }
-            let until = Instant::now().checked_add(Duration::from_millis(publication_timeout_ms))
-                .ok_or("publication deadline overflow")?.min(cleanup_until);
+            let until = Instant::now()
+                .checked_add(Duration::from_millis(publication_timeout_ms))
+                .ok_or("publication deadline overflow")?
+                .min(cleanup_until);
             let result = run.publish_single_root(until);
             let (publication, publication_error) = match result {
                 Ok(true) => ("published", None),
@@ -159,12 +171,20 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
             };
             let failure_evidence = if publication != "published" {
                 match run.write_failure_evidence(publication_error.as_deref()) {
-                    Ok(complete) => serde_json::json!({"status":if complete { "written" } else { "partial" }, "path":"pc-failure-evidence/receipt.json"}),
-                    Err(error) => serde_json::json!({"status":"unavailable", "error":error.to_string()}),
+                    Ok(complete) => {
+                        serde_json::json!({"status":if complete { "written" } else { "partial" }, "path":"pc-failure-evidence/receipt.json"})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"status":"unavailable", "error":error.to_string()})
+                    }
                 }
-            } else { serde_json::json!({"status":"not_needed"}) };
+            } else {
+                serde_json::json!({"status":"not_needed"})
+            };
             let mut observation = run.observation();
-            if let Some(object) = observation.as_object_mut() { object.insert("failure_evidence".into(), failure_evidence); }
+            if let Some(object) = observation.as_object_mut() {
+                object.insert("failure_evidence".into(), failure_evidence);
+            }
             let accepted = run.closed_owner().is_ok()
                 && observation
                     .get("native_error")
@@ -197,12 +217,26 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
                 && observation
                     .get("resource_error")
                     .is_some_and(serde_json::Value::is_null);
-            let publication = observation.get("publisher_status").and_then(serde_json::Value::as_str)
+            let publication = observation
+                .get("publisher_status")
+                .and_then(serde_json::Value::as_str)
                 .map(|value| match value {
-                    "published" if observation.get("corpus_published").and_then(serde_json::Value::as_bool) == Some(true) => "published",
-                    "published" | "partial" => "partial", _ => "unknown_or_not_started" })
+                    "published"
+                        if observation
+                            .get("corpus_published")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true) =>
+                    {
+                        "published"
+                    }
+                    "published" | "partial" => "partial",
+                    _ => "unknown_or_not_started",
+                })
                 .unwrap_or("unknown_or_not_started");
-            let error = observation.get("publisher_error").and_then(serde_json::Value::as_str).map(str::to_owned);
+            let error = observation
+                .get("publisher_error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             (observation, accepted, publication, error)
         }
         _ => return Err("unsupported V2 collection mode".into()),
@@ -325,7 +359,10 @@ fn main() -> std::process::ExitCode {
                 if let Some(warning) = &receipt.diagnostic_warning {
                     // Ancillary diagnostics are not cohort publication or ACK.
                     // Preserve the warning without changing the /1 stdout schema.
-                    let _ = writeln!(std::io::stderr().lock(), "intervention diagnostic warning: {warning}");
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "intervention diagnostic warning: {warning}"
+                    );
                 }
                 let resources = receipt.resource_observations()?;
                 let collection = receipt.collection_observations()?;
@@ -444,7 +481,12 @@ mod v2_cli_tests {
         assert_eq!(selected.original, ["--process-epoch=1"]);
         let mut disabled = arguments();
         disabled.push("--v2-speculative-teacher=false".into());
-        assert!(!parse_lock_v2(disabled).unwrap().unwrap().speculative_teacher);
+        assert!(
+            !parse_lock_v2(disabled)
+                .unwrap()
+                .unwrap()
+                .speculative_teacher
+        );
         let mut invalid = arguments();
         invalid.push("--v2-speculative-teacher=yes".into());
         assert!(parse_lock_v2(invalid).is_err());

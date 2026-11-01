@@ -89,7 +89,15 @@ pub(super) fn publish_lock_v2_payloads(
     index: &RoventCorpusIndexLockV2,
     admissions: &BTreeMap<String, Arc<LockV2PublicationSource>>,
 ) -> Result<RoventLockV2Publication, ArenaError> {
-    publish_lock_v2_payloads_authorized(directory, until, cancel, manifest, index, admissions, || Ok(()))
+    publish_lock_v2_payloads_authorized(
+        directory,
+        until,
+        cancel,
+        manifest,
+        index,
+        admissions,
+        || Ok(()),
+    )
 }
 
 #[cfg(feature = "pals-collection-onnx")]
@@ -102,21 +110,38 @@ pub(super) fn publish_lock_v2_payloads_speculative(
     admissions: &BTreeMap<String, Arc<LockV2PublicationSource>>,
     game_gate: &std::sync::atomic::AtomicU64,
 ) -> Result<RoventLockV2Publication, ArenaError> {
+    use super::collection_hooks_core_v2::{
+        GAME_HAS_ABORT, GAME_IDLE, GAME_PHASE_MASK, GAME_PUBLICATION_GRANTED,
+    };
     use std::sync::atomic::Ordering;
-    use super::collection_hooks_core_v2::{GAME_HAS_ABORT, GAME_IDLE, GAME_PHASE_MASK, GAME_PUBLICATION_GRANTED};
     let expected = game_gate.load(Ordering::Acquire);
-    check(expected & (GAME_HAS_ABORT | GAME_PUBLICATION_GRANTED) == 0
-        && expected & GAME_PHASE_MASK == GAME_IDLE,
-        "speculative publication original game is aborted, busy, or already authorized")?;
-    publish_lock_v2_payloads_authorized(directory, until, cancel, manifest, index, admissions, || {
-        // This CAS is the logical publication authorization point. A UCI stop
-        // that sets abort first prevents the final hard-link; a later stop is
-        // ordered after authorization even if file visibility is later.
-        game_gate.compare_exchange(expected, expected | GAME_PUBLICATION_GRANTED,
-            Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| invalid("speculative publication game changed or was aborted"))?;
-        Ok(())
-    })
+    check(
+        expected & (GAME_HAS_ABORT | GAME_PUBLICATION_GRANTED) == 0
+            && expected & GAME_PHASE_MASK == GAME_IDLE,
+        "speculative publication original game is aborted, busy, or already authorized",
+    )?;
+    publish_lock_v2_payloads_authorized(
+        directory,
+        until,
+        cancel,
+        manifest,
+        index,
+        admissions,
+        || {
+            // This CAS is the logical publication authorization point. A UCI stop
+            // that sets abort first prevents the final hard-link; a later stop is
+            // ordered after authorization even if file visibility is later.
+            game_gate
+                .compare_exchange(
+                    expected,
+                    expected | GAME_PUBLICATION_GRANTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| invalid("speculative publication game changed or was aborted"))?;
+            Ok(())
+        },
+    )
 }
 
 fn publish_lock_v2_payloads_authorized(
@@ -186,24 +211,34 @@ fn publish_lock_v2_payloads_authorized(
     )
 }
 
-
 #[cfg(all(test, target_os = "linux", feature = "pals-collection-onnx"))]
 mod speculative_publication_boundary_tests {
-    use super::*;
     use super::super::collection_hooks_core_v2::{
         GAME_HAS_ABORT, GAME_IDLE, GAME_PHASE_MASK, GAME_PUBLICATION_GRANTED,
     };
+    use super::*;
     use std::collections::BTreeMap;
-    use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
     use std::time::{Duration, Instant};
 
     // This is only a source-byte fixture for the actual filesystem writer;
     // it cannot construct /2 native admission or a training corpus.
-    struct Source { digest: String }
+    struct Source {
+        digest: String,
+    }
     impl publication::PublicationSourceBytes for Source {
-        fn canonical_lock_sha256(&self) -> &str { &self.digest }
-        fn lock_bytes(&self) -> &[u8] { b"{}" }
-        fn runtime_bundle(&self) -> Option<(&rz_experiments::ArtifactRef, &[u8])> { None }
+        fn canonical_lock_sha256(&self) -> &str {
+            &self.digest
+        }
+        fn lock_bytes(&self) -> &[u8] {
+            b"{}"
+        }
+        fn runtime_bundle(&self) -> Option<(&rz_experiments::ArtifactRef, &[u8])> {
+            None
+        }
     }
 
     struct Scratch(std::path::PathBuf);
@@ -213,7 +248,10 @@ mod speculative_publication_boundary_tests {
             let parent = std::env::temp_dir().canonicalize().expect("temp directory");
             loop {
                 let id = NEXT.fetch_add(1, Ordering::Relaxed);
-                let path = parent.join(format!("rovent-publication-boundary-{}-{id}", std::process::id()));
+                let path = parent.join(format!(
+                    "rovent-publication-boundary-{}-{id}",
+                    std::process::id()
+                ));
                 match std::fs::create_dir(&path) {
                     Ok(()) => {
                         std::fs::create_dir(path.join("chunks")).expect("owned chunks directory");
@@ -227,28 +265,42 @@ mod speculative_publication_boundary_tests {
             }
         }
         fn directory(&self) -> cap_std::fs::Dir {
-            cap_std::fs::Dir::open_ambient_dir(&self.0, cap_std::ambient_authority()).expect("scratch capability")
+            cap_std::fs::Dir::open_ambient_dir(&self.0, cap_std::ambient_authority())
+                .expect("scratch capability")
         }
     }
     impl Drop for Scratch {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn exercise_boundary(abort_before_grant: bool) {
         let scratch = Scratch::new();
         let directory = scratch.directory();
         let mut sources = BTreeMap::new();
-        sources.insert("original-root".to_owned(), Arc::new(Source { digest: "a".repeat(64) }));
+        sources.insert(
+            "original-root".to_owned(),
+            Arc::new(Source {
+                digest: "a".repeat(64),
+            }),
+        );
         let chunks: Vec<rz_experiments::rovent_corpus::RoventCorpusChunk> = Vec::new();
         let material = publication::RoventPublicationMaterial {
-            manifest_bytes: b"{}", index_bytes: b"{}", chunks: &chunks, admissions: &sources,
+            manifest_bytes: b"{}",
+            index_bytes: b"{}",
+            chunks: &chunks,
+            admissions: &sources,
         };
         let cancel = AtomicBool::new(false);
         let expected = (GAME_PHASE_MASK + 1) | GAME_IDLE;
         let gate = AtomicU64::new(expected);
         let authorization_reached = AtomicBool::new(false);
         let result = publication::publish_original_payloads_authorized(
-            &directory, Instant::now() + Duration::from_secs(30), &cancel, material,
+            &directory,
+            Instant::now() + Duration::from_secs(30),
+            &cancel,
+            material,
             |_, _, _, _, _| Ok(serde_json::json!({"test":"publication boundary only"})),
             || {
                 authorization_reached.store(true, Ordering::Release);
@@ -256,18 +308,31 @@ mod speculative_publication_boundary_tests {
                 // the visible success link must not exist yet.
                 assert!(directory.open("publication.pending.json").is_ok());
                 assert!(directory.open("publication.json").is_err());
-                if abort_before_grant { gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel); }
-                gate.compare_exchange(expected, expected | GAME_PUBLICATION_GRANTED,
-                    Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| invalid("speculative publication game changed or was aborted"))?;
-                if !abort_before_grant { gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel); }
+                if abort_before_grant {
+                    gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel);
+                }
+                gate.compare_exchange(
+                    expected,
+                    expected | GAME_PUBLICATION_GRANTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| invalid("speculative publication game changed or was aborted"))?;
+                if !abort_before_grant {
+                    gate.fetch_or(GAME_HAS_ABORT, Ordering::AcqRel);
+                }
                 Ok(())
             },
         );
-        assert!(authorization_reached.load(Ordering::Acquire),
-            "publisher did not reach final authorization: {result:?}");
+        assert!(
+            authorization_reached.load(Ordering::Acquire),
+            "publisher did not reach final authorization: {result:?}"
+        );
         if abort_before_grant {
-            assert!(result.is_err(), "abort before authorization must fail: {result:?}");
+            assert!(
+                result.is_err(),
+                "abort before authorization must fail: {result:?}"
+            );
             assert!(directory.open("publication.pending.json").is_ok());
             assert!(directory.open("publication.json").is_err());
             assert_eq!(gate.load(Ordering::Acquire), expected | GAME_HAS_ABORT);
@@ -275,10 +340,16 @@ mod speculative_publication_boundary_tests {
             // Logical authorization preceded this simulated stop; the actual
             // link appears afterward. This is not a claim of physical pre-stop
             // file visibility or complete model/teacher execution.
-            assert!(result.is_ok(), "publication after authorization failed: {result:?}");
+            assert!(
+                result.is_ok(),
+                "publication after authorization failed: {result:?}"
+            );
             assert!(directory.open("publication.pending.json").is_err());
             assert!(directory.open("publication.json").is_ok());
-            assert_eq!(gate.load(Ordering::Acquire), expected | GAME_PUBLICATION_GRANTED | GAME_HAS_ABORT);
+            assert_eq!(
+                gate.load(Ordering::Acquire),
+                expected | GAME_PUBLICATION_GRANTED | GAME_HAS_ABORT
+            );
         }
     }
 

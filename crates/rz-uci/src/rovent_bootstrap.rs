@@ -1215,55 +1215,65 @@ fn bootstrap_source_digest(sources: &[&str]) -> [u8; 32] {
 }
 
 const BOOTSTRAP_SOURCES: &[&str] = &[
-        include_str!("rovent_bootstrap.rs"),
-        include_str!("rovent_bootstrap/pinned.rs"),
-        include_str!("rovent_bootstrap/configuration.rs"),
-        include_str!("rovent_bootstrap/configuration/v2.rs"),
-        include_str!("rovent_bootstrap/configuration/v3.rs"),
-        include_str!("rovent_bootstrap/configuration/v4.rs"),
-        include_str!("rovent_bootstrap/pinned/external_r.rs"),
-        include_str!("rovent_bootstrap/external_session.rs"),
-        include_str!("rovent_bootstrap/pc_session.rs"),
-        include_str!("rovent_bootstrap/product.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics_v2.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics_v2_adaptive.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics_v2_nnuec.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics_v2_pc.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics/nnuec.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics/nnuec_cpu_slices.rs"),
-        include_str!("rovent_bootstrap/product/diagnostics/nnuec_cpu_slices/chain.rs"),
-        include_str!("rovent_bootstrap/product/storage.rs"),
-        include_str!("rovent_bootstrap/storage_lifecycle.rs"),
-        include_str!("rovent_bootstrap/storage_lifecycle/observation.rs"),
-        include_str!("rovent_bootstrap/launch.rs"),
-        include_str!("rovent_bootstrap/launch/selected_view_observation.rs"),
-        include_str!("rovent_bootstrap/launch/collection.rs"),
-        include_str!("rovent_bootstrap/launch/collection_v2_observer.rs"),
-        include_str!("rovent_bootstrap/launch/evidence.rs"),
-        include_str!("rovent_bootstrap/launch/storage.rs"),
-        include_str!("rovent_bootstrap/launch/v2_external.rs"),
-        include_str!("rovent_bootstrap/launch/v2_rejections.rs"),
-        include_str!("rovent_bootstrap/nnuec_source.rs"),
-        include_str!("rovent_bootstrap/nnuec_preparing.rs"),
-        include_str!("rovent_bootstrap/nnuec_session.rs"),
-        include_str!("rovent_bootstrap/nnuec_session/root_run.rs"),
-        include_str!("rovent_bootstrap/nnuec_session/diagnostics.rs"),
-        include_str!("rovent_bootstrap/nnuec_session/diagnostics/cpu_slices.rs"),
-        include_str!("rovent_bootstrap/nnuec_session/retirement.rs"),
-        include_str!("rovent_bootstrap/nnuec_session/initial_cleanup.rs"),
-        include_str!("rovent_bootstrap/pinned/nnuec.rs"),
-        include_str!("rovent_bootstrap/pinned/collection.rs"),
-        include_str!("pals_adaptive_bootstrap/runtime_assets.rs"),
-    ];
+    include_str!("rovent_bootstrap.rs"),
+    include_str!("rovent_bootstrap/pinned.rs"),
+    include_str!("rovent_bootstrap/configuration.rs"),
+    include_str!("rovent_bootstrap/configuration/v2.rs"),
+    include_str!("rovent_bootstrap/configuration/v3.rs"),
+    include_str!("rovent_bootstrap/configuration/v4.rs"),
+    include_str!("rovent_bootstrap/pinned/external_r.rs"),
+    include_str!("rovent_bootstrap/external_session.rs"),
+    include_str!("rovent_bootstrap/pc_session.rs"),
+    include_str!("rovent_bootstrap/product.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics_v2.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics_v2_adaptive.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics_v2_nnuec.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics_v2_pc.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics/nnuec.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics/nnuec_cpu_slices.rs"),
+    include_str!("rovent_bootstrap/product/diagnostics/nnuec_cpu_slices/chain.rs"),
+    include_str!("rovent_bootstrap/product/storage.rs"),
+    include_str!("rovent_bootstrap/storage_lifecycle.rs"),
+    include_str!("rovent_bootstrap/storage_lifecycle/observation.rs"),
+    include_str!("rovent_bootstrap/launch.rs"),
+    include_str!("rovent_bootstrap/launch/selected_view_observation.rs"),
+    include_str!("rovent_bootstrap/launch/collection.rs"),
+    include_str!("rovent_bootstrap/launch/collection_v2_observer.rs"),
+    include_str!("rovent_bootstrap/launch/evidence.rs"),
+    include_str!("rovent_bootstrap/launch/storage.rs"),
+    include_str!("rovent_bootstrap/launch/v2_external.rs"),
+    include_str!("rovent_bootstrap/launch/v2_rejections.rs"),
+    include_str!("rovent_bootstrap/nnuec_source.rs"),
+    include_str!("rovent_bootstrap/nnuec_preparing.rs"),
+    include_str!("rovent_bootstrap/nnuec_session.rs"),
+    include_str!("rovent_bootstrap/nnuec_session/root_run.rs"),
+    include_str!("rovent_bootstrap/nnuec_session/diagnostics.rs"),
+    include_str!("rovent_bootstrap/nnuec_session/diagnostics/cpu_slices.rs"),
+    include_str!("rovent_bootstrap/nnuec_session/retirement.rs"),
+    include_str!("rovent_bootstrap/nnuec_session/initial_cleanup.rs"),
+    include_str!("rovent_bootstrap/pinned/nnuec.rs"),
+    include_str!("rovent_bootstrap/pinned/collection.rs"),
+    include_str!("pals_adaptive_bootstrap/runtime_assets.rs"),
+];
 
 #[cfg(test)]
 #[test]
 fn bootstrap_source_identity_covers_selected_view_observer() {
     let source = include_str!("rovent_bootstrap/launch/selected_view_observation.rs");
-    assert_eq!(BOOTSTRAP_SOURCES.iter().filter(|s| **s == source).count(), 1);
-    let without: Vec<_> = BOOTSTRAP_SOURCES.iter().copied().filter(|s| *s != source).collect();
-    assert_ne!(compiled_bootstrap_source_digest(), bootstrap_source_digest(&without));
+    assert_eq!(
+        BOOTSTRAP_SOURCES.iter().filter(|s| **s == source).count(),
+        1
+    );
+    let without: Vec<_> = BOOTSTRAP_SOURCES
+        .iter()
+        .copied()
+        .filter(|s| *s != source)
+        .collect();
+    assert_ne!(
+        compiled_bootstrap_source_digest(),
+        bootstrap_source_digest(&without)
+    );
 }
 pub(crate) fn fail(kind: K, message: &'static str) -> BackendError {
     BackendError::new(kind, S::Admission, message)

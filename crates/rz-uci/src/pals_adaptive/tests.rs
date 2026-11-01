@@ -1323,11 +1323,16 @@ fn neutral_mismatch_keeps_failure_and_closes_original_admission() {
         fixture(FixtureScope::TwoIndependentRoles, true, 4096);
     let expected = Digest([1; 32]);
     let actual = Digest([2; 32]);
-    assert!(manager.quiesce_neutral_mismatch(
-        AdaptiveManagerError::InterventionNeutralMismatch {
-            expected, actual, reference_matches: false, model_matches: true,
-        },
-    ).unwrap());
+    assert!(
+        manager
+            .quiesce_neutral_mismatch(AdaptiveManagerError::InterventionNeutralMismatch {
+                expected,
+                actual,
+                reference_matches: false,
+                model_matches: true,
+            },)
+            .unwrap()
+    );
     assert_ne!(manager.phase(), ManagerPhase::Running);
     assert!(manager.failures().any(|failure| matches!(failure,
         AdaptiveManagerError::InterventionNeutralMismatch {

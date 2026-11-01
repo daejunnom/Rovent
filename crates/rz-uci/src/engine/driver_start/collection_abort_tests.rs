@@ -33,16 +33,35 @@ fn started() -> (
     )
     .unwrap();
     let mut session = Session::new(
-        RulesUciPort::new(Arc::new(OwnerRegistry::default()), PositionLimits::default()),
-        EngineIdentity { name: "original start test".into(), author: "RoveZero".into() },
+        RulesUciPort::new(
+            Arc::new(OwnerRegistry::default()),
+            PositionLimits::default(),
+        ),
+        EngineIdentity {
+            name: "original start test".into(),
+            author: "RoveZero".into(),
+        },
         Vec::new(),
         ParserLimits::default(),
     )
     .unwrap();
     let mut out = owner.handle_line(&mut session, "go nodes 1", |_| Ok(Color::White));
     assert!(out.session.accepted);
-    let start_index = out.session.effects.iter().position(|e| matches!(e, Effect::Start { .. })).unwrap();
-    let Effect::Start { ticket, snapshot, limits, .. } = out.session.effects.remove(start_index) else { unreachable!() };
+    let start_index = out
+        .session
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::Start { .. }))
+        .unwrap();
+    let Effect::Start {
+        ticket,
+        snapshot,
+        limits,
+        ..
+    } = out.session.effects.remove(start_index)
+    else {
+        unreachable!()
+    };
     let authority = match owner.lifecycle_scope() {
         SessionScope::Search(authority) => authority,
         _ => panic!("start did not preserve search scope"),
@@ -63,12 +82,21 @@ fn started() -> (
         shutdown_deadline: control.deadline + Duration::from_secs(2),
         current: Arc::new(Mutex::new(SessionScope::Search(authority))),
     };
-    let start = DriverStartSource::from_start(&ticket, snapshot.rules_position(), binding, &context, &clock).unwrap();
+    let start = DriverStartSource::from_start(
+        &ticket,
+        snapshot.rules_position(),
+        binding,
+        &context,
+        &clock,
+    )
+    .unwrap();
     context.original_start = Some(Arc::clone(&start));
     owner.bind_original_start(&ticket, start).unwrap();
     let game = Arc::new(AtomicU64::new(0));
     let root = Arc::new(AtomicBool::new(false));
-    context.bind_original_collection_abort(Arc::clone(&game), Arc::clone(&root)).unwrap();
+    context
+        .bind_original_collection_abort(Arc::clone(&game), Arc::clone(&root))
+        .unwrap();
     (owner, session, context, game, root)
 }
 
@@ -76,7 +104,9 @@ fn started() -> (
 fn accepted_stop_and_new_game_abort_exact_start_but_rejected_position_does_not() {
     for command in ["stop", "ucinewgame", "position startpos", "quit"] {
         let (mut owner, mut session, context, game, root) = started();
-        let bad = owner.handle_line(&mut session, "position startpos moves e2e5", |_| Ok(Color::White));
+        let bad = owner.handle_line(&mut session, "position startpos moves e2e5", |_| {
+            Ok(Color::White)
+        });
         assert!(!bad.session.accepted);
         assert!(!root.load(Ordering::Acquire));
         assert_eq!(game.load(Ordering::Acquire), 0);
@@ -84,7 +114,10 @@ fn accepted_stop_and_new_game_abort_exact_start_but_rejected_position_does_not()
         let out = owner.handle_line(&mut session, command, |_| Ok(Color::White));
         assert!(out.session.accepted, "{command}");
         assert!(root.load(Ordering::Acquire), "{command}");
-        assert_ne!(game.load(Ordering::Acquire) & crate::search_driver::ROVENT_COLLECTION_ABORT_BIT, 0);
+        assert_ne!(
+            game.load(Ordering::Acquire) & crate::search_driver::ROVENT_COLLECTION_ABORT_BIT,
+            0
+        );
         assert!(context.cancellation.is_canceled());
     }
 }
@@ -93,10 +126,15 @@ fn accepted_stop_and_new_game_abort_exact_start_but_rejected_position_does_not()
 fn natural_completion_closes_common_token_without_aborting_collection() {
     let (mut owner, mut session, context, game, root) = started();
     let ticket = owner.active_ticket().unwrap().clone();
-    let out = owner.handle_event(&mut session, Event::Complete {
-        ticket,
-        completion: SearchCompletion::Completed { bestmove: Some("e2e4".into()) },
-    });
+    let out = owner.handle_event(
+        &mut session,
+        Event::Complete {
+            ticket,
+            completion: SearchCompletion::Completed {
+                bestmove: Some("e2e4".into()),
+            },
+        },
+    );
     assert!(out.session.accepted);
     assert!(context.cancellation.is_canceled());
     assert!(!root.load(Ordering::Acquire));
@@ -122,11 +160,16 @@ fn accepted_stop_and_publication_grant_have_one_atomic_order() {
                 owner.handle_line(&mut session, "stop", |_| Ok(Color::White))
             });
             barrier.wait();
-            let granted = game.compare_exchange(0, GRANTED, Ordering::AcqRel, Ordering::Acquire).is_ok();
+            let granted = game
+                .compare_exchange(0, GRANTED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
             assert!(stopped.join().expect("stop worker").session.accepted);
             assert!(context.cancellation.is_canceled());
             assert!(root.load(Ordering::Acquire));
-            assert_eq!(game.load(Ordering::Acquire), ABORTED | if granted { GRANTED } else { 0 });
+            assert_eq!(
+                game.load(Ordering::Acquire),
+                ABORTED | if granted { GRANTED } else { 0 }
+            );
         });
     }
 }

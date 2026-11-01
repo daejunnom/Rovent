@@ -226,9 +226,16 @@ pub struct RoventPcRevokeObservationV2 {
     pub driver_complete_at_revoke: bool,
 }
 #[derive(Clone, Copy, Debug)]
-pub enum RoventPcRevokeOriginV2 { LoopCondition, RunEnded }
+pub enum RoventPcRevokeOriginV2 {
+    LoopCondition,
+    RunEnded,
+}
 #[derive(Clone, Copy, Debug)]
-pub enum RoventPcContextAcceptanceV2 { Accepted, Rejected, Unavailable }
+pub enum RoventPcContextAcceptanceV2 {
+    Accepted,
+    Rejected,
+    Unavailable,
+}
 
 /// Failed marker cleanup after the same root's native fence. This owns the
 /// original capability and diagnostic; it never claims collection completion.
@@ -245,11 +252,21 @@ pub enum RoventPcDeferredCleanupFailureV2 {
     Panic(Box<dyn Any + Send>),
 }
 impl RoventPcDeferredCleanupV2 {
-    pub fn capability(&self) -> &crate::pals_adaptive::RoventNoCaptureRootCapabilityV2 { &self.capability }
-    pub fn reason(&self) -> &AdaptiveCollectionError { &self.reason }
-    pub fn fence(&self) -> &RoleOnlyShutdownReceipt { &self.fence }
-    pub fn failure(&self) -> &RoventPcDeferredCleanupFailureV2 { &self.cleanup_failure }
-    pub fn retention_failure(&self) -> Option<&AdaptiveManagerError> { self.retention_failure.as_ref() }
+    pub fn capability(&self) -> &crate::pals_adaptive::RoventNoCaptureRootCapabilityV2 {
+        &self.capability
+    }
+    pub fn reason(&self) -> &AdaptiveCollectionError {
+        &self.reason
+    }
+    pub fn fence(&self) -> &RoleOnlyShutdownReceipt {
+        &self.fence
+    }
+    pub fn failure(&self) -> &RoventPcDeferredCleanupFailureV2 {
+        &self.cleanup_failure
+    }
+    pub fn retention_failure(&self) -> Option<&AdaptiveManagerError> {
+        self.retention_failure.as_ref()
+    }
 }
 
 impl RoventPcCollectionRootCustodyV2 {
@@ -305,7 +322,9 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
         _capability: &crate::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         _fence: &RoleOnlyShutdownReceipt,
     ) -> Result<crate::pals_adaptive::AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("P/C no-capture cleanup unsupported"))
+        Err(AdaptiveManagerError::Invalid(
+            "P/C no-capture cleanup unsupported",
+        ))
     }
     /// Keep the exact unresolved cleanup and its original diagnostic. Success
     /// means custody only, not marker removal or collection publication.
@@ -313,17 +332,29 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
         &self,
         _cleanup: Arc<Mutex<RoventPcDeferredCleanupV2>>,
     ) -> Result<RoventPcCustodyReturnV2, AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("P/C deferred cleanup custody unsupported"))
+        Err(AdaptiveManagerError::Invalid(
+            "P/C deferred cleanup custody unsupported",
+        ))
     }
     fn pump(&self) -> Result<(), AdaptiveManagerError>;
     fn revoke(&self);
     /// Scoped hooks must act only on this original admission. Legacy global
     /// hooks are retained for compatibility but are not safe for reuse.
-    fn pump_root(&self, _root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("P/C root-scoped pump unsupported"))
+    fn pump_root(
+        &self,
+        _root: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "P/C root-scoped pump unsupported",
+        ))
     }
-    fn revoke_root(&self, _root: &RoventCollectionRootAdmissionV2) -> Result<(), AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("P/C root-scoped revoke unsupported"))
+    fn revoke_root(
+        &self,
+        _root: &RoventCollectionRootAdmissionV2,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "P/C root-scoped revoke unsupported",
+        ))
     }
     /// This callback must be bounded and nonblocking like `revoke_root`.
     fn revoke_root_observed(
@@ -342,8 +373,13 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
     fn handoff_sender_root(
         &self,
         _root: &RoventCollectionRootAdmissionV2,
-    ) -> Result<std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>, AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("P/C root-scoped handoff unsupported"))
+    ) -> Result<
+        std::sync::mpsc::SyncSender<Arc<Mutex<RoventPcCollectionHandoffV2>>>,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "P/C root-scoped handoff unsupported",
+        ))
     }
     /// Nonblocking; `None` preserves the still-running original worker.
     fn try_take_root_custody(
@@ -358,7 +394,9 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
         &self,
         _custody: Arc<Mutex<RoventPcCollectionRootCustodyV2>>,
     ) -> Result<RoventPcCustodyReturnV2, AdaptiveManagerError> {
-        Err(AdaptiveManagerError::Invalid("P/C V2 custody receiver unavailable"))
+        Err(AdaptiveManagerError::Invalid(
+            "P/C V2 custody receiver unavailable",
+        ))
     }
 }
 
@@ -366,7 +404,9 @@ pub trait RoventPcCollectionHooksV2: Send + Sync {
 /// native no-capture marker to have been registered before returning it.
 pub enum RoventPcCollectionAdmissionOutcomeV2 {
     Installed,
-    Pending { admission: RoventCollectionRootAdmissionV2 },
+    Pending {
+        admission: RoventCollectionRootAdmissionV2,
+    },
     DeferredNoCapture {
         capability: crate::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         reason: AdaptiveCollectionError,
@@ -853,7 +893,12 @@ pub struct RoventPcSessionDriver {
     collection_v2_outstanding: AtomicBool,
     retained_collection_handoff_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionHandoffV2>>>>,
     retained_collection_custody_v2: Mutex<Option<Arc<Mutex<RoventPcCollectionRootCustodyV2>>>>,
-    retained_no_capture_v2: Mutex<Option<(crate::pals_adaptive::RoventNoCaptureRootCapabilityV2, AdaptiveCollectionError)>>,
+    retained_no_capture_v2: Mutex<
+        Option<(
+            crate::pals_adaptive::RoventNoCaptureRootCapabilityV2,
+            AdaptiveCollectionError,
+        )>,
+    >,
     retained_deferred_cleanup_v2: Mutex<Option<Arc<Mutex<RoventPcDeferredCleanupV2>>>>,
     retained_collection_failure_v2: Mutex<Option<RoventPcCollectionAdmissionFailureV2>>,
     retained_collection_panic_v2: Mutex<(Option<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>)>,
@@ -2237,26 +2282,43 @@ impl RoventPcSessionDriver {
                             ))?;
                     loop {
                         v2_hook_started = true;
-                        self.collection_v2_outstanding.store(true, Ordering::Release);
-                        let mut port = RoventPcCollectionAdmissionPortV2 { manager: &mut manager };
+                        self.collection_v2_outstanding
+                            .store(true, Ordering::Release);
+                        let mut port = RoventPcCollectionAdmissionPortV2 {
+                            manager: &mut manager,
+                        };
                         match hook.admit(&mut port, admission.clone()) {
                             Ok(RoventPcCollectionAdmissionOutcomeV2::Installed) => {
                                 let actual = manager.collection_root_admission_v2().ok_or(
-                                    AdaptiveManagerError::Invalid("P/C V2 observer was not installed"),
+                                    AdaptiveManagerError::Invalid(
+                                        "P/C V2 observer was not installed",
+                                    ),
                                 )?;
                                 if !actual.same_original_admission(&expected) {
-                                    return Err(AdaptiveManagerError::Invalid("P/C installed V2 admission owner differs"));
+                                    return Err(AdaptiveManagerError::Invalid(
+                                        "P/C installed V2 admission owner differs",
+                                    ));
                                 }
                                 break;
                             }
-                            Ok(RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture { capability, reason }) => {
+                            Ok(RoventPcCollectionAdmissionOutcomeV2::DeferredNoCapture {
+                                capability,
+                                reason,
+                            }) => {
                                 if !capability.same_original_admission(&expected)
-                                    || manager.collection_root_admission_v2().is_some() {
-                                    v2_admission_failure = Some(RoventPcCollectionAdmissionFailureV2 {
-                                        error: AdaptiveManagerError::Invalid("P/C no-capture owner mismatch"),
-                                        admission: expected.clone(), owners: Box::new((capability, reason)),
-                                    });
-                                    return Err(AdaptiveManagerError::Invalid("P/C no-capture owner mismatch"));
+                                    || manager.collection_root_admission_v2().is_some()
+                                {
+                                    v2_admission_failure =
+                                        Some(RoventPcCollectionAdmissionFailureV2 {
+                                            error: AdaptiveManagerError::Invalid(
+                                                "P/C no-capture owner mismatch",
+                                            ),
+                                            admission: expected.clone(),
+                                            owners: Box::new((capability, reason)),
+                                        });
+                                    return Err(AdaptiveManagerError::Invalid(
+                                        "P/C no-capture owner mismatch",
+                                    ));
                                 }
                                 no_capture_v2 = Some((capability, reason));
                                 v2_hook_started = false;
@@ -2264,24 +2326,36 @@ impl RoventPcSessionDriver {
                             }
                             Ok(RoventPcCollectionAdmissionOutcomeV2::Pending { admission }) => {
                                 if !admission.same_original_admission(&expected)
-                                    || manager.collection_root_admission_v2().is_some() {
-                                    v2_admission_failure = Some(RoventPcCollectionAdmissionFailureV2 {
-                                        error: AdaptiveManagerError::Invalid("P/C pending admission owner mismatch"),
-                                        admission, owners: Box::new(()),
-                                    });
-                                    return Err(AdaptiveManagerError::Invalid("P/C pending admission owner mismatch"));
+                                    || manager.collection_root_admission_v2().is_some()
+                                {
+                                    v2_admission_failure =
+                                        Some(RoventPcCollectionAdmissionFailureV2 {
+                                            error: AdaptiveManagerError::Invalid(
+                                                "P/C pending admission owner mismatch",
+                                            ),
+                                            admission,
+                                            owners: Box::new(()),
+                                        });
+                                    return Err(AdaptiveManagerError::Invalid(
+                                        "P/C pending admission owner mismatch",
+                                    ));
                                 }
                                 v2_hook_started = false;
-                                if !context.accepts().unwrap_or(false) || context.soft_expired(Instant::now()) {
+                                if !context.accepts().unwrap_or(false)
+                                    || context.soft_expired(Instant::now())
+                                {
                                     return Err(AdaptiveManagerError::Deadline);
                                 }
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                             Err(rejected) => {
-                                let error = if rejected.admission.same_original_admission(&expected) {
+                                let error = if rejected.admission.same_original_admission(&expected)
+                                {
                                     rejected.error.clone()
                                 } else {
-                                    AdaptiveManagerError::Invalid("P/C rejected V2 admission owner differs")
+                                    AdaptiveManagerError::Invalid(
+                                        "P/C rejected V2 admission owner differs",
+                                    )
                                 };
                                 v2_admission_failure = Some(rejected);
                                 return Err(error);
@@ -2351,33 +2425,44 @@ impl RoventPcSessionDriver {
                         let revoke_acceptance = context.accepts();
                         let revoke_soft_expired = context.soft_expired(revoke_now);
                         if !revoke_acceptance.as_ref().copied().unwrap_or(false)
-                            || revoke_soft_expired || manager.phase() != ManagerPhase::Running {
-                        if let Some(hook) = &self.collection_hooks_v2 {
-                            let observation = RoventPcRevokeObservationV2 {
-                                origin: RoventPcRevokeOriginV2::LoopCondition,
-                                elapsed_from_start: context.original_time_budget
-                                    .and_then(|budget| revoke_now.checked_duration_since(budget.start)),
-                                context_acceptance: match revoke_acceptance {
-                                    Ok(true) => RoventPcContextAcceptanceV2::Accepted,
-                                    Ok(false) => RoventPcContextAcceptanceV2::Rejected,
-                                    Err(_) => RoventPcContextAcceptanceV2::Unavailable,
-                                },
-                                soft_expired: revoke_soft_expired,
-                                manager_phase: manager.phase(),
-                                goal: manager.driver().port().rovent_frontier_receipt()
-                                    .map(|receipt| receipt.snapshot.goal),
-                                role_calls_admitted: manager.role_call_budget_usage().0,
-                                role_calls_reserved: manager.role_call_budget_usage().1,
-                                role_call_limit: manager.role_call_limit(),
-                                role_call_limit_reached: manager.role_call_limit_reached(),
-                                manager_failures: manager.failures().count(),
-                                driver_complete_at_revoke: manager.driver_is_complete(),
-                            };
-                            hook.revoke_root_observed(v2_current_admission.as_ref().ok_or(
-                                AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
-                            )?, observation)?;
-                        }
-                        v2_hook_revoked = true;
+                            || revoke_soft_expired
+                            || manager.phase() != ManagerPhase::Running
+                        {
+                            if let Some(hook) = &self.collection_hooks_v2 {
+                                let observation = RoventPcRevokeObservationV2 {
+                                    origin: RoventPcRevokeOriginV2::LoopCondition,
+                                    elapsed_from_start: context.original_time_budget.and_then(
+                                        |budget| revoke_now.checked_duration_since(budget.start),
+                                    ),
+                                    context_acceptance: match revoke_acceptance {
+                                        Ok(true) => RoventPcContextAcceptanceV2::Accepted,
+                                        Ok(false) => RoventPcContextAcceptanceV2::Rejected,
+                                        Err(_) => RoventPcContextAcceptanceV2::Unavailable,
+                                    },
+                                    soft_expired: revoke_soft_expired,
+                                    manager_phase: manager.phase(),
+                                    goal: manager
+                                        .driver()
+                                        .port()
+                                        .rovent_frontier_receipt()
+                                        .map(|receipt| receipt.snapshot.goal),
+                                    role_calls_admitted: manager.role_call_budget_usage().0,
+                                    role_calls_reserved: manager.role_call_budget_usage().1,
+                                    role_call_limit: manager.role_call_limit(),
+                                    role_call_limit_reached: manager.role_call_limit_reached(),
+                                    manager_failures: manager.failures().count(),
+                                    driver_complete_at_revoke: manager.driver_is_complete(),
+                                };
+                                hook.revoke_root_observed(
+                                    v2_current_admission.as_ref().ok_or(
+                                        AdaptiveManagerError::Invalid(
+                                            "P/C revoke original root unavailable",
+                                        ),
+                                    )?,
+                                    observation,
+                                )?;
+                            }
+                            v2_hook_revoked = true;
                         }
                     }
                     if v2_hook_started {
@@ -2440,7 +2525,10 @@ impl RoventPcSessionDriver {
             },
         ));
         if let Some(no_capture) = no_capture_v2.take() {
-            *self.retained_no_capture_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(no_capture);
+            *self
+                .retained_no_capture_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(no_capture);
         }
         if let Some(rejected) = v2_admission_failure {
             *self
@@ -2455,13 +2543,17 @@ impl RoventPcSessionDriver {
         if v2_hook_started && !v2_hook_revoked {
             if let Some(hook) = &self.collection_hooks_v2 {
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    let root = v2_current_admission.as_ref().ok_or(
-                        AdaptiveManagerError::Invalid("P/C revoke original root unavailable"),
-                    )?;
+                    let root =
+                        v2_current_admission
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "P/C revoke original root unavailable",
+                            ))?;
                     let now = Instant::now();
                     let observation = RoventPcRevokeObservationV2 {
                         origin: RoventPcRevokeOriginV2::RunEnded,
-                        elapsed_from_start: context.original_time_budget
+                        elapsed_from_start: context
+                            .original_time_budget
                             .and_then(|budget| now.checked_duration_since(budget.start)),
                         context_acceptance: match context.accepts() {
                             Ok(true) => RoventPcContextAcceptanceV2::Accepted,
@@ -2470,7 +2562,10 @@ impl RoventPcSessionDriver {
                         },
                         soft_expired: context.soft_expired(now),
                         manager_phase: manager.phase(),
-                        goal: manager.driver().port().rovent_frontier_receipt()
+                        goal: manager
+                            .driver()
+                            .port()
+                            .rovent_frontier_receipt()
                             .map(|receipt| receipt.snapshot.goal),
                         role_calls_admitted: manager.role_call_budget_usage().0,
                         role_calls_reserved: manager.role_call_budget_usage().1,
@@ -2485,14 +2580,20 @@ impl RoventPcSessionDriver {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         if let Some(payload) = original_panic.take() {
-                            self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                            self.retained_collection_panic_v2
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .0 = Some(payload);
                         }
                         *state = State::Manager(manager);
                         self.closed.store(true, Ordering::Release);
                         return Err(physical_unknown_at("RoventPcV2CollectionRevoke", error));
                     }
                     Err(payload) => {
-                        let mut retained = self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut retained = self
+                            .retained_collection_panic_v2
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
                         retained.0 = original_panic.take();
                         retained.1 = Some(payload);
                         *state = State::Manager(manager);
@@ -2559,26 +2660,48 @@ impl RoventPcSessionDriver {
                 return Err(physical_unknown_at("RoventPcShutdownReceipt", error));
             }
         };
-        let no_capture = self.retained_no_capture_v2.lock().unwrap_or_else(|p| p.into_inner())
-            .as_ref().map(|(capability, _)| capability.clone());
+        let no_capture = self
+            .retained_no_capture_v2
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(capability, _)| capability.clone());
         if let Some(capability) = no_capture {
             if !capability.matches_role_only_shutdown_receipt(&physical) {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
-                return Err(physical_unknown_at("RoventPcNoCaptureFence", "same-root native fence unavailable"));
+                return Err(physical_unknown_at(
+                    "RoventPcNoCaptureFence",
+                    "same-root native fence unavailable",
+                ));
             }
             let Some(hook) = &self.collection_hooks_v2 else {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
-                return Err(physical_unknown_at("RoventPcNoCaptureOwner", "original collection hook unavailable"));
+                return Err(physical_unknown_at(
+                    "RoventPcNoCaptureOwner",
+                    "original collection hook unavailable",
+                ));
             };
             let signal = manager.activity_signal();
             let cleanup_failure = loop {
                 let observed = signal.version();
-                match catch_unwind(AssertUnwindSafe(|| hook.finish_deferred(&capability, &physical))) {
-                    Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready)) => break None,
-                    Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) if Instant::now() < context.shutdown_deadline => {
-                        signal.wait_changed(observed, context.shutdown_deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                match catch_unwind(AssertUnwindSafe(|| {
+                    hook.finish_deferred(&capability, &physical)
+                })) {
+                    Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Ready)) => {
+                        break None;
+                    }
+                    Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy))
+                        if Instant::now() < context.shutdown_deadline =>
+                    {
+                        signal.wait_changed(
+                            observed,
+                            context
+                                .shutdown_deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10)),
+                        );
                     }
                     Ok(Ok(crate::pals_adaptive::AdaptiveCollectionBoundaryV2::Busy)) => {
                         break Some(RoventPcDeferredCleanupFailureV2::Busy);
@@ -2592,26 +2715,53 @@ impl RoventPcSessionDriver {
                 }
             };
             if let Some(cleanup_failure) = cleanup_failure {
-                let (capability, reason) = self.retained_no_capture_v2.lock().unwrap_or_else(|p| p.into_inner()).take()
+                let (capability, reason) = self
+                    .retained_no_capture_v2
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
                     .expect("original no-capture owner remains with this root");
                 let cleanup = Arc::new(Mutex::new(RoventPcDeferredCleanupV2 {
-                    capability, reason, fence: physical.clone(), cleanup_failure, retention_failure: None,
+                    capability,
+                    reason,
+                    fence: physical.clone(),
+                    cleanup_failure,
+                    retention_failure: None,
                 }));
-                *self.retained_deferred_cleanup_v2.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&cleanup));
+                *self
+                    .retained_deferred_cleanup_v2
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&cleanup));
                 let transferred = loop {
                     let observed = signal.version();
-                    match catch_unwind(AssertUnwindSafe(|| hook.retain_deferred_cleanup(Arc::clone(&cleanup)))) {
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        hook.retain_deferred_cleanup(Arc::clone(&cleanup))
+                    })) {
                         Ok(Ok(RoventPcCustodyReturnV2::Accepted)) => break true,
-                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) if Instant::now() < context.shutdown_deadline => {
-                            signal.wait_changed(observed, context.shutdown_deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                        Ok(Ok(RoventPcCustodyReturnV2::Busy))
+                            if Instant::now() < context.shutdown_deadline =>
+                        {
+                            signal.wait_changed(
+                                observed,
+                                context
+                                    .shutdown_deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(10)),
+                            );
                         }
                         Ok(Ok(RoventPcCustodyReturnV2::Busy)) => break false,
                         Ok(Err(error)) => {
-                            cleanup.lock().unwrap_or_else(|p| p.into_inner()).retention_failure = Some(error);
+                            cleanup
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .retention_failure = Some(error);
                             break false;
                         }
                         Err(payload) => {
-                            self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
+                            self.retained_collection_panic_v2
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .0 = Some(payload);
                             break false;
                         }
                     }
@@ -2619,13 +2769,23 @@ impl RoventPcSessionDriver {
                 if !transferred {
                     *state = State::Manager(manager);
                     self.closed.store(true, Ordering::Release);
-                    return Err(failure("RoventPcNoCaptureCustody", "native fence confirmed; original marker cleanup and failure retained"));
+                    return Err(failure(
+                        "RoventPcNoCaptureCustody",
+                        "native fence confirmed; original marker cleanup and failure retained",
+                    ));
                 }
-                self.retained_deferred_cleanup_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
+                self.retained_deferred_cleanup_v2
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
             } else {
-                self.retained_no_capture_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
+                self.retained_no_capture_v2
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
             }
-            self.collection_v2_outstanding.store(false, Ordering::Release);
+            self.collection_v2_outstanding
+                .store(false, Ordering::Release);
         }
         if v2_hook_started {
             // Acquire the channel before removing any owner from the manager.
@@ -2680,12 +2840,18 @@ impl RoventPcSessionDriver {
                 .retained_collection_handoff_v2
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
-            let same_root = handoff.lock().unwrap_or_else(|p| p.into_inner())
-                .admission.same_original_admission(v2_current_admission.as_ref().expect("started root"));
+            let same_root = handoff
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .admission
+                .same_original_admission(v2_current_admission.as_ref().expect("started root"));
             if !same_root {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
-                return Err(physical_unknown_at("RoventPcV2HandoffRoot", "original handoff and manager retained"));
+                return Err(physical_unknown_at(
+                    "RoventPcV2HandoffRoot",
+                    "original handoff and manager retained",
+                ));
             }
             if sender.try_send(Arc::clone(&handoff)).is_err() {
                 *state = State::Manager(manager);
@@ -2717,7 +2883,9 @@ impl RoventPcSessionDriver {
                         if matches {
                             joined = Some(custody);
                         } else {
-                            custody_state = "foreign joined worker custody retained; original root unresolved".into();
+                            custody_state =
+                                "foreign joined worker custody retained; original root unresolved"
+                                    .into();
                         }
                         break;
                     }
@@ -2755,9 +2923,16 @@ impl RoventPcSessionDriver {
                     let aggregate_ready = match handoff.try_lock() {
                         Ok(original) => original.teacher_aggregate_ack().is_some(),
                         Err(std::sync::TryLockError::WouldBlock) => {
-                            if Instant::now() >= context.shutdown_deadline { break; }
-                            signal.wait_changed(observed, context.shutdown_deadline
-                                .saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+                            if Instant::now() >= context.shutdown_deadline {
+                                break;
+                            }
+                            signal.wait_changed(
+                                observed,
+                                context
+                                    .shutdown_deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(10)),
+                            );
                             continue;
                         }
                         Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -2766,23 +2941,44 @@ impl RoventPcSessionDriver {
                         }
                     };
                     if !aggregate_ready {
-                        custody_state = "joined worker lacks original aggregate physical proof".into();
+                        custody_state =
+                            "joined worker lacks original aggregate physical proof".into();
                         break;
                     }
-                    match catch_unwind(AssertUnwindSafe(|| hook.return_root_custody(Arc::clone(&custody)))) {
-                        Ok(Ok(RoventPcCustodyReturnV2::Accepted)) => { returned = true; break; }
-                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) if Instant::now() < context.shutdown_deadline => {
-                            signal.wait_changed(observed, context.shutdown_deadline
-                                .saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
-                        }
-                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) => {
-                            custody_state = "custody receiver remained busy until the original deadline".into();
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        hook.return_root_custody(Arc::clone(&custody))
+                    })) {
+                        Ok(Ok(RoventPcCustodyReturnV2::Accepted)) => {
+                            returned = true;
                             break;
                         }
-                        Ok(Err(error)) => { custody_state = format!("custody receiver failed: {error:?}"); break; }
+                        Ok(Ok(RoventPcCustodyReturnV2::Busy))
+                            if Instant::now() < context.shutdown_deadline =>
+                        {
+                            signal.wait_changed(
+                                observed,
+                                context
+                                    .shutdown_deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(10)),
+                            );
+                        }
+                        Ok(Ok(RoventPcCustodyReturnV2::Busy)) => {
+                            custody_state =
+                                "custody receiver remained busy until the original deadline".into();
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            custody_state = format!("custody receiver failed: {error:?}");
+                            break;
+                        }
                         Err(payload) => {
-                            self.retained_collection_panic_v2.lock().unwrap_or_else(|p| p.into_inner()).0 = Some(payload);
-                            custody_state = "custody receiver panicked; original owner retained".into();
+                            self.retained_collection_panic_v2
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .0 = Some(payload);
+                            custody_state =
+                                "custody receiver panicked; original owner retained".into();
                             break;
                         }
                     }
@@ -2791,13 +2987,23 @@ impl RoventPcSessionDriver {
             if !returned {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
-                return Err(physical_unknown_at("RoventPcV2CollectionCustodyPending", custody_state));
+                return Err(physical_unknown_at(
+                    "RoventPcV2CollectionCustodyPending",
+                    custody_state,
+                ));
             }
             // The collection owner retains the exact joined worker and handoff.
             // It separately records publication and settlement outcomes.
-            self.retained_collection_custody_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
-            self.retained_collection_handoff_v2.lock().unwrap_or_else(|p| p.into_inner()).take();
-            self.collection_v2_outstanding.store(false, Ordering::Release);
+            self.retained_collection_custody_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            self.retained_collection_handoff_v2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            self.collection_v2_outstanding
+                .store(false, Ordering::Release);
         }
         if let Some(observer) = &self.collection_hooks.root_closure {
             if let Err(error) = observer(&mut manager) {
@@ -3406,10 +3612,20 @@ impl Drop for RoventPcSessionDriver {
             {
                 std::mem::forget(custody);
             }
-            if let Some(capability) = self.retained_no_capture_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+            if let Some(capability) = self
+                .retained_no_capture_v2
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
                 std::mem::forget(capability);
             }
-            if let Some(cleanup) = self.retained_deferred_cleanup_v2.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+            if let Some(cleanup) = self
+                .retained_deferred_cleanup_v2
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
                 std::mem::forget(cleanup);
             }
             if let Some(failure) = self

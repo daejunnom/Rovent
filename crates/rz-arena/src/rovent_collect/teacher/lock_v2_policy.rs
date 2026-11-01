@@ -1,7 +1,7 @@
 //! Move-only V2 teacher evidence is checked and transformed outside the
 //! producer lock. A later short producer commit only transfers the prepared
 //! target to the same original retired row.
-use super::collection::{scope_json, ROVENT_COLLECTION_TEACHER_BINDING};
+use super::collection::{ROVENT_COLLECTION_TEACHER_BINDING, scope_json};
 use super::v2_session::SealedTeacherPolicyV2;
 use super::*;
 
@@ -34,7 +34,10 @@ pub(crate) fn prepare_teacher_policy_lock_v2(
 ) -> Result<PreparedTeacherPolicyLockV2, Box<PrepareTeacherPolicyFailureV2>> {
     let prepare = || -> Result<(GenerationPolicyTargetV3, RoventHeadSource), ArenaError> {
         if let Some(guard) = &sealed.speculative_guard {
-            check(!guard.is_ticket_canceled(), "V2 speculative teacher input canceled before preparation")?;
+            check(
+                !guard.is_ticket_canceled(),
+                "V2 speculative teacher input canceled before preparation",
+            )?;
             guard.matches_original_row(row)?;
         }
         let evidence = &sealed.evidence;
@@ -163,7 +166,10 @@ impl RoventCorpusProducerLockV2 {
             // Preserve and inspect the same original guard through this owner
             // boundary; a load alone does not linearize concurrent revoke.
             if let Some(guard) = &prepared.sealed.speculative_guard {
-                check(!guard.is_ticket_canceled(), "V2 speculative teacher input canceled before commit")?;
+                check(
+                    !guard.is_ticket_canceled(),
+                    "V2 speculative teacher input canceled before commit",
+                )?;
                 guard.matches_original_row(row)?;
             }
             check(
@@ -187,13 +193,13 @@ impl RoventCorpusProducerLockV2 {
                 return Err(Box::new(CommitTeacherPolicyFailureV2 {
                     error,
                     panic: None,
-                }))
+                }));
             }
             Err(panic) => {
                 return Err(Box::new(CommitTeacherPolicyFailureV2 {
                     error: invalid("V2 teacher policy commit validation panicked"),
                     panic: Some(panic),
-                }))
+                }));
             }
         }
         let producer = self.teacher_target_producer_mut();

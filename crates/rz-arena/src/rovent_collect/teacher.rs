@@ -318,7 +318,9 @@ fn prepare_completed_teacher_policy(
     // exist and occur in order. Missing, reversed or unrepresentable values
     // remain null; absolute process-local Instants are never serialized.
     let elapsed_ns = |start: Option<std::time::Instant>, end: Option<std::time::Instant>| {
-        start.zip(end).and_then(|(start, end)| end.checked_duration_since(start))
+        start
+            .zip(end)
+            .and_then(|(start, end)| end.checked_duration_since(start))
             .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
     };
     let body = json!({"schema":HEAD_DOMAIN,"kind":"teacher_policy","actor_id":actor_id,
@@ -376,26 +378,42 @@ fn validate_completed_teacher_opinions(
     let raw = &r.raw;
     // Preserve the same short-circuit eligibility checks while recording the
     // first failed condition. No failed or partial report becomes a target.
-    check(r.purpose == ExternalEnginePurpose::Teacher,
-        "teacher conditional policy target: purpose mismatch")?;
-    check(r.profile.source_commit() == pin.source_commit,
-        "teacher conditional policy target: source commit mismatch")?;
-    check(raw.identity.binary_sha256 == pin.binary_sha256,
-        "teacher conditional policy target: binary identity mismatch")?;
-    check(raw.identity.options == pin.options,
-        "teacher conditional policy target: options mismatch")?;
+    check(
+        r.purpose == ExternalEnginePurpose::Teacher,
+        "teacher conditional policy target: purpose mismatch",
+    )?;
+    check(
+        r.profile.source_commit() == pin.source_commit,
+        "teacher conditional policy target: source commit mismatch",
+    )?;
+    check(
+        raw.identity.binary_sha256 == pin.binary_sha256,
+        "teacher conditional policy target: binary identity mismatch",
+    )?;
+    check(
+        raw.identity.options == pin.options,
+        "teacher conditional policy target: options mismatch",
+    )?;
     if !outcome.conditional_policy_target_known {
         return Err(invalid(format!(
             "teacher conditional policy target: completed opinions unknown (completion={:?}, requested_multipv={}, observed_opinions={})",
-            raw.completion, outcome.requested_multipv, outcome.opinions.len(),
+            raw.completion,
+            outcome.requested_multipv,
+            outcome.opinions.len(),
         )));
     }
-    check(r.readiness_barrier_completed,
-        "teacher conditional policy target: readiness barrier incomplete")?;
-    check(!outcome.opinions.is_empty(),
-        "teacher conditional policy target: no opinions")?;
-    check(outcome.opinions.len() <= 4,
-        "teacher conditional policy target: too many opinions")?;
+    check(
+        r.readiness_barrier_completed,
+        "teacher conditional policy target: readiness barrier incomplete",
+    )?;
+    check(
+        !outcome.opinions.is_empty(),
+        "teacher conditional policy target: no opinions",
+    )?;
+    check(
+        outcome.opinions.len() <= 4,
+        "teacher conditional policy target: too many opinions",
+    )?;
     let mut opinions = outcome.opinions.iter().collect::<Vec<_>>();
     opinions.sort_by_key(|o| o.rank);
     let mut ranked = Vec::new();

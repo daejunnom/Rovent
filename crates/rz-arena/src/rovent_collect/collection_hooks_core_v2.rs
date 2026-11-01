@@ -2,16 +2,17 @@
 //! callbacks; this worker never accesses its producer while that root is live.
 //! Teacher process retirement and native handoff remain separate observations.
 #![allow(dead_code)]
+use super::teacher::lock_v2_row_pump::{PumpItemV2, RetiredRowPumpV2};
 use super::teacher::v2_session::{
     RoventCollectionTeacherSessionV2, RoventTeacherRosterEntryV2, TeacherSessionPrepareOwnerV2,
     TeacherSessionRetirementSealV2, TeacherSessionStartErrorV2,
 };
-use super::teacher::lock_v2_row_pump::{PumpItemV2, RetiredRowPumpV2};
 use super::{ArenaError, RoventCollectionOwnerLockV2, check, invalid};
-use rz_search::external_cpu::ExternalGoConstraint;
 use rz_experiments::rovent_corpus_lock_v2::record::RoventCorpusManifestLockV2;
+use rz_search::external_cpu::ExternalGoConstraint;
 use rz_uci::pals_adaptive::{
-    AdaptiveCollectionError, AdaptiveCollectionStage, AdaptiveManagerError, RoventCollectionRootAdmissionV2, RoventTeacherScopePhysicalAckV2,
+    AdaptiveCollectionError, AdaptiveCollectionStage, AdaptiveManagerError,
+    RoventCollectionRootAdmissionV2, RoventTeacherScopePhysicalAckV2,
     RoventTeacherScopeWorkerAckV2,
 };
 use rz_uci::rovent_bootstrap::RoventStartupControl;
@@ -58,15 +59,25 @@ const GAME_UNKNOWN: u64 = 4;
 // Only the original stop bit may change while this generation owns COMMIT.
 // Never clear it when returning the game to its preceding phase.
 fn release_game_commit(gate: &AtomicU64, commit: u64, restore: u64) {
-    if let Err(actual) = gate.compare_exchange(commit, restore, Ordering::AcqRel, Ordering::Acquire) {
+    if let Err(actual) = gate.compare_exchange(commit, restore, Ordering::AcqRel, Ordering::Acquire)
+    {
         if actual == (commit | GAME_HAS_ABORT) {
-            let _ = gate.compare_exchange(actual, restore | GAME_HAS_ABORT, Ordering::AcqRel, Ordering::Acquire);
+            let _ = gate.compare_exchange(
+                actual,
+                restore | GAME_HAS_ABORT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoreUnstartedSealV2 { Sealed, Busy, Unknown }
+pub(crate) enum CoreUnstartedSealV2 {
+    Sealed,
+    Busy,
+    Unknown,
+}
 
 struct GameInstallGuard<'a> {
     gate: &'a AtomicU64,
@@ -80,18 +91,37 @@ enum GameInstallAttempt<'a> {
     Unknown,
 }
 impl GameInstallGuard<'_> {
-    fn enter(&mut self) { self.install_entered = true; }
+    fn enter(&mut self) {
+        self.install_entered = true;
+    }
     fn mark_installed(&mut self) -> Result<(), AdaptiveManagerError> {
         let expected = self.generation | GAME_INSTALLING;
-        match self.gate.compare_exchange(expected, self.generation | GAME_ACTIVE, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => {},
+        match self.gate.compare_exchange(
+            expected,
+            self.generation | GAME_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
             // The optional UCI abort may race this completed installation.
             // It changes no generation or phase, so preserve its sticky bit.
             Err(actual) if actual == (expected | GAME_HAS_ABORT) => {
-                self.gate.compare_exchange(actual, self.generation | GAME_HAS_ABORT | GAME_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| AdaptiveManagerError::Invalid("Collection game installation state changed"))?;
+                self.gate
+                    .compare_exchange(
+                        actual,
+                        self.generation | GAME_HAS_ABORT | GAME_ACTIVE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|_| {
+                        AdaptiveManagerError::Invalid("Collection game installation state changed")
+                    })?;
             }
-            Err(_) => return Err(AdaptiveManagerError::Invalid("Collection game installation state changed")),
+            Err(_) => {
+                return Err(AdaptiveManagerError::Invalid(
+                    "Collection game installation state changed",
+                ));
+            }
         }
         self.installed = true;
         Ok(())
@@ -99,12 +129,27 @@ impl GameInstallGuard<'_> {
 }
 impl Drop for GameInstallGuard<'_> {
     fn drop(&mut self) {
-        if self.installed { return; }
-        let replacement = self.generation | if self.install_entered { GAME_UNKNOWN } else { GAME_IDLE };
+        if self.installed {
+            return;
+        }
+        let replacement = self.generation
+            | if self.install_entered {
+                GAME_UNKNOWN
+            } else {
+                GAME_IDLE
+            };
         let expected = self.generation | GAME_INSTALLING;
-        if let Err(actual) = self.gate.compare_exchange(expected, replacement, Ordering::AcqRel, Ordering::Acquire) {
+        if let Err(actual) =
+            self.gate
+                .compare_exchange(expected, replacement, Ordering::AcqRel, Ordering::Acquire)
+        {
             if actual == (expected | GAME_HAS_ABORT) {
-                let _ = self.gate.compare_exchange(actual, replacement | GAME_HAS_ABORT, Ordering::AcqRel, Ordering::Acquire);
+                let _ = self.gate.compare_exchange(
+                    actual,
+                    replacement | GAME_HAS_ABORT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
         }
     }
@@ -113,19 +158,33 @@ impl Drop for GameInstallGuard<'_> {
 fn try_game_install(gate: &AtomicU64) -> Result<GameInstallAttempt<'_>, AdaptiveManagerError> {
     let previous = gate.load(Ordering::Acquire);
     match previous & GAME_PHASE_MASK {
-        GAME_IDLE => {},
+        GAME_IDLE => {}
         GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING => return Ok(GameInstallAttempt::Busy),
         _ => return Ok(GameInstallAttempt::Unknown),
     }
     let generation = (previous & !(GAME_PHASE_MASK | GAME_CONTROL_BITS))
         .checked_add(GAME_PHASE_MASK + 1)
         .filter(|generation| generation & GAME_CONTROL_BITS == 0)
-        .ok_or(AdaptiveManagerError::Invalid("Collection game generation exhausted"))?
+        .ok_or(AdaptiveManagerError::Invalid(
+            "Collection game generation exhausted",
+        ))?
         | (previous & GAME_CONTROL_BITS);
-    match gate.compare_exchange(previous, generation | GAME_INSTALLING, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => Ok(GameInstallAttempt::Ready(GameInstallGuard { gate, generation, install_entered: false, installed: false })),
+    match gate.compare_exchange(
+        previous,
+        generation | GAME_INSTALLING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(GameInstallAttempt::Ready(GameInstallGuard {
+            gate,
+            generation,
+            install_entered: false,
+            installed: false,
+        })),
         Err(actual) => match actual & GAME_PHASE_MASK {
-            GAME_IDLE | GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING => Ok(GameInstallAttempt::Busy),
+            GAME_IDLE | GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING => {
+                Ok(GameInstallAttempt::Busy)
+            }
             _ => Ok(GameInstallAttempt::Unknown),
         },
     }
@@ -134,8 +193,12 @@ fn try_game_install(gate: &AtomicU64) -> Result<GameInstallAttempt<'_>, Adaptive
 struct AdmissionSlot {
     admission: RoventCollectionRootAdmissionV2,
     state: AtomicU8,
-    speculative: Mutex<Option<(super::native_capture::SpeculativeRootV2,
-        mpsc::Receiver<super::producer_v2::SubmittedTeacherQueryV2>)>>,
+    speculative: Mutex<
+        Option<(
+            super::native_capture::SpeculativeRootV2,
+            mpsc::Receiver<super::producer_v2::SubmittedTeacherQueryV2>,
+        )>,
+    >,
     speculative_install_issue: Mutex<Option<String>>,
     speculative_issue_unknown: AtomicBool,
 }
@@ -197,7 +260,10 @@ impl<H> Drop for RoventCollectionCommitGateV2<'_, H> {
         // A changed phase is not replaced: an unexpected owner transition
         // must remain observable instead of being overwritten.
         let _ = self.core.admission_phase.compare_exchange(
-            ADMISSION_COMMITTING, ADMISSION_INSTALLED, Ordering::AcqRel, Ordering::Acquire,
+            ADMISSION_COMMITTING,
+            ADMISSION_INSTALLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
         );
         release_game_commit(&self.core.game_gate, self.game_commit, self.game_restore);
     }
@@ -216,9 +282,16 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
     /// Called only by this admission before invoking the install callback.
     /// A competing cancellation never becomes proof of an unstarted root.
     fn close_reserved_before_install(&self) {
-        if self.admission_phase.compare_exchange(
-            ADMISSION_RESERVED, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire,
-        ).is_ok() {
+        if self
+            .admission_phase
+            .compare_exchange(
+                ADMISSION_RESERVED,
+                ADMISSION_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
             self.unstarted_sealed.store(true, Ordering::Release);
         }
     }
@@ -231,18 +304,33 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         let attempt = match self.original_attempt.try_lock() {
             Ok(attempt) => attempt,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(CoreUnstartedSealV2::Busy),
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ArenaError::Invalid("Collection original attempt poisoned".into())),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(ArenaError::Invalid(
+                    "Collection original attempt poisoned".into(),
+                ));
+            }
         };
-        let Some(original) = attempt.as_ref() else { return Ok(CoreUnstartedSealV2::Unknown); };
+        let Some(original) = attempt.as_ref() else {
+            return Ok(CoreUnstartedSealV2::Unknown);
+        };
         if !original.same_original_admission(admission) {
-            return Err(ArenaError::Invalid("Collection unstarted root differs from original attempt".into()));
+            return Err(ArenaError::Invalid(
+                "Collection unstarted root differs from original attempt".into(),
+            ));
         }
-        match self.admission_phase.compare_exchange(ADMISSION_OPEN, ADMISSION_CLOSED, Ordering::AcqRel, Ordering::Acquire) {
+        match self.admission_phase.compare_exchange(
+            ADMISSION_OPEN,
+            ADMISSION_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => {
                 self.unstarted_sealed.store(true, Ordering::Release);
                 Ok(CoreUnstartedSealV2::Sealed)
             }
-            Err(ADMISSION_CLOSED) if self.unstarted_sealed.load(Ordering::Acquire) => Ok(CoreUnstartedSealV2::Sealed),
+            Err(ADMISSION_CLOSED) if self.unstarted_sealed.load(Ordering::Acquire) => {
+                Ok(CoreUnstartedSealV2::Sealed)
+            }
             Err(_) => Ok(CoreUnstartedSealV2::Unknown),
         }
     }
@@ -255,14 +343,19 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
     /// cancellation Arc. Equal copied deadline values alone are insufficient.
     pub(crate) fn same_original_startup(&self, other: &Self) -> bool {
         match (self.startup.get(), other.startup.get()) {
-            (Some(left), Some(right)) => Arc::ptr_eq(&left.cancellation, &right.cancellation)
-                && left.until == right.until && left.cleanup_until == right.cleanup_until,
+            (Some(left), Some(right)) => {
+                Arc::ptr_eq(&left.cancellation, &right.cancellation)
+                    && left.until == right.until
+                    && left.cleanup_until == right.cleanup_until
+            }
             _ => false,
         }
     }
     /// Actual installed admission, retained even after the bridge closes.
     /// This is custody identity only, not completion or publication evidence.
-    pub(crate) fn installed_admission_for_recovery(&self) -> Option<&RoventCollectionRootAdmissionV2> {
+    pub(crate) fn installed_admission_for_recovery(
+        &self,
+    ) -> Option<&RoventCollectionRootAdmissionV2> {
         if !self.installed_published.load(Ordering::Acquire) {
             return None;
         }
@@ -278,50 +371,98 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         admission: &RoventCollectionRootAdmissionV2,
     ) -> Result<bool, ArenaError> {
         if !self.revoked.load(Ordering::Acquire)
-            || !self.installed_admission_for_recovery().is_some_and(|original| original.same_original_admission(admission)) {
-            return Err(ArenaError::Invalid("Collection game release original root mismatch".into()));
+            || !self
+                .installed_admission_for_recovery()
+                .is_some_and(|original| original.same_original_admission(admission))
+        {
+            return Err(ArenaError::Invalid(
+                "Collection game release original root mismatch".into(),
+            ));
         }
-        let Some(status) = self.owner.try_status()? else { return Ok(false); };
-        if !status.admitted || !status.settled || status.pending_count != 0 || status.pending_retired_count != 0 {
+        let Some(status) = self.owner.try_status()? else {
+            return Ok(false);
+        };
+        if !status.admitted
+            || !status.settled
+            || status.pending_count != 0
+            || status.pending_retired_count != 0
+        {
             return Ok(false);
         }
         let generation = self.game_generation.load(Ordering::Acquire);
-        if generation == 0 { return Err(ArenaError::Invalid("Collection game release generation unavailable".into())); }
-        let same_generation = |word: u64| (word & !GAME_CONTROL_BITS) == (generation & !GAME_CONTROL_BITS);
+        if generation == 0 {
+            return Err(ArenaError::Invalid(
+                "Collection game release generation unavailable".into(),
+            ));
+        }
+        let same_generation =
+            |word: u64| (word & !GAME_CONTROL_BITS) == (generation & !GAME_CONTROL_BITS);
         let current = self.game_gate.load(Ordering::Acquire);
-        if same_generation(current & !GAME_PHASE_MASK) && current & GAME_PHASE_MASK == GAME_IDLE { return Ok(true); }
-        if same_generation(current & !GAME_PHASE_MASK) && current & GAME_PHASE_MASK == GAME_COMMITTING { return Ok(false); }
-        if !same_generation(current & !GAME_PHASE_MASK) || current & GAME_PHASE_MASK != GAME_ACTIVE {
-            return Err(ArenaError::Invalid("Collection game release generation or state mismatch".into()));
+        if same_generation(current & !GAME_PHASE_MASK) && current & GAME_PHASE_MASK == GAME_IDLE {
+            return Ok(true);
+        }
+        if same_generation(current & !GAME_PHASE_MASK)
+            && current & GAME_PHASE_MASK == GAME_COMMITTING
+        {
+            return Ok(false);
+        }
+        if !same_generation(current & !GAME_PHASE_MASK) || current & GAME_PHASE_MASK != GAME_ACTIVE
+        {
+            return Err(ArenaError::Invalid(
+                "Collection game release generation or state mismatch".into(),
+            ));
         }
         let idle = (current & !GAME_PHASE_MASK) | GAME_IDLE;
-        match self.game_gate.compare_exchange(current, idle, Ordering::AcqRel, Ordering::Acquire) {
+        match self
+            .game_gate
+            .compare_exchange(current, idle, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => Ok(true),
             // The original stop may have set the sticky bit while release was
             // attempted. Retry on the caller's normal bounded polling path.
-            Err(actual) if same_generation(actual & !GAME_PHASE_MASK)
-                && matches!(actual & GAME_PHASE_MASK, GAME_ACTIVE | GAME_COMMITTING) => Ok(false),
-            Err(actual) if same_generation(actual & !GAME_PHASE_MASK)
-                && actual & GAME_PHASE_MASK == GAME_IDLE => Ok(true),
-            Err(_) => Err(ArenaError::Invalid("Collection game release raced or state unknown".into())),
+            Err(actual)
+                if same_generation(actual & !GAME_PHASE_MASK)
+                    && matches!(actual & GAME_PHASE_MASK, GAME_ACTIVE | GAME_COMMITTING) =>
+            {
+                Ok(false)
+            }
+            Err(actual)
+                if same_generation(actual & !GAME_PHASE_MASK)
+                    && actual & GAME_PHASE_MASK == GAME_IDLE =>
+            {
+                Ok(true)
+            }
+            Err(_) => Err(ArenaError::Invalid(
+                "Collection game release raced or state unknown".into(),
+            )),
         }
     }
     /// The single-root bridge can no longer install another observer only
     /// after its admission has irrevocably closed. A reserved installation
     /// remains unknown and must never be represented as a no-capture root.
-    pub(crate) fn closed_before_next_admission(&self, next: &RoventCollectionRootAdmissionV2) -> bool {
+    pub(crate) fn closed_before_next_admission(
+        &self,
+        next: &RoventCollectionRootAdmissionV2,
+    ) -> bool {
         if !self.revoked.load(Ordering::Acquire) {
             return false;
         }
-        if !matches!(self.admission_phase.load(Ordering::Acquire), ADMISSION_INSTALLED | ADMISSION_COMMITTING)
-            || !self.installed_published.load(Ordering::Acquire) {
+        if !matches!(
+            self.admission_phase.load(Ordering::Acquire),
+            ADMISSION_INSTALLED | ADMISSION_COMMITTING
+        ) || !self.installed_published.load(Ordering::Acquire)
+        {
             return false;
         }
-        let Some(previous) = self.installed_admission.get() else { return false; };
+        let Some(previous) = self.installed_admission.get() else {
+            return false;
+        };
         let old = previous.root_admission().authority();
         let new = next.root_admission().authority();
         !previous.same_original_admission(next)
-            && previous.native_origin().same_original_origin(next.native_origin())
+            && previous
+                .native_origin()
+                .same_original_origin(next.native_origin())
             && old.epoch == new.epoch
             && old.implementation == new.implementation
             && (new.game > old.game || (new.game == old.game && new.root > old.root))
@@ -331,36 +472,69 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         &self,
         admission: &RoventCollectionRootAdmissionV2,
     ) -> Result<Option<RoventCollectionCommitGateV2<'_, H>>, ArenaError> {
-        if !self.revoked.load(Ordering::Acquire) || !self.installed_published.load(Ordering::Acquire)
-            || !self.installed_admission.get().is_some_and(|original| original.same_original_admission(admission)) {
-            return Err(ArenaError::Invalid("commit does not match the original closed collection root".into()));
+        if !self.revoked.load(Ordering::Acquire)
+            || !self.installed_published.load(Ordering::Acquire)
+            || !self
+                .installed_admission
+                .get()
+                .is_some_and(|original| original.same_original_admission(admission))
+        {
+            return Err(ArenaError::Invalid(
+                "commit does not match the original closed collection root".into(),
+            ));
         }
         let previous = self.game_gate.load(Ordering::Acquire);
         if self.speculative_enabled.load(Ordering::Acquire) && previous & GAME_HAS_ABORT != 0 {
-            return Err(ArenaError::Invalid("original speculative Collection authority was canceled".into()));
+            return Err(ArenaError::Invalid(
+                "original speculative Collection authority was canceled".into(),
+            ));
         }
         let phase = previous & GAME_PHASE_MASK;
         let generation = self.game_generation.load(Ordering::Acquire);
-        if !matches!(phase, GAME_IDLE | GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING) {
-            return Err(ArenaError::Invalid("Collection game owner state unknown".into()));
+        if !matches!(
+            phase,
+            GAME_IDLE | GAME_INSTALLING | GAME_ACTIVE | GAME_COMMITTING
+        ) {
+            return Err(ArenaError::Invalid(
+                "Collection game owner state unknown".into(),
+            ));
         }
-        if phase != GAME_IDLE && !(phase == GAME_ACTIVE
-            && (previous & !(GAME_PHASE_MASK | GAME_CONTROL_BITS)) == (generation & !GAME_CONTROL_BITS)) {
+        if phase != GAME_IDLE
+            && !(phase == GAME_ACTIVE
+                && (previous & !(GAME_PHASE_MASK | GAME_CONTROL_BITS))
+                    == (generation & !GAME_CONTROL_BITS))
+        {
             return Ok(None);
         }
         let commit = (previous & !GAME_PHASE_MASK) | GAME_COMMITTING;
-        if self.game_gate.compare_exchange(previous, commit, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if self
+            .game_gate
+            .compare_exchange(previous, commit, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(None);
         }
-        match self.admission_phase.compare_exchange(ADMISSION_INSTALLED, ADMISSION_COMMITTING, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => Ok(Some(RoventCollectionCommitGateV2 { core: self, admission: admission.clone(), game_commit: commit, game_restore: previous })),
+        match self.admission_phase.compare_exchange(
+            ADMISSION_INSTALLED,
+            ADMISSION_COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(Some(RoventCollectionCommitGateV2 {
+                core: self,
+                admission: admission.clone(),
+                game_commit: commit,
+                game_restore: previous,
+            })),
             Err(ADMISSION_COMMITTING) => {
                 release_game_commit(&self.game_gate, commit, previous);
                 Ok(None)
             }
             Err(_) => {
                 release_game_commit(&self.game_gate, commit, previous);
-                Err(ArenaError::Invalid("original collection admission is not commit-ready".into()))
+                Err(ArenaError::Invalid(
+                    "original collection admission is not commit-ready".into(),
+                ))
             }
         }
     }
@@ -377,7 +551,8 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         receipt: &rz_uci::pals_adaptive::AdaptiveShutdownReceipt,
     ) -> Result<bool, ArenaError> {
-        self.owner.try_finish_whole_root_no_capture(capability, receipt)
+        self.owner
+            .try_finish_whole_root_no_capture(capability, receipt)
     }
 
     pub(crate) fn try_finish_no_capture_role_only(
@@ -385,7 +560,8 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2,
         receipt: &rz_uci::pals_adaptive::RoleOnlyShutdownReceipt,
     ) -> Result<bool, ArenaError> {
-        self.owner.try_finish_whole_root_no_capture_role_only(capability, receipt)
+        self.owner
+            .try_finish_whole_root_no_capture_role_only(capability, receipt)
     }
 
     pub(crate) fn new(
@@ -503,13 +679,17 @@ pub(crate) type HandoffMatches<H> =
 pub(crate) type HandoffSubmit<H> =
     fn(&mut H, RoventTeacherScopeAggregateAckV2) -> Result<(), RoventTeacherScopeAggregateAckV2>;
 /// Custody recovery only. It grants no completion or publication evidence.
-pub(crate) type HandoffRecovery<H> = fn(
-    &RoventCollectionRootAdmissionV2,
-) -> Result<Option<Arc<Mutex<H>>>, &'static str>;
+pub(crate) type HandoffRecovery<H> =
+    fn(&RoventCollectionRootAdmissionV2) -> Result<Option<Arc<Mutex<H>>>, &'static str>;
 pub(crate) type HandoffIdentity<H> = fn(&mut H, &RoventCollectionRootAdmissionV2) -> bool;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoreGameGateStatus { NotApplicable, Busy, OwnerBlocked, Unknown }
+pub(crate) enum CoreGameGateStatus {
+    NotApplicable,
+    Busy,
+    OwnerBlocked,
+    Unknown,
+}
 
 pub(crate) struct CoreAdmissionFailure {
     pub(crate) error: AdaptiveManagerError,
@@ -554,26 +734,36 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             game_gate_status: CoreGameGateStatus::NotApplicable,
         };
         let reject_started = |error, admission| CoreAdmissionFailure {
-            error, admission, owners: Box::new(()), before_start: false,
+            error,
+            admission,
+            owners: Box::new(()),
+            before_start: false,
             game_gate_status: CoreGameGateStatus::NotApplicable,
         };
         {
             let mut attempt = match self.original_attempt.try_lock() {
                 Ok(attempt) => attempt,
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    let mut failure = reject_started(AdaptiveManagerError::AuxiliaryPending, admission);
+                    let mut failure =
+                        reject_started(AdaptiveManagerError::AuxiliaryPending, admission);
                     failure.game_gate_status = CoreGameGateStatus::Busy;
                     return Err(failure);
                 }
                 Err(std::sync::TryLockError::Poisoned(_)) => {
-                    let mut failure = reject_started(AdaptiveManagerError::Invalid("Collection original attempt poisoned"), admission);
+                    let mut failure = reject_started(
+                        AdaptiveManagerError::Invalid("Collection original attempt poisoned"),
+                        admission,
+                    );
                     failure.game_gate_status = CoreGameGateStatus::Unknown;
                     return Err(failure);
                 }
             };
             if let Some(original) = attempt.as_ref() {
                 if !original.same_original_admission(&admission) {
-                    return Err(reject_started(AdaptiveManagerError::Invalid("Collection original attempt mismatch"), admission));
+                    return Err(reject_started(
+                        AdaptiveManagerError::Invalid("Collection original attempt mismatch"),
+                        admission,
+                    ));
                 }
             } else {
                 *attempt = Some(admission.clone());
@@ -594,13 +784,19 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         {
             // The phase/owner may belong to an earlier or concurrent attempt;
             // this guard alone does not prove this root never installed.
-            return Err(reject_started(AdaptiveManagerError::AdmissionClosed, admission));
+            return Err(reject_started(
+                AdaptiveManagerError::AdmissionClosed,
+                admission,
+            ));
         }
         let mut game_install = match try_game_install(&self.game_gate) {
             Ok(GameInstallAttempt::Ready(guard)) => guard,
             Ok(GameInstallAttempt::Busy) => {
                 let _ = self.admission_phase.compare_exchange(
-                    ADMISSION_RESERVED, ADMISSION_OPEN, Ordering::AcqRel, Ordering::Acquire,
+                    ADMISSION_RESERVED,
+                    ADMISSION_OPEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 );
                 let mut failure = reject(AdaptiveManagerError::AuxiliaryPending, admission);
                 failure.game_gate_status = CoreGameGateStatus::Busy;
@@ -608,7 +804,10 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             }
             Ok(GameInstallAttempt::Unknown) => {
                 self.close_reserved_before_install();
-                let mut failure = reject(AdaptiveManagerError::Invalid("Collection game owner state unknown"), admission);
+                let mut failure = reject(
+                    AdaptiveManagerError::Invalid("Collection game owner state unknown"),
+                    admission,
+                );
                 failure.game_gate_status = CoreGameGateStatus::Unknown;
                 return Err(failure);
             }
@@ -618,10 +817,13 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             }
         };
         match self.owner.try_install_readiness(&admission) {
-            Ok(Some(super::observer_lock_v2::OwnerInstallReadinessV2::Ready)) => {},
+            Ok(Some(super::observer_lock_v2::OwnerInstallReadinessV2::Ready)) => {}
             Ok(None) => {
                 let _ = self.admission_phase.compare_exchange(
-                    ADMISSION_RESERVED, ADMISSION_OPEN, Ordering::AcqRel, Ordering::Acquire,
+                    ADMISSION_RESERVED,
+                    ADMISSION_OPEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 );
                 let mut failure = reject(AdaptiveManagerError::AuxiliaryPending, admission);
                 failure.game_gate_status = CoreGameGateStatus::Busy;
@@ -629,7 +831,10 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             }
             Ok(Some(super::observer_lock_v2::OwnerInstallReadinessV2::Blocked(original))) => {
                 let _ = self.admission_phase.compare_exchange(
-                    ADMISSION_RESERVED, ADMISSION_OPEN, Ordering::AcqRel, Ordering::Acquire,
+                    ADMISSION_RESERVED,
+                    ADMISSION_OPEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 );
                 let mut failure = reject(AdaptiveManagerError::Collection(original), admission);
                 failure.game_gate_status = CoreGameGateStatus::OwnerBlocked;
@@ -637,8 +842,14 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             }
             Err(error) => {
                 self.close_reserved_before_install();
-                let mut failure = reject(AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
-                    AdaptiveCollectionStage::Dispatch, "CollectionOwnerUnavailable", error.to_string())), admission);
+                let mut failure = reject(
+                    AdaptiveManagerError::Collection(AdaptiveCollectionError::new(
+                        AdaptiveCollectionStage::Dispatch,
+                        "CollectionOwnerUnavailable",
+                        error.to_string(),
+                    )),
+                    admission,
+                );
                 failure.game_gate_status = CoreGameGateStatus::Unknown;
                 return Err(failure);
             }
@@ -647,18 +858,28 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         // consumer cannot use the root until the release-store of INSTALLED.
         // Route registration is optional and bounded. An unavailable route
         // affects only its own collection observation, never native search.
-        let (speculative, speculative_install_issue) = if self.speculative_enabled.load(Ordering::Acquire) {
-            match self.owner.try_status() {
-                Ok(Some(status)) => match self.owner.capture_registration().try_install_speculative_root(
-                    &admission, SPECULATIVE_QUERY_QUEUE_CAPACITY, status.game_record_limit.min(65_536), Arc::clone(&self.revoked)) {
-                    Ok(Some(route)) => (Some(route), None),
-                    Ok(None) => (None, Some("speculative root installation busy".into())),
+        let (speculative, speculative_install_issue) =
+            if self.speculative_enabled.load(Ordering::Acquire) {
+                match self.owner.try_status() {
+                    Ok(Some(status)) => match self
+                        .owner
+                        .capture_registration()
+                        .try_install_speculative_root(
+                            &admission,
+                            SPECULATIVE_QUERY_QUEUE_CAPACITY,
+                            status.game_record_limit.min(65_536),
+                            Arc::clone(&self.revoked),
+                        ) {
+                        Ok(Some(route)) => (Some(route), None),
+                        Ok(None) => (None, Some("speculative root installation busy".into())),
+                        Err(error) => (None, Some(error.to_string())),
+                    },
+                    Ok(None) => (None, Some("speculative owner status busy".into())),
                     Err(error) => (None, Some(error.to_string())),
-                },
-                Ok(None) => (None, Some("speculative owner status busy".into())),
-                Err(error) => (None, Some(error.to_string())),
-            }
-        } else { (None, None) };
+                }
+            } else {
+                (None, None)
+            };
         let slot = Arc::new(AdmissionSlot {
             admission: admission.clone(),
             state: AtomicU8::new(RESERVING),
@@ -671,11 +892,19 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             // delivered: only this no-start branch may attempt rollback.
             if let Ok(speculative) = slot.speculative.try_lock() {
                 if let Some((route, _)) = speculative.as_ref() {
-                    let rollback = self.owner.capture_registration().try_rollback_unstarted_speculative_root(route);
+                    let rollback = self
+                        .owner
+                        .capture_registration()
+                        .try_rollback_unstarted_speculative_root(route);
                     if !matches!(rollback, Ok(Some(true))) {
                         if let Ok(mut issue) = slot.speculative_install_issue.try_lock() {
-                            *issue = Some(format!("speculative pre-start rollback unresolved: {rollback:?}"));
-                        } else { slot.speculative_issue_unknown.store(true, Ordering::Release); }
+                            *issue = Some(format!(
+                                "speculative pre-start rollback unresolved: {rollback:?}"
+                            ));
+                        } else {
+                            slot.speculative_issue_unknown
+                                .store(true, Ordering::Release);
+                        }
                     }
                 }
             }
@@ -690,9 +919,13 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         let abort_binding_issue = match slot.speculative.try_lock() {
             Ok(speculative) => match speculative.as_ref() {
                 Some((route, _)) => {
-                    match admission.root_admission().original_context().bind_original_collection_abort(
-                        Arc::clone(&self.game_gate), route.target_revoke_flag(),
-                    ) {
+                    match admission
+                        .root_admission()
+                        .original_context()
+                        .bind_original_collection_abort(
+                            Arc::clone(&self.game_gate),
+                            route.target_revoke_flag(),
+                        ) {
                         Ok(()) => None,
                         Err(error) => {
                             route.revoke_all_targets();
@@ -711,7 +944,9 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         if let Some(issue) = abort_binding_issue {
             match slot.speculative_install_issue.try_lock() {
                 Ok(mut stored) if stored.is_none() => *stored = Some(issue),
-                _ => slot.speculative_issue_unknown.store(true, Ordering::Release),
+                _ => slot
+                    .speculative_issue_unknown
+                    .store(true, Ordering::Release),
             }
         }
         // Bind the exact route before observer installation; a failed optional
@@ -731,7 +966,9 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
         if let Some(issue) = bind_issue {
             match slot.speculative_install_issue.try_lock() {
                 Ok(mut stored) => *stored = Some(issue),
-                Err(_) => slot.speculative_issue_unknown.store(true, Ordering::Release),
+                Err(_) => slot
+                    .speculative_issue_unknown
+                    .store(true, Ordering::Release),
             }
         }
         // If installation panics, UCI retains its manager/panic evidence and
@@ -742,10 +979,19 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             // roll back its empty registration. Unknown leaves it retained.
             let rollback_issue = match slot.speculative.try_lock() {
                 Ok(speculative) => match speculative.as_ref() {
-                    Some((route, _)) => match self.owner.try_unbind_unstarted_speculative_root(&admission, route) {
-                        Ok(Some(_)) => match self.owner.capture_registration().try_rollback_unstarted_speculative_root(route) {
+                    Some((route, _)) => match self
+                        .owner
+                        .try_unbind_unstarted_speculative_root(&admission, route)
+                    {
+                        Ok(Some(_)) => match self
+                            .owner
+                            .capture_registration()
+                            .try_rollback_unstarted_speculative_root(route)
+                        {
                             Ok(Some(true)) => None,
-                            other => Some(format!("speculative route rollback unresolved: {other:?}")),
+                            other => {
+                                Some(format!("speculative route rollback unresolved: {other:?}"))
+                            }
                         },
                         other => Some(format!("speculative owner unbind unresolved: {other:?}")),
                     },
@@ -756,7 +1002,9 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
             if let Some(issue) = rollback_issue {
                 match slot.speculative_install_issue.try_lock() {
                     Ok(mut stored) => *stored = Some(issue),
-                    Err(_) => slot.speculative_issue_unknown.store(true, Ordering::Release),
+                    Err(_) => slot
+                        .speculative_issue_unknown
+                        .store(true, Ordering::Release),
                 }
             }
             return Err(reject(AdaptiveManagerError::Deadline, admission));
@@ -791,10 +1039,20 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
                         slot.admission.clone(),
                     ));
                 }
-                if self.installed_admission.set(slot.admission.clone()).is_err() {
-                    return Err(reject_started(AdaptiveManagerError::Invalid("Collection V2 original admission already installed"), slot.admission.clone()));
+                if self
+                    .installed_admission
+                    .set(slot.admission.clone())
+                    .is_err()
+                {
+                    return Err(reject_started(
+                        AdaptiveManagerError::Invalid(
+                            "Collection V2 original admission already installed",
+                        ),
+                        slot.admission.clone(),
+                    ));
                 }
-                self.game_generation.store(game_install.generation, Ordering::Release);
+                self.game_generation
+                    .store(game_install.generation, Ordering::Release);
                 if let Err(error) = game_install.mark_installed() {
                     return Err(reject_started(error, slot.admission.clone()));
                 }
@@ -821,8 +1079,10 @@ impl<H: Send + 'static> CollectionBridgeCoreV2<H> {
     }
     /// Opt-in before root admission; default path remains unchanged.
     pub(crate) fn enable_speculative(&self) -> Result<(), ArenaError> {
-        check(self.admission_phase.load(Ordering::Acquire) == ADMISSION_OPEN,
-            "speculative capture must be enabled before admission")?;
+        check(
+            self.admission_phase.load(Ordering::Acquire) == ADMISSION_OPEN,
+            "speculative capture must be enabled before admission",
+        )?;
         self.speculative_enabled.store(true, Ordering::Release);
         Ok(())
     }
@@ -880,13 +1140,19 @@ impl WorkerFailure {
     /// it was truncated. This projection does not consume the original error.
     pub(crate) fn diagnostic_projection(&self) -> (String, usize, bool) {
         let detail = match self {
-            Self::Preparation(error) | Self::Retirement(error) | Self::RowPump(error) => format!("{error:?}"),
+            Self::Preparation(error) | Self::Retirement(error) | Self::RowPump(error) => {
+                format!("{error:?}")
+            }
             Self::ActorStart(TeacherSessionStartErrorV2::Admission(error)) => format!("{error:?}"),
             Self::ActorStart(TeacherSessionStartErrorV2::Binding(error)) => format!("{error:?}"),
             Self::ActorStart(TeacherSessionStartErrorV2::BeforeSpawn(cause))
-            | Self::ActorStart(TeacherSessionStartErrorV2::AfterSpawn { cause, .. }) => format!("{cause:?}"),
+            | Self::ActorStart(TeacherSessionStartErrorV2::AfterSpawn { cause, .. }) => {
+                format!("{cause:?}")
+            }
             Self::Shutdown(error) => format!("{error:?}"),
-            Self::TeacherWorkerJoin { actor_id, error } => format!("actor={actor_id} error={error:?}"),
+            Self::TeacherWorkerJoin { actor_id, error } => {
+                format!("actor={actor_id} error={error:?}")
+            }
             Self::TeacherRegistryPoisoned { actor_id } => format!("actor={actor_id}"),
             Self::HandoffRecovery(detail) | Self::AggregateRejected(detail) => (*detail).to_owned(),
             _ => String::new(),
@@ -1028,11 +1294,19 @@ pub(crate) enum HandoffObservationErrorV2 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PumpSendOutcomeV2 { Empty, Sent, Full }
+pub(crate) enum PumpSendOutcomeV2 {
+    Empty,
+    Sent,
+    Full,
+}
 
 impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     /// Install before the worker starts; P-C keeps its existing channel path.
-    pub(crate) fn configure_handoff_recovery(&mut self, recovery: HandoffRecovery<H>, identity: HandoffIdentity<H>) {
+    pub(crate) fn configure_handoff_recovery(
+        &mut self,
+        recovery: HandoffRecovery<H>,
+        identity: HandoffIdentity<H>,
+    ) {
         self.handoff_recovery = Some(recovery);
         self.handoff_identity = Some(identity);
     }
@@ -1043,8 +1317,14 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         constraint: ExternalGoConstraint,
         soft_quantum: Duration,
     ) -> Result<(), ArenaError> {
-        check(self.slot.is_none() && self.pump_config.is_none(), "row pump already configured or started")?;
-        check(soft_quantum >= rz_search::external_cpu::EXTERNAL_MIN_QUANTUM, "teacher quantum below minimum")?;
+        check(
+            self.slot.is_none() && self.pump_config.is_none(),
+            "row pump already configured or started",
+        )?;
+        check(
+            soft_quantum >= rz_search::external_cpu::EXTERNAL_MIN_QUANTUM,
+            "teacher quantum below minimum",
+        )?;
         self.pump_config = Some((constraint, soft_quantum));
         Ok(())
     }
@@ -1052,24 +1332,35 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     /// Unpublished and rejected rows remain in this original worker custody.
     pub(crate) fn has_unpublished_pump_rows(&self) -> bool {
         self.pump.as_ref().is_some_and(|pump| pump.len() != 0)
-            || !self.pump_ready.is_empty() || self.pump_rejected.is_some()
-            || self.pump_waiting_row.is_some() || self.speculative_rejected.is_some()
-            || !self.speculative_late.is_empty() || !self.speculative_capture_complete()
+            || !self.pump_ready.is_empty()
+            || self.pump_rejected.is_some()
+            || self.pump_waiting_row.is_some()
+            || self.speculative_rejected.is_some()
+            || !self.speculative_late.is_empty()
+            || !self.speculative_capture_complete()
     }
 
     /// This is only a capture handoff observation. Sent is not teacher
     /// completion, native consumption, physical completion or publication.
     pub(crate) fn speculative_capture_complete(&self) -> bool {
         use super::native_capture::SpeculativeHandoffV2;
-        if self.speculative_install_issue.is_some() { return false; }
-        let Some(route) = self.speculative_route.as_ref() else { return true; };
-        if route.unattributed_count() != 0 { return false; }
-        let Ok(Some(observations)) = route.try_observations() else { return false; };
+        if self.speculative_install_issue.is_some() {
+            return false;
+        }
+        let Some(route) = self.speculative_route.as_ref() else {
+            return true;
+        };
+        if route.unattributed_count() != 0 {
+            return false;
+        }
+        let Ok(Some(observations)) = route.try_observations() else {
+            return false;
+        };
         let mut sent = 0usize;
         for (_, state, _) in observations {
             match state {
                 SpeculativeHandoffV2::Sent => sent += 1,
-                SpeculativeHandoffV2::NotRequired | SpeculativeHandoffV2::Canceled => {},
+                SpeculativeHandoffV2::NotRequired | SpeculativeHandoffV2::Canceled => {}
                 _ => return false,
             }
         }
@@ -1081,62 +1372,107 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     /// other late capsule is retained and cleanup deferred. The route Arc and
     /// its ledger remain owned by this worker after unlink.
     pub(super) fn try_unlink_finished_speculative_route(
-        &mut self, proof: &super::pc_hooks_lock_v2::PcSpeculativeRouteFenceV2,
+        &mut self,
+        proof: &super::pc_hooks_lock_v2::PcSpeculativeRouteFenceV2,
     ) -> bool {
-        if self.speculative_route_unlinked { return true; }
-        let Some(route) = self.speculative_route.as_ref() else { return true; };
-        let Some(slot) = self.slot.as_ref() else { return false; };
-        if !proof.matches(&slot.admission) || !route.matches_admission(&slot.admission) { return false; }
+        if self.speculative_route_unlinked {
+            return true;
+        }
+        let Some(route) = self.speculative_route.as_ref() else {
+            return true;
+        };
+        let Some(slot) = self.slot.as_ref() else {
+            return false;
+        };
+        if !proof.matches(&slot.admission) || !route.matches_admission(&slot.admission) {
+            return false;
+        }
         // The source channel itself is bounded to 16. Preserve any late
         // capsules in the original worker and advance at most one per call.
         // A seventeenth unexpected item uses the existing overflow custody.
-        if self.speculative_late.len() >= SPECULATIVE_QUERY_QUEUE_CAPACITY && self.speculative_rejected.is_some() { return false; }
-        if self.speculative_late.len() < SPECULATIVE_QUERY_QUEUE_CAPACITY && self.speculative_late.try_reserve(1).is_err() {
-            self.speculative_unlink_issue = Some("late speculative custody allocation failed".into());
+        if self.speculative_late.len() >= SPECULATIVE_QUERY_QUEUE_CAPACITY
+            && self.speculative_rejected.is_some()
+        {
             return false;
         }
-        let Some(receiver) = self.speculative_receiver.as_ref() else { return false; };
+        if self.speculative_late.len() < SPECULATIVE_QUERY_QUEUE_CAPACITY
+            && self.speculative_late.try_reserve(1).is_err()
+        {
+            self.speculative_unlink_issue =
+                Some("late speculative custody allocation failed".into());
+            return false;
+        }
+        let Some(receiver) = self.speculative_receiver.as_ref() else {
+            return false;
+        };
         match receiver.try_recv() {
             Ok(capsule) => {
                 self.speculative_received = self.speculative_received.saturating_add(1);
-                if self.pump.as_ref().is_some_and(|pump| pump.is_exact_retired_duplicate(&capsule)) {
-                    self.speculative_late_duplicates = self.speculative_late_duplicates.saturating_add(1);
+                if self
+                    .pump
+                    .as_ref()
+                    .is_some_and(|pump| pump.is_exact_retired_duplicate(&capsule))
+                {
+                    self.speculative_late_duplicates =
+                        self.speculative_late_duplicates.saturating_add(1);
                     return false;
                 }
                 if self.speculative_late.len() < SPECULATIVE_QUERY_QUEUE_CAPACITY {
                     self.speculative_late.push_back(capsule);
                 } else {
-                    self.speculative_rejected = Some(Box::new((invalid("speculative late channel exceeds original capacity"), capsule)));
+                    self.speculative_rejected = Some(Box::new((
+                        invalid("speculative late channel exceeds original capacity"),
+                        capsule,
+                    )));
                 }
                 return false;
             }
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {},
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
         }
-        match self.owner.capture_registration().try_unlink_finished_speculative_root(
-            route, proof, self.speculative_received) {
-            Ok(Some(true)) => { self.speculative_route_unlinked = true; true },
+        match self
+            .owner
+            .capture_registration()
+            .try_unlink_finished_speculative_root(route, proof, self.speculative_received)
+        {
+            Ok(Some(true)) => {
+                self.speculative_route_unlinked = true;
+                true
+            }
             Ok(Some(false) | None) => false,
-            Err(error) => { self.speculative_unlink_issue = Some(error.to_string()); false },
+            Err(error) => {
+                self.speculative_unlink_issue = Some(error.to_string());
+                false
+            }
         }
     }
 
     /// Read-only outcome; unlink success is independent of collection or
     /// native physical completion and does not represent publication.
     pub(crate) fn speculative_route_unlink_observation(&self) -> (bool, Option<&str>) {
-        (self.speculative_route_unlinked, self.speculative_unlink_issue.as_deref())
+        (
+            self.speculative_route_unlinked,
+            self.speculative_unlink_issue.as_deref(),
+        )
     }
     pub(crate) fn speculative_late_observation(&self) -> (usize, usize) {
-        (self.speculative_late.len(), self.speculative_late_duplicates)
+        (
+            self.speculative_late.len(),
+            self.speculative_late_duplicates,
+        )
     }
 
     pub(crate) fn pending_pump_rows(&self) -> usize {
         self.pump.as_ref().map_or(0, RetiredRowPumpV2::len)
-            + self.pump_ready.len() + usize::from(self.pump_rejected.is_some())
-            + usize::from(self.pump_waiting_row.is_some()) + usize::from(self.speculative_rejected.is_some())
+            + self.pump_ready.len()
+            + usize::from(self.pump_rejected.is_some())
+            + usize::from(self.pump_waiting_row.is_some())
+            + usize::from(self.speculative_rejected.is_some())
             + self.speculative_late.len()
     }
 
-    pub(crate) fn pump_stage_counts(&self) -> Option<super::teacher::lock_v2_row_pump::PumpStageCountsV2> {
+    pub(crate) fn pump_stage_counts(
+        &self,
+    ) -> Option<super::teacher::lock_v2_row_pump::PumpStageCountsV2> {
         self.pump.as_ref().map(RetiredRowPumpV2::stage_counts)
     }
 
@@ -1146,8 +1482,14 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
 
     /// Install the original bounded consumer before the worker starts.
     /// The receiver must retain every item until publication or recovery.
-    pub(crate) fn configure_pump_sender(&mut self, sender: mpsc::SyncSender<PumpItemV2>) -> Result<(), ArenaError> {
-        check(self.slot.is_none() && self.pump_sender.is_none(), "pump sender must be registered before root admission")?;
+    pub(crate) fn configure_pump_sender(
+        &mut self,
+        sender: mpsc::SyncSender<PumpItemV2>,
+    ) -> Result<(), ArenaError> {
+        check(
+            self.slot.is_none() && self.pump_sender.is_none(),
+            "pump sender must be registered before root admission",
+        )?;
         self.pump_sender = Some(sender);
         Ok(())
     }
@@ -1159,17 +1501,30 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         &mut self,
         sender: &mpsc::SyncSender<PumpItemV2>,
     ) -> Result<PumpSendOutcomeV2, ArenaError> {
-        let Some(item) = self.pump_ready.front() else { return Ok(PumpSendOutcomeV2::Empty); };
+        let Some(item) = self.pump_ready.front() else {
+            return Ok(PumpSendOutcomeV2::Empty);
+        };
         if let PumpItemV2::Failed { evidence, .. } = item {
             self.pump_uncertain_evidence_handed_off |= evidence.has_uncertain_cleanup();
         }
         let row = match item {
-            PumpItemV2::Unlabeled { row } | PumpItemV2::Prepared { row, .. }
-            | PumpItemV2::Committed { row, .. } | PumpItemV2::Failed { row, .. } => row,
+            PumpItemV2::Unlabeled { row }
+            | PumpItemV2::Prepared { row, .. }
+            | PumpItemV2::Committed { row, .. }
+            | PumpItemV2::Failed { row, .. } => row,
         };
-        let admission = self.slot.as_ref().ok_or_else(|| invalid("P/C or Own pump root admission absent"))?;
-        check(row.admission.same_original_admission(&admission.admission), "pump row belongs to a different original root")?;
-        let item = self.pump_ready.pop_front().expect("checked original pump item");
+        let admission = self
+            .slot
+            .as_ref()
+            .ok_or_else(|| invalid("P/C or Own pump root admission absent"))?;
+        check(
+            row.admission.same_original_admission(&admission.admission),
+            "pump row belongs to a different original root",
+        )?;
+        let item = self
+            .pump_ready
+            .pop_front()
+            .expect("checked original pump item");
         match sender.try_send(item) {
             Ok(()) => Ok(PumpSendOutcomeV2::Sent),
             Err(mpsc::TrySendError::Full(item)) => {
@@ -1191,7 +1546,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         for item in &self.pump_ready {
             match item {
                 PumpItemV2::Unlabeled { .. } => unlabeled += 1,
-                PumpItemV2::Prepared { sealed: Some(_), .. } => committed += 1,
+                PumpItemV2::Prepared {
+                    sealed: Some(_), ..
+                } => committed += 1,
                 PumpItemV2::Prepared { sealed: None, .. } => prepared += 1,
                 PumpItemV2::Committed { .. } => committed += 1,
                 PumpItemV2::Failed { .. } => failed += 1,
@@ -1201,14 +1558,19 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     }
 
     fn poll_row_pump(&mut self) {
-        let Some((constraint, quantum)) = self.pump_config else { return; };
-        if self.session.is_none() { return; }
+        let Some((constraint, quantum)) = self.pump_config else {
+            return;
+        };
+        if self.session.is_none() {
+            return;
+        }
         if self.pump_failed || self.pump_rejected.is_some() {
             // A failed pump must not issue or seal any more work, but its
             // original session still owns any already-submitted terminal.
             if !self.pending_drain_failed {
                 if let (Some(pump), Some(session)) = (self.pump.as_mut(), self.session.as_mut()) {
-                    let result = pump.poll_captured(session, false)
+                    let result = pump
+                        .poll_captured(session, false)
                         .and_then(|_| pump.drain_pending_terminal(session).map(|_| ()));
                     if let Err(error) = result {
                         self.pending_drain_failed = true;
@@ -1218,15 +1580,23 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             }
             return;
         }
-        if self.failure.is_some() && self.pump.is_none() { return; }
+        if self.failure.is_some() && self.pump.is_none() {
+            return;
+        }
         if self.pump.is_none() {
             let session = self.session.as_mut().expect("original teacher session");
             match RetiredRowPumpV2::new(session, 16, constraint, quantum) {
                 Ok(pump) => self.pump = Some(pump),
-                Err(error) => { self.pump_failed = true; self.record_failure(WorkerFailure::RowPump(error)); return; }
+                Err(error) => {
+                    self.pump_failed = true;
+                    self.record_failure(WorkerFailure::RowPump(error));
+                    return;
+                }
             }
         }
-        if self.pump_rejected.is_some() { return; }
+        if self.pump_rejected.is_some() {
+            return;
+        }
         let pump = self.pump.as_mut().expect("original session pump");
         // Read only this root's dedicated capture route, before retired rows.
         // Full leaves the remaining capsules in the original bounded channel.
@@ -1238,25 +1608,41 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                         if let Err(original) = pump.enqueue_captured(capsule) {
                             self.speculative_rejected = Some(original);
                         }
-                    },
-                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {},
+                    }
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
                 }
             }
         }
         // The output and input together remain bounded. Never remove a row
         // from its original outbox if this worker cannot retain it.
         if self.pump_ready.len() < 16 {
-            if let Some(item) = pump.take_ready() { self.pump_ready.push_back(item); }
+            if let Some(item) = pump.take_ready() {
+                self.pump_ready.push_back(item);
+            }
         }
-        if !self.revoked.load(Ordering::Acquire) && !self.shutdown_requested && self.failure.is_none() {
-            if self.pump_waiting_row.is_none() && (self.pump_ready.len() + pump.retired_len() < 16 || self.speculative_route.is_some()) {
+        if !self.revoked.load(Ordering::Acquire)
+            && !self.shutdown_requested
+            && self.failure.is_none()
+        {
+            if self.pump_waiting_row.is_none()
+                && (self.pump_ready.len() + pump.retired_len() < 16
+                    || self.speculative_route.is_some())
+            {
                 match self.owner.take_retired() {
                     Ok(Some(row)) => self.pump_waiting_row = Some(row),
-                    Ok(None) => {},
-                    Err(error) => { self.pump_failed = true; self.record_failure(WorkerFailure::RowPump(error)); return; }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.pump_failed = true;
+                        self.record_failure(WorkerFailure::RowPump(error));
+                        return;
+                    }
                 }
             }
-            if self.pump_waiting_row.as_ref().is_some_and(|row| pump.can_enqueue_row(row)) {
+            if self
+                .pump_waiting_row
+                .as_ref()
+                .is_some_and(|row| pump.can_enqueue_row(row))
+            {
                 let row = self.pump_waiting_row.take().expect("waiting row checked");
                 if let Err(original) = pump.enqueue(row) {
                     self.pump_rejected = Some(original);
@@ -1266,11 +1652,15 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 }
             }
         }
-        let session = self.session.as_mut().expect("same original teacher session");
+        let session = self
+            .session
+            .as_mut()
+            .expect("same original teacher session");
         // This prevents submission after this worker observes closure; it
         // does not linearize a simultaneous revoke against mailbox admission.
         let allow_submission = !self.revoked.load(Ordering::Acquire)
-            && !self.shutdown_requested && self.failure.is_none();
+            && !self.shutdown_requested
+            && self.failure.is_none();
         if let Err(error) = pump.poll_captured(session, allow_submission) {
             self.pump_failed = true;
             self.record_failure(WorkerFailure::RowPump(error));
@@ -1278,8 +1668,11 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         }
         // A terminal already received may be sealed within this same tick;
         // the actual session still checks the live root and original deadline.
-        if pump.has_captured_completed() && !self.revoked.load(Ordering::Acquire)
-            && !self.shutdown_requested && self.failure.is_none() {
+        if pump.has_captured_completed()
+            && !self.revoked.load(Ordering::Acquire)
+            && !self.shutdown_requested
+            && self.failure.is_none()
+        {
             if let Err(error) = pump.poll_captured(session, true) {
                 self.pump_failed = true;
                 self.record_failure(WorkerFailure::RowPump(error));
@@ -1296,9 +1689,12 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         // the worker's shutdown step in the same tick. The original session
         // rechecks authority and deadline; no new job is admitted here. A
         // busy seal remains retained for a later tick and is not spun on.
-        if pending_before && pump.front_completed()
+        if pending_before
+            && pump.front_completed()
             && !self.revoked.load(Ordering::Acquire)
-            && !self.shutdown_requested && self.failure.is_none() {
+            && !self.shutdown_requested
+            && self.failure.is_none()
+        {
             if let Err(error) = pump.poll(session, false) {
                 self.pump_failed = true;
                 self.record_failure(WorkerFailure::RowPump(error));
@@ -1307,8 +1703,12 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     }
 
     fn poll_pump_sender(&mut self) {
-        if self.pump_sender_failed { return; }
-        let Some(sender) = self.pump_sender.clone() else { return; };
+        if self.pump_sender_failed {
+            return;
+        }
+        let Some(sender) = self.pump_sender.clone() else {
+            return;
+        };
         if let Err(error) = self.try_send_first_pump_item(&sender) {
             // The original item was restored before reporting the failure.
             self.pump_sender_failed = true;
@@ -1321,12 +1721,20 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     /// explicitly unissued failures; no target or completion is fabricated.
     /// Full keeps the same item in this worker's custody.
     fn drain_ready_pump_after_revoke(&mut self) {
-        if self.pump_sender_failed { return; }
-        let Some(sender) = self.pump_sender.clone() else { return; };
+        if self.pump_sender_failed {
+            return;
+        }
+        let Some(sender) = self.pump_sender.clone() else {
+            return;
+        };
         for _ in 0..16 {
             if self.pump_ready.is_empty() {
-                if let Some(pump) = self.pump.as_mut() { pump.retire_unissued_after_revoke(); }
-                let Some(item) = self.pump.as_mut().and_then(RetiredRowPumpV2::take_ready) else { break; };
+                if let Some(pump) = self.pump.as_mut() {
+                    pump.retire_unissued_after_revoke();
+                }
+                let Some(item) = self.pump.as_mut().and_then(RetiredRowPumpV2::take_ready) else {
+                    break;
+                };
                 self.pump_ready.push_back(item);
             }
             match self.try_send_first_pump_item(&sender) {
@@ -1414,7 +1822,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         if slot.speculative_issue_unknown.load(Ordering::Acquire) {
             self.speculative_install_issue = Some("speculative bind issue unavailable".into());
         }
-        if slot.state.load(Ordering::Acquire) == RESERVING { return; }
+        if slot.state.load(Ordering::Acquire) == RESERVING {
+            return;
+        }
         if self.speculative_route.is_none() && self.speculative_receiver.is_none() {
             match slot.speculative.try_lock() {
                 Ok(mut value) => {
@@ -1426,8 +1836,10 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                         match slot.speculative_install_issue.try_lock() {
                             Ok(issue) => self.speculative_install_issue = issue.clone(),
                             Err(std::sync::TryLockError::WouldBlock) => return,
-                            Err(std::sync::TryLockError::Poisoned(_)) =>
-                                self.speculative_install_issue = Some("speculative issue state poisoned".into()),
+                            Err(std::sync::TryLockError::Poisoned(_)) => {
+                                self.speculative_install_issue =
+                                    Some("speculative issue state poisoned".into())
+                            }
                         }
                     }
                 }
@@ -1438,7 +1850,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
             }
         }
         if self.revoked.load(Ordering::Acquire) {
-            if let Some(route) = self.speculative_route.as_ref() { route.cancel_all(); }
+            if let Some(route) = self.speculative_route.as_ref() {
+                route.cancel_all();
+            }
         }
         match slot.state.load(Ordering::Acquire) {
             RESERVING => return,
@@ -1516,7 +1930,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
         // worker owner. Missing startup remains unobserved, not successful.
         if let Some(session) = &self.session {
             for item in &self.roster {
-                if self.teacher_startups.contains_key(&item.actor_id) { continue; }
+                if self.teacher_startups.contains_key(&item.actor_id) {
+                    continue;
+                }
                 if let Some(startup) = session.actor_startup_report(&item.actor_id) {
                     self.teacher_startups.insert(item.actor_id.clone(), startup);
                 }
@@ -1545,7 +1961,9 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                     if self.tokens.contains_key(&item.actor_id) {
                         continue;
                     }
-                    if let Some(original) = session.take_actor_diagnostics_after_join(&item.actor_id) {
+                    if let Some(original) =
+                        session.take_actor_diagnostics_after_join(&item.actor_id)
+                    {
                         self.diagnostics.insert(item.actor_id.clone(), original);
                     }
                     if self.worker_tokens.contains_key(&item.actor_id) {
@@ -1614,9 +2032,14 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     }
 
     fn poll_handoff(&mut self) {
-        if self.handoff.is_none() && self.pending_handoff.is_none() && self.foreign_handoff.is_none() {
+        if self.handoff.is_none()
+            && self.pending_handoff.is_none()
+            && self.foreign_handoff.is_none()
+        {
             match self.handoff_receiver.try_recv() {
-                Ok(handoff) if self.handoff_identity.is_some() => self.pending_handoff = Some(handoff),
+                Ok(handoff) if self.handoff_identity.is_some() => {
+                    self.pending_handoff = Some(handoff)
+                }
                 Ok(handoff) => self.handoff = Some(handoff),
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) if self.handoff_recovery.is_none() => {
@@ -1625,8 +2048,11 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 Err(mpsc::TryRecvError::Disconnected) => self.handoff_disconnected = true,
             }
         }
-        if let (Some(identity), Some(slot), Some(pending)) =
-            (self.handoff_identity, self.slot.as_ref(), self.pending_handoff.as_ref()) {
+        if let (Some(identity), Some(slot), Some(pending)) = (
+            self.handoff_identity,
+            self.slot.as_ref(),
+            self.pending_handoff.as_ref(),
+        ) {
             let matched = match pending.try_lock() {
                 Ok(mut handoff) => Some(Ok(identity(&mut *handoff, &slot.admission))),
                 Err(std::sync::TryLockError::WouldBlock) => None,
@@ -1640,13 +2066,17 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
                 }
                 Some(Err(())) => {
                     self.foreign_handoff = self.pending_handoff.take();
-                    self.record_failure(WorkerFailure::HandoffRecovery("received handoff poisoned"));
+                    self.record_failure(WorkerFailure::HandoffRecovery(
+                        "received handoff poisoned",
+                    ));
                 }
                 None => {}
             }
         }
-        if self.handoff.is_none() && !self.handoff_recovery_failed
-            && (self.foreign_handoff.is_some() || self.handoff_disconnected) {
+        if self.handoff.is_none()
+            && !self.handoff_recovery_failed
+            && (self.foreign_handoff.is_some() || self.handoff_disconnected)
+        {
             if let (Some(recover), Some(slot)) = (self.handoff_recovery, self.slot.as_ref()) {
                 match recover(&slot.admission) {
                     Ok(Some(original)) => self.handoff = Some(original),
@@ -1939,13 +2369,27 @@ impl<H: Send + 'static> CollectionWorkerCoreV2<H> {
     /// Routing cleanup may outlive a known semantic collection failure, but
     /// never treats missing failure detail or panic/poison as physical proof.
     pub(super) fn cleanup_failure_is_known(&self) -> bool {
-        if self.omitted_failures != 0 || self.pump_uncertain_evidence_handed_off
-            || self.pump_rejected.is_some() || self.speculative_rejected.is_some()
-            || self.pump_ready.iter().any(|item| matches!(item,
-                PumpItemV2::Failed { evidence, .. } if evidence.has_uncertain_cleanup()))
-            || self.pump.as_ref().is_some_and(|pump| pump.has_uncertain_failure()) { return false; }
-        let known = |failure: &WorkerFailure| matches!(failure,
-            WorkerFailure::RootClosedBeforeStartup | WorkerFailure::RowPumpInputRejected);
+        if self.omitted_failures != 0
+            || self.pump_uncertain_evidence_handed_off
+            || self.pump_rejected.is_some()
+            || self.speculative_rejected.is_some()
+            || self.pump_ready.iter().any(|item| {
+                matches!(item,
+                PumpItemV2::Failed { evidence, .. } if evidence.has_uncertain_cleanup())
+            })
+            || self
+                .pump
+                .as_ref()
+                .is_some_and(|pump| pump.has_uncertain_failure())
+        {
+            return false;
+        }
+        let known = |failure: &WorkerFailure| {
+            matches!(
+                failure,
+                WorkerFailure::RootClosedBeforeStartup | WorkerFailure::RowPumpInputRejected
+            )
+        };
         match &self.failure {
             Some(failure) => known(failure) && self.additional_failures.iter().all(known),
             None => !self.failed.load(Ordering::Acquire) && self.additional_failures.is_empty(),

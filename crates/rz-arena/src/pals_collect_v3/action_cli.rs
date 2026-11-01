@@ -237,20 +237,27 @@ impl ActionCliFailureV3 {
         until: std::time::Instant,
     ) -> ActionOriginalCleanupObservationV3 {
         let mut observation = ActionOriginalCleanupObservationV3 {
-            action_processes: "not_present", action_receipts: 0,
-            intake_process: "not_present", frozen_helper: "not_present", errors: Vec::new(),
+            action_processes: "not_present",
+            action_receipts: 0,
+            intake_process: "not_present",
+            frozen_helper: "not_present",
+            errors: Vec::new(),
         };
         let Some(owner) = self.owner.as_mut() else {
             observation.action_processes = "unknown";
             observation.intake_process = "unknown";
             observation.frozen_helper = "unknown";
-            observation.errors.push("original action owner absent".into());
+            observation
+                .errors
+                .push("original action owner absent".into());
             return observation;
         };
         if let Some(factory) = owner.factory.as_mut() {
             if std::time::Instant::now() >= until {
                 observation.action_processes = "unknown";
-                observation.errors.push("original cleanup deadline elapsed before action cleanup".into());
+                observation
+                    .errors
+                    .push("original cleanup deadline elapsed before action cleanup".into());
             } else {
                 match factory.attempt_original_cleanup(until) {
                     Ok(None) => observation.action_processes = "not_present",
@@ -264,7 +271,9 @@ impl ActionCliFailureV3 {
                     }
                     Err(error) => {
                         observation.action_processes = "unknown";
-                        observation.errors.push(format!("original action cleanup: {error}"));
+                        observation
+                            .errors
+                            .push(format!("original action cleanup: {error}"));
                     }
                 }
             }
@@ -272,17 +281,25 @@ impl ActionCliFailureV3 {
         if let Some(process) = owner.intake_process.as_ref() {
             if std::time::Instant::now() >= until {
                 observation.intake_process = "unknown";
-                observation.errors.push("original cleanup deadline elapsed before intake cleanup".into());
+                observation
+                    .errors
+                    .push("original cleanup deadline elapsed before intake cleanup".into());
             } else {
                 match process.finish_process(until) {
-                    Ok(receipt) if receipt.permits_process_close() => observation.intake_process = "closed_observed",
+                    Ok(receipt) if receipt.permits_process_close() => {
+                        observation.intake_process = "closed_observed"
+                    }
                     Ok(_) => {
                         observation.intake_process = "unknown";
-                        observation.errors.push("original intake did not establish process close".into());
+                        observation
+                            .errors
+                            .push("original intake did not establish process close".into());
                     }
                     Err(error) => {
                         observation.intake_process = "unknown";
-                        observation.errors.push(format!("original intake cleanup: {error}"));
+                        observation
+                            .errors
+                            .push(format!("original intake cleanup: {error}"));
                     }
                 }
             }
@@ -297,15 +314,23 @@ impl ActionCliFailureV3 {
                     // The failed helper's process/child handle is retained by
                     // its original failure. This is no new kill/reap right.
                     observation.frozen_helper = "unknown_retained";
-                    if failure.process.as_ref().is_some_and(|process| process.process().pending_child.is_some()) {
-                        observation.errors.push("original frozen helper child remains in custody".into());
+                    if failure
+                        .process
+                        .as_ref()
+                        .is_some_and(|process| process.process().pending_child.is_some())
+                    {
+                        observation
+                            .errors
+                            .push("original frozen helper child remains in custody".into());
                     }
                 }
                 None => {}
             },
             Err(_) => {
                 observation.frozen_helper = "unknown_retained";
-                observation.errors.push("original frozen helper custody busy or poisoned".into());
+                observation
+                    .errors
+                    .push("original frozen helper custody busy or poisoned".into());
             }
         }
         observation
@@ -533,8 +558,12 @@ pub struct ActionDiagnosticOutcomeV3 {
 }
 
 impl ActionDiagnosticOutcomeV3 {
-    pub fn status(&self) -> &serde_json::Value { &self.status }
-    pub fn partial_archive(&self) -> &GenerationPartialArchiveV3 { &self.partial }
+    pub fn status(&self) -> &serde_json::Value {
+        &self.status
+    }
+    pub fn partial_archive(&self) -> &GenerationPartialArchiveV3 {
+        &self.partial
+    }
 }
 
 /// Runs only the first declared saved root from the one supplied original
@@ -551,28 +580,57 @@ pub fn run_action_diagnostic_owned_v3(
 ) -> Result<ActionDiagnosticOutcomeV3, Box<ActionCliFailureV3>> {
     #[allow(unused_mut)]
     let mut owner = ActionCliOwnerV3 {
-        archives: vec![archive], collector: None,
-        frozen: Arc::new(Mutex::new(None)), intake_process: None, factory: None,
+        archives: vec![archive],
+        collector: None,
+        frozen: Arc::new(Mutex::new(None)),
+        intake_process: None,
+        factory: None,
     };
     #[cfg(not(target_os = "linux"))]
     let result = {
-        let _ = (declaration_path, declaration_sha256, selected_decision_index, cancel, wall);
-        Err((invalid("actual action diagnostic requires Linux original native owners"), None))
+        let _ = (
+            declaration_path,
+            declaration_sha256,
+            selected_decision_index,
+            cancel,
+            wall,
+        );
+        Err((
+            invalid("actual action diagnostic requires Linux original native owners"),
+            None,
+        ))
     };
     #[cfg(target_os = "linux")]
-    let result = run_diagnostic_linux(declaration_path, declaration_sha256, selected_decision_index, &mut owner, cancel, wall);
+    let result = run_diagnostic_linux(
+        declaration_path,
+        declaration_sha256,
+        selected_decision_index,
+        &mut owner,
+        cancel,
+        wall,
+    );
     match result {
-        Ok((status, partial)) => Ok(ActionDiagnosticOutcomeV3 { status, partial, _owner: Box::new(owner) }),
+        Ok((status, partial)) => Ok(ActionDiagnosticOutcomeV3 {
+            status,
+            partial,
+            _owner: Box::new(owner),
+        }),
         Err((error, preservation_error)) => Err(Box::new(ActionCliFailureV3 {
-            error, preservation_error, owner: Some(Box::new(owner)),
+            error,
+            preservation_error,
+            owner: Some(Box::new(owner)),
         })),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn run_diagnostic_linux(
-    path: &Path, expected: &str, selected_decision_index: usize, owner: &mut ActionCliOwnerV3,
-    cancel: Arc<AtomicBool>, wall: Duration,
+    path: &Path,
+    expected: &str,
+    selected_decision_index: usize,
+    owner: &mut ActionCliOwnerV3,
+    cancel: Arc<AtomicBool>,
+    wall: Duration,
 ) -> Result<(serde_json::Value, GenerationPartialArchiveV3), (ArenaError, Option<ArenaError>)> {
     use sha2::Digest as _;
     use std::io::Read;
@@ -580,112 +638,246 @@ fn run_diagnostic_linux(
     let until = started.checked_add(wall).unwrap_or(started);
     let mut diagnostic_root = None;
     let execute = (|| -> Result<_, ArenaError> {
-        check(!wall.is_zero() && wall <= Duration::from_secs(3600)
-            && absolute_safe(path) && generation_sha(expected), "diagnostic declaration or wall bound")?;
-        let parent = super::selfplay_cli::open_directory(path.parent().ok_or_else(|| invalid("diagnostic declaration parent"))?)?;
-        let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| invalid("diagnostic declaration name"))?;
+        check(
+            !wall.is_zero()
+                && wall <= Duration::from_secs(3600)
+                && absolute_safe(path)
+                && generation_sha(expected),
+            "diagnostic declaration or wall bound",
+        )?;
+        let parent = super::selfplay_cli::open_directory(
+            path.parent()
+                .ok_or_else(|| invalid("diagnostic declaration parent"))?,
+        )?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("diagnostic declaration name"))?;
         let file = super::selfplay_cli::open_regular(&parent, name)?;
-        let length = file.metadata().map_err(|_| invalid("diagnostic declaration metadata"))?.len();
-        check(length > 0 && length <= MAX_DECLARATION_BYTES, "diagnostic declaration size")?;
+        let length = file
+            .metadata()
+            .map_err(|_| invalid("diagnostic declaration metadata"))?
+            .len();
+        check(
+            length > 0 && length <= MAX_DECLARATION_BYTES,
+            "diagnostic declaration size",
+        )?;
         let mut bytes = Vec::with_capacity(length as usize);
-        Read::take(&file, length + 1).read_to_end(&mut bytes).map_err(|_| invalid("diagnostic declaration read"))?;
-        check(bytes.len() as u64 == length && format!("{:x}", sha2::Sha256::digest(&bytes)) == expected,
-            "diagnostic original declaration SHA-256")?;
+        Read::take(&file, length + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| invalid("diagnostic declaration read"))?;
+        check(
+            bytes.len() as u64 == length
+                && format!("{:x}", sha2::Sha256::digest(&bytes)) == expected,
+            "diagnostic original declaration SHA-256",
+        )?;
         let declaration: ActionCliDeclarationV3 = serde_json::from_slice(&bytes)
             .map_err(|error| invalid(format!("diagnostic declaration: {error}")))?;
         declaration.validate_with_minimum_roots(1)?;
-        check(declaration.roots.len() == 1 && declaration.roots[0].game_ordinal == 0
-            && declaration.roots[0].decision_index == selected_decision_index,
-            "diagnostic requires exactly one root of the original supplied game")?;
-        let preflight_until = (started + Duration::from_millis(declaration.preflight_ms)).min(until);
+        check(
+            declaration.roots.len() == 1
+                && declaration.roots[0].game_ordinal == 0
+                && declaration.roots[0].decision_index == selected_decision_index,
+            "diagnostic requires exactly one root of the original supplied game",
+        )?;
+        let preflight_until =
+            (started + Duration::from_millis(declaration.preflight_ms)).min(until);
         check_live(preflight_until, &cancel)?;
         let managed = super::selfplay_cli::open_directory(&declaration.managed_root)?;
         super::selfplay_cli::private_root(&managed)?;
-        super::selfplay_cli::scan_staging(&managed, declaration.max_staging_bytes, preflight_until, &cancel)?;
+        super::selfplay_cli::scan_staging(
+            &managed,
+            declaration.max_staging_bytes,
+            preflight_until,
+            &cancel,
+        )?;
         let archive = &owner.archives[0];
-        check(archive.request().game_ordinal == 0
-            && serde_json::to_vec(&archive.request().plan.openings).map_err(|e| invalid(e.to_string()))?
-                == serde_json::to_vec(&declaration.openings.openings).map_err(|e| invalid(e.to_string()))?
-            && archive.cwd_path().starts_with(&declaration.managed_root),
-            "diagnostic original game owner or openings differ")?;
+        check(
+            archive.request().game_ordinal == 0
+                && serde_json::to_vec(&archive.request().plan.openings)
+                    .map_err(|e| invalid(e.to_string()))?
+                    == serde_json::to_vec(&declaration.openings.openings)
+                        .map_err(|e| invalid(e.to_string()))?
+                && archive.cwd_path().starts_with(&declaration.managed_root),
+            "diagnostic original game owner or openings differ",
+        )?;
         let cwd = std::env::current_dir().map_err(|_| invalid("diagnostic current directory"))?;
-        check(cwd == declaration.private_cwd, "diagnostic private cwd differs")?;
+        check(
+            cwd == declaration.private_cwd,
+            "diagnostic private cwd differs",
+        )?;
         let pinned = Arc::new(rz_uci::pals_adaptive_startup::PinnedPalsStartupV5::open(
             rz_uci::pals_adaptive_startup::PalsStartupOptionsV5 {
-                config_path: declaration.startup_config.clone(), lock_path: declaration.startup_lock.clone(),
-                config_sha256: declaration.startup_config_sha256.clone(), metadata_preflight: false,
-            }, &cwd)?);
+                config_path: declaration.startup_config.clone(),
+                lock_path: declaration.startup_lock.clone(),
+                config_sha256: declaration.startup_config_sha256.clone(),
+                metadata_preflight: false,
+            },
+            &cwd,
+        )?);
         rz_experiments::verify_compiled_source_components_v5(&pinned.config.source_components)?;
-        check(pinned.config.source_components.get("arena") == Some(&declaration.producer.source_sha256)
-            && pinned.asset(rz_experiments::PalsStartupAssetPurposeV5::RuntimeLibrary)?.declaration.artifact.sha256
-                == declaration.producer.runtime_sha256,
-            "diagnostic compiled collector/runtime source pins")?;
+        check(
+            pinned.config.source_components.get("arena")
+                == Some(&declaration.producer.source_sha256)
+                && pinned
+                    .asset(rz_experiments::PalsStartupAssetPurposeV5::RuntimeLibrary)?
+                    .declaration
+                    .artifact
+                    .sha256
+                    == declaration.producer.runtime_sha256,
+            "diagnostic compiled collector/runtime source pins",
+        )?;
         check_live(preflight_until, &cancel)?;
-        load_verified_frozen(&declaration, Arc::clone(&pinned), owner, Arc::clone(&cancel), until)?;
-        let registration = owner.frozen.lock().map_err(|_| invalid("diagnostic frozen owner poisoned"))?
-            .as_ref().ok_or_else(|| invalid("diagnostic frozen intake absent"))?
-            .as_ref().map_err(|failure| invalid(failure.error.to_string()))?.registration().clone();
+        load_verified_frozen(
+            &declaration,
+            Arc::clone(&pinned),
+            owner,
+            Arc::clone(&cancel),
+            until,
+        )?;
+        let registration = owner
+            .frozen
+            .lock()
+            .map_err(|_| invalid("diagnostic frozen owner poisoned"))?
+            .as_ref()
+            .ok_or_else(|| invalid("diagnostic frozen intake absent"))?
+            .as_ref()
+            .map_err(|failure| invalid(failure.error.to_string()))?
+            .registration()
+            .clone();
         check_live(until, &cancel)?;
-        let staging = super::selfplay_cli::scan_staging(&managed, declaration.max_staging_bytes, until, &cancel)?;
-        check(declaration.plan.maximum_output_bytes.checked_add(MAX_PROBE_BYTES)
-            .is_some_and(|needed| needed <= declaration.max_staging_bytes.saturating_sub(staging.unique_inode_bytes)),
-            "diagnostic archive and probe reserve")?;
+        let staging = super::selfplay_cli::scan_staging(
+            &managed,
+            declaration.max_staging_bytes,
+            until,
+            &cancel,
+        )?;
+        check(
+            declaration
+                .plan
+                .maximum_output_bytes
+                .checked_add(MAX_PROBE_BYTES)
+                .is_some_and(|needed| {
+                    needed
+                        <= declaration
+                            .max_staging_bytes
+                            .saturating_sub(staging.unique_inode_bytes)
+                }),
+            "diagnostic archive and probe reserve",
+        )?;
         owner.collector = Some(GenerationActionOutcomeCollectorV3::new(
-            declaration.plan.clone(), declaration.openings.clone(), declaration.producer.clone(),
-            declaration.context_epoch, declaration.output_directory.clone(), until)?);
+            declaration.plan.clone(),
+            declaration.openings.clone(),
+            declaration.producer.clone(),
+            declaration.context_epoch,
+            declaration.output_directory.clone(),
+            until,
+        )?);
         diagnostic_root = Some(declaration.output_directory.clone());
         let selected = &declaration.roots[0];
-        let (root, used) = owner.archives[0].saved_action_root(selected.decision_index, until,
-            Some(&cancel), declaration.max_root_read_bytes.min(MAX_ROOT_READ_BYTES))?;
+        let (root, used) = owner.archives[0].saved_action_root(
+            selected.decision_index,
+            until,
+            Some(&cancel),
+            declaration.max_root_read_bytes.min(MAX_ROOT_READ_BYTES),
+        )?;
         let source_epoch = root.source_epoch();
-        let issuer: GenerationActionProcessEpochIssuerV3 = Arc::new(move || loop {
-            let epoch = reserve_actual_session_epochs_v3(1)?;
-            if epoch.0 != source_epoch { return Ok(epoch); }
+        let issuer: GenerationActionProcessEpochIssuerV3 = Arc::new(move || {
+            loop {
+                let epoch = reserve_actual_session_epochs_v3(1)?;
+                if epoch.0 != source_epoch {
+                    return Ok(epoch);
+                }
+            }
         });
-        owner.factory = Some(ActualGenerationActionOutcomeFactoryV3::new(
-            Arc::clone(&pinned), registration, declaration.producer.clone(), issuer,
-            GenerationActualActionLimitsV3 { process_wall: Duration::from_millis(declaration.process_ms),
-                shutdown_reserve: Duration::from_millis(declaration.shutdown_reserve_ms) },
-        )?.with_cancellation(Arc::clone(&cancel)));
+        owner.factory = Some(
+            ActualGenerationActionOutcomeFactoryV3::new(
+                Arc::clone(&pinned),
+                registration,
+                declaration.producer.clone(),
+                issuer,
+                GenerationActualActionLimitsV3 {
+                    process_wall: Duration::from_millis(declaration.process_ms),
+                    shutdown_reserve: Duration::from_millis(declaration.shutdown_reserve_ms),
+                },
+            )?
+            .with_cancellation(Arc::clone(&cancel)),
+        );
         // `run_context` may use up to 30 seconds of its registered cleanup
         // after its execution deadline. Keep that reserve inside this
         // diagnostic's original whole window.
         let cleanup_reserve = Duration::from_secs(30);
-        let latest_context_end = until.checked_sub(cleanup_reserve)
+        let latest_context_end = until
+            .checked_sub(cleanup_reserve)
             .ok_or_else(|| invalid("diagnostic cleanup reserve outside wall"))?;
-        check(Instant::now() < latest_context_end, "diagnostic has no context and cleanup window")?;
-        let context_until = (Instant::now() + Duration::from_millis(declaration.context_ms)).min(latest_context_end);
-        let report = owner.collector.as_mut().expect("diagnostic collector owned")
-            .run_context(owner.factory.as_mut().expect("diagnostic factory owned"), &root, context_until)?;
+        check(
+            Instant::now() < latest_context_end,
+            "diagnostic has no context and cleanup window",
+        )?;
+        let context_until = (Instant::now() + Duration::from_millis(declaration.context_ms))
+            .min(latest_context_end);
+        let report = owner
+            .collector
+            .as_mut()
+            .expect("diagnostic collector owned")
+            .run_context(
+                owner.factory.as_mut().expect("diagnostic factory owned"),
+                &root,
+                context_until,
+            )?;
         check_live(until, &cancel)?;
-        let probe = owner.factory.as_mut().expect("diagnostic factory owned").take_probe_receipt()
+        let probe = owner
+            .factory
+            .as_mut()
+            .expect("diagnostic factory owned")
+            .take_probe_receipt()
             .ok_or_else(|| invalid("diagnostic actual source probe missing"))?;
-        let raw = serde_json::to_vec(&probe_json(&probe, Some(0), Some(selected))?).map_err(|e| invalid(e.to_string()))?;
-        check(raw.len() as u64 <= MAX_PROBE_BYTES, "diagnostic source probe bound")?;
-        publish_new(&declaration.output_directory, "source-probe-0000.json", &raw)?;
+        let raw = serde_json::to_vec(&probe_json(&probe, Some(0), Some(selected))?)
+            .map_err(|e| invalid(e.to_string()))?;
+        check(
+            raw.len() as u64 <= MAX_PROBE_BYTES,
+            "diagnostic source probe bound",
+        )?;
+        publish_new(
+            &declaration.output_directory,
+            "source-probe-0000.json",
+            &raw,
+        )?;
         owner.factory = None;
-        let collector = owner.collector.as_mut().expect("diagnostic collector owned");
+        let collector = owner
+            .collector
+            .as_mut()
+            .expect("diagnostic collector owned");
         collector.preserve_partial("nonpromotion one-context functional diagnostic", until)?;
         check_live(until, &cancel)?;
-        let partial = collector.partial_archive().ok_or_else(|| invalid("diagnostic partial archive missing"))?.clone();
-        Ok((serde_json::json!({
-            "schema":"rz-pals-actual-action-diagnostic/1", "status":"one_context_completed",
-            "training_eligible":false, "optimizer_updates":0, "context_quota_satisfied":false,
-            "actual_game_owners":1, "attempted_contexts":collector.attempted_contexts(),
-            "unique_contexts":collector.unique_contexts(), "action_members":report.action_members,
-            "known_pairs":report.known_pairs, "partial_manifest":partial.manifest_path,
-            "partial_manifest_sha256":partial.manifest_sha256, "root_read_bytes":used,
-            "declaration_sha256":expected,
-        }), partial))
+        let partial = collector
+            .partial_archive()
+            .ok_or_else(|| invalid("diagnostic partial archive missing"))?
+            .clone();
+        Ok((
+            serde_json::json!({
+                "schema":"rz-pals-actual-action-diagnostic/1", "status":"one_context_completed",
+                "training_eligible":false, "optimizer_updates":0, "context_quota_satisfied":false,
+                "actual_game_owners":1, "attempted_contexts":collector.attempted_contexts(),
+                "unique_contexts":collector.unique_contexts(), "action_members":report.action_members,
+                "known_pairs":report.known_pairs, "partial_manifest":partial.manifest_path,
+                "partial_manifest_sha256":partial.manifest_sha256, "root_read_bytes":used,
+                "declaration_sha256":expected,
+            }),
+            partial,
+        ))
     })();
     execute.map_err(|error| {
         let mut preservation_error = diagnostic_root.as_ref().and_then(|root| {
             preserve_failed_factory(owner.factory.as_ref(), root, MAX_PROBE_BYTES, until).err()
         });
         if let Some(collector) = owner.collector.as_mut()
-            && let Err(archive_error) = collector.preserve_partial(&error.to_string(), until) {
+            && let Err(archive_error) = collector.preserve_partial(&error.to_string(), until)
+        {
             preservation_error = Some(match preservation_error {
-                Some(raw_error) => invalid(format!("diagnostic raw preservation: {raw_error}; partial archive: {archive_error}")),
+                Some(raw_error) => invalid(format!(
+                    "diagnostic raw preservation: {raw_error}; partial archive: {archive_error}"
+                )),
                 None => archive_error,
             });
         }

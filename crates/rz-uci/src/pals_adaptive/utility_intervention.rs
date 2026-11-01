@@ -1267,7 +1267,10 @@ fn compare_neutral_targets(
     let model_matches = previous["model_identity"] == current["model_identity"];
     if expected != actual || !reference_matches || !model_matches {
         Err(AdaptiveManagerError::InterventionNeutralMismatch {
-            expected, actual, reference_matches, model_matches,
+            expected,
+            actual,
+            reference_matches,
+            model_matches,
         })
     } else {
         Ok(())
@@ -1283,15 +1286,21 @@ mod tests {
         let original = json!({"reference_json":"original", "model_identity":"model"});
         assert!(compare_neutral_targets(first, &original, first, &original).is_ok());
         let changed = json!({"reference_json":"different", "model_identity":"model"});
-        assert!(matches!(compare_neutral_targets(first, &original, other, &changed),
+        assert!(
+            matches!(compare_neutral_targets(first, &original, other, &changed),
             Err(AdaptiveManagerError::InterventionNeutralMismatch {
                 expected, actual, reference_matches: false, model_matches: true,
-            }) if expected == first && actual == other));
+            }) if expected == first && actual == other)
+        );
         let changed = json!({"reference_json":"original", "model_identity":"other"});
-        assert!(matches!(compare_neutral_targets(first, &original, first, &changed),
+        assert!(matches!(
+            compare_neutral_targets(first, &original, first, &changed),
             Err(AdaptiveManagerError::InterventionNeutralMismatch {
-                reference_matches: true, model_matches: false, ..
-            })));
+                reference_matches: true,
+                model_matches: false,
+                ..
+            })
+        ));
     }
     #[test]
     fn utility_requires_a_witness_and_does_not_trade_cost_for_more_discovery() {
