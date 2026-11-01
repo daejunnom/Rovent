@@ -34,12 +34,62 @@ MONITOR_CONFIG_SCHEMA = 'rovezero.storage-monitor-configuration.v1'
 MONITOR_REGISTRY_KEY = r'Software\RoveZero\StorageMonitor'
 SOURCE_ROOTS_SCHEMA = 'rovezero.storage-source-roots.v1'
 MAX_SOURCE_ROOTS = 64
+SHARED_MONITOR_FILE = 'monitor-configuration.json'
+
+
+def _package_roots():
+    """Return only Codex package-local roots, not arbitrary disk locations."""
+    local = os.environ.get('LOCALAPPDATA')
+    if not local or not os.path.isabs(local):
+        return []
+    roots = []
+    try:
+        with os.scandir(Path(local) / 'Packages') as children:
+            for child in children:
+                if child.name.casefold().startswith('openai.codex_') and child.is_dir(follow_symlinks=False):
+                    roots.append(Path(child.path) / 'LocalCache' / 'Roaming' / 'RoveZero')
+    except OSError:
+        pass
+    return roots
+
+
+def _shared_monitor_dir():
+    """Find a shared installation by validated directory identity.
+
+    A present directory with a missing or invalid setup file is damaged, not
+    an invitation to consult a process-local registry or environment value.
+    """
+    found = {}
+    for root in _package_roots():
+        path = root / 'storage' / 'total-usage'
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        identity = _identity_nofollow(path, directory=True)
+        try:
+            config = json.loads(_read_nofollow(path / SHARED_MONITOR_FILE))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError('shared_monitor_configuration_unavailable') from exc
+        if (not isinstance(config, dict) or config.get('schema') != MONITOR_CONFIG_SCHEMA
+                or 'sources' not in config
+                or type(config.get('volume_serial')) is not int
+                or type(config.get('file_index')) is not int
+                or (config['volume_serial'], config['file_index']) !=
+                   (identity['volume_serial'], identity['file_index'])):
+            raise ValueError('shared_monitor_identity_changed')
+        found[(identity['volume_serial'], identity['file_index'])] = path
+    if len(found) > 1:
+        raise ValueError('multiple_shared_monitor_directories')
+    return next(iter(found.values()), None)
 
 
 def windows_monitor_installed():
     """Read the per-user installation marker; no monitor files are opened."""
     if os.name != 'nt':
         return False
+    if _shared_monitor_dir() is not None:
+        return True
     import winreg
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, MONITOR_REGISTRY_KEY)
@@ -106,6 +156,26 @@ def register_monitor_dir(value):
     identity = _identity_nofollow(path, directory=True)
     config = {'schema': MONITOR_CONFIG_SCHEMA, 'directory': str(path),
               'volume_serial': identity['volume_serial'], 'file_index': identity['file_index']}
+    package_targets = [_normalize_windows_path(root / 'storage' / 'total-usage') for root in _package_roots()]
+    if _normalize_windows_path(path) in package_targets:
+        # Only nonsecret configuration goes into this shared package-local file.
+        # The actual directory identity is checked by both readers.
+        config['sources'] = None
+        existing = path / SHARED_MONITOR_FILE
+        try:
+            existing.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            previous = json.loads(_read_nofollow(existing))
+            if (not isinstance(previous, dict) or previous.get('schema') != MONITOR_CONFIG_SCHEMA
+                    or 'sources' not in previous
+                    or previous.get('volume_serial') != identity['volume_serial']
+                    or previous.get('file_index') != identity['file_index']):
+                raise ValueError('shared_monitor_configuration_invalid')
+            config['sources'] = previous['sources']
+        _atomic_write(path / SHARED_MONITOR_FILE, config)
+        return {'status': 'monitor_registered', 'schema': MONITOR_CONFIG_SCHEMA}
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, MONITOR_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE) as key:
         # One REG_SZ value holds the complete identity; Enabled is written last.
         winreg.SetValueEx(key, 'Configuration', 0, winreg.REG_SZ, json.dumps(config, sort_keys=True))
@@ -117,6 +187,9 @@ def monitor_dir():
     # Once installed, every process must use the same pinned directory even if
     # APPDATA is redirected or an unrelated environment override is present.
     # Missing/corrupt settings are errors, not permission to pick another root.
+    shared = _shared_monitor_dir()
+    if shared is not None:
+        return shared
     if windows_monitor_installed():
         return _installed_monitor_dir()
     override = os.environ.get('RZ_USAGE_MONITOR_DIR')
@@ -168,6 +241,15 @@ def _windows_root_candidates():
 
 def _read_source_roots_config():
     """Read explicit installation scope; never infer arbitrary worktrees."""
+    shared = _shared_monitor_dir()
+    if shared is not None:
+        try:
+            value = json.loads(_read_nofollow(shared / SHARED_MONITOR_FILE))['sources']
+        except OSError as exc:
+            raise ValueError('shared_source_roots_unavailable') from exc
+        if value is None:
+            return None
+        return _validate_source_roots_config(value)
     if not windows_monitor_installed():
         return None
     import winreg
@@ -186,6 +268,10 @@ def _read_source_roots_config():
     if kind != winreg.REG_SZ or not isinstance(raw, str) or len(raw) > 32768:
         raise ValueError('invalid_source_roots_config')
     value = json.loads(raw)
+    return _validate_source_roots_config(value)
+
+
+def _validate_source_roots_config(value):
     if (not isinstance(value, dict) or value.get('schema') != SOURCE_ROOTS_SCHEMA
             or not isinstance(value.get('revision'), str)
             or not isinstance(value.get('roots'), list) or len(value['roots']) > MAX_SOURCE_ROOTS):
@@ -243,8 +329,14 @@ def register_source_roots(values):
     config = {'schema': SOURCE_ROOTS_SCHEMA, 'revision': str(uuid.uuid4()), 'roots': entries}
     _checked_source_roots(config)
     encoded = json.dumps(config, sort_keys=True)
-    if len(encoded) > 32768:
+    if len(encoded) > MAX_BYTES:
         raise ValueError('source_roots_config_too_large')
+    shared = _shared_monitor_dir()
+    if shared is not None:
+        shared_config = json.loads(_read_nofollow(shared / SHARED_MONITOR_FILE))
+        shared_config['sources'] = config
+        _atomic_write(shared / SHARED_MONITOR_FILE, shared_config)
+        return {'status': 'source_roots_registered', 'count': len(entries)}
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, MONITOR_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE) as key:
         # The complete configuration is one atomic registry value. The marker
         # permits a missing/corrupt value to be distinguished from no setup.
@@ -730,8 +822,8 @@ class _WindowsMutex:
         self.kernel.ReleaseMutex.restype = wintypes.BOOL
         self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         self.kernel.CloseHandle.restype = wintypes.BOOL
-        user = os.environ.get('USERNAME')
-        user_key = (os.environ.get('USERDOMAIN', '') + '\\' + user).casefold() if user else _normalize_windows_path(root)
+        identity = _identity_nofollow(root, directory=True)
+        user_key = f"{identity['volume_serial']}:{identity['file_index']}"
         # A private fixture-only injection keeps tests from taking a live
         # user's real observer mutex. Production callers never set this value.
         if _fixture_namespace is not None:
@@ -768,8 +860,7 @@ def register_pairing(distro_id, pair_id):
     if os.name != 'nt':
         raise OSError('windows_required')
     base = monitor_dir()
-    root = Path(os.environ['APPDATA']) / 'RoveZero'
-    with _WindowsMutex(root) as acquired:
+    with _WindowsMutex(base) as acquired:
         if not acquired:
             raise OSError('usage_observer_already_running')
         linux = _read_snapshot(base / 'linux.json', LINUX_SCHEMA)
@@ -787,8 +878,7 @@ def scan_once(*, max_entries=2_000_000, max_seconds=120.0, threshold_bytes=THRES
     if os.name != 'nt':
         raise OSError('windows_required')
     base = monitor_dir()
-    root = Path(os.environ['APPDATA']) / 'RoveZero'
-    with _WindowsMutex(root) as acquired:
+    with _WindowsMutex(base) as acquired:
         if not acquired:
             return {'status': 'already_running'}
         spec = importlib.util.spec_from_file_location(

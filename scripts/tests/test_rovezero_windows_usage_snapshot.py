@@ -133,6 +133,9 @@ class CombinedTests(unittest.TestCase):
 class WindowsHandleTests(unittest.TestCase):
     def setUp(self):
         # Fixture tests must not inherit a real user's installed monitor.
+        self.shared_patch = mock.patch.object(usage, '_shared_monitor_dir', return_value=None)
+        self.shared_patch.start()
+        self.addCleanup(self.shared_patch.stop)
         self.installed_patch = mock.patch.object(usage, 'windows_monitor_installed', return_value=False)
         self.installed = self.installed_patch.start()
         self.addCleanup(self.installed_patch.stop)
@@ -146,6 +149,39 @@ class WindowsHandleTests(unittest.TestCase):
         self.mutex_patch = mock.patch.object(usage, '_WindowsMutex', FixtureMutex)
         self.mutex_patch.start()
         self.addCleanup(self.mutex_patch.stop)
+
+    def test_package_shared_setup_ignores_distinct_registry_and_appdata(self):
+        self.shared_patch.stop()
+        self.installed_patch.stop()
+        with tempfile.TemporaryDirectory() as directory:
+            local = Path(directory) / 'local'
+            package = local / 'Packages' / 'OpenAI.Codex_fixture' / 'LocalCache' / 'Roaming'
+            target = package / 'RoveZero' / 'storage' / 'total-usage'
+            target.mkdir(parents=True)
+            normal = Path(directory) / 'normal'
+            (normal / 'RoveZero').mkdir(parents=True)
+            source = Path(directory) / 'checkout' / 'RoveZero'
+            source.mkdir(parents=True)
+            (source / '.git').touch()
+            with mock.patch.dict(os.environ, {'LOCALAPPDATA': str(local), 'APPDATA': str(normal)}, clear=False):
+                usage.register_monitor_dir(target)
+                usage.register_source_roots([source])
+                config = usage._read_source_roots_config()
+                self.assertEqual(usage._checked_source_roots(config), [source])
+                with mock.patch.dict(os.environ, {'APPDATA': str(package),
+                        'RZ_USAGE_MONITOR_DIR': str(normal / 'other')}):
+                    self.assertTrue(usage.windows_monitor_installed())
+                    self.assertEqual(usage.monitor_dir(), target)
+                    self.assertEqual(usage._read_source_roots_config()['revision'], config['revision'])
+                config_file = target / usage.SHARED_MONITOR_FILE
+                shared_config = json.loads(usage._read_nofollow(config_file))
+                del shared_config['sources']
+                usage._atomic_write(config_file, shared_config)
+                with self.assertRaises(ValueError):
+                    usage._read_source_roots_config()
+                config_file.unlink()
+                with self.assertRaises(ValueError):
+                    usage.monitor_dir()
 
     def test_windows_monitor_installation_marker_is_independent_of_snapshot_files(self):
         import winreg
@@ -440,16 +476,18 @@ class WindowsHandleTests(unittest.TestCase):
             usage._atomic_write(usage.monitor_dir() / 'linux.json', linux)
             old = {'schema': usage.PAIRING_SCHEMA, 'existing': True}
             usage._atomic_write(usage.monitor_dir() / 'pairing.json', old)
+            self.assertTrue(usage.monitor_dir().is_dir())
             other = {'pair_tag': digest, 'machine_tag': 'd' * 64, 'boot_tag': 'c' * 64}
             result = mock.Mock(returncode=0, stdout=json.dumps(other).encode())
+            identity = {'canonical_path': 'd:\\fixture', 'volume_serial': 10, 'file_index': 100}
             with mock.patch.object(usage, '_registered_distro', return_value=('fixture', Path('D:/x'))), \
-                    mock.patch.object(usage, '_identity_nofollow', return_value={'fixture': True}), \
+                    mock.patch.object(usage, '_identity_nofollow', return_value=identity), \
                     mock.patch.object(usage.subprocess, 'run', return_value=result):
                 with self.assertRaisesRegex(ValueError, 'identity_mismatch'):
                     usage.register_pairing('12345678-1234-4234-8234-123456789abc', pair_id)
             self.assertEqual(json.loads(usage._read_nofollow(usage.monitor_dir() / 'pairing.json')), old)
             with mock.patch.object(usage, '_registered_distro', return_value=('fixture', Path('D:/x'))), \
-                    mock.patch.object(usage, '_identity_nofollow', return_value={'fixture': True}), \
+                    mock.patch.object(usage, '_identity_nofollow', return_value=identity), \
                     mock.patch.object(usage.subprocess, 'run',
                                       side_effect=usage.subprocess.TimeoutExpired('wsl', 15)):
                 with self.assertRaises(usage.subprocess.TimeoutExpired):
