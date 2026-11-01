@@ -7,6 +7,12 @@
 use crate::ArenaError;
 use rz_experiments::{PalsSystemStartupLockV6, SystemRuntimeReceiptV6};
 
+mod pair;
+mod pair_native;
+#[cfg(target_os = "linux")]
+mod preflight;
+pub use pair::*;
+
 /// A verified startup declaration, not a running child or an admission token.
 #[derive(Clone, Debug)]
 pub struct PalsSystemArenaEndpointV6 {
@@ -48,9 +54,24 @@ impl PalsSystemArenaEndpointV6 {
         if process_id == 0 {
             return Err(ArenaError::Invalid("PALS child PID must be nonzero".into()));
         }
-        let session = role_directory
-            .open_dir_nofollow(format!("native-process-{process_id}"))
-            .map_err(|_| ArenaError::Io("PALS child receipt directory is unavailable".into()))?;
+        let session = match role_directory.open_dir_nofollow(format!("native-process-{process_id}"))
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let unavailable = format!("PALS child receipt directory is unavailable: {error}");
+                return Ok(PalsSystemChildReceiptClaimsV6 {
+                    endpoint_id: self.startup.config.endpoint.id.clone(),
+                    process_id,
+                    process_generation: self.startup.config.process_generation,
+                    startup: PalsSystemReceiptClaimV6::Unavailable {
+                        reason: unavailable.clone(),
+                    },
+                    termination: PalsSystemReceiptClaimV6::Unavailable {
+                        reason: unavailable,
+                    },
+                });
+            }
+        };
         let lock = &self.startup.config.system_runtime_lock;
         let generation = self.startup.config.process_generation;
         Ok(PalsSystemChildReceiptClaimsV6 {
@@ -73,6 +94,133 @@ impl PalsSystemArenaEndpointV6 {
             ),
         })
     }
+
+    /// Check both reports against the same declared child identity and system
+    /// runtime. This validates the child's claims only: the native supervisor
+    /// must independently bind `process_id` to the actual process and verify
+    /// its exit and the PALS session's own physical-lifetime evidence.
+    pub fn validate_reported_session(
+        &self,
+        claims: &PalsSystemChildReceiptClaimsV6,
+    ) -> Result<PalsSystemReportedSessionV6, ArenaError> {
+        use rz_experiments::{NativeRuntimeSourceV6, PhysicalCompletionV6, ProviderReadinessV6};
+
+        self.startup.verify()?;
+        let lock = &self.startup.config.system_runtime_lock;
+        let generation = self.startup.config.process_generation;
+        if claims.endpoint_id != self.startup.config.endpoint.id
+            || claims.process_id == 0
+            || claims.process_generation != generation
+        {
+            return Err(ArenaError::Integrity(
+                "PALS system session identity differs".into(),
+            ));
+        }
+        let PalsSystemReceiptClaimV6::Reported {
+            bytes: startup_bytes,
+            receipt: startup,
+        } = &claims.startup
+        else {
+            return Err(ArenaError::Integrity(
+                "PALS system startup report is unavailable or invalid".into(),
+            ));
+        };
+        let PalsSystemReceiptClaimV6::Reported {
+            bytes: termination_bytes,
+            receipt: termination,
+        } = &claims.termination
+        else {
+            return Err(ArenaError::Integrity(
+                "PALS system termination report is unavailable or invalid".into(),
+            ));
+        };
+        let decode = |bytes: &[u8]| -> Result<SystemRuntimeReceiptV6, ArenaError> {
+            if bytes.len() > 256 << 10 {
+                return Err(ArenaError::Integrity(
+                    "PALS system receipt exceeds its byte budget".into(),
+                ));
+            }
+            let input = std::str::from_utf8(bytes)
+                .map_err(|_| ArenaError::Integrity("PALS system receipt is not UTF-8".into()))?;
+            Ok(SystemRuntimeReceiptV6::from_json(
+                input,
+                lock,
+                claims.process_id,
+                generation,
+            )?)
+        };
+        if decode(startup_bytes)? != *startup || decode(termination_bytes)? != *termination {
+            return Err(ArenaError::Integrity(
+                "PALS system report differs from its preserved bytes".into(),
+            ));
+        }
+        let NativeRuntimeSourceV6::SystemCuda(system) = &lock.runtime else {
+            return Err(ArenaError::Integrity(
+                "PALS V6 session is not system CUDA".into(),
+            ));
+        };
+        if startup.provider_ready != ProviderReadinessV6::Ready
+            || startup.physical_completion != PhysicalCompletionV6::Unknown
+            || startup.observed_identity_sha256.as_deref()
+                != Some(system.system_identity_sha256.as_str())
+            || termination.provider_ready != ProviderReadinessV6::Ready
+            || !matches!(
+                termination.physical_completion,
+                PhysicalCompletionV6::Confirmed { .. }
+            )
+            || termination.observed_identity_sha256.as_deref()
+                != Some(system.system_identity_sha256.as_str())
+        {
+            return Err(ArenaError::Integrity(
+                "PALS system startup observation is incomplete".into(),
+            ));
+        }
+        for receipt in [startup, termination] {
+            system.validate_observed(&receipt.observed_libraries)?;
+            if system
+                .libraries
+                .iter()
+                .filter(|library| library.required_mapping)
+                .any(|library| {
+                    !receipt.observed_libraries.iter().any(|observed| {
+                        observed.role == library.role && observed.mapped == Some(true)
+                    })
+                })
+            {
+                return Err(ArenaError::Integrity(
+                    "PALS required system library mapping was not observed".into(),
+                ));
+            }
+        }
+        let strict_inventory_empty = match (
+            &startup.unregistered_native_mappings,
+            &termination.unregistered_native_mappings,
+        ) {
+            (Some(start), Some(end)) => Some(start.is_empty() && end.is_empty()),
+            (Some(mappings), _) | (_, Some(mappings)) if !mappings.is_empty() => Some(false),
+            _ => None,
+        };
+        let optional_mappings_observed = [startup, termination].iter().all(|receipt| {
+            receipt
+                .observed_libraries
+                .iter()
+                .all(|library| library.mapped.is_some())
+        });
+        Ok(PalsSystemReportedSessionV6 {
+            strict_inventory_empty,
+            optional_mappings_observed,
+        })
+    }
+}
+
+/// Reported mapping completeness is distinct from the required registered
+/// library observations. Additional or unobserved mappings do not establish
+/// the stricter inventory claim, and do not themselves prove a conflict.
+/// Neither this value nor a child's completion report authenticates the child.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PalsSystemReportedSessionV6 {
+    pub strict_inventory_empty: Option<bool>,
+    pub optional_mappings_observed: bool,
 }
 
 /// A structurally valid report is still an unauthenticated child claim. Raw
