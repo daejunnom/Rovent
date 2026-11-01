@@ -223,6 +223,8 @@ pub enum NativeSessionReleaseSource {
 pub struct NativeSessionReleaseObservation {
     release: rz_eval::worker::SessionReleased,
     source: NativeSessionReleaseSource,
+    runtime_mapping_status: crate::pals_native::ticketed::TicketRuntimeMappingStatus,
+    system_placement_status: crate::pals_native::ticketed::TicketSystemPlacementStatus,
 }
 impl NativeSessionReleaseObservation {
     pub fn release(&self) -> rz_eval::worker::SessionReleased {
@@ -231,12 +233,24 @@ impl NativeSessionReleaseObservation {
     pub fn source(&self) -> NativeSessionReleaseSource {
         self.source
     }
+    pub fn runtime_mapping_status(
+        &self,
+    ) -> crate::pals_native::ticketed::TicketRuntimeMappingStatus {
+        self.runtime_mapping_status
+    }
+    pub fn system_placement_status(
+        &self,
+    ) -> crate::pals_native::ticketed::TicketSystemPlacementStatus {
+        self.system_placement_status
+    }
     pub(crate) fn from_report(
         report: &crate::pals_native::ticketed::TicketNativeFinishReport,
         original: bool,
     ) -> Option<Self> {
         report.session_release.map(|release| Self {
             release,
+            runtime_mapping_status: report.runtime_mapping_status,
+            system_placement_status: report.system_placement_status,
             source: if original {
                 NativeSessionReleaseSource::OriginalReport
             } else {

@@ -1541,6 +1541,39 @@ fn session_release_observation_json(
     })
 }
 
+/// Optional mapping and placement observations from this original session's
+/// finish report. Neither is physical completion or numerical acceptance.
+#[cfg(target_os = "linux")]
+fn system_runtime_finish_observation_json(
+    lock: &RoventInputLockV3,
+    process_epoch: u64,
+    release: Option<crate::pals_adaptive::NativeSessionReleaseObservation>,
+) -> serde_json::Value {
+    use crate::pals_native::ticketed::{
+        TicketRuntimeMappingStatus as M, TicketSystemPlacementStatus as P,
+    };
+    let mapping = match release.map(|value| value.runtime_mapping_status()) {
+        Some(M::NonCuda) => "non_cuda",
+        Some(M::Observed) => "observed",
+        Some(M::Unknown) => "unknown",
+        Some(M::NotObserved) | None => "not_observed",
+    };
+    let placement = match release.map(|value| value.system_placement_status()) {
+        Some(P::Incomplete) => "incomplete",
+        Some(P::UnregisteredOrPreexistingMappings) => "unregistered_or_preexisting_mappings",
+        Some(P::Confirmed) => "confirmed",
+        Some(P::NotObserved) | None => "not_observed",
+    };
+    serde_json::json!({
+        "domain": "rz-rovent-system-runtime-finish-observation/1",
+        "process_id": std::process::id(), "process_epoch": process_epoch,
+        "lock_sha256": lock.canonical_sha256,
+        "runtime_mapping_observation": mapping,
+        "system_placement_observation": placement,
+        "scope": "same original session finish report; not a GPU fence or numerical acceptance",
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn runtime_receipt(
     lock: &RoventInputLockV3,
@@ -2997,6 +3030,14 @@ pub(super) fn run_native_admitted(
             value.to_string().as_bytes(),
         ) {
             eprintln!("session release observation warning: {failure}");
+        }
+        let value =
+            system_runtime_finish_observation_json(&lock, arguments.process_epoch, session_release);
+        if let Err(failure) = writer.write_bytes(
+            "system-runtime-finish-observation.v1.json",
+            value.to_string().as_bytes(),
+        ) {
+            eprintln!("system runtime finish observation warning: {failure}");
         }
     }
     let mut termination =

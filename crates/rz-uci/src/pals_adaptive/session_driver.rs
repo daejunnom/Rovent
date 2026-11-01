@@ -4632,6 +4632,10 @@ mod tests {
             physical_shutdown_confirmed: true,
             physical_failure: None,
             semantic_failure: None,
+            runtime_mapping_status:
+                crate::pals_native::ticketed::TicketRuntimeMappingStatus::Unknown,
+            system_placement_status:
+                crate::pals_native::ticketed::TicketSystemPlacementStatus::Incomplete,
             session_release: Some(rz_eval::worker::SessionReleased {
                 completed_synchronous_runs: 0,
             }),
@@ -4639,6 +4643,18 @@ mod tests {
         let original = NativeSessionReleaseObservation::from_report(&report, true).unwrap();
         let snapshot = NativeSessionReleaseObservation::from_report(&report, false).unwrap();
         assert_eq!(original.release().completed_synchronous_runs, 0);
+        assert_eq!(
+            original.runtime_mapping_status(),
+            crate::pals_native::ticketed::TicketRuntimeMappingStatus::Unknown
+        );
+        assert_eq!(
+            snapshot.runtime_mapping_status(),
+            crate::pals_native::ticketed::TicketRuntimeMappingStatus::Unknown
+        );
+        assert_eq!(
+            original.system_placement_status(),
+            crate::pals_native::ticketed::TicketSystemPlacementStatus::Incomplete
+        );
         assert_eq!(
             original.source(),
             NativeSessionReleaseSource::OriginalReport

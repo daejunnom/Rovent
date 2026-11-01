@@ -221,6 +221,8 @@ impl TicketNativeBackend<View, u64> for Fake {
             physical_failure: None,
             session_release: None,
             semantic_failure: self.facts.finish_semantic_failure.lock().unwrap().take(),
+            runtime_mapping_status: TicketRuntimeMappingStatus::NotObserved,
+            system_placement_status: TicketSystemPlacementStatus::NotObserved,
         }
     }
 }

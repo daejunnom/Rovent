@@ -14,6 +14,8 @@ use rz_eval::pals_model::virtual_review::{
     self as model, PalsVirtualReviewInput, ReviewAnchorInput, ReviewExecutionIdentity,
 };
 use rz_eval::pals_model::{PalsModelConfig, PalsRawOutput, PalsRole};
+#[cfg(target_os = "linux")]
+use rz_eval::pals_onnx::SystemVirtualReviewCudaPlacementWitness;
 use rz_eval::pals_onnx::virtual_review::{
     PalsVirtualReviewOnnxBackend, VirtualReviewCompletion, VirtualReviewInvocation,
     VirtualReviewNativeCommand, VirtualReviewNativeResult,
@@ -178,6 +180,15 @@ pub trait VirtualReviewCollectionObserver: Send + 'static {
     ) -> Result<(), RoleFailure> {
         Ok(())
     }
+    /// System-runtime placement has a distinct witness and cannot be promoted
+    /// into the historical bundled-runtime witness domain.
+    #[cfg(target_os = "linux")]
+    fn system_runtime_audited(
+        &mut self,
+        _: &SystemVirtualReviewCudaPlacementWitness,
+    ) -> Result<(), RoleFailure> {
+        Ok(())
+    }
 }
 
 fn isolate_capture_failure(
@@ -235,6 +246,7 @@ pub struct NativeVirtualReviewTicketBackend {
     validator_present: bool,
     approximate_warm_capable: bool,
     virtual_cuda_placement_required: bool,
+    system_cuda_runtime_selected: bool,
     drain_limit: Duration,
     game: u64,
     execution_sequence: u64,
@@ -323,6 +335,7 @@ impl NativeVirtualReviewTicketBackend {
         let validator_present = backend.validator_present();
         let approximate_warm_capable = backend.approximate_warm_capable();
         let virtual_cuda_placement_required = backend.virtual_cuda_placement_required();
+        let system_cuda_runtime_selected = backend.system_cuda_runtime_selected();
         let game = backend.game_generation();
         let applied_session_settings = backend.applied_session_settings();
         #[cfg(feature = "native-validation-diagnostics")]
@@ -337,6 +350,7 @@ impl NativeVirtualReviewTicketBackend {
             validator_present,
             approximate_warm_capable,
             virtual_cuda_placement_required,
+            system_cuda_runtime_selected,
             drain_limit,
             game,
             execution_sequence: 0,
@@ -387,6 +401,7 @@ impl NativeVirtualReviewTicketBackend {
         let validator_present = backend.validator_present();
         let approximate_warm_capable = backend.approximate_warm_capable();
         let virtual_cuda_placement_required = backend.virtual_cuda_placement_required();
+        let system_cuda_runtime_selected = backend.system_cuda_runtime_selected();
         let game = backend.game_generation();
         let applied_session_settings = backend.applied_session_settings();
         // The opaque synchronous proof belongs to this exact backend and is
@@ -410,6 +425,7 @@ impl NativeVirtualReviewTicketBackend {
             validator_present,
             approximate_warm_capable,
             virtual_cuda_placement_required,
+            system_cuda_runtime_selected,
             drain_limit,
             game,
             execution_sequence: 0,
@@ -1235,12 +1251,16 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
         report.physical_shutdown_confirmed && report.semantic_failure.is_none()
     }
     fn finish_report(&mut self, until: Instant) -> TicketNativeFinishReport {
+        let mut runtime_mapping_status = TicketRuntimeMappingStatus::NotObserved;
+        let mut system_placement_status = TicketSystemPlacementStatus::NotObserved;
         if self.physical_unknown || self.outstanding.is_some() {
             return TicketNativeFinishReport {
                 physical_shutdown_confirmed: false,
                 physical_failure: Some(RoleFailure::PhysicalUnknown),
                 semantic_failure: self.game_reset_failure.clone(),
                 session_release: None,
+                runtime_mapping_status,
+                system_placement_status,
             };
         }
         let mut semantic_failure = self
@@ -1248,8 +1268,39 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
             .clone()
             .or_else(|| self.game_reset_failed.then_some(RoleFailure::InvalidOutput));
         if semantic_failure.is_none() && self.completed_nn_seen && !self.runtime_audited {
+            let mut system_placement_ready = false;
             semantic_failure = if Instant::now() >= until {
                 Some(RoleFailure::Expired)
+            } else if self.system_cuda_runtime_selected {
+                use rz_eval::pals_onnx::virtual_review::{
+                    RuntimeMappingObservation, SystemPlacementPrerequisites,
+                };
+                match self.execute_command(VirtualReviewNativeCommand::ObserveRuntimeMapping, until)
+                {
+                    Ok(VirtualReviewNativeResult::RuntimeMappingObserved {
+                        mapping,
+                        system_placement,
+                    }) => match mapping {
+                        RuntimeMappingObservation::NonCuda => Some(RoleFailure::InvalidOutput),
+                        RuntimeMappingObservation::Observed
+                        | RuntimeMappingObservation::Unknown => {
+                            runtime_mapping_status =
+                                if matches!(mapping, RuntimeMappingObservation::Observed) {
+                                    TicketRuntimeMappingStatus::Observed
+                                } else {
+                                    TicketRuntimeMappingStatus::Unknown
+                                };
+                            system_placement_ready =
+                                matches!(system_placement, SystemPlacementPrerequisites::Ready);
+                            if self.virtual_cuda_placement_required {
+                                system_placement_status = TicketSystemPlacementStatus::Incomplete;
+                            }
+                            None
+                        }
+                    },
+                    Ok(_) => Some(RoleFailure::InvalidOutput),
+                    Err(error) => Some(error),
+                }
             } else {
                 match self.execute_command(VirtualReviewNativeCommand::VerifyRuntime, until) {
                     Ok(VirtualReviewNativeResult::RuntimeVerified) => None,
@@ -1257,7 +1308,10 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                     Err(error) => Some(error),
                 }
             };
-            if semantic_failure.is_none() && self.virtual_cuda_placement_required {
+            if semantic_failure.is_none()
+                && self.virtual_cuda_placement_required
+                && !self.system_cuda_runtime_selected
+            {
                 // The actual loaded policy declares this V3 domain. VerifyRuntime
                 // checks dependencies/mappings first; this proof then seals all
                 // registered V3 roles and actual Fresh/seeded-Warm executions.
@@ -1286,7 +1340,66 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                     }
                 };
             }
-            self.runtime_audited = semantic_failure.is_none();
+            if semantic_failure.is_none()
+                && self.system_cuda_runtime_selected
+                && self.virtual_cuda_placement_required
+                && system_placement_ready
+                && runtime_mapping_status == TicketRuntimeMappingStatus::Observed
+            {
+                #[cfg(target_os = "linux")]
+                {
+                    semantic_failure = if Instant::now() >= until {
+                        Some(RoleFailure::Expired)
+                    } else {
+                        use rz_eval::pals_onnx::virtual_review::SystemPlacementObservation;
+                        match self.execute_command(
+                            VirtualReviewNativeCommand::ObserveSystemVirtualCudaPlacement,
+                            until,
+                        ) {
+                            Ok(VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved(
+                                SystemPlacementObservation::Verified(witness),
+                            )) => {
+                                let observed = self.observer.as_mut().map_or(Ok(()), |observer| {
+                                    observer.system_runtime_audited(&witness)
+                                });
+                                if observed.is_ok() {
+                                    system_placement_status =
+                                        TicketSystemPlacementStatus::Confirmed;
+                                }
+                                observed.err()
+                            }
+                            Ok(VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved(
+                                SystemPlacementObservation::MappingUnavailable,
+                            )) => {
+                                runtime_mapping_status = TicketRuntimeMappingStatus::Unknown;
+                                system_placement_status = TicketSystemPlacementStatus::Incomplete;
+                                None
+                            }
+                            Ok(VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved(
+                                SystemPlacementObservation::UnregisteredOrPreexistingMappings,
+                            )) => {
+                                system_placement_status =
+                                    TicketSystemPlacementStatus::UnregisteredOrPreexistingMappings;
+                                None
+                            }
+                            Ok(_) => Some(RoleFailure::InvalidOutput),
+                            Err(error) => Some(error),
+                        }
+                    };
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    semantic_failure = Some(RoleFailure::Unsupported(
+                        "system CUDA placement unavailable",
+                    ));
+                }
+            }
+            self.runtime_audited = semantic_failure.is_none()
+                && (!self.system_cuda_runtime_selected
+                    || runtime_mapping_status == TicketRuntimeMappingStatus::Observed)
+                && (!self.system_cuda_runtime_selected
+                    || !self.virtual_cuda_placement_required
+                    || system_placement_status == TicketSystemPlacementStatus::Confirmed);
             if self.physical_unknown || self.outstanding.is_some() {
                 // Unknown completion still owns native buffers/workspace. A
                 // semantic audit rejection cannot turn quarantine into a fence.
@@ -1295,6 +1408,8 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                     physical_failure: Some(RoleFailure::PhysicalUnknown),
                     semantic_failure,
                     session_release: None,
+                    runtime_mapping_status,
+                    system_placement_status,
                 };
             }
         }
@@ -1316,6 +1431,8 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                         physical_failure,
                         semantic_failure,
                         session_release,
+                        runtime_mapping_status,
+                        system_placement_status,
                     };
                 }
                 Poll::Pending if Instant::now() < until => {
@@ -1327,6 +1444,8 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                         physical_failure: Some(RoleFailure::Expired),
                         semantic_failure,
                         session_release: None,
+                        runtime_mapping_status,
+                        system_placement_status,
                     };
                 }
             }
@@ -1755,6 +1874,7 @@ mod tests {
             validator_present: false,
             approximate_warm_capable: false,
             virtual_cuda_placement_required: required,
+            system_cuda_runtime_selected: false,
             drain_limit: Duration::from_secs(1),
             game: 1,
             execution_sequence: 0,
@@ -1781,6 +1901,155 @@ mod tests {
             rz_eval::error::FailureStage::Backend,
             "mock known audit rejection",
         )
+    }
+
+    #[test]
+    fn system_mapping_unknown_drains_without_claiming_placement() {
+        use rz_eval::pals_onnx::virtual_review::{
+            RuntimeMappingObservation, SystemPlacementPrerequisites,
+        };
+        let worker =
+            SingleWorker::spawn(move |command: &VirtualReviewNativeCommand| match command {
+                VirtualReviewNativeCommand::ObserveRuntimeMapping => {
+                    Ok(VirtualReviewNativeResult::RuntimeMappingObserved {
+                        mapping: RuntimeMappingObservation::Unknown,
+                        system_placement: SystemPlacementPrerequisites::Ready,
+                    })
+                }
+                _ => panic!("unknown mapping must not issue a strict placement proof"),
+            })
+            .unwrap();
+        let mut backend = mock_finish_backend(worker, true);
+        backend.system_cuda_runtime_selected = true;
+        let report = backend.finish_report(Instant::now() + Duration::from_secs(2));
+        assert!(report.physical_shutdown_confirmed);
+        assert!(report.semantic_failure.is_none());
+        assert_eq!(
+            report.runtime_mapping_status,
+            TicketRuntimeMappingStatus::Unknown
+        );
+        assert_eq!(
+            report.system_placement_status,
+            TicketSystemPlacementStatus::Incomplete
+        );
+        assert!(!backend.runtime_audited);
+    }
+
+    #[test]
+    fn system_mapping_conflict_remains_failure_after_physical_drain() {
+        let worker = SingleWorker::spawn(move |command: &VirtualReviewNativeCommand| {
+            assert!(matches!(
+                command,
+                VirtualReviewNativeCommand::ObserveRuntimeMapping
+            ));
+            Err(BackendError::new(
+                rz_eval::error::FailureKind::IdentityMismatch,
+                rz_eval::error::FailureStage::Backend,
+                "fixture conflict",
+            ))
+        })
+        .unwrap();
+        let mut backend = mock_finish_backend(worker, true);
+        backend.system_cuda_runtime_selected = true;
+        let report = backend.finish_report(Instant::now() + Duration::from_secs(2));
+        assert!(report.physical_shutdown_confirmed);
+        assert!(report.semantic_failure.is_some());
+        assert_ne!(
+            report.system_placement_status,
+            TicketSystemPlacementStatus::Confirmed
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_placement_uses_system_command_after_typed_prerequisites() {
+        use rz_eval::pals_onnx::virtual_review::{
+            RuntimeMappingObservation, SystemPlacementPrerequisites,
+        };
+        let worker =
+            SingleWorker::spawn(move |command: &VirtualReviewNativeCommand| match command {
+                VirtualReviewNativeCommand::ObserveRuntimeMapping => {
+                    Ok(VirtualReviewNativeResult::RuntimeMappingObserved {
+                        mapping: RuntimeMappingObservation::Observed,
+                        system_placement: SystemPlacementPrerequisites::Ready,
+                    })
+                }
+                VirtualReviewNativeCommand::ObserveSystemVirtualCudaPlacement => {
+                    Err(mock_audit_failure())
+                }
+                _ => panic!("system runtime must not request a legacy witness"),
+            })
+            .unwrap();
+        let mut backend = mock_finish_backend(worker, true);
+        backend.system_cuda_runtime_selected = true;
+        let report = backend.finish_report(Instant::now() + Duration::from_secs(2));
+        assert!(report.physical_shutdown_confirmed);
+        assert!(report.semantic_failure.is_some());
+        assert_eq!(
+            report.runtime_mapping_status,
+            TicketRuntimeMappingStatus::Observed
+        );
+        assert_ne!(
+            report.system_placement_status,
+            TicketSystemPlacementStatus::Confirmed
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_placement_unavailable_after_initial_observation_is_not_a_shutdown_failure() {
+        use rz_eval::pals_onnx::virtual_review::{
+            RuntimeMappingObservation, SystemPlacementObservation, SystemPlacementPrerequisites,
+        };
+        for foreign in [false, true] {
+            let worker =
+                SingleWorker::spawn(move |command: &VirtualReviewNativeCommand| match command {
+                    VirtualReviewNativeCommand::ObserveRuntimeMapping => {
+                        Ok(VirtualReviewNativeResult::RuntimeMappingObserved {
+                            mapping: RuntimeMappingObservation::Observed,
+                            system_placement: SystemPlacementPrerequisites::Ready,
+                        })
+                    }
+                    VirtualReviewNativeCommand::ObserveSystemVirtualCudaPlacement => {
+                        let placement = if foreign {
+                            SystemPlacementObservation::UnregisteredOrPreexistingMappings
+                        } else {
+                            SystemPlacementObservation::MappingUnavailable
+                        };
+                        Ok(
+                            VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved(
+                                placement,
+                            ),
+                        )
+                    }
+                    _ => panic!("unexpected system audit command"),
+                })
+                .unwrap();
+            let mut backend = mock_finish_backend(worker, true);
+            backend.system_cuda_runtime_selected = true;
+            let report = backend.finish_report(Instant::now() + Duration::from_secs(2));
+            assert!(report.physical_shutdown_confirmed);
+            assert!(report.semantic_failure.is_none());
+            if foreign {
+                assert_eq!(
+                    report.runtime_mapping_status,
+                    TicketRuntimeMappingStatus::Observed
+                );
+                assert_eq!(
+                    report.system_placement_status,
+                    TicketSystemPlacementStatus::UnregisteredOrPreexistingMappings
+                );
+            } else {
+                assert_eq!(
+                    report.runtime_mapping_status,
+                    TicketRuntimeMappingStatus::Unknown
+                );
+                assert_eq!(
+                    report.system_placement_status,
+                    TicketSystemPlacementStatus::Incomplete
+                );
+            }
+        }
     }
 
     // 합성 worker 응답으로 제어 순서만 검사한다. 실제 CUDA kernel 증거가 아니다.

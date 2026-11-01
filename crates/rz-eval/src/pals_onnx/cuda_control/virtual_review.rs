@@ -387,43 +387,81 @@ impl PalsCudaControlPolicy {
         runtime: &OrtRuntime,
         declared_device_id: i32,
     ) -> Result<SystemVirtualReviewCudaPlacementWitness, BackendError> {
+        match self.observe_system_virtual_profiles(
+            profiles,
+            placements,
+            runtime,
+            declared_device_id,
+        )? {
+            super::super::virtual_review::SystemPlacementObservation::Verified(w) => Ok(*w),
+            _ => Err(policy_error(
+                "system CUDA runtime mappings could not be verified",
+            )),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_system_virtual_profiles(
+        &self,
+        profiles: &BTreeMap<String, Vec<u8>>,
+        placements: Vec<PalsGraphPlacement>,
+        runtime: &OrtRuntime,
+        declared_device_id: i32,
+    ) -> Result<super::super::virtual_review::SystemPlacementObservation, BackendError> {
         if declared_device_id < 0 {
             return Err(policy_error("system CUDA declared device is invalid"));
         }
         let system = runtime
             .system_runtime()
             .ok_or_else(|| policy_error("system CUDA placement requires a system runtime owner"))?;
-        let observed = system.verify_mappings().map_err(|cause| {
-            policy_error("system CUDA runtime mappings could not be verified")
-                .with_external_cause(CauseCode::RuntimeLibraryLoad, &cause)
-        })?;
+        // Profile errors must remain errors even when mapping evidence is unavailable.
+        let verified = self.verify_virtual_profiles_common(profiles, placements)?;
+        let observed = match system.verify_mappings() {
+            Ok(observed) => observed,
+            Err(cause) if cause.kind == rz_native_loader::LoadErrorKind::ObservationUnavailable => {
+                return Ok(super::super::virtual_review::SystemPlacementObservation::MappingUnavailable)
+            }
+            Err(cause) if cause.kind == rz_native_loader::LoadErrorKind::ForeignMapping => {
+                return Ok(super::super::virtual_review::SystemPlacementObservation::UnregisteredOrPreexistingMappings)
+            }
+            Err(cause) => {
+                return Err(
+                    policy_error("system CUDA runtime mappings could not be verified")
+                        .with_external_cause(CauseCode::RuntimeLibraryLoad, &cause),
+                )
+            }
+        };
         if observed.identity_sha256 != system.identity_sha256()
             || !observed.missing_required_roles.is_empty()
             || !observed.unregistered_native_mappings.is_empty()
         {
             return Err(policy_error("system CUDA mapping identity differs"));
         }
-        let verified = self.verify_virtual_profiles_common(profiles, placements)?;
-        Ok(SystemVirtualReviewCudaPlacementWitness {
-            schema: "rovezero.pals-virtual-system-cuda-placement.v1",
-            inventory_sha256: self.inventory,
-            manifest_sha256: self.manifest,
-            ort_sha256: runtime.binary_digest(),
-            system_runtime_identity_sha256: observed.identity_sha256,
-            declared_device_id,
-            mapped_roles: observed.mapped_roles,
-            missing_optional_roles: observed.missing_optional_roles,
-            layout: verified.layout,
-            artifact_kind: verified.artifact_kind,
-            optimization: PalsGraphOptimization::Disable,
-            initialization: verified.initialization,
-            kernels: verified.kernels,
-            validator_private_kernels: verified.validator_private_kernels,
-            validator_task_head_kernels: verified.validator_task_head_kernels,
-            warm_seed_identity_kernels: verified.warm_seed_identity_kernels,
-            physical_completion: "not_inferred",
-            category_provenance: "rc10-category-unavailable-id-location-message-used".into(),
-        })
+        Ok(
+            super::super::virtual_review::SystemPlacementObservation::Verified(Box::new(
+                SystemVirtualReviewCudaPlacementWitness {
+                    schema: "rovezero.pals-virtual-system-cuda-placement.v1",
+                    inventory_sha256: self.inventory,
+                    manifest_sha256: self.manifest,
+                    ort_sha256: runtime.binary_digest(),
+                    system_runtime_identity_sha256: observed.identity_sha256,
+                    declared_device_id,
+                    mapped_roles: observed.mapped_roles,
+                    missing_optional_roles: observed.missing_optional_roles,
+                    layout: verified.layout,
+                    artifact_kind: verified.artifact_kind,
+                    optimization: PalsGraphOptimization::Disable,
+                    initialization: verified.initialization,
+                    kernels: verified.kernels,
+                    validator_private_kernels: verified.validator_private_kernels,
+                    validator_task_head_kernels: verified.validator_task_head_kernels,
+                    warm_seed_identity_kernels: verified.warm_seed_identity_kernels,
+                    physical_completion: "not_inferred",
+                    category_provenance: "rc10-category-unavailable-id-location-message-used"
+                        .into(),
+                },
+            )),
+        )
     }
 
     fn verify_virtual_profiles_common(

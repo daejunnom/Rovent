@@ -386,6 +386,46 @@ pub struct VirtualReviewOwnerSnapshot {
     pub vram_peak_bytes: Option<u64>,
 }
 
+/// Per-owner shutdown observation, not provider execution or a GPU fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeMappingObservation {
+    NonCuda,
+    Observed,
+    Unknown,
+}
+
+/// Whether system-specific placement can be requested. Ready is not itself a
+/// placement witness, a completed inference, or a physical GPU fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemPlacementPrerequisites {
+    NotApplicable,
+    Incomplete,
+    Ready,
+}
+
+/// Strict system placement evidence is separate from physical completion.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SystemPlacementObservation {
+    Verified(Box<SystemVirtualReviewCudaPlacementWitness>),
+    MappingUnavailable,
+    UnregisteredOrPreexistingMappings,
+}
+
+fn system_placement_roles_complete(
+    proposer_seen: bool,
+    critic_seen: bool,
+    validator_required: bool,
+    validator_seen: bool,
+    warm_required: bool,
+    warm_seen: bool,
+) -> bool {
+    proposer_seen
+        && critic_seen
+        && (!validator_required || validator_seen)
+        && (!warm_required || warm_seen)
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum VirtualReviewNativeCommand {
     Evaluate(VirtualReviewInvocation),
@@ -418,12 +458,17 @@ pub enum VirtualReviewNativeCommand {
     NewGame,
     SnapshotStats,
     SnapshotOwner,
+    /// Observe without promoting absent mapping evidence to an engine failure.
+    ObserveRuntimeMapping,
     VerifyRuntime,
     VerifyCudaPlacement,
     VerifyVirtualCudaPlacement,
     /// System CUDA uses a separate witness; historical bundle evidence is not reused.
     #[cfg(target_os = "linux")]
     VerifySystemVirtualCudaPlacement,
+    /// Typed observation; unavailable is not a placement witness.
+    #[cfg(target_os = "linux")]
+    ObserveSystemVirtualCudaPlacement,
 }
 
 impl crate::worker::PhysicalScopedInput for VirtualReviewNativeCommand {
@@ -441,7 +486,7 @@ impl crate::worker::PhysicalScopedInput for VirtualReviewNativeCommand {
                     K::InvalidInput,
                     S::Admission,
                     "unscoped control or legacy command has no ticket work identity",
-                ))
+                ));
             }
         };
         if ticket.id.epoch != execution.epoch || ticket.authority.epoch != ticket.id.epoch {
@@ -606,11 +651,17 @@ pub enum VirtualReviewNativeResult {
     NewGame,
     Stats(PalsBackendStats),
     Owner(VirtualReviewOwnerSnapshot),
+    RuntimeMappingObserved {
+        mapping: RuntimeMappingObservation,
+        system_placement: SystemPlacementPrerequisites,
+    },
     RuntimeVerified,
     CudaPlacementVerified(Box<PalsCudaPlacementWitness>),
     VirtualCudaPlacementVerified(Box<VirtualReviewCudaPlacementWitness>),
     #[cfg(target_os = "linux")]
     SystemVirtualCudaPlacementVerified(Box<SystemVirtualReviewCudaPlacementWitness>),
+    #[cfg(target_os = "linux")]
+    SystemVirtualCudaPlacementObserved(SystemPlacementObservation),
 }
 
 /// V3 evidence is owned separately from the legacy P/C-only witness domain.
@@ -628,6 +679,9 @@ struct VirtualControlAudit {
     witness: Option<VirtualReviewCudaPlacementWitness>,
     #[cfg(target_os = "linux")]
     system_witness: Option<SystemVirtualReviewCudaPlacementWitness>,
+    // Once profile finalization starts it must never be repeated on these sessions.
+    #[cfg(target_os = "linux")]
+    system_profiles: Option<BTreeMap<String, Vec<u8>>>,
     rejected: Option<BackendError>,
 }
 
@@ -1392,6 +1446,8 @@ impl PalsVirtualReviewOnnxBackend {
             witness: None,
             #[cfg(target_os = "linux")]
             system_witness: None,
+            #[cfg(target_os = "linux")]
+            system_profiles: None,
             rejected: None,
         });
         let residency = PalsSessionResidency {
@@ -1717,6 +1773,67 @@ impl PalsVirtualReviewOnnxBackend {
         }
         Ok(())
     }
+    /// Observe current mapping evidence while preserving strict verification
+    /// for explicit placement/acceptance requests.
+    pub fn observe_runtime_mapping(&self) -> Result<RuntimeMappingObservation, BackendError> {
+        self.idle()?;
+        if !matches!(self.config.provider, Provider::Cuda { .. }) {
+            return Ok(RuntimeMappingObservation::NonCuda);
+        }
+        let observed = self.mapping.borrow_mut().observe_final_audit(|| {
+            self.runtime
+                .as_ref()
+                .expect("runtime owned")
+                .observe_cuda_runtime_mappings()
+        })?;
+        Ok(match observed {
+            CudaRuntimeMappingEvidence::Observed => RuntimeMappingObservation::Observed,
+            CudaRuntimeMappingEvidence::Unknown => RuntimeMappingObservation::Unknown,
+        })
+    }
+
+    /// Derive the runtime kind from this backend's actual retained owner.
+    pub fn system_cuda_runtime_selected(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(OrtRuntime::is_system_cuda)
+    }
+
+    fn system_placement_prerequisites(&self) -> Result<SystemPlacementPrerequisites, BackendError> {
+        if !self.system_cuda_runtime_selected() {
+            return Ok(SystemPlacementPrerequisites::NotApplicable);
+        }
+        if !matches!(self.config.provider, Provider::Cuda { .. }) {
+            return Err(fail(
+                K::IdentityMismatch,
+                S::Backend,
+                "system CUDA owner does not match the configured provider",
+            ));
+        }
+        let Some(audit) = self.audit.as_ref() else {
+            return Ok(SystemPlacementPrerequisites::Incomplete);
+        };
+        if let Some(cause) = &audit.rejected {
+            return Err(cause.clone());
+        }
+        #[cfg(target_os = "linux")]
+        if audit.system_witness.is_some() {
+            return Ok(SystemPlacementPrerequisites::Ready);
+        }
+        let ready = system_placement_roles_complete(
+            audit.proposer_seen,
+            audit.critic_seen,
+            self.sessions.validator.is_some(),
+            audit.validator_seen,
+            self.warm,
+            audit.warm_seed_seen,
+        );
+        Ok(if ready {
+            SystemPlacementPrerequisites::Ready
+        } else {
+            SystemPlacementPrerequisites::Incomplete
+        })
+    }
     pub fn verify_cuda_placement(&mut self) -> Result<PalsCudaPlacementWitness, BackendError> {
         // This compatibility method never re-labels V3 evidence as the legacy
         // P/C-only witness. Explicit V3 callers use the separate typed command.
@@ -1760,11 +1877,14 @@ impl PalsVirtualReviewOnnxBackend {
         // Missing role execution is a typed lack of evidence; keep profiles
         // open so a later actual role may supply evidence. Never warm up an NN
         // merely to manufacture an acceptance witness.
-        if !audit.proposer_seen
-            || !audit.critic_seen
-            || (self.sessions.validator.is_some() && !audit.validator_seen)
-            || (self.warm && !audit.warm_seed_seen)
-        {
+        if !system_placement_roles_complete(
+            audit.proposer_seen,
+            audit.critic_seen,
+            self.sessions.validator.is_some(),
+            audit.validator_seen,
+            self.warm,
+            audit.warm_seed_seen,
+        ) {
             return Err(fail(
                 K::BackendUnavailable,
                 S::Backend,
@@ -1823,6 +1943,20 @@ impl PalsVirtualReviewOnnxBackend {
     pub fn verify_system_virtual_cuda_placement(
         &mut self,
     ) -> Result<SystemVirtualReviewCudaPlacementWitness, BackendError> {
+        match self.observe_system_virtual_cuda_placement()? {
+            SystemPlacementObservation::Verified(witness) => Ok(*witness),
+            _ => Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "system CUDA placement evidence is unavailable",
+            )),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn observe_system_virtual_cuda_placement(
+        &mut self,
+    ) -> Result<SystemPlacementObservation, BackendError> {
         self.idle()?;
         let runtime = self.runtime.as_ref().expect("runtime owned");
         if !runtime.is_system_cuda() {
@@ -1852,57 +1986,73 @@ impl PalsVirtualReviewOnnxBackend {
         if let Some(cause) = &audit.rejected {
             return Err(cause.clone());
         }
-        if let Some(witness) = &audit.system_witness {
-            return Ok(witness.clone());
-        }
-        if !audit.proposer_seen
-            || !audit.critic_seen
-            || (self.sessions.validator.is_some() && !audit.validator_seen)
-            || (self.warm && !audit.warm_seed_seen)
-        {
+        // Even a previously verified witness cannot attest today's mapping.
+        // Reuse only the retained profile bytes, then recheck mappings below.
+        if !system_placement_roles_complete(
+            audit.proposer_seen,
+            audit.critic_seen,
+            self.sessions.validator.is_some(),
+            audit.validator_seen,
+            self.warm,
+            audit.warm_seed_seen,
+        ) {
             return Err(fail(
                 K::BackendUnavailable,
                 S::Backend,
                 "system V3 placement lacks validated execution for every registered private role",
             ));
         }
-        self.verify_runtime()?;
+        if self.observe_runtime_mapping()? == RuntimeMappingObservation::Unknown {
+            return Ok(SystemPlacementObservation::MappingUnavailable);
+        }
         let audit = self.audit.as_mut().expect("control policy checked");
-        let checked = (|| {
-            let finish = |session: &mut Session, role: &str| {
-                if let Some(directory) = &audit.profile_directory {
-                    audit
-                        .policy
-                        .finish_virtual_profile_owned(session, directory, role)
+        if audit.system_profiles.is_none() {
+            let collected = (|| {
+                let finish = |session: &mut Session, role: &str| {
+                    if let Some(directory) = &audit.profile_directory {
+                        audit
+                            .policy
+                            .finish_virtual_profile_owned(session, directory, role)
+                    } else {
+                        audit
+                            .policy
+                            .finish_virtual_profile(session, &audit.profile_root, role)
+                    }
+                };
+                let public = finish(self.sessions.public.as_mut().expect("public"), "public")?;
+                let private_role = if self.warm {
+                    "shared_warm"
                 } else {
-                    audit
-                        .policy
-                        .finish_virtual_profile(session, &audit.profile_root, role)
+                    "shared_pc"
+                };
+                let pc = finish(self.sessions.shared_pc.as_mut().expect("P/C"), private_role)?;
+                let mut profiles =
+                    BTreeMap::from([("public".into(), public), (private_role.into(), pc)]);
+                if let Some(validator) = &mut self.sessions.validator {
+                    profiles.insert("validator".into(), finish(validator, "validator")?);
                 }
-            };
-            let public = finish(self.sessions.public.as_mut().expect("public"), "public")?;
-            let private_role = if self.warm {
-                "shared_warm"
-            } else {
-                "shared_pc"
-            };
-            let pc = finish(self.sessions.shared_pc.as_mut().expect("P/C"), private_role)?;
-            let mut profiles =
-                BTreeMap::from([("public".into(), public), (private_role.into(), pc)]);
-            if let Some(validator) = &mut self.sessions.validator {
-                profiles.insert("validator".into(), finish(validator, "validator")?);
+                Ok::<_, BackendError>(profiles)
+            })();
+            match collected {
+                Ok(profiles) => audit.system_profiles = Some(profiles),
+                Err(error) => {
+                    audit.rejected = Some(error.clone());
+                    return Err(error);
+                }
             }
-            audit.policy.verify_system_virtual_profiles(
-                &profiles,
-                audit.initialization.to_vec(),
-                runtime,
-                device_id,
-            )
-        })();
+        }
+        let checked = audit.policy.observe_system_virtual_profiles(
+            audit.system_profiles.as_ref().expect("profiles retained"),
+            audit.initialization.to_vec(),
+            runtime,
+            device_id,
+        );
         match checked {
-            Ok(witness) => {
-                audit.system_witness = Some(witness.clone());
-                Ok(witness)
+            Ok(observation) => {
+                if let SystemPlacementObservation::Verified(witness) = &observation {
+                    audit.system_witness = Some((**witness).clone());
+                }
+                Ok(observation)
             }
             Err(error) => {
                 audit.rejected = Some(error.clone());
@@ -2387,6 +2537,17 @@ impl PalsVirtualReviewOnnxBackend {
             VirtualReviewNativeCommand::SnapshotOwner => self
                 .idle()
                 .map(|()| VirtualReviewNativeResult::Owner(self.owner_snapshot())),
+            VirtualReviewNativeCommand::ObserveRuntimeMapping => {
+                self.observe_runtime_mapping().and_then(|mapping| {
+                    self.system_placement_prerequisites()
+                        .map(
+                            |system_placement| VirtualReviewNativeResult::RuntimeMappingObserved {
+                                mapping,
+                                system_placement,
+                            },
+                        )
+                })
+            }
             VirtualReviewNativeCommand::VerifyRuntime => self
                 .verify_runtime()
                 .map(|()| VirtualReviewNativeResult::RuntimeVerified),
@@ -2396,6 +2557,10 @@ impl PalsVirtualReviewOnnxBackend {
             VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => self
                 .verify_virtual_cuda_placement()
                 .map(|w| VirtualReviewNativeResult::VirtualCudaPlacementVerified(Box::new(w))),
+            #[cfg(target_os = "linux")]
+            VirtualReviewNativeCommand::ObserveSystemVirtualCudaPlacement => self
+                .observe_system_virtual_cuda_placement()
+                .map(|w| VirtualReviewNativeResult::SystemVirtualCudaPlacementObserved(w)),
             #[cfg(target_os = "linux")]
             VirtualReviewNativeCommand::VerifySystemVirtualCudaPlacement => {
                 self.verify_system_virtual_cuda_placement().map(|w| {
@@ -2679,6 +2844,28 @@ fn extract_role_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_prerequisites_require_only_registered_roles_and_warm_seed() {
+        assert!(system_placement_roles_complete(
+            true, true, false, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            false, true, false, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            true, false, false, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            true, true, true, false, false, false
+        ));
+        assert!(!system_placement_roles_complete(
+            true, true, false, false, true, false
+        ));
+        assert!(system_placement_roles_complete(
+            true, true, true, true, true, true
+        ));
+    }
     use crate::pals_model::PalsCandidateToken;
     use model::{
         ReviewAnchorInput, ReviewQueryInput, ReviewQueryPurpose, ReviewRecordInput,

@@ -436,8 +436,32 @@ pub trait TicketNativeBackend<V, Q>: Send + 'static {
             physical_failure: None,
             semantic_failure: None,
             session_release: None,
+            runtime_mapping_status: TicketRuntimeMappingStatus::NotObserved,
+            system_placement_status: TicketSystemPlacementStatus::NotObserved,
         }
     }
+}
+
+/// Runtime mapping observations are separate from strict placement acceptance,
+/// neural execution and physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketRuntimeMappingStatus {
+    NotObserved,
+    NonCuda,
+    Observed,
+    Unknown,
+}
+
+/// A placement witness covers only this system-runtime product scope. An
+/// incomplete observation is never an accepted witness or a GPU fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketSystemPlacementStatus {
+    NotObserved,
+    Incomplete,
+    /// Mappings include an identity outside the strict plan or predate its capture.
+    /// This does not establish a mapping conflict or constitute an accepted witness.
+    UnregisteredOrPreexistingMappings,
+    Confirmed,
 }
 
 /// Physical completion permits resource release; it does not imply that all
@@ -449,6 +473,8 @@ pub struct TicketNativeFinishReport {
     pub semantic_failure: Option<RoleFailure>,
     /// This owner's normal session release, not a GPU-wide fence or Run receipt.
     pub session_release: Option<rz_eval::worker::SessionReleased>,
+    pub runtime_mapping_status: TicketRuntimeMappingStatus,
+    pub system_placement_status: TicketSystemPlacementStatus,
 }
 
 fn take_observation_failures<V, Q, B: TicketNativeBackend<V, Q>>(

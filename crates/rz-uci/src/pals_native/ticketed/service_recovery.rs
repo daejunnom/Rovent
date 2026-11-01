@@ -125,6 +125,8 @@ pub(super) fn run_worker_loop<
                         physical_failure: None,
                         semantic_failure: None,
                         session_release: None,
+                        runtime_mapping_status: TicketRuntimeMappingStatus::NotObserved,
+                        system_placement_status: TicketSystemPlacementStatus::NotObserved,
                     }
                 }
             };

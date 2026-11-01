@@ -1482,18 +1482,34 @@ impl CudaMappingAudit {
                 "PALS full CUDA audit requires a completed native Run",
             ));
         }
+        match self.observe_final_audit(full_audit)? {
+            CudaRuntimeMappingEvidence::Observed => Ok(()),
+            CudaRuntimeMappingEvidence::Unknown => Err(fail(
+                K::BackendUnavailable,
+                S::Backend,
+                "PALS CUDA mapping observation is unavailable",
+            )),
+        }
+    }
+
+    /// Production shutdown can retain an unavailable observation without
+    /// calling it a successful strict audit or a physical completion fence.
+    fn observe_final_audit(
+        &mut self,
+        full_audit: impl FnOnce() -> Result<CudaRuntimeMappingEvidence, BackendError>,
+    ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+        self.allow_run()?;
+        if matches!(self, Self::AwaitingFirstRun) {
+            return Ok(CudaRuntimeMappingEvidence::Unknown);
+        }
         match full_audit() {
             Ok(CudaRuntimeMappingEvidence::Observed) => {
                 *self = Self::Confirmed;
-                Ok(())
+                Ok(CudaRuntimeMappingEvidence::Observed)
             }
             Ok(CudaRuntimeMappingEvidence::Unknown) => {
                 *self = Self::ObservationUnknown;
-                Err(fail(
-                    K::BackendUnavailable,
-                    S::Backend,
-                    "PALS CUDA mapping observation is unavailable",
-                ))
+                Ok(CudaRuntimeMappingEvidence::Unknown)
             }
             Err(mut failure) => {
                 failure.detail =
@@ -6460,6 +6476,41 @@ mod tests {
                 .unwrap_err(),
             failure
         );
+    }
+
+    #[test]
+    fn shutdown_mapping_observation_keeps_unknown_distinct_from_conflict() {
+        let mut phase = CudaMappingAudit::default();
+        assert_eq!(
+            phase
+                .observe_final_audit(|| panic!("no run must not claim a fresh audit"))
+                .unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        phase
+            .after_run_observed(true, || Ok(CudaRuntimeMappingEvidence::Unknown))
+            .unwrap();
+        assert_eq!(
+            phase
+                .observe_final_audit(|| Ok(CudaRuntimeMappingEvidence::Unknown))
+                .unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
+        assert!(phase
+            .final_audit_observed(|| Ok(CudaRuntimeMappingEvidence::Unknown))
+            .is_err());
+        phase.allow_run().unwrap();
+        assert_eq!(
+            phase
+                .observe_final_audit(|| Ok(CudaRuntimeMappingEvidence::Observed))
+                .unwrap(),
+            CudaRuntimeMappingEvidence::Observed
+        );
+        let failure = phase
+            .observe_final_audit(|| Err(fail(K::IdentityMismatch, S::Backend, "conflict")))
+            .unwrap_err();
+        assert_eq!(failure.kind, K::IdentityMismatch);
+        assert!(phase.allow_run().is_err());
     }
 
     #[test]
