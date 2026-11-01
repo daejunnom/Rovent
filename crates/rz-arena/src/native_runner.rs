@@ -866,6 +866,71 @@ mod physical_guard_tests {
             .expect("caller can recover without fallback capacity");
         assert_eq!(caller_owned.process.stdout, b"out");
         assert_eq!(caller_owned.original_error.as_deref(), Some("save failed"));
+
+        let mut pending = GuardedProbeReservation::acquire(
+            u64::MAX - 4,
+            "input".into(),
+            "pair",
+            "runner",
+            256 * 1024,
+        );
+        pending.process_available = true;
+        let mut failure = NativePairFailure::<rz_experiments::LockedIntegrationPairSpecV1> {
+            cause: ArenaError::Io("save failed".into()),
+            receipt: None,
+            receipt_artifact: None,
+            bundle: NativeRunBundle {
+                owner: None,
+                process: Some(caller_owned.process),
+                receipt: None,
+                receipt_artifact: None,
+                original_error: Some("save failed".into()),
+                guarded_preflight_failures: Vec::new(),
+                probe_evidence: Some(pending),
+                spawn_custody: crate::process::SpawnCustody::default(),
+                physical_guard_required: true,
+            },
+        };
+        let refused = failure.with_guarded_evidence(|view| {
+            assert_eq!(view.process.stdout, b"out");
+            Err::<(), _>("storage unavailable")
+        });
+        assert_eq!(refused, Err("storage unavailable"));
+        assert!(failure.process().is_some());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = failure.with_guarded_evidence::<(), ()>(|_| panic!("save interrupted"));
+        }));
+        assert!(panic.is_err());
+        assert!(
+            failure
+                .bundle
+                .probe_evidence
+                .as_ref()
+                .unwrap()
+                .persistence_failed
+        );
+        failure
+            .bundle
+            .spawn_custody
+            .pending
+            .store(true, Ordering::Release);
+        let saved = failure.with_guarded_evidence(|view| {
+            assert!(view.physical_or_process_completion_unknown);
+            Ok::<_, ()>(view.process.stdout.len())
+        });
+        assert_eq!(saved, Ok(Some(3)));
+        assert!(failure.bundle.unresolved());
+        assert!(failure.take_guarded_evidence().is_none());
+        // This state-only test did not spawn a child or construct an owner.
+        failure
+            .bundle
+            .spawn_custody
+            .pending
+            .store(false, Ordering::Release);
+        let evidence = failure
+            .take_guarded_evidence()
+            .expect("callback success did not release original evidence");
+        assert_eq!(evidence.process.stdout, b"out");
     }
 }
 impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
@@ -895,10 +960,13 @@ impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
             }
             return;
         }
-        crate::native_launch::close_native_admission();
         let physical_lifetime_unknown = self.physical_guard_required
             && (self.spawn_custody.pending.load(Ordering::Acquire)
                 || self.spawn_custody.child().is_some());
+        // A reaped leader and a gone process group do not prove that no child
+        // escaped into a new session. Keep the whole resource protected until
+        // a supervisor-owned, independently verified tree fence exists.
+        crate::native_launch::close_native_admission();
         let retained = Box::new(RetainedNativeScope {
             _owner: Box::new(self.owner.take().expect("native bundle owns its lease")),
             process: self.process.take(),
@@ -916,17 +984,10 @@ impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
                 probe: p.probe,
             }),
         });
-        // The active lease forbids a second unresolved bundle. Do not abort the
-        // parent: abort would not ensure its runner/process group is terminated.
-        // A busy/poisoned synchronization boundary must not free child inputs.
-        match QUARANTINE.try_lock() {
-            Ok(mut slot) => retain_in_slot(&mut slot, retained),
-            Err(TryLockError::Poisoned(error)) => retain_in_slot(&mut error.into_inner(), retained),
-            Err(TryLockError::WouldBlock) => {
-                QUARANTINE_FALLBACK.store(true, Ordering::Release);
-                std::mem::forget(retained);
-            }
-        }
+        // The mutex protects only a short vector append; transient contention must not
+        // turn an otherwise recoverable owner into an inaccessible leak.
+        let mut slots = QUARANTINE.lock().unwrap_or_else(|e| e.into_inner());
+        retain_in_slot(&mut slots, retained);
     }
 }
 struct RetainedNativeScope {
@@ -949,14 +1010,14 @@ pub struct GuardedProbeScope {
     pub role: &'static str,
     pub probe: &'static str,
 }
-static QUARANTINE: Mutex<Option<Box<RetainedNativeScope>>> = Mutex::new(None);
+static QUARANTINE: Mutex<Vec<Box<RetainedNativeScope>>> = Mutex::new(Vec::new());
 static QUARANTINE_FALLBACK: AtomicBool = AtomicBool::new(false);
-fn retain_in_slot(slot: &mut Option<Box<RetainedNativeScope>>, retained: Box<RetainedNativeScope>) {
-    if slot.is_none() {
-        *slot = Some(retained);
+fn retain_in_slot(slots: &mut Vec<Box<RetainedNativeScope>>, retained: Box<RetainedNativeScope>) {
+    if slots.try_reserve(1).is_ok() {
+        slots.push(retained);
     } else {
-        // Never overwrite an owned scope. This can only be an invariant failure
-        // because the unreleased first lease prevents a second admission.
+        // Drop cannot return an allocation error. Preserve the complete owner
+        // rather than dropping live inputs; the fallback is observable.
         QUARANTINE_FALLBACK.store(true, Ordering::Release);
         std::mem::forget(retained);
     }
@@ -968,10 +1029,16 @@ pub struct NativeQuarantineStatus {
     pub slot_observed: bool,
     pub slot_busy: bool,
     pub bounded_fallback_retained: bool,
+    /// At least one owner remains preserved without an enumerable handle; its
+    /// identity and the number of such owners are unknown.
+    pub unobservable_owner_fallback: bool,
+    /// All scopes stay owned; the legacy detail fields describe the first.
+    pub retained_scope_count: usize,
     pub process_id: Option<u32>,
     pub pending_leader_handle: Option<bool>,
     pub receipt_retained: bool,
     pub original_error_retained: bool,
+    pub original_error: Option<String>,
     /// Separate from process-group state; absent for historical providers and
     /// never a claim that their physical GPU completion was observed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1004,18 +1071,19 @@ fn guarded_process_is_previous(
 ) -> bool {
     physical_unknown && process_pid.is_some() && (current_child_held || process_pid != current_pid)
 }
-/// Passive, nonblocking observation only. No numeric-PID signal, wait/reap,
-/// release, deletion, retry or reopening of native admission is provided.
-pub fn native_quarantine_status() -> NativeQuarantineStatus {
-    let mut status = NativeQuarantineStatus {
+fn empty_quarantine_status() -> NativeQuarantineStatus {
+    NativeQuarantineStatus {
         admission_closed: crate::native_admission_closed(),
         slot_observed: false,
         slot_busy: false,
         bounded_fallback_retained: QUARANTINE_FALLBACK.load(Ordering::Acquire),
+        unobservable_owner_fallback: QUARANTINE_FALLBACK.load(Ordering::Acquire),
+        retained_scope_count: 0,
         process_id: None,
         pending_leader_handle: None,
         receipt_retained: false,
         original_error_retained: false,
+        original_error: None,
         guarded_physical_lifetime_unknown: None,
         guarded_last_spawn_pid: None,
         guarded_original_spawn_handle_retained: None,
@@ -1024,60 +1092,149 @@ pub fn native_quarantine_status() -> NativeQuarantineStatus {
         guarded_spawn_raw_evidence_incomplete: None,
         guarded_probe_scope: None,
         guarded_interrupted_by_unwind: None,
-    };
-    let read = |slot: &Option<Box<RetainedNativeScope>>, status: &mut NativeQuarantineStatus| {
-        status.slot_observed = true;
-        if let Some(scope) = slot {
-            let current_pid = scope
-                .spawned_child
+    }
+}
+
+fn observe_quarantine_scope(
+    slot: Option<&RetainedNativeScope>,
+    status: &mut NativeQuarantineStatus,
+) {
+    status.slot_observed = true;
+    if let Some(scope) = slot {
+        let current_pid = scope
+            .spawned_child
+            .as_ref()
+            .map(std::process::Child::id)
+            .or(scope.last_spawn_pid);
+        let previous_process = guarded_process_is_previous(
+            scope.physical_lifetime_unknown,
+            scope.spawned_child.is_some(),
+            current_pid,
+            scope.process.as_ref().map(|process| process.receipt.pid),
+        );
+        if previous_process {
+            status.guarded_previous_probe_pid =
+                scope.process.as_ref().map(|process| process.receipt.pid);
+        } else {
+            status.process_id = scope.process.as_ref().map(|process| process.receipt.pid);
+            status.pending_leader_handle = scope
+                .process
                 .as_ref()
-                .map(std::process::Child::id)
-                .or(scope.last_spawn_pid);
-            let previous_process = guarded_process_is_previous(
-                scope.physical_lifetime_unknown,
-                scope.spawned_child.is_some(),
-                current_pid,
-                scope.process.as_ref().map(|process| process.receipt.pid),
-            );
-            if previous_process {
-                status.guarded_previous_probe_pid =
-                    scope.process.as_ref().map(|process| process.receipt.pid);
-            } else {
-                status.process_id = scope.process.as_ref().map(|process| process.receipt.pid);
-                status.pending_leader_handle = scope
-                    .process
-                    .as_ref()
-                    .map(|process| process.pending_child.is_some());
-            }
-            status.receipt_retained = scope.receipt.is_some();
-            status.original_error_retained = scope.original_error.is_some();
-            status.guarded_preflight_failures = scope.guarded_preflight_failures.clone();
-            status.guarded_probe_scope = scope.guarded_probe_scope.clone();
-            if scope.physical_lifetime_unknown {
-                status.guarded_interrupted_by_unwind = Some(scope.interrupted_by_unwind);
-            }
-            if scope.physical_lifetime_unknown {
-                status.guarded_physical_lifetime_unknown = Some(true);
-                status.guarded_spawn_raw_evidence_incomplete = Some(
-                    scope.spawned_child.is_some() || previous_process || scope.process.is_none(),
-                );
-                status.guarded_last_spawn_pid = current_pid;
-                status.guarded_original_spawn_handle_retained = Some(
-                    scope.spawned_child.is_some()
-                        || scope.process.as_ref().is_some_and(|process| {
-                            Some(process.receipt.pid) == current_pid
-                                && process.pending_child.is_some()
-                        }),
-                );
-            }
+                .map(|process| process.pending_child.is_some());
         }
-    };
+        status.receipt_retained = scope.receipt.is_some();
+        status.original_error_retained = scope.original_error.is_some();
+        status.original_error = scope.original_error.clone();
+        status.guarded_preflight_failures = scope.guarded_preflight_failures.clone();
+        status.guarded_probe_scope = scope.guarded_probe_scope.clone();
+        if scope.physical_lifetime_unknown {
+            status.guarded_interrupted_by_unwind = Some(scope.interrupted_by_unwind);
+        }
+        if scope.physical_lifetime_unknown {
+            status.guarded_physical_lifetime_unknown = Some(true);
+            status.guarded_spawn_raw_evidence_incomplete =
+                Some(scope.spawned_child.is_some() || previous_process || scope.process.is_none());
+            status.guarded_last_spawn_pid = current_pid;
+            status.guarded_original_spawn_handle_retained = Some(
+                scope.spawned_child.is_some()
+                    || scope.process.as_ref().is_some_and(|process| {
+                        Some(process.receipt.pid) == current_pid && process.pending_child.is_some()
+                    }),
+            );
+        }
+    }
+}
+
+/// Passive, nonblocking observation only. No numeric-PID signal, wait/reap,
+/// release, deletion, retry or reopening of native admission is provided.
+pub fn native_quarantine_status() -> NativeQuarantineStatus {
+    let mut status = empty_quarantine_status();
     match QUARANTINE.try_lock() {
-        Ok(slot) => read(&slot, &mut status),
-        Err(TryLockError::Poisoned(e)) => read(&e.into_inner(), &mut status),
+        Ok(slots) => {
+            status.retained_scope_count = slots.len();
+            observe_quarantine_scope(slots.first().map(Box::as_ref), &mut status);
+        }
+        Err(TryLockError::Poisoned(e)) => {
+            let slots = e.into_inner();
+            status.retained_scope_count = slots.len();
+            observe_quarantine_scope(slots.first().map(Box::as_ref), &mut status);
+        }
         Err(TryLockError::WouldBlock) => status.slot_busy = true,
     }
     status
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeQuarantineSnapshot {
+    /// An owner is retained outside the enumerable list; its identity and
+    /// count are unknown. Never interpret an empty list as no owners if true.
+    pub unobservable_owner_fallback: bool,
+    pub scopes: Vec<NativeQuarantineStatus>,
+}
+
+/// Snapshot every enumerable owner. `None` means contention or allocation
+/// failure prevented a complete observation; it must not be treated as empty.
+/// The fallback flag on each result reports only that an owner was retained
+/// without an enumerable handle, not its identity or count.
+pub fn native_quarantine_statuses() -> Option<NativeQuarantineSnapshot> {
+    let slots = match QUARANTINE.try_lock() {
+        Ok(slots) => slots,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => return None,
+    };
+    snapshot_retained_scopes(&slots, QUARANTINE_FALLBACK.load(Ordering::Acquire))
+}
+
+fn snapshot_retained_scopes(
+    slots: &[Box<RetainedNativeScope>],
+    fallback: bool,
+) -> Option<NativeQuarantineSnapshot> {
+    let mut statuses = Vec::new();
+    statuses.try_reserve_exact(slots.len()).ok()?;
+    for scope in slots.iter() {
+        let mut status = empty_quarantine_status();
+        status.retained_scope_count = slots.len();
+        observe_quarantine_scope(Some(scope), &mut status);
+        statuses.push(status);
+    }
+    Some(NativeQuarantineSnapshot {
+        unobservable_owner_fallback: fallback,
+        scopes: statuses,
+    })
+}
+
+#[cfg(test)]
+mod quarantine_observation_tests {
+    use super::*;
+
+    #[test]
+    fn observes_each_owner_and_unenumerable_fallback_separately() {
+        let owner = |pid, message: &str| {
+            Box::new(RetainedNativeScope {
+                _owner: Box::new(()),
+                process: None,
+                spawned_child: None,
+                last_spawn_pid: Some(pid),
+                physical_lifetime_unknown: true,
+                receipt: None,
+                original_error: Some(message.into()),
+                guarded_preflight_failures: Vec::new(),
+                interrupted_by_unwind: false,
+                guarded_probe_scope: None,
+            })
+        };
+        let slots = vec![owner(11, "first"), owner(22, "second")];
+        let snapshot = snapshot_retained_scopes(&slots, true).unwrap();
+        assert!(snapshot.unobservable_owner_fallback);
+        assert_eq!(snapshot.scopes.len(), 2);
+        assert_eq!(snapshot.scopes[0].guarded_last_spawn_pid, Some(11));
+        assert_eq!(snapshot.scopes[1].guarded_last_spawn_pid, Some(22));
+        assert_eq!(snapshot.scopes[0].original_error.as_deref(), Some("first"));
+        assert_eq!(snapshot.scopes[1].original_error.as_deref(), Some("second"));
+        let empty = snapshot_retained_scopes(&[], true).unwrap();
+        assert!(empty.unobservable_owner_fallback);
+        assert!(empty.scopes.is_empty());
+    }
 }
 
 pub struct NativePairOutput<
@@ -1237,11 +1394,60 @@ pub struct NativePairFailure<
     pub receipt_artifact: Option<rz_experiments::ArtifactRef>,
     bundle: NativeRunBundle<S>,
 }
+
+/// Borrowed originals for a caller-controlled persistence operation. The
+/// caller must not report the callback as successful before its own durability
+/// requirements have been met. No data or GPU capability is copied here.
+pub struct GuardedEvidenceView<'a, A> {
+    pub run_id: u64,
+    pub input_sha256: &'a str,
+    pub role: &'static str,
+    pub probe: &'static str,
+    pub declared_output_limit_bytes: u64,
+    pub process: &'a ProcessOutput,
+    pub pair_receipt: Option<&'a NativePairReceipt<A>>,
+    pub original_error: &'a ArenaError,
+    pub failures: &'a [String],
+    pub physical_or_process_completion_unknown: bool,
+}
+
 impl<S: NativeProviderDeclaration> NativePairFailure<S> {
     /// Transfer original output and receipt when physical completion is known.
     /// The caller becomes responsible for durable storage of the returned data.
     pub fn take_guarded_evidence(&mut self) -> Option<GuardedPreflightEvidence> {
         self.bundle.take_evidence()
+    }
+    /// Let the original caller inspect or persist borrowed evidence. Callback
+    /// success is not proof of durable storage and never releases the original.
+    /// After independent storage verification the caller may explicitly take
+    /// custody with `take_guarded_evidence` when physical completion is known.
+    pub fn with_guarded_evidence<T, E>(
+        &mut self,
+        persist: impl FnOnce(GuardedEvidenceView<'_, S::Audit>) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        let Some(reservation) = self.bundle.probe_evidence.as_ref() else {
+            return Ok(None);
+        };
+        if !reservation.persistence_failed || !reservation.process_available {
+            return Ok(None);
+        }
+        let Some(process) = self.bundle.process.as_ref() else {
+            return Ok(None);
+        };
+        let result = persist(GuardedEvidenceView {
+            run_id: reservation.run_id,
+            input_sha256: &reservation.input_sha256,
+            role: reservation.role,
+            probe: reservation.probe,
+            declared_output_limit_bytes: reservation.output_limit_bytes,
+            process,
+            pair_receipt: self.bundle.receipt.as_ref(),
+            original_error: &self.cause,
+            failures: &self.bundle.guarded_preflight_failures,
+            physical_or_process_completion_unknown: self.bundle.unresolved(),
+        })?;
+        // A callback result cannot prove durable storage or a physical fence.
+        Ok(Some(result))
     }
     pub fn process(&self) -> Option<&ProcessOutput> {
         self.bundle.process.as_ref()
