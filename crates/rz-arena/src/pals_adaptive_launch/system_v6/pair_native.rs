@@ -3,7 +3,10 @@
 //! connected to the same original supervisor.
 
 use super::LockedPalsSystemArenaPairV6;
-use crate::{ArenaError, NativeEngineView, NativeLaunchDeclaration, NativePairView};
+use crate::{
+    ArenaError, NativeEngineView, NativeLaunchDeclaration, NativePairView,
+    NativeProviderDeclaration, NativeProviderSessionAudit,
+};
 use rz_experiments::{
     ArtifactRef, ManifestError, NativeEngineRole, NativeGameClockV3, NativePairClock,
     NativeRuntimeSourceV6, NativeTimeoutsV1,
@@ -82,6 +85,10 @@ impl NativeLaunchDeclaration for LockedPalsSystemArenaPairV6 {
         "PALS-system-V6"
     }
 
+    fn gpu_only_physical_guard(&self) -> bool {
+        true
+    }
+
     fn runtime_source_v6(&self, role: NativeEngineRole) -> Option<&NativeRuntimeSourceV6> {
         Some(
             &self
@@ -157,6 +164,84 @@ impl NativeLaunchDeclaration for LockedPalsSystemArenaPairV6 {
         // bound to the V6 child. This guard runs before snapshots or spawning.
         Err(ArenaError::Invalid(
             "PALS V6 native session owner and receipt consumer are not connected".into(),
+        ))
+    }
+}
+
+impl NativeProviderDeclaration for LockedPalsSystemArenaPairV6 {
+    type Audit = NativeProviderSessionAudit;
+
+    fn scope(&self) -> &'static str {
+        "pals_system_v6_unconnected_native_owner"
+    }
+
+    fn receipt_filename(&self) -> &'static str {
+        "pals-system-arena-receipt.v6.json"
+    }
+
+    fn receipt_version(&self) -> u32 {
+        6
+    }
+
+    fn startup_filename(&self) -> &'static str {
+        "pals-native-startup.v6.json"
+    }
+
+    fn termination_filename(&self) -> &'static str {
+        "pals-native-termination.v6.json"
+    }
+
+    fn requires_physical_lifetime_guard(&self) -> bool {
+        true
+    }
+
+    fn uses_provider_records(&self, _role: NativeEngineRole) -> Result<bool, ArenaError> {
+        Ok(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_external_preflight(
+        &self,
+        role: NativeEngineRole,
+        preflight: &crate::ExternalUciPreflight,
+        runtime_directory: &cap_std::fs::Dir,
+        _inputs: &crate::NativeProviderInputContext<'_>,
+    ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        self.validate_system_preflight_v6(role, preflight, runtime_directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_preflight_no_gpu(
+        &self,
+        role: NativeEngineRole,
+        _probe: crate::NativePreflightProbe,
+        process: &crate::ProcessOutput,
+        runtime_directory: &cap_std::fs::Dir,
+        inputs: &crate::NativeProviderInputContext<'_>,
+    ) -> Result<(), ArenaError> {
+        // Bind the metadata report to the original ProcessOutput, role-owned
+        // directory, startup lock and executable input pins. The child's own
+        // zero-session report plus OS exit does not prove no GPU was used.
+        // Standalone CPU preflight remains independently usable; only the
+        // guarded GPU pair retains its physical owner as unknown here.
+        let _report = self.observe_system_probe_v6(role, process, runtime_directory, inputs)?;
+        Err(ArenaError::Invalid(
+            "PALS V6 preflight GPU absence is independently unobserved".into(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_records(
+        &self,
+        _role: NativeEngineRole,
+        _startup: &[u8],
+        _termination: &[u8],
+        _session: &str,
+    ) -> Result<(Self::Audit, u32), ArenaError> {
+        // Neither system runtime receipts nor a terminated process on their
+        // own prove the original PALS session's lifetime and attribution.
+        Err(ArenaError::Invalid(
+            "PALS V6 game lifecycle receipt consumer is not connected".into(),
         ))
     }
 }

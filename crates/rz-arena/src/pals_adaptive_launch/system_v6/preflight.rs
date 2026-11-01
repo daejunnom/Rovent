@@ -44,6 +44,49 @@ struct PreflightWireV6 {
 }
 
 impl LockedPalsSystemArenaPairV6 {
+    /// Preserve metadata from a single original supervisor probe. A matching
+    /// child report and OS process exit do not independently prove that the
+    /// child never used a GPU. Callers must retain that observation separately.
+    pub(crate) fn observe_system_probe_v6(
+        &self,
+        role: NativeEngineRole,
+        process: &crate::ProcessOutput,
+        role_directory: &Dir,
+        inputs: &crate::NativeProviderInputContext<'_>,
+    ) -> Result<(String, Vec<u8>), ArenaError> {
+        use crate::{CleanupStatus, ProcessStop};
+
+        let endpoint = self.endpoint(role);
+        let pid = process.receipt.pid;
+        if pid == 0
+            || process.receipt.stop != ProcessStop::Exited
+            || process.receipt.exit_code != Some(0)
+            || process.receipt.group_cleanup != CleanupStatus::Gone
+            || !process.receipt.errors.is_empty()
+            || process.pending_child.is_some()
+        {
+            return Err(invalid("system preflight supervisor process did not close normally"));
+        }
+        // These are the original common owner's verified snapshot FDs. The
+        // child report's executable observation is still a child claim.
+        for expected in [&endpoint.startup_lock_artifact, &endpoint.startup_lock.config.endpoint.binary] {
+            let matches: Vec<_> = inputs.pins.iter().filter(|pin| pin.artifact == expected).collect();
+            if matches.len() != 1 {
+                return Err(invalid("system preflight lacks its original lock or binary pin"));
+            }
+            let metadata = matches[0].file.metadata().map_err(|_| invalid("system preflight input pin unavailable"))?;
+            if !metadata.is_file() || metadata.len() != expected.bytes {
+                return Err(invalid("system preflight input pin changed"));
+            }
+        }
+        let name = format!("preflight-process-{pid}");
+        let directory = role_directory.open_dir_nofollow(&name)
+            .map_err(|_| invalid("owned system preflight directory unavailable"))?;
+        let bytes = crate::native_runner::linux::read_file(&directory, "pals-system-preflight.v6.json", 64 << 10)?;
+        validate_preflight_record(&endpoint.startup_lock, pid, &bytes)?;
+        Ok((format!("{name}/pals-system-preflight.v6.json"), bytes))
+    }
+
     /// Bind both endpoints to the original supervisor's four distinct probe
     /// PIDs. This verifies their metadata reports, not model or GPU execution.
     pub fn validate_system_pair_preflights_v6(
