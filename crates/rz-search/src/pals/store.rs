@@ -648,7 +648,7 @@ pub enum RawScore {
 }
 
 impl RawScore {
-    fn model_dependencies(self) -> Option<[ObservationId; 2]> {
+    pub(crate) fn model_dependencies(self) -> Option<[ObservationId; 2]> {
         match self {
             Self::ConditionalWdl {
                 repaired: before,

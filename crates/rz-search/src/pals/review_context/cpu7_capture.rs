@@ -1,9 +1,9 @@
-//! Opt-in, selection-call-only capture of raw owned-CPU observations.
+//! Opt-in, selection-call-only capture of raw owned-CPU and model observations.
 //!
 //! This deliberately narrow projection is not a complete provenance sidecar,
 //! a teacher/physical-completion proof, or permission to publish/train. A
-//! selected model evidence body, external checker, or unsupported observation
-//! leaves this capture unavailable; the original view remains usable.
+//! external checker or unsupported observation leaves this capture unavailable;
+//! the original view remains usable. Model publication markers remain unknown.
 use super::*;
 use crate::cpu_checker::CheckerIdentity;
 use crate::pals::store::{LineChunk, LineId, Observation, RawScore};
@@ -259,6 +259,193 @@ fn borrowed_cpu(
     })
 }
 
+#[derive(Serialize)]
+struct BorrowedModelIdentity<'a> {
+    semantics: &'a str,
+    model: &'a str,
+    encoding: &'a str,
+    precision: &'a str,
+    model_epoch: &'a [u8; 32],
+}
+
+/// Floating-point bit patterns preserve the original payload without using
+/// neural output values as rules, teacher truth, or a new model input.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ModelScore {
+    Unknown,
+    Estimate {
+        value_bits: u32,
+        perspective: u8,
+    },
+    Wdl {
+        win_bits: u32,
+        draw_bits: u32,
+        loss_bits: u32,
+        perspective: u8,
+    },
+    ContextWdl {
+        win_bits: u32,
+        draw_bits: u32,
+        loss_bits: u32,
+        perspective: u8,
+        context_revision: u64,
+    },
+    ConditionalWdl {
+        expectation_bits: u32,
+        perspective: u8,
+        repaired: ObservationId,
+        counter: ObservationId,
+        context_revision: u64,
+    },
+    ConditionalRepairWdl {
+        expectation_bits: u32,
+        perspective: u8,
+        before: ObservationId,
+        after: ObservationId,
+        context_revision: u64,
+    },
+}
+
+#[derive(Serialize)]
+struct BorrowedModelObservation<'a> {
+    schema: &'static str,
+    kind: ObservationKind,
+    state: StateId,
+    line: Option<LineId>,
+    source: u64,
+    epoch: u64,
+    scope_model: u64,
+    scope_encoding: u64,
+    scope_input: u64,
+    model_value_identity: Option<BorrowedModelIdentity<'a>>,
+    model_value_input: Option<&'a [u8; 32]>,
+    score: ModelScore,
+    budget: u64,
+    supersedes: Option<ObservationId>,
+    execution: Option<crate::pals::store::ExecutionId>,
+    id: ObservationId,
+}
+
+fn borrowed_model(
+    id: ObservationId,
+    o: &Observation,
+) -> Result<BorrowedModelObservation<'_>, CaptureUnavailable> {
+    let (scope_model, scope_encoding, scope_input) = match o.scope {
+        EvidenceScope::Model {
+            model,
+            encoding,
+            input,
+        } if matches!(
+            o.kind,
+            ObservationKind::Proposal | ObservationKind::Refutation | ObservationKind::Repair
+        ) =>
+        {
+            (model, encoding, input)
+        }
+        _ => return Err(CaptureUnavailable::UnsupportedObservation),
+    };
+    if o.external_report.is_some()
+        || o.value_identity.is_some()
+        || o.checker_identity.is_some()
+        || o.checker_work.is_some()
+        || o.cpu_condition.is_some()
+        || o.cpu_pv.is_some()
+    {
+        return Err(CaptureUnavailable::UnsupportedObservation);
+    }
+    let perspective = |color| u8::from(color == Color::Black);
+    let score = match o.score {
+        RawScore::Unknown => ModelScore::Unknown,
+        RawScore::Estimate {
+            value,
+            perspective: color,
+        } => ModelScore::Estimate {
+            value_bits: value.to_bits(),
+            perspective: perspective(color),
+        },
+        RawScore::Wdl {
+            win,
+            draw,
+            loss,
+            perspective: color,
+        } => ModelScore::Wdl {
+            win_bits: win.to_bits(),
+            draw_bits: draw.to_bits(),
+            loss_bits: loss.to_bits(),
+            perspective: perspective(color),
+        },
+        RawScore::ContextWdl {
+            win,
+            draw,
+            loss,
+            perspective: color,
+            context_revision,
+        } => ModelScore::ContextWdl {
+            win_bits: win.to_bits(),
+            draw_bits: draw.to_bits(),
+            loss_bits: loss.to_bits(),
+            perspective: perspective(color),
+            context_revision,
+        },
+        RawScore::ConditionalWdl {
+            expectation,
+            perspective: color,
+            repaired,
+            counter,
+            context_revision,
+        } => ModelScore::ConditionalWdl {
+            expectation_bits: expectation.to_bits(),
+            perspective: perspective(color),
+            repaired,
+            counter,
+            context_revision,
+        },
+        RawScore::ConditionalRepairWdl {
+            expectation,
+            perspective: color,
+            before,
+            after,
+            context_revision,
+        } => ModelScore::ConditionalRepairWdl {
+            expectation_bits: expectation.to_bits(),
+            perspective: perspective(color),
+            before,
+            after,
+            context_revision,
+        },
+        _ => return Err(CaptureUnavailable::UnsupportedObservation),
+    };
+    let model_value_identity =
+        o.model_value_identity
+            .as_ref()
+            .map(|identity| BorrowedModelIdentity {
+                semantics: &identity.semantics,
+                model: &identity.model,
+                encoding: &identity.encoding,
+                precision: &identity.precision,
+                model_epoch: &identity.model_epoch,
+            });
+    Ok(BorrowedModelObservation {
+        schema: "rz-pals-cpu7-model-observation/1",
+        kind: o.kind,
+        state: o.state,
+        line: o.line,
+        source: o.source,
+        epoch: o.epoch,
+        scope_model,
+        scope_encoding,
+        scope_input,
+        model_value_identity,
+        model_value_input: o.model_value_input.as_ref(),
+        score,
+        budget: o.budget,
+        supersedes: o.supersedes,
+        execution: o.execution,
+        id,
+    })
+}
+
 fn push<T>(
     items: &mut Vec<T>,
     item: T,
@@ -369,9 +556,6 @@ pub(super) fn capture_selected_cpu_raw(
     let mut pending = Vec::new();
     for record in selected {
         out.check()?;
-        if record.evidence.is_some() {
-            return Err(CaptureUnavailable::UnsupportedSelectedEvidence);
-        }
         if record.record.kind == RecordKind::CpuVerification {
             let id = record
                 .record
@@ -388,6 +572,20 @@ pub(super) fn capture_selected_cpu_raw(
     }
     if pending.len() != 7 {
         return Err(CaptureUnavailable::MissingSource);
+    }
+    for record in selected {
+        out.check()?;
+        for id in [record.evidence, record.record.cpu_observation]
+            .into_iter()
+            .flatten()
+        {
+            if !pending.contains(&id) {
+                if pending.len() >= limits.max_observations {
+                    return Err(CaptureUnavailable::Capacity);
+                }
+                push(&mut pending, id, &mut out)?;
+            }
+        }
     }
     let mut seen = Vec::new();
     let mut line_pending = Vec::new();
@@ -406,11 +604,13 @@ pub(super) fn capture_selected_cpu_raw(
             .observations
             .get(id)
             .map_err(CaptureUnavailable::Store)?;
-        let raw = borrowed_cpu(id, o)?;
         if !seen.is_empty() {
             out.raw(b",")?;
         }
-        out.value(&raw)?;
+        match o.scope {
+            EvidenceScope::Model { .. } => out.value(&borrowed_model(id, o)?)?,
+            _ => out.value(&borrowed_cpu(id, o)?)?,
+        }
         push(&mut seen, id, &mut out)?;
         if !states.iter().any(|(s, _)| *s == o.state) {
             if states.len() >= limits.max_states {
@@ -435,7 +635,11 @@ pub(super) fn capture_selected_cpu_raw(
                 push(&mut line_pending, line, &mut out)?;
             }
         }
-        if let Some(previous) = o.supersedes {
+        for previous in o
+            .supersedes
+            .into_iter()
+            .chain(o.score.model_dependencies().into_iter().flatten())
+        {
             if !pending.contains(&previous) && !seen.contains(&previous) {
                 if pending.len() + seen.len() >= limits.max_observations {
                     return Err(CaptureUnavailable::Capacity);

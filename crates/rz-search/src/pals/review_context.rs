@@ -2227,6 +2227,223 @@ mod tests {
     }
 
     #[test]
+    fn cpu7_raw_capture_preserves_marker_model_dependencies_and_non_cpu_record_cpu() {
+        use super::super::store::{Observation, ObservationKind, RawScore};
+        let (mut stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::default();
+        let root_line = stores.lines.root(state).unwrap();
+        let p_line = stores.lines.append(root_line, &line("e2e4 e7e5")).unwrap();
+        let c_line = stores
+            .lines
+            .append(root_line, &line("e2e4 e7e5 g1f3"))
+            .unwrap();
+        let r_line = stores
+            .lines
+            .append(root_line, &line("e2e4 e7e5 b1c3"))
+            .unwrap();
+        let extra_cpu = cpu_fixture_observation(&mut stores, state, 40);
+        let marker = Observation {
+            state,
+            line: Some(p_line),
+            source: 2,
+            epoch: 0,
+            value_identity: None,
+            checker_identity: None,
+            checker_work: None,
+            external_report: None,
+            model_value_identity: None,
+            model_value_input: None,
+            cpu_condition: None,
+            cpu_pv: None,
+            scope: EvidenceScope::Model {
+                model: 2,
+                encoding: 3,
+                input: 4,
+            },
+            score: RawScore::Unknown,
+            budget: 0,
+            kind: ObservationKind::Proposal,
+            supersedes: None,
+            execution: None,
+        };
+        let marker_id = stores.observations.append(marker.clone()).unwrap();
+        let identity = crate::pals::value::ModelValueIdentity {
+            semantics: crate::pals::value::MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: "fixture-model".into(),
+            encoding: "fixture-encoding".into(),
+            precision: "fp32".into(),
+            model_epoch: [7; 32],
+        };
+        let mut position = Position::startpos();
+        position
+            .make_move(BoardMove::from_uci("e2e4").unwrap())
+            .unwrap();
+        let repaired_state = stores.states.insert(position.snapshot()).unwrap();
+        position
+            .make_move(BoardMove::from_uci("e7e5").unwrap())
+            .unwrap();
+        let counter_state = stores.states.insert(position.snapshot()).unwrap();
+        let mut repaired = marker.clone();
+        repaired.state = repaired_state;
+        repaired.line = None;
+        repaired.model_value_identity = Some(identity.clone());
+        repaired.model_value_input = Some([8; 32]);
+        repaired.score = RawScore::ContextWdl {
+            win: 0.1,
+            draw: 0.2,
+            loss: 0.7,
+            perspective: Color::Black,
+            context_revision: 43,
+        };
+        let repaired_id = stores.observations.append(repaired).unwrap();
+        let mut counter = marker.clone();
+        counter.state = counter_state;
+        counter.line = None;
+        counter.model_value_identity = Some(identity);
+        counter.model_value_input = Some([9; 32]);
+        counter.score = RawScore::ContextWdl {
+            win: 0.2,
+            draw: 0.3,
+            loss: 0.5,
+            perspective: Color::White,
+            context_revision: 43,
+        };
+        let counter_id = stores.observations.append(counter).unwrap();
+        let mut conditional = marker.clone();
+        conditional.kind = ObservationKind::Refutation;
+        conditional.line = Some(c_line);
+        conditional.supersedes = Some(marker_id);
+        conditional.score = RawScore::ConditionalWdl {
+            expectation: 0.2 - 0.5,
+            perspective: Color::White,
+            repaired: repaired_id,
+            counter: counter_id,
+            context_revision: 43,
+        };
+        let conditional_id = stores.observations.append(conditional).unwrap();
+        let mut repair = marker.clone();
+        repair.kind = ObservationKind::Repair;
+        repair.line = Some(r_line);
+        repair.supersedes = Some(conditional_id);
+        repair.score = RawScore::ConditionalRepairWdl {
+            expectation: 0.7 - 0.1,
+            perspective: Color::White,
+            before: counter_id,
+            after: repaired_id,
+            context_revision: 43,
+        };
+        let repair_id = stores.observations.append(repair).unwrap();
+        let mut p = record(state, 1, RecordKind::Proposal, "e2e4 e7e5", None);
+        p.cpu_observation = Some(extra_cpu);
+        let bundle = index.publish(&stores, &p, Some(marker_id)).unwrap();
+        let c = record(
+            state,
+            2,
+            RecordKind::Counterexample,
+            "e2e4 e7e5 g1f3",
+            Some(1),
+        );
+        index.publish(&stores, &c, Some(conditional_id)).unwrap();
+        let mut r = record(state, 3, RecordKind::Repair, "e2e4 e7e5 b1c3", Some(2));
+        r.supersedes_revision = Some(2);
+        index.publish(&stores, &r, Some(repair_id)).unwrap();
+        let mut expected = vec![
+            extra_cpu,
+            marker_id,
+            conditional_id,
+            repair_id,
+            repaired_id,
+            counter_id,
+        ];
+        for revision in 4..=10 {
+            let mut cpu = record(
+                state,
+                revision,
+                RecordKind::CpuVerification,
+                "e2e4 e7e5",
+                Some(if revision == 4 { 1 } else { revision - 1 }),
+            );
+            cpu.supersedes_revision = (revision > 4).then_some(revision - 1);
+            let id = cpu_fixture_observation(&mut stores, state, revision);
+            cpu.cpu_observation = Some(id);
+            expected.push(id);
+            index.publish(&stores, &cpu, None).unwrap();
+        }
+        let policy = ReviewSelectionPolicy {
+            required_bundle: Some(bundle),
+            mode: ReviewAnchorMode::AnchoredCompact,
+            ..ReviewSelectionPolicy::default()
+        };
+        let canceled = AtomicBool::new(false);
+        let mut control = cpu7_capture::CaptureControl {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            canceled: &canceled,
+            limits: cpu7_capture::CaptureLimits {
+                max_observations: 32,
+                max_line_chunks: 16,
+                max_states: 8,
+                max_owned_bytes: 1 << 17,
+                max_retained_history_bytes: 1 << 20,
+            },
+        };
+        let (_, result) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        let capture = result.unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(capture.observations_json()).unwrap();
+        let rows = raw.as_array().unwrap();
+        let actual: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row["id"].as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(actual, expected.iter().map(|id| id.0).collect());
+        let marker_wire = rows.iter().find(|row| row["id"] == marker_id.0).unwrap();
+        assert_eq!(marker_wire["score"]["kind"], "unknown");
+        assert!(marker_wire["model_value_identity"].is_null());
+        assert!(marker_wire["model_value_input"].is_null());
+        let conditional_wire = rows
+            .iter()
+            .find(|row| row["id"] == conditional_id.0)
+            .unwrap();
+        assert_eq!(conditional_wire["score"]["kind"], "conditional_wdl");
+        assert_eq!(conditional_wire["score"]["repaired"], repaired_id.0);
+        assert_eq!(conditional_wire["score"]["counter"], counter_id.0);
+        assert_eq!(conditional_wire["supersedes"], marker_id.0);
+        let repair_wire = rows.iter().find(|row| row["id"] == repair_id.0).unwrap();
+        assert_eq!(repair_wire["score"]["kind"], "conditional_repair_wdl");
+        assert_eq!(repair_wire["score"]["before"], counter_id.0);
+        assert_eq!(repair_wire["score"]["after"], repaired_id.0);
+        assert_eq!(repair_wire["supersedes"], conditional_id.0);
+        assert!(
+            rows.iter().find(|row| row["id"] == repaired_id.0).unwrap()["model_value_identity"]
+                .is_object()
+        );
+        assert_eq!(capture.states().len(), 3);
+        assert_eq!(capture.lines().len(), 4);
+        control.limits.max_observations = 7;
+        let (view, limited) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(view.is_cohort_cpu7());
+        assert!(matches!(
+            limited,
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+    }
+
+    #[test]
     fn cohort_cpu_prefix_keeps_required_repair_and_excludes_other_bundle() {
         let (mut stores, state) = stores(&Position::startpos());
         let mut index = ReviewContextIndex::default();
