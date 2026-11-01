@@ -2368,7 +2368,149 @@ fn experimental_worklist_visits_situation_task_and_reverse_edges_incrementally()
     }
     assert!(done);
     assert_eq!(legacy.into_completed().unwrap(), expected_legacy);
-    assert_eq!(store.expand_pins(seed).unwrap(), expected_legacy);
+    assert_eq!(store.expand_pins(seed.clone()).unwrap(), expected_legacy);
+    for interrupt_after in 0..steps - 1 {
+        let mut interrupted = Cursor::new_complex(seed.clone(), 128, true).unwrap();
+        for _ in 0..interrupt_after {
+            assert!(!interrupted.step(&store, &mut || Ok(())).unwrap());
+        }
+        assert!(matches!(
+            interrupted.step(&store, &mut || Err(StoreError::ArchiveDeadline)),
+            Err(super::partial_closure_cursor::Error::Store(
+                StoreError::ArchiveDeadline
+            ))
+        ));
+        assert!(matches!(
+            interrupted.into_completed(),
+            Err(super::partial_closure_cursor::Error::Unsupported)
+        ));
+    }
+}
+
+#[test]
+fn experimental_worklist_retains_resumed_paused_and_retired_pause_sources() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let focus = store.situations.get(root).unwrap().focus;
+    let consumer = TaskConsumer {
+        id: 91,
+        situation: root,
+        revision: 0,
+        generation: store.generation(),
+        deadline_tick: 100,
+    };
+    let task_key = key(state);
+    let TaskAdmission::Start(original) = store.request_task(task_key.clone(), consumer, 0).unwrap()
+    else {
+        panic!("fixture task")
+    };
+    let evidence = store.append_observation(observation(state)).unwrap();
+    // Store-only fixture. No CPU worker, checkpoint validity, or completion is asserted.
+    store.tasks.pause(original, 7, Some(evidence)).unwrap();
+    let TaskAdmission::Resume {
+        execution: resumed,
+        previous,
+        checkpoint,
+    } = store
+        .request_task(task_key, TaskConsumer { id: 92, ..consumer }, 1)
+        .unwrap()
+    else {
+        panic!("fixture resume")
+    };
+    assert_eq!((previous, checkpoint), (original, 7));
+    let mut seed = StorePins::default();
+    seed.executions.insert(resumed);
+    let expected = StorePins {
+        states: BTreeSet::from([state]),
+        lines: BTreeSet::from([focus]),
+        observations: BTreeSet::from([evidence]),
+        situations: BTreeSet::from([root]),
+        executions: BTreeSet::from([original, resumed]),
+    };
+    for retired in [false, true] {
+        if retired {
+            assert_eq!(
+                store.tasks.retire_paused_except(&BTreeSet::new()).unwrap(),
+                1
+            );
+            assert_eq!(
+                store.tasks.get(original).unwrap().status,
+                TaskStatus::RetiredPaused {
+                    checkpoint: 7,
+                    evidence: Some(evidence)
+                }
+            );
+        } else {
+            assert_eq!(
+                store.tasks.get(original).unwrap().status,
+                TaskStatus::Paused {
+                    checkpoint: 7,
+                    evidence: Some(evidence)
+                }
+            );
+        }
+        let mut cursor = Cursor::new_complex(seed.clone(), expected.count(), true).unwrap();
+        let mut done = false;
+        for _ in 0..128 {
+            if cursor.step(&store, &mut || Ok(())).unwrap() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(cursor.into_completed().unwrap(), expected);
+        assert_eq!(
+            store
+                .retirement_dependency_closure(&seed, expected.count())
+                .unwrap(),
+            expected
+        );
+        let mut limited = Cursor::new_complex(seed.clone(), expected.count() - 1, true).unwrap();
+        let result = loop {
+            match limited.step(&store, &mut || Ok(())) {
+                Ok(false) => {}
+                result => break result,
+            }
+        };
+        assert!(matches!(result, Err(Error::Store(StoreError::Capacity(_)))));
+        assert!(matches!(limited.into_completed(), Err(Error::Unsupported)));
+        assert!(matches!(
+            store.retirement_dependency_closure(&seed, expected.count() - 1),
+            Err(StoreError::Capacity(_))
+        ));
+    }
+}
+
+#[test]
+fn experimental_worklist_rejects_old_situation() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let focus = store.situations.get(root).unwrap().focus;
+    let old = store.situations.insert(state, focus).unwrap();
+    store.situations.remove(old).unwrap();
+    let replacement = store.situations.insert(state, focus).unwrap();
+    assert_eq!(old.slot, replacement.slot);
+    assert_ne!(old.generation, replacement.generation);
+    let mut old_seed = StorePins::default();
+    old_seed.situations.insert(old);
+    let mut stale = Cursor::new_complex(old_seed.clone(), 128, true).unwrap();
+    assert!(matches!(
+        stale.step(&store, &mut || Ok(())),
+        Err(Error::Store(StoreError::InvalidHandle(_)))
+    ));
+    assert!(matches!(stale.into_completed(), Err(Error::Unsupported)));
+    assert!(matches!(
+        store.retirement_dependency_closure(&old_seed, 128),
+        Err(StoreError::InvalidHandle(_))
+    ));
 }
 
 #[test]
