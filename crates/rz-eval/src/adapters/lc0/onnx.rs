@@ -830,20 +830,12 @@ fn classify_system_mapping(
     observation: &rz_native_loader::system::SystemMappingObservation,
     include_runtime: bool,
 ) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+    // A missing required role is incomplete evidence, not an observed
+    // identity conflict. SystemRuntime::observe_mappings already reports
+    // actual path/inode/lifetime conflicts as errors before this projection.
     if observation.availability == SystemMappingAvailability::Observed
-        && (!observation
-            .mapped_roles
-            .iter()
-            .any(|role| role == "ort-core")
-            || (include_runtime && !observation.missing_required_roles.is_empty()))
-    {
-        return Err(BackendError::new(
-            K::IdentityMismatch,
-            S::Backend,
-            "system runtime core or registered mappings differ",
-        ));
-    }
-    if observation.availability == SystemMappingAvailability::Observed
+        && observation.mapped_roles.iter().any(|role| role == "ort-core")
+        && (!include_runtime || observation.missing_required_roles.is_empty())
         && observation.preexisting_mapping_observed
         && observation.preexisting_native_mappings.is_empty()
         && observation.unregistered_native_mappings.is_empty()
@@ -860,7 +852,7 @@ mod system_mapping_evidence_tests {
     use rz_native_loader::system::SystemMappingObservation;
 
     #[test]
-    fn unavailable_is_unknown_but_observed_conflicts_fail() {
+    fn unavailable_and_missing_roles_remain_unknown() {
         let mut observation = SystemMappingObservation {
             identity_sha256: [0; 32],
             availability: SystemMappingAvailability::Unavailable,
@@ -878,7 +870,15 @@ mod system_mapping_evidence_tests {
             CudaRuntimeMappingEvidence::Unknown
         );
         observation.availability = SystemMappingAvailability::Observed;
+        // An observed map that does not yet show ORT core is incomplete; an
+        // identity conflict is reported separately by the system loader.
+        observation.preexisting_mapping_observed = true;
+        assert_eq!(
+            classify_system_mapping(&observation, false).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
         observation.mapped_roles.push("ort-core".into());
+        observation.preexisting_mapping_observed = false;
         assert_eq!(
             classify_system_mapping(&observation, true).unwrap(),
             CudaRuntimeMappingEvidence::Unknown
@@ -899,7 +899,10 @@ mod system_mapping_evidence_tests {
         observation
             .missing_required_roles
             .push("ort-provider-cuda".into());
-        assert!(classify_system_mapping(&observation, true).is_err());
+        assert_eq!(
+            classify_system_mapping(&observation, true).unwrap(),
+            CudaRuntimeMappingEvidence::Unknown
+        );
     }
 }
 
