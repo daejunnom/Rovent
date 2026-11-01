@@ -7,7 +7,6 @@
 use super::*;
 use cap_fs_ext::{DirExt, OpenOptionsFollowExt};
 use cap_std::fs::Dir;
-use sha2::Digest as _;
 use std::{io::Write, path::Component};
 
 /// The caller owns its directory, writer, and at most one row or chunk in
