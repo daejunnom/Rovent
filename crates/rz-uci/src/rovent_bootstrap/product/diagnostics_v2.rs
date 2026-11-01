@@ -28,6 +28,14 @@ trait OriginalV2Observation {
         &self,
         context: &SearchSessionContext,
     ) -> Result<Option<serde_json::Value>, &'static str>;
+
+    /// Optional readback only: an absent observation is not an archive result.
+    fn project_original_storage(
+        &self,
+    ) -> Result<Option<super::super::storage_lifecycle::StorageLifecycleObservation>, &'static str>
+    {
+        Ok(None)
+    }
 }
 
 impl OriginalV2Observation for RoventNativeProductDriverV2 {
@@ -37,6 +45,12 @@ impl OriginalV2Observation for RoventNativeProductDriverV2 {
     ) -> Result<Option<serde_json::Value>, &'static str> {
         pc::project_pc(&self.inner, context, &self.process)
     }
+    fn project_original_storage(
+        &self,
+    ) -> Result<Option<super::super::storage_lifecycle::StorageLifecycleObservation>, &'static str>
+    {
+        self.inner.storage_observation()
+    }
 }
 impl OriginalV2Observation for RoventOwnPcrProductDriverV2 {
     fn project_original_root(
@@ -44,6 +58,12 @@ impl OriginalV2Observation for RoventOwnPcrProductDriverV2 {
         context: &SearchSessionContext,
     ) -> Result<Option<serde_json::Value>, &'static str> {
         adaptive::project_adaptive(&self.inner, context, &self.process)
+    }
+    fn project_original_storage(
+        &self,
+    ) -> Result<Option<super::super::storage_lifecycle::StorageLifecycleObservation>, &'static str>
+    {
+        self.inner.storage_observation()
     }
 }
 impl OriginalV2Observation for RoventExternalPcrProductDriverV2 {
@@ -60,6 +80,12 @@ impl OriginalV2Observation for RoventOwnNnuecProductDriverV2 {
         context: &SearchSessionContext,
     ) -> Result<Option<serde_json::Value>, &'static str> {
         nnuec::project_nnuec(&self.inner, context, &self.process)
+    }
+    fn project_original_storage(
+        &self,
+    ) -> Result<Option<super::super::storage_lifecycle::StorageLifecycleObservation>, &'static str>
+    {
+        self.inner.storage_observation()
     }
 }
 
@@ -233,6 +259,36 @@ impl<T> ObservedV2<T> {
             self.observation_lost.store(true, Ordering::Release);
             return;
         };
+        // Optional storage details cannot suppress an otherwise valid root
+        // or finish observation when both no longer fit the shared pipe row.
+        if (encoded.len().saturating_add(1) > MAX_ROW_BYTES
+            || state.bytes.saturating_add(encoded.len()).saturating_add(1) > MAX_TOTAL_BYTES)
+            && row.get("storage").is_some()
+        {
+            row["storage"] = serde_json::json!({"status":"unknown", "reason":"row_budget"});
+            let Ok(fallback) = serde_json::to_vec(&row) else {
+                state.incomplete = true;
+                self.observation_lost.store(true, Ordering::Release);
+                return;
+            };
+            encoded = fallback;
+            if encoded.len().saturating_add(1) > MAX_ROW_BYTES
+                || state.bytes.saturating_add(encoded.len()).saturating_add(1) > MAX_TOTAL_BYTES
+            {
+                // A missing optional storage field is unknown. This retains a
+                // previously valid original root even if the unknown marker
+                // itself would exceed the existing output budget.
+                if let Some(object) = row.as_object_mut() {
+                    object.remove("storage");
+                }
+                let Ok(without_storage) = serde_json::to_vec(&row) else {
+                    state.incomplete = true;
+                    self.observation_lost.store(true, Ordering::Release);
+                    return;
+                };
+                encoded = without_storage;
+            }
+        }
         encoded.push(b'\n');
         if encoded.len() > MAX_ROW_BYTES
             || state.bytes.saturating_add(encoded.len()) > MAX_TOTAL_BYTES
@@ -257,6 +313,90 @@ impl<T> ObservedV2<T> {
             state.finish_emitted = true;
         }
     }
+}
+
+fn compact_archive_owner(owner: &serde_json::Value) -> serde_json::Value {
+    if !owner.is_object() {
+        return serde_json::Value::Null;
+    }
+    let field = |key| owner.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "owner_id":field("owner_id"), "generation":field("generation"),
+        "complete":field("complete"), "committed_chunks":field("committed_chunks"),
+        "integrity_verified_chunks":field("integrity_verified_chunks"),
+        "ram_reclaim_events":field("ram_reclaim_events"),
+        "loads_requested":field("loads_requested"), "loads_completed":field("loads_completed"),
+        "load_bytes_total":field("load_bytes_total"),
+        "admission_closed":field("admission_closed"), "cleanup_complete":field("cleanup_complete")
+    })
+}
+
+/// Keep only the bounded original phase facts needed to distinguish a real
+/// commit/reclaim/load from a no-op; absent fields remain unknown, never zero.
+fn compact_storage(value: serde_json::Value) -> serde_json::Value {
+    let facts = &value["facts"];
+    let receipts = facts
+        .get("phase_receipts")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .take(2)
+                .map(|item| {
+                    serde_json::json!({
+                        "operation":item.get("operation"), "authority":item.get("authority"),
+                        "loaded_root":item.get("loaded_root"), "io_bytes":item.get("io_bytes"),
+                        "archive_owner":compact_archive_owner(&item["archive_owner"])
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+    let empty = facts
+        .get("empty_game_phase")
+        .filter(|v| v.is_object())
+        .map(|v| {
+            serde_json::json!({
+                "kind":v.get("kind"), "requested_scope":v.get("requested_scope"),
+                "archive_owner":compact_archive_owner(&v["archive_owner"])
+            })
+        });
+    serde_json::json!({
+        "status":if value["complete"] == true {"observed"} else {"unknown"},
+        "phase_scope":facts.get("phase_scope"), "phase_receipts_known":facts.get("phase_receipts_known"),
+        "phase_receipts":receipts, "empty_game_phase":empty,
+        "original_phase_join":facts.get("original_phase_join"),
+        "hot_archive_owner":compact_archive_owner(&facts["hot_semantic_owner"]["archive_owner"]),
+        "finish_completed":facts.get("finish_completed"),
+        "physical_completion_attested":false,
+        "scope":"bounded_original_storage_phase_only"
+    })
+}
+
+fn storage_observation<T: OriginalV2Observation>(
+    inner: &T,
+    authority: Option<rz_contracts::pals::SearchAuthority>,
+) -> serde_json::Value {
+    let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match inner.project_original_storage() {
+            Ok(Some(mut original)) => {
+                match authority {
+                    Some(authority) => original.require_after_root(authority),
+                    None => original.require_after_finish(),
+                }
+                match serde_json::to_value(original) {
+                    Ok(value) => compact_storage(value),
+                    Err(_) => serde_json::json!({"status":"unknown", "reason":"encoding_failed"}),
+                }
+            }
+            Ok(None) => {
+                serde_json::json!({"status":"unknown", "reason":"not_selected_or_unavailable"})
+            }
+            Err(_) => serde_json::json!({"status":"unknown", "reason":"owner_unavailable"}),
+        }
+    }));
+    observed.unwrap_or_else(
+        |_| serde_json::json!({"status":"unknown", "reason":"observation_panicked"}),
+    )
 }
 
 fn failure_observation(failure: &SearchSessionFailure) -> serde_json::Value {
@@ -399,6 +539,107 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn storage_summary_preserves_original_load_and_unknowns_without_claiming_a_fence() {
+        let original = serde_json::json!({
+            "complete":true,
+            "facts":{
+                "phase_scope":{"game":2,"root":4},
+                "phase_receipts_known":true,
+                "phase_receipts":[
+                    {"operation":"prepare_root", "authority":{"game":2,"root":4},
+                     "archive_owner":{"owner_id":3,"generation":1,"complete":true,
+                       "committed_chunks":2,"ram_reclaim_events":1}},
+                    {"operation":"restore_root_if_archived", "authority":{"game":2,"root":4},
+                     "loaded_root":7,"archive_owner":{"owner_id":3,"generation":1,
+                       "complete":true,"loads_completed":1}}
+                ],
+                "original_phase_join":{"worker_joined":true,"owners_returned":true,"admission_closed":true}
+            }
+        });
+        let summary = compact_storage(original.clone());
+        assert_eq!(summary["status"], "observed");
+        assert_eq!(summary["phase_scope"]["root"], 4);
+        assert_eq!(summary["phase_receipts"][1]["loaded_root"], 7);
+        assert_eq!(
+            summary["phase_receipts"][0]["archive_owner"]["ram_reclaim_events"],
+            1
+        );
+        assert!(summary["phase_receipts"][0]["archive_owner"]["loads_completed"].is_null());
+        assert_eq!(summary["original_phase_join"]["worker_joined"], true);
+        assert_eq!(summary["physical_completion_attested"], false);
+        let mut incomplete = original;
+        incomplete["complete"] = false.into();
+        assert_eq!(compact_storage(incomplete)["status"], "unknown");
+        assert_eq!(
+            storage_observation(
+                &MockDriver {
+                    fail_run: false,
+                    runs: AtomicUsize::new(0),
+                    finishes: AtomicUsize::new(0)
+                },
+                None
+            )["status"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn oversized_optional_storage_never_discards_an_otherwise_valid_root_row() {
+        let observed = ObservedV2::new((), String::new());
+        observed.observation_lost.store(false, Ordering::Release);
+        let mut sink = Vec::new();
+        observed.emit_to(
+            &mut sink,
+            serde_json::json!({
+                "event":"root", "root":{"kept":true},
+                "storage":{"status":"observed","oversized":"x".repeat(MAX_ROW_BYTES)}
+            }),
+            Some(authority(4)),
+            false,
+        );
+        let row: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(row["root"]["kept"], true);
+        assert_eq!(row["storage"]["status"], "unknown");
+        assert_eq!(row["storage"]["reason"], "row_budget");
+        assert!(!observed.observation_lost.load(Ordering::Acquire));
+
+        let total_limited = ObservedV2::new((), String::new());
+        total_limited
+            .observation_lost
+            .store(false, Ordering::Release);
+        total_limited.state.lock().unwrap().bytes = MAX_TOTAL_BYTES - MAX_ROW_BYTES / 4;
+        let mut sink = Vec::new();
+        total_limited.emit_to(
+            &mut sink,
+            serde_json::json!({"event":"root", "root":{"kept":true},
+                "storage":{"status":"observed", "details":"x".repeat(MAX_ROW_BYTES / 2)}}),
+            Some(authority(5)),
+            false,
+        );
+        let row: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(row["root"]["kept"], true);
+        assert_eq!(row["storage"]["reason"], "row_budget");
+
+        let tight = ObservedV2::new((), String::new());
+        tight.observation_lost.store(false, Ordering::Release);
+        let bare = serde_json::json!({"event":"root", "root":"", "domain":DOMAIN,
+            "observation_complete_so_far":true});
+        let root_len = MAX_ROW_BYTES - serde_json::to_vec(&bare).unwrap().len() - 1;
+        let mut sink = Vec::new();
+        tight.emit_to(
+            &mut sink,
+            serde_json::json!({"event":"root", "root":"x".repeat(root_len),
+                "storage":{"status":"observed"}}),
+            Some(authority(6)),
+            false,
+        );
+        let row: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(row["root"].as_str().unwrap().len(), root_len);
+        assert!(row.get("storage").is_none());
+        assert_eq!(sink.len(), MAX_ROW_BYTES);
     }
 
     #[test]
@@ -637,12 +878,14 @@ impl<T: SearchSessionDriver + OriginalV2Observation> SearchSessionDriver for Obs
             Ok(Err(issue)) => (issue, None),
             Err(_) => ("observation_panicked", None),
         };
+        let storage = storage_observation(&self.inner, Some(context.authority));
         let row = serde_json::json!({
             "event":"root", "authority":authority_observation(context.authority),
             "input_lock_sha256":self.input_lock_sha256.as_str(),
             "source_status":status, "root":root, "driver_result":if result.is_ok(){"ok"}else{"error"},
             "driver_failure":result.as_ref().err().map(failure_observation),
             "root_physical_completion":"unknown_unless_explicit_in_original_receipt",
+            "storage":storage,
         });
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.emit(
@@ -668,9 +911,10 @@ impl<T: SearchSessionDriver + OriginalV2Observation> SearchSessionDriver for Obs
             Ok(None) => "unavailable",
             Err(_) => "error_unknown",
         };
+        let storage = storage_observation(&self.inner, None);
         let row = serde_json::json!({"event":"finish", "input_lock_sha256":self.input_lock_sha256.as_str(), "physical_completion":physical,
             "driver_result":if result.is_ok(){"ok"}else{"error"},
-            "driver_failure":result.as_ref().err().map(failure_observation)});
+            "driver_failure":result.as_ref().err().map(failure_observation), "storage":storage});
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.emit(row, None, false)))
             .is_err()
         {
