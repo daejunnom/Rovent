@@ -41,6 +41,18 @@ fn native_snapshot_uses_new_inode_preserves_prior_attempt_and_fails_closed_on_pi
     let output = base.join("output");
     fs::create_dir(&source).unwrap();
     fs::create_dir(&output).unwrap();
+    // An unrelated preexisting link is outside this new attempt. Previously a
+    // recursive whole-root admission scan rejected it before the owner could
+    // be created; this must not block independent work or delete the link.
+    std::os::unix::fs::symlink(&source, output.join("unrelated-prior-link")).unwrap();
+    // A sparse file models an unrelated retained history above the old 32GiB
+    // root gate without allocating or writing that much data.
+    let prior_history = output.join("unrelated-prior-history");
+    let prior_logical_bytes = 1_u64 << 36;
+    fs::File::create(&prior_history)
+        .unwrap()
+        .set_len(prior_logical_bytes)
+        .unwrap();
     let reference = |name: &str, bytes: &[u8], provenance: &str| {
         fs::write(source.join(name), bytes).unwrap();
         ArtifactRef {
@@ -136,6 +148,8 @@ fn native_snapshot_uses_new_inode_preserves_prior_attempt_and_fails_closed_on_pi
     .unwrap();
     fs::hard_link(source.join("input-1"), source.join("source-hardlink")).unwrap();
     let owner = prepare_native_launch(&spec, &source, &output, "attempt-one").unwrap();
+    assert!(output.join("unrelated-prior-link").is_symlink());
+    assert_eq!(fs::metadata(&prior_history).unwrap().len(), prior_logical_bytes);
     for (relative, expected_mode) in [
         ("attempt-one", 0o700),
         ("attempt-one/inputs", 0o500),

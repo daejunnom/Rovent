@@ -1226,13 +1226,17 @@ pub(crate) mod linux {
         let root_path = outside_git(output_root)?;
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
             .map_err(|_| io("cannot pin native output root"))?;
-        crate::native_retention::admit(
-            &root,
-            total
-                .checked_add(input.budget.max_output_bytes)
-                .and_then(|n| n.checked_add(metadata_cap))
-                .ok_or_else(|| io("native retention reservation overflow"))?,
-        )?;
+        // Keep this attempt's explicit input/output bounds and overflow check.
+        // When configured, the separately supervised advisory observer reports
+        // total retained storage within its scope; absent, failed or partial
+        // observations are not a claim about this root. Unrelated existing
+        // outputs must not block this launch or force another recursive scan on
+        // its critical path. Legacy profiles with their own registered strict
+        // budget check it separately.
+        let _attempt_reservation = total
+            .checked_add(input.budget.max_output_bytes)
+            .and_then(|n| n.checked_add(metadata_cap))
+            .ok_or_else(|| io("native retention reservation overflow"))?;
         root.create_dir(label).map_err(|_| {
             io("cannot create exclusive native attempt; existing outputs preserved")
         })?;

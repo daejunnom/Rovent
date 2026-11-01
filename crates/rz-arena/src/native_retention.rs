@@ -15,7 +15,6 @@ use std::{
     path::Path,
 };
 
-pub(crate) const OUTPUT_ROOT_BUDGET_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const JOURNAL: &str = "snapshot-retention.v1.jsonl";
 
 #[cfg(test)]
@@ -47,12 +46,13 @@ fn readable_directory(directory: &Dir) -> Result<File, ArenaError> {
         .into_std())
 }
 
+/// Strict admission for legacy profiles whose registered storage contract
+/// includes an explicit root budget. This is not the advisory total-storage
+/// warning used for ordinary native launches.
+///
 /// Admission counts lengths without opening file contents or following links.
 /// Existing evidence is never evicted to make room. Concurrent independent
 /// output-root writers need external serialization; this is not a disk quota.
-pub(crate) fn admit(root: &Dir, reservation: u64) -> Result<(), ArenaError> {
-    admit_bounded(root, reservation, OUTPUT_ROOT_BUDGET_BYTES)
-}
 pub(crate) fn admit_bounded(root: &Dir, reservation: u64, limit: u64) -> Result<(), ArenaError> {
     fn size(
         directory: &Dir,
@@ -475,8 +475,8 @@ mod tests {
         assert!(tree.0.join("historical-evidence").exists());
         file.set_len(0).unwrap();
         std::os::unix::fs::symlink("/unopened-external-target", tree.0.join("link")).unwrap();
-        assert!(admit(&root, 0).is_err());
+        assert!(admit_bounded(&root, 0, 1024).is_err());
         fs::remove_file(tree.0.join("link")).unwrap();
-        assert!(admit(&root, 1024).is_ok());
+        assert!(admit_bounded(&root, 1024, 1024).is_ok());
     }
 }
