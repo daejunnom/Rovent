@@ -1,4 +1,4 @@
-//! PALS V6 system-runtime input custody. No native runtime is created here.
+//! PALS V6 system-runtime input custody and original-control handoff.
 //!
 //! This is a separate owner from V5: it never translates a system runtime to a
 //! bundle lock. The caller must verify the mapped executable, keep this owner
@@ -342,6 +342,53 @@ impl PinnedPalsSystemStartupV6 {
     }
     pub fn mapped_executable(&self) -> &crate::process_receipts::ExecutableIdentityV1 {
         &self.mapped_executable
+    }
+
+    /// Start capturing the system runtime against this exact V6 owner and its
+    /// original deadline and cancellation. This is an internal building block,
+    /// not permission to start a game or evidence of provider readiness.
+    ///
+    /// The callback is reached at the native ORT entry boundary. Its caller
+    /// must record that entry and retain the captured owner and any runtime
+    /// returned by ORT on every later error or unwind until the original
+    /// process supervisor has resolved physical lifetime. In particular,
+    /// dropping this Result or receiving an error is not a completion fence.
+    #[cfg(all(target_os = "linux", feature = "onnx-cpu"))]
+    #[allow(dead_code)]
+    pub(crate) fn load_system_cuda_with(
+        &self,
+        load: impl FnOnce(
+            &rz_eval::onnx::SystemRuntime,
+        ) -> Result<rz_eval::onnx::OrtRuntime, rz_eval::error::BackendError>,
+    ) -> Result<
+        crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup,
+        rz_eval::error::BackendError,
+    > {
+        use rz_eval::error::{BackendError, CauseCode, FailureKind, FailureStage};
+
+        self.verify_source_unchanged().map_err(|error| {
+            let kind = match &error {
+                PalsSystemSourceReadFailureV6::Cancelled
+                | PalsSystemSourceReadFailureV6::Expired => FailureKind::BackendUnavailable,
+                PalsSystemSourceReadFailureV6::Io(_) => FailureKind::Io,
+                PalsSystemSourceReadFailureV6::Resource => FailureKind::ResourceExhausted,
+                PalsSystemSourceReadFailureV6::Identity
+                | PalsSystemSourceReadFailureV6::Owner(_) => FailureKind::IdentityMismatch,
+            };
+            BackendError::new(
+                kind,
+                FailureStage::Admission,
+                "PALS system source owner failed",
+            )
+            .with_external_cause(CauseCode::RuntimeLibraryLoad, &error)
+        })?;
+
+        crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup::capture_and_load_until_with(
+            &self.lock.config.system_runtime_lock,
+            self.original_until,
+            &self.original_cancelled,
+            load,
+        )
     }
     /// Publish only metadata observed during this process's preflight. No
     /// provider, session, neural execution, or physical fence is implied.

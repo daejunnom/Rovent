@@ -144,6 +144,25 @@ fn channel_is_live(stream: &UnixStream) -> io::Result<()> {
     }
 }
 
+// After a control acknowledgement the parent may immediately queue its
+// first command. This checks only for EOF, unlike the liveness-only stream.
+#[cfg(feature = "onnx-cuda")]
+fn control_channel_is_open(stream: &UnixStream) -> io::Result<()> {
+    let mut probe = [0u8; 1];
+    match recv(
+        stream.as_raw_fd(),
+        &mut probe,
+        MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+    ) {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "original parent control channel disconnected",
+        )),
+        Ok(_) | Err(Errno::EAGAIN) => Ok(()),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
 impl ConnectedParent {
     /// Capture before publishing the endpoint; later reparenting is rejected.
     pub(crate) fn capture_original_parent() -> io::Result<i32> {
@@ -160,6 +179,28 @@ impl ConnectedParent {
     /// Authenticate the accepted stream against the actual parent PID/UID and
     /// the original launch values. The original deadline is never renewed.
     pub(crate) fn authenticate(
+        stream: UnixStream,
+        child_pid: u32,
+        original_parent_pid: i32,
+        epoch: u64,
+        lock_sha256: &str,
+        cuda_ordinal: i32,
+        until: Instant,
+    ) -> io::Result<Self> {
+        Self::authenticate_inner(
+            stream,
+            child_pid,
+            original_parent_pid,
+            epoch,
+            lock_sha256,
+            cuda_ordinal,
+            until,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authenticate_inner(
         mut stream: UnixStream,
         child_pid: u32,
         original_parent_pid: i32,
@@ -167,6 +208,7 @@ impl ConnectedParent {
         lock_sha256: &str,
         cuda_ordinal: i32,
         until: Instant,
+        control: bool,
     ) -> io::Result<Self> {
         if child_pid != getpid().as_raw() as u32 {
             return Err(invalid("child pid differs from the running process"));
@@ -216,7 +258,14 @@ impl ConnectedParent {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
         validate_peer(&stream, parent_pid, parent_uid)?;
-        channel_is_live(&stream)?;
+        if control {
+            #[cfg(feature = "onnx-cuda")]
+            control_channel_is_open(&stream)?;
+            #[cfg(not(feature = "onnx-cuda"))]
+            return Err(invalid("separate control requires CUDA support"));
+        } else {
+            channel_is_live(&stream)?;
+        }
         remaining(until)?;
         Ok(Self {
             stream,
@@ -239,6 +288,32 @@ impl ConnectedParent {
         self.process_epoch == epoch
             && self.lock_sha256 == lock_sha256
             && self.cuda_ordinal == cuda_ordinal
+    }
+
+    /// Authenticate a separate, same-parent control connection against this
+    /// original admission. The admission socket remains liveness-only; control
+    /// bytes must never be multiplexed onto it. Returning this stream grants no
+    /// cleanup or physical-completion authority and does not implement a
+    /// control protocol. The caller must retain the original parent owner.
+    #[cfg(feature = "onnx-cuda")]
+    pub(crate) fn authenticate_separate_control(
+        &self,
+        stream: UnixStream,
+        until: Instant,
+    ) -> io::Result<UnixStream> {
+        self.ensure_live()?;
+        let control = Self::authenticate_inner(
+            stream,
+            getpid().as_raw() as u32,
+            self.parent_pid,
+            self.process_epoch,
+            &self.lock_sha256,
+            self.cuda_ordinal,
+            until,
+            true,
+        )?;
+        self.ensure_live()?;
+        Ok(control.stream)
     }
 }
 
@@ -290,6 +365,26 @@ mod tests {
         drop(client);
         assert_eq!(
             channel_is_live(&server).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[cfg(feature = "onnx-cuda")]
+    #[test]
+    fn control_open_check_preserves_immediately_queued_command() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(b"status\n").unwrap();
+        assert!(control_channel_is_open(&server).is_ok());
+        assert_eq!(
+            channel_is_live(&server).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut command = [0; 7];
+        server.read_exact(&mut command).unwrap();
+        assert_eq!(&command, b"status\n");
+        drop(client);
+        assert_eq!(
+            control_channel_is_open(&server).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
     }

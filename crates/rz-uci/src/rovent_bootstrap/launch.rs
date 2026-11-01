@@ -95,6 +95,8 @@ pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody
 pub(crate) use system_parent::ConnectedParent;
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
 use v2_rejections::{reject_external_pcr_product_v2, reject_own_nnuec_product_v2};
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) use v3::SystemReceiptWriter;
 #[cfg(target_os = "linux")]
 pub use v3::v3_scope::{
     RoventV3ScopeKey, V3NativeReobservation, V3ProductFinishObservation, V3ScopeObservation,

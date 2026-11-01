@@ -2,6 +2,69 @@
 use super::*;
 use crate::pals_adaptive_startup::{PalsSystemStartupOptionsV6, PinnedPalsSystemStartupV6};
 
+/// Construct the native worker with the original system CUDA factory custody.
+/// This is an internal handoff for a future V6 supervisor, not an executable
+/// launch path: the caller still must derive the limits from its own sealed
+/// resource plan, retain this service and parent on failure, consume the V6
+/// startup/termination records, and resolve physical completion before exit.
+/// Neither `run_cli` nor the V6 arena enables this path yet.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+#[allow(dead_code)]
+fn spawn_system_native_v6(
+    owner: Arc<PinnedPalsSystemStartupV6>,
+    parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    clock: rz_runtime::contracts::ContractSystemClock,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    receipt_writer: Option<Arc<crate::rovent_bootstrap::launch::SystemReceiptWriter>>,
+    limits: TicketServiceLimits,
+    pending_capacity: usize,
+    command_capacity: usize,
+) -> Result<
+    ActualService,
+    crate::pals_native::ticketed::FactoryStartupSpawnRejection<
+        crate::pals_native::startup_system_v6::PalsSystemFactoryCustodyV6,
+    >,
+> {
+    use crate::pals_native::startup_system_v6::PalsSystemFactoryCustodyV6;
+    use rz_search::pals::coordinator::RoleFailure;
+
+    let runtime_lock = owner.lock().config.system_runtime_lock.clone();
+    let custody = PalsSystemFactoryCustodyV6::new(owner, observer, Arc::clone(&parent));
+    TicketedNativeService::spawn_with_startup_custody(
+        custody,
+        move |factory| {
+            PalsSystemFactoryCustodyV6::initialize_runtime(factory, &parent)
+                .map_err(|error| RoleFailure::Backend(error.to_string()))?;
+            PalsSystemFactoryCustodyV6::initialize_sessions(factory, &parent)
+                .map_err(|error| RoleFailure::Backend(error.to_string()))?;
+            PalsSystemFactoryCustodyV6::prepare_ticket(factory, clock)?;
+            if let Some(writer) = receipt_writer.as_ref() {
+                let report = factory.parts().0.startup_runtime_report();
+                let result = report
+                    .map_err(|error| error.to_string())
+                    .and_then(|report| {
+                        writer.write("system-runtime-startup.v6.json", &report, &runtime_lock)
+                    });
+                if let Err(error) = result {
+                    // Evidence publication is separate from the original
+                    // worker's physical lifetime and functional outcome.
+                    eprintln!("PALS system startup receipt warning: {error}");
+                }
+            }
+            factory
+                .parts()
+                .0
+                .take_prepared_ticket()
+                .map(ActualNativeBackendV5::from)
+                .map(ProjectedNativeBackend::new)
+                .ok_or(RoleFailure::InvalidOutput)
+        },
+        limits,
+        pending_capacity,
+        command_capacity,
+    )
+}
+
 /// This executes before any lock, source asset, runtime or model is opened.
 /// The response is an observation of this binary, not external provenance.
 pub(super) fn source_inventory() -> Result<(), AdaptiveBootstrapError> {

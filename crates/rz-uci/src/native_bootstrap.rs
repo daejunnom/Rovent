@@ -53,6 +53,8 @@ use std::{
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
 #[allow(dead_code)]
 mod system_cuda;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+pub use system_cuda::{Lc0PendingSupervisor, Lc0SupervisedSession};
 
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_FATAL_RECEIPTS: usize = 32;
@@ -1550,6 +1552,21 @@ impl NativeSessionFactory {
         served: Result<(), EngineError>,
         until: Instant,
     ) -> Result<NativeRunReport, NativeRunError> {
+        self.finish_until_with_mapping(served, until, false).0
+    }
+
+    // System runtime mappings are a separate observation, not a reason to
+    // convert unavailable /proc evidence into a physical completion failure.
+    // The legacy bundled route keeps its strict mapping audit unchanged.
+    fn finish_until_with_mapping(
+        &self,
+        served: Result<(), EngineError>,
+        until: Instant,
+        system_observation: bool,
+    ) -> (
+        Result<NativeRunReport, NativeRunError>,
+        Option<rz_eval::onnx::CudaRuntimeMappingEvidence>,
+    ) {
         let mut collection_error = None;
         let mut worker_shutdown_error = None;
         let mut worker_joined = false;
@@ -1594,12 +1611,32 @@ impl NativeSessionFactory {
             }
             thread::sleep(Duration::from_millis(1));
         }
+        let mut mapping_observation = None;
         let runtime_mapping_error =
             if collection_error.is_none() && self.owner.origin() == NativeWorkerOrigin::CudaOnnx {
-                self._runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.verify_cuda_runtime_mappings().err())
-                    .map(Box::new)
+                if system_observation {
+                    match self._runtime.as_ref() {
+                        Some(runtime) if runtime.is_system_cuda() => {
+                            match runtime.observe_cuda_runtime_mappings() {
+                                Ok(observation) => {
+                                    mapping_observation = Some(observation);
+                                    None
+                                }
+                                Err(error) => Some(Box::new(error)),
+                            }
+                        }
+                        _ => Some(Box::new(BackendError::new(
+                            FailureKind::IdentityMismatch,
+                            FailureStage::Backend,
+                            "original system CUDA runtime is unavailable during final observation",
+                        ))),
+                    }
+                } else {
+                    self._runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.verify_cuda_runtime_mappings().err())
+                        .map(Box::new)
+                }
             } else {
                 None
             };
@@ -1623,17 +1660,23 @@ impl NativeSessionFactory {
             && runtime_mapping_error.is_none()
             && report.as_ref().is_some_and(|report| !report.has_failure())
         {
-            return Ok(report.expect("checked report presence"));
+            return (
+                Ok(report.expect("checked report presence")),
+                mapping_observation,
+            );
         }
-        Err(NativeRunError {
-            service,
-            report: report.map(Box::new),
-            collection_error,
-            worker_shutdown_error,
-            runtime_mapping_error,
-            retained_evidence: self.evidence.clone(),
-            retained_owner: self.owner.clone(),
-        })
+        (
+            Err(NativeRunError {
+                service,
+                report: report.map(Box::new),
+                collection_error,
+                worker_shutdown_error,
+                runtime_mapping_error,
+                retained_evidence: self.evidence.clone(),
+                retained_owner: self.owner.clone(),
+            }),
+            mapping_observation,
+        )
     }
 }
 

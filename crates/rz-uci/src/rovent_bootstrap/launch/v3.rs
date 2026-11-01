@@ -1438,14 +1438,14 @@ fn open_original_binary_v3(root: &Dir, artifact: &ArtifactRef) -> Result<File, R
 }
 
 #[cfg(target_os = "linux")]
-struct SystemReceiptWriter {
+pub(crate) struct SystemReceiptWriter {
     directory: Dir,
     relative_path: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
 impl SystemReceiptWriter {
-    fn open(root: &Dir, path: &std::path::Path) -> std::io::Result<Self> {
+    pub(crate) fn open(root: &Dir, path: &std::path::Path) -> std::io::Result<Self> {
         // Walk only the original private-root capability. The resource owner
         // creates the parent; this process exclusively creates its own leaf.
         let mut dir = root.try_clone()?;
@@ -1463,7 +1463,7 @@ impl SystemReceiptWriter {
         })
     }
 
-    fn write(
+    pub(crate) fn write(
         &self,
         name: &str,
         receipt: &rz_experiments::SystemRuntimeReceiptV6,
@@ -1475,9 +1475,13 @@ impl SystemReceiptWriter {
         self.write_bytes(name, &bytes)
     }
 
-    fn write_bytes(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn write_bytes(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
         use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
         use std::io::Write;
+        let mut parts = std::path::Path::new(name).components();
+        if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some() {
+            return Err("invalid receipt filename".into());
+        }
         let mut options = cap_std::fs::OpenOptions::new();
         options
             .write(true)

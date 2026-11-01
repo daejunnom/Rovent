@@ -6,10 +6,13 @@
 //! process exit. The legacy CLI intentionally rejects this path until that
 //! caller and the normal shutdown/receipt path are connected.
 
-use super::NativeConfig;
-use crate::engine::OwnerRegistry;
+use super::{
+    NATIVE_DIAGNOSTIC_CAPACITY, NativeBootstrapError, NativeConfig, NativeCudaFactory,
+    NativeRunError, NativeRunReport,
+};
+use crate::engine::{EngineError, OwnerRegistry};
 use crate::pals_adaptive_bootstrap::runtime_assets::system_cuda::SystemCudaStartup;
-use crate::rovent_bootstrap::launch::ConnectedParent;
+use crate::rovent_bootstrap::launch::{ConnectedParent, SystemReceiptWriter};
 use rz_contracts::{
     CompletionContext, ContractError, Digest, EncodingHandle, ErrorCode, ModelHandle,
     SlotGeneration, Stage,
@@ -21,12 +24,15 @@ use rz_eval::{
     error::{BackendError, FailureKind, FailureStage},
     native_runtime_bridge::NativeWorkerOwner,
     onnx::{
-        BackendConfig, Lc0StartupCustody, Lc0StartupState, OnnxBackend, OrtRuntime, Provider,
-        SystemRuntime,
+        BackendConfig, CudaRuntimeMappingEvidence, ExecutionExperiments, IO_BYTES_PER_ITEM,
+        Lc0StartupCustody, Lc0StartupState, OnnxBackend, OrtRuntime, Provider, SystemRuntime,
     },
     worker::{PhysicalRecoveryKey, PhysicalRecoveryReservation, SessionReleased},
 };
-use rz_experiments::{NativeRuntimeSourceV6, SystemRuntimeLockV6};
+use rz_experiments::{
+    NativeRuntimeSourceV6, PhysicalCompletionV6, ProviderReadinessV6, SystemRuntimeLockV6,
+    SystemRuntimeReceiptV6,
+};
 use rz_telemetry::source::SourceJournal;
 use std::{
     io,
@@ -35,6 +41,10 @@ use std::{
     task::Poll,
     time::Instant,
 };
+
+mod control;
+mod facade;
+pub use facade::{Lc0PendingSupervisor, Lc0SupervisedSession};
 
 /// A parent PID captured before the caller publishes any child endpoint. The
 /// accepted stream is bound to this exact parent and the V6 runtime lock;
@@ -137,6 +147,8 @@ pub(super) struct Lc0SystemStartupCustody {
     session_release: Option<SessionReleased>,
     parent: Option<Arc<ConnectedParent>>,
     process_epoch: u64,
+    execution_experiments: ExecutionExperiments,
+    raw_cache: bool,
     phase: Lc0SystemStartupPhase,
     ort_entry_observed: bool,
     attempted: bool,
@@ -148,6 +160,251 @@ pub(super) struct Lc0SystemStartupCustody {
 struct Lc0ReadyObjects {
     metadata: AssetMetadata,
     backend: Option<OnnxBackend>,
+}
+
+/// Holds the original startup custody beside the factory that uses its worker.
+/// This is an internal construction boundary, not a supervisor or an executable
+/// launch path. The caller must retain this object and its process on unknown
+/// completion, including unwinds; dropping it is not a physical fence.
+pub(super) struct Lc0SystemSessionOwner {
+    custody: Lc0SystemStartupCustody,
+    factory: Option<Arc<NativeCudaFactory>>,
+    owner_token: Arc<()>,
+}
+
+/// The three observations have distinct meanings. In particular, a mapping
+/// `Unknown`, a service failure, and an unconfirmed physical release cannot
+/// be substituted for one another or authorize the supervisor to exit.
+pub(super) struct Lc0SystemFinish {
+    owner_token: Arc<()>,
+    pub(super) run: Result<NativeRunReport, NativeRunError>,
+    pub(super) mapping: Option<CudaRuntimeMappingEvidence>,
+    pub(super) session_release: Poll<Result<SessionReleased, PhysicalFailure>>,
+}
+
+impl Lc0SystemSessionOwner {
+    pub(super) fn new(custody: Lc0SystemStartupCustody) -> Self {
+        Self {
+            custody,
+            factory: None,
+            owner_token: Arc::new(()),
+        }
+    }
+
+    pub(super) fn custody_mut(&mut self) -> &mut Lc0SystemStartupCustody {
+        &mut self.custody
+    }
+
+    /// Build the factory from the same authenticated custody and reservation.
+    /// On any error, including one after worker creation, `self` retains the
+    /// original custody so the caller can preserve or drain it. This operation
+    /// is intentionally separate from the guarded legacy executable path.
+    pub(super) fn connect(
+        &mut self,
+        owners: &OwnerRegistry,
+        config: &NativeConfig,
+    ) -> Result<(), NativeBootstrapError> {
+        if config.parallelism != 1
+            || config.execution_experiments != self.custody.execution_experiments
+            || config.raw_cache != self.custody.raw_cache
+        {
+            return Err(NativeBootstrapError::Config(
+                "LC0 system session options differ from the original B1 custody",
+            ));
+        }
+        if self.factory.is_some() {
+            return Err(NativeBootstrapError::Config(
+                "LC0 system session already connected",
+            ));
+        }
+        match self.custody.phase() {
+            Lc0SystemStartupPhase::BackendReady => {
+                // Validate tracing before moving the backend out of startup.
+                let trace = config.source_journal()?;
+                if self.custody.ready_parts().is_none() {
+                    self.custody.prepare_handoff()?;
+                }
+                let projection = self.custody.build_projection(owners)?;
+                self.custody.start_retained_worker(
+                    projection,
+                    NATIVE_DIAGNOSTIC_CAPACITY,
+                    trace,
+                )?;
+            }
+            // Factory construction may fail after the original worker was
+            // installed. Retry only the factory step, never native startup.
+            Lc0SystemStartupPhase::WorkerOwned => {}
+            _ => {
+                return Err(NativeBootstrapError::Config(
+                    "LC0 system startup is not ready for session connection",
+                ));
+            }
+        }
+        self.factory = Some(Arc::new(NativeCudaFactory::from_system_custody(
+            &self.custody,
+        )?));
+        Ok(())
+    }
+
+    /// A returned factory is not a completion witness and does not authorize
+    /// process exit. The caller must retain this owner while any clone is live.
+    pub(super) fn factory(&self) -> Option<&Arc<NativeCudaFactory>> {
+        self.factory.as_ref()
+    }
+
+    /// Bounded collection on the original factory. The caller still owns
+    /// `self` on every outcome and must retain the authenticated process if
+    /// session release is pending or unknown. This is not a supervisor.
+    pub(super) fn finish_until(
+        &mut self,
+        served: Result<(), EngineError>,
+        until: Instant,
+    ) -> Result<Lc0SystemFinish, NativeBootstrapError> {
+        let factory = self.factory.as_ref().ok_or(NativeBootstrapError::Config(
+            "LC0 system session is not connected",
+        ))?;
+        let (run, mapping) = factory.inner.finish_until_with_mapping(served, until, true);
+        let session_release = self.custody.try_finish();
+        Ok(Lc0SystemFinish {
+            owner_token: Arc::clone(&self.owner_token),
+            run,
+            mapping,
+            session_release,
+        })
+    }
+
+    /// Only the same worker's session release; this does not attest that the
+    /// protocol service or report collection succeeded.
+    pub(super) fn try_release(&mut self) -> Poll<Result<SessionReleased, PhysicalFailure>> {
+        self.custody.try_finish()
+    }
+
+    /// Observe the original runtime without converting unavailable mapping
+    /// evidence into a conflict or a successful strict-attestation witness.
+    /// The result is independent of the worker's physical completion.
+    pub(super) fn observe_mappings(&self) -> Result<CudaRuntimeMappingEvidence, BackendError> {
+        if !matches!(
+            self.custody.phase(),
+            Lc0SystemStartupPhase::WorkerOwned | Lc0SystemStartupPhase::SessionReleased
+        ) {
+            return Err(BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 system worker is not ready for mapping observation",
+            ));
+        }
+        self.custody
+            .runtime()
+            .ok_or_else(|| {
+                BackendError::new(
+                    FailureKind::BackendUnavailable,
+                    FailureStage::Admission,
+                    "LC0 original system runtime is unavailable",
+                )
+            })?
+            .observe_cuda_runtime_mappings()
+    }
+
+    /// A partial V6 claim from the original custody. It deliberately leaves
+    /// physical completion unknown; a same-worker release is not a GPU fence.
+    pub(super) fn runtime_receipt(
+        &self,
+        lock: &SystemRuntimeLockV6,
+    ) -> Result<SystemRuntimeReceiptV6, BackendError> {
+        self.custody.runtime_receipt(lock)
+    }
+
+    /// Publish to the same no-follow, create-new private directory writer used
+    /// by the existing native supervisor. Failure to write is not a physical
+    /// completion result, and the caller must retain this owner on failure.
+    pub(super) fn publish_runtime_receipt(
+        &self,
+        writer: &SystemReceiptWriter,
+        lock: &SystemRuntimeLockV6,
+        finish: bool,
+    ) -> Result<(), String> {
+        let receipt = self
+            .runtime_receipt(lock)
+            .map_err(|error| error.to_string())?;
+        let name = if finish {
+            "lc0-system-runtime-finish.v6.json"
+        } else {
+            "lc0-system-runtime-startup.v6.json"
+        };
+        writer.write(name, &receipt, lock)
+    }
+
+    /// This observation is separately scoped from the V6 runtime receipt and
+    /// binds to the exact owner that produced `finish`. The same-worker release
+    /// remains a session observation, never a device-wide completion claim.
+    pub(super) fn publish_finish_observation(
+        &self,
+        writer: &SystemReceiptWriter,
+        lock: &SystemRuntimeLockV6,
+        finish: &Lc0SystemFinish,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.owner_token, &finish.owner_token) {
+            return Err("LC0 finish belongs to a different owner".into());
+        }
+        let spec = match &lock.runtime {
+            NativeRuntimeSourceV6::SystemCuda(spec) if lock.verify().is_ok() => spec,
+            _ => return Err("LC0 finish requires a valid system CUDA lock".into()),
+        };
+        if !self.custody.parent.as_ref().is_some_and(|parent| {
+            parent.matches(
+                self.custody.process_epoch,
+                &lock.canonical_sha256,
+                spec.cuda_device_id,
+            )
+        }) {
+            return Err("LC0 finish lock differs from the original owner".into());
+        }
+        let (session_status, completed_runs) = match &finish.session_release {
+            Poll::Pending => ("pending", None),
+            Poll::Ready(Err(_)) => ("failed", None),
+            Poll::Ready(Ok(release)) => ("released", Some(release.completed_synchronous_runs)),
+        };
+        let mapping = match finish.mapping {
+            Some(CudaRuntimeMappingEvidence::Observed) => "observed",
+            Some(CudaRuntimeMappingEvidence::Unknown) => "unknown",
+            None if finish
+                .run
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.runtime_mapping_error.is_some()) =>
+            {
+                "failed"
+            }
+            None => "not_observed",
+        };
+        let failure = finish.run.as_ref().err();
+        let startup_probe = self.custody.worker.as_ref().and_then(|worker| {
+            worker.system_cuda_metadata().map(|metadata| {
+                serde_json::json!({
+                    "executed_cuda_nodes": metadata.executed_cuda_nodes,
+                    "synchronous_run_returned": metadata.warm_probe_synchronous_run_returned,
+                    "scope": "startup probe only; not evidence for later requests"
+                })
+            })
+        });
+        let observation = serde_json::json!({
+            "domain": "rz-lc0-system-runtime-finish-observation/1",
+            "process_id": std::process::id(),
+            "process_epoch": self.custody.process_epoch,
+            "lock_sha256": lock.canonical_sha256,
+            "run_status": if failure.is_some() { "failed" } else { "completed" },
+            "service_error": failure.is_some_and(|error| error.service.is_some()),
+            "collection_error": failure.is_some_and(|error| error.collection_error.is_some()),
+            "worker_shutdown_error": failure.is_some_and(|error| error.worker_shutdown_error.is_some()),
+            "runtime_mapping_observation": mapping,
+            "startup_cuda_probe": startup_probe,
+            "session_release": { "status": session_status, "completed_synchronous_runs": completed_runs },
+            "physical_completion": "unknown",
+            "scope": "original process-local LC0 session, not device-wide completion or numerical acceptance"
+        });
+        let bytes = serde_json::to_vec(&observation).map_err(|error| error.to_string())?;
+        writer.write_bytes("lc0-system-finish-observation.v1.json", &bytes)
+    }
 }
 
 impl Lc0SystemStartupCustody {
@@ -243,6 +500,13 @@ impl Lc0SystemStartupCustody {
                 "LC0 supervisor is not bound to the V6 system runtime lock",
             ));
         }
+        if config.parallelism != 1 {
+            return Err(BackendError::new(
+                FailureKind::InvalidInput,
+                FailureStage::Admission,
+                "LC0 system worker currently supports B1 only",
+            ));
+        }
         // Reserve before the first possible native entry. This reserves a
         // process-local recovery slot, not a GPU or an external supervisor.
         let (reservation, recovery_key) = PhysicalRecoveryReservation::reserve()?;
@@ -259,6 +523,8 @@ impl Lc0SystemStartupCustody {
             session_release: None,
             parent: Some(parent),
             process_epoch,
+            execution_experiments: config.execution_experiments,
+            raw_cache: config.raw_cache,
             phase: Lc0SystemStartupPhase::BeforeOrtCall,
             ort_entry_observed: false,
             attempted: false,
@@ -271,6 +537,94 @@ impl Lc0SystemStartupCustody {
 
     pub(super) fn ort_entry_observed(&self) -> bool {
         self.ort_entry_observed
+    }
+
+    /// Construct a process-bound partial observation from actual custody,
+    /// never from the declaration alone. Failure to observe libraries stays
+    /// an error and does not authorize owner release or imply GPU failure.
+    pub(super) fn runtime_receipt(
+        &self,
+        lock: &SystemRuntimeLockV6,
+    ) -> Result<SystemRuntimeReceiptV6, BackendError> {
+        lock.verify().map_err(|_| {
+            BackendError::new(
+                FailureKind::IdentityMismatch,
+                FailureStage::Admission,
+                "LC0 system receipt lock is invalid",
+            )
+        })?;
+        let spec = match &lock.runtime {
+            NativeRuntimeSourceV6::SystemCuda(spec) => spec,
+            NativeRuntimeSourceV6::Cpu => {
+                return Err(BackendError::new(
+                    FailureKind::IdentityMismatch,
+                    FailureStage::Admission,
+                    "LC0 system receipt requires a CUDA lock",
+                ));
+            }
+        };
+        if !self.parent.as_ref().is_some_and(|parent| {
+            parent.matches(
+                self.process_epoch,
+                &lock.canonical_sha256,
+                spec.cuda_device_id,
+            )
+        }) {
+            return Err(BackendError::new(
+                FailureKind::IdentityMismatch,
+                FailureStage::Admission,
+                "LC0 system receipt owner differs from the original parent",
+            ));
+        }
+        let ready = matches!(
+            self.phase,
+            Lc0SystemStartupPhase::BackendReady
+                | Lc0SystemStartupPhase::WorkerOwned
+                | Lc0SystemStartupPhase::SessionReleased
+        );
+        let (observed_libraries, unregistered_native_mappings) = match &self.startup {
+            Some(startup) if ready => {
+                let observed = startup.observe_ready_mappings()?;
+                (observed.libraries, observed.unregistered_native_mappings)
+            }
+            Some(startup) => (startup.observe()?, None),
+            None => (Vec::new(), None),
+        };
+        let observed_identity_sha256 = self.runtime.as_ref().and_then(|runtime| {
+            runtime.cuda_runtime_identity().map(|digest| {
+                use std::fmt::Write;
+                let mut text = String::with_capacity(64);
+                for byte in digest {
+                    write!(&mut text, "{byte:02x}").expect("format byte into String");
+                }
+                text
+            })
+        });
+        let receipt = SystemRuntimeReceiptV6 {
+            domain: rz_experiments::SYSTEM_RUNTIME_RECEIPT_V6_DOMAIN.into(),
+            lock_sha256: lock.canonical_sha256.clone(),
+            process_id: std::process::id(),
+            process_generation: self.process_epoch,
+            observed_identity_sha256,
+            observed_libraries,
+            unregistered_native_mappings,
+            provider_ready: if ready {
+                ProviderReadinessV6::Ready
+            } else {
+                ProviderReadinessV6::Unknown
+            },
+            physical_completion: PhysicalCompletionV6::Unknown,
+        };
+        receipt
+            .validate_against(lock, std::process::id(), self.process_epoch)
+            .map_err(|_| {
+                BackendError::new(
+                    FailureKind::IdentityMismatch,
+                    FailureStage::Admission,
+                    "LC0 system receipt does not match its original lock",
+                )
+            })?;
+        Ok(receipt)
     }
 
     /// The already-owned authenticated parent channel is checked immediately
@@ -302,11 +656,15 @@ impl Lc0SystemStartupCustody {
             }
         };
         if !matches_registered_provider(config.provider, spec.cuda_device_id, spec.cuda_arena_bytes)
+            || config.experiments != self.execution_experiments
+            || config.max_batch != 1
+            || config.intra_threads != 1
+            || config.host_io_bytes != IO_BYTES_PER_ITEM
         {
             return Err(BackendError::new(
                 FailureKind::IdentityMismatch,
                 FailureStage::Admission,
-                "LC0 backend provider, device or arena differs from the system lock",
+                "LC0 backend provider, device, arena or B1 execution options differ",
             ));
         }
         let parent = self.parent.as_ref().expect("original parent retained");
@@ -455,9 +813,13 @@ impl Lc0SystemStartupCustody {
             generation: SlotGeneration(1),
             manifest: Digest(metadata.manifest_digest()),
         };
-        Ok(ClassicalProjection::new(MaiaBinding::for_backend(
-            backend, model, encoding, fill,
-        )?))
+        let projection =
+            ClassicalProjection::new(MaiaBinding::for_backend(backend, model, encoding, fill)?);
+        #[cfg(feature = "experimental-raw-cache")]
+        if self.raw_cache {
+            projection.configure_raw_cache(rz_eval::raw_cache::RawCacheLimits::default())?;
+        }
+        Ok(projection)
     }
 
     /// Transfer only through the original reservation-aware factory. On any
@@ -524,6 +886,21 @@ impl Lc0SystemStartupCustody {
 
     pub(super) fn recovery_key(&self) -> Option<&PhysicalRecoveryKey> {
         self.recovery_key.as_ref()
+    }
+
+    /// A future supervisor may use this distinct stream for its bounded
+    /// control protocol. The original admission stream remains liveness-only.
+    /// This authenticates the original parent; it neither starts that protocol
+    /// nor changes the custody or completion state.
+    pub(super) fn authenticate_control(
+        &self,
+        stream: UnixStream,
+        until: Instant,
+    ) -> io::Result<UnixStream> {
+        self.parent
+            .as_ref()
+            .ok_or_else(|| io::Error::other("LC0 original parent is unavailable"))?
+            .authenticate_separate_control(stream, until)
     }
 
     /// Normal same-worker release only. It is not a device-wide GPU fence and
