@@ -69,6 +69,10 @@ pub mod storage;
 mod v2_external;
 mod v2_rejections;
 mod v3;
+#[cfg(target_os = "linux")]
+mod system_parent;
+#[cfg(target_os = "linux")]
+pub(crate) use system_parent::ConnectedParent;
 pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
@@ -445,6 +449,20 @@ impl Arguments {
             initial_stop_source_diagnostics: initial_stop_source_diagnostics.unwrap_or(false),
             storage,
         })
+    }
+
+    fn v1_strict_source(&self) -> Result<bool, RoventLaunchError> {
+        if self.system_runtime_receipt_root.is_some() {
+            return Err(error(
+                "InputLockUnsupportedV1",
+                "system receipt root requires an original /3 lock",
+            ));
+        }
+        Ok(self.strict_source.unwrap_or(true))
+    }
+
+    fn v2_strict_source(&self) -> bool {
+        self.strict_source.unwrap_or(true)
     }
 }
 fn private_path(value: &str) -> Result<String, RoventLaunchError> {
@@ -1038,6 +1056,8 @@ pub fn run_with_v3_resource_admission<'a>(
             is_installed: None,
             #[cfg(target_os = "linux")]
             scope_reserved: None,
+            #[cfg(target_os = "linux")]
+            parent_stream: None,
             callback: Box::new(
                 move |lock, _root, _file, _until, _cleanup, _control, _path| admit_resource(lock),
             ),
@@ -1065,6 +1085,7 @@ pub fn run_with_v3_resource_admission_retaining<'a>(
             scope_pin: None,
             is_installed: None,
             scope_reserved: None,
+            parent_stream: None,
             callback: Box::new(move |lock, root, file, until, _cleanup, _control, _path| {
                 admit_resource(lock, root, file, until)
             }),
@@ -1115,6 +1136,37 @@ pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'stat
     ) -> Result<(), RoventLaunchError>
     + 'a,
 ) -> ControlledV3Result<C> {
+    run_with_v3_control_slot_inner(arguments, control, None, admit_resource)
+}
+
+/// The connected variant receives the very stream accepted by the original
+/// control endpoint. UCI authenticates the kernel peer and registered input
+/// before it can be used for system-CUDA startup.
+#[cfg(target_os = "linux")]
+pub fn run_with_v3_resource_admission_retaining_connected_control_slot<'a, C: Send + 'static>(
+    arguments: Vec<String>,
+    control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    parent_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+    admit_resource: impl FnOnce(
+        &Arc<RoventInputLockV3>, &Dir, &std::fs::File,
+        std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>,
+        &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    ) -> Result<(), RoventLaunchError> + 'a,
+) -> ControlledV3Result<C> {
+    run_with_v3_control_slot_inner(arguments, control, Some(parent_stream), admit_resource)
+}
+
+#[cfg(target_os = "linux")]
+fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
+    arguments: Vec<String>,
+    control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    parent_stream: Option<Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>>,
+    admit_resource: impl FnOnce(
+        &Arc<RoventInputLockV3>, &Dir, &std::fs::File,
+        std::time::Instant, std::time::Instant, Option<&Dir>, Option<&std::path::Path>,
+        &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    ) -> Result<(), RoventLaunchError> + 'a,
+) -> ControlledV3Result<C> {
     let scope_marker = Arc::new(std::sync::OnceLock::new());
     if let Some(original_control) = control.get() {
         return ControlledV3Result::Controlled {
@@ -1151,6 +1203,7 @@ pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'stat
             require_control_dir: true,
             scope_pin: Some(Box::new(control)),
             is_installed: Some(Box::new(move || gate_control.get().is_some())),
+            parent_stream,
             scope_reserved: Some(Box::new(move |key| {
                 marker_for_scope
                     .set(key.clone())
@@ -1292,6 +1345,8 @@ struct ResourceAdmissionV3<'a> {
     #[cfg(target_os = "linux")]
     scope_reserved:
         Option<Box<dyn FnOnce(&RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
+    #[cfg(target_os = "linux")]
+    parent_stream: Option<Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>>,
     callback: Box<
         dyn FnOnce(
                 &Arc<RoventInputLockV3>,
@@ -1423,8 +1478,7 @@ fn run_inner<'a>(
     let lock = match parse_launch_lock(&lock_bytes)? {
         LaunchInputLock::V1(lock) => lock,
         LaunchInputLock::V2(lock) => {
-            if arguments.system_runtime_receipt_root.is_some() || arguments.strict_source.is_some()
-            {
+            if arguments.system_runtime_receipt_root.is_some() {
                 return Err(error(
                     "InputLockUnsupportedV2",
                     "system receipt root requires an original /3 lock",
@@ -1485,12 +1539,7 @@ fn run_inner<'a>(
             "direct native assets require an original /3 lock",
         ));
     }
-    if arguments.system_runtime_receipt_root.is_some() || arguments.strict_source.is_some() {
-        return Err(error(
-            "InputLockUnsupportedV1",
-            "system receipt root requires an original /3 lock",
-        ));
-    }
+    let strict_source = arguments.v1_strict_source()?;
     if arguments.lifecycle_diagnostics_v2 {
         return Err(error(
             "InputLockUnsupportedV1",
@@ -1596,20 +1645,22 @@ fn run_inner<'a>(
             .trace(
                 NativeStartupDiagnosticStage::SourcePins,
                 || match &collection_preload {
-                    Some(preload) => RoventPinnedNativeSources::open_collection(
+                    Some(preload) => RoventPinnedNativeSources::open_collection_with_source_policy(
                         Arc::clone(&lock),
                         source_root,
                         cwd.clone(),
                         selection,
                         &control,
                         Arc::clone(preload),
+                        strict_source,
                     ),
-                    None => RoventPinnedNativeSources::open(
+                    None => RoventPinnedNativeSources::open_with_source_policy(
                         Arc::clone(&lock),
                         source_root,
                         cwd.clone(),
                         selection,
                         &control,
+                        strict_source,
                     ),
                 },
             )
@@ -2014,7 +2065,6 @@ fn run_v2_native<'a>(
 ) -> Result<(), RoventLaunchError> {
     if arguments.direct_native_assets.is_some()
         || arguments.system_runtime_receipt_root.is_some()
-        || arguments.strict_source.is_some()
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
         || arguments.initial_stop_source_diagnostics
@@ -2236,21 +2286,23 @@ fn run_v2_native<'a>(
                     }
                 }
                 let preload = Arc::new(preload);
-                RoventPinnedNativeSources::<RoventInputLockV2>::open_v2_with_collection(
+                RoventPinnedNativeSources::<RoventInputLockV2>::open_v2_with_collection_source_policy(
                     Arc::clone(&lock),
                     source_root,
                     cwd,
                     selection,
                     &control,
                     preload,
+                    arguments.v2_strict_source(),
                 )
             }
-            None => RoventPinnedNativeSources::<RoventInputLockV2>::open_v2(
+            None => RoventPinnedNativeSources::<RoventInputLockV2>::open_v2_with_source_policy(
                 Arc::clone(&lock),
                 source_root,
                 cwd,
                 selection,
                 &control,
+                arguments.v2_strict_source(),
             ),
         }
         .map_err(|failure| error("Assets", failure))?,

@@ -92,6 +92,44 @@ fn arguments() -> Vec<String> {
 }
 
 #[test]
+fn v2_source_verification_is_strict_unless_explicitly_observed() {
+    let default = Arguments::parse(&arguments()).unwrap();
+    assert!(default.v2_strict_source());
+
+    let mut strict = arguments();
+    strict.push("--source-verification=strict".into());
+    assert!(Arguments::parse(&strict).unwrap().v2_strict_source());
+
+    let mut observe = arguments();
+    observe.push("--source-verification=observe".into());
+    assert!(!Arguments::parse(&observe).unwrap().v2_strict_source());
+    observe.push("--source-verification=strict".into());
+    assert!(Arguments::parse(&observe).is_err());
+
+    let mut unsupported = arguments();
+    unsupported.push("--source-verification=ignore".into());
+    assert!(Arguments::parse(&unsupported).is_err());
+}
+
+#[test]
+fn v1_source_observation_is_explicit_and_does_not_enable_system_receipts() {
+    let default = Arguments::parse(&arguments()).unwrap();
+    assert!(default.v1_strict_source().unwrap());
+
+    let mut observed = arguments();
+    observed.push("--source-verification=observe".into());
+    assert!(!Arguments::parse(&observed).unwrap().v1_strict_source().unwrap());
+
+    let mut with_system_receipts = observed;
+    with_system_receipts.push("--system-runtime-receipt-root=outputs/system".into());
+    let error = Arguments::parse(&with_system_receipts)
+        .unwrap()
+        .v1_strict_source()
+        .unwrap_err();
+    assert_eq!(error.stage, "InputLockUnsupportedV1");
+}
+
+#[test]
 fn product_arguments_require_one_explicit_closed_selection_and_policy() {
     let args = Arguments::parse(&arguments()).unwrap();
     assert_eq!(args.root_policy, RoventRootAdmissionPolicy::DynamicGo);

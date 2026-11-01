@@ -493,6 +493,22 @@ impl RoventPinnedNativeSources {
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
+        Self::open_with_source_policy(lock, root, private_root_path, selection, control, true)
+    }
+
+    /// Explicitly observe Rules encoder and bootstrap/model source drift for
+    /// functional verification while retaining the original lock, Rules
+    /// semantics, export, checkpoint and graph pins. Source mismatches or
+    /// unavailable source identity are warnings, not reproduction or
+    /// numerical evidence.
+    pub(crate) fn open_with_source_policy(
+        lock: Arc<RoventInputLock>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        strict_source: bool,
+    ) -> Result<Self, BackendError> {
         Self::open_selected(
             lock,
             root,
@@ -500,7 +516,7 @@ impl RoventPinnedNativeSources {
             selection,
             control,
             None,
-            true,
+            strict_source,
         )
     }
     /// Explicit source-only Collection preload. The same full lock and all
@@ -512,6 +528,22 @@ impl RoventPinnedNativeSources {
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
         collection: Arc<RoventCollectionPreloadSources>,
+    ) -> Result<Self, BackendError> {
+        Self::open_collection_with_source_policy(
+            lock, root, private_root_path, selection, control, collection, true,
+        )
+    }
+
+    /// As above, the policy affects source observations only; the original
+    /// Collection preload must still own the exact same input lock.
+    pub(crate) fn open_collection_with_source_policy(
+        lock: Arc<RoventInputLock>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        collection: Arc<RoventCollectionPreloadSources>,
+        strict_source: bool,
     ) -> Result<Self, BackendError> {
         if !collection.matches_input_lock(&lock) {
             return Err(fail(
@@ -526,7 +558,7 @@ impl RoventPinnedNativeSources {
             selection,
             control,
             Some(collection),
-            true,
+            strict_source,
         )
     }
 }
@@ -586,6 +618,24 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
         control: &RoventStartupControl,
         collection: Arc<RoventCollectionPreloadSources>,
     ) -> Result<Self, BackendError> {
+        Self::open_v2_with_collection_source_policy(
+            lock, root, private_root_path, selection, control, collection, true,
+        )
+    }
+
+    /// Explicit source-observation policy for the same original V2 inputs.
+    /// Encoder, bootstrap and model implementation source drift may be
+    /// observed; descriptor semantics and export, graph and checkpoint
+    /// identities remain mandatory.
+    pub(crate) fn open_v2_with_collection_source_policy(
+        lock: Arc<RoventInputLockV2>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        collection: Arc<RoventCollectionPreloadSources>,
+        strict_source: bool,
+    ) -> Result<Self, BackendError> {
         control.check()?;
         if !collection.matches_v2_origin(&lock, control)
             || !collection.matches_original_root_path_v2(&private_root_path)
@@ -603,7 +653,7 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
             selection,
             control,
             Some(collection),
-            true,
+            strict_source,
         )?;
         owner.verify_collection_v2_origin()?;
         Ok(owner)
@@ -618,6 +668,19 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
+        Self::open_v2_with_source_policy(lock, root, private_root_path, selection, control, true)
+    }
+
+    /// Keep strict verification by default; observation is an explicit caller
+    /// choice and does not alter any model, Rules semantics or asset pins.
+    pub(crate) fn open_v2_with_source_policy(
+        lock: Arc<RoventInputLockV2>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        strict_source: bool,
+    ) -> Result<Self, BackendError> {
         Self::open_selected(
             lock,
             root,
@@ -625,7 +688,7 @@ impl RoventPinnedNativeSources<RoventInputLockV2> {
             selection,
             control,
             None,
-            true,
+            strict_source,
         )
     }
 }
@@ -1009,10 +1072,13 @@ impl<L: NativeInputLock> RoventPinnedNativeSources<L> {
             control.check()?;
         }
         if lock.system_runtime_lock().is_some() {
-            if runtime_bundle_manifest.is_some() || !runtime.is_empty() || control_blob.is_some() {
+            // The exact-flow inventory is pinned model metadata, not a copied
+            // CUDA/ORT runtime. Its optional presence must not relax the
+            // system-runtime restriction on native bundle or library copies.
+            if runtime_bundle_manifest.is_some() || !runtime.is_empty() {
                 return Err(fail(
                     K::IdentityMismatch,
-                    "system CUDA cannot own copied native bundle or control inventory",
+                    "system CUDA cannot own copied native bundle or runtime libraries",
                 ));
             }
         } else if matches!(lock.engine().pc.device, rz_experiments::RoventDevice::Cpu)
