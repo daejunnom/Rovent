@@ -6,6 +6,7 @@ import json
 import math
 import shutil
 import sys
+import time
 from pathlib import Path
 sys.dont_write_bytecode = True
 from managed_storage import (ManagedBuild, StorageError, canonical_root, tree_size,
@@ -121,8 +122,15 @@ def main(*, output_preservation=None) -> int:
                 _emit_storage_cleanup_failure(cleanup_error)
             raise
 
+        # acquire() has already checked the catalog. Revisit the full build tree
+        # at most once per minute while running; finish() rechecks it on exit.
+        # This can delay build-tree path anomaly detection by an interval plus
+        # the next supervisor sample/scan time. Output custody sampling below
+        # keeps its original cadence.
+        next_build_warning = time.monotonic() + 60
+
         def check_budget():
-            nonlocal budget_failure
+            nonlocal budget_failure, next_build_warning
             try:
                 if output_preservation is None:
                     note_output_total(sample_output_budget(supervisor_scope=output_scope,
@@ -135,9 +143,11 @@ def main(*, output_preservation=None) -> int:
                 # after that same cleanup; do not alter its type or message.
                 budget_failure = exc
                 raise
-            build_total = tree_size(manager.root / "slots", allow_disappearing=True)
-            warn_output_threshold(build_total, manager.total_limit, scope="managed_build_catalog",
-                                  observed_bytes=build_total)
+            if time.monotonic() >= next_build_warning:
+                build_total = tree_size(manager.root / "slots", allow_disappearing=True)
+                warn_output_threshold(build_total, manager.total_limit, scope="managed_build_catalog",
+                                      observed_bytes=build_total)
+                next_build_warning = time.monotonic() + 60
 
         # Set before even attempting dispatch: a launcher failure with uncertain
         # child creation must never use the no-child cleanup shortcut.
