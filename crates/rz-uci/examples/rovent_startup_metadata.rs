@@ -1766,6 +1766,80 @@ mod metadata {
                 assert!(output.len() <= STDOUT_MAX_BYTES);
             }
         }
+        #[test]
+        fn v5_metadata_keeps_document_and_configuration_domains_distinct() {
+            let document_domain = rz_experiments::ROVENT_STARTUP_DOCUMENT_V5_DOMAIN;
+            let configuration_domain = rz_experiments::ROVENT_STARTUP_CONFIGURATION_V5_DOMAIN;
+            let configuration: serde_json::Value = serde_json::from_slice(&fixture(
+                configuration_domain,
+                r#", "post_repair":"disabled", "external":{"kind":"absent"}, "own_r_root_tie":{"kind":"not_applicable"}"#,
+            ))
+            .unwrap();
+            let envelope = serde_json::json!({
+                "domain": document_domain,
+                "system_runtime_lock_sha256": "a".repeat(64),
+                "configuration": configuration,
+            });
+            let raw = serde_json::to_vec(&envelope).unwrap();
+            let document = StartupConfigurationDocument::from_json(&raw).unwrap();
+            assert!(matches!(&document, StartupConfigurationDocument::V5(_)));
+            let position = parse_position_command("position startpos").unwrap();
+            let output = prepare_metadata_with_options(
+                &raw,
+                None,
+                Some(&position),
+                Some(SessionImplementationPolicy::DynamicGo),
+            )
+            .unwrap();
+            let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(output["configuration_document_domain"], document_domain);
+            let canonical = output["canonical_configuration_json"].as_str().unwrap();
+            assert_eq!(canonical.as_bytes(), document.canonical_bytes().unwrap());
+            let canonical_envelope: serde_json::Value = serde_json::from_str(canonical).unwrap();
+            assert_eq!(canonical_envelope["domain"], document_domain);
+            assert_eq!(
+                canonical_envelope["configuration"]["domain"],
+                configuration_domain
+            );
+            assert_ne!(document_domain, configuration_domain);
+            assert_eq!(
+                output["configuration_sha256"],
+                hex(&document.configuration_digest().unwrap())
+            );
+            assert_eq!(
+                output["search_configuration_sha256"],
+                hex(&document.search_configuration_digest().unwrap())
+            );
+            assert_eq!(output["actual_startup_ready"], false);
+            assert_eq!(output["native_authority"], false);
+            assert_eq!(output["training"], false);
+            assert_eq!(output["root_metadata"]["root_authority"], false);
+            assert_eq!(
+                output["session_implementation"]["actual_session_constructed"],
+                false
+            );
+            assert_eq!(output["session_implementation"]["root_authority"], false);
+
+            let mut changed_envelope = envelope;
+            changed_envelope["system_runtime_lock_sha256"] = serde_json::json!("b".repeat(64));
+            let changed = StartupConfigurationDocument::from_json(
+                &serde_json::to_vec(&changed_envelope).unwrap(),
+            )
+            .unwrap();
+            assert_ne!(
+                document.canonical_bytes().unwrap(),
+                changed.canonical_bytes().unwrap()
+            );
+            assert_eq!(
+                document.configuration_digest().unwrap(),
+                changed.configuration_digest().unwrap()
+            );
+            assert_eq!(
+                document.search_configuration_digest().unwrap(),
+                changed.search_configuration_digest().unwrap()
+            );
+        }
+
         fn backend_fixture() -> Vec<u8> {
             // A declaration-only synthetic digest, not an actual native asset.
             format!(r#"{{"domain":"rz-rovent-backend-metadata-input/1","device":{{"device":"cpu"}},"runtime_binary_sha256":"{}","runtime_bundle_sha256":{{"kind":"absent"}},"control_inventory_sha256":{{"kind":"absent"}},"loading_profile":{{"kind":"absent"}}}}"#, "11".repeat(32)).into_bytes()
