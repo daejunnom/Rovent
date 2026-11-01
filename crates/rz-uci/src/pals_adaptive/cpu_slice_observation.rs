@@ -167,6 +167,8 @@ pub struct AdaptiveCpuSliceDiagnosticSnapshot {
     pub records_max: usize,
     pub unavailable: Option<AdaptiveCpuSliceDiagnosticUnavailable>,
     pub records: Vec<AdaptiveCpuSliceObservation>,
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub reference_input: Option<(u64, Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>)>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     pub nnuec_chain: Vec<NnuecChainObservation>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -176,6 +178,8 @@ pub struct AdaptiveCpuSliceDiagnosticSnapshot {
 struct State {
     authority: Option<SearchAuthority>,
     records: Vec<AdaptiveCpuSliceObservation>,
+    #[cfg(feature = "native-validation-diagnostics")]
+    reference_input: Option<(u64, Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>)>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     nnuec_chain: Vec<NnuecChainObservation>,
 }
@@ -217,6 +221,8 @@ impl AdaptiveCpuSliceDiagnostic {
                 state: Mutex::new(State {
                     authority: None,
                     records,
+                    #[cfg(feature = "native-validation-diagnostics")]
+                    reference_input: None,
                     #[cfg(feature = "pals-adaptive-diagnostics")]
                     nnuec_chain,
                 }),
@@ -244,6 +250,8 @@ impl AdaptiveCpuSliceDiagnostic {
             authority: state.authority,
             records_max: self.inner.records_max,
             records: state.records.clone(),
+            #[cfg(feature = "native-validation-diagnostics")]
+            reference_input: state.reference_input.clone(),
             #[cfg(feature = "pals-adaptive-diagnostics")]
             nnuec_chain: state.nnuec_chain.clone(),
             #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -252,6 +260,26 @@ impl AdaptiveCpuSliceDiagnostic {
                 self.inner.unavailable.load(Ordering::Acquire),
             ),
         })
+    }
+    /// Separate optional bytes. Never changes the settled-prefix availability.
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub(crate) fn record_reference_input(
+        &self,
+        execution: rz_contracts::ExecutionId,
+        input: Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>,
+    ) {
+        let Ok(mut state) = self.inner.state.try_lock() else { return; };
+        if state.reference_input.is_some() { return; }
+        let Some(original) = state.records.last() else { return; };
+        if original.grant.execution != execution || original.admission_rejected { return; }
+        if input.scalar.is_some_and(|sample| {
+            sample.binding != original.scope.job.evaluation_namespace
+                || sample.view_seal != original.scope.view.view_digest.0
+                || sample.record_scope != original.scope.public_context.0
+                || sample.generation != original.scope.authority.root.0
+        }) { return; }
+        let sequence = original.sequence;
+        state.reference_input = Some((sequence, input));
     }
     pub(crate) fn bind(
         &self,

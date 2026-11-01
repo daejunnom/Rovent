@@ -417,6 +417,8 @@ pub struct RoventProductLifecycleObservation {
 
 #[derive(Default)]
 struct State {
+    #[cfg(feature = "native-validation-diagnostics")]
+    reference_input: Option<nnuec_cpu_slices::ReferencePending>,
     root_runs: u64,
     initial_stop_rows: u64,
     root_run_errors: u64,
@@ -827,6 +829,8 @@ impl RoventLifecycleDiagnostics {
         row.scope_incomplete |= state.scope_incomplete;
         row.diagnostic_failure = state.first_issue;
         state.latest = Some(row);
+        #[cfg(feature = "native-validation-diagnostics")]
+        self.flush_reference_input(&mut state);
         match state.first_issue {
             Some(cause) => Err(cause),
             None => Ok(()),

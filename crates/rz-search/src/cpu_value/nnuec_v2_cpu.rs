@@ -105,6 +105,10 @@ impl V2CpuValue {
             numeric.value.to_bits(),
             score,
         );
+        #[cfg(feature = "nnuec-scalar-diagnostics")]
+        super::scalar_diagnostic::capture_reference_input(|| {
+            self.model.reference_input(self.bound.context(), &state.local, position)
+        });
         Ok(score)
     }
 

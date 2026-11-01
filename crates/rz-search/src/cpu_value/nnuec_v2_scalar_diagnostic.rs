@@ -1,9 +1,15 @@
 //! Fixed-size raw observation on the actual private worker thread.
 //! No owner/Bound/model/token is retained. A sample records an already returned
-//! numeric result; no new forward, score, hash, clock, allocation or I/O occurs.
+//! numeric result; the ordinary scalar tap adds no forward, score, hash, clock,
+//! allocation or I/O. Explicit optional reference-input capture has its own bound.
 use super::review::Provenance;
 use rz_contracts::Digest;
 use std::cell::{Cell, RefCell};
+
+#[path = "nnuec_v2_scalar_reference.rs"]
+mod reference_input;
+pub use reference_input::{INPUT_BYTES_ENV, MAX_INPUT_BYTES, InputUnavailable, ReferenceInputSnapshot};
+pub(crate) use reference_input::capture as capture_reference_input;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
@@ -50,10 +56,16 @@ impl Invocation {
             *current = Some(Summary::default());
             true
         });
+        if owns_scope {
+            reference_input::begin();
+        }
         Self {
             owns_scope,
             _thread_local_owner: std::marker::PhantomData,
         }
+    }
+    pub(crate) fn take_reference_input(&self) -> Option<ReferenceInputSnapshot> {
+        self.owns_scope.then(reference_input::take).flatten()
     }
     pub(crate) fn finish(self) -> Option<Summary> {
         if !self.owns_scope {
@@ -82,6 +94,7 @@ impl Drop for Invocation {
             }
         });
         INCOMPLETE.set(false);
+        reference_input::clear();
     }
 }
 pub(super) fn record(

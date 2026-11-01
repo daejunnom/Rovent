@@ -98,6 +98,9 @@ impl CpuSliceJournal {
 pub(crate) struct CpuSliceOwnerObservation {
     pub summary: CpuSliceSummary,
     pub records: Vec<SettledSlice>,
+    #[cfg(feature = "native-validation-diagnostics")]
+    #[serde(skip)]
+    pub reference_input: Option<(u64, Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>)>,
     // A separate versioned writer consumes these; existing slice JSON stays
     // unchanged. Missing handle never becomes an empty observed chain.
     #[serde(skip)]
@@ -173,6 +176,8 @@ fn project(
             scope: "original_manager_settled_receipt_prefix_not_token_or_semantic_authority",
         },
         records,
+        #[cfg(feature = "native-validation-diagnostics")]
+        reference_input: snapshot.as_ref().and_then(|s| s.reference_input.clone()),
         nnuec_chain: snapshot
             .as_ref()
             .map(|s| s.nnuec_chain.clone())
@@ -411,6 +416,7 @@ impl From<&AdaptiveCpuSliceObservation> for SettledSlice {
 }
 #[cfg(feature = "native-validation-diagnostics")]
 impl SettledSlice {
+    pub(crate) fn sequence(&self) -> u64 { self.sequence }
     pub(crate) fn nnuec_scalar(&self) -> Option<&serde_json::Value> {
         self.nnuec_scalar.as_ref()
     }
@@ -480,6 +486,8 @@ mod tests {
                     crate::pals_adaptive::AdaptiveCpuSliceDiagnosticUnavailable::Overflow,
                 ),
                 records: Vec::new(),
+                #[cfg(feature = "native-validation-diagnostics")]
+                reference_input: None,
                 nnuec_chain: Vec::new(),
                 nnuec_chain_dropped: 0,
             }),
@@ -503,6 +511,8 @@ mod tests {
                 records_max: RECORDS_MAX,
                 unavailable: None,
                 records: Vec::new(),
+                #[cfg(feature = "native-validation-diagnostics")]
+                reference_input: None,
                 nnuec_chain: Vec::new(),
                 nnuec_chain_dropped: 0,
             }),
@@ -526,6 +536,8 @@ mod tests {
                 records_max: RECORDS_MAX,
                 unavailable: None,
                 records: Vec::new(),
+                #[cfg(feature = "native-validation-diagnostics")]
+                reference_input: None,
                 nnuec_chain: Vec::new(),
                 nnuec_chain_dropped: 0,
             }),

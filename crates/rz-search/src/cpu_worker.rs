@@ -1207,8 +1207,14 @@ impl CpuWorkerSliceTiming {
 pub struct CpuWorkerEventObservation {
     original: CpuWorkerEvent,
     timing: Option<CpuWorkerSliceTiming>,
+    #[cfg(feature = "nnuec-scalar-diagnostics")]
+    reference_input: Option<Arc<crate::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>>,
 }
 impl CpuWorkerEventObservation {
+    #[cfg(feature = "nnuec-scalar-diagnostics")]
+    pub fn reference_input(&self) -> Option<&Arc<crate::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>> {
+        self.reference_input.as_ref()
+    }
     pub fn into_parts(self) -> (CpuWorkerEvent, Option<CpuWorkerSliceTiming>) {
         (self.original, self.timing)
     }
@@ -1550,6 +1556,8 @@ impl CpuWorker {
                             let _ = permit.publish(CpuWorkerEventObservation {
                                 original: CpuWorkerEvent::JobTerminated(termination),
                                 timing: None,
+                                #[cfg(feature = "nnuec-scalar-diagnostics")]
+                                reference_input: None,
                             });
                         }
                         active = None;
@@ -1757,6 +1765,8 @@ impl CpuWorker {
                     report.result = Err(error);
                 }
                 let mut owner_timing = None;
+                #[cfg(feature = "nnuec-scalar-diagnostics")]
+                let mut reference_input = None;
                 if eligible {
                     let task = active.as_mut().expect("checked private job");
                     // Starting the next slice consumes the previous pause
@@ -1857,6 +1867,8 @@ impl CpuWorker {
                             })
                     }));
                     let analyze_returned_at = Instant::now();
+                    #[cfg(feature = "nnuec-scalar-diagnostics")]
+                    { reference_input = diagnostic.take_reference_input().map(Arc::new); }
                     owner_timing = Some(CpuWorkerSliceTiming {
                         run_started_at,
                         analyze_returned_at,
@@ -2025,6 +2037,8 @@ impl CpuWorker {
                     .publish(CpuWorkerEventObservation {
                         original: CpuWorkerEvent::Slice(report),
                         timing: owner_timing,
+                        #[cfg(feature = "nnuec-scalar-diagnostics")]
+                        reference_input,
                     })
                     .is_err()
                 {

@@ -81,10 +81,36 @@ impl RoventLifecycleDiagnostics {
             performance_evidence: false,
             full_acceptance_issued: false,
         };
+        #[cfg(feature = "native-validation-diagnostics")]
+        let reference = snapshot.as_ref().and_then(|s| {
+            let (sequence, input) = s.reference_input.as_ref()?;
+            let original = s.records.iter().find(|r| r.sequence() == *sequence)?;
+            Some(ReferencePending {
+                header: serde_json::json!({
+                    "domain":"rz-rovent-nnuec-reference-input-observation/1",
+                    "event":"optional_input_after_original_session_finish",
+                    "input_lock_sha256":hex(self.lock), "implementation_sha256":hex(self.implementation),
+                    "root_admission_sha256":s.summary.root_admission_sha256,
+                    "source_status":status, "original_settled_slice":original,
+                    "scalar":input.scalar.map(|v|serde_json::json!({
+                        "binding_sha256":hex(v.binding),"full_view_sha256":hex(Digest(v.full_view)),
+                        "view_seal_sha256":hex(Digest(v.view_seal)),"record_scope_sha256":hex(Digest(v.record_scope)),
+                        "generation":v.generation,"raw_value_f32_bits":v.raw_value_bits,
+                        "scaled_value_f32_bits":v.scaled_value_bits,"returned_frontier_score_i32":v.returned_frontier_score})),
+                    "capture_maximum_input_bytes":input.maximum_bytes,
+                    "unavailable":input.unavailable.map(|v|v.code()),
+                    "execution_authorized":false,"physical_completion_attested":false,
+                    "full_acceptance_issued":false,"performance_evidence":false
+                }),
+                input: Arc::clone(input),
+            })
+        });
         let Ok(mut state) = self.state.lock() else {
             self.poisoned.store(true, Ordering::Release);
             return;
         };
+        #[cfg(feature = "native-validation-diagnostics")]
+        if state.reference_input.is_none() { state.reference_input = reference; }
         if state.root_runs > MAX_ROOT_ROWS {
             state.scope_incomplete = true;
             state
@@ -153,6 +179,64 @@ fn write_slice_row<T: Serialize>(
         .map_err(|_| "nnuec_cpu_slice_write_failed")?;
     output.flush().map_err(|_| "nnuec_cpu_slice_flush_failed")
 }
+
+#[cfg(feature = "native-validation-diagnostics")]
+pub(super) struct ReferencePending {
+    header: serde_json::Value,
+    input: Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>,
+}
+#[cfg(feature = "native-validation-diagnostics")]
+impl RoventLifecycleDiagnostics {
+    /// This optional output is last. Its failure cannot take a required row's
+    /// seat or change the original protocol/finish/diagnostic Result.
+    pub(super) fn flush_reference_input(&self, state: &mut State) {
+        let Some(pending) = state.reference_input.take() else { return; };
+        let raw = pending.input.input_json.as_deref().map(str::as_bytes);
+        let available = MAX_STREAM_BYTES.saturating_sub(state.bytes);
+        let make_rows = || -> Option<Vec<Vec<u8>>> {
+            use sha2::{Digest as _, Sha256};
+            let total = raw.map_or(1, |b| b.len().div_ceil(1024).max(1));
+            let digest = raw.map(|b| format!("{:x}", Sha256::digest(b)));
+            let mut rows = Vec::new();
+            rows.try_reserve_exact(total).ok()?;
+            let mut bytes = 0usize;
+            for index in 0..total {
+                let mut value = pending.header.clone();
+                let data = raw.map(|b| &b[index * 1024..b.len().min((index + 1) * 1024)]);
+                value["reference_input"] = serde_json::json!({
+                    "status":if raw.is_some(){"captured"}else{"unavailable"},
+                    "encoding":"original_utf8_hex_chunks", "bytes":raw.map(|v|v.len()),
+                    "raw_sha256":digest,"chunk_index":index,"chunks":total,
+                    "data_hex":data.map(|b|b.iter().map(|x|format!("{x:02x}")).collect::<String>())
+                });
+                let mut encoded = serde_json::to_vec(&value).ok()?;
+                encoded.push(b'\n');
+                bytes = bytes.checked_add(encoded.len())?;
+                if encoded.len() > MAX_ROW_BYTES || bytes > available { return None; }
+                rows.push(encoded);
+            }
+            Some(rows)
+        };
+        let rows = make_rows().unwrap_or_else(|| {
+            let mut header = pending.header.clone();
+            header["reference_input"] = serde_json::json!({
+                "status":"unavailable","reason":"optional_output_capacity_or_encoding",
+                "bytes":raw.map(|v|v.len())
+            });
+            serde_json::to_vec(&header).ok().and_then(|mut row| {
+                row.push(b'\n');
+                (row.len() <= MAX_ROW_BYTES && row.len() <= available).then_some(vec![row])
+            }).unwrap_or_default()
+        });
+        let mut output = io::stderr().lock();
+        for row in rows {
+            if output.write_all(&row).is_err() { break; }
+            state.bytes += row.len();
+        }
+        let _ = output.flush();
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

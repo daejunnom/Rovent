@@ -6674,21 +6674,29 @@ where
         slot: usize,
         event: CpuWorkerEvent,
     ) -> Result<(), AdaptiveManagerError> {
-        self.own_event_with_timing(slot, event, None)
+        self.own_event_with_timing(slot, event, None,
+            #[cfg(feature = "native-validation-diagnostics")] None,
+        )
     }
     fn own_event_observed(
         &mut self,
         slot: usize,
         event: CpuWorkerEventObservation,
     ) -> Result<(), AdaptiveManagerError> {
+        #[cfg(feature = "native-validation-diagnostics")]
+        let reference_input = event.reference_input().cloned();
         let (original, timing) = event.into_parts();
-        self.own_event_with_timing(slot, original, timing)
+        self.own_event_with_timing(slot, original, timing,
+            #[cfg(feature = "native-validation-diagnostics")] reference_input,
+        )
     }
     fn own_event_with_timing(
         &mut self,
         slot: usize,
         event: CpuWorkerEvent,
         timing: Option<CpuWorkerSliceTiming>,
+        #[cfg(feature = "native-validation-diagnostics")]
+        reference_input: Option<Arc<rz_search::cpu_value::nnuec::v2::scalar_diagnostic::ReferenceInputSnapshot>>,
     ) -> Result<(), AdaptiveManagerError> {
         match event {
             CpuWorkerEvent::Slice(report) => {
@@ -6833,6 +6841,10 @@ where
                         accounting,
                         timing,
                     );
+                    #[cfg(feature = "native-validation-diagnostics")]
+                    if let Some(input) = reference_input {
+                        diagnostic.record_reference_input(report.grant.execution, input);
+                    }
                 }
                 if binding.queued_resume_termination.is_some() {
                     // The real terminal already discarded the OLD paused
