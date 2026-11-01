@@ -145,8 +145,8 @@ def same_file_identity(before, after, named):
             == identity(named, creation_time=os.name == 'nt'))
 
 
-def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False):
-    """Hash a retained O_NOFOLLOW FD; Cargo alone may own up to 32 hardlinks."""
+def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False, *, git_blob=True):
+    """Hash a retained FD; only tracked-source consumers need a Git blob SHA-1."""
     checked(path)
     fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
     stream = os.fdopen(fd, 'rb')
@@ -155,20 +155,21 @@ def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False):
         require(stat.S_ISREG(before.st_mode) and 1 <= before.st_nlink <= (32 if cargo else 1)
                 and (0 if allow_empty else 1) <= before.st_size <= maximum, 'ArtifactTypeOrSize')
         digest = hashlib.sha256()
-        blob = hashlib.sha1(b'blob ' + str(before.st_size).encode() + b'\0')
+        blob = hashlib.sha1(b'blob ' + str(before.st_size).encode() + b'\0') if git_blob else None
         while raw := stream.read(65536):
             digest.update(raw)
-            blob.update(raw)
+            if blob is not None:
+                blob.update(raw)
         require(same_file_identity(before, os.fstat(fd), path.lstat()), 'ArtifactIdentityChanged')
         stream.seek(0)
-        return stream, {'bytes': before.st_size, 'sha256': digest.hexdigest()}, before, blob.hexdigest()
+        return stream, {'bytes': before.st_size, 'sha256': digest.hexdigest()}, before, None if blob is None else blob.hexdigest()
     except BaseException:
         stream.close()
         raise
 
 
 def file_pin(path, maximum=SOURCE_CAP):
-    stream, pin, _, _ = pinned_file(path, maximum)
+    stream, pin, _, _ = pinned_file(path, maximum, git_blob=False)
     stream.close()
     return pin
 
@@ -176,7 +177,7 @@ def file_pin(path, maximum=SOURCE_CAP):
 def copy_cargo_elf(source, destination, check_budget):
     """Original report's Cargo FD -> private nlink=1 custody, no source unlink."""
     require(not destination.exists(), 'CargoElfCopyPlacement')
-    stream, expected, before, _ = pinned_file(source, ELF_CAP, cargo=True)
+    stream, expected, before, _ = pinned_file(source, ELF_CAP, cargo=True, git_blob=False)
     with stream:
         check_budget(expected['bytes'])
         require(stream.read(4) == b'\x7fELF', 'CargoOutputNotElf')
@@ -441,13 +442,13 @@ def cleanup_closed_partial_elf_copies(root, artifact, receipt):
     require(all(type(key) is str and key and Path(key).name == key for key in binaries),
             'PartialTargetNames')
     require({entry.name for entry in private.iterdir()} == set(binaries), 'PartialPrivateContents')
-    archive_stream, archive_pin, archive_before, _ = pinned_file(artifact / name, ARTIFACT_CAP)
+    archive_stream, archive_pin, archive_before, _ = pinned_file(artifact / name, ARTIFACT_CAP, git_blob=False)
     handles = []
     try:
         require(archive_pin == receipt.get('partial_binary_bundle'), 'PartialBundleChanged')
         pins = {}
         for target, info in binaries.items():
-            stream, pin, before, _ = pinned_file(private / target, ELF_CAP)
+            stream, pin, before, _ = pinned_file(private / target, ELF_CAP, git_blob=False)
             handles.append((target, stream, before))
             require(pin == {key: info['pin'][key] for key in ('bytes', 'sha256')}, 'PrivateElfChanged')
             require(stream.read(4) == b'\x7fELF', 'PrivateFileNotElf')
@@ -582,13 +583,13 @@ class Build:
                 'CommandOrOriginalTreeClosureFailed:' + label)
         check()
         stream, row['stdout_pin'], before, _ = pinned_file(
-            out, LOG_CAP, allow_empty=code != 0 or allow_empty_stdout)
+            out, LOG_CAP, allow_empty=code != 0 or allow_empty_stdout, git_blob=False)
         with stream:
             raw = stream.read()
             require(same_file_identity(before, os.fstat(stream.fileno()), out.lstat()), 'CommandStdoutFDChanged')
         # Empty stderr is ordinary; stdout-consuming commands are nonempty.
         row['stderr_bytes'] = err.stat().st_size
-        stream, row['stderr_pin'], _, _ = pinned_file(err, LOG_CAP, allow_empty=True)
+        stream, row['stderr_pin'], _, _ = pinned_file(err, LOG_CAP, allow_empty=True, git_blob=False)
         stream.close()
         if code != 0:
             raise CommandExitFailure(row)
@@ -705,7 +706,7 @@ def archive_selected_binaries(build, artifact, private, binaries, filename):
     with bundle.open('xb') as raw, tarfile.open(fileobj=BoundedArchiveWriter(raw, compressed_cap),
                                               mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
         for name in sorted(binaries):
-            stream, actual, before, _ = pinned_file(private / name, ELF_CAP)
+            stream, actual, before, _ = pinned_file(private / name, ELF_CAP, git_blob=False)
             with stream:
                 require(actual == {k: binaries[name]['pin'][k] for k in ('bytes', 'sha256')}, 'PreBundlePrivatePin')
                 info = tarfile.TarInfo('bin/' + name)
@@ -760,7 +761,7 @@ def collect_metadata_getter(build, *, artifact, private, binaries, results, labe
         return None
     result['status'] = 'preparing'
     failure_check()
-    stream, actual, before, _ = pinned_file(private / target, ELF_CAP)
+    stream, actual, before, _ = pinned_file(private / target, ELF_CAP, git_blob=False)
     with stream:
         require(actual == {key: binaries[target]['pin'][key] for key in ('bytes', 'sha256')}
                 and same_file_identity(before, os.fstat(stream.fileno()), (private / target).lstat()),
@@ -809,7 +810,7 @@ def rules_encoder_source_digest(source):
             ('pals_native/virtual_selected_input.rs', 'crates/rz-uci/src/pals_native/virtual_selected_input.rs'),
             ('pals_native/ticketed/virtual_bridge.rs', 'crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs'),
             ('rz-eval/pals_model/virtual_review.rs', 'crates/rz-eval/src/pals_model/virtual_review.rs')):
-        stream, _, before, _ = pinned_file(source / logical, 16 << 20)
+        stream, _, before, _ = pinned_file(source / logical, 16 << 20, git_blob=False)
         with stream:
             raw = stream.read()
             require(same_file_identity(before, os.fstat(stream.fileno()), (source / logical).lstat()),
@@ -928,7 +929,7 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
             # its own embedded map before executing.
             components = (component_inventory(catalog, rows, selected_profile=True) if selected_gpu
                           else component_inventory(catalog, rows))
-        lock, lock_pin, lock_meta, _ = pinned_file(source / 'Cargo.lock')
+        lock, lock_pin, lock_meta, _ = pinned_file(source / 'Cargo.lock', git_blob=False)
         toolchain = tomllib.loads((source / 'rust-toolchain.toml').read_text())
         require(toolchain['toolchain']['channel'] == '1.96.0', 'RegisteredRustToolchain')
         for name in ('rustc', 'cargo'):
@@ -1102,7 +1103,7 @@ def run(source, root, expected_head, seconds, *, profile='native-validation'):
             logs.mkdir(mode=0o700)
             for path in sorted((root / 'logs').iterdir()):
                 try:
-                    stream, log_pin, before, _ = pinned_file(path, LOG_CAP, allow_empty=True)
+                    stream, log_pin, before, _ = pinned_file(path, LOG_CAP, allow_empty=True, git_blob=False)
                     with stream, (logs / path.name).open('xb') as target:
                         shutil.copyfileobj(stream, target, 65536)
                         target.flush()

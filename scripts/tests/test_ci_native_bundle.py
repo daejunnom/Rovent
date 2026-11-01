@@ -21,6 +21,29 @@ import ci_native_bundle as bundle
 
 
 class NativeBundleTests(unittest.TestCase):
+    def test_raw_pins_skip_unused_git_blob_but_keep_original_bytes_and_size_cap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'synthetic-artifact'
+            data = b'\x7fELF' + b'x' * (65536 + 17)
+            source.write_bytes(data)
+            expected = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+            expected_blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+            stream, pin, _, blob = bundle.pinned_file(source)
+            with stream:
+                self.assertEqual(stream.read(), data)
+            self.assertEqual(pin, expected)
+            self.assertEqual(blob, expected_blob)
+
+            with patch.object(bundle.hashlib, 'sha1', side_effect=AssertionError('unused Git blob computation')):
+                stream, pin, _, blob = bundle.pinned_file(source, git_blob=False)
+                with stream:
+                    self.assertEqual(stream.read(), data)
+                self.assertEqual(pin, expected)
+                self.assertIsNone(blob)
+                self.assertEqual(bundle.file_pin(source), expected)
+                with self.assertRaisesRegex(RuntimeError, 'ArtifactTypeOrSize'):
+                    bundle.pinned_file(source, maximum=len(data) - 1, git_blob=False)
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'closed-owner ELF cleanup is Linux-only')
     def test_partial_failure_reclaims_only_verified_restorable_private_copies(self):
         with tempfile.TemporaryDirectory() as temporary:
