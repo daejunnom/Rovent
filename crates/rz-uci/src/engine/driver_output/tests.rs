@@ -494,6 +494,106 @@ fn fallback_and_none_bestmove_never_inherit_an_older_proof_or_another_start_slot
 }
 
 #[test]
+fn rovent_horizon_belongs_to_the_actual_start_report_and_move() {
+    let fixture = start("position startpos");
+    let movement = mv("e2e4");
+    for work in [
+        DriverWork::Rovent {
+            root_entries: 1,
+            total_node_visits: 5,
+            role_calls: 2,
+            accepted_policy: 1,
+            accepted_fresh_values: 1,
+            checked_transitions: 4,
+            native_r_calls: 0,
+            native_nodes: 0,
+            native_qsearch_nodes: 0,
+            native_pvs_entries: None,
+            native_see_nodes: None,
+            external_teacher_calls: 0,
+            completed_depth: Some(3),
+            maximum_examined_ply: 5,
+        },
+        DriverWork::RoventNative {
+            root_entries: 1,
+            total_node_visits: Some(5),
+            checked_transitions: 4,
+            native_nodes: None,
+            native_qsearch_nodes: None,
+            submitted_role_tickets: 2,
+            consumed_role_outputs: 2,
+            completed_nn_inputs: Some(2),
+            consumed_nn_inputs: Some(2),
+            completed_depth: None,
+            maximum_examined_ply: 5,
+        },
+    ] {
+        let expected = match &work {
+            DriverWork::Rovent { .. } => (Some(3), 5),
+            _ => (None, 5),
+        };
+        let envelope =
+            DriverOutputEnvelope::new(fixture.ticket.clone(), authority(), &fixture.root, None)
+                .unwrap();
+        let recorded = envelope
+            .record(SearchSessionReport {
+                best_move: Some(movement),
+                work,
+                mate_strategy: None,
+            })
+            .unwrap();
+        assert_eq!(
+            envelope
+                .horizon_for(&recorded, scope(), "e2e4", true)
+                .unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            envelope
+                .horizon_for(&recorded, evaluation_scope(), "e2e4", false)
+                .unwrap(),
+            None
+        );
+        assert_error(
+            envelope.horizon_for(&recorded, evaluation_scope(), "e2e4", true),
+            ErrorCode::Stale,
+            Stage::Output,
+        );
+        assert_error(
+            envelope.horizon_for(&recorded, scope(), "d2d4", true),
+            ErrorCode::IdentityMismatch,
+            Stage::Output,
+        );
+        let different_report = Arc::new(recorded.as_ref().clone());
+        assert_error(
+            envelope.horizon_for(&different_report, scope(), "e2e4", true),
+            ErrorCode::Stale,
+            Stage::Output,
+        );
+    }
+}
+
+#[test]
+fn local_cpu_depth_is_not_published_as_rovent_root_horizon() {
+    let fixture = start("position startpos");
+    let envelope =
+        DriverOutputEnvelope::new(fixture.ticket.clone(), authority(), &fixture.root, None)
+            .unwrap();
+    let mut actual = report(Some(mv("e2e4")), None);
+    actual.work = DriverWork::Cpu {
+        nodes: 99,
+        completed_depth: 7,
+    };
+    let recorded = envelope.record(actual).unwrap();
+    assert_eq!(
+        envelope
+            .horizon_for(&recorded, scope(), "e2e4", true)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn poisoned_publication_slot_returns_typed_failure_and_fallback_remains_proof_free() {
     let fixture = start("position startpos");
     let envelope =

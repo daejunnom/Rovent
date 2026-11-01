@@ -1643,6 +1643,27 @@ impl Owner {
                     return;
                 }
             };
+            let horizon = match &pending.driver_output {
+                Some(publication) if pending.from_driver_report => match &publication.report {
+                    Some(report) => {
+                        publication
+                            .envelope
+                            .horizon_for(report, pending.scope, bestmove, true)
+                    }
+                    None => Err(failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "reported driver output has no actual Start final report",
+                    )),
+                },
+                _ => Ok(None),
+            };
+            let horizon = match horizon {
+                Ok(horizon) => horizon,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            };
             if let (Some(driver), crate::contracts::SessionScope::Search(authority)) =
                 (&self.driver, pending.scope)
             {
@@ -1652,6 +1673,11 @@ impl Owner {
                     self.close_physical_fence(session, out, error.into());
                     return;
                 }
+            }
+            if let Some((depth, seldepth)) = horizon {
+                let depth = depth.map_or_else(String::new, |value| format!(" depth {value}"));
+                out.protocol
+                    .push(format!("info{depth} seldepth {seldepth} pv {bestmove}"));
             }
             if let Some(strategy) = strategy {
                 if let Some(mate) = strategy.conclusion().exact_uci_mate() {

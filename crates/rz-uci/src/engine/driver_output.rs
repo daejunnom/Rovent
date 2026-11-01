@@ -4,7 +4,7 @@
 
 use crate::SearchTicket;
 use crate::contracts::SessionScope;
-use crate::search_driver::SearchSessionReport;
+use crate::search_driver::{DriverWork, SearchSessionReport};
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::{ContractError, ErrorCode, Stage};
 use rz_position::{BoardMove, Position, PositionSnapshot};
@@ -151,6 +151,50 @@ impl DriverOutputEnvelope {
             ));
         }
         Ok(report.mate_strategy.clone())
+    }
+
+    /// A horizon is publishable only with the original report's own move and
+    /// authority. A fallback or a report from another Start cannot supply it.
+    /// These are root-relative Rovent ply observations, not local CPU depth.
+    pub(super) fn horizon_for(
+        &self,
+        report: &Arc<SearchSessionReport>,
+        scope: SessionScope,
+        bestmove: &str,
+        from_report: bool,
+    ) -> Result<Option<(Option<u16>, u16)>, ContractError> {
+        if !from_report {
+            return Ok(None);
+        }
+        self.validate_scope(scope)?;
+        let slot = self.report.lock().map_err(|_| poisoned())?;
+        if !slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, report)) {
+            return Err(stale(
+                "driver output horizon is not from this Start's recorded report",
+            ));
+        }
+        self.validate_report(report)?;
+        let Some(movement) = report.best_move else {
+            return Ok(None);
+        };
+        if bestmove != movement.to_string() {
+            return Err(output_mismatch(
+                "driver output bestmove differs from the recorded horizon",
+            ));
+        }
+        match &report.work {
+            DriverWork::Rovent {
+                completed_depth,
+                maximum_examined_ply,
+                ..
+            }
+            | DriverWork::RoventNative {
+                completed_depth,
+                maximum_examined_ply,
+                ..
+            } => Ok(Some((*completed_depth, *maximum_examined_ply))),
+            DriverWork::Cpu { .. } | DriverWork::Pals { .. } => Ok(None),
+        }
     }
 
     fn validate_scope(&self, scope: SessionScope) -> Result<(), ContractError> {
