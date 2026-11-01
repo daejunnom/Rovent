@@ -464,13 +464,7 @@ impl PinnedPalsSystemStartupV6 {
 
     #[cfg(target_os = "linux")]
     fn source_window(&self) -> Result<(), PalsSystemSourceReadFailureV6> {
-        if self.original_cancelled.load(Ordering::Acquire) {
-            return Err(PalsSystemSourceReadFailureV6::Cancelled);
-        }
-        if Instant::now() >= self.original_until {
-            return Err(PalsSystemSourceReadFailureV6::Expired);
-        }
-        Ok(())
+        check_source_window(self.original_until, &self.original_cancelled)
     }
 
     #[cfg(target_os = "linux")]
@@ -503,6 +497,20 @@ impl PinnedPalsSystemStartupV6 {
             .open_dir_nofollow(&self.lock.config.runtime_directory)
             .map_err(|_| invalid("system runtime owner directory missing or linked"))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn check_source_window(
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> Result<(), PalsSystemSourceReadFailureV6> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(PalsSystemSourceReadFailureV6::Cancelled);
+    }
+    if Instant::now() >= until {
+        return Err(PalsSystemSourceReadFailureV6::Expired);
+    }
+    Ok(())
 }
 
 fn check_window(until: Instant, cancelled: &AtomicBool) -> Result<(), ManifestError> {
@@ -724,6 +732,21 @@ mod tests {
         assert!(check_window(Instant::now(), &cancelled).is_err());
         assert!(check_startup_window(100, 100).is_ok());
         assert!(check_startup_window(100, 101).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn source_window_reports_cancel_and_expiry_separately() {
+        let cancelled = AtomicBool::new(false);
+        assert!(matches!(
+            check_source_window(Instant::now(), &cancelled),
+            Err(PalsSystemSourceReadFailureV6::Expired)
+        ));
+        cancelled.store(true, Ordering::Release);
+        assert!(matches!(
+            check_source_window(Instant::now() + Duration::from_secs(1), &cancelled),
+            Err(PalsSystemSourceReadFailureV6::Cancelled)
+        ));
     }
 
     #[test]
