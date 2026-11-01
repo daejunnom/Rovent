@@ -26,7 +26,7 @@ def setUpModule():
     # These lifecycle fixtures use private temporary catalogs and must never
     # schedule maintenance based on a real host's storage observation.
     global _host_usage_patch
-    _host_usage_patch = patch('rovezero_usage_snapshot.confirmed_total_usage_exceeded', return_value=False)
+    _host_usage_patch = patch('rovezero_usage_snapshot.claim_total_usage_maintenance', return_value=False)
     _host_usage_patch.start()
 
 

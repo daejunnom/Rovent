@@ -1,8 +1,10 @@
 """Focused checks for bounded advisory snapshot consumption."""
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -50,6 +52,38 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(usage, 'DEFAULT_THRESHOLD_BYTES', 18):
             self.assertTrue(usage.confirmed_total_usage_exceeded())
         module.read_windows_combined.assert_called_once_with()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory flock')
+    def test_claim_once_per_snapshot_across_concurrent_callers(self):
+        state = self.path.with_name('maintenance.state')
+        with mock.patch.object(usage, '_current_total_usage', return_value=dict(self.value)), \
+             mock.patch.object(usage, 'DEFAULT_THRESHOLD_BYTES', 18):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda _: usage.claim_total_usage_maintenance(state_path=state), range(8)))
+            self.assertEqual(results.count(True), 1)
+            self.assertFalse(usage.claim_total_usage_maintenance(state_path=state))
+        next_value = dict(self.value, observed_at_utc='1970-01-01T00:17:00+00:00')
+        with mock.patch.object(usage, '_current_total_usage', return_value=next_value), \
+             mock.patch.object(usage, 'DEFAULT_THRESHOLD_BYTES', 18):
+            self.assertTrue(usage.claim_total_usage_maintenance(state_path=state))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory flock')
+    def test_claim_rejects_symlink_and_unknown_observation(self):
+        victim = self.path.with_name('victim')
+        victim.write_text('unchanged', encoding='utf-8')
+        state = self.path.with_name('maintenance.state')
+        state.symlink_to(victim)
+        sink = io.StringIO()
+        with mock.patch.object(usage, '_current_total_usage', return_value=dict(self.value)), \
+             mock.patch.object(usage, 'DEFAULT_THRESHOLD_BYTES', 18), \
+             mock.patch.object(usage.sys, 'stderr', sink):
+            self.assertFalse(usage.claim_total_usage_maintenance(state_path=state))
+        self.assertEqual(victim.read_text(encoding='utf-8'), 'unchanged')
+        self.assertIn('rovezero_storage_maintenance_deferred=', sink.getvalue())
+        with mock.patch.object(usage, '_current_total_usage', return_value={'decision': 'unknown'}), \
+             mock.patch.object(usage.sys, 'stderr', sink):
+            self.assertFalse(usage.claim_total_usage_maintenance(state_path=state))
+        self.assertIn('observation_unknown', sink.getvalue())
 
     @unittest.skipUnless(hasattr(__import__('os'), 'O_NOFOLLOW'), 'Linux nofollow')
     def test_complete_snapshot_and_stale_snapshot_are_distinct(self):

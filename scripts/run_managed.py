@@ -158,8 +158,8 @@ def main(*, output_preservation=None) -> int:
         # establish actual disk pressure. Read a fresh advisory snapshot only
         # after the owner is released, and never let monitoring fail the run.
         try:
-            from rovezero_usage_snapshot import confirmed_total_usage_exceeded
-            maintenance_due = confirmed_total_usage_exceeded()
+            from rovezero_usage_snapshot import claim_total_usage_maintenance
+            maintenance_due = claim_total_usage_maintenance() if gone is True else False
         except Exception:
             maintenance_due = False
         if maintenance_due and gone is True:

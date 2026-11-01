@@ -72,6 +72,23 @@ def read_snapshot(path=SNAPSHOT, *, now=None, max_age_seconds=MAX_AGE_SECONDS,
             os.close(fd)
 
 
+def _current_total_usage():
+    if sys.platform == 'win32':
+        from rovezero_windows_usage_snapshot import read_windows_combined
+        return read_windows_combined()
+    if sys.platform.startswith('linux'):
+        return read_snapshot()
+    raise OSError('unsupported_platform')
+
+
+def _confirmed_exceeded(value):
+    allocated = value.get('allocated_bytes_lower_bound')
+    threshold = value.get('threshold_bytes')
+    return (value.get('decision') == 'exceeded'
+            and type(allocated) is int and type(threshold) is int
+            and threshold > 0 and allocated > max(threshold, DEFAULT_THRESHOLD_BYTES))
+
+
 def confirmed_total_usage_exceeded():
     """Check one fresh advisory snapshot without taking an ownership gate.
 
@@ -80,20 +97,87 @@ def confirmed_total_usage_exceeded():
     are not evidence that maintenance is due.
     """
     try:
-        if sys.platform == 'win32':
-            from rovezero_windows_usage_snapshot import read_windows_combined
-            value = read_windows_combined()
-        elif sys.platform.startswith('linux'):
-            value = read_snapshot()
-        else:
-            return False
-        allocated = value.get('allocated_bytes_lower_bound')
-        threshold = value.get('threshold_bytes')
-        return (value.get('decision') == 'exceeded'
-                and type(allocated) is int and type(threshold) is int
-                and threshold > 0 and allocated > max(threshold, DEFAULT_THRESHOLD_BYTES))
+        return _confirmed_exceeded(_current_total_usage())
     except Exception:
         return False
+
+
+def claim_total_usage_maintenance(*, state_path=None):
+    """Claim at most one attempt per fresh exceeded observation and euid.
+
+    The state file is only an advisory throttle, never cleanup authority. An
+    unknown observation, busy lock, or unsafe/inaccessible state skips the
+    attempt without affecting the completed run. Newly generated artifacts
+    can remain until the next observer sample (normally 30 minutes).
+    """
+    fd = directory = None
+    try:
+        value = _current_total_usage()
+        if value.get('decision') == 'unknown':
+            raise ValueError('observation_unknown')
+        if not _confirmed_exceeded(value):
+            return False
+        if not sys.platform.startswith('linux'):
+            raise OSError('maintenance_platform_unavailable')
+        import fcntl
+        observed = value['observed_at_utc']
+        source = value.get('source_observed_at_utc')
+        identity = json.dumps({'observed_at_utc': observed, 'sources': source},
+                              sort_keys=True, separators=(',', ':')).encode('utf-8')
+        digest = hashlib.sha256(identity).hexdigest().encode('ascii')
+        path = Path(state_path) if state_path is not None else Path('/tmp') / (
+            'rovezero-total-maintenance-' + str(os.geteuid()) + '.state')
+        if not path.is_absolute() or path.name in ('', '.', '..'):
+            raise ValueError('invalid_state_path')
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                     0o600, dir_fd=directory)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 64):
+            raise ValueError('untrusted_state')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 64):
+            raise ValueError('untrusted_state')
+        named = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError('state_identity_changed')
+        previous = os.read(fd, 65)
+        if previous == digest:
+            return False
+        if previous and (len(previous) != 64 or any(c not in b'0123456789abcdef' for c in previous)):
+            # A partial write is uncertain. Only a demonstrably newer
+            # observation may replace it; the previous attempt is never
+            # retried against the same snapshot.
+            stamps = [observed] + (list(source.values()) if isinstance(source, dict) else [])
+            latest = max(datetime.fromisoformat(s).timestamp() for s in stamps)
+            if latest <= info.st_mtime + 1:
+                raise ValueError('uncertain_state')
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.write(fd, digest) != len(digest):
+            raise OSError('short_state_write')
+        os.ftruncate(fd, len(digest))
+        return True
+    except Exception as error:
+        reason = ('lock_busy' if isinstance(error, BlockingIOError) else
+                  str(error) if isinstance(error, ValueError) and str(error) in {
+                      'observation_unknown', 'invalid_state_path', 'untrusted_state',
+                      'state_identity_changed', 'uncertain_state'} else
+                  'state_or_observation_unavailable')
+        try:
+            sys.stderr.write('rovezero_storage_maintenance_deferred=' + reason + '\n')
+        except BaseException:
+            pass
+        return False
+    finally:
+        for handle in (fd, directory):
+            if handle is not None:
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
 
 
 def warn_cached_total_usage():

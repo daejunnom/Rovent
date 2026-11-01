@@ -759,8 +759,8 @@ class OutputLease:
         maintenance_due = False
         if tree_gone is True and self.outer is None:
             try:
-                from rovezero_usage_snapshot import confirmed_total_usage_exceeded
-                maintenance_due = confirmed_total_usage_exceeded()
+                from rovezero_usage_snapshot import claim_total_usage_maintenance
+                maintenance_due = claim_total_usage_maintenance()
             except Exception:
                 pass
         if maintenance_due:

@@ -220,7 +220,7 @@ class CompletedCommandMaintenanceTests(unittest.TestCase):
              patch.object(run_managed, "ManagedBuild", return_value=manager), \
              patch.object(run_managed, "sample_output_budget", return_value=total), \
              patch.object(run_managed, "run_group", return_value=(7, gone, None)), \
-             patch("rovezero_usage_snapshot.confirmed_total_usage_exceeded", return_value=confirmed), \
+             patch("rovezero_usage_snapshot.claim_total_usage_maintenance", return_value=confirmed), \
              patch.object(maintenance, "cleanup_completed_builds", side_effect=cleanup) as called:
             code = run_managed.main()
         return code, events, called.call_count
@@ -274,7 +274,7 @@ class DirectOutputMaintenanceTests(unittest.TestCase):
             return {"status": "protected_or_empty"}
 
         lease._release_guard = release
-        with patch("rovezero_usage_snapshot.confirmed_total_usage_exceeded", return_value=due), \
+        with patch("rovezero_usage_snapshot.claim_total_usage_maintenance", return_value=due), \
              patch.object(maintenance, "cleanup_completed_builds_for_output", side_effect=cleanup) as called:
             lease.finish(status="completed", tree_gone=tree_gone)
         return events, called.call_count, lease.record
