@@ -104,8 +104,8 @@ fn native_receipt_belongs_to_owner(
     native: &crate::NativePairReceipt<PalsAdaptiveSessionAuditV5>,
     owner: &NativeLaunchOwner<LockedPalsArenaLaunchV5>,
 ) -> bool {
-    native.receipt_version == 5
-        && native.input_sha256 == owner.spec.sha256
+    native.receipt_version == owner.spec.receipt_version()
+        && native.input_sha256 == owner.spec.input_sha256()
         && native.pair_id == owner.spec.input.semantic_lock.manifest.run_id
         && native.contract_revision == owner.spec.contract_revision()
         && native.runner_source_commit == owner.spec.input.runner.source_commit
@@ -364,7 +364,7 @@ pub fn build_pals_failed_run_receipt_v5(
     }
     receipt.validate_against(lock)?;
     Ok(PalsNormalizedFailedPairReceiptV5 {
-        domain:"rz-pals-normalized-pair-failure-v5/1".into(), normalized:receipt,
+        domain:match owner.spec.storage_policy { PalsOwnedStoragePolicy::StrictV5 => "rz-pals-normalized-pair-failure-v5/1", PalsOwnedStoragePolicy::AdvisoryV1 => "rz-pals-normalized-pair-failure-storage-advisory-v1/1" }.into(), normalized:receipt,
         original_cause:cause.to_string(),raw_native_receipt:native.cloned(),native_receipt_proof:proof,
         supervisor_process:process.map(|p|PalsObservedV3::Observed { value:p.receipt.clone(),method:"passive observation of original retained supervisor output; no cleanup operation performed".into() }).unwrap_or(PalsObservedV3::Unknown),
         observed_run_time_ms:elapsed,observed_cleanup_time_ms:cleanup,artifacts:artifacts.into_values().collect(),
@@ -438,7 +438,11 @@ pub fn save_pals_failed_run_receipt_v5(
         };
         return Ok((wrapper, None));
     }
-    match save_parent(owner, "pals-run-failure.v5.json", &bytes) {
+    let filename = match owner.spec.storage_policy {
+        PalsOwnedStoragePolicy::StrictV5 => "pals-run-failure.v5.json",
+        PalsOwnedStoragePolicy::AdvisoryV1 => "pals-run-failure.storage-advisory-v1.json",
+    };
+    match save_parent(owner, filename, &bytes) {
         Ok(artifact) => Ok((wrapper, Some(artifact))),
         Err(error) => {
             wrapper.persistence_not_permitted_reason = Some(error.to_string());
@@ -992,7 +996,7 @@ pub fn build_pals_run_receipt_v5(
         }
     }
     let base_bytes = owner_output_bytes(owner)?;
-    let mut wrapper=PalsNormalizedPairReceiptV5{domain:"rz-pals-normalized-pair-receipt-v5/1".into(),normalized:receipt,
+    let mut wrapper=PalsNormalizedPairReceiptV5{domain:match owner.spec.storage_policy { PalsOwnedStoragePolicy::StrictV5 => "rz-pals-normalized-pair-receipt-v5/1", PalsOwnedStoragePolicy::AdvisoryV1 => "rz-pals-normalized-pair-receipt-storage-advisory-v1/1" }.into(),normalized:receipt,
         native_receipt:output.receipt_artifact.clone(),sessions:native.provider_sessions.clone(),endpoint_scopes:scopes,
         artifacts:paths.into_values().collect(),elapsed_scope:"original run entry includes input admission, metadata probes, runner, Rules/provider/clock verification; snapshot preparation is separately scoped".into(),
         raw_game_failures_preserved:true,training_executed:false};
@@ -1032,7 +1036,11 @@ pub fn build_pals_run_receipt_v5(
         total <= lock.manifest.window.output_bytes_max,
         "normalized receipt cannot be persisted outside registered output quota",
     )?;
-    let artifact = save_parent(owner, "pals-run-receipt.v5.json", &bytes)?;
+    let filename = match owner.spec.storage_policy {
+        PalsOwnedStoragePolicy::StrictV5 => "pals-run-receipt.v5.json",
+        PalsOwnedStoragePolicy::AdvisoryV1 => "pals-run-receipt.storage-advisory-v1.json",
+    };
+    let artifact = save_parent(owner, filename, &bytes)?;
     Ok((wrapper, artifact))
 }
 #[cfg(not(target_os = "linux"))]

@@ -4500,7 +4500,7 @@ pub fn prepare_pals_pair_launch(
 ) -> Result<NativeLaunchOwner<LockedPalsArenaLaunchV3>, Box<crate::NativePreparationFailure>> {
     if let Err(cause) = verify_pals_launch_exports(spec, source_root) {
         return Err(Box::new(crate::NativePreparationFailure {
-            receipt:crate::NativePreparationReceipt {receipt_version:3,execution_ready:false,input_sha256:spec.sha256.clone(),
+            receipt:crate::NativePreparationReceipt {receipt_version:3,policy_envelope:None,execution_ready:false,input_sha256:spec.sha256.clone(),
                 output_directory:"not-created".into(),attempt_created:false,attempted_snapshot_relative_paths:vec![],completed_snapshots:vec![],
                 child_spawned:false,writers_closed:true,input_pins_required:false,original_error:cause.to_string(),
                 subsequent_file_owner:"source assets retained; descriptor verification failed before snapshot creation or child launch".into(),automatic_retry:false},

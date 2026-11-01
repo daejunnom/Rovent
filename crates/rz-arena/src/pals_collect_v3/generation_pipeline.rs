@@ -524,6 +524,22 @@ pub fn run_generation_and_evaluation_owned_v3(
     expected_sha256: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<crate::pals_adaptive_launch::PalsEvaluationSeriesV5, Box<GenerationPipelineFailureV3>> {
+    run_generation_and_evaluation_owned_with_storage_policy_v3(
+        path,
+        expected_sha256,
+        cancel,
+        crate::pals_adaptive_launch::PalsOwnedStoragePolicy::StrictV5,
+    )
+}
+
+/// Select an explicit storage admission policy for the evaluation series.
+/// The existing V3 entry keeps the strict V5 policy for compatibility.
+pub fn run_generation_and_evaluation_owned_with_storage_policy_v3(
+    path: &Path,
+    expected_sha256: &str,
+    cancel: Arc<AtomicBool>,
+    storage_policy: crate::pals_adaptive_launch::PalsOwnedStoragePolicy,
+) -> Result<crate::pals_adaptive_launch::PalsEvaluationSeriesV5, Box<GenerationPipelineFailureV3>> {
     // This sequential parent retains the original non-Send control owner.
     // Arc preserves its identity through evaluation custody; this owner is
     // never transferred to the CPU/GPU workers or made Send/Sync by the wrapper.
@@ -537,13 +553,14 @@ pub fn run_generation_and_evaluation_owned_v3(
     let source_root = pipeline.evaluation_launches().source_root().to_owned();
     let output_root = pipeline.evaluation_output_root().to_owned();
     let prefix = pipeline.evaluation_attempt_prefix().to_owned();
-    Ok(crate::pals_adaptive_launch::run_pals_evaluation_series_v5(
+    Ok(crate::pals_adaptive_launch::run_pals_evaluation_series_with_storage_policy_v5(
         pipeline,
         launches,
         &source_root,
         &output_root,
         &prefix,
         &cancel,
+        storage_policy,
     ))
 }
 

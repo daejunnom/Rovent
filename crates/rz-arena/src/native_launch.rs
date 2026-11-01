@@ -40,6 +40,11 @@ static NATIVE_ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
 #[doc(hidden)]
 pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 'static {
     fn input_sha256(&self) -> &str;
+    /// Optional policy provenance for preparation failures. Legacy formats
+    /// omit this field entirely, retaining their original serialized bytes.
+    fn preparation_policy_envelope(&self) -> Option<NativePreparationPolicyEnvelope> {
+        None
+    }
     fn view(&self) -> NativePairView<'_>;
     fn declared_inputs(&self) -> Vec<&ArtifactRef>;
     fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError>;
@@ -352,8 +357,18 @@ pub struct NativeSnapshotReceipt {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct NativePreparationPolicyEnvelope {
+    pub domain: String,
+    pub policy: String,
+    pub base_launch_sha256: String,
+    pub execution_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct NativePreparationReceipt {
     pub receipt_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_envelope: Option<NativePreparationPolicyEnvelope>,
     pub execution_ready: bool,
     pub input_sha256: String,
     pub output_directory: String,
@@ -487,7 +502,7 @@ pub(crate) fn prepare_native_launch_for<S: NativeLaunchDeclaration>(
     output_root: &Path,
     output_directory: &str,
 ) -> Result<NativeLaunchOwner<S>, Box<NativePreparationFailure>> {
-    let mut receipt=NativePreparationReceipt{receipt_version:1,execution_ready:false,input_sha256:spec.input_sha256().into(),
+    let mut receipt=NativePreparationReceipt{receipt_version:1,policy_envelope:spec.preparation_policy_envelope(),execution_ready:false,input_sha256:spec.input_sha256().into(),
         output_directory:if safe_output_basename(output_directory){output_directory.into()}else{"rejected-basename".into()},
         attempt_created:false,attempted_snapshot_relative_paths:Vec::new(),completed_snapshots:Vec::new(),child_spawned:false,writers_closed:true,input_pins_required:false,original_error:String::new(),
         subsequent_file_owner:"caller retains exclusively owned outside-Git attempt; all writers are closed and no child was spawned, so input handles may be released; retained historical files are not a process-lifetime aggregate quota".into(),automatic_retry:false};
@@ -2104,6 +2119,105 @@ pub(crate) mod linux {
             ) -> Result<(Self::Audit, u32), ArenaError> {
                 panic!("rejected admission must never inspect provider records")
             }
+        }
+
+        #[test]
+        fn preparation_failure_policy_envelope_is_saved_and_legacy_bytes_stay_identical() {
+            use serde::Serialize;
+            #[derive(Clone, Debug)]
+            struct PreparationFixture {
+                input: String,
+                policy: Option<NativePreparationPolicyEnvelope>,
+            }
+            impl sealed::Sealed for PreparationFixture {}
+            impl NativeLaunchDeclaration for PreparationFixture {
+                fn input_sha256(&self) -> &str { &self.input }
+                fn preparation_policy_envelope(&self) -> Option<NativePreparationPolicyEnvelope> {
+                    self.policy.clone()
+                }
+                fn view(&self) -> NativePairView<'_> { panic!("rejected basename has no pair") }
+                fn declared_inputs(&self) -> Vec<&ArtifactRef> { Vec::new() }
+                fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError> { Ok(0) }
+                fn engine_view(&self, _: NativeEngineRole) -> Result<NativeEngineView<'_>, rz_experiments::ManifestError> {
+                    panic!("rejected basename has no engine")
+                }
+                fn provider_name(&self) -> &'static str { "fixture" }
+            }
+            // This explicit legacy representation is the pre-envelope wire
+            // format and compares actual serialized bytes, including field order.
+            #[derive(Serialize)]
+            struct LegacyPreparation<'a> {
+                receipt_version: u32,
+                execution_ready: bool,
+                input_sha256: &'a str,
+                output_directory: &'a str,
+                attempt_created: bool,
+                attempted_snapshot_relative_paths: &'a [String],
+                completed_snapshots: &'a [NativeSnapshotReceipt],
+                child_spawned: bool,
+                writers_closed: bool,
+                input_pins_required: bool,
+                original_error: &'a str,
+                subsequent_file_owner: &'a str,
+                automatic_retry: bool,
+            }
+            let base_sha = "a".repeat(64);
+            let execution_sha = "b".repeat(64);
+            let strict = PreparationFixture { input: base_sha.clone(), policy: None };
+            let advisory = PreparationFixture {
+                input: execution_sha.clone(),
+                policy: Some(NativePreparationPolicyEnvelope {
+                    domain: "rz-pals-preparation-storage-advisory-v1/1".into(),
+                    policy: "advisory".into(),
+                    base_launch_sha256: base_sha.clone(),
+                    execution_sha256: execution_sha.clone(),
+                }),
+            };
+            let fail = |fixture: &PreparationFixture| {
+                prepare_native_launch_for(fixture, Path::new("/"), Path::new("/"), "../invalid")
+                    .err().expect("invalid basename cannot start a child")
+            };
+            let strict_failure = fail(&strict);
+            let advisory_failure = fail(&advisory);
+            assert!(!strict_failure.receipt.child_spawned && !advisory_failure.receipt.child_spawned);
+            let r = &strict_failure.receipt;
+            assert!(r.policy_envelope.is_none());
+            let old = LegacyPreparation {
+                receipt_version: r.receipt_version, execution_ready: r.execution_ready,
+                input_sha256: &r.input_sha256, output_directory: &r.output_directory,
+                attempt_created: r.attempt_created,
+                attempted_snapshot_relative_paths: &r.attempted_snapshot_relative_paths,
+                completed_snapshots: &r.completed_snapshots, child_spawned: r.child_spawned,
+                writers_closed: r.writers_closed, input_pins_required: r.input_pins_required,
+                original_error: &r.original_error, subsequent_file_owner: &r.subsequent_file_owner,
+                automatic_retry: r.automatic_retry,
+            };
+            assert_eq!(serde_json::to_vec(&r).unwrap(), serde_json::to_vec(&old).unwrap());
+            let policy = advisory_failure.receipt.policy_envelope.as_ref().unwrap();
+            assert_eq!(policy.domain, "rz-pals-preparation-storage-advisory-v1/1");
+            assert_eq!(policy.base_launch_sha256, base_sha);
+            assert_eq!(policy.execution_sha256, execution_sha);
+            assert_eq!(advisory_failure.receipt.input_sha256, execution_sha);
+
+            struct OwnedFixture(std::path::PathBuf);
+            impl Drop for OwnedFixture {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("native-preparation-failure.v1.json"));
+                    let _ = std::fs::remove_dir(&self.0);
+                }
+            }
+            let root = OwnedFixture(std::env::temp_dir().join(format!(
+                "rz-preparation-policy-{}-{}", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            )));
+            std::fs::create_dir(&root.0).unwrap();
+            let directory = Dir::open_ambient_dir(&root.0, cap_std::ambient_authority()).unwrap();
+            let artifact = save_preparation_failure(Some(&directory), &advisory_failure.receipt, "fixture")
+                .unwrap().expect("fixture directory permits evidence saving");
+            let bytes = std::fs::read(root.0.join("native-preparation-failure.v1.json")).unwrap();
+            assert_eq!(bytes, serde_json::to_vec_pretty(&advisory_failure.receipt).unwrap());
+            assert_eq!(artifact.bytes, bytes.len() as u64);
+            assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
         }
 
         #[test]
