@@ -297,6 +297,198 @@ impl StorePins {
 /// Legacy archive expansion uses the same graph traversal without a new bound.
 type PinClosureCheck<'a> = Option<&'a mut dyn FnMut() -> Result<(), StoreError>>;
 
+// Shared by the production closure and the deliberately incomplete test-only
+// worklist below. Keep ordering identical to the original line/observation walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClosureEdge {
+    State(StateId),
+    Line(LineId),
+    Observation(ObservationId),
+    Execution(ExecutionId),
+}
+
+fn line_closure_edges(line: &LineChunk) -> [Option<ClosureEdge>; 2] {
+    [
+        Some(ClosureEdge::State(line.start_state)),
+        line.parent.map(ClosureEdge::Line),
+    ]
+}
+
+fn observation_closure_edges(observation: &Observation) -> [(Option<ClosureEdge>, bool); 7] {
+    let model = observation.score.model_dependencies();
+    [
+        (Some(ClosureEdge::State(observation.state)), false),
+        (observation.line.map(ClosureEdge::Line), true),
+        (observation.cpu_pv.map(ClosureEdge::Line), true),
+        (observation.supersedes.map(ClosureEdge::Observation), true),
+        (model.map(|ids| ClosureEdge::Observation(ids[0])), true),
+        (model.map(|ids| ClosureEdge::Observation(ids[1])), true),
+        (observation.execution.map(ClosureEdge::Execution), false),
+    ]
+}
+
+fn insert_closure_edge(
+    pins: &mut StorePins,
+    edge: ClosureEdge,
+    count: &mut usize,
+    maximum: Option<usize>,
+    check: &mut PinClosureCheck<'_>,
+) -> Result<(), StoreError> {
+    match edge {
+        ClosureEdge::State(id) => insert_closure_pin(&mut pins.states, id, count, maximum, check),
+        ClosureEdge::Line(id) => insert_closure_pin(&mut pins.lines, id, count, maximum, check),
+        ClosureEdge::Observation(id) => {
+            insert_closure_pin(&mut pins.observations, id, count, maximum, check)
+        }
+        ClosureEdge::Execution(id) => {
+            insert_closure_pin(&mut pins.executions, id, count, maximum, check)
+        }
+    }
+}
+
+/// Test-only partial worklist. Situation, execution and reverse-dependency
+/// traversal are deliberately unsupported: it is not a complete snapshot,
+/// a production cursor, or a selection-time/mutation attestation.
+#[cfg(test)]
+mod partial_closure_cursor {
+    use super::*;
+
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum Error {
+        Unsupported,
+        Store(StoreError),
+    }
+    impl From<StoreError> for Error {
+        fn from(value: StoreError) -> Self {
+            Self::Store(value)
+        }
+    }
+
+    pub(super) struct Cursor {
+        completed: StorePins,
+        states: BTreeSet<StateId>,
+        lines: BTreeSet<LineId>,
+        observations: BTreeSet<ObservationId>,
+        count: usize,
+        maximum: usize,
+        failed: bool,
+    }
+    impl Cursor {
+        pub(super) fn new(mut seed: StorePins, maximum: usize) -> Result<Self, Error> {
+            if !seed.situations.is_empty() || !seed.executions.is_empty() {
+                return Err(Error::Unsupported);
+            }
+            let count = seed.count();
+            if count > maximum {
+                return Err(StoreError::Capacity("retirement dependency closure").into());
+            }
+            Ok(Self {
+                states: std::mem::take(&mut seed.states),
+                lines: std::mem::take(&mut seed.lines),
+                observations: std::mem::take(&mut seed.observations),
+                completed: seed,
+                count,
+                maximum,
+                failed: false,
+            })
+        }
+        fn add(&mut self, edge: ClosureEdge) -> Result<(), Error> {
+            let fresh = match edge {
+                ClosureEdge::State(id) => {
+                    !self.completed.states.contains(&id) && !self.states.contains(&id)
+                }
+                ClosureEdge::Line(id) => {
+                    !self.completed.lines.contains(&id) && !self.lines.contains(&id)
+                }
+                ClosureEdge::Observation(id) => {
+                    !self.completed.observations.contains(&id) && !self.observations.contains(&id)
+                }
+                ClosureEdge::Execution(_) => return Err(Error::Unsupported),
+            };
+            if !fresh {
+                return Ok(());
+            }
+            self.count = self
+                .count
+                .checked_add(1)
+                .filter(|n| *n <= self.maximum)
+                .ok_or(StoreError::Capacity("retirement dependency closure"))?;
+            match edge {
+                ClosureEdge::State(id) => {
+                    self.states.insert(id);
+                }
+                ClosureEdge::Line(id) => {
+                    self.lines.insert(id);
+                }
+                ClosureEdge::Observation(id) => {
+                    self.observations.insert(id);
+                }
+                ClosureEdge::Execution(_) => unreachable!(),
+            }
+            Ok(())
+        }
+        /// At most one state, line, or observation is visited; line and
+        /// observation emit at most two and seven fixed-size edges respectively.
+        pub(super) fn step(
+            &mut self,
+            stores: &PalsStores,
+            check: &mut dyn FnMut() -> Result<(), StoreError>,
+        ) -> Result<bool, Error> {
+            if self.failed {
+                return Err(Error::Unsupported);
+            }
+            let result = self.step_inner(stores, check);
+            if result.is_err() {
+                self.failed = true;
+            }
+            result
+        }
+        fn step_inner(
+            &mut self,
+            stores: &PalsStores,
+            check: &mut dyn FnMut() -> Result<(), StoreError>,
+        ) -> Result<bool, Error> {
+            check()?;
+            if let Some(id) = self.states.pop_first() {
+                stores.states.get(id)?;
+                self.completed.states.insert(id);
+            } else if let Some(id) = self.lines.pop_first() {
+                let edges = line_closure_edges(stores.lines.get(id)?);
+                self.completed.lines.insert(id);
+                for edge in edges.into_iter().flatten() {
+                    check()?;
+                    self.add(edge)?;
+                }
+            } else if let Some(id) = self.observations.pop_first() {
+                let edges = observation_closure_edges(stores.observations.get(id)?);
+                self.completed.observations.insert(id);
+                for (edge, _) in edges {
+                    if let Some(edge) = edge {
+                        check()?;
+                        self.add(edge)?;
+                    }
+                }
+            } else {
+                check()?;
+                return Ok(true);
+            }
+            check()?;
+            Ok(false)
+        }
+        pub(super) fn into_completed(self) -> Result<StorePins, Error> {
+            if !self.failed
+                && self.states.is_empty()
+                && self.lines.is_empty()
+                && self.observations.is_empty()
+            {
+                Ok(self.completed)
+            } else {
+                Err(Error::Unsupported)
+            }
+        }
+    }
+}
+
 fn check_pin_closure(check: &mut PinClosureCheck<'_>) -> Result<(), StoreError> {
     match check {
         Some(check) => check(),
@@ -2731,48 +2923,21 @@ impl PalsStores {
             for id in clone_closure_set(&pins.lines, &mut check)? {
                 check_pin_closure(&mut check)?;
                 let line = self.lines.get(id)?;
-                insert_closure_pin(
-                    &mut pins.states,
-                    line.start_state,
-                    &mut count,
-                    maximum,
-                    &mut check,
-                )?;
-                if let Some(parent) = line.parent {
-                    insert_closure_pin(&mut pins.lines, parent, &mut count, maximum, &mut check)?;
+                for edge in line_closure_edges(line).into_iter().flatten() {
+                    insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
                 }
                 check_pin_closure(&mut check)?;
             }
             for id in clone_closure_set(&pins.observations, &mut check)? {
                 check_pin_closure(&mut check)?;
                 let o = self.observations.get(id)?;
-                insert_closure_pin(&mut pins.states, o.state, &mut count, maximum, &mut check)?;
-                for line in [o.line, o.cpu_pv].into_iter().flatten() {
-                    check_pin_closure(&mut check)?;
-                    insert_closure_pin(&mut pins.lines, line, &mut count, maximum, &mut check)?;
-                }
-                for observation in o
-                    .supersedes
-                    .into_iter()
-                    .chain(o.score.model_dependencies().into_iter().flatten())
-                {
-                    check_pin_closure(&mut check)?;
-                    insert_closure_pin(
-                        &mut pins.observations,
-                        observation,
-                        &mut count,
-                        maximum,
-                        &mut check,
-                    )?;
-                }
-                if let Some(execution) = o.execution {
-                    insert_closure_pin(
-                        &mut pins.executions,
-                        execution,
-                        &mut count,
-                        maximum,
-                        &mut check,
-                    )?;
+                for (edge, additional_check) in observation_closure_edges(o) {
+                    if let Some(edge) = edge {
+                        if additional_check {
+                            check_pin_closure(&mut check)?;
+                        }
+                        insert_closure_edge(&mut pins, edge, &mut count, maximum, &mut check)?;
+                    }
                 }
                 check_pin_closure(&mut check)?;
             }

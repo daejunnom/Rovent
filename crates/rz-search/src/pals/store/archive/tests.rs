@@ -978,6 +978,192 @@ fn observation(state: StateId) -> Observation {
         execution: None,
     }
 }
+
+#[test]
+fn partial_line_observation_worklist_matches_original_closure_or_reports_unsupported() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let root = store
+        .focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let line_root = store.lines.root(state).unwrap();
+    let line = store
+        .lines
+        .append(line_root, &[mv("e2e4"), mv("e7e5")])
+        .unwrap();
+    let earlier = store.observations.append(observation(state)).unwrap();
+    let mut latest = observation(state);
+    latest.line = Some(line);
+    latest.supersedes = Some(earlier);
+    let latest = store.observations.append(latest).unwrap();
+    let mut seed = StorePins::default();
+    seed.observations.insert(latest);
+    let expected = store.retirement_dependency_closure(&seed, 128).unwrap();
+    let mut cursor = Cursor::new(seed.clone(), 128).unwrap();
+    while !cursor.step(&store, &mut || Ok(())).unwrap() {}
+    assert_eq!(cursor.into_completed().unwrap(), expected);
+
+    let mut cursor = Cursor::new(seed.clone(), 2).unwrap();
+    let error = loop {
+        match cursor.step(&store, &mut || Ok(())) {
+            Err(error) => break error,
+            Ok(false) => {}
+            Ok(true) => panic!("partial cursor unexpectedly fit the limit"),
+        }
+    };
+    assert!(matches!(error, Error::Store(StoreError::Capacity(_))));
+    assert!(matches!(
+        store.retirement_dependency_closure(&seed, 2),
+        Err(StoreError::Capacity(_))
+    ));
+    assert!(matches!(cursor.into_completed(), Err(Error::Unsupported)));
+
+    let mut cursor = Cursor::new(seed.clone(), 128).unwrap();
+    assert_eq!(
+        cursor.step(&store, &mut || Err(StoreError::CancelledConsumer)),
+        Err(Error::Store(StoreError::CancelledConsumer))
+    );
+    assert!(matches!(cursor.into_completed(), Err(Error::Unsupported)));
+    let mut unsupported = seed;
+    unsupported.situations.insert(root);
+    assert!(matches!(
+        Cursor::new(unsupported, 128),
+        Err(Error::Unsupported)
+    ));
+}
+
+#[test]
+fn partial_cursor_expected_edges_cover_pv_parent_supersedes_and_both_model_inputs() {
+    use super::partial_closure_cursor::{Cursor, Error};
+    let mut store = PalsStores::new(limits());
+    let mut position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let root_situation = store.situations.get(root).unwrap();
+    let state = root_situation.state;
+    let line_root = root_situation.focus;
+    let line_first = store.lines.append(line_root, &[mv("e2e4")]).unwrap();
+    let line_reply = store.lines.append(line_first, &[mv("e7e5")]).unwrap();
+    let line_pv = store.lines.append(line_root, &[mv("d2d4")]).unwrap();
+
+    // Typed synthetic Store fixtures; these do not attest a real CPU run.
+    let mut cpu = observation(state);
+    cpu.line = Some(line_first);
+    cpu.cpu_pv = Some(line_pv);
+    let cpu_id = store.observations.append(cpu).unwrap();
+    position.make_move(mv("e2e4")).unwrap();
+    let repaired_state = store.states.insert(position.snapshot()).unwrap();
+    let repaired = store
+        .observations
+        .append(context_model_observation(
+            repaired_state,
+            Color::Black,
+            [0.1, 0.2, 0.7],
+            43,
+        ))
+        .unwrap();
+    position.make_move(mv("e7e5")).unwrap();
+    let counter_state = store.states.insert(position.snapshot()).unwrap();
+    let counter = store
+        .observations
+        .append(context_model_observation(
+            counter_state,
+            Color::White,
+            [0.2, 0.3, 0.5],
+            43,
+        ))
+        .unwrap();
+    let mut conditional = model_observation(state, Color::White, [0.2, 0.3, 0.5]);
+    conditional.line = Some(line_reply);
+    conditional.supersedes = Some(cpu_id);
+    conditional.kind = ObservationKind::Refutation;
+    conditional.model_value_identity = None;
+    conditional.model_value_input = None;
+    conditional.score = RawScore::ConditionalWdl {
+        expectation: 0.2 - 0.5,
+        perspective: Color::White,
+        repaired,
+        counter,
+        context_revision: 43,
+    };
+    let conditional_id = store.observations.append(conditional.clone()).unwrap();
+    assert_eq!(
+        line_closure_edges(store.lines.get(line_reply).unwrap()),
+        [
+            Some(ClosureEdge::State(state)),
+            Some(ClosureEdge::Line(line_first)),
+        ]
+    );
+    assert_eq!(
+        observation_closure_edges(&conditional),
+        [
+            (Some(ClosureEdge::State(state)), false),
+            (Some(ClosureEdge::Line(line_reply)), true),
+            (None, true),
+            (Some(ClosureEdge::Observation(cpu_id)), true),
+            (Some(ClosureEdge::Observation(repaired)), true),
+            (Some(ClosureEdge::Observation(counter)), true),
+            (None, false),
+        ]
+    );
+    let mut conditional_repair = conditional.clone();
+    conditional_repair.score = RawScore::ConditionalRepairWdl {
+        expectation: 0.0,
+        perspective: Color::White,
+        before: repaired,
+        after: counter,
+        context_revision: 43,
+    };
+    assert_eq!(
+        observation_closure_edges(&conditional_repair),
+        observation_closure_edges(&conditional)
+    );
+    let mut seed = StorePins::default();
+    seed.observations.insert(conditional_id);
+    let expected = StorePins {
+        states: [state, repaired_state, counter_state].into_iter().collect(),
+        lines: [line_root, line_first, line_reply, line_pv]
+            .into_iter()
+            .collect(),
+        observations: [cpu_id, repaired, counter, conditional_id]
+            .into_iter()
+            .collect(),
+        situations: BTreeSet::new(),
+        executions: BTreeSet::new(),
+    };
+    let mut cursor = Cursor::new(seed.clone(), 128).unwrap();
+    while !cursor.step(&store, &mut || Ok(())).unwrap() {}
+    assert_eq!(cursor.into_completed().unwrap(), expected);
+    assert_eq!(
+        store.retirement_dependency_closure(&seed, 128).unwrap(),
+        expected
+    );
+
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            key(state),
+            TaskConsumer {
+                id: 711,
+                situation: root,
+                revision: 0,
+                generation: store.generation(),
+                deadline_tick: 100,
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("fixture task must start")
+    };
+    let mut has_execution = observation(state);
+    has_execution.execution = Some(execution);
+    let id = store.observations.append(has_execution).unwrap();
+    let mut execution_seed = StorePins::default();
+    execution_seed.observations.insert(id);
+    let mut cursor = Cursor::new(execution_seed, 128).unwrap();
+    assert_eq!(cursor.step(&store, &mut || Ok(())), Err(Error::Unsupported));
+    assert!(matches!(cursor.into_completed(), Err(Error::Unsupported)));
+}
 fn key(state: StateId) -> TaskKey {
     TaskKey {
         state,
