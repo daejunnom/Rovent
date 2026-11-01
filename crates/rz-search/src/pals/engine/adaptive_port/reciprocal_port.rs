@@ -25,7 +25,7 @@ pub(super) struct ReciprocalPortState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::pals::coordinator::{
         NativeAcceptanceIssuer, PhysicalRoleCompletion, RoleCompletion, RoleSubmission,
@@ -176,7 +176,10 @@ mod tests {
         (port, work, accepted, output)
     }
 
-    fn pending(port: &mut Port, work: &Work) {
+    pub(in crate::pals::engine::adaptive_port) fn pending<M: RoleModel>(
+        port: &mut AdaptiveEnginePort<M>,
+        work: &Work,
+    ) {
         let anchor = Arc::new(
             port.issue_rules_position(work.input.question.position.clone())
                 .unwrap()
@@ -202,7 +205,11 @@ mod tests {
             question_digest: work.input.question_digest,
             view: work.input.view_seal,
             evidence_revision: work.input.question.context.public_revision,
-            root_budget: ContractDigest([8; 32]),
+            root_budget: port
+                .rovent_frontier()
+                .map_or(ContractDigest([8; 32]), |frontier| {
+                    frontier.registration().root_budget
+                }),
             original_deadline: work.original_deadline,
         };
         port.reciprocal.pending.insert(
@@ -287,7 +294,10 @@ mod tests {
         assert_eq!(port.counters.consumed_role_outputs, 1);
 
         let mut changed_output = output.clone();
-        let RolePayload::Proposal { candidate_logits, .. } = &mut changed_output.payload else {
+        let RolePayload::Proposal {
+            candidate_logits, ..
+        } = &mut changed_output.payload
+        else {
             panic!("expected proposer head");
         };
         candidate_logits[0] = 1.0;
@@ -895,7 +905,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     && answer.question.view == work.input.view_seal
                     && Arc::ptr_eq(&answer.view, &work.input.view)
                     && Arc::ptr_eq(&answer.query, &work.input.question)
-                    && self.role_consumption_recorded(ticket, &work.input.view).unwrap_or(false)
+                    && self
+                        .role_consumption_recorded(ticket, &work.input.view)
+                        .unwrap_or(false)
             })
     }
 

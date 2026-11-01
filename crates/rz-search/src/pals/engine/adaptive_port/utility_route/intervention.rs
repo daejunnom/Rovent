@@ -1370,6 +1370,124 @@ mod tests {
     }
 
     #[test]
+    fn utility_commit_reuses_only_the_original_consumed_reciprocal_answer() {
+        use crate::pals::coordinator::{
+            NativeAcceptanceIssuer, PhysicalRoleCompletion, RoleCompletion, RoleSubmission,
+            RoleTicketRegistry,
+        };
+        let (mut port, mut machine, _work, target, _bound, actor, _replay) = fixture();
+        let candidate = port
+            .prepare_utility_intervention(target, UtilityRouteRecipient::Proposer)
+            .unwrap_or_else(|_| panic!("supported P arm"));
+        let (frame, admission) = machine
+            .admit_intervention(candidate, port.deadline.clock, MonotonicTick(0))
+            .unwrap_or_else(|_| panic!("actual intervention admission"));
+        let arm = machine
+            .ready_work(frame, port.deadline.clock, MonotonicTick(0))
+            .unwrap();
+        let mut action = port
+            .bind_utility_intervention_route(admission, &arm)
+            .unwrap_or_else(|_| panic!("same arm binding"));
+
+        // An authored role result passes the real linear native registry;
+        // the fixture pending record supplies no physical GPU evidence.
+        super::super::super::reciprocal_port::tests::pending(&mut port, &arm);
+        let (_, mut output) = super::super::super::port_tests::output(&arm, 7);
+        let (model, encoding, precision, frozen_epoch) =
+            port.model_namespace().unwrap().representation_identity();
+        output.key.model = model;
+        output.key.encoding = encoding;
+        output.key.precision = precision;
+        output.key.frozen_epoch = frozen_epoch;
+        let mut registry = RoleTicketRegistry::<ReviewView, RoleOutput>::new(
+            port.authority,
+            512,
+            rz_runtime::adaptive::CoordinatorPolicy::Fixed,
+            1,
+        )
+        .unwrap();
+        let ticket = registry
+            .admit(
+                RoleSubmission {
+                    question: arm.input.question_digest,
+                    view: arm.input.view_seal,
+                    representation: output.key,
+                    role: Role::Proposer,
+                    original_deadline: arm.original_deadline,
+                },
+                Arc::clone(&arm.input.view),
+                port.deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        output.id = ticket.id;
+        registry.take_dispatch().unwrap();
+        registry
+            .complete_reciprocal_role(RoleCompletion {
+                ticket,
+                physical: PhysicalRoleCompletion::Confirmed,
+                result: Ok(output.clone()),
+            })
+            .unwrap();
+        registry
+            .take_ready(port.deadline.clock, MonotonicTick(0))
+            .unwrap();
+        let (issuer, verifier) = NativeAcceptanceIssuer::new_pair();
+        registry
+            .register_native_acceptance_verifier(verifier)
+            .unwrap();
+        let permit = registry
+            .issue_reciprocal_native_acceptance(&ticket, port.deadline.clock, MonotonicTick(0))
+            .unwrap();
+        let accepted = registry
+            .accept_reciprocal_native(
+                issuer.issue_success(permit),
+                port.deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        let guard = port
+            .begin_utility_route_commit(&action, &arm, StepExecution::Role(ticket.id))
+            .unwrap();
+        let _answer = port
+            .consume_cpu_reciprocal(&arm, &accepted, &output, None)
+            .unwrap();
+        assert!(!port.reciprocal_source_consumed(&arm, &ticket, &output));
+        port.commit_utility_route_role(&mut action, &guard, &arm, &accepted, &output)
+            .unwrap();
+        assert_eq!(action.pc_origins.len(), 1);
+        port.commit_utility_route_role(&mut action, &guard, &arm, &accepted, &output)
+            .unwrap();
+        assert_eq!(
+            action.pc_origins.len(),
+            1,
+            "same guard refresh must not duplicate a source"
+        );
+        let mut altered = output.clone();
+        let RolePayload::Proposal {
+            candidate_logits, ..
+        } = &mut altered.payload
+        else {
+            panic!("expected proposer output");
+        };
+        candidate_logits[0] = 1.0;
+        assert!(
+            port.commit_utility_route_role(&mut action, &guard, &arm, &accepted, &altered)
+                .is_err()
+        );
+        let mut other = arm.clone();
+        other.input.question = Arc::new(other.input.question.as_ref().clone());
+        assert!(
+            port.commit_utility_route_role(&mut action, &guard, &other, &accepted, &output)
+                .is_err()
+        );
+        assert_eq!(action.pc_origins.len(), 1);
+        machine.revoke();
+        actor.shutdown().unwrap();
+        machine.retired_after_worker_join();
+    }
+
+    #[test]
     fn intervention_admission_closed_returns_original_candidate_and_retains_source() {
         let (mut port, mut machine, work, target, _bound, actor, _replay) = fixture();
         let candidate = port
