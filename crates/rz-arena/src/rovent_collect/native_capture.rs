@@ -62,6 +62,28 @@ struct SpeculativeRouteV2 {
     root_revoked: Arc<AtomicBool>,
     targets_revoked: Arc<AtomicBool>,
 }
+/// Read-only view of this callback's original ticket and route flags. It
+/// grants neither an issuance claim nor publication/physical authority.
+pub(super) struct OriginalTicketGuardV2 {
+    route: Arc<SpeculativeRouteV2>,
+    ticket: Arc<SpeculativeTicketV2>,
+}
+#[cfg(feature = "experimental-teacher-exact-observation")]
+impl OriginalTicketGuardV2 {
+    pub(super) fn allows_diagnostic(
+        &self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+        ticket: &RoleTicketEnvelope,
+    ) -> bool {
+        self.ticket.ticket == *ticket
+            && self.route.admission.same_original_admission(admission)
+            && self.route.installed.load(Ordering::Acquire)
+            && SpeculativeHandoffV2::decode(self.ticket.state.load(Ordering::Acquire))
+                == SpeculativeHandoffV2::Sent
+            && !self.ticket.authority.canceled()
+            && !self.route.targets_revoked.load(Ordering::Acquire)
+    }
+}
 /// Retains each original ticket and its one callback outcome, including
 /// Full/closed. The root worker owns this handle and the matching receiver.
 #[derive(Clone)]
@@ -188,6 +210,7 @@ pub(super) enum LockV2RegistrationAttempt {
 pub(super) struct RoventCapturedLockInputV2 {
     captured: RoventCapturedInputV2,
     admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+    diagnostic_ticket_guard: Option<OriginalTicketGuardV2>,
 }
 impl RoventCapturedLockInputV2 {
     pub(super) fn captured(&self) -> &RoventCapturedInputV2 {
@@ -201,8 +224,9 @@ impl RoventCapturedLockInputV2 {
     ) -> (
         RoventCapturedInputV2,
         rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
+        Option<OriginalTicketGuardV2>,
     ) {
-        (self.captured, self.admission)
+        (self.captured, self.admission, self.diagnostic_ticket_guard)
     }
 }
 type Registrations = Arc<Mutex<BTreeMap<RequestId, RegisteredInputCapture>>>;
@@ -1165,6 +1189,21 @@ impl RoventNativeInputObserver {
                 let input = RoventCapturedLockInputV2 {
                     captured,
                     admission,
+                    diagnostic_ticket_guard: {
+                        #[cfg(feature = "experimental-teacher-exact-observation")]
+                        {
+                            speculative.as_ref().filter(|_| teacher_required).map(
+                                |(route, ticket)| OriginalTicketGuardV2 {
+                                    route: Arc::clone(route),
+                                    ticket: Arc::clone(ticket),
+                                },
+                            )
+                        }
+                        #[cfg(not(feature = "experimental-teacher-exact-observation"))]
+                        {
+                            None
+                        }
+                    },
                 };
                 match self.lock_v2_sender.try_send(input) {
                     Ok(()) => {

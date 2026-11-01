@@ -2,9 +2,9 @@
 //! This borrows the original evidence; it neither creates a policy target nor
 //! provides a new publication, retirement, or physical completion authority.
 //! This is a repeatable diagnostic, not a linearized publication operation.
-//! A retired-row-only seal has no retained ticket guard and cannot use this
-//! path; a missing guard or expired original deadline fails closed. A guard
-//! check observes cancellation but does not lock against a later cancellation.
+//! A retired-row seal can use only a guard retained by the original capture.
+//! A missing guard or expired deadline fails closed. A guard check observes
+//! cancellation but does not lock against a later cancellation.
 use super::v2_session::SealedTeacherPolicyV2;
 use super::*;
 use rz_experiments::pals_data_v3::teacher_exact_rank::{
@@ -21,14 +21,21 @@ pub(crate) fn project_original_exact_observation_v2(
     row: &RoventRetiredLockV2Record,
     sealed: &SealedTeacherPolicyV2,
 ) -> Result<TeacherExactRankObservation, ArenaError> {
-    // A row-only seal does not retain a live ticket cancellation guard. Never
-    // turn that missing authority into a clean cancellation observation.
-    let guard = sealed
-        .speculative_guard
-        .as_ref()
-        .ok_or_else(|| invalid("exact witness original ticket cancellation guard unavailable"))?;
-    check(!guard.is_ticket_canceled(), "exact witness ticket canceled")?;
-    guard.matches_original_row(row)?;
+    let check_guard = || -> Result<(), ArenaError> {
+        if let Some(guard) = &sealed.speculative_guard {
+            guard.matches_original_row(row)?;
+            check(!guard.is_ticket_canceled(), "exact witness ticket canceled")
+        } else {
+            let guard = row.diagnostic_ticket_guard.as_ref().ok_or_else(|| {
+                invalid("exact witness original ticket cancellation guard unavailable")
+            })?;
+            check(
+                guard.allows_diagnostic(&row.admission, &row.ticket),
+                "exact witness original ticket guard unavailable or canceled",
+            )
+        }
+    };
+    check_guard()?;
     let evidence = &sealed.evidence;
     let dispatch = evidence.dispatch();
     let completion = evidence.completion();
@@ -182,11 +189,7 @@ pub(crate) fn project_original_exact_observation_v2(
         .map_err(|e| invalid(e.to_string()))?;
     // A check is not a lock: cancellation immediately after this observation
     // is possible. A future publisher must linearize against the real owner.
-    guard.matches_original_row(row)?;
-    check(
-        !guard.is_ticket_canceled(),
-        "exact witness ticket canceled during projection",
-    )?;
+    check_guard()?;
     let clock = root.runtime_clock();
     let now = clock.try_now().map_err(|e| invalid(e.to_string()))?;
     // RootAdmissionV2 binds its immutable runtime clock domain and origin to
@@ -199,9 +202,9 @@ pub(crate) fn project_original_exact_observation_v2(
             && dispatch
                 .original_deadline()
                 .accepts(original_domain, now)
-                .is_ok()
-            && !guard.is_ticket_canceled(),
+                .is_ok(),
         "exact witness canceled or original deadline elapsed during projection",
     )?;
+    check_guard()?;
     Ok(observed)
 }

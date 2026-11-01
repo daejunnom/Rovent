@@ -20,6 +20,9 @@ pub struct RoventRetiredLockV2Record {
     pub(super) producer_owner: std::sync::Arc<()>,
     pub(super) admission: RoventCollectionRootAdmissionV2,
     pub(super) ticket: RoleTicketEnvelope,
+    // Original callback-owned cancellation state, if one was actually
+    // captured. This is not serialized and grants no target authority.
+    pub(super) diagnostic_ticket_guard: Option<super::native_capture::OriginalTicketGuardV2>,
 }
 
 impl RoventRetiredLockV2Record {

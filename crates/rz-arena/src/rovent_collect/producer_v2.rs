@@ -106,7 +106,7 @@ impl SpeculativeTicketAuthorityV2 {
             & TICKET_ISSUING
             != 0
     }
-    fn canceled(&self) -> bool {
+    pub(super) fn canceled(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Acquire) & TICKET_CANCELED != 0
     }
     fn claim(&self) -> Result<SpeculativeIssuanceClaimV2, ArenaError> {
@@ -512,6 +512,9 @@ pub struct RoventCorpusProducerLockV2 {
     producer_owner: std::sync::Arc<()>,
     original: RoventCorpusProducerV2,
     native_retirements: BTreeMap<RequestId, RoleTicketEnvelope>,
+    // Original callback-owned cancellation observations, never deserialized
+    // or synthesized from a ticket ID. Bounded by the existing pending cap.
+    diagnostic_ticket_guards: BTreeMap<RequestId, super::native_capture::OriginalTicketGuardV2>,
     native_observation_failures:
         BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
 }
@@ -571,6 +574,7 @@ impl RoventCorpusProducerLockV2 {
             producer_owner: std::sync::Arc::new(()),
             original,
             native_retirements: BTreeMap::new(),
+            diagnostic_ticket_guards: BTreeMap::new(),
             native_observation_failures: BTreeMap::new(),
         })
     }
@@ -651,6 +655,12 @@ impl RoventCorpusProducerLockV2 {
                 "lock-v2 original input duplicate/cap",
             )?;
             check(
+                !self
+                    .diagnostic_ticket_guards
+                    .contains_key(&captured.original.pending.ticket.id),
+                "lock-v2 diagnostic ticket guard duplicate",
+            )?;
+            check(
                 captured.original.manifest_sha256 == original.manifest_sha256
                     && original
                         .reserved
@@ -667,7 +677,8 @@ impl RoventCorpusProducerLockV2 {
         }
         // Validation happens before moving the input; commit has no fallible
         // operations and preserves the original owner and reservation.
-        let (captured, _) = input.into_original();
+        let (captured, _, diagnostic_guard) = input.into_original();
+        let ticket_id = captured.original.pending.ticket.id;
         let key = (
             captured.original.pending.ticket.id.epoch.0,
             captured.original.pending.ticket.id.sequence,
@@ -681,6 +692,9 @@ impl RoventCorpusProducerLockV2 {
             .pending
             .insert(key, captured.original.pending);
         self.original.inputs.insert(key, captured.input);
+        if let Some(guard) = diagnostic_guard {
+            self.diagnostic_ticket_guards.insert(ticket_id, guard);
+        }
         Ok(())
     }
 
@@ -749,7 +763,11 @@ impl RoventCorpusProducerLockV2 {
     }
 
     pub fn discard_unpublished(&mut self, id: RequestId) -> bool {
-        self.original.discard_unpublished(id)
+        let discarded = self.original.discard_unpublished(id);
+        if discarded {
+            self.diagnostic_ticket_guards.remove(&id);
+        }
+        discarded
     }
 
     /// Consumes the manager-issued witness for an actually accepted and
@@ -867,6 +885,7 @@ impl RoventCorpusProducerLockV2 {
             producer_owner: std::sync::Arc::clone(&self.producer_owner),
             ticket,
             admission: self.admission.clone(),
+            diagnostic_ticket_guard: self.diagnostic_ticket_guards.remove(&ticket.id),
             record: rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2(
                 RoventTrainingRecordV2 {
                     schema: rz_experiments::rovent_corpus_lock_v2::record::ROVENT_TRAINING_RECORD_LOCK_V2_DOMAIN.into(),
