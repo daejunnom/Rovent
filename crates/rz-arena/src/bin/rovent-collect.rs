@@ -121,12 +121,10 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
     if plan.output_directory != cli.output {
         return Err("V2 output directory differs from pinned plan".into());
     }
-    if cli.mode == "own-nnuec" && plan.maximum_roots != 1 {
-        return Err("V2 Own NNUEC runner supports exactly one root".into());
+    if !valid_v2_root_capacity(&cli.mode, plan.maximum_roots) {
+        return Err("V2 collection root capacity must be between 1 and 64".into());
     }
-    if cli.mode == "pc" && !(1..=64).contains(&plan.maximum_roots) {
-        return Err("V2 P/C root capacity must be between 1 and 64".into());
-    }
+    let root_capacity = plan.maximum_roots;
     let publication_timeout_ms = plan.publication_timeout_ms;
     let speculative_requested = cli.speculative_teacher;
     let speculative_effective = speculative_requested && cli.mode == "pc";
@@ -247,6 +245,7 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
     // of the native wall deadline remain the external supervisor's evidence.
     let in_process_complete = accepted && publication == "published" && publication_error.is_none();
     let mut result = serde_json::json!({"schema":"rz-rovent-collection-cli-v2-observation/1", "mode":cli.mode,
+        "root_capacity":root_capacity,
         "input_directory":cli.input, "output_directory":cli.output, "worker_timeout_ms":cli.worker_ms,
         "cleanup_timeout_ms":cli.cleanup_ms, "runner_observation":observation,
         "owner_inspection_available":accepted, "publication":publication, "publication_error":publication_error, "training_executed":false,
@@ -269,6 +268,13 @@ fn run_lock_v2(cli: LockV2Cli) -> Result<(serde_json::Value, bool), Box<dyn std:
         );
     }
     Ok((result, in_process_complete))
+}
+
+/// This is a capacity, not a claim that that many roots were admitted,
+/// processed or published. The original worker and owner report those states.
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+fn valid_v2_root_capacity(mode: &str, maximum_roots: u16) -> bool {
+    matches!(mode, "pc" | "own-nnuec") && (1..=64).contains(&maximum_roots)
 }
 
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
@@ -418,7 +424,20 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(all(test, target_os = "linux", feature = "pals-collection-onnx"))]
 mod v2_cli_tests {
-    use super::parse_lock_v2;
+    use super::{parse_lock_v2, valid_v2_root_capacity};
+
+    #[test]
+    fn v2_root_capacity_matches_both_production_supervisors() {
+        for mode in ["pc", "own-nnuec"] {
+            for count in [1, 2, 64] {
+                assert!(valid_v2_root_capacity(mode, count));
+            }
+            for count in [0, 65] {
+                assert!(!valid_v2_root_capacity(mode, count));
+            }
+        }
+        assert!(!valid_v2_root_capacity("unknown", 1));
+    }
 
     fn arguments() -> Vec<String> {
         [

@@ -1176,7 +1176,38 @@ impl RoventNnuecCollectionRunV2 {
             "collection_owner_observation":owner_observation,
             "collection_owner":owner_value
         });
+        // Only original installed admissions are counted. A prepared worker
+        // slot is not an admission, and an admission is not completion or
+        // publication. While the supervisor owns its slots, this bounded
+        // observation is necessarily a lower bound.
+        let primary_admission = self.bridge.installed_admission_for_recovery();
+        let secondary_admissions: Vec<_> = self
+            .secondary_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.bridge
+                    .installed_admission_for_recovery()
+                    .map(|admission| {
+                        json!({"returned_slot":index + 1,
+                        "admission_sha256":admission.raw_sha256(),
+                        "worker_join_observed":slot.worker_join_observed})
+                    })
+            })
+            .collect();
+        let installed_admissions_lower_bound =
+            usize::from(primary_admission.is_some()) + secondary_admissions.len();
         let remaining = json!({
+            "root_admissions_observation": {
+                "scope":"installed_admissions_lower_bound_not_processed_or_published_roots",
+                "installed_count_lower_bound":installed_admissions_lower_bound,
+                "primary_admission_sha256":primary_admission.map(|admission|admission.raw_sha256()),
+                "returned_secondary_admissions":secondary_admissions,
+                "supervisor_pending":self.supervisor.is_some(),
+                "supervisor_error":self.supervisor_error.as_ref().map(|error|error.to_string()),
+                "processed_root_count":"unknown",
+                "physical_completion":"not_attested"
+            },
             "deferred_collection_roots_observation":deferred_observation,
             "pending_stopped_observation":pending_observation,
             "before_start_failure":self.bridge.before_start_failure().map(|error|format!("{error:?}")),
@@ -1482,9 +1513,9 @@ impl Drop for RoventNnuecCollectionRunV2 {
     }
 }
 
-/// Load an explicitly pinned /2 manifest and start the actual Own NNUEC UCI path.
-/// The plan's single-root limit is the bridge's current capability; it must
-/// not be reported as multi-root Collection support.
+/// Load an explicitly pinned /2 manifest and start the actual Own NNUEC UCI
+/// path. The registered limit is a capacity, not proof that each root was
+/// admitted, completed, physically drained, or published.
 pub fn run_rovent_own_nnuec_collection_lock_v2(
     arguments: Vec<String>,
     plan: RoventCollectionLockV2LaunchPlan,
