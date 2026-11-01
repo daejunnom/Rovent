@@ -477,7 +477,7 @@ pub fn spawn_onnx_worker_retained_profiled<P: Send + Sync + 'static>(
     original: &mut Option<crate::onnx::OnnxBackend>,
     reservation: &mut crate::worker::PhysicalRecoveryReservation,
     trace: Option<rz_telemetry::source::SourceJournal<CompletionContext>>,
-) -> Result<OnnxWorker<P>, ContractError> {
+) -> Result<OnnxWorker<P>, PhysicalFailure> {
     let backend = original.as_ref().ok_or_else(|| {
         error(
             ErrorCode::InvalidInput,
@@ -494,7 +494,7 @@ pub fn spawn_onnx_worker_retained_profiled<P: Send + Sync + 'static>(
         },
         |backend, _until| backend.synchronous_shutdown_proof(),
     )
-    .map_err(|failure| backend_error(&failure))
+    .map_err(PhysicalFailure::from)
 }
 
 #[cfg(feature = "onnx")]
