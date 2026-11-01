@@ -527,6 +527,48 @@ mod tests {
     }
 
     #[test]
+    fn independent_cpu7_capture_registration_checks_cohort_and_bounds_without_changing_v2() {
+        let mut input = cohort().input;
+        input
+            .requested_recipients
+            .push(RoventUtilityCohortRecipient::Critic);
+        let legacy = RoventUtilityInterventionCohortV2::seal(input, 0).unwrap();
+        let legacy_bytes = legacy.canonical_bytes().unwrap();
+        let mut cpu7 = legacy.clone();
+        cpu7.policy = RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1;
+        let cpu7_bytes = cpu7.canonical_bytes().unwrap();
+        let registration = RoventCpu7CaptureRegistrationV1 {
+            domain: "rz-rovent-cpu7-capture-registration/1".into(),
+            cohort_canonical_sha256: cpu7.canonical_sha256().unwrap(),
+            max_observations: 64,
+            max_line_chunks: 64,
+            max_states: 16,
+            max_owned_bytes: 1 << 20,
+            max_retained_history_bytes: 4 << 20,
+            max_duration_ns: 8_000_000,
+        };
+        let raw = serde_json::to_string(&registration).unwrap();
+        let parsed = RoventCpu7CaptureRegistrationV1::from_json(&raw).unwrap();
+        assert_eq!(parsed, registration);
+        assert!(parsed.validate_cohort(&cpu7).is_ok());
+        assert!(parsed.validate_cohort(&legacy).is_err());
+        let mut wrong = parsed.clone();
+        wrong.cohort_canonical_sha256 = legacy.canonical_sha256().unwrap();
+        assert!(wrong.validate_cohort(&cpu7).is_err());
+        wrong = parsed.clone();
+        wrong.max_observations = 6;
+        assert!(wrong.validate().is_err());
+        wrong = parsed.clone();
+        wrong.max_owned_bytes = 16 * 1024 * 1024 + 1;
+        assert!(wrong.validate().is_err());
+        wrong = parsed.clone();
+        wrong.max_duration_ns = 0;
+        assert!(wrong.validate().is_err());
+        assert_eq!(legacy.canonical_bytes().unwrap(), legacy_bytes);
+        assert_eq!(cpu7.canonical_bytes().unwrap(), cpu7_bytes);
+    }
+
+    #[test]
     fn intervention_requires_comparable_declared_arms_and_bounded_target() {
         let mut input = cohort().input;
         assert!(RoventUtilityInterventionCohortV2::seal(input.clone(), 0).is_err());

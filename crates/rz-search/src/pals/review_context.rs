@@ -2093,6 +2093,54 @@ mod tests {
                 .len(),
             7
         );
+        // A test scope exercises the reservation mechanics; it is not an
+        // admission or a claim about the UCI session owner.
+        struct DiagnosticTestScope;
+        impl cpu7_capture::CaptureScope for DiagnosticTestScope {
+            fn check_scope(&self) -> Result<(), cpu7_capture::CaptureUnavailable> {
+                Ok(())
+            }
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(control.limits, std::time::Duration::from_secs(10));
+        let permit = grant.control(Some(&cancel), deadline).unwrap();
+        let guarded =
+            cpu7_capture::capture_selected_cpu_raw_permitted(&captured_view, &stores, permit)
+                .unwrap();
+        assert_eq!(
+            guarded.view_binding(),
+            captured_view.cohort_cpu7_binding().unwrap()
+        );
+        assert!(matches!(
+            grant.control(Some(&cancel), deadline),
+            Err(cpu7_capture::CaptureUnavailable::CaptureBusy)
+        ));
+        drop(guarded);
+        drop(grant.control(Some(&cancel), deadline).unwrap());
+
+        // Failure must release the same root reservation, not poison it.
+        let mut tiny = control.limits;
+        tiny.max_owned_bytes = 1;
+        let small_grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(tiny, std::time::Duration::from_secs(10));
+        let permit = small_grant.control(Some(&cancel), deadline).unwrap();
+        assert!(matches!(
+            cpu7_capture::capture_selected_cpu_raw_permitted(&captured_view, &stores, permit),
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+        drop(small_grant.control(Some(&cancel), deadline).unwrap());
         control.limits.max_owned_bytes = 1;
         let (still_valid, exhausted) = index
             .select_cohort_cpu7_with_raw_capture(

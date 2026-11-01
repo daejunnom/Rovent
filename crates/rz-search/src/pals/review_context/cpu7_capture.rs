@@ -835,3 +835,82 @@ fn capture_selected_cpu_raw_inner<'a>(
         _reservation: reservation,
     })
 }
+
+#[cfg(test)]
+mod scope_postcondition_tests {
+    use super::*;
+
+    // These are controlled callback behaviors, not stand-ins for a UCI owner.
+    struct CancelDuringCheck<'a>(&'a AtomicBool);
+    impl CaptureScope for CancelDuringCheck<'_> {
+        fn check_scope(&self) -> Result<(), CaptureUnavailable> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+    struct DeadlineDuringCheck {
+        deadline: Instant,
+        called: AtomicBool,
+    }
+    impl CaptureScope for DeadlineDuringCheck {
+        fn check_scope(&self) -> Result<(), CaptureUnavailable> {
+            self.called.store(true, Ordering::Release);
+            while Instant::now() < self.deadline {
+                std::thread::yield_now();
+            }
+            Ok(())
+        }
+    }
+    fn limits() -> CaptureLimits {
+        CaptureLimits {
+            max_observations: 7,
+            max_line_chunks: 0,
+            max_states: 1,
+            max_owned_bytes: 1024,
+            max_retained_history_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn callback_success_cannot_hide_cancellation_or_expiry() {
+        let canceled = AtomicBool::new(false);
+        let control = CaptureControl {
+            deadline: Instant::now() + std::time::Duration::from_secs(10),
+            canceled: &canceled,
+            limits: limits(),
+        };
+        let scope = CancelDuringCheck(&canceled);
+        let writer = BudgetWriter {
+            bytes: Vec::new(),
+            charged: 0,
+            control: &control,
+            scope_check: Some(&scope),
+            error: None,
+        };
+        assert!(matches!(writer.check(), Err(CaptureUnavailable::Canceled)));
+
+        let canceled = AtomicBool::new(false);
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let control = CaptureControl {
+            deadline,
+            canceled: &canceled,
+            limits: limits(),
+        };
+        let scope = DeadlineDuringCheck {
+            deadline,
+            called: AtomicBool::new(false),
+        };
+        let writer = BudgetWriter {
+            bytes: Vec::new(),
+            charged: 0,
+            control: &control,
+            scope_check: Some(&scope),
+            error: None,
+        };
+        assert!(matches!(writer.check(), Err(CaptureUnavailable::Deadline)));
+        assert!(
+            scope.called.load(Ordering::Acquire),
+            "deadline must cross inside scope callback"
+        );
+    }
+}
