@@ -11,7 +11,8 @@ use cap_std::fs::Dir;
 use rz_contracts::Digest;
 use rz_eval::error::{BackendError, FailureKind as K};
 use rz_experiments::{
-    ArtifactRef, RoventEngineDeclaration, RoventInputLock, RoventInputLockV2, RoventPurpose,
+    ArtifactRef, RoventEngineDeclaration, RoventInputLock, RoventInputLockV2, RoventInputLockV3,
+    RoventPurpose,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -75,12 +76,14 @@ struct PinnedTeacherSource {
 enum CollectionInputLock {
     V1(Arc<RoventInputLock>),
     V2(Arc<RoventInputLockV2>),
+    V3(Arc<RoventInputLockV3>),
 }
 impl CollectionInputLock {
     fn validate(&self) -> Result<(), BackendError> {
         match self {
             Self::V1(lock) => lock.validate(),
             Self::V2(lock) => lock.validate(),
+            Self::V3(lock) => lock.validate(),
         }
         .map_err(|_| invalid("original Collection lock"))
     }
@@ -88,24 +91,28 @@ impl CollectionInputLock {
         match self {
             Self::V1(lock) => lock.manifest.purpose,
             Self::V2(lock) => lock.manifest.purpose,
+            Self::V3(lock) => lock.manifest.purpose,
         }
     }
     fn engine(&self) -> &RoventEngineDeclaration {
         match self {
             Self::V1(lock) => &lock.manifest.engine,
             Self::V2(lock) => &lock.manifest.engine,
+            Self::V3(lock) => &lock.manifest.engine,
         }
     }
     fn provenance(&self) -> &[ArtifactRef] {
         match self {
             Self::V1(lock) => &lock.manifest.provenance,
             Self::V2(lock) => &lock.manifest.provenance,
+            Self::V3(lock) => &lock.manifest.provenance,
         }
     }
     fn canonical_sha256(&self) -> &str {
         match self {
             Self::V1(lock) => &lock.canonical_sha256,
             Self::V2(lock) => &lock.canonical_sha256,
+            Self::V3(lock) => &lock.canonical_sha256,
         }
     }
     fn teacher_launch(
@@ -117,6 +124,7 @@ impl CollectionInputLock {
         match self {
             Self::V1(lock) => PreparedRoventExternalLaunch::from_lock(lock, slot, bytes),
             Self::V2(lock) => PreparedRoventExternalLaunch::from_lock_v2(lock, slot, bytes),
+            Self::V3(lock) => PreparedRoventExternalLaunch::from_lock_v3(lock, slot, bytes),
         }
         .map_err(|_| invalid("original teacher profile/capability declaration"))
     }
@@ -126,7 +134,7 @@ impl CollectionInputLock {
 /// and its exact retained profile, executable, cwd and separate-asset files.
 pub struct RoventCollectionPreloadSources {
     lock: CollectionInputLock,
-    /// /2 retains the original source-admission control for later owner joins.
+    /// /2 and /3 retain the original source-admission control for later joins.
     /// /1 keeps its existing behavior and does not retain an extra control.
     startup_control_v2: Option<RoventStartupControl>,
     // This is the path used for profile program/cwd checks, not proof that a
@@ -286,6 +294,44 @@ impl RoventCollectionPreloadSources {
         )
     }
 
+    /// Retain the exact /3 lock, source directory and startup control; this
+    /// prepares teacher descriptors but grants no worker or root authority.
+    pub fn open_v3(
+        lock: Arc<RoventInputLockV3>,
+        root: Dir,
+        private_root_path: &Path,
+        selections: Vec<RoventTeacherSourceSelection>,
+        control: &RoventStartupControl,
+    ) -> Result<Self, BackendError> {
+        Self::open_original(
+            CollectionInputLock::V3(lock),
+            root,
+            private_root_path,
+            selections,
+            control,
+            &[],
+        )
+    }
+
+    /// The optional sealed-teacher policy is independent of system CUDA.
+    pub fn open_v3_with_sealed_policy(
+        lock: Arc<RoventInputLockV3>,
+        root: Dir,
+        private_root_path: &Path,
+        selections: Vec<RoventTeacherSourceSelection>,
+        control: &RoventStartupControl,
+        sealed_teacher_indices: &[usize],
+    ) -> Result<Self, BackendError> {
+        Self::open_original(
+            CollectionInputLock::V3(lock),
+            root,
+            private_root_path,
+            selections,
+            control,
+            sealed_teacher_indices,
+        )
+    }
+
     fn open_original(
         lock: CollectionInputLock,
         root: Dir,
@@ -296,10 +342,12 @@ impl RoventCollectionPreloadSources {
     ) -> Result<Self, BackendError> {
         control.check()?;
         lock.validate()?;
-        let startup_control_v2 =
-            matches!(&lock, CollectionInputLock::V2(_)).then(|| control.clone());
-        let private_root_path_v2 =
-            matches!(&lock, CollectionInputLock::V2(_)).then(|| private_root_path.to_owned());
+        let retain_origin = matches!(
+            &lock,
+            CollectionInputLock::V2(_) | CollectionInputLock::V3(_)
+        );
+        let startup_control_v2 = retain_origin.then(|| control.clone());
+        let private_root_path_v2 = retain_origin.then(|| private_root_path.to_owned());
         if lock.purpose() != RoventPurpose::Collection
             || lock.engine().teachers.is_empty()
             || lock.engine().teachers.len() > 16
@@ -320,7 +368,11 @@ impl RoventCollectionPreloadSources {
             || sealed_teacher_indices
                 .iter()
                 .any(|&index| index >= selections.len())
-            || (!sealed_teacher_indices.is_empty() && !matches!(&lock, CollectionInputLock::V2(_)))
+            || (!sealed_teacher_indices.is_empty()
+                && !matches!(
+                    &lock,
+                    CollectionInputLock::V2(_) | CollectionInputLock::V3(_)
+                ))
         {
             return Err(invalid("invalid sealed executable source slot selection"));
         }
@@ -369,9 +421,11 @@ impl RoventCollectionPreloadSources {
             // arguments or external assets; every other profile keeps its
             // original executable descriptor and verified startup behavior.
             #[cfg(target_os = "linux")]
-            let sealed_supported = matches!(&lock, CollectionInputLock::V2(_))
-                && declaration.engine
-                    == rz_search::external_cpu::ExternalEngineProfile::Stockfish19EmbeddedNnue
+            let sealed_supported = matches!(
+                &lock,
+                CollectionInputLock::V2(_) | CollectionInputLock::V3(_)
+            ) && declaration.engine
+                == rz_search::external_cpu::ExternalEngineProfile::Stockfish19EmbeddedNnue
                 && declaration.arguments.is_empty()
                 && declaration.identity.assets.is_empty()
                 && selection.assets.is_empty();
@@ -549,7 +603,34 @@ impl RoventCollectionPreloadSources {
     /// Also require the exact path used in the original profile mapping.
     /// The retained directory identity must be checked independently.
     pub fn matches_original_root_path_v2(&self, private_root_path: &Path) -> bool {
-        self.private_root_path_v2.as_deref() == Some(private_root_path)
+        matches!(&self.lock, CollectionInputLock::V2(_))
+            && self.private_root_path_v2.as_deref() == Some(private_root_path)
+    }
+    /// /3 must use its original Arc, cancellation allocation, and deadlines.
+    pub fn matches_v3_origin(
+        &self,
+        lock: &Arc<RoventInputLockV3>,
+        control: &RoventStartupControl,
+    ) -> bool {
+        matches!(&self.lock, CollectionInputLock::V3(original) if Arc::ptr_eq(original, lock))
+            && self.startup_control_v2.as_ref().is_some_and(|original| {
+                Arc::ptr_eq(&original.cancellation, &control.cancellation)
+                    && original.until == control.until
+                    && original.cleanup_until == control.cleanup_until
+            })
+    }
+    pub(super) fn matches_v3_lock_value(&self, lock: &RoventInputLockV3) -> bool {
+        matches!(&self.lock, CollectionInputLock::V3(original) if std::ptr::eq(original.as_ref(), lock))
+    }
+    pub fn matches_original_root_v3(&self, root: &Dir) -> Result<bool, BackendError> {
+        if !matches!(&self.lock, CollectionInputLock::V3(_)) {
+            return Ok(false);
+        }
+        super::same_directory_identity(&self._original_root, root)
+    }
+    pub fn matches_original_root_path_v3(&self, private_root_path: &Path) -> bool {
+        matches!(&self.lock, CollectionInputLock::V3(_))
+            && self.private_root_path_v2.as_deref() == Some(private_root_path)
     }
     pub fn teacher_count(&self) -> usize {
         self.teachers.len()

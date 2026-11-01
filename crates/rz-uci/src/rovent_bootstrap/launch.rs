@@ -46,7 +46,7 @@ use std::{
     fmt,
     fs::File,
     io::Read,
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -114,6 +114,7 @@ fn error(stage: &'static str, detail: impl fmt::Display) -> RoventLaunchError {
 struct Arguments {
     input_lock: String,
     native_assets: String,
+    direct_native_assets: Option<DirectNativeAssets>,
     external_r_sources: Option<String>,
     retirement_sink: Option<String>,
     evidence_root: Option<PathBuf>,
@@ -127,6 +128,17 @@ struct Arguments {
     lifecycle_diagnostics_v2: bool,
     initial_stop_source_diagnostics: bool,
     storage: Option<StorageArguments>,
+}
+
+/// V3 selects existing original lock artifacts without an auxiliary index file.
+#[derive(Debug, Eq, PartialEq)]
+struct DirectNativeAssets {
+    export: String,
+    rules: String,
+    public_graph: String,
+    shared_pc_graph: String,
+    public_graph_name: Option<String>,
+    shared_pc_graph_name: Option<String>,
 }
 
 /// A complete explicit selection, not an archive-on default. The private
@@ -145,6 +157,12 @@ impl Arguments {
     fn parse(arguments: &[String]) -> Result<Self, RoventLaunchError> {
         let mut input_lock = None;
         let mut native_assets = None;
+        let mut direct_export = None;
+        let mut direct_rules = None;
+        let mut direct_public = None;
+        let mut direct_shared_pc = None;
+        let mut direct_public_name = None;
+        let mut direct_shared_pc_name = None;
         let mut external_r_sources = None;
         let mut retirement_sink = None;
         let mut evidence_root = None;
@@ -171,6 +189,24 @@ impl Arguments {
                 "--input-lock" if input_lock.is_none() => input_lock = Some(private_path(value)?),
                 "--native-assets" if native_assets.is_none() => {
                     native_assets = Some(private_path(value)?)
+                }
+                "--native-export" if direct_export.is_none() => {
+                    direct_export = Some(private_path(value)?)
+                }
+                "--native-rules" if direct_rules.is_none() => {
+                    direct_rules = Some(private_path(value)?)
+                }
+                "--native-public-graph" if direct_public.is_none() => {
+                    direct_public = Some(private_path(value)?)
+                }
+                "--native-shared-pc-graph" if direct_shared_pc.is_none() => {
+                    direct_shared_pc = Some(private_path(value)?)
+                }
+                "--native-public-graph-name" if direct_public_name.is_none() => {
+                    direct_public_name = Some(native_basename(value)?)
+                }
+                "--native-shared-pc-graph-name" if direct_shared_pc_name.is_none() => {
+                    direct_shared_pc_name = Some(native_basename(value)?)
                 }
                 "--external-r-sources" if external_r_sources.is_none() => {
                     external_r_sources = Some(private_path(value)?)
@@ -321,10 +357,44 @@ impl Arguments {
                 "initial-stop source diagnostics require --lifecycle-diagnostics=stderr-v1",
             ));
         }
+        let direct_native_assets = match (
+            direct_export,
+            direct_rules,
+            direct_public,
+            direct_shared_pc,
+        ) {
+            (None, None, None, None)
+                if direct_public_name.is_none() && direct_shared_pc_name.is_none() =>
+            {
+                None
+            }
+            (Some(export), Some(rules), Some(public_graph), Some(shared_pc_graph)) => {
+                Some(DirectNativeAssets {
+                    export,
+                    rules,
+                    public_graph,
+                    shared_pc_graph,
+                    public_graph_name: direct_public_name,
+                    shared_pc_graph_name: direct_shared_pc_name,
+                })
+            }
+            _ => {
+                return Err(error(
+                    "Arguments",
+                    "direct native assets require export, rules, public and shared-pc graph paths",
+                ));
+            }
+        };
+        if native_assets.is_some() == direct_native_assets.is_some() {
+            return Err(error(
+                "Arguments",
+                "select exactly one of --native-assets or direct native assets",
+            ));
+        }
         Ok(Self {
             input_lock: input_lock.ok_or_else(|| error("Arguments", "--input-lock is required"))?,
-            native_assets: native_assets
-                .ok_or_else(|| error("Arguments", "--native-assets is required"))?,
+            native_assets: native_assets.unwrap_or_default(),
+            direct_native_assets,
             external_r_sources,
             retirement_sink,
             evidence_root,
@@ -349,6 +419,20 @@ fn private_path(value: &str) -> Result<String, RoventLaunchError> {
             "Arguments",
             "input must use the closed inputs snapshot namespace",
         ));
+    }
+    Ok(value.into())
+}
+fn native_basename(value: &str) -> Result<String, RoventLaunchError> {
+    // Match the retained graph consumer's basename contract. The name is
+    // compared to the export manifest and is not used as a filesystem path.
+    if value.is_empty()
+        || value.len() > 256
+        || !matches!(
+            Path::new(value).components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        )
+    {
+        return Err(error("Arguments", "native graph name must be a basename"));
     }
     Ok(value.into())
 }
@@ -861,6 +945,12 @@ fn run_inner<'a>(
             return v3::run_native(arguments, lock, root, cwd, lock_file);
         }
     };
+    if arguments.direct_native_assets.is_some() {
+        return Err(error(
+            "InputLockUnsupportedV1",
+            "direct native assets require an original /3 lock",
+        ));
+    }
     if arguments.system_runtime_receipt_root.is_some() || arguments.strict_source.is_some() {
         return Err(error(
             "InputLockUnsupportedV1",
@@ -1388,7 +1478,8 @@ fn run_v2_native<'a>(
     lock_file: File,
     collection: Option<CollectionLaunchV2<'a>>,
 ) -> Result<(), RoventLaunchError> {
-    if arguments.system_runtime_receipt_root.is_some()
+    if arguments.direct_native_assets.is_some()
+        || arguments.system_runtime_receipt_root.is_some()
         || arguments.strict_source.is_some()
         || arguments.storage.is_some()
         || arguments.startup_diagnostics

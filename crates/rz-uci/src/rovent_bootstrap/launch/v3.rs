@@ -11,6 +11,70 @@ use crate::rovent_bootstrap::process_boundary::{
 use rz_experiments::NativeRuntimeSourceV6;
 use rz_experiments::RoventInputLockV3;
 
+/// Select only original lock entries. No independent mutable index is needed;
+/// `open_v3` still opens and verifies every original asset and validates the
+/// export/Rules/graph/weights relationship before starting the native owner.
+#[cfg(target_os = "linux")]
+fn direct_selection(
+    lock: &RoventInputLockV3,
+    selection: &DirectNativeAssets,
+) -> Result<RoventNativeAssetSelection, RoventLaunchError> {
+    let original = |path: &str| -> Result<ArtifactRef, RoventLaunchError> {
+        let mut matches = lock
+            .manifest
+            .provenance
+            .iter()
+            .filter(|item| item.path == path);
+        let artifact = matches
+            .next()
+            .ok_or_else(|| error("Assets", "direct path is absent from original provenance"))?;
+        if matches.next().is_some() {
+            return Err(error(
+                "Assets",
+                "direct path is ambiguous in original provenance",
+            ));
+        }
+        Ok(artifact.clone())
+    };
+    let graph = |role: &str,
+                 path: &str,
+                 original_name: &Option<String>|
+     -> Result<RoventNativeGraphAsset, RoventLaunchError> {
+        let registered_file = match original_name {
+            Some(name) => name.clone(),
+            None => path
+                .rsplit('/')
+                .next()
+                .ok_or_else(|| error("Assets", "graph basename is missing"))?
+                .to_owned(),
+        };
+        Ok(RoventNativeGraphAsset {
+            role: role.to_owned(),
+            registered_file,
+            artifact: original(path)?,
+        })
+    };
+    Ok(RoventNativeAssetSelection {
+        startup_configuration: lock.manifest.startup_document.clone(),
+        export_manifest: original(&selection.export)?,
+        rules_descriptor: original(&selection.rules)?,
+        graphs: vec![
+            graph(
+                "public",
+                &selection.public_graph,
+                &selection.public_graph_name,
+            )?,
+            graph(
+                "shared_pc",
+                &selection.shared_pc_graph,
+                &selection.shared_pc_graph_name,
+            )?,
+        ],
+        cuda_control_inventory: None,
+        runtime_bundle_manifest: None,
+    })
+}
+
 #[cfg(target_os = "linux")]
 struct SystemReceiptWriter {
     directory: Dir,
@@ -116,7 +180,9 @@ struct OriginalV3Inputs {
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
     control: RoventStartupControl,
     clock: ProcessClock,
-    selection_file: File,
+    // A legacy selection index is retained through physical completion;
+    // direct lock-backed selection has no separate index descriptor.
+    selection_file: Option<File>,
     lock_file: File,
     receipt_writer: Option<SystemReceiptWriter>,
 }
@@ -227,22 +293,28 @@ fn admit_original<'a>(
                 None
             }
         });
-    let selected: Vec<_> = lock
-        .manifest
-        .provenance
-        .iter()
-        .filter(|artifact| artifact.path == arguments.native_assets)
-        .collect();
-    if selected.len() != 1 {
-        return Err(error(
-            "Assets",
-            "selection is not a unique original provenance artifact",
-        ));
-    }
-    let selection_file = selected[0]
-        .open_verified_at(root, MAX_SELECTION_BYTES)
-        .map_err(|failure| error("Assets", failure))?;
-    let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
+    let (selection, selection_file) = if let Some(direct) = arguments.direct_native_assets.as_ref()
+    {
+        (direct_selection(&lock, direct)?, None)
+    } else {
+        let selected: Vec<_> = lock
+            .manifest
+            .provenance
+            .iter()
+            .filter(|artifact| artifact.path == arguments.native_assets)
+            .collect();
+        if selected.len() != 1 {
+            return Err(error(
+                "Assets",
+                "selection is not a unique original provenance artifact",
+            ));
+        }
+        let selection_file = selected[0]
+            .open_verified_at(root, MAX_SELECTION_BYTES)
+            .map_err(|failure| error("Assets", failure))?;
+        let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
+        (selection, Some(selection_file))
+    };
     let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
     let sources = Arc::new(
         if arguments.strict_source.unwrap_or(false) {

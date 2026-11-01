@@ -395,16 +395,20 @@ impl NativeInputLock for RoventInputLockV3 {
     ) -> Result<RoventStartupTopology, BackendError> {
         self.validate()
             .map_err(|_| fail(K::IdentityMismatch, "Rovent /3 lock validation failed"))?;
-        if collection.is_some() {
-            return Err(fail(
-                K::UnsupportedModel,
-                "Rovent /3 collection source owner is not connected",
-            ));
-        }
-        let explicit_purpose = matches!(
-            self.manifest.purpose,
-            rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment
-        ) && self.manifest.engine.teachers.is_empty();
+        let explicit_purpose = match collection {
+            None => {
+                matches!(
+                    self.manifest.purpose,
+                    rz_experiments::RoventPurpose::Validation
+                        | rz_experiments::RoventPurpose::Deployment
+                ) && self.manifest.engine.teachers.is_empty()
+            }
+            Some(original) => {
+                self.manifest.purpose == rz_experiments::RoventPurpose::Collection
+                    && original.matches_v3_lock_value(self)
+                    && original.teacher_count() == self.manifest.engine.teachers.len()
+            }
+        };
         super::admitted_native_topology_fields(
             &self.manifest.engine,
             &self.manifest.coordinator,
@@ -616,6 +620,68 @@ impl RoventPinnedNativeSources<RoventInputLockV3> {
         self.original_v2_control
             .as_ref()
             .is_some_and(|original| same_startup_control(original, control))
+    }
+
+    /// Recheck the exact /3 preload, lock, startup control and held root.
+    /// This is source custody only; it grants no Collection root authority.
+    pub fn verify_collection_v3_origin(
+        &self,
+    ) -> Result<&Arc<RoventCollectionPreloadSources>, BackendError> {
+        let original = self.collection.as_ref().ok_or_else(|| {
+            fail(
+                K::IdentityMismatch,
+                "V3 Collection preload source is absent",
+            )
+        })?;
+        let control = self
+            .original_v2_control
+            .as_ref()
+            .ok_or_else(|| fail(K::IdentityMismatch, "original V3 startup control is absent"))?;
+        if !original.matches_v3_origin(&self.lock, control)
+            || !original.matches_original_root_path_v3(&self.private_root_path)
+            || !original.matches_original_root_v3(&self._root)?
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                "V3 Collection source origin differs",
+            ));
+        }
+        Ok(original)
+    }
+
+    /// Join the original /3 teacher preload before admitting native inputs.
+    /// `strict_source` chooses reproduction checking; system functionality
+    /// must not depend on unrelated source-provenance observations.
+    pub fn open_v3_with_collection(
+        lock: Arc<RoventInputLockV3>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        collection: Arc<RoventCollectionPreloadSources>,
+        strict_source: bool,
+    ) -> Result<Self, BackendError> {
+        control.check()?;
+        if !collection.matches_v3_origin(&lock, control)
+            || !collection.matches_original_root_path_v3(&private_root_path)
+            || !collection.matches_original_root_v3(&root)?
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                "V3 Collection source origin differs",
+            ));
+        }
+        let owner = Self::open_selected(
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            Some(collection),
+            strict_source,
+        )?;
+        owner.verify_collection_v3_origin()?;
+        Ok(owner)
     }
 
     /// Source admission uses the original /3 lock, root capability and control.
