@@ -151,6 +151,14 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(public['scope'], 'linux_only')
         self.assertEqual(public['age_seconds'], 30)
 
+    def test_scan_summary_filters_untrusted_names(self):
+        summary = {'visited_roots': 1, 'unvisited_roots': 0, 'entries': 2,
+                   'unique_regular_files': 1, 'partial_causes': ['deadline', '/private/path'],
+                   'path': '/private/path'}
+        filtered = usage.public_scan_summary(summary)
+        self.assertEqual(filtered['partial_causes'], ['deadline'])
+        self.assertNotIn('/private/path', json.dumps(filtered))
+
     def test_windows_installed_monitor_reports_cached_combined_total(self):
         usage._last_check = float('-inf')
         usage._last_warning = None
@@ -288,6 +296,21 @@ class SnapshotTests(unittest.TestCase):
         already_paired = usage.read_snapshot(self.path, now=1001, require_root_owner=False)
         self.assertEqual((already_paired['allocated_bytes_lower_bound'], already_paired['decision']),
                          (20, 'unknown'))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory snapshot')
+    def test_snapshot_scans_other_files_after_threshold_crossing(self):
+        root = Path(self.tmp.name) / 'source'
+        root.mkdir()
+        (root / 'one').write_bytes(b'a' * 50)
+        (root / 'two').write_bytes(b'b' * 70)
+        with mock.patch.object(usage, 'default_roots_and_discovery', return_value=([root], [])):
+            value = usage.create_snapshot(self.path, threshold_bytes=1)
+        self.assertEqual(value['decision'], 'exceeded')
+        self.assertEqual(value['logical_bytes_lower_bound'], 120)
+        self.assertEqual(value['scan_summary']['unique_regular_files'], 2)
+        self.assertNotIn('threshold_short_circuit', value['scan_summary']['partial_causes'])
+        self.assertIn('custom_scope_unknown', value['scan_summary']['partial_causes'])
+        self.assertNotIn(str(root), json.dumps(value))
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux advisory snapshot')
     def test_scan_preserves_raw_linux_alongside_existing_windows_pair(self):

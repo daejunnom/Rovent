@@ -36,7 +36,21 @@ SOURCE_ROOTS_SCHEMA = 'rovezero.storage-source-roots.v1'
 MAX_SOURCE_ROOTS = 64
 SHARED_MONITOR_FILE = 'monitor-configuration.json'
 PARTIAL_CAUSES = frozenset({'threshold_short_circuit', 'deadline', 'entry_limit',
-                            'unvisited_roots', 'other_observation_limit', 'custom_scope_unknown'})
+                            'unvisited_roots', 'other_observation_limit', 'custom_scope_unknown',
+                            'privacy_excluded', 'other_mount_excluded'})
+
+
+def _public_scan_summary(value):
+    if not isinstance(value, dict):
+        return None
+    keys = ('visited_roots', 'unvisited_roots', 'entries', 'unique_regular_files')
+    if any(type(value.get(key)) is not int or value[key] < 0 for key in keys):
+        return None
+    causes = value.get('partial_causes')
+    if not isinstance(causes, list):
+        return None
+    return dict({key: value[key] for key in keys}, partial_causes=sorted({
+        cause for cause in causes if isinstance(cause, str) and cause in PARTIAL_CAUSES}))
 
 
 def _package_roots():
@@ -792,10 +806,13 @@ def combine(windows, linux, *, proven_disjoint=False, now=None, threshold=THRESH
             revision = value.get('source_roots_revision') if label == 'windows' else None
             if isinstance(revision, str) and len(revision) <= 36:
                 parts[label]['source_roots_revision'] = revision
-            causes = value.get('partial_causes') if label == 'windows' else None
+            causes = value.get('partial_causes')
             if isinstance(causes, list):
                 parts[label]['partial_causes'] = sorted({cause for cause in causes
                                                         if isinstance(cause, str) and cause in PARTIAL_CAUSES})
+            summary = _public_scan_summary(value.get('scan_summary'))
+            if summary is not None:
+                parts[label]['scan_summary'] = summary
             proof = value.get('origin_proof') if label == 'linux' else None
             if (isinstance(proof, dict)
                     and all(_hex_tag(proof.get(k)) for k in ('pair_tag', 'machine_tag', 'boot_tag'))
@@ -943,13 +960,15 @@ def scan_once(*, max_entries=2_000_000, max_seconds=120.0, threshold_bytes=THRES
             roots = discover_windows_roots(source_config=None, load_config=False)
         result = module.scan_total_usage(roots, threshold_bytes=threshold_bytes,
                                          max_entries=max_entries, max_seconds=max_seconds,
-                                         stop_when_exceeded=True,
+                                         stop_when_exceeded=False,
                                          priority_roots=_priority_managed_roots(roots))
         windows = {key: result[key] for key in ('observed_at_utc', 'decision', 'coverage',
                    'threshold_bytes', 'allocated_bytes_lower_bound', 'logical_bytes_lower_bound')}
         windows.update(schema=WINDOWS_SCHEMA, scope='windows_standard_codex_and_configured_sources_custom_unknown',
                        host_physical_bytes='unknown', consistency='best_effort_non_atomic',
-                       allocated_measure=ALLOCATED_MEASURE, source_roots_revision=revision)
+                       allocated_measure=ALLOCATED_MEASURE, source_roots_revision=revision,
+                       scan_summary=module.public_scan_summary(result))
+        windows['scan_summary']['partial_causes'].append('custom_scope_unknown')
         reasons = result.get('partial_reasons', {})
         causes = {key for key in ('threshold_short_circuit', 'deadline', 'entry_limit') if reasons.get(key)}
         if any(value for key, value in reasons.items() if key not in causes):

@@ -460,7 +460,7 @@ class WindowsHandleTests(unittest.TestCase):
             now = datetime.now(timezone.utc).timestamp()
             linux = sample(usage.LINUX_SCHEMA, 4096, observed=now, coverage='partial')
             usage._atomic_write(usage.monitor_dir() / 'linux.json', linux)
-            result = usage.scan_once(max_entries=1000, max_seconds=5)
+            result = usage.scan_once(max_entries=1000, max_seconds=5, threshold_bytes=1)
             self.assertEqual(result['aggregation'], 'overlap_unknown_max')
             self.assertEqual(result['coverage'], 'partial')
             self.assertEqual(result['components']['linux']['allocated_bytes_lower_bound'], 4096)
@@ -468,6 +468,9 @@ class WindowsHandleTests(unittest.TestCase):
             windows = usage._read_snapshot(usage.monitor_dir() / 'windows.json', usage.WINDOWS_SCHEMA)
             self.assertEqual(windows['scope'], 'windows_standard_codex_and_configured_sources_custom_unknown')
             self.assertGreaterEqual(windows['logical_bytes_lower_bound'], 384)
+            self.assertEqual(windows['scan_summary']['visited_roots'], 2)
+            self.assertNotIn('threshold_short_circuit', windows['scan_summary']['partial_causes'])
+            self.assertNotIn(str(root), json.dumps(windows['scan_summary']))
 
     def test_observed_root_identity_must_match_the_same_current_handle(self):
         import rovezero_total_usage as scanner

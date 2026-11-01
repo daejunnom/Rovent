@@ -193,6 +193,31 @@ def _open_directory(path: Path, expected: os.stat_result):
         raise
 
 
+def public_scan_summary(result):
+    """Return aggregate scope and limitation counters without paths or names."""
+    reasons = result.get('partial_reasons', {})
+    groups = {
+        'threshold_short_circuit': ('threshold_short_circuit',),
+        'deadline': ('deadline',),
+        'entry_limit': ('entry_limit',),
+        'privacy_excluded': ('private_discovery_excluded', 'private_entries_excluded',
+                             'private_root_excluded'),
+        'other_mount_excluded': ('other_mount_excluded',),
+    }
+    known = {name for names in groups.values() for name in names}
+    causes = [name for name, names in groups.items() if any(reasons.get(key) for key in names)]
+    if any(value for key, value in reasons.items() if key not in known):
+        causes.append('other_observation_limit')
+    unvisited = len(result.get('unvisited_roots', ()))
+    if unvisited:
+        causes.append('unvisited_roots')
+    counts = result.get('counts', {})
+    return {'visited_roots': len(result.get('roots', ())), 'unvisited_roots': unvisited,
+            'entries': counts.get('entries', 0),
+            'unique_regular_files': counts.get('unique_regular_files', 0),
+            'partial_causes': sorted(causes)}
+
+
 def scan_total_usage(roots, *, discover_parents=(), threshold_bytes=DEFAULT_THRESHOLD,
                      max_entries=1_000_000, max_seconds=60.0,
                      stop_when_exceeded=False, priority_roots=()):

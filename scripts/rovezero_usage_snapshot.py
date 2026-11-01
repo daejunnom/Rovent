@@ -31,6 +31,23 @@ WINDOWS_REFRESH_TASK = 'RoveZero Total Storage Warning'
 WINDOWS_TASK_RUNNER = Path('/mnt/c/Windows/System32/schtasks.exe')
 WINDOWS_REFRESH_STATE = 'windows-refresh.state'
 MIRROR_CONFIG = 'paired-mirror.json'
+PUBLIC_SCAN_CAUSES = frozenset({'threshold_short_circuit', 'deadline', 'entry_limit',
+    'privacy_excluded', 'other_mount_excluded', 'other_observation_limit',
+    'unvisited_roots', 'custom_scope_unknown'})
+
+
+def public_scan_summary(value):
+    """Filter externally supplied summaries so warnings never expose paths."""
+    if not isinstance(value, dict):
+        return None
+    keys = ('visited_roots', 'unvisited_roots', 'entries', 'unique_regular_files')
+    if any(type(value.get(key)) is not int or value[key] < 0 for key in keys):
+        return None
+    causes = value.get('partial_causes')
+    if not isinstance(causes, list):
+        return None
+    return dict({key: value[key] for key in keys}, partial_causes=sorted({
+        cause for cause in causes if isinstance(cause, str) and cause in PUBLIC_SCAN_CAUSES}))
 
 
 def read_snapshot(path=SNAPSHOT, *, now=None, max_age_seconds=MAX_AGE_SECONDS,
@@ -259,6 +276,13 @@ def warn_cached_total_usage():
                   'allocated_bytes_lower_bound', 'logical_bytes_lower_bound',
                   'threshold_bytes', 'observed_at_utc', 'source_observed_at_utc',
                   'scope', 'windows_source_scope', 'windows_refresh', 'age_seconds') if key in value}
+        summary = public_scan_summary(value.get('scan_summary'))
+        if summary is not None:
+            public['scan_summary'] = summary
+        summaries = value.get('source_scan_summary')
+        if isinstance(summaries, dict):
+            public['source_scan_summary'] = {name: row for name in ('linux', 'windows')
+                if (row := public_scan_summary(summaries.get(name))) is not None}
         public.setdefault('observed_at_utc', 'unknown')
         public.setdefault('scope', 'unknown')
         public.setdefault('coverage', 'unknown')
@@ -277,6 +301,9 @@ def warn_cached_total_usage():
                 if name in ('linux', 'windows') and isinstance(row, dict)
             }
             public['aggregation'] = value.get('aggregation', 'unknown')
+            public['source_scan_summary'] = {name: row for name, component in value['components'].items()
+                if name in ('linux', 'windows') and isinstance(component, dict)
+                if (row := public_scan_summary(component.get('scan_summary'))) is not None}
         signature = (public.get('decision'), public.get('reason'), public.get('coverage'),
                      public.get('observed_at_utc'), public.get('scope'),
                      public.get('windows_refresh'), public.get('allocated_bytes_lower_bound'),
@@ -481,6 +508,9 @@ def paired_observation(mirror_dir, linux, *, now=None, max_age_seconds=MAX_AGE_S
                       scope='paired_observations_not_host_physical_total',
                       source_observed_at_utc={'linux': linux['observed_at_utc'],
                                               'windows': right['observed_at_utc']})
+        result['source_scan_summary'] = {name: summary for name, component in
+            (('linux', linux), ('windows', right))
+            if (summary := public_scan_summary(component.get('scan_summary'))) is not None}
         # The older source is the age bound for this paired observation.
         result['observed_at_utc'] = min(
             (linux['observed_at_utc'], right['observed_at_utc']),
@@ -569,7 +599,7 @@ def create_snapshot(path=SNAPSHOT, *, extra_roots=(), max_entries=2_000_000,
                               discover_parents=parents,
                               threshold_bytes=threshold_bytes,
                               max_entries=max_entries, max_seconds=max_seconds,
-                              stop_when_exceeded=True)
+                              stop_when_exceeded=False)
     # Unknown XDG cache roots and nonstandard user-home locations prevent an
     # exhaustive claim. A proven threshold exceedance remains meaningful.
     value = {key: result[key] for key in ('observed_at_utc', 'decision',
@@ -577,7 +607,9 @@ def create_snapshot(path=SNAPSHOT, *, extra_roots=(), max_entries=2_000_000,
              'allocated_measure')}
     value.update(schema=SCHEMA, coverage='partial',
                  scope='default_rovezero_caches_siblings_and_var_tmp_xdg_exceptions_unknown',
-                 consistency='best_effort_non_atomic', host_physical_bytes='unknown')
+                 consistency='best_effort_non_atomic', host_physical_bytes='unknown',
+                 scan_summary=module.public_scan_summary(result))
+    value['scan_summary']['partial_causes'].append('custom_scope_unknown')
     value['origin_proof'] = origin_proof(result, pair_id) if pair_id else None
     if value['decision'] == 'within':
         value['decision'] = 'unknown'
