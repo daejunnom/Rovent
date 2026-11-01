@@ -95,6 +95,22 @@ fn input_lock_v3(position: &Position) -> rz_experiments::RoventOriginalInputLock
         "domain".into(),
         json!(rz_experiments::ROVENT_EXECUTION_V3_DOMAIN),
     );
+    // This is a test fixture, not a migration of an existing /2 record.
+    // /3 derives root budget and deadline seals at admission, so its
+    // coordinator declaration contains only the common policy and limits.
+    let coordinator = &base.v2().unwrap().manifest.coordinator;
+    object.insert(
+        "coordinator".into(),
+        serde_json::to_value(rz_experiments::RoventCoordinatorDeclarationV3 {
+            policy_sha256: coordinator.policy_sha256.clone(),
+            questions_max: coordinator.questions_max,
+            ancestor_depth_max: coordinator.ancestor_depth_max,
+            waiting_jobs_max: coordinator.waiting_jobs_max,
+            role_tickets_max: coordinator.role_tickets_max,
+            cpu_credit_limit: coordinator.cpu_credit_limit,
+        })
+        .unwrap(),
+    );
     object.insert(
         "system_runtime_lock".into(),
         serde_json::to_value(
