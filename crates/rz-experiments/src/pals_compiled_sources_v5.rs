@@ -151,6 +151,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/review_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/semantic_state.rs"),
             source!("crates/rz-search/src/pals/review_context.rs"),
+            source!("crates/rz-search/src/pals/review_context/cpu7_capture.rs"),
             source!("crates/rz-search/src/pals/review_context/historical.rs"),
             source!("crates/rz-search/src/pals/rovent_frontier/horizon_questions.rs"),
         ],

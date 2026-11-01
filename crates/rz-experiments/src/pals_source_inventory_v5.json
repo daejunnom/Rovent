@@ -104,6 +104,7 @@
       "crates/rz-search/src/pals/engine/review_lifecycle.rs",
       "crates/rz-search/src/pals/engine/semantic_state.rs",
       "crates/rz-search/src/pals/review_context.rs",
+      "crates/rz-search/src/pals/review_context/cpu7_capture.rs",
       "crates/rz-search/src/pals/review_context/historical.rs",
       "crates/rz-search/src/pals/rovent_frontier/horizon_questions.rs"
     ],

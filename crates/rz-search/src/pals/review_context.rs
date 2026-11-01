@@ -17,6 +17,7 @@ use super::store::{
     StorePins, StoreReadOwner, StoreReadPin,
 };
 
+pub mod cpu7_capture;
 pub mod historical;
 
 pub const REVIEW_CONTEXT_VERSION: &str = "rz-pals-selected-review/1";
@@ -912,6 +913,28 @@ impl ReviewContextIndex {
             return Err(ReviewError::InvalidPolicy);
         }
         self.select_inner(stores, root, query, policy, Some(7))
+    }
+
+    /// Optional diagnostic capture at the same single-writer selection call.
+    /// Capture failure is returned separately and never changes the selected
+    /// view or makes an otherwise valid neural request fail.
+    pub fn select_cohort_cpu7_with_raw_capture(
+        &mut self,
+        stores: &PalsStores,
+        root: StateId,
+        query: ReviewQuerySequences<'_>,
+        policy: ReviewSelectionPolicy,
+        control: Option<&cpu7_capture::CaptureControl<'_>>,
+    ) -> Result<
+        (
+            ReviewView,
+            Result<cpu7_capture::SelectedCpuRawCapture, cpu7_capture::CaptureUnavailable>,
+        ),
+        ReviewError,
+    > {
+        let view = self.select_cohort_cpu7(stores, root, query, policy)?;
+        let capture = cpu7_capture::capture_selected_cpu_raw(&view, stores, control);
+        Ok((view, capture))
     }
 
     /// A readiness hint only: selection still validates owner, Rules,
@@ -2005,6 +2028,112 @@ mod tests {
         assert!(matches!(
             index.select_cohort_cpu7(&stores, state, empty_query(), legacy),
             Err(ReviewError::InvalidPolicy)
+        ));
+        let (_, missing_control) = index
+            .select_cohort_cpu7_with_raw_capture(&stores, state, empty_query(), policy, None)
+            .unwrap();
+        assert!(matches!(
+            missing_control,
+            Err(cpu7_capture::CaptureUnavailable::MissingOriginalControl)
+        ));
+        let canceled = AtomicBool::new(false);
+        let mut control = cpu7_capture::CaptureControl {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            canceled: &canceled,
+            limits: cpu7_capture::CaptureLimits {
+                max_observations: 7,
+                max_line_chunks: 0,
+                max_states: 1,
+                max_owned_bytes: 1 << 16,
+                max_retained_history_bytes: 1 << 20,
+            },
+        };
+        let (captured_view, raw) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        let raw = raw.unwrap();
+        assert_eq!(
+            raw.view_binding(),
+            captured_view.cohort_cpu7_binding().unwrap()
+        );
+        assert_eq!(raw.original_bundle().selected_len(), 9);
+        assert_eq!(raw.states().len(), 1);
+        assert!(raw.lines().is_empty());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(raw.observations_json())
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        control.limits.max_owned_bytes = 1;
+        let (still_valid, exhausted) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            exhausted,
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+        canceled.store(true, Ordering::Release);
+        let (still_valid, interrupted) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            interrupted,
+            Err(cpu7_capture::CaptureUnavailable::Canceled)
+        ));
+        canceled.store(false, Ordering::Release);
+        control.limits.max_owned_bytes = 1 << 16;
+        control.limits.max_retained_history_bytes = 1;
+        let (still_valid, history_limit) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            history_limit,
+            Err(cpu7_capture::CaptureUnavailable::Capacity)
+        ));
+        control.deadline = std::time::Instant::now();
+        let (still_valid, expired) = index
+            .select_cohort_cpu7_with_raw_capture(
+                &stores,
+                state,
+                empty_query(),
+                policy,
+                Some(&control),
+            )
+            .unwrap();
+        assert!(still_valid.is_cohort_cpu7());
+        assert!(matches!(
+            expired,
+            Err(cpu7_capture::CaptureUnavailable::Deadline)
         ));
         let first = index
             .select_cohort_cpu7(&stores, state, empty_query(), policy)
