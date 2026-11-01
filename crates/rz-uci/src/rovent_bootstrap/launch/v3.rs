@@ -14,6 +14,12 @@ use rz_experiments::RoventInputLockV3;
 #[path = "v3_scope.rs"]
 pub(super) mod v3_scope;
 
+// WIP: the supervisor has not yet connected its exclusive inherited-FD
+// ownership, per-packet credentials, and single-stdin serialization. Keep
+// this optional channel disabled until those actual boundaries are validated.
+#[cfg(target_os = "linux")]
+const GO_OBSERVER_PARENT_HANDOFF_CONNECTED: bool = false;
+
 /// V3 launch errors can retain the exact unstarted factory owner. Absence of
 /// native entry is scoped to this attempt; it is not a GPU completion proof.
 #[cfg(target_os = "linux")]
@@ -984,6 +990,7 @@ mod retaining_failure_tests {
             ProcessClock::new(rz_contracts::ProcessEpoch(1)),
             Arc::new(OwnerRegistry::default()),
             EngineSettings::default(),
+            None,
         );
         assert!(result.is_err());
         assert!(payload.as_ref().is_some_and(|p| p.is::<PanicPayload>()));
@@ -1623,6 +1630,7 @@ pub(super) struct OriginalV3Inputs<'a> {
     receipt_writer: Option<Arc<SystemReceiptWriter>>,
     control_scope_pin: Option<Box<dyn std::any::Any + Send>>,
     connected_parent: Option<Arc<super::ConnectedParent>>,
+    go_observer: Option<crate::engine::GoAdmissionObserver>,
     scope_reserved:
         Option<Box<dyn FnOnce(&v3_scope::RoventV3ScopeKey) -> Result<(), RoventLaunchError> + 'a>>,
 }
@@ -1915,6 +1923,51 @@ pub(super) fn admit_original<'a>(
         .revalidate_startup()
         .map_err(|failure| error("ProcessBoundary", failure))?;
     drop(view);
+    // Optional diagnostics are bound to the authenticated original parent;
+    // their absence or failure never rejects the product launch.
+    let go_observer = arguments.go_observer_fd.and_then(|fd| {
+        if !GO_OBSERVER_PARENT_HANDOFF_CONNECTED {
+            super::go_observer_warning("supervisor handoff is not connected");
+            return None;
+        }
+        if !arguments.go_observer_fd_exclusive {
+            super::go_observer_warning("child-exclusive descriptor ownership not declared");
+            return None;
+        }
+        let Some(parent) = connected_parent.as_ref() else {
+            super::go_observer_warning("authenticated parent unavailable");
+            return None;
+        };
+        let ordinal = match &lock.manifest.engine.pc.device {
+            RoventDevice::Cuda { ordinal, .. } => match i32::try_from(*ordinal) {
+                Ok(value) => value,
+                Err(_) => {
+                    super::go_observer_warning("CUDA ordinal unavailable");
+                    return None;
+                }
+            },
+            _ => {
+                super::go_observer_warning("system CUDA parent required");
+                return None;
+            }
+        };
+        match rz_platform::duplicate_inherited_unix_datagram(fd).and_then(|socket| {
+            super::go_observer::from_original_parent(
+                socket,
+                fd,
+                Arc::clone(parent),
+                arguments.process_epoch,
+                &lock.canonical_sha256,
+                ordinal,
+            )
+        }) {
+            Ok(observer) => Some(observer),
+            Err(_) => {
+                super::go_observer_warning("descriptor or peer validation failed");
+                None
+            }
+        }
+    });
     Ok(OriginalV3Inputs {
         lock,
         boundary,
@@ -1926,6 +1979,7 @@ pub(super) fn admit_original<'a>(
         receipt_writer: receipt_writer.map(Arc::new),
         control_scope_pin,
         connected_parent,
+        go_observer,
         scope_reserved,
     })
 }
@@ -1984,12 +2038,19 @@ fn serve_driver_retaining(
     clock: ProcessClock,
     owners: Arc<OwnerRegistry>,
     settings: EngineSettings,
+    go_observer: Option<crate::engine::GoAdmissionObserver>,
 ) -> (
     Result<(), RoventLaunchError>,
     Option<Box<dyn std::any::Any + Send>>,
 ) {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        serve_driver(Arc::clone(driver), clock, owners, settings)
+        crate::pals_adaptive_bootstrap::protocol::serve_driver_with_go_observer(
+            Arc::clone(driver),
+            clock,
+            owners,
+            settings,
+            go_observer,
+        )
     })) {
         Ok(result) => (result.map_err(|failure| error("UciSession", failure)), None),
         Err(payload) => (
@@ -2030,6 +2091,7 @@ pub(super) fn run_native_admitted(
         receipt_writer,
         control_scope_pin,
         connected_parent,
+        go_observer,
         scope_reserved,
     } = original;
     // Each selected product receives its own original V3 owner. Collection
@@ -3037,7 +3099,7 @@ pub(super) fn run_native_admitted(
     // panic is not physical completion, and its original payload is retained
     // with the same owner below instead of being reduced to a string.
     let (result, panic_payload) =
-        serve_driver_retaining(&driver, clock, Arc::clone(&owners), settings);
+        serve_driver_retaining(&driver, clock, Arc::clone(&owners), settings, go_observer);
     let physical_confirmed = completion.is_confirmed();
     #[cfg(feature = "native-validation-diagnostics")]
     if let Some(handle) = numeric_handle {

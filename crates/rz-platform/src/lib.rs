@@ -13,7 +13,10 @@ pub use windows::{observe_windows_cpu, observe_windows_thread_affinity};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::observe_linux_thread_affinity;
+pub use linux::{
+    duplicate_inherited_unix_datagram, mark_inherited_datagram_cloexec,
+    observe_linux_thread_affinity,
+};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod placement;

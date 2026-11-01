@@ -21,7 +21,22 @@ pub fn serve_driver(
     owners: Arc<OwnerRegistry>,
     settings: EngineSettings,
 ) -> Result<(), engine::EngineError> {
-    let process = EngineProcess::with_search_driver(Arc::clone(&driver), owners, clock);
+    serve_driver_with_go_observer(driver, clock, owners, settings, None)
+}
+
+/// The optional in-process observer does not authenticate or transport events.
+/// Its caller owns any separate bounded, authenticated external channel.
+pub fn serve_driver_with_go_observer(
+    driver: Arc<dyn SearchSessionDriver>,
+    clock: ProcessClock,
+    owners: Arc<OwnerRegistry>,
+    settings: EngineSettings,
+    observer: Option<engine::GoAdmissionObserver>,
+) -> Result<(), engine::EngineError> {
+    let mut process = EngineProcess::with_search_driver(Arc::clone(&driver), owners, clock);
+    if let Some(observer) = observer {
+        process = process.with_go_admission_observer(observer);
+    }
     let (sender, events) = engine::event_channel();
     let input = sender.clone();
     // Only stdin may block here. Search, stop and physical drain have independent

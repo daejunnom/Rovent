@@ -1,8 +1,11 @@
 //! Current-thread observations and the explicit bounded libc affinity boundary.
 use crate::placement::{ThreadAffinityAccess, ThreadAffinityMask, ThreadAffinitySnapshot};
 use crate::{LinuxThreadAffinity, PlatformCpuError};
+use nix::libc;
 use std::collections::BTreeSet;
 use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::net::UnixDatagram;
 
 const MAX_AFFINITY_CPUS: usize = 4096;
 const MASK_WORDS: usize = MAX_AFFINITY_CPUS / usize::BITS as usize;
@@ -10,6 +13,118 @@ const MASK_WORDS: usize = MAX_AFFINITY_CPUS / usize::BITS as usize;
 extern "C" {
     fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut usize) -> i32;
     fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const usize) -> i32;
+}
+
+/// Duplicate an explicitly supplied inherited FD without taking ownership of
+/// the original. The caller must still validate socket type and peer identity.
+/// The original remains owned by the process that inherited it; only the new
+/// close-on-exec descriptor is owned by the returned value.
+pub fn duplicate_inherited_unix_datagram(fd: i32) -> std::io::Result<UnixDatagram> {
+    if fd < 3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "inherited descriptor must not be standard I/O",
+        ));
+    }
+    // The kernel validates fd and duplicates it atomically with close-on-exec;
+    // it never transfers or closes the inherited original.
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3_i32) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Check the kernel socket type before creating a typed UnixDatagram.
+    let mut kind = 0_i32;
+    let mut domain = 0_i32;
+    let mut kind_len = std::mem::size_of::<i32>() as libc::socklen_t;
+    let mut domain_len = kind_len;
+    // SAFETY: both output pointers are valid writable i32 storage and lengths
+    // describe that storage; duplicated is a valid descriptor owned here.
+    let type_ok = unsafe {
+        libc::getsockopt(
+            duplicated,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut i32).cast(),
+            &mut kind_len,
+        )
+    } == 0;
+    let domain_ok = unsafe {
+        libc::getsockopt(
+            duplicated,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            (&mut domain as *mut i32).cast(),
+            &mut domain_len,
+        )
+    } == 0;
+    if !type_ok
+        || !domain_ok
+        || kind_len as usize != std::mem::size_of::<i32>()
+        || domain_len as usize != std::mem::size_of::<i32>()
+        || kind != libc::SOCK_DGRAM
+        || domain != libc::AF_UNIX
+    {
+        // SAFETY: duplicated is still our uniquely owned kernel descriptor.
+        unsafe {
+            libc::close(duplicated);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "inherited descriptor is not a Unix datagram socket",
+        ));
+    }
+    // SAFETY: successful F_DUPFD_CLOEXEC returned a new, open Unix datagram
+    // descriptor that has not been handed to another Rust owner.
+    Ok(unsafe { UnixDatagram::from_raw_fd(duplicated) })
+}
+
+/// Mark the explicitly child-exclusive inherited descriptor close-on-exec,
+/// after confirming it still names the same object as the verified duplicate.
+/// This changes descriptor flags only; it does not close the original or alter
+/// the shared file-status flags. The caller must own the inheritance contract
+/// and prevent concurrent close/reuse of `fd` for the duration of this call.
+pub fn mark_inherited_datagram_cloexec(
+    fd: i32,
+    verified_duplicate: &UnixDatagram,
+) -> std::io::Result<()> {
+    if fd < 3 || fd == verified_duplicate.as_raw_fd() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid original descriptor",
+        ));
+    }
+    let mut original = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let mut duplicate = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat receives valid writable stat storage; on failure neither
+    // value is read and descriptor ownership remains unchanged.
+    if unsafe { libc::fstat(fd, original.as_mut_ptr()) } != 0
+        || unsafe { libc::fstat(verified_duplicate.as_raw_fd(), duplicate.as_mut_ptr()) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: each fstat above returned success and initialized its value.
+    let original = unsafe { original.assume_init() };
+    let duplicate = unsafe { duplicate.assume_init() };
+    if (original.st_dev, original.st_ino, original.st_mode)
+        != (duplicate.st_dev, duplicate.st_ino, duplicate.st_mode)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "original descriptor changed",
+        ));
+    }
+    // F_GETFD/F_SETFD operate on per-descriptor flags, not F_GETFL/F_SETFL.
+    // SAFETY: both calls accept an integer descriptor and integer flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if flags & libc::FD_CLOEXEC == 0
+        && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn affinity_native_error(function: &'static str) -> PlatformCpuError {
@@ -165,6 +280,39 @@ pub fn observe_linux_thread_affinity() -> Result<LinuxThreadAffinity, PlatformCp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn inherited_datagram_duplication_never_closes_original() {
+        let (original, peer) = UnixDatagram::pair().unwrap();
+        let duplicate = duplicate_inherited_unix_datagram(original.as_raw_fd()).unwrap();
+        // Simulate the inheritable FD delivered by the parent and verify only
+        // per-descriptor flags change, never shared file-status flags.
+        let fd = original.as_raw_fd();
+        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(original_flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, original_flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        let status_before = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(status_before >= 0);
+        mark_inherited_datagram_cloexec(fd, &duplicate).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, status_before);
+        drop(duplicate);
+        original.send(b"owner").unwrap();
+        let mut received = [0_u8; 5];
+        assert_eq!(peer.recv(&mut received).unwrap(), received.len());
+        assert_eq!(&received, b"owner");
+        assert!(duplicate_inherited_unix_datagram(-1).is_err());
+        let regular = std::fs::File::open("/dev/null").unwrap();
+        assert!(duplicate_inherited_unix_datagram(regular.as_raw_fd()).is_err());
+    }
+
     #[test]
     fn current_thread_parser_preserves_large_cpu_ids_and_rejects_ambiguity() {
         assert_eq!(

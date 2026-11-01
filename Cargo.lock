@@ -500,6 +500,9 @@ dependencies = [
 [[package]]
 name = "rz-platform"
 version = "0.1.0"
+dependencies = [
+ "nix",
+]
 
 [[package]]
 name = "rz-position"
@@ -551,6 +554,7 @@ dependencies = [
  "rz-eval",
  "rz-experiments",
  "rz-native-loader",
+ "rz-platform",
  "rz-position",
  "rz-runtime",
  "rz-search",

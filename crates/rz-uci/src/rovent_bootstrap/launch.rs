@@ -63,6 +63,8 @@ mod collection_v2_observer;
 #[cfg(test)]
 mod collection_v2_tests;
 mod evidence;
+#[cfg(target_os = "linux")]
+mod go_observer;
 #[cfg(feature = "native-validation-diagnostics")]
 mod selected_view_observation;
 pub mod storage;
@@ -145,6 +147,10 @@ struct Arguments {
     lifecycle_diagnostics_v2: bool,
     initial_stop_source_diagnostics: bool,
     storage: Option<StorageArguments>,
+    /// Optional inherited datagram capability; malformed diagnostics never
+    /// change admission or the product result.
+    go_observer_fd: Option<i32>,
+    go_observer_fd_exclusive: bool,
 }
 
 /// V3 selects existing original lock artifacts without an auxiliary index file.
@@ -171,6 +177,14 @@ struct StorageArguments {
     archive_root: PathBuf,
     checkout_root: PathBuf,
     protected_root: PathBuf,
+}
+
+fn go_observer_warning(message: &str) {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "go admission observation warning: {message}"
+    );
 }
 
 impl Arguments {
@@ -204,12 +218,40 @@ impl Arguments {
         let mut archive_root = None;
         let mut storage_checkout_root = None;
         let mut storage_protected_root = None;
+        let mut go_observer_fd = None;
+        let mut go_observer_fd_seen = false;
+        let mut go_observer_ownership_seen = false;
+        let mut go_observer_fd_exclusive = false;
         for argument in arguments {
             let (name, value) = argument
                 .split_once('=')
                 .ok_or_else(|| error("Arguments", "every option requires its explicit =value"))?;
             match name {
                 "--input-lock" if input_lock.is_none() => input_lock = Some(private_path(value)?),
+                "--go-observer-fd" => {
+                    if go_observer_fd_seen {
+                        go_observer_fd = None;
+                        go_observer_warning("repeated descriptor; disabled");
+                    } else {
+                        go_observer_fd_seen = true;
+                        go_observer_fd = value.parse::<i32>().ok().filter(|fd| *fd >= 3);
+                        if go_observer_fd.is_none() {
+                            go_observer_warning("invalid descriptor; disabled");
+                        }
+                    }
+                }
+                "--go-observer-fd-ownership" => {
+                    if go_observer_ownership_seen {
+                        go_observer_fd_exclusive = false;
+                        go_observer_warning("repeated ownership declaration; disabled");
+                    } else {
+                        go_observer_ownership_seen = true;
+                        go_observer_fd_exclusive = value == "exclusive-child";
+                        if !go_observer_fd_exclusive {
+                            go_observer_warning("unknown ownership declaration; disabled");
+                        }
+                    }
+                }
                 "--native-assets" if native_assets.is_none() => {
                     native_assets = Some(private_path(value)?)
                 }
@@ -457,6 +499,8 @@ impl Arguments {
             lifecycle_diagnostics_v2,
             initial_stop_source_diagnostics: initial_stop_source_diagnostics.unwrap_or(false),
             storage,
+            go_observer_fd,
+            go_observer_fd_exclusive,
         })
     }
 

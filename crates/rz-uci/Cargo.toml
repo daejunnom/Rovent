@@ -71,7 +71,7 @@ onnx-cpu = [
 ]
 search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-fs-ext", "dep:nix"]
 onnx-cuda = ["onnx-cpu"]
-pals-adaptive = ["dep:rz-experiments", "rz-experiments/pals-content-admission", "search-work-receipts"]
+pals-adaptive = ["dep:rz-experiments", "dep:rz-platform", "rz-experiments/pals-content-admission", "search-work-receipts"]
 pals-adaptive-diagnostics = ["pals-adaptive", "onnx-cpu"]
 native-validation-diagnostics = ["pals-adaptive-diagnostics", "rz-eval/native-validation-diagnostics", "rz-search/nnuec-scalar-diagnostics"]
 # Optional bounded archive-to-submitted-view diagnostics; not a receipt.
@@ -95,6 +95,7 @@ cap-fs-ext = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 # Safe Linux proc/cgroup filesystem checks and nonblocking observer opens.
 nix = { workspace = true, optional = true }
+rz-platform = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Keep retained-handle Win32 calls in the existing native FFI owner.

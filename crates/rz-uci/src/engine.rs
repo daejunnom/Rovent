@@ -36,6 +36,101 @@ fn failure(code: contract::ErrorCode, detail: &'static str) -> contract::Contrac
     contract::ContractError::new(code, contract::Stage::Admission, detail)
 }
 
+/// An actual driver pre-ticket rejection, separate from search or GPU results.
+/// The sequence counts parsed `go` commands after the observer is attached.
+/// This is an instantaneous owner observation, not a physical-completion proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriorSearchObservation {
+    NoOwnerSearchOrDrainObserved,
+    SearchDrainOrFailurePending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GoAdmissionRejection {
+    pub go_sequence: u64,
+    pub epoch: contract::ProcessEpoch,
+    pub game: contract::GameGeneration,
+    pub root: contract::RootGeneration,
+    pub prior_search: PriorSearchObservation,
+    pub stage: contract::Stage,
+    pub code: contract::ErrorCode,
+}
+
+/// Optional bounded observation only: a full or closed receiver never changes
+/// command handling. A supervisor must bind events to its own process/lock and
+/// authenticate any external transport; this queue grants no stop authority.
+#[derive(Clone)]
+pub struct GoAdmissionObserver {
+    sink: Arc<dyn GoAdmissionSink>,
+    missed: Arc<AtomicU64>,
+}
+
+/// Implementations must return promptly without blocking the UCI owner.
+/// False records observation failure and never changes the go result.
+pub(crate) trait GoAdmissionSink: Send + Sync {
+    fn try_publish(&self, event: GoAdmissionRejection) -> bool;
+}
+
+struct GoAdmissionChannel(SyncSender<GoAdmissionRejection>);
+impl GoAdmissionSink for GoAdmissionChannel {
+    fn try_publish(&self, event: GoAdmissionRejection) -> bool {
+        self.0.try_send(event).is_ok()
+    }
+}
+
+impl GoAdmissionObserver {
+    pub fn channel() -> (Self, Receiver<GoAdmissionRejection>) {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        (
+            Self::from_sink(Arc::new(GoAdmissionChannel(sender))),
+            receiver,
+        )
+    }
+    pub(crate) fn from_sink(sink: Arc<dyn GoAdmissionSink>) -> Self {
+        Self {
+            sink,
+            missed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    pub fn missed(&self) -> u64 {
+        self.missed.load(Ordering::Relaxed)
+    }
+    fn record_missed(&self) {
+        let _ = self
+            .missed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            });
+    }
+    fn rejected(
+        &self,
+        go_sequence: u64,
+        scope: crate::contracts::SessionScope,
+        epoch: contract::ProcessEpoch,
+        prior_search: PriorSearchObservation,
+        error: contract::ContractError,
+    ) {
+        let event = GoAdmissionRejection {
+            go_sequence,
+            epoch,
+            game: scope.game(),
+            root: scope.root(),
+            prior_search,
+            stage: error.stage,
+            code: error.code,
+        };
+        // Observer code is auxiliary; an unwind must not reject or cancel the
+        // already-existing search. Process abort/OOM is not catchable here.
+        if !std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.sink.try_publish(event)
+        }))
+        .unwrap_or(false)
+        {
+            self.record_missed();
+        }
+    }
+}
+
 /// All position forks obtain a checked fresh owner. Clone shares immutable state.
 #[derive(Debug, Default)]
 pub struct OwnerRegistry(AtomicU64);
@@ -402,6 +497,7 @@ pub struct EngineProcess {
     owners: Arc<OwnerRegistry>,
     clock: ProcessClock,
     identity: EngineIdentity,
+    go_admission_observer: Option<GoAdmissionObserver>,
 }
 impl EngineProcess {
     /// CPU/PALS evidence is distinct from the legacy evaluator's native
@@ -429,6 +525,7 @@ impl EngineProcess {
                 name: "RoveZero CPU mock integration".into(),
                 author: "RoveZero contributors".into(),
             },
+            go_admission_observer: None,
         }
     }
     /// Search-only startup. No neural descriptor or evaluator is constructed.
@@ -444,11 +541,19 @@ impl EngineProcess {
             owners,
             clock,
             identity,
+            go_admission_observer: None,
         }
     }
     /// Session validates the declared identity before starting protocol service.
     pub fn with_identity(mut self, identity: EngineIdentity) -> Self {
         self.identity = identity;
+        self
+    }
+
+    /// Attach an optional, nonblocking in-process observer. This does not
+    /// authorize an external peer or change ordinary UCI behavior.
+    pub fn with_go_admission_observer(mut self, observer: GoAdmissionObserver) -> Self {
+        self.go_admission_observer = Some(observer);
         self
     }
 }
@@ -741,6 +846,8 @@ struct Owner {
     pending_close: Option<Event>,
     fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
+    go_admission_observer: Option<GoAdmissionObserver>,
+    go_sequence: u64,
 }
 struct PendingBestMove {
     scope: crate::contracts::SessionScope,
@@ -848,9 +955,54 @@ impl Owner {
             Ok(Command::Go(limits)) => Some(Arc::new(limits.clone())),
             _ => None,
         };
+        let go_sequence = if original_go.is_some() && self.go_admission_observer.is_some() {
+            match self.go_sequence.checked_add(1) {
+                Some(sequence) => {
+                    self.go_sequence = sequence;
+                    Some(sequence)
+                }
+                None => {
+                    if let Some(observer) = &self.go_admission_observer {
+                        observer.record_missed();
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let (Some(driver), Some(original_go)) = (&self.driver, &original_go) {
             if let Err(error) = driver.validate_go(session.snapshot().rules_position(), original_go)
             {
+                if let (Some(observer), Some(sequence)) = (&self.go_admission_observer, go_sequence)
+                {
+                    // Report the owner's existing state at rejection; a rejected
+                    // go does not cancel an earlier accepted search. Empty worker
+                    // bookkeeping is not evidence of a GPU/device-wide fence.
+                    let prior_search = if session.active_ticket().is_none()
+                        && self.active.is_none()
+                        && self.workers.is_empty()
+                        && self.pending_failures.is_empty()
+                        && self.pending_bestmove.is_none()
+                        && self.ponder.is_none()
+                        && self.held_ponder_bestmove.is_none()
+                        && self.admitted_ponder_report.is_none()
+                        && self.pending_original_go.is_none()
+                        && self.pending_close.is_none()
+                        && self.fence_failure.is_none()
+                    {
+                        PriorSearchObservation::NoOwnerSearchOrDrainObserved
+                    } else {
+                        PriorSearchObservation::SearchDrainOrFailurePending
+                    };
+                    observer.rejected(
+                        sequence,
+                        self.session_owner.lifecycle_scope(),
+                        self.clock.epoch(),
+                        prior_search,
+                        error,
+                    );
+                }
                 let mut rejected = SessionResult {
                     accepted: false,
                     ..SessionResult::default()
@@ -2690,6 +2842,7 @@ pub fn serve<O: Write, D: Write>(
         owners,
         clock,
         identity,
+        go_admission_observer,
     } = process;
     if settings.max_workers == 0
         || settings.shutdown_limit.is_zero()
@@ -2757,6 +2910,8 @@ pub fn serve<O: Write, D: Write>(
         pending_close: None,
         fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
+        go_admission_observer,
+        go_sequence: 0,
     }));
     let mut session = Session::new(
         RulesUciPort::new(owners, settings.position),
@@ -3526,6 +3681,8 @@ mod tests {
             pending_close: None,
             fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
+            go_admission_observer: None,
+            go_sequence: 0,
         };
         let session = Session::new(
             RulesUciPort::new(owners, settings.position),
@@ -3606,6 +3763,8 @@ mod tests {
         let scope = owner.session_owner.lifecycle_scope();
         let control = owner.session_owner.control().unwrap().clone();
         owner.driver = Some(Arc::new(RejectGo));
+        let (observer, events) = GoAdmissionObserver::channel();
+        owner.go_admission_observer = Some(observer.clone());
         let rejected = owner.handle(&mut session, Event::Line("go nodes 7".into()));
         assert!(!rejected.accepted);
         assert!(rejected.effects.is_empty() && rejected.protocol.is_empty());
@@ -3616,9 +3775,84 @@ mod tests {
                 .any(|d| d.code == "DriverGoRejected"
                     && d.message.contains("exact workload differs"))
         );
-        assert_eq!(session.active_ticket(), Some(ticket));
+        assert_eq!(session.active_ticket(), Some(ticket.clone()));
         assert_eq!(owner.session_owner.lifecycle_scope(), scope);
         assert!(!control.cancellation.load(Ordering::Acquire));
+        assert_eq!(
+            events.try_recv().unwrap(),
+            GoAdmissionRejection {
+                go_sequence: 1,
+                epoch: owner.clock.epoch(),
+                game: scope.game(),
+                root: scope.root(),
+                prior_search: PriorSearchObservation::SearchDrainOrFailurePending,
+                stage: contract::Stage::Admission,
+                code: contract::ErrorCode::InvalidInput,
+            }
+        );
+        assert_eq!(observer.missed(), 0);
+        let another = owner.handle(&mut session, Event::Line("go nodes 8".into()));
+        assert!(!another.accepted);
+        assert_eq!(events.try_recv().unwrap().go_sequence, 2);
+        // A closed observer cannot alter command acceptance or the old search.
+        drop(events);
+        let rejected_again = owner.handle(&mut session, Event::Line("go nodes 7".into()));
+        assert!(!rejected_again.accepted);
+        assert_eq!(observer.missed(), 1);
+        assert_eq!(session.active_ticket(), Some(ticket));
+        assert!(!control.cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn go_admission_observer_is_bounded_and_nonblocking_when_full() {
+        let (observer, events) = GoAdmissionObserver::channel();
+        let rejection = contract::ContractError::new(
+            contract::ErrorCode::InvalidInput,
+            contract::Stage::Admission,
+            "test failure",
+        );
+        let (owner, _) = fixture();
+        for sequence in 1..=16 {
+            observer.rejected(
+                sequence,
+                owner.session_owner.lifecycle_scope(),
+                owner.clock.epoch(),
+                PriorSearchObservation::NoOwnerSearchOrDrainObserved,
+                rejection,
+            );
+        }
+        assert!(observer.missed() > 0);
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(!received.is_empty());
+        assert!(
+            received
+                .windows(2)
+                .all(|pair| pair[0].go_sequence < pair[1].go_sequence)
+        );
+    }
+
+    #[test]
+    fn observer_unwind_is_counted_without_escaping() {
+        struct PanickingSink;
+        impl GoAdmissionSink for PanickingSink {
+            fn try_publish(&self, _: GoAdmissionRejection) -> bool {
+                panic!("observer failure")
+            }
+        }
+        let observer = GoAdmissionObserver::from_sink(Arc::new(PanickingSink));
+        let (owner, _) = fixture();
+        observer.rejected(
+            1,
+            owner.session_owner.lifecycle_scope(),
+            owner.clock.epoch(),
+            PriorSearchObservation::NoOwnerSearchOrDrainObserved,
+            contract::ContractError::new(
+                contract::ErrorCode::InvalidInput,
+                contract::Stage::Admission,
+                "test rejection",
+            ),
+        );
+        assert_eq!(observer.missed(), 1);
     }
 
     fn assert_canceled_result_ignored(out: &SessionResult<RulesSearchPosition>) {
