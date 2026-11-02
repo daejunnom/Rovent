@@ -17,7 +17,7 @@ mod manifest;
 pub mod native_validation_diagnostics;
 mod owned_sources;
 pub use legacy_manifest::{
-    validate_pals_legacy_export_manifest, LegacyPalsExportManifestSummary, LegacyPalsGraphPin,
+    LegacyPalsExportManifestSummary, LegacyPalsGraphPin, validate_pals_legacy_export_manifest,
 };
 pub use owned_sources::{VirtualReviewOwnedSources, VirtualReviewProfileDirectory};
 mod tickets;
@@ -1124,7 +1124,7 @@ impl PalsVirtualReviewOnnxBackend {
             audit,
             mode,
             warm,
-            &mut || {},
+            &mut || Ok(()),
         )?;
         custody.backend.take().ok_or_else(|| {
             fail(
@@ -1149,6 +1149,34 @@ impl PalsVirtualReviewOnnxBackend {
         kind: VirtualReviewArtifactKind,
         policy: Option<PalsCudaControlPolicy>,
         before_native: &mut impl FnMut(),
+    ) -> Result<(), BackendError> {
+        Self::load_owned_sources_with_profile_into_checked(
+            custody,
+            expected_sha256,
+            config,
+            mode,
+            kind,
+            policy,
+            &mut || {
+                before_native();
+                Ok(())
+            },
+        )
+    }
+
+    /// As above, but the original owner may reject each individual Session
+    /// constructor at its final pre-native boundary. A rejection returns its
+    /// exact error, preserves the serialized bytes and all earlier sessions in
+    /// `custody`, and does not prove physical completion of earlier work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_owned_sources_with_profile_into_checked(
+        custody: &mut VirtualReviewStartupCustody,
+        expected_sha256: &str,
+        config: PalsOnnxConfig,
+        mode: VirtualReviewExecutionMode,
+        kind: VirtualReviewArtifactKind,
+        policy: Option<PalsCudaControlPolicy>,
+        before_native: &mut impl FnMut() -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
         if kind == VirtualReviewArtifactKind::ApproxWarm
             && mode != VirtualReviewExecutionMode::Deployment
@@ -1201,7 +1229,7 @@ impl PalsVirtualReviewOnnxBackend {
         audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
         mode: VirtualReviewExecutionMode,
         warm: bool,
-        before_native: &mut impl FnMut(),
+        before_native: &mut impl FnMut() -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
         if custody.backend.is_some()
             || custody.sessions.len() != 0
@@ -2868,8 +2896,8 @@ mod tests {
     }
     use crate::pals_model::PalsCandidateToken;
     use model::{
-        ReviewAnchorInput, ReviewQueryInput, ReviewQueryPurpose, ReviewRecordInput,
-        ReviewRecordKind, INPUT_SCHEMA,
+        INPUT_SCHEMA, ReviewAnchorInput, ReviewQueryInput, ReviewQueryPurpose, ReviewRecordInput,
+        ReviewRecordKind,
     };
     #[test]
     fn synchronous_tracker_requires_only_entered_runs_to_complete() {
@@ -3075,13 +3103,15 @@ mod tests {
         assert_eq!(actual.validator_nn_runs_attempted(), 1);
         assert_eq!(actual.validator_nn_runs_failed_known(), 1);
         assert_eq!(actual.validator_nn_runs_completed(), 0);
-        assert!(VirtualReviewTicketOwnerAccounting::between(
-            &before,
-            &failed,
-            PalsRole::Validator,
-            false,
-        )
-        .is_none());
+        assert!(
+            VirtualReviewTicketOwnerAccounting::between(
+                &before,
+                &failed,
+                PalsRole::Validator,
+                false,
+            )
+            .is_none()
+        );
     }
     #[test]
     fn ticket_accounting_public_only_failure_never_counts_a_validator_role_call() {
@@ -3106,13 +3136,15 @@ mod tests {
         assert_eq!(actual.validator_nn_runs_attempted(), 0);
         assert_eq!(actual.validator_nn_runs_completed(), 0);
         assert_eq!(actual.validator_nn_runs_failed_known(), 0);
-        assert!(VirtualReviewTicketOwnerAccounting::between(
-            &before,
-            &failed,
-            PalsRole::Validator,
-            false,
-        )
-        .is_none());
+        assert!(
+            VirtualReviewTicketOwnerAccounting::between(
+                &before,
+                &failed,
+                PalsRole::Validator,
+                false,
+            )
+            .is_none()
+        );
     }
     #[test]
     fn ticket_accounting_rejects_decreasing_saturated_inconsistent_and_mixed_counters() {
@@ -3120,40 +3152,48 @@ mod tests {
         let mut changed = before.clone();
         changed.admitted_role_requests = 1;
         changed.role_nn_runs_completed = 1;
-        assert!(VirtualReviewTicketOwnerAccounting::between(
-            &before,
-            &changed,
-            PalsRole::Validator,
-            true,
-        )
-        .is_none());
+        assert!(
+            VirtualReviewTicketOwnerAccounting::between(
+                &before,
+                &changed,
+                PalsRole::Validator,
+                true,
+            )
+            .is_none()
+        );
         changed = before.clone();
         changed.admitted_role_requests = u64::MAX;
-        assert!(VirtualReviewTicketOwnerAccounting::between(
-            &before,
-            &changed,
-            PalsRole::Validator,
-            true,
-        )
-        .is_none());
+        assert!(
+            VirtualReviewTicketOwnerAccounting::between(
+                &before,
+                &changed,
+                PalsRole::Validator,
+                true,
+            )
+            .is_none()
+        );
         changed = before.clone();
         changed.admitted_role_requests = 1;
-        assert!(VirtualReviewTicketOwnerAccounting::between(
-            &changed,
-            &before,
-            PalsRole::Validator,
-            true,
-        )
-        .is_none());
+        assert!(
+            VirtualReviewTicketOwnerAccounting::between(
+                &changed,
+                &before,
+                PalsRole::Validator,
+                true,
+            )
+            .is_none()
+        );
         changed.admitted_role_requests = 2;
         changed.public_cache_hits = 2;
-        assert!(VirtualReviewTicketOwnerAccounting::between(
-            &before,
-            &changed,
-            PalsRole::Validator,
-            true,
-        )
-        .is_none());
+        assert!(
+            VirtualReviewTicketOwnerAccounting::between(
+                &before,
+                &changed,
+                PalsRole::Validator,
+                true,
+            )
+            .is_none()
+        );
     }
     fn input() -> PalsVirtualReviewInput {
         let movement = PalsCandidateToken {

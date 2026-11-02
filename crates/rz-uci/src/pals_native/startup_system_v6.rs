@@ -468,22 +468,32 @@ impl PalsSystemFactoryCustodyV6 {
         } else {
             VirtualReviewArtifactKind::Fresh
         };
-        let manifest_sha = &owner
-            .sources
-            .owner
+        let source_owner = Arc::clone(&owner.sources.owner);
+        let manifest_sha = source_owner
             .asset(Purpose::ExportManifest)
             .map_err(transport)?
             .declaration()
             .artifact
-            .sha256;
-        PalsVirtualReviewOnnxBackend::load_owned_sources_with_profile_into(
+            .sha256
+            .clone();
+        PalsVirtualReviewOnnxBackend::load_owned_sources_with_profile_into_checked(
             &mut owner.review,
-            manifest_sha,
+            &manifest_sha,
             configuration,
             mode,
             kind,
             None,
-            &mut || entry.mark_native_entered(),
+            &mut || {
+                source_owner.source_window().map_err(transport_source)?;
+                parent.ensure_live().map_err(|_| {
+                    fail(
+                        FailureKind::BackendUnavailable,
+                        "PALS original system supervisor is no longer live",
+                    )
+                })?;
+                entry.mark_native_entered();
+                Ok(())
+            },
         )?;
         owner
             .sources
@@ -631,6 +641,7 @@ impl crate::pals_native::ticketed::FactoryStartupRecovery for PalsSystemFactoryC
         crate::pals_native::ticketed::TicketNativeRecoveryProbe,
         rz_search::pals::coordinator::RoleFailure,
     > {
+        use crate::pals_native::ticketed::TicketNativeBackend;
         match self.ticket.as_mut() {
             Some(ticket) => ticket.reobserve_quarantined(until),
             None => Ok(crate::pals_native::ticketed::TicketNativeRecoveryProbe::Unknown),
@@ -645,6 +656,7 @@ impl crate::pals_native::ticketed::FactoryStartupRecovery for PalsSystemFactoryC
         crate::pals_native::ticketed::TicketNativeRelease,
         rz_search::pals::coordinator::RoleFailure,
     > {
+        use crate::pals_native::ticketed::TicketNativeBackend;
         match self.ticket.as_mut() {
             Some(ticket) => ticket.release_quarantined(proof, until),
             None => Ok(crate::pals_native::ticketed::TicketNativeRelease::Unknown),

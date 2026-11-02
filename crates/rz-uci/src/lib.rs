@@ -34,6 +34,8 @@ pub mod pals_checker_profile;
 #[cfg(feature = "search-work-receipts")]
 pub mod pals_cpu_task;
 pub mod pals_native;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+pub mod pals_system_proxy;
 pub mod parser;
 #[cfg(feature = "search-work-receipts")]
 pub mod process_receipts;

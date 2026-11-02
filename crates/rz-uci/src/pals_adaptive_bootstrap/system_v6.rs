@@ -2,10 +2,91 @@
 use super::*;
 use crate::pals_adaptive_startup::{PalsSystemStartupOptionsV6, PinnedPalsSystemStartupV6};
 
+/// The receipt directory is derived from the exact held startup root, never
+/// from a caller-provided pathname or a different supervisor's writer.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+struct PalsSystemReceiptOwnerV6 {
+    owner: Arc<PinnedPalsSystemStartupV6>,
+    parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    writer: crate::rovent_bootstrap::launch::SystemReceiptWriter,
+}
+
+/// The supervisor receives this same capability from the factory; absent or
+/// disconnected delivery remains unknown and does not attest GPU completion.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+struct PalsSystemReceiptPublicationV6 {
+    owner: Option<PalsSystemReceiptOwnerV6>,
+    startup_write: Result<(), String>,
+}
+
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+struct PalsSystemNativeStartV6 {
+    service: ActualService,
+    receipt_publication: mpsc::Receiver<PalsSystemReceiptPublicationV6>,
+}
+
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+impl PalsSystemReceiptOwnerV6 {
+    fn open(
+        owner: Arc<PinnedPalsSystemStartupV6>,
+        parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    ) -> Result<Self, String> {
+        use rz_experiments::NativeRuntimeSourceV6;
+        owner
+            .verify_unchanged()
+            .map_err(|error| error.to_string())?;
+        let lock = owner.lock();
+        let NativeRuntimeSourceV6::SystemCuda(runtime) = &lock.config.system_runtime_lock.runtime
+        else {
+            return Err("PALS system receipt requires CUDA".into());
+        };
+        if !parent.matches(
+            lock.config.process_generation,
+            &lock.canonical_sha256,
+            runtime.cuda_device_id,
+        ) {
+            return Err("PALS receipt supervisor differs from original owner".into());
+        }
+        parent.ensure_live().map_err(|error| error.to_string())?;
+        let directory = owner
+            .runtime_directory_capability()
+            .map_err(|error| error.to_string())?;
+        let writer = crate::rovent_bootstrap::launch::SystemReceiptWriter::open(
+            &directory,
+            std::path::Path::new(""),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            owner,
+            parent,
+            writer,
+        })
+    }
+
+    fn write_startup(
+        &self,
+        owner: &Arc<PinnedPalsSystemStartupV6>,
+        parent: &Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+        receipt: &rz_experiments::SystemRuntimeReceiptV6,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.owner, owner) || !Arc::ptr_eq(&self.parent, parent) {
+            return Err("PALS receipt owner or supervisor changed".into());
+        }
+        self.parent
+            .ensure_live()
+            .map_err(|error| error.to_string())?;
+        self.writer.write(
+            "system-runtime-startup.v6.json",
+            receipt,
+            &self.owner.lock().config.system_runtime_lock,
+        )
+    }
+}
+
 /// Construct the native worker with the original system CUDA factory custody.
 /// This is an internal handoff for a future V6 supervisor, not an executable
-/// launch path: the caller still must derive the limits from its own sealed
-/// resource plan, retain this service and parent on failure, consume the V6
+/// launch path: the caller still must verify and retain its OS resource owner,
+/// retain this service and parent on failure, consume the V6
 /// startup/termination records, and resolve physical completion before exit.
 /// Neither `run_cli` nor the V6 arena enables this path yet.
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
@@ -15,12 +96,8 @@ fn spawn_system_native_v6(
     parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
     clock: rz_runtime::contracts::ContractSystemClock,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
-    receipt_writer: Option<Arc<crate::rovent_bootstrap::launch::SystemReceiptWriter>>,
-    limits: TicketServiceLimits,
-    pending_capacity: usize,
-    command_capacity: usize,
 ) -> Result<
-    ActualService,
+    PalsSystemNativeStartV6,
     crate::pals_native::ticketed::FactoryStartupSpawnRejection<
         crate::pals_native::startup_system_v6::PalsSystemFactoryCustodyV6,
     >,
@@ -28,9 +105,20 @@ fn spawn_system_native_v6(
     use crate::pals_native::startup_system_v6::PalsSystemFactoryCustodyV6;
     use rz_search::pals::coordinator::RoleFailure;
 
-    let runtime_lock = owner.lock().config.system_runtime_lock.clone();
+    // The validated V6 lock carries the same V5 bounded queue declarations.
+    // Host byte caps match the existing PALS ticket service profile. They are
+    // resource limits, not measurements or proof of actual OS quota settings.
+    let endpoint = &owner.lock().config.endpoint;
+    let limits = TicketServiceLimits {
+        review_token_budget: endpoint.context.token_budget as u16,
+        ..TicketServiceLimits::default()
+    };
+    let pending_capacity = endpoint.coordinator.slices.role_tickets_max as usize;
+    let command_capacity = endpoint.coordinator.slices.worker_commands_max as usize;
+    let receipt_owner = Arc::clone(&owner);
     let custody = PalsSystemFactoryCustodyV6::new(owner, observer, Arc::clone(&parent));
-    TicketedNativeService::spawn_with_startup_custody(
+    let (receipt_sender, receipt_publication) = mpsc::sync_channel(1);
+    let service = TicketedNativeService::spawn_with_startup_custody(
         custody,
         move |factory| {
             PalsSystemFactoryCustodyV6::initialize_runtime(factory, &parent)
@@ -38,18 +126,32 @@ fn spawn_system_native_v6(
             PalsSystemFactoryCustodyV6::initialize_sessions(factory, &parent)
                 .map_err(|error| RoleFailure::Backend(error.to_string()))?;
             PalsSystemFactoryCustodyV6::prepare_ticket(factory, clock)?;
-            if let Some(writer) = receipt_writer.as_ref() {
-                let report = factory.parts().0.startup_runtime_report();
-                let result = report
-                    .map_err(|error| error.to_string())
-                    .and_then(|report| {
-                        writer.write("system-runtime-startup.v6.json", &report, &runtime_lock)
-                    });
-                if let Err(error) = result {
-                    // Evidence publication is separate from the original
-                    // worker's physical lifetime and functional outcome.
-                    eprintln!("PALS system startup receipt warning: {error}");
+            let publication = match PalsSystemReceiptOwnerV6::open(
+                Arc::clone(&receipt_owner),
+                Arc::clone(&parent),
+            ) {
+                Ok(writer) => {
+                    let startup_write = factory
+                        .parts()
+                        .0
+                        .startup_runtime_report()
+                        .map_err(|error| error.to_string())
+                        .and_then(|report| writer.write_startup(&receipt_owner, &parent, &report));
+                    PalsSystemReceiptPublicationV6 {
+                        owner: Some(writer),
+                        startup_write,
+                    }
                 }
+                Err(error) => PalsSystemReceiptPublicationV6 {
+                    owner: None,
+                    startup_write: Err(error),
+                },
+            };
+            // Never block a native owner on a diagnostic consumer. The
+            // caller must retain this channel and distinguish Empty and
+            // Disconnected from a successfully published startup record.
+            if receipt_sender.try_send(publication).is_err() {
+                eprintln!("PALS system receipt publication unavailable");
             }
             factory
                 .parts()
@@ -62,7 +164,11 @@ fn spawn_system_native_v6(
         limits,
         pending_capacity,
         command_capacity,
-    )
+    )?;
+    Ok(PalsSystemNativeStartV6 {
+        service,
+        receipt_publication,
+    })
 }
 
 /// This executes before any lock, source asset, runtime or model is opened.

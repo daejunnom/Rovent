@@ -30,10 +30,14 @@ pub struct PalsSystemStartupOptionsV6 {
     pub lock_sha256: String,
     pub startup_ms: u64,
     pub preflight: bool,
+    /// A future direct-parent control route, never read or connected during
+    /// metadata preflight. This path alone authenticates no process.
+    pub parent_socket: Option<PathBuf>,
 }
 impl PalsSystemStartupOptionsV6 {
     pub fn parse(arguments: &[String]) -> Result<Self, ManifestError> {
         let (mut lock, mut sha, mut startup, mut preflight) = (None, None, None, false);
+        let mut parent_socket = None;
         for argument in arguments {
             if let Some(value) = argument.strip_prefix("--pals-system-startup-lock=") {
                 if lock.replace(absolute_control_path(value)?).is_some() {
@@ -51,17 +55,30 @@ impl PalsSystemStartupOptionsV6 {
                 if !(1..=86_400_000).contains(&value) || startup.replace(value).is_some() {
                     return Err(invalid("invalid system startup window"));
                 }
+            } else if let Some(value) = argument.strip_prefix("--pals-system-parent-socket=") {
+                if parent_socket
+                    .replace(absolute_control_path(value)?)
+                    .is_some()
+                {
+                    return Err(invalid("duplicate system parent socket"));
+                }
             } else if argument == "--preflight=true" && !preflight {
                 preflight = true;
             } else {
                 return Err(invalid("unsupported or duplicate system startup argument"));
             }
         }
+        if preflight && parent_socket.is_some() {
+            return Err(invalid(
+                "metadata preflight cannot accept a system parent socket",
+            ));
+        }
         Ok(Self {
             lock_path: lock.ok_or_else(|| invalid("system lock required"))?,
             lock_sha256: sha.ok_or_else(|| invalid("system lock digest required"))?,
             startup_ms: startup.ok_or_else(|| invalid("system startup window required"))?,
             preflight,
+            parent_socket,
         })
     }
 }
@@ -510,7 +527,7 @@ impl PinnedPalsSystemStartupV6 {
     }
 
     #[cfg(target_os = "linux")]
-    fn source_window(&self) -> Result<(), PalsSystemSourceReadFailureV6> {
+    pub(crate) fn source_window(&self) -> Result<(), PalsSystemSourceReadFailureV6> {
         check_source_window(self.original_until, &self.original_cancelled)
     }
 
@@ -766,6 +783,24 @@ mod tests {
         let mut legacy = args.clone();
         legacy.push("--startup-config=inputs/legacy.json".to_owned());
         assert!(PalsSystemStartupOptionsV6::parse(&legacy).is_err());
+
+        let parent = format!(
+            "--pals-system-parent-socket={}",
+            root.join("owner.sock").display()
+        );
+        let mut preflight_with_parent = args.clone();
+        preflight_with_parent.push(parent.clone());
+        assert!(PalsSystemStartupOptionsV6::parse(&preflight_with_parent).is_err());
+        let mut actual = args[..3].to_vec();
+        actual.push(parent.clone());
+        assert!(
+            PalsSystemStartupOptionsV6::parse(&actual)
+                .unwrap()
+                .parent_socket
+                .is_some()
+        );
+        actual.push(parent);
+        assert!(PalsSystemStartupOptionsV6::parse(&actual).is_err());
     }
 
     #[test]
