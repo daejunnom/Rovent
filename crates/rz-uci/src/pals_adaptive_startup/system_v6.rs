@@ -361,6 +361,114 @@ impl PinnedPalsSystemStartupV6 {
         &self.mapped_executable
     }
 
+    /// Connect to the direct parent's socket using only this startup owner's
+    /// original lock, deadline and cancellation. The caller must capture the
+    /// original PPID at process startup, before opening any native runtime.
+    /// A live authenticated connection is not GPU completion evidence.
+    #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+    #[allow(dead_code)]
+    pub(crate) fn authenticate_direct_parent(
+        &self,
+        socket_path: &Path,
+        original_parent_pid: i32,
+    ) -> std::io::Result<Arc<crate::rovent_bootstrap::launch::ConnectedParent>> {
+        use nix::errno::Errno;
+        use nix::poll::{PollFd, PollFlags, poll};
+        use nix::sys::socket::{
+            AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket, sockopt,
+        };
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::{
+            fs::{FileTypeExt, MetadataExt},
+            net::UnixStream,
+        };
+
+        let invalid = |detail| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
+        if original_parent_pid <= 0 || socket_path.parent() != Some(self.private_cwd()) {
+            return Err(invalid(
+                "PALS direct parent socket differs from private root",
+            ));
+        }
+        self.verify_source_unchanged()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let metadata = std::fs::symlink_metadata(socket_path)?;
+        if !metadata.file_type().is_socket() || metadata.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(invalid("PALS direct parent socket owner differs"));
+        }
+        let address = UnixAddr::new(socket_path).map_err(std::io::Error::other)?;
+        let descriptor = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(std::io::Error::other)?;
+        loop {
+            self.source_window()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if nix::unistd::getppid().as_raw() != original_parent_pid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "PALS original parent changed",
+                ));
+            }
+            match connect(descriptor.as_raw_fd(), &address) {
+                Ok(()) | Err(Errno::EISCONN) => break,
+                Err(Errno::EINPROGRESS) | Err(Errno::EALREADY) => {
+                    let mut poll_fd = [PollFd::new(descriptor.as_fd(), PollFlags::POLLOUT)];
+                    let wait_ms = self
+                        .original_until
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(50) as u16;
+                    match poll(&mut poll_fd, wait_ms) {
+                        Ok(0) | Err(Errno::EINTR) => continue,
+                        Err(error) => return Err(std::io::Error::other(error)),
+                        Ok(_) => {
+                            self.source_window()
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                            let socket_error = getsockopt(&descriptor, sockopt::SocketError)
+                                .map_err(std::io::Error::other)?;
+                            if socket_error != 0 {
+                                return Err(std::io::Error::from_raw_os_error(socket_error));
+                            }
+                            break;
+                        }
+                    }
+                }
+                Err(Errno::EAGAIN) | Err(Errno::EINTR) => {
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(5).min(
+                            self.original_until
+                                .saturating_duration_since(Instant::now()),
+                        ),
+                    );
+                }
+                Err(error) => return Err(std::io::Error::other(error)),
+            }
+        }
+        self.source_window()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let rz_experiments::NativeRuntimeSourceV6::SystemCuda(runtime) =
+            &self.lock.config.system_runtime_lock.runtime
+        else {
+            return Err(invalid("PALS direct parent requires system CUDA"));
+        };
+        let stream = UnixStream::from(descriptor);
+        let parent = crate::rovent_bootstrap::launch::ConnectedParent::authenticate(
+            stream,
+            std::process::id(),
+            original_parent_pid,
+            self.lock.config.process_generation,
+            &self.lock.canonical_sha256,
+            runtime.cuda_device_id,
+            self.original_until,
+        )?;
+        self.source_window()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Arc::new(parent))
+    }
+
     /// Start capturing the system runtime against this exact V6 owner and its
     /// original deadline and cancellation. This is an internal building block,
     /// not permission to start a game or evidence of provider readiness.
@@ -706,6 +814,20 @@ fn open_verified_until(
     file.seek(SeekFrom::Start(0))
         .map_err(|_| invalid("cannot rewind system asset"))?;
     Ok((file, after))
+}
+
+/// Reuse the same no-follow, bounded-length verifier for the direct proxy's
+/// original executable FD. The time/cancel check is cooperative between
+/// reads; a single blocked kernel I/O call cannot be preempted here.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) fn open_system_proxy_binary_until(
+    root: &Dir,
+    artifact: &ArtifactRef,
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> Result<File, ManifestError> {
+    let (file, _) = open_verified_until(root, artifact, until, cancelled)?;
+    Ok(file)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

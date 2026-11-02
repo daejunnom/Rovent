@@ -94,7 +94,7 @@ cap-fs-ext = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Safe Linux proc/cgroup filesystem checks and nonblocking observer opens.
-nix = { workspace = true, optional = true }
+nix = { workspace = true, optional = true, features = ["poll"] }
 rz-platform = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]

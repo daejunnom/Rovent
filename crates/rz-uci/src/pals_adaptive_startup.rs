@@ -18,6 +18,8 @@ use std::{
 mod search_settings;
 pub use search_settings::*;
 mod system_v6;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) use system_v6::open_system_proxy_binary_until;
 pub use system_v6::*;
 
 const CONTROL_BYTES_MAX: u64 = 4 * 1024 * 1024;
