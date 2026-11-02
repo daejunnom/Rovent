@@ -15,17 +15,18 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
     duplicate_inherited_unix_datagram, mark_inherited_datagram_cloexec,
-    observe_linux_thread_affinity,
+    observe_linux_thread_affinity, seal_exclusive_inherited_unix_datagram,
 };
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod placement;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub use placement::{
-    apply_current_thread_affinity, CurrentThreadAffinityGuard, ThreadAffinityApplyError,
-    ThreadAffinityCause, ThreadAffinityCompensationOutcome, ThreadAffinityFailure,
-    ThreadAffinityFailureRecord, ThreadAffinityMask, ThreadAffinityRestoreError,
-    ThreadAffinityRollback, ThreadAffinitySetConflict, ThreadAffinitySnapshot, ThreadAffinityStage,
+    CurrentThreadAffinityGuard, ThreadAffinityApplyError, ThreadAffinityCause,
+    ThreadAffinityCompensationOutcome, ThreadAffinityFailure, ThreadAffinityFailureRecord,
+    ThreadAffinityMask, ThreadAffinityRestoreError, ThreadAffinityRollback,
+    ThreadAffinitySetConflict, ThreadAffinitySnapshot, ThreadAffinityStage,
+    apply_current_thread_affinity,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

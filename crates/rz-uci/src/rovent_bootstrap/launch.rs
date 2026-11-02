@@ -198,12 +198,8 @@ fn go_observer_warning(message: &str) {
 /// diagnostic failure leaves the ordinary product path unchanged. Until the
 /// Python/Rust handoff is independently accepted its dispatch gate stays off.
 ///
-/// # Safety
-/// Any descriptor identified by the opt-in declaration must be inherited
-/// exclusively for this child and have no Rust owner, concurrent users,
-/// close or reuse during this call.
 #[cfg(target_os = "linux")]
-pub unsafe fn seal_go_observer_at_process_entry(arguments: &[String]) {
+pub fn seal_go_observer_at_process_entry(arguments: &[String]) {
     let mut descriptors = arguments
         .iter()
         .filter_map(|arg| arg.strip_prefix("--go-observer-fd="));
@@ -234,8 +230,7 @@ pub unsafe fn seal_go_observer_at_process_entry(arguments: &[String]) {
         go_observer_warning("invalid early descriptor; disabled");
         return;
     };
-    // SAFETY: upheld by the wrapper's documented process-entry contract.
-    if unsafe { go_observer::seal_early_exclusive(fd) }.is_err() {
+    if go_observer::seal_early_exclusive(fd).is_err() {
         go_observer_warning("early inherited descriptor seal failed; disabled");
     }
 }

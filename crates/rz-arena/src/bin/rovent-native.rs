@@ -11,10 +11,7 @@ fn main() -> std::process::ExitCode {
     // Optional diagnostic FD must be sealed before argument parsing, provider
     // initialization, or any product thread/child can be created. Failure is
     // diagnostic only; the later observer gate remains disabled.
-    // SAFETY: at this process entry no product thread or Rust FD owner has
-    // been created. A caller opting into this path must supply a descriptor
-    // inherited exclusively for this child, as declared by the CLI option.
-    unsafe { rz_uci::rovent_bootstrap::launch::seal_go_observer_at_process_entry(&arguments) };
+    rz_uci::rovent_bootstrap::launch::seal_go_observer_at_process_entry(&arguments);
     let result = match parse_native_resource_cli(arguments) {
         Ok(RoventNativeResourceCli::Help) => {
             writeln!(std::io::stdout().lock(), "{ROVENT_RESOURCE_USAGE}")

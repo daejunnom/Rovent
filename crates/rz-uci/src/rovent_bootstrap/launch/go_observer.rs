@@ -29,10 +29,8 @@ static EARLY_INHERITED: OnceLock<(i32, UnixDatagram)> = OnceLock::new();
 /// belongs exclusively to the child and cannot be closed or replaced by any
 /// other owner. Retaining the duplicate pins the original socket identity for
 /// later checks. No open-file-description or unrelated descriptor is changed.
-pub(super) unsafe fn seal_early_exclusive(fd: i32) -> io::Result<()> {
-    // SAFETY: the process-entry caller supplies the same unique inherited FD
-    // and guarantees no other thread or Rust object can own or reuse it.
-    let duplicate = unsafe { rz_platform::seal_exclusive_inherited_unix_datagram(fd) }?;
+pub(super) fn seal_early_exclusive(fd: i32) -> io::Result<()> {
+    let duplicate = rz_platform::seal_exclusive_inherited_unix_datagram(fd)?;
     EARLY_INHERITED
         .set((fd, duplicate))
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "go observer already sealed"))
