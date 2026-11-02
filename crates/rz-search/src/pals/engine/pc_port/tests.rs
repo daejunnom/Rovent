@@ -1086,7 +1086,13 @@ fn idle_archive_worker_keeps_actual_pc_projection_and_restores_original_relation
     let idle = owner
         .into_idle_archive()
         .unwrap_or_else(|_| panic!("restored idle"));
-    let authority = idle.adaptive_archive_authority(next).unwrap();
+    // The preceding check registered `next` as a search root. Maintenance
+    // must use a later generation, which it does not itself register.
+    let after_boundary = SearchAuthority {
+        root: RootGeneration(10),
+        ..next
+    };
+    let authority = idle.adaptive_archive_authority(after_boundary).unwrap();
     let (idle, receipt) = idle_archive_work(
         &mut worker,
         idle,
