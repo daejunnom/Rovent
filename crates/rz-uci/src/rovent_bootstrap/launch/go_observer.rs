@@ -18,10 +18,32 @@ use rz_contracts::{ErrorCode, Stage};
 use std::{
     io,
     os::{fd::AsRawFd, unix::net::UnixDatagram},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 const MAX_PACKET_BYTES: usize = 4096;
+static EARLY_INHERITED: OnceLock<(i32, UnixDatagram)> = OnceLock::new();
+
+/// Called only at the wrapper's single-threaded process entry, before parsing
+/// or starting workers. The caller explicitly declares that this descriptor
+/// belongs exclusively to the child and cannot be closed or replaced by any
+/// other owner. Retaining the duplicate pins the original socket identity for
+/// later checks. No open-file-description or unrelated descriptor is changed.
+pub(super) unsafe fn seal_early_exclusive(fd: i32) -> io::Result<()> {
+    // SAFETY: the process-entry caller supplies the same unique inherited FD
+    // and guarantees no other thread or Rust object can own or reuse it.
+    let duplicate = unsafe { rz_platform::seal_exclusive_inherited_unix_datagram(fd) }?;
+    EARLY_INHERITED
+        .set((fd, duplicate))
+        .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "go observer already sealed"))
+}
+
+/// Revalidate the original descriptor against the socket pinned at entry.
+pub(super) fn early_seal_matches(fd: i32) -> bool {
+    EARLY_INHERITED.get().is_some_and(|(original, socket)| {
+        *original == fd && rz_platform::mark_inherited_datagram_cloexec(fd, socket).is_ok()
+    })
+}
 
 struct OriginalParentGoDatagram {
     socket: UnixDatagram,

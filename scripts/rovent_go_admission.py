@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import struct
+import threading
 
 MAX_PACKET = 4096
 _CRED = struct.Struct('3i')
@@ -140,3 +141,141 @@ class GoAdmissionChannel:
     def close_after_child_completion(self):
         self.after_spawn()
         self.receiver.close()
+
+
+class OriginalOwnerGoSupervisor:
+    """Serialize this owner's stdin and handle one authenticated rejected go.
+
+    The caller must route *every* stdin command through this object, retain the
+    original Popen and admission connection, and preserve the normal shutdown
+    and physical-completion evidence path. This object is not a GPU fence.
+    """
+
+    def __init__(self, process, engine_io, channel, *, epoch, lock_sha256):
+        if engine_io.process is not process:
+            raise ValueError('engine stream and original process differ')
+        self.process, self.engine_io, self.channel = process, engine_io, channel
+        self.epoch, self.lock_sha256 = epoch, lock_sha256
+        self.uid = os.geteuid()
+        self.pending = False
+        self.frozen = False
+        self.rejection = None
+        self.observation_error = None
+        self._shutdown_attempted = False
+        self._observer_disabled = False
+        self._owner_thread = threading.current_thread()
+
+    def _assert_owner_thread(self):
+        if threading.current_thread() is not self._owner_thread:
+            raise RuntimeError('stdin control belongs to the original owner thread')
+
+    def _disable_observer(self, reason):
+        self.observation_error = reason
+        self._observer_disabled = True
+        self.channel.revoke()
+
+    def write(self, command):
+        self._assert_owner_thread()
+        if self.frozen or self.pending:
+            raise RuntimeError('original stdin is sealed or a go is pending')
+        # Match the engine parser's ASCII, single-line and tab/space token
+        # rules. In particular an embedded newline must not smuggle a go.
+        if (not isinstance(command, str) or not command.isascii()
+                or any((ord(ch) < 32 and ch != '\t') or ord(ch) == 127 for ch in command)):
+            raise ValueError('one ASCII UCI command without control characters required')
+        fields = command.split()
+        is_go = bool(fields) and fields[0] == 'go'
+        if is_go:
+            if not self._observer_disabled:
+                try:
+                    self.channel.begin_go()
+                except (OSError, RuntimeError) as exc:
+                    self._disable_observer({'type': type(exc).__name__,
+                                            'errno': getattr(exc, 'errno', None)})
+            self.pending = True
+        try:
+            self.engine_io.write(command)
+        except BaseException:
+            # The child may have received a partial command; never treat it
+            # as a known rejection or issue an inferred shutdown.
+            self.channel.revoke()
+            self.frozen = True
+            raise
+
+    def bestmove(self):
+        self._assert_owner_thread()
+        if not self.pending or self.frozen:
+            raise RuntimeError('bestmove has no original pending go')
+        # Losing an optional diagnostic cannot invalidate an otherwise valid
+        # bestmove. A trusted report of a prior active search is different:
+        # that result cannot safely be attributed to the rejected go.
+        if self.channel.last_trusted_rejection is not None:
+            raise RuntimeError('bestmove attribution is ambiguous after rejected go')
+        if not self._observer_disabled:
+            self.channel.completed_go()
+        self.pending = False
+
+    def _same_live_owner(self):
+        admission = self.engine_io.parent_admission
+        if (self.engine_io.process is not self.process or admission is None
+                or admission.process is not self.process or not admission.confirmed
+                or admission.epoch != self.epoch or admission.lock_sha != self.lock_sha256
+                or admission.peer is None or admission.peer.fileno() < 0):
+            return False
+        # Never reap the direct child: the owner retains the wait relationship
+        # through its process-group census and evidence-preservation sequence.
+        if os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+            return False
+        pid, uid, _ = _CRED.unpack(admission.peer.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, _CRED.size))
+        if pid != self.process.pid or uid != self.uid:
+            return False
+        try:
+            # The admission stream carries no further application frames.
+            # EOF or unexpected data makes its current liveness ambiguous.
+            admission.peer.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            return False
+        except BlockingIOError:
+            return True
+
+    def poll_rejection(self):
+        """Return a same-owner rejection; never stop a prior/unknown search."""
+        self._assert_owner_thread()
+        if not self.pending or self.frozen or self._observer_disabled:
+            return None
+        try:
+            if not self._same_live_owner():
+                self._disable_observer({'type': 'OriginalPeerUnavailable', 'errno': None})
+                return None
+            event = self.channel.receive(child_pid=self.process.pid, child_uid=self.uid,
+                                         epoch=self.epoch, lock_sha256=self.lock_sha256)
+            if self.channel.observation_error is not None:
+                self._disable_observer(self.channel.observation_error)
+                return None
+            if event is None:
+                return None
+            if not self._same_live_owner():
+                self._disable_observer({'type': 'OriginalPeerUnavailable', 'errno': None})
+                return None
+        except (OSError, ValueError, struct.error) as exc:
+            # A diagnostic or liveness-check failure is not a model failure.
+            self._disable_observer({'type': type(exc).__name__, 'errno': getattr(exc, 'errno', None)})
+            return None
+        self.frozen = True
+        self.pending = False
+        self.rejection = event
+        return event
+
+    def stop_and_quit_after_rejection(self):
+        self._assert_owner_thread()
+        if not self.frozen or self.rejection is None or self._shutdown_attempted:
+            raise RuntimeError('same-owner rejected go not established')
+        if not self._same_live_owner():
+            raise RuntimeError('original child or admission is no longer live')
+        # No new stdin command can be sent through write() after freeze.
+        # A write failure leaves the ordinary original-owner quarantine path.
+        self._shutdown_attempted = True
+        self.engine_io.write('stop')
+        if not self._same_live_owner():
+            raise RuntimeError('original child or admission changed after stop')
+        self.engine_io.write('quit')

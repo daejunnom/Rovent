@@ -3229,9 +3229,45 @@ fn run_native(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[cfg(feature = "onnx-cpu")]
-fn run_native(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_native(mut arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut parent_preflight = None;
+    arguments.retain(|argument| {
+        if let Some(value) = argument.strip_prefix("--lc0-parent-preflight=") {
+            if parent_preflight.is_some() {
+                parent_preflight = Some("duplicate".to_owned());
+            } else {
+                parent_preflight = Some(value.to_owned());
+            }
+            false
+        } else {
+            true
+        }
+    });
     // NativeConfig owns exact flag/asset/hash validation and bounded public errors.
     let config = NativeConfig::parse(arguments)?;
+    if let Some(specification) = parent_preflight {
+        if config.provider() != NativeProvider::Cuda {
+            return Err("LC0 parent preflight requires explicit system CUDA".into());
+        }
+        let (epoch, seconds) = specification
+            .split_once(':')
+            .ok_or("LC0 parent preflight requires EPOCH:SECONDS")?;
+        let epoch: u64 = epoch.parse()?;
+        let seconds: u64 = seconds.parse()?;
+        if epoch == 0 || !(1..=3600).contains(&seconds) {
+            return Err("LC0 parent preflight epoch or duration is invalid".into());
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+        {
+            let until = std::time::Instant::now()
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or("LC0 parent preflight deadline overflow")?;
+            return rz_uci::native_bootstrap::lc0_parent_preflight(&config, epoch, until)
+                .map_err(Into::into);
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux")))]
+        return Err("LC0 parent preflight requires Linux, onnx-cuda and pals-adaptive".into());
+    }
     match config.provider() {
         NativeProvider::Cpu => run_cpu(config),
         NativeProvider::Cuda => run_cuda(config),

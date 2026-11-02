@@ -189,6 +189,57 @@ fn go_observer_warning(message: &str) {
     );
 }
 
+/// Optional supervisor FD preparation at the original native wrapper entry.
+///
+/// This is called before any product threads or child processes exist. The
+/// explicit `exclusive-child` declaration is a caller contract: the FD must
+/// have been passed solely for this child and must not be concurrently closed
+/// or reused. A malformed declaration never changes any descriptor, and any
+/// diagnostic failure leaves the ordinary product path unchanged. Until the
+/// Python/Rust handoff is independently accepted its dispatch gate stays off.
+///
+/// # Safety
+/// Any descriptor identified by the opt-in declaration must be inherited
+/// exclusively for this child and have no Rust owner, concurrent users,
+/// close or reuse during this call.
+#[cfg(target_os = "linux")]
+pub unsafe fn seal_go_observer_at_process_entry(arguments: &[String]) {
+    let mut descriptors = arguments
+        .iter()
+        .filter_map(|arg| arg.strip_prefix("--go-observer-fd="));
+    let Some(value) = descriptors.next() else {
+        return;
+    };
+    let mut owners = arguments
+        .iter()
+        .filter_map(|arg| arg.strip_prefix("--go-observer-fd-ownership="));
+    if descriptors.next().is_some()
+        || owners.next() != Some("exclusive-child")
+        || owners.next().is_some()
+        || arguments
+            .iter()
+            .filter(|arg| *arg == "--resource-system-runtime-v3")
+            .count()
+            != 1
+        || arguments
+            .iter()
+            .filter(|arg| *arg == "--custody-control")
+            .count()
+            != 1
+    {
+        go_observer_warning("invalid early exclusive descriptor declaration; disabled");
+        return;
+    }
+    let Ok(fd) = value.parse::<i32>() else {
+        go_observer_warning("invalid early descriptor; disabled");
+        return;
+    };
+    // SAFETY: upheld by the wrapper's documented process-entry contract.
+    if unsafe { go_observer::seal_early_exclusive(fd) }.is_err() {
+        go_observer_warning("early inherited descriptor seal failed; disabled");
+    }
+}
+
 impl Arguments {
     fn parse(arguments: &[String]) -> Result<Self, RoventLaunchError> {
         let mut input_lock = None;

@@ -43,8 +43,13 @@ use std::{
 };
 
 mod control;
+mod endpoint;
 mod facade;
-pub use facade::{Lc0PendingSupervisor, Lc0SupervisedSession};
+mod profile;
+pub use facade::{
+    Lc0ParentListener, Lc0PendingSupervisor, Lc0ReceiptOwner, Lc0SupervisedSession,
+    parent_preflight,
+};
 
 /// A parent PID captured before the caller publishes any child endpoint. The
 /// accepted stream is bound to this exact parent and the V6 runtime lock;
@@ -57,6 +62,10 @@ pub(super) struct Lc0PendingParent {
 }
 
 impl Lc0PendingParent {
+    fn parent_pid(&self) -> i32 {
+        self.original_parent_pid
+    }
+
     pub(super) fn capture(
         process_epoch: u64,
         lock: &SystemRuntimeLockV6,

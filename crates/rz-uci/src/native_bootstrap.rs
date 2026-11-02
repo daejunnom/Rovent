@@ -54,7 +54,10 @@ use std::{
 #[allow(dead_code)]
 mod system_cuda;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-pub use system_cuda::{Lc0PendingSupervisor, Lc0SupervisedSession};
+pub use system_cuda::{
+    Lc0ParentListener, Lc0PendingSupervisor, Lc0ReceiptOwner, Lc0SupervisedSession,
+    parent_preflight as lc0_parent_preflight,
+};
 
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_FATAL_RECEIPTS: usize = 32;

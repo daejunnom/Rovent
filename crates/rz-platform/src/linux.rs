@@ -4,7 +4,7 @@ use crate::{LinuxThreadAffinity, PlatformCpuError};
 use nix::libc;
 use std::collections::BTreeSet;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 
 const MAX_AFFINITY_CPUS: usize = 4096;
@@ -48,6 +48,7 @@ pub fn duplicate_inherited_unix_datagram(fd: i32) -> std::io::Result<UnixDatagra
             &mut kind_len,
         )
     } == 0;
+    // SAFETY: domain and domain_len are valid writable output storage.
     let domain_ok = unsafe {
         libc::getsockopt(
             duplicated,
@@ -76,6 +77,88 @@ pub fn duplicate_inherited_unix_datagram(fd: i32) -> std::io::Result<UnixDatagra
     // SAFETY: successful F_DUPFD_CLOEXEC returned a new, open Unix datagram
     // descriptor that has not been handed to another Rust owner.
     Ok(unsafe { UnixDatagram::from_raw_fd(duplicated) })
+}
+
+/// Seal a child-exclusive Unix datagram immediately at single-threaded entry.
+///
+/// The caller must guarantee that `fd` was inherited solely for this child,
+/// has no Rust owner, and cannot be closed or reused concurrently. A verified
+/// socket is closed if setting FD_CLOEXEC fails; once sealed, the original stays
+/// open even if duplication fails. A descriptor that cannot be validated as a
+/// Unix datagram is left untouched and the observer must remain disabled.
+///
+/// # Safety
+/// The caller must establish child-exclusive ownership of `fd` with no Rust
+/// owner and no concurrent close or reuse until this function returns.
+pub unsafe fn seal_exclusive_inherited_unix_datagram(fd: i32) -> std::io::Result<UnixDatagram> {
+    if fd < 3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid inherited descriptor",
+        ));
+    }
+    let mut kind = 0_i32;
+    let mut domain = 0_i32;
+    let mut kind_len = std::mem::size_of::<i32>() as libc::socklen_t;
+    let mut domain_len = kind_len;
+    // SAFETY: each pointer refers to initialized writable storage. The caller
+    // guarantees the inherited descriptor cannot be closed or reused here.
+    let type_ok = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut i32).cast(),
+            &mut kind_len,
+        )
+    } == 0;
+    // SAFETY: domain and domain_len are valid writable output storage.
+    let domain_ok = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            (&mut domain as *mut i32).cast(),
+            &mut domain_len,
+        )
+    } == 0;
+    if !type_ok
+        || !domain_ok
+        || kind_len as usize != std::mem::size_of::<i32>()
+        || domain_len as usize != std::mem::size_of::<i32>()
+        || kind != libc::SOCK_DGRAM
+        || domain != libc::AF_UNIX
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "inherited descriptor is not a Unix datagram socket",
+        ));
+    }
+    // SAFETY: validated descriptor is child-exclusive and has no existing
+    // Rust owner under the stated entry contract. On a sealing error it is
+    // closed, preventing an unsealed diagnostic FD from reaching later exec.
+    let original = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: original owns an open FD and this operation reads its flags.
+    let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFD changes only this owned descriptor's descriptor flags.
+    if flags & libc::FD_CLOEXEC == 0
+        && unsafe {
+            libc::fcntl(
+                original.as_raw_fd(),
+                libc::F_SETFD,
+                flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Leave the sealed original owned by the process under its explicit
+    // inheritance contract; the returned duplicate has independent ownership.
+    let original_fd = original.into_raw_fd();
+    duplicate_inherited_unix_datagram(original_fd)
 }
 
 /// Mark the explicitly child-exclusive inherited descriptor close-on-exec,
@@ -280,7 +363,48 @@ pub fn observe_linux_thread_affinity() -> Result<LinuxThreadAffinity, PlatformCp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+
+    #[test]
+    fn exclusive_child_socket_is_sealed_before_peer_validation() {
+        let (original, peer) = UnixDatagram::pair().unwrap();
+        let fd = original.into_raw_fd();
+        let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(fd_flags >= 0 && status_flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        let peer_flags = unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_GETFD) };
+        // SAFETY: into_raw_fd transferred this test's unique ownership.
+        let duplicate = unsafe { seal_exclusive_inherited_unix_datagram(fd) }.unwrap();
+        // SAFETY: the early sealing function returns the original ownership
+        // to the process on success, and this test reclaims it exactly once.
+        let original = unsafe { UnixDatagram::from_raw_fd(fd) };
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, status_flags);
+        assert_eq!(
+            unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_GETFD) },
+            peer_flags
+        );
+        drop(duplicate);
+        original.send(b"owner").unwrap();
+        let mut bytes = [0_u8; 5];
+        assert_eq!(peer.recv(&mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"owner");
+        let regular_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let before = unsafe { libc::fcntl(regular_fd, libc::F_GETFD) };
+        // SAFETY: into_raw_fd transfers the unique file ownership to this test;
+        // the validation rejects a regular file before claiming it.
+        assert!(unsafe { seal_exclusive_inherited_unix_datagram(regular_fd) }.is_err());
+        assert_eq!(unsafe { libc::fcntl(regular_fd, libc::F_GETFD) }, before);
+        // SAFETY: rejection left this test's raw FD open and unowned by Rust.
+        drop(unsafe { std::fs::File::from_raw_fd(regular_fd) });
+    }
 
     #[test]
     fn inherited_datagram_duplication_never_closes_original() {

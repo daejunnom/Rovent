@@ -54,6 +54,7 @@ enum ControlOperation {
 pub(super) struct Lc0ControlSupervisor {
     owner: Lc0SystemSessionOwner,
     state: ServiceState,
+    service_started: bool,
     finish: Option<Lc0SystemFinish>,
     // Preserve the original panic payload without rendering possibly sensitive
     // details or treating it as a normally completed protocol service.
@@ -141,6 +142,7 @@ impl Lc0ControlSupervisor {
         Self {
             owner,
             state: ServiceState::Prepared,
+            service_started: false,
             finish: None,
             service_panic: None,
             finish_panic: None,
@@ -154,6 +156,52 @@ impl Lc0ControlSupervisor {
             control_until,
             last_control: None,
         }
+    }
+
+    /// This only determines whether this original process session is settled;
+    /// it is not a device-wide GPU fence or V6 physical-completion claim.
+    pub(super) fn original_scope_settled(&self) -> bool {
+        if !self.service_started
+            && self.state != ServiceState::Serving
+            && self.owner.custody.phase() == Lc0SystemStartupPhase::BeforeOrtCall
+            && !self.owner.custody.ort_entry_observed()
+            && self.owner.custody.runtime.is_none()
+            && self.owner.custody.model.is_none()
+            && self.owner.custody.worker.is_none()
+        {
+            return true;
+        }
+        if self.state != ServiceState::SessionReleased
+            || self.setup_panic.is_some()
+            || self.finish_panic.is_some()
+        {
+            return false;
+        }
+        match &self.finish {
+            Some(finish) => match &finish.run {
+                Ok(_) => true,
+                Err(error) => {
+                    error.service.is_none()
+                        && error.collection_error.is_none()
+                        && error.worker_shutdown_error.is_none()
+                        && error.report.is_some()
+                }
+            },
+            None => matches!(&self.unstarted_release, Some(Poll::Ready(Ok(_)))),
+        }
+    }
+
+    /// Only the recorded service/factory result, not session release,
+    /// publication success, or process-wide completion.
+    pub(super) fn original_service_succeeded(&self) -> bool {
+        self.setup_failure.is_none()
+            && self.setup_panic.is_none()
+            && self.service_panic.is_none()
+            && self.finish_panic.is_none()
+            && self
+                .finish
+                .as_ref()
+                .is_some_and(|finish| finish.run.is_ok())
     }
 
     /// A missing or failed report is separate from the service and session
@@ -246,6 +294,7 @@ impl Lc0ControlSupervisor {
                 "LC0 system session is not connected",
             ))?;
         self.state = ServiceState::Serving;
+        self.service_started = true;
         let result = catch_unwind(AssertUnwindSafe(|| serve(factory)));
         let served = match result {
             Ok(result) => result,

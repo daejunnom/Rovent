@@ -1445,6 +1445,11 @@ pub(crate) struct SystemReceiptWriter {
 
 #[cfg(target_os = "linux")]
 impl SystemReceiptWriter {
+    #[cfg(feature = "onnx-cuda")]
+    pub(crate) fn original_directory(&self) -> &Dir {
+        &self.directory
+    }
+
     pub(crate) fn open(root: &Dir, path: &std::path::Path) -> std::io::Result<Self> {
         // Walk only the original private-root capability. The resource owner
         // creates the parent; this process exclusively creates its own leaf.
@@ -1936,6 +1941,10 @@ pub(super) fn admit_original<'a>(
         }
         if !arguments.go_observer_fd_exclusive {
             super::go_observer_warning("child-exclusive descriptor ownership not declared");
+            return None;
+        }
+        if !super::go_observer::early_seal_matches(fd) {
+            super::go_observer_warning("early inherited descriptor seal unavailable");
             return None;
         }
         let Some(parent) = connected_parent.as_ref() else {
