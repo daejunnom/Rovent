@@ -12,9 +12,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod codec;
+mod cpu7_historical;
 mod foreign_permit;
 mod review_projection;
 use codec::{Bundle, LineWire, ObservationWire, RoleRecordWire, StateWire};
+pub use cpu7_historical::{
+    Cpu7DiagnosticExpected, HistoricalCpu7Observation, inspect_cpu7_diagnostic_ack,
+};
 pub use foreign_permit::{
     ForeignAppendPermit, ForeignGoIssuedProof, ProfiledForeignAppendPermit,
     ProfiledForeignGoIssuedProof,

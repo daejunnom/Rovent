@@ -168,7 +168,7 @@ impl RoventUtilityInterventionLaunchFailure {
 struct CohortCaller {
     profile: RoventUtilityInterventionCohortV2,
     cpu7_capture_registration:
-        Option<rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistrationV1>,
+        Option<rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistration>,
     cpu7_capture_registration_status: Option<(&'static str, RoventPublicationFile)>,
     plan: RoventCollectionLaunchPlan,
     manifest: RoventCorpusManifestV2,
@@ -192,6 +192,8 @@ struct CohortCaller {
     // Same create_new output owner; diagnostics are outside the proof corpus.
     diagnostic_directory: Dir,
     diagnostic_held: Option<std::fs::File>,
+    cpu7_projection_held: Option<std::fs::File>,
+    cpu7_projection_observations: Vec<Value>,
     diagnostic_attempted: bool,
     diagnostic_error: Option<ArenaError>,
     failure: Option<String>,
@@ -295,6 +297,87 @@ impl UtilityInterventionSourceObserver<AdaptivePortQuestion> for SourceObserver 
 }
 
 impl CohortCaller {
+    /// Publish only detached selection-time observations after their own
+    /// original trial retired. These files are diagnostic siblings, not part
+    /// of the /2 corpus, and their ACK never grants training or GPU authority.
+    fn publish_cpu7_projection_sidecars(&mut self) -> Result<(), ArenaError> {
+        let Some(("registered", registration)) = &self.cpu7_capture_registration_status else {
+            return Ok(());
+        };
+        if !matches!(
+            self.cpu7_capture_registration.as_ref(),
+            Some(
+                rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistration::WithBundle(_)
+            )
+        ) {
+            return Ok(());
+        }
+        let registration = registration.clone();
+        let mut candidates = Vec::with_capacity(self.trials.len());
+        for trial in &self.trials {
+            let trial = trial
+                .try_lock()
+                .map_err(|_| invalid("CPU7 trial custody unavailable"))?;
+            if let Some(original) = &trial.original_final {
+                candidates.push(Arc::clone(original));
+            }
+        }
+        let until = Instant::now()
+            .checked_add(Duration::from_millis(self.plan.publication_timeout_ms))
+            .ok_or_else(|| invalid("CPU7 diagnostic publication deadline overflow"))?;
+        for original in candidates {
+            let sequence = original.trial_sequence();
+            let Some(result) = original.cpu7_projection() else {
+                self.cpu7_projection_observations
+                    .push(json!({"trial_sequence":sequence,"status":"unavailable"}));
+                continue;
+            };
+            let projection = match result {
+                Ok(projection) => projection,
+                Err(_) => {
+                    self.cpu7_projection_observations
+                        .push(json!({"trial_sequence":sequence,"status":"capture_unavailable"}));
+                    continue;
+                }
+            };
+            let observation_index = self.cpu7_projection_observations.len();
+            self.cpu7_projection_observations
+                .push(json!({"trial_sequence":sequence,
+                "status":"projection_write_attempted"}));
+            let file = put_final_raw(
+                &self.diagnostic_directory,
+                &format!("cpu7-selection-{sequence:06}.json"),
+                projection.bytes(),
+                &mut self.cpu7_projection_held,
+                until,
+            )?;
+            self.cpu7_projection_observations[observation_index] = json!({
+                "trial_sequence":sequence,"status":"projection_published_ack_attempted",
+                "projection":&file});
+            let ack = json!({"schema":"rz-rovent-cpu7-diagnostic-projection-ack/1",
+                "cohort_id":hex(original.cohort_id()),"trial_sequence":sequence,
+                "authority":{"process_epoch":original.authority().epoch.0,
+                    "game_generation":original.authority().game.0,
+                    "root_generation":original.authority().root.0,
+                    "implementation_sha256":hex(original.authority().implementation)},
+                "trial_semantic_sha256":hex(original.sha256()),
+                "registration":&registration,"projection":&file,
+                "scope":"selection_diagnostic_only","physical_completion_attested":false,
+                "training_authorized":false});
+            let raw = serde_json::to_vec(&ack).map_err(|error| invalid(error.to_string()))?;
+            let ack_file = put_final_raw(
+                &self.diagnostic_directory,
+                &format!("cpu7-selection-{sequence:06}-ack.json"),
+                &raw,
+                &mut self.cpu7_projection_held,
+                until,
+            )?;
+            self.cpu7_projection_observations[observation_index] = json!({
+                "trial_sequence":sequence,"status":"published_diagnostic",
+                "projection":file,"ack":ack_file});
+        }
+        Ok(())
+    }
     fn collection_observations(&self) -> Result<Value, ArenaError> {
         let r = self
             .trials
@@ -330,6 +413,25 @@ impl CohortCaller {
             "original finite diagnostic publication already attempted",
         )?;
         self.diagnostic_attempted = true;
+        let cpu7_projection = if matches!(
+            self.cpu7_capture_registration.as_ref(),
+            Some(
+                rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistration::WithBundle(_)
+            )
+        ) {
+            match self.publish_cpu7_projection_sidecars() {
+                Ok(()) => json!({"status":"attempted","trials":&self.cpu7_projection_observations}),
+                Err(error) => json!({"status":"unavailable","error":error.to_string(),
+                    "trials":&self.cpu7_projection_observations,
+                    "physical_completion_attested":false}),
+            }
+        } else if let Some((status, _)) = self.cpu7_capture_registration_status.as_ref()
+            && *status != "registered"
+        {
+            json!({"status":"unavailable","registration_status":status})
+        } else {
+            json!({"status":"not_requested"})
+        };
         let trials = self.trials.iter().enumerate().map(|(ordinal, trial)| {
             let trial = trial.try_lock().map_err(|_|invalid("original trial diagnostics are busy or poisoned"))?;
             let finite = trial.finite.try_lock().map_err(|_|invalid("original finite diagnostics are busy or poisoned"))?;
@@ -354,6 +456,7 @@ impl CohortCaller {
             "original_launch_error":original_launch_error,"trials":trials,
             "training_executed":false,"physical_completion_attested":false,"performance_evidence":false
         });
+        diagnostic["cpu7_projection"] = cpu7_projection;
         if let Some((status, pin)) = &self.cpu7_capture_registration_status {
             diagnostic["cpu7_capture_registration"] = json!({"status":status,"input":pin});
         }
@@ -682,7 +785,7 @@ pub fn run_rovent_utility_intervention(
             Some(pin) => {
                 let (registration, status) = match read_pin(input, pin, 64 << 10) {
                     Err(_) => (None, "input_unavailable"),
-                    Ok(bytes) => match std::str::from_utf8(&bytes).ok().and_then(|text| rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistrationV1::from_json(text).ok()) {
+                    Ok(bytes) => match std::str::from_utf8(&bytes).ok().and_then(|text| rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistration::from_json(text).ok()) {
                         None => (None, "invalid_registration"),
                         Some(value) if value.validate_cohort(&profile).is_err() => (None, "cohort_mismatch"),
                         Some(value) => (Some(value), "registered"),
@@ -801,6 +904,8 @@ pub fn run_rovent_utility_intervention(
             held_payload: None,
             diagnostic_directory: output,
             diagnostic_held: None,
+            cpu7_projection_held: None,
+            cpu7_projection_observations: Vec::new(),
             diagnostic_attempted: false,
             diagnostic_error: None,
             failure: None,
@@ -1117,11 +1222,12 @@ fn run_trial(
                         shared: Arc::downgrade(&ready_owner),
                         loaded: Arc::clone(source),
                     });
-                    match manager.set_utility_intervention_source_observer_with_capture(
-                        &profile,
-                        cpu7_capture_registration.as_ref(),
-                        observer,
-                    ) {
+                    match manager
+                        .set_utility_intervention_source_observer_with_capture_registration(
+                            &profile,
+                            cpu7_capture_registration.as_ref(),
+                            observer,
+                        ) {
                         Ok(()) => Ok(()),
                         Err((error, observer)) => {
                             if let Ok(mut trial) = admitted.lock() {

@@ -22,6 +22,13 @@ pub struct CaptureLimits {
     /// Conservative per-snapshot history charge, including shared histories.
     pub max_retained_history_bytes: usize,
 }
+/// Independent bound for the optional full-bundle serialization. These are
+/// not a bound on temporary Store-closure allocations or process peak RSS.
+#[derive(Clone, Copy, Debug)]
+pub struct BundleProjectionLimits {
+    pub max_records: usize,
+    pub max_serialized_bytes: usize,
+}
 pub struct CaptureControl<'a> {
     /// The caller must pass the original root deadline and cancellation flag.
     /// These values themselves do not attest that provenance.
@@ -42,6 +49,7 @@ pub struct RootCaptureGrant {
     capture_deadline: Instant,
     scope_check: Arc<dyn CaptureScope>,
     registered: Option<(CaptureLimits, std::time::Duration, Arc<AtomicBool>)>,
+    original_bundle_projection: Option<BundleProjectionLimits>,
 }
 impl RootCaptureGrant {
     pub fn unverified_diagnostic(
@@ -56,6 +64,7 @@ impl RootCaptureGrant {
             capture_deadline,
             scope_check,
             registered: None,
+            original_bundle_projection: None,
         }
     }
     /// Diagnostic caps are checked by the UCI owner against its independent
@@ -66,6 +75,13 @@ impl RootCaptureGrant {
         duration: std::time::Duration,
     ) -> Self {
         self.registered = Some((limits, duration, Arc::new(AtomicBool::new(false))));
+        self
+    }
+    /// Opt in to an additional bounded historical bundle/Store projection.
+    /// The consumer must retain and publish it separately; no provenance
+    /// authority is granted by this flag or the resulting bytes.
+    pub fn with_original_bundle_projection(mut self, limits: BundleProjectionLimits) -> Self {
+        self.original_bundle_projection = Some(limits);
         self
     }
     pub(crate) fn control<'a>(
@@ -106,6 +122,7 @@ impl RootCaptureGrant {
             },
             scope_check: self.scope_check.as_ref(),
             reservation: CaptureReservation(Arc::clone(occupied)),
+            original_bundle_projection: self.original_bundle_projection,
         })
     }
 }
@@ -113,6 +130,7 @@ pub(crate) struct CapturePermit<'a> {
     control: CaptureControl<'a>,
     scope_check: &'a dyn CaptureScope,
     reservation: CaptureReservation,
+    original_bundle_projection: Option<BundleProjectionLimits>,
 }
 #[derive(Debug)]
 struct CaptureReservation(Arc<AtomicBool>);
@@ -120,6 +138,11 @@ impl Drop for CaptureReservation {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+#[derive(Debug)]
+enum HeldCaptureReservation {
+    Exclusive { _owner: CaptureReservation },
+    Shared(Arc<CaptureReservation>),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CaptureUnavailable {
@@ -151,9 +174,28 @@ pub struct SelectedCpuRawCapture {
     observations_json: Vec<u8>,
     states: Vec<(StateId, PositionSnapshot)>,
     lines: Vec<(LineId, LineChunk)>,
+    // Separate, optional full index/Store projection captured on the same
+    // selection and control lease. It is diagnostic evidence, not an ACK or a
+    // proof of CPU physical completion. It may be unavailable even when the
+    // smaller raw-observation capture succeeded.
+    original_bundle_projection: Option<Result<Arc<Cpu7BundleProjection>, CaptureUnavailable>>,
     requested_owned_bytes: usize,
     retained_history_bytes: usize,
-    _reservation: Option<CaptureReservation>,
+    _reservation: Option<HeldCaptureReservation>,
+}
+
+/// Detached, single-allocation diagnostic bytes. Clones share the same bytes
+/// and original capture reservation; they do not retain a Store pin or confer
+/// authority to publish or use the bytes for training.
+#[derive(Debug)]
+pub struct Cpu7BundleProjection {
+    bytes: Vec<u8>,
+    _reservation: Option<Arc<CaptureReservation>>,
+}
+impl Cpu7BundleProjection {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 impl SelectedCpuRawCapture {
     pub fn original_bundle(&self) -> &CohortCpu7OriginalBundle {
@@ -170,6 +212,14 @@ impl SelectedCpuRawCapture {
     }
     pub fn lines(&self) -> &[(LineId, LineChunk)] {
         &self.lines
+    }
+    /// Original selection-time bundle and Store projection, when it fit the
+    /// remaining diagnostic budget. An unavailable projection must not be
+    /// interpreted as an empty bundle or as a completed publication.
+    pub fn original_bundle_projection(
+        &self,
+    ) -> Option<Result<Arc<Cpu7BundleProjection>, CaptureUnavailable>> {
+        self.original_bundle_projection.clone()
     }
     pub fn requested_owned_bytes(&self) -> usize {
         self.requested_owned_bytes
@@ -619,7 +669,7 @@ pub(super) fn capture_selected_cpu_raw(
     stores: &PalsStores,
     control: Option<&CaptureControl<'_>>,
 ) -> Result<SelectedCpuRawCapture, CaptureUnavailable> {
-    capture_selected_cpu_raw_inner(view, stores, control, None, None)
+    capture_selected_cpu_raw_inner(view, stores, control, None, None, None)
 }
 
 pub(super) fn capture_selected_cpu_raw_permitted(
@@ -631,6 +681,7 @@ pub(super) fn capture_selected_cpu_raw_permitted(
         control,
         scope_check,
         reservation,
+        original_bundle_projection,
     } = permit;
     capture_selected_cpu_raw_inner(
         view,
@@ -638,6 +689,7 @@ pub(super) fn capture_selected_cpu_raw_permitted(
         Some(&control),
         Some(scope_check),
         Some(reservation),
+        original_bundle_projection,
     )
 }
 
@@ -647,8 +699,16 @@ fn capture_selected_cpu_raw_inner<'a>(
     control: Option<&'a CaptureControl<'a>>,
     scope_check: Option<&'a dyn CaptureScope>,
     reservation: Option<CaptureReservation>,
+    capture_bundle_projection: Option<BundleProjectionLimits>,
 ) -> Result<SelectedCpuRawCapture, CaptureUnavailable> {
     let control = control.ok_or(CaptureUnavailable::MissingOriginalControl)?;
+    let reservation = reservation.map(|owner| {
+        if capture_bundle_projection.is_some() {
+            HeldCaptureReservation::Shared(Arc::new(owner))
+        } else {
+            HeldCaptureReservation::Exclusive { _owner: owner }
+        }
+    });
     let limits = control.limits;
     if !(7..=64).contains(&limits.max_observations)
         || limits.max_line_chunks > 4096
@@ -824,12 +884,61 @@ fn capture_selected_cpu_raw_inner<'a>(
         push(&mut lines, (id, chunk.clone()), &mut out)?;
     }
     out.check()?;
+    // Capture full provenance only in the already opt-in CPU7 diagnostic
+    // path, under the original cancellation, deadline and scope checks. A
+    // failure here is independent of the earlier selected-observation capture.
+    let remaining = limits.max_owned_bytes.saturating_sub(out.charged);
+    let original_bundle_projection = capture_bundle_projection.map(|projection| {
+        if projection.max_records == 0
+            || projection.max_records > 65_536
+            || projection.max_serialized_bytes == 0
+            || projection.max_serialized_bytes > 16 * 1024 * 1024
+        {
+            return Err(CaptureUnavailable::InvalidLimits);
+        }
+        if remaining == 0 {
+            return Err(CaptureUnavailable::Capacity);
+        }
+        let max_bytes = remaining.min(projection.max_serialized_bytes);
+        let mut control_error = None;
+        let mut check = || match out.check() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                control_error = Some(error);
+                Err(StoreError::InvalidConditions(
+                    "CPU7 diagnostic control unavailable",
+                ))
+            }
+        };
+        let result = view.capture_cohort_cpu7_evidence(
+            stores,
+            projection.max_records,
+            max_bytes,
+            &mut check,
+        );
+        match (result, control_error) {
+            (_, Some(error)) => Err(error),
+            (Err(error), None) => Err(CaptureUnavailable::Store(error)),
+            (Ok(bytes), None) if bytes.capacity() > remaining => Err(CaptureUnavailable::Capacity),
+            (Ok(bytes), None) => {
+                out.charged += bytes.capacity();
+                Ok(Arc::new(Cpu7BundleProjection {
+                    bytes,
+                    _reservation: match &reservation {
+                        Some(HeldCaptureReservation::Shared(owner)) => Some(Arc::clone(owner)),
+                        _ => None,
+                    },
+                }))
+            }
+        }
+    });
     Ok(SelectedCpuRawCapture {
         source: Arc::clone(source),
         binding,
         observations_json: out.bytes,
         states,
         lines,
+        original_bundle_projection,
         requested_owned_bytes: out.charged,
         retained_history_bytes: history_charge,
         _reservation: reservation,

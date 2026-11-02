@@ -21,7 +21,7 @@ pub mod cpu7_capture;
 pub mod historical;
 
 pub const REVIEW_CONTEXT_VERSION: &str = "rz-pals-selected-review/1";
-const MAX_LINE: usize = 256;
+pub(in crate::pals) const MAX_LINE: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReviewIndexLimits {
@@ -158,6 +158,10 @@ pub struct CohortCpu7OriginalRecord {
     evidence: Option<ObservationId>,
 }
 impl CohortCpu7OriginalRecord {
+    /// Detached history only; this does not issue a Store pin or a live view.
+    pub(in crate::pals) fn historical(record: RoleRecord, evidence: Option<ObservationId>) -> Self {
+        Self { record, evidence }
+    }
     pub fn record(&self) -> &RoleRecord {
         &self.record
     }
@@ -1648,7 +1652,7 @@ fn write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), ReviewError
 }
 /// Link an original index snapshot to this exact selected query view. This
 /// remains per-root metadata, not a substitute for trial or model authority.
-fn cohort_cpu7_view_binding(
+pub(in crate::pals) fn cohort_cpu7_view_binding(
     original: [u8; 32],
     policy: [u8; 32],
     input: [u8; 32],
@@ -1666,7 +1670,7 @@ fn cohort_cpu7_view_binding(
 /// Hash original index records and observation handles independently from the
 /// selected model input. Observation/line payloads are not hashed here. Each
 /// root has its own evidence digest and identity; this is not historical proof.
-fn cohort_cpu7_original_digest(
+pub(in crate::pals) fn cohort_cpu7_original_digest(
     bundle_id: u64,
     generation: u64,
     root: StateId,
@@ -2118,12 +2122,89 @@ mod tests {
             guarded.view_binding(),
             captured_view.cohort_cpu7_binding().unwrap()
         );
+        assert!(guarded.original_bundle_projection().is_none());
         assert!(matches!(
             grant.control(Some(&cancel), deadline),
             Err(cpu7_capture::CaptureUnavailable::CaptureBusy)
         ));
         drop(guarded);
         drop(grant.control(Some(&cancel), deadline).unwrap());
+
+        let mut projected_limits = control.limits;
+        projected_limits.max_observations = 64;
+        projected_limits.max_line_chunks = 64;
+        projected_limits.max_states = 16;
+        projected_limits.max_owned_bytes = 1 << 20;
+        let projection_grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(projected_limits, std::time::Duration::from_secs(10))
+        .with_original_bundle_projection(cpu7_capture::BundleProjectionLimits {
+            max_records: 128,
+            max_serialized_bytes: 1 << 20,
+        });
+        let projected = cpu7_capture::capture_selected_cpu_raw_permitted(
+            &captured_view,
+            &stores,
+            projection_grant.control(Some(&cancel), deadline).unwrap(),
+        )
+        .unwrap();
+        let projection = projected.original_bundle_projection().unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(projection.bytes()).unwrap();
+        assert_eq!(value["schema"], "rz-pals-cpu7-view-evidence/1");
+        assert_eq!(value["selected_len"], 9);
+        drop(projected);
+        assert!(matches!(
+            projection_grant.control(Some(&cancel), deadline),
+            Err(cpu7_capture::CaptureUnavailable::CaptureBusy)
+        ));
+        drop(projection);
+        drop(projection_grant.control(Some(&cancel), deadline).unwrap());
+
+        // A separate one-byte projection budget cannot hold the JSON object;
+        // the already-complete selected-observation capture remains valid.
+        let limited_projection_grant = cpu7_capture::RootCaptureGrant::unverified_diagnostic(
+            Arc::clone(&cancel),
+            deadline,
+            deadline,
+            Arc::new(DiagnosticTestScope),
+        )
+        .with_diagnostic_limits(projected_limits, std::time::Duration::from_secs(10))
+        .with_original_bundle_projection(cpu7_capture::BundleProjectionLimits {
+            max_records: 128,
+            max_serialized_bytes: 1,
+        });
+        let raw_with_failed_projection = cpu7_capture::capture_selected_cpu_raw_permitted(
+            &captured_view,
+            &stores,
+            limited_projection_grant
+                .control(Some(&cancel), deadline)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            raw_with_failed_projection.original_bundle_projection(),
+            Some(Err(_))
+        ));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                raw_with_failed_projection.observations_json()
+            )
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+            7
+        );
+        drop(raw_with_failed_projection);
+        drop(
+            limited_projection_grant
+                .control(Some(&cancel), deadline)
+                .unwrap(),
+        );
 
         // Failure must release the same root reservation, not poison it.
         let mut tiny = control.limits;

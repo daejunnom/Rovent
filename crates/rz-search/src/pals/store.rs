@@ -24,9 +24,10 @@ pub mod hot_commit;
 pub use archive::{
     ArchiveConfig, ArchiveIoBudget, ArchiveLoadPin, ArchiveOwnerLifecycle, ArchiveOwnerSnapshot,
     ArchiveReceipt, ArchiveRecordKind, ArchiveRootCapability, ArchiveRuntimeLimits, ArchiveStats,
-    ColdHandle, EngineArchiveNode, EngineArchiveReceipt, ForeignAppendPermit, ForeignGoIssuedProof,
-    LoadedArchive, ProfiledForeignAppendPermit, ProfiledForeignGoIssuedProof, StorePins,
-    archive_accounting_source_sha256,
+    ColdHandle, Cpu7DiagnosticExpected, EngineArchiveNode, EngineArchiveReceipt,
+    ForeignAppendPermit, ForeignGoIssuedProof, HistoricalCpu7Observation, LoadedArchive,
+    ProfiledForeignAppendPermit, ProfiledForeignGoIssuedProof, StorePins,
+    archive_accounting_source_sha256, inspect_cpu7_diagnostic_ack,
 };
 use hot::HotRecords;
 

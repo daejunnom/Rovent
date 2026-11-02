@@ -92,6 +92,85 @@ impl RoventCpu7CaptureRegistrationV1 {
     }
 }
 
+/// Separate, explicitly opted-in full bundle/Store diagnostic projection.
+/// The existing /1 registration and the cohort's /2 canonical bytes remain
+/// unchanged. This declaration does not grant source or training authority.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventCpu7CaptureRegistrationV2 {
+    pub domain: String,
+    pub capture: RoventCpu7CaptureRegistrationV1,
+    pub max_projection_records: usize,
+    pub max_projection_serialized_bytes: usize,
+}
+impl RoventCpu7CaptureRegistrationV2 {
+    pub fn validate_cohort(
+        &self,
+        cohort: &RoventUtilityInterventionCohortV2,
+    ) -> Result<(), ManifestError> {
+        require(
+            self.domain == "rz-rovent-cpu7-capture-registration/2",
+            "invalid bundle projection registration domain",
+        )?;
+        self.capture.validate_cohort(cohort)?;
+        require(
+            (1..=65_536).contains(&self.max_projection_records)
+                && (1..=16 * 1024 * 1024).contains(&self.max_projection_serialized_bytes),
+            "invalid bundle projection limits",
+        )
+    }
+}
+
+/// A caller must read and pin the exact original registration bytes first.
+/// Parsing either version alone never creates a capture grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoventCpu7CaptureRegistration {
+    Selected(RoventCpu7CaptureRegistrationV1),
+    WithBundle(RoventCpu7CaptureRegistrationV2),
+}
+impl RoventCpu7CaptureRegistration {
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        require(
+            input.len() <= MAX_ROVENT_UTILITY_COHORT_BYTES,
+            "capture registration exceeds 64 KiB",
+        )?;
+        let raw: serde_json::Value = decode_json(input)?;
+        match raw.get("domain").and_then(serde_json::Value::as_str) {
+            Some("rz-rovent-cpu7-capture-registration/1") => Ok(Self::Selected(
+                RoventCpu7CaptureRegistrationV1::from_json(input)?,
+            )),
+            Some("rz-rovent-cpu7-capture-registration/2") => {
+                let value: RoventCpu7CaptureRegistrationV2 = decode_json(input)?;
+                value.capture.validate()?;
+                require(
+                    (1..=65_536).contains(&value.max_projection_records)
+                        && (1..=16 * 1024 * 1024).contains(&value.max_projection_serialized_bytes),
+                    "invalid bundle projection limits",
+                )?;
+                Ok(Self::WithBundle(value))
+            }
+            _ => Err(ManifestError::Parse(
+                "unknown CPU7 capture registration".into(),
+            )),
+        }
+    }
+    pub fn validate_cohort(
+        &self,
+        cohort: &RoventUtilityInterventionCohortV2,
+    ) -> Result<(), ManifestError> {
+        match self {
+            Self::Selected(value) => value.validate_cohort(cohort),
+            Self::WithBundle(value) => value.validate_cohort(cohort),
+        }
+    }
+    pub fn capture(&self) -> &RoventCpu7CaptureRegistrationV1 {
+        match self {
+            Self::Selected(value) => value,
+            Self::WithBundle(value) => &value.capture,
+        }
+    }
+}
+
 /// This first opt-in profile is CPU only. It does not enable a GPU path or
 /// alter the meaning of the existing four-mode execution declaration.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -550,6 +629,10 @@ mod tests {
         let raw = serde_json::to_string(&registration).unwrap();
         let parsed = RoventCpu7CaptureRegistrationV1::from_json(&raw).unwrap();
         assert_eq!(parsed, registration);
+        assert_eq!(
+            RoventCpu7CaptureRegistration::from_json(&raw).unwrap(),
+            RoventCpu7CaptureRegistration::Selected(registration.clone())
+        );
         assert!(parsed.validate_cohort(&cpu7).is_ok());
         assert!(parsed.validate_cohort(&legacy).is_err());
         let mut wrong = parsed.clone();
@@ -564,6 +647,21 @@ mod tests {
         wrong = parsed.clone();
         wrong.max_duration_ns = 0;
         assert!(wrong.validate().is_err());
+        let projection = RoventCpu7CaptureRegistrationV2 {
+            domain: "rz-rovent-cpu7-capture-registration/2".into(),
+            capture: registration,
+            max_projection_records: 128,
+            max_projection_serialized_bytes: 1 << 20,
+        };
+        let projection_raw = serde_json::to_string(&projection).unwrap();
+        assert!(RoventCpu7CaptureRegistrationV1::from_json(&projection_raw).is_err());
+        let parsed_projection = RoventCpu7CaptureRegistration::from_json(&projection_raw).unwrap();
+        assert_eq!(
+            parsed_projection,
+            RoventCpu7CaptureRegistration::WithBundle(projection)
+        );
+        assert!(parsed_projection.validate_cohort(&cpu7).is_ok());
+        assert!(parsed_projection.validate_cohort(&legacy).is_err());
         assert_eq!(legacy.canonical_bytes().unwrap(), legacy_bytes);
         assert_eq!(cpu7.canonical_bytes().unwrap(), cpu7_bytes);
     }

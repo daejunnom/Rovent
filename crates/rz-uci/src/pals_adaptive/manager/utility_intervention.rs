@@ -177,6 +177,29 @@ where
             Box<dyn UtilityInterventionSourceObserver<Q>>,
         ),
     > {
+        let registration = capture
+            .cloned()
+            .map(rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistration::Selected);
+        self.set_utility_intervention_source_observer_with_capture_registration(
+            profile,
+            registration.as_ref(),
+            observer,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn set_utility_intervention_source_observer_with_capture_registration(
+        &mut self,
+        profile: &rz_experiments::rovent_utility_cohort::RoventUtilityInterventionCohortV2,
+        capture: Option<&rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistration>,
+        observer: Box<dyn UtilityInterventionSourceObserver<Q>>,
+    ) -> Result<
+        (),
+        (
+            AdaptiveManagerError,
+            Box<dyn UtilityInterventionSourceObserver<Q>>,
+        ),
+    > {
         let cpu7 = matches!(
             profile.policy,
             rz_experiments::rovent_utility_cohort::RoventUtilityInterventionPolicyV2::FrozenProposalReviewCpu7V1
@@ -280,17 +303,25 @@ where
                         if let Some(registration) =
                             capture.filter(|value| value.validate_cohort(profile).is_ok())
                         {
+                            let capture = registration.capture();
                             grant = grant.with_diagnostic_limits(
                                 rz_search::pals::review_context::cpu7_capture::CaptureLimits {
-                                    max_observations: registration.max_observations,
-                                    max_line_chunks: registration.max_line_chunks,
-                                    max_states: registration.max_states,
-                                    max_owned_bytes: registration.max_owned_bytes,
-                                    max_retained_history_bytes: registration
-                                        .max_retained_history_bytes,
+                                    max_observations: capture.max_observations,
+                                    max_line_chunks: capture.max_line_chunks,
+                                    max_states: capture.max_states,
+                                    max_owned_bytes: capture.max_owned_bytes,
+                                    max_retained_history_bytes: capture.max_retained_history_bytes,
                                 },
-                                Duration::from_nanos(registration.max_duration_ns),
+                                Duration::from_nanos(capture.max_duration_ns),
                             );
+                            if let rz_experiments::rovent_utility_cohort::RoventCpu7CaptureRegistration::WithBundle(projection) = registration {
+                                grant = grant.with_original_bundle_projection(
+                                    rz_search::pals::review_context::cpu7_capture::BundleProjectionLimits {
+                                        max_records: projection.max_projection_records,
+                                        max_serialized_bytes: projection.max_projection_serialized_bytes,
+                                    },
+                                );
+                            }
                         }
                         self.driver.install_cpu7_capture_grant(grant);
                     }

@@ -268,6 +268,7 @@ impl UtilityInterventionCohortOwner {
                 root,
                 window: None,
                 neutral: None,
+                cpu7_projection: None,
                 arm_query: None,
                 action: None,
                 cost_epoch: None,
@@ -311,6 +312,12 @@ pub struct UtilityInterventionTrialAdmission<Q> {
     root: Value,
     window: Option<UtilityTrialWindow>,
     neutral: Option<(Digest, Value, Arc<NnuecUtilityInputCapture>)>,
+    cpu7_projection: Option<
+        Result<
+            Arc<rz_search::pals::review_context::cpu7_capture::Cpu7BundleProjection>,
+            rz_search::pals::review_context::cpu7_capture::CaptureUnavailable,
+        >,
+    >,
     arm_query: Option<Value>,
     action: Option<UtilityRouteActionId>,
     cost_epoch: Option<Digest>,
@@ -380,6 +387,14 @@ impl<Q> UtilityInterventionTrialAdmission<Q> {
         {
             return Err(invalid("intervention neutral source allocation changed"));
         }
+        // Retain only the detached selection-time projection, never its
+        // ReviewView/Store pin. Its capture reservation stays with the same
+        // bytes through diagnostic publication and does not mint authority.
+        self.cpu7_projection = match target.source_work().input.view.cpu7_raw_capture() {
+            None => None,
+            Some(Err(error)) => Some(Err(error.clone())),
+            Some(Ok(raw)) => raw.original_bundle_projection(),
+        };
         let digest = target.neutral_target_digest();
         let wire = super::utility_intervention_historical::neutral_target(target)?;
         let mut state = self
@@ -533,6 +548,12 @@ pub struct UtilityInterventionTrialPhysicalRetirement {
     root: Arc<crate::rovent_root_admission::RoventRootAdmission>,
     proof: UtilityCohortRootClosureProof,
     neutral: Option<(Digest, Value)>,
+    cpu7_projection: Option<
+        Result<
+            Arc<rz_search::pals::review_context::cpu7_capture::Cpu7BundleProjection>,
+            rz_search::pals::review_context::cpu7_capture::CaptureUnavailable,
+        >,
+    >,
     arm_query: Option<Value>,
     materialized:
         Option<super::utility_intervention_historical::UtilityInterventionMaterializedSource>,
@@ -737,6 +758,7 @@ impl<Q> UtilityInterventionTrialAdmission<Q> {
             preparation: self.preparation.clone(),
             proof,
             neutral: self.neutral.take().map(|(d, v, _)| (d, v)),
+            cpu7_projection: self.cpu7_projection.take(),
             arm_query: self.arm_query.take(),
             materialized: self.materialized.take(),
             cost,
@@ -753,6 +775,7 @@ impl<Q> UtilityInterventionTrialAdmission<Q> {
             }
             Err(error) => {
                 self.materialized = retired.materialized;
+                self.cpu7_projection = retired.cpu7_projection;
                 Err(UtilityInterventionTrialRetirementRejection {
                     trial: self,
                     proof: retired.proof,
@@ -763,6 +786,18 @@ impl<Q> UtilityInterventionTrialAdmission<Q> {
     }
 }
 impl UtilityInterventionTrialPhysicalRetirement {
+    /// Detached optional selection diagnostic. This is not part of /2 trial
+    /// bytes, an original publication ACK, or authority for training.
+    pub fn cpu7_projection(
+        &self,
+    ) -> Option<
+        &Result<
+            Arc<rz_search::pals::review_context::cpu7_capture::Cpu7BundleProjection>,
+            rz_search::pals::review_context::cpu7_capture::CaptureUnavailable,
+        >,
+    > {
+        self.cpu7_projection.as_ref()
+    }
     pub fn cohort_id(&self) -> Digest {
         self.shared.cohort
     }
