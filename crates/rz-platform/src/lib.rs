@@ -22,11 +22,10 @@ pub use linux::{
 mod placement;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub use placement::{
-    CurrentThreadAffinityGuard, ThreadAffinityApplyError, ThreadAffinityCause,
-    ThreadAffinityCompensationOutcome, ThreadAffinityFailure, ThreadAffinityFailureRecord,
-    ThreadAffinityMask, ThreadAffinityRestoreError, ThreadAffinityRollback,
-    ThreadAffinitySetConflict, ThreadAffinitySnapshot, ThreadAffinityStage,
-    apply_current_thread_affinity,
+    apply_current_thread_affinity, CurrentThreadAffinityGuard, ThreadAffinityApplyError,
+    ThreadAffinityCause, ThreadAffinityCompensationOutcome, ThreadAffinityFailure,
+    ThreadAffinityFailureRecord, ThreadAffinityMask, ThreadAffinityRestoreError,
+    ThreadAffinityRollback, ThreadAffinitySetConflict, ThreadAffinitySnapshot, ThreadAffinityStage,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
