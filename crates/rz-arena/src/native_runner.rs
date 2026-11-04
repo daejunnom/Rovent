@@ -8,6 +8,8 @@ use crate::{
     ProcessOutput, ProcessReceipt,
 };
 use serde::Serialize;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::{
     fmt,
     sync::{
@@ -34,6 +36,39 @@ fn clamp_original_wall(
         })?;
     Ok(declared_ms.min(remaining))
 }
+
+#[cfg(target_os = "linux")]
+fn earlier_deadline(
+    first: Option<std::time::Instant>,
+    second: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn v6_effective_deadlines(
+    run_until: std::time::Instant,
+    cleanup_until: std::time::Instant,
+    provider_until: Option<std::time::Instant>,
+) -> Result<(std::time::Instant, std::time::Instant, u64), ArenaError> {
+    let reserve = cleanup_until
+        .checked_duration_since(run_until)
+        .ok_or_else(|| ArenaError::Budget("V6 original cleanup window is invalid".into()))?;
+    let run = provider_until.map_or(run_until, |deadline| deadline.min(run_until));
+    let cleanup = run
+        .checked_add(reserve)
+        .ok_or_else(|| ArenaError::Budget("V6 effective cleanup window overflow".into()))?
+        .min(cleanup_until);
+    // The existing process supervisor permits twice its integer-millisecond
+    // grace. Round up only enough to cover the original whole deadline.
+    let grace_ms = u64::try_from(reserve.as_nanos().div_ceil(2_000_000))
+        .map_err(|_| ArenaError::Budget("V6 cleanup grace overflow".into()))?;
+    Ok((run, cleanup, grace_ms))
+}
 #[cfg(test)]
 mod original_window_tests {
     use super::*;
@@ -48,6 +83,58 @@ mod original_window_tests {
         assert!(
             clamp_original_wall(100, Some(now + std::time::Duration::from_nanos(1)), now).is_err()
         );
+    }
+
+    #[test]
+    fn v6_stricter_deadline_and_odd_cleanup_do_not_extend_the_original_window() {
+        let now = std::time::Instant::now();
+        let run = now + std::time::Duration::from_secs(10);
+        let cleanup = run + std::time::Duration::from_millis(5);
+        let earlier = now + std::time::Duration::from_secs(8);
+        assert_eq!(
+            v6_effective_deadlines(run, cleanup, Some(earlier)).unwrap(),
+            (earlier, earlier + std::time::Duration::from_millis(5), 3)
+        );
+        assert_eq!(
+            v6_effective_deadlines(run, cleanup, None).unwrap(),
+            (run, cleanup, 3)
+        );
+        assert!(v6_effective_deadlines(cleanup, run, None).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v6_control_busy_does_not_block_or_replace_the_original_owner() {
+        struct Control(Arc<std::sync::atomic::AtomicUsize>);
+        impl NativeV6Control for Control {
+            fn poll_run(
+                &mut self,
+                _: &crate::process::SpawnCustody,
+                _: std::time::Instant,
+            ) -> Result<(), ArenaError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn poll_cleanup(
+                &mut self,
+                _: &crate::process::SpawnCustody,
+                _: std::time::Instant,
+            ) -> Result<(), ArenaError> {
+                self.0.fetch_add(10, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control: Arc<Mutex<Box<dyn NativeV6Control>>> =
+            Arc::new(Mutex::new(Box::new(Control(Arc::clone(&calls)))));
+        let custody = crate::process::SpawnCustody::default();
+        let held = control.lock().unwrap();
+        poll_v6_control(&control, &custody, std::time::Instant::now(), false).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        drop(held);
+        poll_v6_control(&control, &custody, std::time::Instant::now(), false).unwrap();
+        poll_v6_control(&control, &custody, std::time::Instant::now(), true).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 11);
     }
 }
 
@@ -429,6 +516,64 @@ impl SnapshotCacheHint {
     }
 }
 
+/// The original V6 control owner remains in the same bundle as the runner.
+/// Its callbacks must be bounded/nonblocking and do not attest completion.
+#[cfg(target_os = "linux")]
+pub(crate) trait NativeV6Control: Send {
+    fn poll_run(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+    ) -> Result<(), ArenaError>;
+    fn poll_cleanup(
+        &mut self,
+        custody: &crate::process::SpawnCustody,
+        until: std::time::Instant,
+    ) -> Result<(), ArenaError>;
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct NativeV6Supervisor {
+    execution: crate::pals_adaptive_launch::PalsV6ExecutionStart,
+    control: Arc<Mutex<Box<dyn NativeV6Control>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl NativeV6Supervisor {
+    pub(crate) fn new(
+        execution: crate::pals_adaptive_launch::PalsV6ExecutionStart,
+        control: Box<dyn NativeV6Control>,
+    ) -> Self {
+        Self {
+            execution,
+            control: Arc::new(Mutex::new(control)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn poll_v6_control(
+    control: &Mutex<Box<dyn NativeV6Control>>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+    cleanup: bool,
+) -> Result<(), ArenaError> {
+    let mut owner = match control.try_lock() {
+        Ok(owner) => owner,
+        // The original owner remains intact and the supervisor will poll
+        // again; transient contention is not a process failure or completion.
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("v6 original control owner poisoned".into()));
+        }
+    };
+    if cleanup {
+        owner.poll_cleanup(custody, until)
+    } else {
+        owner.poll_run(custody, until)
+    }
+}
+
 struct NativeRunBundle<S: NativeProviderDeclaration> {
     owner: Option<NativeLaunchOwner<S>>,
     process: Option<ProcessOutput>,
@@ -441,6 +586,8 @@ struct NativeRunBundle<S: NativeProviderDeclaration> {
     /// cleared only by the matching physical/no-GPU evidence verifier.
     spawn_custody: crate::process::SpawnCustody,
     physical_guard_required: bool,
+    #[cfg(target_os = "linux")]
+    v6_supervisor: Option<NativeV6Supervisor>,
 }
 
 /// Original probe output retained after a storage failure.  Taking this value
@@ -723,6 +870,8 @@ mod physical_guard_tests {
             probe_evidence: None,
             spawn_custody: crate::process::SpawnCustody::default(),
             physical_guard_required: true,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
         };
         assert!(!bundle.unresolved()); // no child was spawned
         bundle.spawn_custody.pending.store(true, Ordering::Release);
@@ -743,6 +892,8 @@ mod physical_guard_tests {
             probe_evidence: None,
             spawn_custody: crate::process::SpawnCustody::default(),
             physical_guard_required: false,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
         };
         bundle.spawn_custody.pending.store(true, Ordering::Release);
         assert!(!bundle.unresolved());
@@ -827,6 +978,8 @@ mod physical_guard_tests {
             probe_evidence: Some(reservation),
             spawn_custody: crate::process::SpawnCustody::default(),
             physical_guard_required: true,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
         };
         assert!(!bundle.unresolved());
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -860,6 +1013,8 @@ mod physical_guard_tests {
             probe_evidence: Some(next),
             spawn_custody: crate::process::SpawnCustody::default(),
             physical_guard_required: true,
+            #[cfg(target_os = "linux")]
+            v6_supervisor: None,
         };
         let caller_owned = bundle
             .take_evidence()
@@ -889,6 +1044,8 @@ mod physical_guard_tests {
                 probe_evidence: Some(pending),
                 spawn_custody: crate::process::SpawnCustody::default(),
                 physical_guard_required: true,
+                #[cfg(target_os = "linux")]
+                v6_supervisor: None,
             },
         };
         let refused = failure.with_guarded_evidence(|view| {
@@ -983,6 +1140,8 @@ impl<S: NativeProviderDeclaration> Drop for NativeRunBundle<S> {
                 role: p.role,
                 probe: p.probe,
             }),
+            #[cfg(target_os = "linux")]
+            _v6_supervisor: self.v6_supervisor.take(),
         });
         // The mutex protects only a short vector append; transient contention must not
         // turn an otherwise recoverable owner into an inaccessible leak.
@@ -1001,6 +1160,8 @@ struct RetainedNativeScope {
     guarded_preflight_failures: Vec<String>,
     interrupted_by_unwind: bool,
     guarded_probe_scope: Option<GuardedProbeScope>,
+    #[cfg(target_os = "linux")]
+    _v6_supervisor: Option<NativeV6Supervisor>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1221,6 +1382,8 @@ mod quarantine_observation_tests {
                 guarded_preflight_failures: Vec::new(),
                 interrupted_by_unwind: false,
                 guarded_probe_scope: None,
+                #[cfg(target_os = "linux")]
+                _v6_supervisor: None,
             })
         };
         let slots = vec![owner(11, "first"), owner(22, "second")];
@@ -1488,6 +1651,29 @@ pub(crate) fn run_native_pair_for<S: NativeProviderDeclaration>(
     owner: NativeLaunchOwner<S>,
     cancel: Option<&AtomicBool>,
 ) -> Result<NativePairOutput<S>, Box<NativePairFailure<S>>> {
+    run_native_pair_inner(owner, cancel, None)
+}
+
+/// V6-only opt-in. The caller transfers its original execution/control owner;
+/// no deadline is created from dispatch time and no physical fence is implied.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_native_pair_for_v6_controlled(
+    owner: NativeLaunchOwner<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+    cancel: Option<&AtomicBool>,
+    supervisor: NativeV6Supervisor,
+) -> Result<
+    NativePairOutput<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>,
+    Box<NativePairFailure<crate::pals_adaptive_launch::LockedPalsSystemArenaPairV6>>,
+> {
+    run_native_pair_inner(owner, cancel, Some(supervisor))
+}
+
+fn run_native_pair_inner<S: NativeProviderDeclaration>(
+    owner: NativeLaunchOwner<S>,
+    cancel: Option<&AtomicBool>,
+    #[cfg(target_os = "linux")] supervisor: Option<NativeV6Supervisor>,
+    #[cfg(not(target_os = "linux"))] _supervisor: Option<()>,
+) -> Result<NativePairOutput<S>, Box<NativePairFailure<S>>> {
     // Existing V1/V5 and Rovent V3 declarations keep their established
     // behavior. PALS V6 must explicitly opt in before its launch guard opens.
     let physical_guard_required = owner.spec.requires_physical_lifetime_guard();
@@ -1501,6 +1687,8 @@ pub(crate) fn run_native_pair_for<S: NativeProviderDeclaration>(
         probe_evidence: None,
         spawn_custody: crate::process::SpawnCustody::default(),
         physical_guard_required,
+        #[cfg(target_os = "linux")]
+        v6_supervisor: supervisor,
     };
     #[cfg(target_os = "linux")]
     let result = linux::run(&mut bundle, cancel);
@@ -2099,6 +2287,7 @@ pub(crate) mod linux {
         bundle: &mut NativeRunBundle<S>,
         cancel: Option<&AtomicBool>,
         run_id: Option<u64>,
+        v6_deadline: Option<std::time::Instant>,
     ) -> Result<(Vec<crate::ExternalUciPreflight>, Vec<ArtifactRef>), ArenaError> {
         let mut receipts = Vec::new();
         let mut provider_artifacts = Vec::new();
@@ -2162,7 +2351,7 @@ pub(crate) mod linux {
             let mut limits = crate::ProcessLimits {
                 wall_ms: clamp_original_wall(
                     e.handshake_timeout_ms,
-                    owner.spec.original_wall_deadline()?,
+                    earlier_deadline(owner.spec.original_wall_deadline()?, v6_deadline),
                     std::time::Instant::now(),
                 )?,
                 shutdown_grace_ms: owner.spec.view().timeouts.shutdown_ms,
@@ -2284,7 +2473,7 @@ pub(crate) mod linux {
             preflight_runtime_totals(owner)?;
             limits.wall_ms = clamp_original_wall(
                 limits.wall_ms,
-                owner.spec.original_wall_deadline()?,
+                earlier_deadline(owner.spec.original_wall_deadline()?, v6_deadline),
                 std::time::Instant::now(),
             )?;
             if bundle.physical_guard_required {
@@ -2507,6 +2696,32 @@ pub(crate) mod linux {
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let run_started = std::time::Instant::now();
+        let (v6_window, v6_deadline, v6_grace) =
+            if let Some(supervisor) = bundle.v6_supervisor.as_ref() {
+                let owner = bundle.owner.as_ref().expect("prepared native owner");
+                if !bundle.physical_guard_required
+                    || owner.spec.input_sha256() != supervisor.execution.pair_sha256()
+                {
+                    return Err(invalid(
+                        "V6 control requires the same guarded original pair",
+                    ));
+                }
+                // A provider may specify a stricter limit; accept it without
+                // extending the original run or its cleanup reserve.
+                let (run_until, cleanup_until, grace) = v6_effective_deadlines(
+                    supervisor.execution.run_until(),
+                    supervisor.execution.cleanup_until(),
+                    owner.spec.original_wall_deadline()?,
+                )?;
+                let window = crate::process::OriginalProcessWindow::new(
+                    supervisor.execution.started(),
+                    run_until,
+                    cleanup_until,
+                )?;
+                (Some(window), Some(run_until), Some(grace))
+            } else {
+                (None, None, None)
+            };
         let run_id = if bundle.physical_guard_required {
             Some(
                 GUARDED_EVIDENCE_NEXT_RUN
@@ -2516,7 +2731,7 @@ pub(crate) mod linux {
         } else {
             None
         };
-        {
+        if v6_window.is_none() {
             let owner = bundle.owner.as_mut().expect("prepared native owner");
             owner.snapshot.limits.wall_ms = clamp_original_wall(
                 owner.snapshot.limits.wall_ms,
@@ -2531,7 +2746,7 @@ pub(crate) mod linux {
             .spec
             .validate_runtime_admission()?;
         let (external_preflight, preflight_artifacts) =
-            preflight_endpoints(bundle, cancel, run_id)?;
+            preflight_endpoints(bundle, cancel, run_id, v6_deadline)?;
         let owner = bundle.owner.as_mut().expect("prepared native owner");
         crate::emit_native_phase("prelaunch_verification_started");
         let mut rolling = SnapshotCacheHint::rolling(
@@ -2564,16 +2779,21 @@ pub(crate) mod linux {
             }
         };
         let mut limits = s.limits;
-        limits.wall_ms = limits
-            .wall_ms
-            .checked_sub(u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX))
-            .filter(|n| *n > 0)
-            .ok_or_else(|| invalid("V2 prelaunch consumed whole pair runtime budget"))?;
-        limits.wall_ms = clamp_original_wall(
-            limits.wall_ms,
-            owner.spec.original_wall_deadline()?,
-            std::time::Instant::now(),
-        )?;
+        if let Some(grace) = v6_grace {
+            limits.shutdown_grace_ms = limits.shutdown_grace_ms.max(grace);
+        }
+        if v6_window.is_none() {
+            limits.wall_ms = limits
+                .wall_ms
+                .checked_sub(u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX))
+                .filter(|n| *n > 0)
+                .ok_or_else(|| invalid("V2 prelaunch consumed whole pair runtime budget"))?;
+            limits.wall_ms = clamp_original_wall(
+                limits.wall_ms,
+                owner.spec.original_wall_deadline()?,
+                std::time::Instant::now(),
+            )?;
+        }
         if bundle.physical_guard_required {
             bundle.probe_evidence = Some(GuardedProbeReservation::acquire(
                 run_id.expect("guarded run has evidence identity"),
@@ -2583,25 +2803,51 @@ pub(crate) mod linux {
                 limits.max_output_bytes,
             ));
         }
-        let process = crate::process::supervise_tree_observed_with_spawn(
-            &if let Some(execution) = owner.spec.match_execution() {
-                crate::native_launch::linux::pin(&s.pins, &execution.executor)?
+        let runner = &if let Some(execution) = owner.spec.match_execution() {
+            crate::native_launch::linux::pin(&s.pins, &execution.executor)?
+        } else {
+            &s.pins[s.runner_index]
+        }
+        .file;
+        let process =
+            if let (Some(window), Some(supervisor)) = (v6_window, bundle.v6_supervisor.as_ref()) {
+                let run_owner = Arc::clone(&supervisor.control);
+                let cleanup_owner = Arc::clone(&supervisor.control);
+                let mut run_control = |custody: &crate::process::SpawnCustody, until| {
+                    poll_v6_control(&run_owner, custody, until, false)
+                };
+                let mut cleanup_control = |custody: &crate::process::SpawnCustody, until| {
+                    poll_v6_control(&cleanup_owner, custody, until, true)
+                };
+                crate::process::supervise_tree_observed_with_controls(
+                    runner,
+                    &s.invocation.args,
+                    &s.cwd,
+                    limits,
+                    cancel,
+                    &s.watch,
+                    Some(&mut on_stdout),
+                    Some(&mut bundle.spawn_custody),
+                    Some(&mut run_control),
+                    Some(&mut cleanup_control),
+                    Some(window),
+                )?
             } else {
-                &s.pins[s.runner_index]
-            }
-            .file,
-            &s.invocation.args,
-            &s.cwd,
-            limits,
-            cancel,
-            &s.watch,
-            Some(&mut on_stdout),
-            if bundle.physical_guard_required {
-                Some(&mut bundle.spawn_custody)
-            } else {
-                None
-            },
-        )?;
+                crate::process::supervise_tree_observed_with_spawn(
+                    runner,
+                    &s.invocation.args,
+                    &s.cwd,
+                    limits,
+                    cancel,
+                    &s.watch,
+                    Some(&mut on_stdout),
+                    if bundle.physical_guard_required {
+                        Some(&mut bundle.spawn_custody)
+                    } else {
+                        None
+                    },
+                )?
+            };
         crate::native_diagnostics::finish_logs();
         crate::emit_native_phase("runner_supervision_finished");
         bundle.process = Some(process);
