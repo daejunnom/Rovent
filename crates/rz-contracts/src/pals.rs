@@ -1,6 +1,7 @@
 //! PALS-specific contracts. The existing evaluation revision 0.1 is unchanged.
 //! IDs and digests are issued by owners; estimates never certify Rules facts.
 
+pub mod cancel_control_v1;
 pub mod deadline_grant_v1;
 
 use crate::{
@@ -474,14 +475,18 @@ mod tests {
         assert!(output.validate_for(&validator).is_err());
         let mut deployment = validator;
         deployment.mode = ExecutionMode::Deployment;
-        assert!(deployment
-            .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
-            .is_err());
+        assert!(
+            deployment
+                .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
+                .is_err()
+        );
         let mut proposer = role_request(Role::Proposer);
         proposer.divergence_count = 1;
-        assert!(proposer
-            .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
-            .is_err());
+        assert!(
+            proposer
+                .validate(ClockDomain(ProcessEpoch(1)), MonotonicTick(1))
+                .is_err()
+        );
     }
 
     #[test]
@@ -525,10 +530,12 @@ mod tests {
             conditions: Digest([3; 32]),
             ..coverage
         }));
-        assert!(!CpuCoverage {
-            bound: Bound::LowerAtDepth,
-            ..coverage
-        }
-        .satisfies(coverage));
+        assert!(
+            !CpuCoverage {
+                bound: Bound::LowerAtDepth,
+                ..coverage
+            }
+            .satisfies(coverage)
+        );
     }
 }
