@@ -1126,9 +1126,11 @@ mod tests {
                 }
                 if self.0.timer.as_ref().is_some_and(JoinHandle::is_finished) {
                     if let Some(timer) = self.0.timer.take() {
-                        let _ = timer.join();
+                        match timer.join() {
+                            Ok(()) => self.0.timer_joined = true,
+                            Err(payload) => self.0.timer_panic = Some(payload),
+                        }
                     }
-                    self.0.timer_joined = true;
                 }
             }
         }
@@ -1160,6 +1162,10 @@ mod tests {
         assert!(run.final_output_observation().is_some());
         // TimerGuard retires and joins this fixture's own CPU timer on both
         // normal return and assertion unwind; no GPU resource was created.
+        drop(guard);
+        let original = slot.original_run().unwrap();
+        assert!(original.timer_joined);
+        assert!(original.timer_panic.is_none());
     }
 
     #[test]
