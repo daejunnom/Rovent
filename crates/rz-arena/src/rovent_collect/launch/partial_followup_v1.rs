@@ -73,7 +73,10 @@ pub fn decide_partial_followup(
             if process_tree == ProcessTreeState::GoneObserved
                 && producer_exit == ProducerExit::Exited(PARTIAL_COLLECTION_EXIT_CODE)
                 && partial.is_some_and(|reader| {
-                    reader.chunk_count() > 0 && reader.failure_evidence_integrity_verified()
+                    reader.chunk_count() > 0
+                        && reader
+                            .verify_failure_evidence_current()
+                            .is_ok_and(|valid| valid)
                 })
             {
                 FollowupDecision::Run

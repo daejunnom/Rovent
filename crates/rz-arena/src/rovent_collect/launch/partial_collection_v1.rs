@@ -331,6 +331,261 @@ fn portable_attempt(v: &serde_json::Value) -> bool {
         && p["stderr_bytes"].as_u64().is_some()
 }
 
+fn portable_teacher_fields(teacher: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(dispatch) = teacher.get("dispatch") else {
+        return false;
+    };
+    let Some(completion) = teacher.get("completion") else {
+        return false;
+    };
+    let Some(scope) = teacher.get("input_scope") else {
+        return false;
+    };
+    let Some(startup) = teacher.get("startup") else {
+        return false;
+    };
+    let Some(profiled) = teacher.get("profiled_report") else {
+        return false;
+    };
+    let process = |v: &serde_json::Value| {
+        exact_keys(v, &["pid", "process_group", "proc_start_ticks"])
+            && ["pid", "process_group", "proc_start_ticks"]
+                .iter()
+                .all(|k| v[*k].as_u64().is_some())
+    };
+    let nonempty = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.is_empty());
+    let seq_keys = [
+        "cancel_sequence",
+        "yield_sequence",
+        "publish_sequence",
+        "cancel_ack",
+        "yield_ack",
+        "publish_ack",
+    ];
+    let controls = &completion["controls"];
+    let control_keys = [
+        "cancel_sequence",
+        "yield_sequence",
+        "publish_sequence",
+        "cancel_ack",
+        "yield_ack",
+        "publish_ack",
+        "terminal",
+    ];
+    let deadline = &dispatch["original_deadline"];
+    let authority = &scope["authority"];
+    let scope_digests = [
+        "input_sha256",
+        "view_sha256",
+        "source_sha256",
+        "rules_semantic",
+        "input_lock",
+        "root_admission",
+        "root_budget",
+        "frozen_actor",
+    ];
+    let scope_keys = [
+        "authority",
+        "input_sha256",
+        "view_sha256",
+        "source_sha256",
+        "role",
+        "rules_semantic",
+        "input_lock",
+        "root_admission",
+        "root_budget",
+        "frozen_actor",
+    ];
+    let opinion_ok = |v: &serde_json::Value| {
+        let score = &v["score"];
+        let score_ok = match score["kind"].as_str() {
+            Some("unknown") => exact_keys(score, &["kind"]),
+            Some("centipawns" | "mate_moves") => {
+                exact_keys(score, &["kind", "value"]) && score["value"].as_i64().is_some()
+            }
+            _ => false,
+        };
+        let wdl = &v["reported_wdl"];
+        exact_keys(
+            v,
+            &[
+                "rank",
+                "depth",
+                "seldepth",
+                "score",
+                "bound",
+                "reported_wdl",
+                "pv",
+            ],
+        ) && v["rank"].as_u64().is_some()
+            && v["depth"].as_u64().is_some()
+            && optional_u64(&v["seldepth"])
+            && score_ok
+            && matches!(
+                v["bound"].as_str(),
+                Some("exact_reported" | "lower" | "upper" | "unknown")
+            )
+            && (wdl.is_null()
+                || wdl
+                    .as_array()
+                    .is_some_and(|a| a.len() == 3 && a.iter().all(|n| n.as_u64().is_some())))
+            && v["pv"].as_array().is_some_and(|a| a.iter().all(nonempty))
+    };
+    exact_keys(
+        dispatch,
+        &[
+            "collection_owner",
+            "sequence",
+            "process",
+            "constraint",
+            "original_deadline_debug",
+            "original_debug",
+            "original_deadline",
+            "soft_quantum_ns",
+            "profile",
+            "evaluation_namespace_sha256",
+            "root_restriction_sha256",
+            "original_root_moves",
+        ],
+    ) && dispatch["collection_owner"].as_u64().is_some()
+        && dispatch["sequence"].as_u64().is_some()
+        && process(&dispatch["process"])
+        && serde_json::from_value::<rz_search::external_cpu::ExternalGoConstraint>(
+            dispatch["constraint"].clone(),
+        )
+        .is_ok()
+        && nonempty(&dispatch["original_deadline_debug"])
+        && nonempty(&dispatch["original_debug"])
+        && exact_keys(deadline, &["clock_epoch", "at_ns"])
+        && deadline["clock_epoch"].as_u64().is_some()
+        && deadline["at_ns"].as_u64().is_some()
+        && dispatch["soft_quantum_ns"].as_u64().is_some()
+        && serde_json::from_value::<rz_search::external_cpu::ExternalEngineProfile>(
+            dispatch["profile"].clone(),
+        )
+        .is_ok()
+        && ["evaluation_namespace_sha256", "root_restriction_sha256"]
+            .iter()
+            .all(|k| dispatch[*k].as_str().is_some_and(digest_string))
+        && (dispatch["original_root_moves"].is_null()
+            || dispatch["original_root_moves"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(nonempty)))
+        && exact_keys(
+            completion,
+            &[
+                "collection_owner",
+                "sequence",
+                "matches_dispatch_identity",
+                "process",
+                "go_issue",
+                "issued_go",
+                "issued_constraint",
+                "controls",
+                "timing_debug",
+                "original_debug",
+            ],
+        )
+        && completion["collection_owner"].as_u64().is_some()
+        && completion["sequence"].as_u64().is_some()
+        && completion["matches_dispatch_identity"].as_bool().is_some()
+        && (completion["process"].is_null() || process(&completion["process"]))
+        && matches!(
+            completion["go_issue"].as_str(),
+            Some("not_issued" | "unknown" | "issued")
+        )
+        && (completion["issued_go"].is_null() || completion["issued_go"].is_string())
+        && (completion["issued_constraint"].is_null()
+            || serde_json::from_value::<rz_search::external_cpu::ExternalGoConstraint>(
+                completion["issued_constraint"].clone(),
+            )
+            .is_ok())
+        && exact_keys(controls, &control_keys)
+        && seq_keys.iter().all(|k| controls[*k].as_u64().is_some())
+        && controls["terminal"].as_bool().is_some()
+        && nonempty(&completion["timing_debug"])
+        && nonempty(&completion["original_debug"])
+        && exact_keys(scope, &scope_keys)
+        && scope_digests
+            .iter()
+            .all(|k| scope[*k].as_str().is_some_and(digest_string))
+        && nonempty(&scope["role"])
+        && exact_keys(
+            authority,
+            &[
+                "process_epoch",
+                "game_generation",
+                "root_generation",
+                "implementation_sha256",
+            ],
+        )
+        && ["process_epoch", "game_generation", "root_generation"]
+            .iter()
+            .all(|k| authority[*k].as_u64().is_some())
+        && authority["implementation_sha256"]
+            .as_str()
+            .is_some_and(digest_string)
+        && exact_keys(
+            startup,
+            &[
+                "actor_id",
+                "pin",
+                "canonical_sha256",
+                "capability_sha256",
+                "input_lock_sha256",
+                "observed_uci",
+                "process_identity",
+            ],
+        )
+        && nonempty(&startup["actor_id"])
+        && serde_json::from_value::<rz_experiments::rovent_corpus::RoventTeacherPin>(
+            startup["pin"].clone(),
+        )
+        .is_ok()
+        && ["canonical_sha256", "capability_sha256", "input_lock_sha256"]
+            .iter()
+            .all(|k| startup[*k].as_str().is_some_and(digest_string))
+        && exact_keys(&startup["observed_uci"], &["name", "author"])
+        && nonempty(&startup["observed_uci"]["name"])
+        && (startup["observed_uci"]["author"].is_null()
+            || startup["observed_uci"]["author"].is_string())
+        && process(&startup["process_identity"])
+        && ["reported_node_overshoot", "readiness_barrier_completed"]
+            .iter()
+            .all(|k| profiled[*k].as_bool().is_some())
+        && optional_u64(&profiled["strict_native_nodes"])
+        && (profiled["option_application_observed"].is_null()
+            || profiled["option_application_observed"].is_boolean())
+        && serde_json::from_value::<rz_search::external_cpu::ExternalEngineProfile>(
+            profiled["profile"].clone(),
+        )
+        .is_ok()
+        && serde_json::from_value::<rz_search::external_cpu::ExternalEnginePurpose>(
+            profiled["purpose"].clone(),
+        )
+        .is_ok()
+        && ["requested", "issued"].iter().all(|k| {
+            serde_json::from_value::<rz_search::external_cpu::ExternalGoConstraint>(
+                profiled[*k].clone(),
+            )
+            .is_ok()
+        })
+        && nonempty(&profiled["issued_go"])
+        && teacher
+            .get("opinions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| a.iter().all(opinion_ok))
+        && teacher.get("stop_control").is_some_and(|v| {
+            v.is_null()
+                || (exact_keys(v, &["sequence", "action"])
+                    && v["sequence"].as_u64().is_some()
+                    && matches!(
+                        v["action"].as_str(),
+                        Some("continue" | "yield" | "cancel" | "revoked")
+                    ))
+        })
+}
+
 fn verify_failure_evidence(
     directory: &Dir,
     spec: &PartialCollectionSpec,
@@ -433,11 +688,14 @@ fn verify_failure_evidence(
             && teacher.get("schema").and_then(serde_json::Value::as_str)
                 == Some("portable_teacher_observation_v1")
             && teacher.get("opaque_exclusions") == Some(&exclusions);
-        let sequence = row
-            .original_row
-            .get("native")
-            .and_then(|v| v.get("retired_sequence"))
-            .and_then(serde_json::Value::as_u64);
+        let original_json = serde_json::to_string(&row.original_row)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let original =
+            rz_experiments::rovent_corpus_lock_v2::record::RoventTrainingRecordLockV2::from_json(
+                &original_json,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let sequence = Some(original.0.native.retired_sequence);
         if row.schema != FAILURE_DOMAIN
             || row.error.is_empty()
             || !row.original_row.is_object()
@@ -445,6 +703,7 @@ fn verify_failure_evidence(
             || row.owner_reconstructable
             || row.physical_completion != "not_attested"
             || !complete_teacher
+            || !portable_teacher_fields(teacher)
             || teacher.get("conditional_policy_target_known")
                 != Some(&serde_json::Value::Bool(false))
             || teacher.get("portable_observation_complete") != Some(&serde_json::Value::Bool(true))
@@ -736,6 +995,7 @@ fn read_partial_receipt_in(
 /// Each visit independently verifies the bytes it will pass to the callback.
 pub struct PartialCollectionReader {
     directory: Dir,
+    spec: PartialCollectionSpec,
     receipt: PartialCollectionReceipt,
 }
 
@@ -743,7 +1003,11 @@ impl PartialCollectionReader {
     pub fn open(parent: &Dir, spec: &PartialCollectionSpec) -> io::Result<Self> {
         let directory = parent.open_dir_nofollow(DIRECTORY)?;
         let receipt = read_partial_receipt_in(&directory, spec)?;
-        Ok(Self { directory, receipt })
+        Ok(Self {
+            directory,
+            spec: spec.clone(),
+            receipt,
+        })
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -754,10 +1018,12 @@ impl PartialCollectionReader {
         &self.receipt
     }
 
-    /// Readback checked only serialized evidence bytes and their declared
-    /// identities, not reconstructability of the native owner or completion.
-    pub fn failure_evidence_integrity_verified(&self) -> bool {
-        self.receipt.failure_evidence.is_some()
+    /// Rechecks the current file against the pinned receipt and the original
+    /// spec. This observation has a time boundary: a later mutation can still
+    /// occur, and neither this nor a clean process exit establishes a fence.
+    pub fn verify_failure_evidence_current(&self) -> io::Result<bool> {
+        verify_failure_evidence(&self.directory, &self.spec, &self.receipt)?;
+        Ok(self.receipt.failure_evidence.is_some())
     }
 
     pub fn visit_chunk(
@@ -1190,6 +1456,14 @@ mod tests {
             "process":{"process_identity":null,"stop_sent":false,"quit_sent":false,"exit_observed":false,
                 "stdout_drained":false,"stderr_drained":false,"exit_code":null,"exit_signal":null,
                 "cleanup_complete":false,"quarantined":false,"ownership_lost":false,"stdout_bytes":0,"stderr_bytes":0}}});
+        assert!(portable_report(&report));
+        assert!(portable_attempt(&attempt));
+        let mut malformed_report = report.clone();
+        malformed_report.as_object_mut().unwrap().remove("completion");
+        assert!(!portable_report(&malformed_report));
+        let mut malformed_attempt = attempt.clone();
+        malformed_attempt["external"]["process"]["stdout_bytes"] = "missing".into();
+        assert!(!portable_attempt(&malformed_attempt));
         let evidence = serde_json::json!({"schema":FAILURE_DOMAIN,"row_id":"failure-sequence-1",
             "original_row":{"native":{"retired_sequence":1}},"error":"fixture only",
             "teacher_evidence":{"schema":"portable_teacher_observation_v1","dispatch":{},"completion":{},"input_scope":{},"startup":{},
@@ -1225,7 +1499,16 @@ mod tests {
         assert!(write_partial_receipt(&output, &spec(), &receipt).is_err());
         assert!(!path.join(DIRECTORY).join(FILE).exists());
         std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), &evidence_bytes).unwrap();
-        write_partial_receipt(&output, &spec(), &receipt).unwrap();
+        // This intentionally incomplete synthetic original row must never pass
+        // the real lock-v2 decoder, even if the file's digest is correct.
+        assert!(write_partial_receipt(&output, &spec(), &receipt).is_err());
+        assert!(!path.join(DIRECTORY).join(FILE).exists());
+        let empty = PartialCollectionAccounting::new(8, 4096)
+            .unwrap()
+            .finish(PartialEndReason::InputExhausted)
+            .ok()
+            .unwrap();
+        write_partial_receipt(&output, &spec(), &empty).unwrap();
         assert!(read_partial_receipt(&parent, &spec()).is_ok());
         {
             use super::super::partial_followup_v1::{
@@ -1234,7 +1517,7 @@ mod tests {
                 decide_partial_followup,
             };
             let reader = PartialCollectionReader::open(&parent, &spec()).unwrap();
-            assert!(reader.failure_evidence_integrity_verified());
+            assert!(!reader.verify_failure_evidence_current().unwrap());
             let decide = |dep, resources| {
                 decide_partial_followup(
                     dep,
@@ -1271,12 +1554,9 @@ mod tests {
                 FollowupDecision::Run
             );
         }
-        std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), b"corrupt\n").unwrap();
-        assert!(read_partial_receipt(&parent, &spec()).is_err());
-        std::fs::write(path.join(DIRECTORY).join(FAILURE_FILE), &evidence_bytes).unwrap();
         assert!(!path.join("publication.json").exists());
         assert!(!path.join(DIRECTORY).join("publication.json").exists());
-        assert!(write_partial_receipt(&output, &spec(), &receipt).is_err());
+        assert!(write_partial_receipt(&output, &spec(), &empty).is_err());
         let receipt_path = path.join(DIRECTORY).join(FILE);
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
