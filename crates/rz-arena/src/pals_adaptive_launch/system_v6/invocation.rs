@@ -149,6 +149,15 @@ impl PalsV6RoleSockets {
         }
     }
 
+    /// The child-only name is a declaration, not a bound listener or peer proof.
+    pub(super) fn selected_child_name(&self, role: NativeEngineRole) -> &str {
+        &self.roles[match role {
+            NativeEngineRole::Baseline => 0,
+            NativeEngineRole::Candidate => 1,
+        }]
+        .child_name
+    }
+
     pub(crate) fn verify_original(
         &self,
         owner: &NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
