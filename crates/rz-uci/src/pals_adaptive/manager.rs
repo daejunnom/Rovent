@@ -2072,6 +2072,10 @@ struct RoleBinding<Q, O> {
     /// reservation. Disabled-only tickets must not consume capture custody.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     v2_capture_possible: bool,
+    /// The actual native acceptance is already consumed by the registry.
+    /// Busy retries only this observer callback using the retained binding.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_accept_pending: bool,
     physical: Option<TicketExecutionEvidence>,
     prepared_at: Instant,
     preparation_elapsed: Option<Duration>,
@@ -3722,11 +3726,73 @@ where
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
             self.collection_pending_event.is_some()
+                || self.roles.iter().any(|role| role.collection_accept_pending)
         }
         #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
         {
             false
         }
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn poll_collection_pending_acceptances(&mut self) -> Result<bool, AdaptiveManagerError> {
+        let mut changed = false;
+        for index in 0..self.roles.len() {
+            if !self.roles[index].collection_accept_pending {
+                continue;
+            }
+            let verifier =
+                self.native
+                    .native_acceptance_verifier()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "pending collection native verifier absent",
+                    ))?;
+            let admission =
+                self.collection_admission_v2
+                    .as_ref()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "pending collection admission absent",
+                    ))?;
+            let binding = &self.roles[index];
+            let proof =
+                binding
+                    .reciprocal_acceptance
+                    .as_ref()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "pending collection acceptance absent",
+                    ))?;
+            let output = binding
+                .delivered
+                .as_ref()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "pending collection output absent",
+                ))?;
+            let witness = collection::VersionedCollectionAcceptedWitness::new(
+                admission,
+                &verifier,
+                proof,
+                output.proposer_ranking_output(),
+            )?;
+            let observer =
+                self.collection_observer_v2
+                    .as_mut()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "pending collection observer absent",
+                    ))?;
+            let result = observer.try_accepted(witness, &binding.input, output.as_ref());
+            match result {
+                Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {}
+                Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {
+                    self.roles[index].collection_accept_pending = false;
+                    changed = true;
+                }
+                Err(error) => {
+                    self.roles[index].collection_accept_pending = false;
+                    self.record_failure(error.into());
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
     }
     fn has_collection_v2(&self) -> bool {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -4443,6 +4509,8 @@ where
             rovent_collection_registered: false,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             v2_capture_possible: false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_accept_pending: false,
             physical: None,
             prepared_at: Instant::now(),
             preparation_elapsed: None,
@@ -5486,14 +5554,23 @@ where
                                                     )
                                                 })
                                                 .and_then(|witness| {
-                                                    observer.accepted(
+                                                    observer.try_accepted(
                                                         witness,
                                                         &binding.input,
                                                         output.as_ref(),
                                                     )
                                                 });
-                                            if let Err(error) = result {
-                                                collection_failures.push(error);
+                                            match result {
+                                                Ok(
+                                                    collection::AdaptiveCollectionBoundaryV2::Busy,
+                                                ) => {
+                                                    self.roles[index].collection_accept_pending =
+                                                        true;
+                                                }
+                                                Ok(
+                                                    collection::AdaptiveCollectionBoundaryV2::Ready,
+                                                ) => {}
+                                                Err(error) => collection_failures.push(error),
                                             }
                                         } else {
                                             collection_failures.push(AdaptiveCollectionError::new(AdaptiveCollectionStage::Accepted,
@@ -6203,6 +6280,10 @@ where
         // The root common ledger receives only the real native ledger's
         // opaque success receipt, before any later semantic CPU publication.
         let mut changed = self.flush_frontier_native()?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            changed |= self.poll_collection_pending_acceptances()?;
+        }
         for index in 0..self.own.len() {
             if self.own[index]
                 .binding
@@ -6241,6 +6322,16 @@ where
             }
         }
         while self.driver.semantic_owner_available() {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if let Some(DeferredCommit::Role { ticket, .. }) = self.deferred.front() {
+                if self
+                    .roles
+                    .iter()
+                    .any(|role| role.ticket == Some(*ticket) && role.collection_accept_pending)
+                {
+                    break;
+                }
+            }
             if self.phase == ManagerPhase::Running && !self.driver.prepare_semantic_commit()? {
                 break;
             }
