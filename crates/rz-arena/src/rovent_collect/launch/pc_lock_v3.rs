@@ -737,8 +737,39 @@ pub(crate) struct ManagedOutputOwnerV3 {
 struct ManagedOutputStateV3 {
     observation: super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
     authorized: bool,
+    directory: Option<Dir>,
     chunks: Option<Dir>,
     uncertain: bool,
+}
+
+impl ManagedOutputStateV3 {
+    /// Compare the retained chunks capability with the current no-follow
+    /// entry under the retained output root. This is an observation, not a
+    /// claim that unrelated writers cannot race or mutate that directory.
+    fn check_chunks_binding(&self) -> std::io::Result<()> {
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("managed output root missing"))?;
+        let held = self
+            .chunks
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("managed chunks missing"))?
+            .try_clone()?
+            .into_std_file()
+            .metadata()?;
+        let current = directory
+            .open_dir_nofollow("chunks")?
+            .into_std_file()
+            .metadata()?;
+        if !held.is_dir()
+            || !current.is_dir()
+            || (held.dev(), held.ino()) != (current.dev(), current.ino())
+        {
+            return Err(std::io::Error::other("managed chunks binding changed"));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) enum ManagedOutputWriteErrorV3 {
@@ -749,24 +780,38 @@ pub(crate) enum ManagedOutputWriteErrorV3 {
 
 #[allow(dead_code)]
 impl ManagedOutputOwnerV3 {
+    /// `deadline` is the original collection cleanup ceiling, not the
+    /// shorter startup deadline; expiry preserves any unfinished packet.
     pub(super) fn from_observation(
         inputs: Arc<PreparedPcCollectionInputsV3>,
         observation: super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
         deadline: Instant,
-    ) -> Result<Self, ArenaError> {
-        check(
-            Instant::now() < deadline
-                && inputs
-                    .managed_binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.same_original(&observation.original_binding())),
-            "Collection output original observation differs",
-        )?;
+    ) -> Result<
+        Self,
+        (
+            ArenaError,
+            Arc<PreparedPcCollectionInputsV3>,
+            super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+        ),
+    > {
+        if Instant::now() >= deadline
+            || !inputs
+                .managed_binding
+                .as_ref()
+                .is_some_and(|binding| binding.same_original(&observation.original_binding()))
+        {
+            return Err((
+                invalid("Collection output original observation differs or expired"),
+                inputs,
+                observation,
+            ));
+        }
         Ok(Self {
             inputs,
             state: Mutex::new(ManagedOutputStateV3 {
                 observation,
                 authorized: false,
+                directory: None,
                 chunks: None,
                 uncertain: false,
             }),
@@ -855,9 +900,11 @@ impl ManagedOutputOwnerV3 {
                 state.observation.verify_live(self.deadline)?;
                 directory.try_clone()?.into_std_file().sync_all()?;
                 state.observation.verify_live(self.deadline)?;
+                state.directory = Some(directory);
                 state.chunks = Some(chunks);
             }
             state.observation.verify_live(self.deadline)?;
+            state.check_chunks_binding()?;
             attempted = true;
             state.uncertain = true;
             let mut options = cap_std::fs::OpenOptions::new();
@@ -871,10 +918,13 @@ impl ManagedOutputOwnerV3 {
                 .expect("chunks established")
                 .open_with(leaf, &options)?;
             state.observation.verify_live(self.deadline)?;
+            state.check_chunks_binding()?;
             file.write_all(bytes)?;
             state.observation.verify_live(self.deadline)?;
+            state.check_chunks_binding()?;
             file.sync_all()?;
             state.observation.verify_live(self.deadline)?;
+            state.check_chunks_binding()?;
             state
                 .chunks
                 .as_ref()
@@ -883,6 +933,7 @@ impl ManagedOutputOwnerV3 {
                 .into_std_file()
                 .sync_all()?;
             state.observation.verify_live(self.deadline)?;
+            state.check_chunks_binding()?;
             Ok(())
         })();
         match result {
