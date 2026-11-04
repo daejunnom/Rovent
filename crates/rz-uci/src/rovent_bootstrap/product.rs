@@ -71,6 +71,7 @@ fn assembly_completion_unknown(mut error: SearchSessionFailure) -> SearchSession
 }
 
 // Shared board preparation; the /3 profile obtains its root budget only at go.
+const ROVENT_PRODUCT_SOURCE: &[u8] = include_bytes!("product.rs");
 #[cfg(target_os = "linux")]
 const ROVENT_OWN_BOARD_V3_SOURCE: &[u8] = include_bytes!("product/own_board_v3.rs");
 
@@ -331,7 +332,7 @@ macro_rules! build_own_board_pcr {
             let root_budget = own_board_root_budget!($kind, pins)?;
             let mut hash = Sha256::new();
             hash.update(b"rz-rovent-native-product/1\0");
-            hash.update(include_bytes!("product.rs"));
+            hash.update(crate::rovent_bootstrap::product::ROVENT_PRODUCT_SOURCE);
             hash.update(crate::rovent_bootstrap::compiled_bootstrap_source_digest());
             own_board_hash_version_source!($kind, hash);
             hash.update(
