@@ -387,6 +387,7 @@ struct QuarantinedBoardWorkerStageV3 {
     task: Arc<Mutex<Option<RoventBoardRootWorkerTaskV3>>>,
     phase: RoventBoardWorkerStagePhaseV3,
     failure: Option<std::io::Error>,
+    start_seal: Option<Arc<()>>,
 }
 enum BoardWorkerSlotV3 {
     Reserved(RoventBoardCollectionWorkerKeyV3),
@@ -462,6 +463,66 @@ pub struct RoventBoardCollectionWorkerStageV3 {
     thread: Option<std::thread::JoinHandle<Box<dyn Any + Send>>>,
     phase: RoventBoardWorkerStagePhaseV3,
     failure: Option<std::io::Error>,
+    start_seal: Option<Arc<()>>,
+}
+
+/// Unique, non-clone witness for one Ready stage and its original receiver.
+/// It asserts neither task submission nor physical execution.
+pub struct RoventBoardWorkerStartSourceV3 {
+    seal: Arc<()>,
+    key: RoventBoardCollectionWorkerKeyV3,
+    admission: RoventCollectionRootAdmissionV3,
+    received: Arc<Mutex<Option<RoventBoardRootHandoffV3>>>,
+}
+
+/// Minted only by `start_with_source` after that same stage's spawn returns.
+/// A start result is not a worker join or physical completion proof.
+pub struct RoventBoardWorkerStartOutcomeV3 {
+    seal: Arc<()>,
+    key: RoventBoardCollectionWorkerKeyV3,
+    admission: RoventCollectionRootAdmissionV3,
+    received: Arc<Mutex<Option<RoventBoardRootHandoffV3>>>,
+    result: RoventBoardWorkerStageStartV3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventBoardWorkerStartSourceErrorV3 {
+    NotReady,
+    AlreadyIssued,
+    Busy,
+    Poisoned,
+    RegistryUnknown,
+}
+
+pub struct RoventBoardWorkerStartSourceCancelFailureV3 {
+    pub error: RoventBoardWorkerStartSourceErrorV3,
+    pub source: RoventBoardWorkerStartSourceV3,
+}
+
+impl RoventBoardWorkerStartSourceV3 {
+    pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+
+    pub fn same_original_outcome(&self, outcome: &RoventBoardWorkerStartOutcomeV3) -> bool {
+        Arc::ptr_eq(&self.seal, &outcome.seal)
+            && self.key.same_original(&outcome.key)
+            && self.admission.same_original_admission(&outcome.admission)
+            && Arc::ptr_eq(&self.received, &outcome.received)
+    }
+
+    pub fn recovery_key(&self) -> RoventBoardCollectionWorkerKeyV3 {
+        self.key.clone()
+    }
+}
+
+impl RoventBoardWorkerStartOutcomeV3 {
+    pub fn result(&self) -> RoventBoardWorkerStageStartV3 {
+        self.result
+    }
+    pub fn recovery_key(&self) -> RoventBoardCollectionWorkerKeyV3 {
+        self.key.clone()
+    }
 }
 
 pub enum RoventBoardCollectionWorkerJoinFailureV3 {
@@ -477,6 +538,113 @@ pub enum RoventBoardCollectionWorkerJoinFailureV3 {
 }
 
 impl RoventBoardCollectionWorkerStageV3 {
+    /// Issue exactly one witness from this actual Ready stage. The caller
+    /// must separately establish the original game/dispatch authority.
+    pub fn issue_start_source(
+        &mut self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<RoventBoardWorkerStartSourceV3, RoventBoardWorkerStartSourceErrorV3> {
+        if self.start_seal.is_some() {
+            return Err(RoventBoardWorkerStartSourceErrorV3::AlreadyIssued);
+        }
+        if self.phase != RoventBoardWorkerStagePhaseV3::Ready
+            || !self.matches_admission(admission)
+            || self.receiver.is_none()
+            || self.thread.is_some()
+            || self.failure.is_some()
+        {
+            return Err(RoventBoardWorkerStartSourceErrorV3::NotReady);
+        }
+        {
+            let slot = self.task.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => RoventBoardWorkerStartSourceErrorV3::Busy,
+                std::sync::TryLockError::Poisoned(_) => {
+                    RoventBoardWorkerStartSourceErrorV3::Poisoned
+                }
+            })?;
+            if slot.is_some() {
+                return Err(RoventBoardWorkerStartSourceErrorV3::NotReady);
+            }
+        }
+        match self.key.observe() {
+            RoventBoardWorkerRecoveryObservationV3::Reserved => {}
+            RoventBoardWorkerRecoveryObservationV3::Busy => {
+                return Err(RoventBoardWorkerStartSourceErrorV3::Busy);
+            }
+            RoventBoardWorkerRecoveryObservationV3::Poisoned => {
+                return Err(RoventBoardWorkerStartSourceErrorV3::Poisoned);
+            }
+            _ => return Err(RoventBoardWorkerStartSourceErrorV3::RegistryUnknown),
+        }
+        let seal = Arc::new(());
+        self.start_seal = Some(Arc::clone(&seal));
+        Ok(RoventBoardWorkerStartSourceV3 {
+            seal,
+            key: self.key.clone(),
+            admission: self.admission.clone(),
+            received: Arc::clone(&self.received),
+        })
+    }
+
+    pub fn matches_start_source(&self, source: &RoventBoardWorkerStartSourceV3) -> bool {
+        self.start_seal
+            .as_ref()
+            .is_some_and(|seal| Arc::ptr_eq(seal, &source.seal))
+            && self.key.same_original(&source.key)
+            && self.admission.same_original_admission(&source.admission)
+            && Arc::ptr_eq(&self.received, &source.received)
+    }
+
+    /// Revoke an unused witness only while the same stage is still Ready and
+    /// its original task cell is empty. Rejection retains the witness.
+    pub fn cancel_start_source(
+        &mut self,
+        source: RoventBoardWorkerStartSourceV3,
+    ) -> Result<(), RoventBoardWorkerStartSourceCancelFailureV3> {
+        if !self.matches_start_source(&source)
+            || self.phase != RoventBoardWorkerStagePhaseV3::Ready
+            || self.receiver.is_none()
+        {
+            return Err(RoventBoardWorkerStartSourceCancelFailureV3 {
+                error: RoventBoardWorkerStartSourceErrorV3::NotReady,
+                source,
+            });
+        }
+        let state = match self.task.try_lock() {
+            Ok(slot) => {
+                if slot.is_none() {
+                    None
+                } else {
+                    Some(RoventBoardWorkerStartSourceErrorV3::NotReady)
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Some(RoventBoardWorkerStartSourceErrorV3::Busy)
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Some(RoventBoardWorkerStartSourceErrorV3::Poisoned)
+            }
+        };
+        if let Some(error) = state {
+            return Err(RoventBoardWorkerStartSourceCancelFailureV3 { error, source });
+        }
+        let registry_error = match self.key.observe() {
+            RoventBoardWorkerRecoveryObservationV3::Reserved => None,
+            RoventBoardWorkerRecoveryObservationV3::Busy => {
+                Some(RoventBoardWorkerStartSourceErrorV3::Busy)
+            }
+            RoventBoardWorkerRecoveryObservationV3::Poisoned => {
+                Some(RoventBoardWorkerStartSourceErrorV3::Poisoned)
+            }
+            _ => Some(RoventBoardWorkerStartSourceErrorV3::RegistryUnknown),
+        };
+        if let Some(error) = registry_error {
+            return Err(RoventBoardWorkerStartSourceCancelFailureV3 { error, source });
+        }
+        self.start_seal = None;
+        Ok(())
+    }
+
     fn retain_unregistered(&mut self) {
         if self.phase == RoventBoardWorkerStagePhaseV3::Running && self.thread.is_none() {
             self.phase = RoventBoardWorkerStagePhaseV3::StartingUnknown;
@@ -490,6 +658,7 @@ impl RoventBoardCollectionWorkerStageV3 {
             task: Arc::clone(&self.task),
             phase: self.phase,
             failure: self.failure.take(),
+            start_seal: self.start_seal.take(),
         };
         // Registry loss/poison prevents keyed recovery. Preserve every
         // original component and report invariant/physical unknown instead.
@@ -538,6 +707,7 @@ impl RoventBoardCollectionWorkerStageV3 {
             thread: None,
             phase: RoventBoardWorkerStagePhaseV3::Ready,
             failure: None,
+            start_seal: None,
         })
     }
 
@@ -574,6 +744,7 @@ impl RoventBoardCollectionWorkerStageV3 {
             thread: None,
             phase: owner.phase,
             failure: owner.failure,
+            start_seal: owner.start_seal,
         })
     }
 
@@ -585,11 +756,62 @@ impl RoventBoardCollectionWorkerStageV3 {
         &mut self,
         task: RoventBoardRootWorkerTaskV3,
     ) -> Result<RoventBoardWorkerStageStartV3, RoventBoardWorkerStageStartRejectionV3> {
+        if self.start_seal.is_some() {
+            return Err(RoventBoardWorkerStageStartRejectionV3 {
+                reason: "sealed stage requires its original start source",
+                task,
+            });
+        }
+        self.start_inner(task)
+    }
+
+    /// A result witness exists only when the actual platform spawn returned
+    /// on this exact stage. Unwind leaves no witness and no retry authority.
+    pub fn start_with_source(
+        &mut self,
+        source: &RoventBoardWorkerStartSourceV3,
+        task: RoventBoardRootWorkerTaskV3,
+    ) -> Result<RoventBoardWorkerStartOutcomeV3, RoventBoardWorkerStageStartRejectionV3> {
+        if !self.matches_start_source(source) {
+            return Err(RoventBoardWorkerStageStartRejectionV3 {
+                reason: "different original start source",
+                task,
+            });
+        }
+        let result = self.start_inner(task)?;
+        Ok(RoventBoardWorkerStartOutcomeV3 {
+            seal: Arc::clone(&source.seal),
+            key: source.key.clone(),
+            admission: source.admission.clone(),
+            received: Arc::clone(&source.received),
+            result,
+        })
+    }
+
+    fn start_inner(
+        &mut self,
+        task: RoventBoardRootWorkerTaskV3,
+    ) -> Result<RoventBoardWorkerStageStartV3, RoventBoardWorkerStageStartRejectionV3> {
         if self.phase != RoventBoardWorkerStagePhaseV3::Ready || self.receiver.is_none() {
             return Err(RoventBoardWorkerStageStartRejectionV3 {
                 reason: "original stage is not ready",
                 task,
             });
+        }
+        match self.key.observe() {
+            RoventBoardWorkerRecoveryObservationV3::Reserved => {}
+            RoventBoardWorkerRecoveryObservationV3::Busy => {
+                return Err(RoventBoardWorkerStageStartRejectionV3 {
+                    reason: "original worker registry busy",
+                    task,
+                });
+            }
+            _ => {
+                return Err(RoventBoardWorkerStageStartRejectionV3 {
+                    reason: "original worker registry unknown",
+                    task,
+                });
+            }
         }
         {
             let mut slot = match self.task.lock() {
@@ -731,6 +953,7 @@ impl Drop for RoventBoardCollectionWorkerStageV3 {
                 thread,
             });
         } else if has_task
+            || self.start_seal.is_some()
             || matches!(
                 self.phase,
                 RoventBoardWorkerStagePhaseV3::StartingUnknown
@@ -753,6 +976,7 @@ impl Drop for RoventBoardCollectionWorkerStageV3 {
                 task: Arc::clone(&self.task),
                 phase: self.phase,
                 failure: self.failure.take(),
+                start_seal: self.start_seal.take(),
             });
         } else {
             slots.swap_remove(index);
