@@ -423,7 +423,7 @@ impl PolicyRowPipelineV3 {
         &mut self,
         inputs: &Arc<PreparedPcCollectionInputsV3>,
         output: &Arc<ManagedOutputOwnerV3>,
-    ) -> Result<(), ArenaError> {
+    ) -> Result<bool, ArenaError> {
         super::check(
             self.idle()
                 && self.output_directory.is_none()
@@ -435,8 +435,19 @@ impl PolicyRowPipelineV3 {
                 }),
             "V3 managed output plan, manifest or writer owner differs",
         )?;
+        let identity = self
+            .writer
+            .as_ref()
+            .expect("validated original writer")
+            .original_identity();
+        if !output
+            .try_register_original_writer(&identity)
+            .map_err(super::invalid)?
+        {
+            return Ok(false);
+        }
         self.output_directory = Some(Arc::clone(output));
-        Ok(())
+        Ok(true)
     }
 
     /// Persist the exact retained chunk through the original managed chunks
