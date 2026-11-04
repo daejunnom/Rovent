@@ -85,6 +85,9 @@ pub(super) struct RoventRetiredLockV3Record {
     producer_owner: Arc<()>,
     admission: RoventCollectionRootAdmissionV3,
     ticket: RoleTicketEnvelope,
+    // A prepared target remains opaque and unpublished until the same
+    // original ticket/root publication gate has been acquired.
+    prepared_policy: Option<super::teacher::policy_prepare_v3::PreparedTeacherPolicyLockV3>,
 }
 impl RoventRetiredLockV3Record {
     /// Borrow the original accepted row for target preparation. This does not
@@ -102,6 +105,13 @@ impl RoventRetiredLockV3Record {
     }
     pub(super) fn manifest(&self) -> &Arc<RoventCorpusManifestLockV3> {
         &self.manifest_owner
+    }
+    /// Recover exactly the staged owner on cancel or an unsupported writer.
+    /// Taking it does not issue target, publication or completion authority.
+    pub(super) fn take_prepared_teacher_policy(
+        &mut self,
+    ) -> Option<super::teacher::policy_prepare_v3::PreparedTeacherPolicyLockV3> {
+        self.prepared_policy.take()
     }
 }
 pub(super) struct RoventCorpusProducerLockV3 {
@@ -403,6 +413,7 @@ impl RoventCorpusProducerLockV3 {
             manifest_owner: std::sync::Arc::clone(&self.manifest),
             producer_owner: std::sync::Arc::clone(&self.producer_owner),
             ticket,
+            prepared_policy: None,
             admission: self.admission.clone(),
             record: rz_experiments::rovent_corpus_lock_v3::record::RoventTrainingRecordLockV3(
                 RoventTrainingRecordV2 {
@@ -432,7 +443,8 @@ impl RoventCorpusProducerLockV3 {
     pub fn seal_retired(&self, row: &mut RoventRetiredLockV3Record) -> Result<(), ArenaError> {
         let targets = &row.record.0.targets;
         check(
-            targets.policy.is_none()
+            row.prepared_policy.is_none()
+                && targets.policy.is_none()
                 && targets.wdl.is_none()
                 && targets.divergence.is_none()
                 && targets.task.is_none()
@@ -456,6 +468,41 @@ impl RoventCorpusProducerLockV3 {
             self.admission.native_origin().original_input_lock(),
         )?;
         row.record = candidate;
+        Ok(())
+    }
+
+    /// Retain the original prepared teacher evidence with this exact
+    /// producer's retired row. This does not commit a target or bypass the
+    /// evidence-only publisher. A future gated writer must establish the
+    /// cancellation/publication ordering before consuming the prepared owner.
+    pub(super) fn stage_prepared_teacher_policy(
+        &self,
+        row: &mut RoventRetiredLockV3Record,
+        prepared: &mut Option<super::teacher::policy_prepare_v3::PreparedTeacherPolicyLockV3>,
+    ) -> Result<(), ArenaError> {
+        let value = prepared
+            .as_ref()
+            .ok_or_else(|| invalid("lock-v3 prepared teacher custody is empty"))?;
+        check(
+            row.prepared_policy.is_none()
+                && row.record.0.targets.policy.is_none()
+                && !row.record.0.head_sources.contains_key("policy")
+                && Arc::ptr_eq(&row.producer_owner, &self.producer_owner)
+                && Arc::ptr_eq(&row.manifest_owner, &self.manifest)
+                && row.admission.same_original_admission(&self.admission)
+                && value.ticket() == row.ticket
+                && value
+                    .sealed()
+                    .evidence()
+                    .admission()
+                    .same_original_admission(&self.admission)
+                && !value.sealed().capsule().is_ticket_canceled(),
+            "lock-v3 prepared policy differs from original producer/root or is canceled",
+        )?;
+        value.sealed().capsule().matches_original_row(row)?;
+        // No fallible work between transfer and installation in the original
+        // row: the caller retains its option on every earlier rejection.
+        row.prepared_policy = prepared.take();
         Ok(())
     }
 
