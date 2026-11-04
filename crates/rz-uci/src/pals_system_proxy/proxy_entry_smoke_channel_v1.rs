@@ -104,6 +104,13 @@ pub(super) struct PendingDirectSmokeChallenge {
 }
 
 impl PendingDirectSmokeChallenge {
+    #[cfg(test)]
+    pub(super) fn retained_fd_and_read(&self) -> Option<(std::os::fd::RawFd, usize)> {
+        use std::os::fd::AsRawFd;
+        self.stream
+            .as_ref()
+            .map(|stream| (stream.as_raw_fd(), self.read))
+    }
     pub(super) fn begin(
         stream: UnixStream,
         until: Instant,

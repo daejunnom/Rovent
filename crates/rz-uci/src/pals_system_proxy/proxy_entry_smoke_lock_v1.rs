@@ -87,6 +87,11 @@ pub(super) struct SmokeLockAdmissionFailure {
 }
 
 impl OriginalSmokeLockAdmission {
+    #[cfg(test)]
+    pub(super) fn retained_file_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.pin.file.as_raw_fd()
+    }
     /// This early read uses only caller-local entry/startup cap, not a claim
     /// that either original arena grant has been obtained. Subsequent session
     /// work must intersect with the authenticated original run/cleanup grants.

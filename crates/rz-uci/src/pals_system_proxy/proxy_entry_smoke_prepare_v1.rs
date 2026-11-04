@@ -22,6 +22,10 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+#[path = "smoke_prepare_tests.rs"]
+mod tests;
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }

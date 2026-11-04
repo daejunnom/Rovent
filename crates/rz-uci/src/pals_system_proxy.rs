@@ -10,9 +10,9 @@ mod arena_grant_channel;
 #[allow(dead_code)]
 mod arena_launch_inputs;
 #[allow(dead_code)]
-mod proxy_entry_smoke_channel_v1;
-#[allow(dead_code)]
 mod proxy_entry_no_game_smoke_v1;
+#[allow(dead_code)]
+mod proxy_entry_smoke_channel_v1;
 #[allow(dead_code)]
 mod proxy_entry_smoke_lock_v1;
 #[allow(dead_code)]
@@ -21,6 +21,8 @@ mod proxy_entry_smoke_prepare_v1;
 mod proxy_entry_smoke_v1;
 #[allow(dead_code)]
 mod smoke_expected_argv_v1;
+#[cfg(test)]
+mod smoke_prepare_lock_fixture;
 pub use proxy_entry_smoke_v1::ProxyEntryFunctionalSmokeV1;
 #[allow(dead_code)]
 mod cancel_control_v1;
