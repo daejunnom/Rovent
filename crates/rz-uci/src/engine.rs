@@ -850,6 +850,7 @@ pub enum EngineError {
     Session(SessionError),
     Transport(Box<ServeError<EngineError>>),
     WorkerPanic,
+    TimerSpawn(std::io::Error),
     DrainTimeout,
     UndeliveredDiagnostics(Vec<(WorkerDiagnosticReceipt, u64)>),
     UndeliveredWorkerFailure(Box<UndeliveredWorkerFailure>),
@@ -3000,6 +3001,15 @@ fn prepare_engine(
             });
         }
     };
+    // These Arc/identity copies identify the same pre-worker resources; the
+    // sole priority owner remains unique. They are only used if timer thread
+    // creation fails before any engine work can begin.
+    let recovery_factory = process.factory.clone();
+    let recovery_driver = process.driver.clone();
+    let recovery_owners = Arc::clone(&process.owners);
+    let recovery_clock = process.clock.clone();
+    let recovery_identity = process.identity.clone();
+    let recovery_go_observer = process.go_admission_observer.clone();
     let EngineProcess {
         factory,
         driver,
@@ -3049,7 +3059,7 @@ fn prepare_engine(
     let close_observer = _priority_close_owner.as_ref().map(|owner| owner.observer());
     #[cfg(feature = "pals-adaptive")]
     let dispatch_close_observer = close_observer.clone();
-    let timer = thread::spawn(move || {
+    let timer = thread::Builder::new().spawn(move || {
         let mut delivered = None;
         while !timer_flag.load(Ordering::Acquire) {
             if let Ok(owner) = timer_owner.lock() {
@@ -3097,6 +3107,29 @@ fn prepare_engine(
             thread::sleep(Duration::from_millis(1));
         }
     });
+    let timer = match timer {
+        Ok(timer) => timer,
+        Err(error) => {
+            let process = EngineProcess {
+                factory: recovery_factory,
+                driver: recovery_driver,
+                owners: recovery_owners,
+                clock: recovery_clock,
+                identity: recovery_identity,
+                go_admission_observer: recovery_go_observer,
+                #[cfg(feature = "pals-adaptive")]
+                priority_cancel: _priority_owner,
+                #[cfg(feature = "pals-adaptive")]
+                priority_close: _priority_close_owner,
+            };
+            return Err(PrepareEngineFailure {
+                error: EngineError::TimerSpawn(error),
+                process,
+                events,
+                sender,
+            });
+        }
+    };
     Ok(PreparedEngine {
         owner,
         session,
