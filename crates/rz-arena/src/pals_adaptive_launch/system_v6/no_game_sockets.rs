@@ -53,6 +53,7 @@ impl NoGameRoleSocketsV1 {
             child_name: format!("{prefix}-smoke-child"),
         };
         result.verify_original(owner, execution)?;
+        execution.require_running()?;
         Ok(Arc::new(result))
     }
 
