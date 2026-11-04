@@ -8,7 +8,9 @@ use super::own_hooks_lock_v3::{
     OwnPrepareOutcomeV3, OwnPreparedRootV3, OwnReserveOutcomeV3, OwnRootRequestV3,
     RoventOwnCollectionBridgeV3,
 };
-use super::policy_row_pipeline_v3::{PolicyRootRetainedOwnerV3, PolicyRowPipelineOwnerV3};
+use super::policy_row_pipeline_v3::{
+    PolicyChunkPersistenceV3, PolicyRootRetainedOwnerV3, PolicyRowPipelineOwnerV3,
+};
 use super::speculative_route_v3::{SpeculativeReceiverV3, SpeculativeRootV3};
 use super::teacher::v3_policy_consumer::{
     TeacherPolicyConsumerOwnerV3, TeacherPolicyConsumerProgressV3, TeacherPolicyConsumerStartV3,
@@ -45,6 +47,9 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) consumer: Option<TeacherPolicyConsumerOwnerV3>,
     pub(super) processed: Option<TeacherProcessedOwnerV3>,
     pub(super) consumer_failure: Option<ArenaError>,
+    // The pipeline owns the original packet and detailed failure. This flag
+    // prevents an automatic retry after a failed or uncertain write.
+    pub(super) persistence_failure: Option<&'static str>,
     pub(super) pipeline: PolicyRowPipelineOwnerV3,
     pub(super) retained_policy: Option<PolicyRootRetainedOwnerV3>,
     pub(super) pump_error: Option<TeacherPumpSetupErrorV3>,
@@ -91,6 +96,7 @@ impl OwnRootRecoveryV3 {
             consumer: None,
             processed: None,
             consumer_failure: None,
+            persistence_failure: None,
             pump_error: None,
             pump_unknown: false,
             worker_key: None,
@@ -820,6 +826,32 @@ impl OwnRootRecoveryV3 {
         ];
         for step in steps {
             match step(&mut consumer) {
+                Ok(TeacherPolicyConsumerProgressV3::ChunkReady) => {
+                    if self.persistence_failure.is_some() {
+                        return;
+                    }
+                    let mut pipeline = match self.pipeline.try_lock() {
+                        Ok(Some(pipeline)) => pipeline,
+                        Ok(None) => return,
+                        Err(_) => {
+                            self.persistence_failure = Some("Own /3 output owner poisoned");
+                            return;
+                        }
+                    };
+                    match pipeline.persist_chunk() {
+                        PolicyChunkPersistenceV3::Persisted
+                        | PolicyChunkPersistenceV3::NotReady => {}
+                        PolicyChunkPersistenceV3::Failed => {
+                            self.persistence_failure = Some("Own /3 output write failed");
+                        }
+                        PolicyChunkPersistenceV3::Unknown => {
+                            self.persistence_failure = Some("Own /3 output write outcome unknown");
+                        }
+                    }
+                    // Re-observe append on the next worker pass after the
+                    // original pipeline has retained the persistence result.
+                    return;
+                }
                 Ok(
                     TeacherPolicyConsumerProgressV3::Rejected
                     | TeacherPolicyConsumerProgressV3::Unknown,
