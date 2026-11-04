@@ -259,6 +259,8 @@ pub struct RoventNativeSystemResourceRunReceiptV3 {
     pub finished_evidence_error: Option<String>,
     pub finished_policy_observation_error: Option<String>,
     pub control_cleanup_error: Option<String>,
+    /// Native success does not establish a joined Collection CPU supervisor.
+    pub cpu_supervisor_custody_unresolved: bool,
     startup: Option<rz_experiments::SystemRuntimeReceiptV6>,
     termination: Option<rz_experiments::SystemRuntimeReceiptV6>,
     startup_receipt_error: Option<String>,
@@ -285,7 +287,7 @@ impl RoventNativeSystemResourceRunReceiptV3 {
             && self.system_runtime_evidence_error.is_none()
     }
     pub fn observation(&self) -> Value {
-        json!({"schema":"rz-rovent-native-system-resource-run/3",
+        let mut observation = json!({"schema":"rz-rovent-native-system-resource-run/3",
             "admission":self.admission,"finished_live":self.finished_live,
             "admission_evidence_error":self.admission_evidence_error,
             "finished_evidence_error":self.finished_evidence_error,
@@ -315,7 +317,11 @@ impl RoventNativeSystemResourceRunReceiptV3 {
             "original_resource_owner_retained":self.custody.lock().ok().is_some_and(|state|state.scope_v3.is_some()),
             "independent_post_exit_process_observation":false,
             "independent_gpu_fence_observation":false,
-            "controlled_comparison_accepted":false,"training_executed":false})
+            "controlled_comparison_accepted":false,"training_executed":false});
+        if self.cpu_supervisor_custody_unresolved {
+            observation["cpu_supervisor_custody"] = json!("unresolved");
+        }
+        observation
     }
 }
 
@@ -336,6 +342,8 @@ pub struct RoventNativeResourceRunFailure {
     native_recovery_attempts: Vec<rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery>,
     control_panic: Option<Box<dyn std::any::Any + Send>>,
     control_panic_may_be_native: bool,
+    /// Separate original CPU supervisor uncertainty; not GPU entry evidence.
+    cpu_supervisor_custody_unresolved: bool,
     control_scope_marker: Option<Arc<OnceLock<rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey>>>,
     pre_native_admission: Option<PreNativeAdmissionEvidence>,
     factory_pre_native: Option<FactoryPreNativeEvidence>,
@@ -571,14 +579,21 @@ impl RoventNativeResourceRunFailure {
     /// The caller must keep the entire failure, including its original
     /// resource owner, for as long as the native scope is quarantined.
     /// This observation itself does not authorize exit or resource release.
+    /// Original shared resource custody is quarantined. This may be solely
+    /// due to CPU supervisor uncertainty and is not proof of GPU entry.
     pub fn native_quarantined(&self) -> bool {
-        self.control_panic_may_be_native
+        self.cpu_supervisor_custody_unresolved
+            || self.control_panic_may_be_native
             || matches!(
                 self.native_failure.as_ref(),
                 Some(
                     rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError::Quarantined { .. }
                 )
             )
+    }
+
+    pub fn cpu_supervisor_custody_unresolved(&self) -> bool {
+        self.cpu_supervisor_custody_unresolved
     }
 
     /// A panic payload is retained exactly; this boolean is not a fence.
@@ -730,6 +745,9 @@ impl RoventNativeResourceRunFailure {
             if let Some(evidence) = self.pre_native_admission {
                 observation["pre_native_admission"] = json!(evidence);
             }
+            if self.cpu_supervisor_custody_unresolved {
+                observation["cpu_supervisor_custody"] = json!("unresolved");
+            }
             if let Some(evidence) = &self.factory_pre_native {
                 observation["factory_pre_native"] = json!(evidence);
             }
@@ -819,6 +837,160 @@ pub(crate) struct NativeResourceCustody {
     admission_v2_succeeded: bool,
     admission_v3_succeeded: bool,
     finished_attempted: bool,
+}
+
+/// A post-auth Collection start observation tied to the original resource,
+/// control, lock, launch and UCI scope owners. It is not a worker-start,
+/// physical-completion or release receipt.
+pub(crate) struct PcCollectionResourceStartProofV3 {
+    custody: Arc<Mutex<NativeResourceCustody>>,
+    lock: Arc<RoventInputLockV3>,
+    native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    control: rz_uci::rovent_bootstrap::RoventStartupControl,
+    scope_key: rz_uci::rovent_bootstrap::launch::RoventV3ScopeKey,
+}
+
+/// A borrowed capability valid only while the original resource and bound
+/// control guards are held by `with_start_lease`. It cannot escape that call.
+pub(crate) struct PcCollectionResourceStartLeaseV3<'a> {
+    proof: &'a PcCollectionResourceStartProofV3,
+    gate: &'a rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+}
+
+impl PcCollectionResourceStartLeaseV3<'_> {
+    pub(crate) fn matches_original(
+        &self,
+        gate: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+        control: &rz_uci::rovent_bootstrap::RoventStartupControl,
+    ) -> bool {
+        std::ptr::eq(self.gate, gate)
+            && Arc::ptr_eq(&self.proof.native, native)
+            && gate.scope_key().same_original(&self.proof.scope_key)
+            && gate.matches_original_lock(&self.proof.lock)
+            && gate.matches_original_collection_owner(native)
+            && gate.matches_startup_control(control)
+            && gate.matches_startup_control(&self.proof.control)
+    }
+}
+
+/// Held by the original resource launch. It cannot be constructed from
+/// caller-supplied hashes or a different control owner.
+pub(crate) struct PcCollectionResourceStartIssuerV3 {
+    custody: Arc<Mutex<NativeResourceCustody>>,
+    native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+}
+
+impl PcCollectionResourceStartIssuerV3 {
+    pub(crate) fn issue(
+        &self,
+        gate: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+        control: &rz_uci::rovent_bootstrap::RoventStartupControl,
+    ) -> Result<PcCollectionResourceStartProofV3, &'static str> {
+        PcCollectionResourceStartProofV3::from_original(&self.custody, gate, &self.native, control)
+    }
+}
+
+impl PcCollectionResourceStartProofV3 {
+    /// Construct only from the original arena custody and UCI-issued gate.
+    /// A transient lock collision is not interpreted as a completed start.
+    fn from_original(
+        custody: &Arc<Mutex<NativeResourceCustody>>,
+        gate: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+        control: &rz_uci::rovent_bootstrap::RoventStartupControl,
+    ) -> Result<Self, &'static str> {
+        let state = custody
+            .try_lock()
+            .map_err(|_| "original resource custody unavailable")?;
+        let scope = state
+            .scope_v3
+            .as_ref()
+            .ok_or("original resource scope missing")?;
+        let lock = Arc::clone(scope.input_lock());
+        let bound = state
+            .bound_control
+            .as_ref()
+            .ok_or("original bound control missing")?;
+        let original = state.control.as_ref().ok_or("original control missing")?;
+        let bound = bound
+            .try_lock()
+            .map_err(|_| "original bound control unavailable")?;
+        if !state.system_v3
+            || !state.admission_v3_succeeded
+            || !scope.matches_input_lock(&lock)
+            || !bound.matches_original(original)
+            || !gate.matches_original_lock(&lock)
+            || !gate.matches_original_collection_owner(native)
+            || !gate.matches_startup_control(control)
+        {
+            return Err("original Collection resource/control/parent gate differs");
+        }
+        Ok(Self {
+            custody: Arc::clone(custody),
+            lock,
+            native: Arc::clone(native),
+            control: control.clone(),
+            scope_key: gate.scope_key().clone(),
+        })
+    }
+
+    /// Keep the original resource and bound-control owners locked through the
+    /// caller's start operation. The closure must not re-enter either owner.
+    pub(crate) fn with_start_lease<T>(
+        &self,
+        gate: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+        control: &rz_uci::rovent_bootstrap::RoventStartupControl,
+        action: impl for<'a> FnOnce(PcCollectionResourceStartLeaseV3<'a>) -> T,
+    ) -> Result<T, &'static str> {
+        if !Arc::ptr_eq(&self.native, native)
+            || !gate.scope_key().same_original(&self.scope_key)
+            || !gate.matches_original_lock(&self.lock)
+            || !gate.matches_original_collection_owner(native)
+            || !gate.matches_startup_control(&self.control)
+            || !gate.matches_startup_control(control)
+        {
+            return Err("original Collection start proof differs");
+        }
+        let state = self
+            .custody
+            .try_lock()
+            .map_err(|_| "original resource custody unavailable")?;
+        let scope = state
+            .scope_v3
+            .as_ref()
+            .ok_or("original resource scope missing")?;
+        let bound = state
+            .bound_control
+            .as_ref()
+            .ok_or("original bound control missing")?;
+        let original = state.control.as_ref().ok_or("original control missing")?;
+        let bound = bound
+            .try_lock()
+            .map_err(|_| "original bound control unavailable")?;
+        if !state.system_v3
+            || !state.admission_v3_succeeded
+            || !scope.matches_input_lock(&self.lock)
+            || !bound.matches_original(original)
+        {
+            return Err("original Collection resource owner changed");
+        }
+        control
+            .check()
+            .map_err(|_| "original Collection startup canceled or expired")?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            action(PcCollectionResourceStartLeaseV3 { proof: self, gate })
+        }));
+        // Keep the original panic payload but release both guards normally,
+        // so a failed start does not poison independent recovery access.
+        drop(bound);
+        drop(state);
+        match result {
+            Ok(value) => Ok(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
 }
 impl NativeResourceCustody {
     fn factory_rejection_before_native(
@@ -1529,6 +1701,7 @@ fn run_native_with_resources_inner(
         native_recovery_attempts: Vec::new(),
         control_panic: None,
         control_panic_may_be_native: false,
+        cpu_supervisor_custody_unresolved: false,
         control_scope_marker: None,
         pre_native_admission: None,
         factory_pre_native: None,
@@ -1579,6 +1752,7 @@ fn run_native_with_resources_inner(
         native_recovery_attempts: Vec::new(),
         control_panic: None,
         control_panic_may_be_native: false,
+        cpu_supervisor_custody_unresolved: false,
         control_scope_marker: None,
         pre_native_admission: None,
         factory_pre_native: None,
@@ -1630,7 +1804,7 @@ pub fn run_native_with_resources_v3(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventNativeResourceRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, false, None, None).map_err(|error| {
+    run_native_with_resources_v3_inner(pin, arguments, false, None, None, None).map_err(|error| {
         match error {
             V3InnerFailure::BeforeControl(failure) | V3InnerFailure::Failed(failure) => failure,
             V3InnerFailure::Quarantined(quarantine) => quarantine.original_failure,
@@ -1644,8 +1818,8 @@ pub fn run_native_with_resources_v3_control(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, true, None, None).map_err(
-        |error| match error {
+    run_native_with_resources_v3_inner(pin, arguments, true, None, None, None).map_err(|error| {
+        match error {
             V3InnerFailure::BeforeControl(failure) => {
                 RoventControlledRunFailure::BeforeControl(failure)
             }
@@ -1653,8 +1827,8 @@ pub fn run_native_with_resources_v3_control(
             V3InnerFailure::Quarantined(quarantine) => {
                 RoventControlledRunFailure::Quarantined(quarantine)
             }
-        },
-    )
+        }
+    })
 }
 
 /// Native/resource observation and the original Collection owner remain
@@ -1782,6 +1956,23 @@ impl RoventPcCollectionResourceOutcomeV3 {
         &mut self,
         recover_poison: bool,
     ) -> Result<Option<RoventPcCollectionSettledOutcomeV3>, &'static str> {
+        // A native fence and root settlement alone do not join the separate
+        // supervisor driver. Until its original typed custody is integrated,
+        // retain the outcome and do not reclaim the observer on that basis.
+        let cpu_unresolved = match self.native.as_ref() {
+            Some(Ok(receipt)) => receipt.cpu_supervisor_custody_unresolved,
+            Some(Err(
+                RoventControlledRunFailure::BeforeControl(failure)
+                | RoventControlledRunFailure::Failed(failure),
+            )) => failure.cpu_supervisor_custody_unresolved(),
+            Some(Err(RoventControlledRunFailure::Quarantined(quarantine))) => quarantine
+                .original_failure
+                .cpu_supervisor_custody_unresolved(),
+            None => return Err("native outcome already moved"),
+        };
+        if cpu_unresolved {
+            return Ok(None);
+        }
         let owner = self
             .collection
             .as_ref()
@@ -1868,12 +2059,60 @@ pub fn run_pc_collection_with_resources_v3_control(
     + Send
     + 'static,
 ) -> RoventPcCollectionResourceOutcomeV3 {
+    run_pc_collection_with_resources_v3_control_inner(
+        pin,
+        arguments,
+        collection,
+        Box::new(validate_collection),
+        None,
+    )
+}
+
+type PcCollectionValidationV3 = Box<
+    dyn FnOnce(&Arc<RoventInputLockV3>, &Dir, &std::fs::File) -> Result<(), RoventLaunchError>
+        + Send,
+>;
+type PcCollectionPostAuthV3 = Box<
+    dyn FnOnce(
+            &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+            &PcCollectionResourceStartIssuerV3,
+        ) -> Result<(), RoventLaunchError>
+        + Send,
+>;
+
+/// The callback is invoked only after UCI authenticated the original parent.
+/// Its caller must pre-retain the original supervisor and partial start/join
+/// custody before calling this entry. It does not itself prove worker startup.
+pub(crate) fn run_pc_collection_with_resources_v3_post_auth(
+    pin: RoventNativeResourcePlanPin,
+    arguments: Vec<String>,
+    collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    validate_collection: PcCollectionValidationV3,
+    post_auth: PcCollectionPostAuthV3,
+) -> RoventPcCollectionResourceOutcomeV3 {
+    run_pc_collection_with_resources_v3_control_inner(
+        pin,
+        arguments,
+        collection,
+        validate_collection,
+        Some(post_auth),
+    )
+}
+
+fn run_pc_collection_with_resources_v3_control_inner(
+    pin: RoventNativeResourcePlanPin,
+    arguments: Vec<String>,
+    collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    validate_collection: PcCollectionValidationV3,
+    post_auth: Option<PcCollectionPostAuthV3>,
+) -> RoventPcCollectionResourceOutcomeV3 {
     let native = run_native_with_resources_v3_inner(
         pin,
         arguments,
         true,
         Some(collection),
-        Some(Box::new(validate_collection)),
+        Some(validate_collection),
+        post_auth,
     )
     .map_err(|error| match error {
         V3InnerFailure::BeforeControl(failure) => {
@@ -1909,6 +2148,7 @@ fn run_native_with_resources_v3_inner(
                 + Send,
         >,
     >,
+    post_auth: Option<PcCollectionPostAuthV3>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, V3InnerFailure> {
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
@@ -1927,12 +2167,15 @@ fn run_native_with_resources_v3_inner(
         native_recovery_attempts: Vec::new(),
         control_panic: None,
         control_panic_may_be_native: false,
+        cpu_supervisor_custody_unresolved: false,
         control_scope_marker: None,
         pre_native_admission: None,
         factory_pre_native: None,
     })?;
     state.system_v3 = true;
     let custody = Arc::new(Mutex::new(state));
+    // Propagate actual post-auth entry through every later failure projection.
+    let post_auth_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let failure = |detail: String| RoventNativeResourceRunFailure {
         detail,
         custody: Some(Arc::clone(&custody)),
@@ -1941,6 +2184,8 @@ fn run_native_with_resources_v3_inner(
         native_recovery_attempts: Vec::new(),
         control_panic: None,
         control_panic_may_be_native: false,
+        cpu_supervisor_custody_unresolved: post_auth_entered
+            .load(std::sync::atomic::Ordering::Acquire),
         control_scope_marker: None,
         pre_native_admission: None,
         factory_pre_native: None,
@@ -1962,6 +2207,8 @@ fn run_native_with_resources_v3_inner(
     let mut control_scope_marker = None;
     let mut before_control = false;
     let mut controlled_bound = None;
+    // Only an actually entered post-auth callback may have started this CPU
+    // owner. Pre-auth rejection must not manufacture CPU uncertainty.
     let result = if custody_control {
         // Capture before the callback binds or publishes the endpoint.
         let original_parent_pid = nix::unistd::getppid().as_raw();
@@ -1970,12 +2217,13 @@ fn run_native_with_resources_v3_inner(
             RoventRetainingLaunchError,
         };
         macro_rules! run_controlled {
-            ($entry:path $(, $owner:expr)?) => {
+            ($entry:path $(, $owner:expr)? ; $($post:expr)?) => {
                 $entry(
                 arguments,
                 Arc::clone(&control_slot),
                 parent_stream,
                 $($owner,)?
+                $($post,)?
                 move |lock, root, file, _startup_until, cleanup_until, directory, path, slot| {
                     if let Some(validate) = validate_collection {
                         validate(lock, root, file)?;
@@ -2065,14 +2313,31 @@ fn run_native_with_resources_v3_inner(
             )
             };
         }
-        let controlled = match collection {
-            Some(owner) => run_controlled!(
+        let controlled = match (collection, post_auth) {
+            (Some(owner), Some(post_auth)) => {
+                let issuer = PcCollectionResourceStartIssuerV3 {
+                    custody: Arc::clone(&custody),
+                    native: Arc::clone(owner),
+                };
+                let entered = Arc::clone(&post_auth_entered);
+                run_controlled!(
+                    rz_uci::rovent_bootstrap::launch::run_pc_collection_v3_with_post_auth_resource_admission_retaining_connected_control_slot,
+                    owner; move |gate| {
+                        entered.store(true, std::sync::atomic::Ordering::Release);
+                        post_auth(gate, &issuer)
+                    }
+                )
+            }
+            (Some(owner), None) => run_controlled!(
                 rz_uci::rovent_bootstrap::launch::run_pc_collection_v3_with_resource_admission_retaining_connected_control_slot,
-                owner
+                owner;
             ),
-            None => run_controlled!(
-                rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_connected_control_slot
+            (None, None) => run_controlled!(
+                rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_connected_control_slot;
             ),
+            (None, Some(_)) => {
+                return Err(failure("Collection post-auth owner missing".into()).into());
+            }
         };
         let outcome = match controlled {
             ControlledV3Result::BeforeControl { outcome } => {
@@ -2096,8 +2361,13 @@ fn run_native_with_resources_v3_inner(
                     .unwrap_or_else(|error| error.into_inner())
                     .bound_control = Some(Arc::clone(&original_control));
                 controlled_bound = Some(original_control);
-                control_panic_may_be_native = matches!(&outcome, ControlledV3Outcome::Panic(_))
-                    && scope_marker.get().is_some();
+                control_panic_may_be_native =
+                    matches!(&outcome, ControlledV3Outcome::Panic(_))
+                        && scope_marker.get().is_some_and(|key| {
+                            !(post_auth_entered.load(std::sync::atomic::Ordering::Acquire)
+                                && matches!(key.terminal_evidence(),
+                                    rz_uci::rovent_bootstrap::launch::V3ScopeTerminalEvidence::BeforeNative))
+                        });
                 control_scope_marker = Some(scope_marker);
                 outcome
             }
@@ -2132,7 +2402,12 @@ fn run_native_with_resources_v3_inner(
     };
     // A quarantined native owner may still be doing work.  Keep its resource
     // owner and do not publish an observation as a finished-run readback.
-    let native_quarantined = control_panic_may_be_native
+    // BeforeNative distinguishes GPU entry from a partially started CPU
+    // supervisor; it does not authorize releasing the shared resource owner.
+    let post_auth_cpu_custody_unresolved =
+        post_auth_entered.load(std::sync::atomic::Ordering::Acquire);
+    let native_quarantined = post_auth_cpu_custody_unresolved
+        || control_panic_may_be_native
         || matches!(
             &result,
             Err(rz_uci::rovent_bootstrap::launch::RoventRetainingLaunchError::Quarantined { .. })
@@ -2223,6 +2498,7 @@ fn run_native_with_resources_v3_inner(
         retained.native_failure = Some(native_error);
         retained.control_panic = control_panic;
         retained.control_panic_may_be_native = control_panic_may_be_native;
+        retained.cpu_supervisor_custody_unresolved = post_auth_cpu_custody_unresolved;
         retained.control_scope_marker = control_scope_marker;
         if native_quarantined {
             if let Some(original_control) = controlled_bound {
@@ -2238,15 +2514,20 @@ fn run_native_with_resources_v3_inner(
             V3InnerFailure::Failed(retained)
         });
     }
-    finish
-        .expect("successful native execution is not quarantined")
-        .map_err(|error| failure(error.to_string()))?;
+    if let Some(finish) = finish {
+        finish.map_err(|error| failure(error.to_string()))?;
+    }
+    let failure_after_call = |detail: String| {
+        let mut original = failure(detail);
+        original.control_scope_marker = control_scope_marker.clone();
+        original
+    };
     let state = custody
         .lock()
-        .map_err(|_| failure("original resource owner poisoned".into()))?;
+        .map_err(|_| failure_after_call("original resource owner poisoned".into()))?;
     let system_lock_sha256 = state
         .original_v3_scope()
-        .map_err(|error| failure(error.to_string()))?
+        .map_err(|error| failure_after_call(error.to_string()))?
         .input_lock()
         .manifest
         .system_runtime_lock
@@ -2283,6 +2564,7 @@ fn run_native_with_resources_v3_inner(
         finished_evidence_error,
         finished_policy_observation_error,
         control_cleanup_error,
+        cpu_supervisor_custody_unresolved: post_auth_cpu_custody_unresolved,
         startup: observations.startup,
         termination: observations.termination,
         startup_receipt_error: observations.startup_error,
@@ -2492,6 +2774,7 @@ mod tests {
             native_recovery_attempts: Vec::new(),
             control_panic: None,
             control_panic_may_be_native: false,
+            cpu_supervisor_custody_unresolved: false,
             control_scope_marker: None,
             pre_native_admission: None,
             factory_pre_native: None,

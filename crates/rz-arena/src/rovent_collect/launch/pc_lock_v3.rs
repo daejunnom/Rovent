@@ -5,7 +5,7 @@
 use super::*;
 use crate::rovent_collect::capture_router_v3::CaptureRouterV3;
 use crate::rovent_collect::pc_hooks_lock_v3::RoventPcCollectionBridgeV3;
-use crate::rovent_collect::pc_worker_v3::PcWorkerSupervisorV3;
+use crate::rovent_collect::pc_worker_v3::{PcWorkerSupervisorV3, SupervisorStartCustodyV3};
 use crate::rovent_collect::teacher::v3_session::TeacherRosterEntryV3;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
 use rz_experiments::{RoventActor, RoventInputLockV3, RoventPurpose, RoventResearcher};
@@ -176,6 +176,7 @@ pub(crate) struct PcCollectionOwnersV3 {
     bridge: Arc<RoventPcCollectionBridgeV3>,
     native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
     supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    driver_custody: Arc<Mutex<SupervisorStartCustodyV3>>,
 }
 
 #[allow(dead_code)]
@@ -210,12 +211,18 @@ impl PcCollectionOwnersV3 {
             cleanup_ceiling,
         )
         .map_err(invalid)?;
+        let supervisor = Arc::new(Mutex::new(supervisor));
+        // The recovery registry retains this exact owner before any callback
+        // can start a worker. It does not itself start a thread or teacher.
+        let driver_custody =
+            SupervisorStartCustodyV3::register(&supervisor, cleanup_ceiling).map_err(invalid)?;
         Ok(Self {
             inputs,
             router,
             bridge,
             native,
-            supervisor: Arc::new(Mutex::new(supervisor)),
+            supervisor,
+            driver_custody,
         })
     }
 
@@ -229,6 +236,50 @@ impl PcCollectionOwnersV3 {
     }
     pub(crate) fn supervisor(&self) -> &Arc<Mutex<PcWorkerSupervisorV3>> {
         &self.supervisor
+    }
+
+    pub(crate) fn driver_custody(&self) -> &Arc<Mutex<SupervisorStartCustodyV3>> {
+        &self.driver_custody
+    }
+
+    /// Remove the pre-registered driver only when its original custody proves
+    /// no worker was started. Unknown/running states remain in the registry.
+    pub(crate) fn release_unstarted_driver(&self) -> Result<bool, &'static str> {
+        SupervisorStartCustodyV3::release_no_worker(&self.driver_custody)
+    }
+
+    /// Resource validation is separate and precedes any worker start.
+    pub(crate) fn validate_original_boundary(
+        &self,
+        lock: &Arc<RoventInputLockV3>,
+        directory: &Dir,
+        lock_file: &std::fs::File,
+    ) -> Result<(), ArenaError> {
+        self.inputs
+            .validate_original_boundary(lock, directory, lock_file)
+    }
+
+    /// Only an authenticated UCI gate and the same admitted arena resource
+    /// owner can start the already retained original supervisor driver.
+    pub(crate) fn start_verified(
+        &self,
+        gate: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
+        issuer: &crate::rovent_resource_scope::launch::PcCollectionResourceStartIssuerV3,
+    ) -> Result<(), &'static str> {
+        let control = self
+            .bridge
+            .startup()
+            .ok_or("original startup control missing")?;
+        let proof = issuer.issue(gate, control)?;
+        proof.with_start_lease(gate, &self.native, control, |lease| {
+            SupervisorStartCustodyV3::start_verified(
+                &self.driver_custody,
+                &lease,
+                gate,
+                &self.native,
+                control,
+            )
+        })?
     }
 }
 
