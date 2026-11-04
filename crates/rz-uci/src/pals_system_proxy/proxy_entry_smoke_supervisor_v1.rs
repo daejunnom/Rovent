@@ -6,6 +6,7 @@ use super::{
     PalsDirectChildObservationV6, PalsProxyBinaryPinV6, PalsProxyLaunchV6,
     cli_v6::{parse_arguments, sensitive, validate_descriptor},
     finish::PalsSessionReleaseClaimV6,
+    finish::session_shutdown_report_v1::ObservedSessionShutdownV1,
     proxy_entry_no_game_smoke_v1::{
         ProxyEntryNoGameAdmittedBundleV1, ProxyEntryNoGameSmokeReceiptV1,
     },
@@ -14,7 +15,7 @@ use super::{
     relay,
     runner_v6::{
         PalsProxySupervisorV6, ProxyStageV6, ProxySupervisorObservationV6,
-        SessionReleaseObservationV6,
+        ReportedSessionShutdownObservationV1, SessionReleaseObservationV6,
     },
     smoke_expected_argv_v1::ParsedSmokeExpectedArgvV1,
 };
@@ -101,6 +102,26 @@ impl NoGamePreparedSupervisorV1 {
     /// original child's session claim, not a GPU fence.
     pub(super) fn observe_session_release_once(&mut self) -> SessionReleaseObservationV6 {
         self.supervisor.observe_session_release_once()
+    }
+
+    /// Explicitly select the separate reported-session protocol; the same
+    /// one-shot finish stream cannot also be consumed by the legacy path.
+    pub(super) fn observe_reported_session_shutdown_once(
+        &mut self,
+    ) -> ReportedSessionShutdownObservationV1 {
+        self.supervisor.observe_reported_session_shutdown_once()
+    }
+
+    pub(super) fn reported_session_shutdown(&self) -> Option<&ObservedSessionShutdownV1> {
+        self.supervisor.reported_session_shutdown.as_ref()
+    }
+
+    pub(super) fn session_shutdown_error(&self) -> Option<&io::Error> {
+        self.supervisor.session_release_error.as_ref()
+    }
+
+    pub(super) fn session_shutdown_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.supervisor.session_release_panic.as_deref()
     }
 
     pub(super) fn session_release_claim(&self) -> Option<&PalsSessionReleaseClaimV6> {

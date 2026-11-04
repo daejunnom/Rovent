@@ -7,6 +7,7 @@ use super::{
     DirectPalsChildV6, PalsDirectChildInputPipeV6, PalsDirectChildObservationV6,
     PalsImageGrantObservationV6, PalsProxyBinaryPinV6, PalsProxyLaunchV6,
     cancel_control_v1::{CancelFailureObservation, CancelReceiverV1},
+    finish::session_shutdown_report_v1::{self, ObservedSessionShutdownV1},
     finish::{self, PalsRuntimeFinishClaimV6, PalsSessionReleaseClaimV6},
     proxy_entry_smoke_cancel_v1::{NoGameCancelFailure, NoGameCancelReceiverV1},
     relay::{
@@ -49,6 +50,16 @@ pub(super) enum ProxyStageV6 {
 pub(super) enum SessionReleaseObservationV6 {
     NotReady,
     ClaimRecorded,
+    TransportUnknown,
+    Panicked,
+    AlreadyAttempted,
+}
+
+/// A same-child reported observation, never a device fence or release token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReportedSessionShutdownObservationV1 {
+    NotReady,
+    ObservationRecorded,
     TransportUnknown,
     Panicked,
     AlreadyAttempted,
@@ -128,6 +139,7 @@ pub(super) struct PalsProxySupervisorV6 {
     pub diagnostic_discard_started: bool,
     pub runtime_finish: Option<PalsRuntimeFinishClaimV6>,
     pub session_release: Option<PalsSessionReleaseClaimV6>,
+    pub reported_session_shutdown: Option<ObservedSessionShutdownV1>,
     pub runtime_finish_error: Option<io::Error>,
     pub session_release_error: Option<io::Error>,
     pub runtime_finish_panic: Option<Box<dyn Any + Send>>,
@@ -184,6 +196,7 @@ impl PalsProxySupervisorV6 {
             diagnostic_discard_started: false,
             runtime_finish: None,
             session_release: None,
+            reported_session_shutdown: None,
             runtime_finish_error: None,
             session_release_error: None,
             runtime_finish_panic: None,
@@ -648,6 +661,75 @@ impl PalsProxySupervisorV6 {
             Ok(Err(payload)) => {
                 self.session_release_panic = Some(payload);
                 SessionReleaseObservationV6::Panicked
+            }
+        }
+    }
+
+    /// Select the separate report protocol for this same one-shot finish
+    /// channel. v1 and this protocol cannot both consume the original stream.
+    /// ACK or a reported observation is not a physical release capability.
+    pub(super) fn observe_reported_session_shutdown_once(
+        &mut self,
+    ) -> ReportedSessionShutdownObservationV1 {
+        if self.session_release_attempted {
+            return ReportedSessionShutdownObservationV1::AlreadyAttempted;
+        }
+        if !self.finish_read_allowed() {
+            return ReportedSessionShutdownObservationV1::NotReady;
+        }
+        match self
+            .child
+            .as_ref()
+            .map(DirectPalsChildV6::image_grant_observation)
+        {
+            None | Some(PalsImageGrantObservationV6::NotAttempted) => {
+                return ReportedSessionShutdownObservationV1::NotReady;
+            }
+            Some(PalsImageGrantObservationV6::Failed { .. }) => {
+                self.session_release_attempted = true;
+                self.session_release_error = Some(io::Error::other(
+                    "original image grant failed; physical delivery unknown",
+                ));
+                return ReportedSessionShutdownObservationV1::TransportUnknown;
+            }
+            Some(PalsImageGrantObservationV6::Acknowledged) => {}
+        }
+        self.session_release_attempted = true;
+        let result = self.with_cancel_service(|owner| {
+            catch_unwind(AssertUnwindSafe(|| {
+                let child = owner
+                    .child
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("original child unavailable"))?;
+                let stream = child.accept_original_finish_stream(
+                    owner.finish_until,
+                    owner.finish_cancelled.as_ref(),
+                )?;
+                owner.session_release_stream = Some(stream);
+                let stream = owner
+                    .session_release_stream
+                    .as_mut()
+                    .expect("original finish stream retained");
+                session_shutdown_report_v1::observe_report(
+                    child,
+                    stream,
+                    owner.finish_until,
+                    owner.finish_cancelled.as_ref(),
+                )
+            }))
+        });
+        match result {
+            Ok(Ok(Ok(observation))) => {
+                self.reported_session_shutdown = Some(observation);
+                ReportedSessionShutdownObservationV1::ObservationRecorded
+            }
+            Ok(Ok(Err(error))) | Err(error) => {
+                self.session_release_error = Some(error);
+                ReportedSessionShutdownObservationV1::TransportUnknown
+            }
+            Ok(Err(payload)) => {
+                self.session_release_panic = Some(payload);
+                ReportedSessionShutdownObservationV1::Panicked
             }
         }
     }

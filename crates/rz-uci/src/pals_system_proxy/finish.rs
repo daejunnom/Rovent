@@ -21,6 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
+pub(crate) mod session_shutdown_report_v1;
+
 const MAX_FINISH_FRAME: usize = 256 << 10;
 const IO_QUANTUM: Duration = Duration::from_millis(50);
 const RELEASE_DOMAIN: &str = "rz-pals-session-release-event/1";
