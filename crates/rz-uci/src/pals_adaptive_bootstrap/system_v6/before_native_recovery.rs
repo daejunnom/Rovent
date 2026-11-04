@@ -50,6 +50,7 @@ pub(super) enum BeforeNativeRecoveryObservation {
 #[must_use = "retain the original recovery owner while its outcome is unresolved"]
 pub(super) struct BeforeNativeRecoveryV6 {
     service: Option<ActualService>,
+    completion_signal: rz_runtime::CompletionSignal,
     original_key: Option<TicketNativeRecoveryKey>,
     until: Instant,
     handover_attempted: bool,
@@ -71,8 +72,10 @@ impl BeforeNativeRecoveryV6 {
     /// `until` is the original registered cleanup deadline and is never reset.
     pub(super) fn new(service: ActualService, until: Instant) -> Self {
         let original_key = service.recovery_key();
+        let completion_signal = service.completion_signal();
         Self {
             service: Some(service),
+            completion_signal,
             original_key,
             until,
             handover_attempted: false,
@@ -92,6 +95,33 @@ impl BeforeNativeRecoveryV6 {
 
     pub(super) fn original_key(&self) -> Option<&TicketNativeRecoveryKey> {
         self.original_key.as_ref()
+    }
+    /// Read only this same original registry slot, even after the original
+    /// cleanup deadline. This does not take an event, move the factory owner,
+    /// submit recovery work, or turn a BeforeNative observation into release.
+    pub(super) fn passive_original_status(
+        &self,
+    ) -> Result<TicketRecoveryStatus, TicketRecoveryError> {
+        let key = self
+            .original_key
+            .as_ref()
+            .ok_or(TicketRecoveryError::InvalidKey)?;
+        if let Some(service) = self.service.as_ref() {
+            let current = service
+                .recovery_key()
+                .ok_or(TicketRecoveryError::InvalidKey)?;
+            if !key.same_owner(&current) {
+                return Err(TicketRecoveryError::InvalidKey);
+            }
+        }
+        key.status()
+    }
+    /// Same worker signal retained before the receiver is handed to the
+    /// registry. It carries no event, completion proof, or authority; some
+    /// registry transitions do not notify, so callers must recheck with a
+    /// finite timeout and the original deadline.
+    pub(super) fn completion_signal(&self) -> rz_runtime::CompletionSignal {
+        self.completion_signal.clone()
     }
     pub(super) fn service_retained(&self) -> bool {
         self.service.is_some()

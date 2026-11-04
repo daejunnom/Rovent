@@ -144,6 +144,52 @@ impl ChildEntryV6 {
         }
     }
 
+    /// Advance the original startup until service is ready or a terminal
+    /// observation is recorded. The owner stays with the caller. A version
+    /// is captured before each check to avoid lost wakeups; the short bounded
+    /// fallback also handles signal saturation and missing notifications.
+    pub(super) fn drive_startup_until_boundary(&mut self) -> ChildStepV6 {
+        loop {
+            if self.pipeline.observation() == V6PipelineObservation::ReadyForService {
+                return ChildStepV6::Pipeline(V6PipelineObservation::ReadyForService);
+            }
+            let hint = self.pipeline.startup_wait_hint();
+            let version = hint.as_ref().map(|(signal, _)| signal.version());
+            let observation = self.step();
+            if !matches!(
+                observation,
+                ChildStepV6::Pipeline(V6PipelineObservation::WaitingNative)
+            ) {
+                return observation;
+            }
+            let Some((signal, until)) = hint else {
+                // A service may have been installed by the step itself;
+                // recheck once without inventing a replacement owner.
+                if self.pipeline.startup_wait_hint().is_some() {
+                    continue;
+                }
+                return observation;
+            };
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // The existing step applies the original startup deadline.
+                return self.step();
+            }
+            let slice = remaining.min(Duration::from_millis(10));
+            let started = Instant::now();
+            signal.wait_changed(version.expect("hint has a version"), slice);
+            let elapsed = started.elapsed();
+            if elapsed < Duration::from_millis(1) {
+                // Saturated/poisoned signals can wake immediately forever.
+                std::thread::sleep(
+                    until
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(1)),
+                );
+            }
+        }
+    }
+
     /// One bounded call against the retained pipeline and original deadline.
     /// The caller schedules subsequent observations; this does not spin.
     pub(super) fn cleanup_once(&mut self) -> ChildCleanupV6 {
@@ -158,6 +204,35 @@ impl ChildEntryV6 {
                 ChildCleanupV6::OwnerUnresolved
             }
         }
+    }
+
+    /// A passive same-owner observation for an explicitly requested window.
+    /// This never retries native startup or extends the original cleanup
+    /// deadline, and no variant attests device-wide GPU completion.
+    pub(super) fn observe_recovery_status(
+        &mut self,
+    ) -> (
+        rz_contracts::pals::child_reobserve_v1::ChildReobserveStatusV1,
+        bool,
+    ) {
+        if self.panic.is_some() {
+            return (
+                rz_contracts::pals::child_reobserve_v1::ChildReobserveStatusV1::Unknown,
+                Instant::now() >= self.pipeline.original_cleanup_until(),
+            );
+        }
+        self.pipeline.observe_recovery_status()
+    }
+
+    /// Poll the retained same-parent control once within this observation
+    /// window. A timeout is not a physical completion or cleanup renewal.
+    pub(super) fn wait_reobserve_control(&mut self, until: Instant) -> std::io::Result<bool> {
+        self.pipeline.wait_reobserve_control(until)
+    }
+
+    pub(super) fn poll_reobserve_control(&mut self, until: Instant) -> std::io::Result<bool> {
+        self.pipeline
+            .poll_reobserve_control(until, self.panic.is_some())
     }
 
     fn observe_cleanup_once(&mut self) -> ChildCleanupV6 {

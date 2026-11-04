@@ -20,6 +20,10 @@ use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
+#[path = "child_reobserve_control.rs"]
+mod child_reobserve_control;
+use child_reobserve_control::ChildReobserveControlV1;
+
 /// These are orchestration observations, never claims of GPU or game success.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum V6PipelineObservation {
@@ -64,6 +68,12 @@ pub(super) struct V6Pipeline {
     require_parent_cleanup_deadline: bool,
     parent: Option<Arc<ConnectedParent>>,
     admission: Option<Arc<PalsPostImageAdmissionV6>>,
+    // The original separately authenticated stream is retained even when a
+    // later preparation or native operation fails. It grants no GPU fence.
+    reobserve_stream: Option<std::os::unix::net::UnixStream>,
+    reobserve_control: Option<ChildReobserveControlV1>,
+    reobserve_panic: Option<Box<dyn Any + Send>>,
+    reobserve_unsent_response: Option<rz_contracts::pals::child_reobserve_v1::ChildReobserveResponseV1>,
     cpu: Option<PalsSystemCpuPreparationV6>,
     startup_rejection: Option<PalsSystemStartupRejectionV6>,
     search_owner: Option<V6SearchPreparationOwner>,
@@ -128,6 +138,10 @@ impl V6Pipeline {
             require_parent_cleanup_deadline: false,
             parent: None,
             admission: None,
+            reobserve_stream: None,
+            reobserve_control: None,
+            reobserve_panic: None,
+            reobserve_unsent_response: None,
             cpu: None,
             startup_rejection: None,
             search_owner: None,
@@ -149,6 +163,21 @@ impl V6Pipeline {
 
     pub(super) fn observation(&self) -> V6PipelineObservation {
         self.state
+    }
+    /// Wake hint from the same original startup service. It carries no result
+    /// and must be paired with a recheck under the original startup deadline.
+    pub(super) fn startup_wait_hint(&self) -> Option<(rz_runtime::CompletionSignal, Instant)> {
+        let service = self
+            .search_owner
+            .as_ref()?
+            .custody
+            .native
+            .service
+            .as_ref()?;
+        Some((
+            service.completion_signal(),
+            self.source.original_startup_control().0,
+        ))
     }
     pub(super) fn original_cleanup_until(&self) -> Instant {
         self.original_cleanup_until
@@ -327,6 +356,129 @@ impl V6Pipeline {
     pub(super) fn before_native_recovery(&self) -> Option<&BeforeNativeRecoveryV6> {
         self.before_native_recovery.as_ref()
     }
+    /// A caller-requested observation of already-owned work only. This never
+    /// creates a worker, restarts shutdown, takes a before-native owner, or
+    /// changes the original cleanup window. Late means observation after that
+    /// window, not a fresh physical fence or device-wide completion.
+    pub(super) fn observe_recovery_status(
+        &mut self,
+    ) -> (
+        rz_contracts::pals::child_reobserve_v1::ChildReobserveStatusV1,
+        bool,
+    ) {
+        use crate::pals_native::ticketed::TicketRecoveryStatus;
+        use rz_contracts::pals::child_reobserve_v1::ChildReobserveStatusV1 as Status;
+        let elapsed = Instant::now() >= self.original_cleanup_until;
+        if !elapsed {
+            return (Status::Pending, false);
+        }
+        if let Some(owner) = self.before_native_recovery.as_ref() {
+            return match owner.passive_original_status() {
+                Ok(TicketRecoveryStatus::BeforeNative) => (Status::BeforeNativeLate, true),
+                Ok(TicketRecoveryStatus::Reserved | TicketRecoveryStatus::Running) => {
+                    (Status::Pending, true)
+                }
+                _ => (Status::Unknown, true),
+            };
+        }
+        // Only inspect an already-issued drain, never create/start another.
+        let service = if let Some(owner) = self.search_owner.as_mut() {
+            owner.custody.native.service.as_mut()
+        } else {
+            self.pre_admission
+                .as_mut()
+                .and_then(V6PreAdmissionOwner::failed_native_service)
+        };
+        match (self.failed_native_drain.as_mut(), service) {
+            (Some(drain), Some(service)) => match drain.poll_once(service) {
+                FailedNativeDrainObservation::NativePhysicalConfirmedObservedLate => {
+                    (Status::NativeFinishedLate, true)
+                }
+                FailedNativeDrainObservation::Pending => (Status::Pending, true),
+                _ => (Status::Unknown, true),
+            },
+            _ => (Status::Unknown, true),
+        }
+    }
+
+    /// Wait only for control-stream readiness within an observation window.
+    /// No native work or original deadline is extended by this wait.
+    pub(super) fn wait_reobserve_control(&mut self, io_until: Instant) -> std::io::Result<bool> {
+        if self.reobserve_panic.is_some() {
+            return Err(std::io::Error::other(
+                "original reobservation handler panicked",
+            ));
+        }
+        let Some(control) = self.reobserve_control.as_mut() else {
+            return Err(std::io::Error::other(
+                "original reobservation control unavailable",
+            ));
+        };
+        control.wait_ready(io_until)
+    }
+
+    /// Perform at most one nonblocking step on the same control owner.
+    /// Window expiry does not renew the original native or cleanup deadline.
+    pub(super) fn poll_reobserve_control(
+        &mut self,
+        io_until: Instant,
+        force_unknown: bool,
+    ) -> std::io::Result<bool> {
+        use rz_contracts::pals::child_reobserve_v1::ChildReobserveResponseV1;
+        if self.reobserve_panic.is_some() {
+            return Err(std::io::Error::other(
+                "original reobservation handler panicked",
+            ));
+        }
+        let Some(mut control) = self.reobserve_control.take() else {
+            return Err(std::io::Error::other(
+                "original reobservation control unavailable",
+            ));
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<bool> {
+            if control.has_pending_response() {
+                return control.poll_write(io_until);
+            }
+            let Some(request) = control.poll_request(io_until)?.cloned() else {
+                return Ok(false);
+            };
+            // A single passive observation performs no wait, so a zero
+            // request budget is valid and no previous work is reissued.
+            let (status, elapsed) = if force_unknown {
+                (
+                    rz_contracts::pals::child_reobserve_v1::ChildReobserveStatusV1::Unknown,
+                    Instant::now() >= self.original_cleanup_until,
+                )
+            } else {
+                self.observe_recovery_status()
+            };
+            let response = ChildReobserveResponseV1 {
+                generation: request.generation,
+                lock_sha256: request.lock_sha256,
+                sequence: request.sequence,
+                status,
+                original_cleanup_elapsed: elapsed,
+                // The actual first typed failure stays in this pipeline.
+                // None is unavailable, not a fabricated error detail.
+                original_error: None,
+            };
+            if let Err((error, response)) = control.queue_response(response) {
+                self.reobserve_unsent_response = Some(response);
+                return Err(error);
+            }
+            control.poll_write(io_until)
+        }));
+        self.reobserve_control = Some(control);
+        match result {
+            Ok(result) => result,
+            Err(payload) => {
+                self.reobserve_panic = Some(payload);
+                Err(std::io::Error::other(
+                    "original reobservation handler panicked",
+                ))
+            }
+        }
+    }
     /// Reuse the exact service and recovery key after an actual BeforeNative
     /// startup outcome; this never asserts any GPU-wide fence.
     pub(super) fn poll_before_native_recovery(
@@ -470,6 +622,70 @@ impl V6Pipeline {
             }
         }
         self.admission = Some(admission);
+        if self.require_parent_cleanup_deadline {
+            // Obtain this dedicated same-parent stream before native startup;
+            // neither liveness/image-grant nor finish channels are reused.
+            let parent = self.parent.as_ref().expect("original parent");
+            let admission = self.admission.as_ref().expect("original admission");
+            let (startup_until, startup_cancelled) = self.source.original_startup_control();
+            let until = startup_until.min(self.original_cleanup_until);
+            let stream = match self.source.open_cleanup_parent_stream(
+                &self.parent_socket,
+                self.parent_pid,
+                parent,
+                admission,
+                until,
+                startup_cancelled.as_ref(),
+            ) {
+                Ok(stream) => stream,
+                Err(error) => return self.fail(V6PipelineFailure::ParentGrant(error)),
+            };
+            self.reobserve_stream = Some(stream);
+            let cloned = match self
+                .reobserve_stream
+                .as_ref()
+                .expect("original reobserve stream")
+                .try_clone()
+            {
+                Ok(stream) => stream,
+                Err(error) => return self.fail(V6PipelineFailure::ParentGrant(error)),
+            };
+            if let Err(error) = parent.authenticate_separate_control_with_cancel(
+                cloned,
+                until,
+                startup_cancelled.as_ref(),
+            ) {
+                // The retained stream shares the modified socket state; an
+                // incomplete handshake is unknown and must never be retried.
+                return self.fail(V6PipelineFailure::ParentGrant(error));
+            }
+            let rz_experiments::NativeRuntimeSourceV6::SystemCuda(runtime) =
+                &self.source.lock().config.system_runtime_lock.runtime
+            else {
+                return self.fail(V6PipelineFailure::ParentGrant(std::io::Error::other(
+                    "original reobservation runtime unavailable",
+                )));
+            };
+            let stream = self
+                .reobserve_stream
+                .take()
+                .expect("original reobserve stream");
+            match ChildReobserveControlV1::new(
+                Arc::clone(parent),
+                stream,
+                self.parent_pid,
+                nix::unistd::geteuid().as_raw(),
+                self.source.lock().config.process_generation,
+                self.source.lock().canonical_sha256.clone(),
+                runtime.cuda_device_id,
+            ) {
+                Ok(control) => self.reobserve_control = Some(control),
+                Err((error, stream)) => {
+                    self.reobserve_stream = Some(stream);
+                    return self.fail(V6PipelineFailure::ParentGrant(error));
+                }
+            }
+        }
         let cpu = match prepare_cpu_v6(Arc::clone(&self.source), &self.clock) {
             Ok(cpu) => cpu,
             Err(error) => return self.fail(V6PipelineFailure::Bootstrap(error)),

@@ -47,6 +47,7 @@ pub(super) enum FailedNativeDrainObservation {
 #[must_use = "retain the original failed startup owner while completion is unknown"]
 pub(super) struct V6FailedStartupDrain {
     original_owner_key: TicketNativeRecoveryKey,
+    completion_signal: rz_runtime::CompletionSignal,
     requires_report: Option<bool>,
     until: Instant,
     started: bool,
@@ -76,6 +77,7 @@ impl V6FailedStartupDrain {
             .ok_or(FailedNativeDrainObservation::OwnerUnavailable)?;
         Ok(Self {
             original_owner_key,
+            completion_signal: service.completion_signal(),
             requires_report: None,
             until,
             started: false,
@@ -108,6 +110,12 @@ impl V6FailedStartupDrain {
 
     pub(super) fn original_startup_failure(&self) -> Option<&RoleFailure> {
         self.startup_failure.as_ref()
+    }
+    /// Original worker wake hint, not a native completion or join proof.
+    /// Consumers must recheck the retained owner after bounded waits because
+    /// not every registry or join-state transition publishes this signal.
+    pub(super) fn completion_signal(&self) -> rz_runtime::CompletionSignal {
+        self.completion_signal.clone()
     }
     pub(super) fn original_ready_clock(&self) -> Option<&ContractSystemClock> {
         self.ready.as_ref()
