@@ -49,10 +49,27 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// Pre-owned before a teacher scope can be claimed. The separate slot lock
+/// permits revalidation with the original supervisor/recovery guards held.
+struct PcScopeEffectSlotsV3 {
+    proof: Option<PcReceivedStageProofV3>,
+    teacher_source: Option<super::teacher::v3_session::TeacherScopeEffectSourceV3>,
+    game_source: Option<super::game_authority_v3::GameEffectSourceV3<PcWorkerSupervisorV3>>,
+    claim: Option<super::game_authority_v3::GameEffectClaimV3<PcWorkerSupervisorV3>>,
+    outcome: Option<Result<super::teacher::v3_session::TeacherScopeEffectOutcomeV3,
+        super::teacher::v3_session::TeacherScopeEffectClaimFailureV3>>,
+}
+impl PcScopeEffectSlotsV3 {
+    fn new() -> Self {
+        Self { proof: None, teacher_source: None, game_source: None, claim: None, outcome: None }
+    }
+}
+
 /// The original scope, route, session and any uncertain worker remain rooted
 /// here even if preparation or a worker task is interrupted.
 pub(crate) struct PcRootRecoveryV3 {
     original_self: Weak<Mutex<PcRootRecoveryV3>>,
+    scope_effects: Arc<Mutex<PcScopeEffectSlotsV3>>,
     admission: RoventCollectionRootAdmissionV3,
     received_root: Option<PcReceivedRootV3>,
     stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
@@ -114,6 +131,7 @@ impl PcRootRecoveryV3 {
         let output = pipeline.output_owner();
         Arc::new_cyclic(|original_self| Mutex::new(Self {
             original_self: original_self.clone(),
+            scope_effects: Arc::new(Mutex::new(PcScopeEffectSlotsV3::new())),
             admission,
             received_root: None,
             stage: None,
