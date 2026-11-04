@@ -4,19 +4,102 @@
 //! future peer, a running executable, provider readiness or physical finish.
 //! The proxy sidecar remains a declaration and is not a process capability.
 
+use super::smoke_preparation::ProxyEntrySmokeSnapshotOwnerV1;
 use super::{LockedPalsSystemArenaPairV6, PalsSystemProxyInputsV1};
 use crate::{
     ArenaError, NativeLaunchOwner,
-    native_launch::linux::{self, InputPin, Snapshot},
+    native_launch::linux::{self, InputPin},
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{OpenOptions, OpenOptionsExt};
-use rz_experiments::NativeEngineRole;
+use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+use rz_experiments::{ArtifactRef, NativeEngineRole, PalsSystemStartupLockV6};
 use std::{
+    collections::BTreeMap,
     fs::{File, Metadata},
     os::unix::fs::{FileExt, MetadataExt},
-    path::Path,
+    path::{Path, PathBuf},
 };
+
+/// Borrow only capabilities actually held by one original owner. The
+/// selected smoke owner is never converted to a paired execution owner.
+#[derive(Clone, Copy)]
+struct SelectedInputView<'a> {
+    paired: Option<(&'a LockedPalsSystemArenaPairV6, &'a PalsSystemProxyInputsV1)>,
+    startup_lock: &'a PalsSystemStartupLockV6,
+    lock_artifact: &'a ArtifactRef,
+    startup_path: &'a str,
+    child_artifact: &'a ArtifactRef,
+    child_path: &'a str,
+    proxy_artifact: &'a ArtifactRef,
+    proxy_path: &'a str,
+    directory: &'a Dir,
+    input_directory: &'a Dir,
+    input_subdirectories: &'a BTreeMap<PathBuf, Dir>,
+    cwd: &'a File,
+    path: &'a Path,
+    pins: &'a [InputPin],
+}
+
+impl<'a> SelectedInputView<'a> {
+    fn from_pair(
+        owner: &'a NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
+        role: NativeEngineRole,
+    ) -> Result<Self, ArenaError> {
+        let snapshot = &owner.snapshot;
+        let pair = owner.spec();
+        let sidecar = pair
+            .proxy_inputs()
+            .ok_or_else(|| invalid("PALS V6 original owner has no proxy sidecar"))?;
+        sidecar.validate_for_pair(pair)?;
+        let endpoint = pair.endpoint(role);
+        Ok(Self {
+            paired: Some((pair, sidecar)),
+            startup_lock: &endpoint.startup_lock,
+            lock_artifact: &endpoint.startup_lock_artifact,
+            startup_path: &endpoint.startup_snapshot_path,
+            child_artifact: &endpoint.startup_lock.config.endpoint.binary,
+            child_path: &endpoint.binary_snapshot_path,
+            proxy_artifact: &sidecar.proxy_binary,
+            proxy_path: &sidecar.proxy_snapshot_path,
+            directory: &snapshot.directory,
+            input_directory: &snapshot.input_directory,
+            input_subdirectories: &snapshot.input_subdirectories,
+            cwd: &snapshot.cwd,
+            path: &snapshot.path,
+            pins: &snapshot.pins,
+        })
+    }
+
+    fn from_smoke(
+        owner: &'a ProxyEntrySmokeSnapshotOwnerV1,
+        role: NativeEngineRole,
+    ) -> Result<Self, ArenaError> {
+        if owner.role != role
+            || owner.plan.input().declared_role != role
+            || !owner.execution.matches_plan(&owner.plan)
+        {
+            return Err(invalid("PALS smoke selected role differs"));
+        }
+        let plan = owner.plan.input();
+        let endpoint = &plan.endpoint;
+        Ok(Self {
+            paired: None,
+            startup_lock: &endpoint.startup_lock,
+            lock_artifact: &endpoint.startup_lock_artifact,
+            startup_path: &endpoint.startup_snapshot_path,
+            child_artifact: &endpoint.startup_lock.config.endpoint.binary,
+            child_path: &endpoint.binary_snapshot_path,
+            proxy_artifact: &plan.proxy_binary,
+            proxy_path: &plan.proxy_snapshot_path,
+            directory: &owner.directory,
+            input_directory: &owner.input_directory,
+            input_subdirectories: &owner.input_subdirectories,
+            cwd: &owner.cwd,
+            path: &owner.path,
+            pins: &owner.pins,
+        })
+    }
+}
 
 /// Check both endpoint views against the same original owner before the V6
 /// supervisor proceeds. This is a pinned-input observation, not a spawn,
@@ -37,8 +120,7 @@ fn invalid(detail: &'static str) -> ArenaError {
 /// A borrow from the actual owner, not a copy or an independently reopened
 /// replacement. The caller must retain this owner through its physical scope.
 pub(crate) struct PalsV6EndpointSnapshot<'a> {
-    owner: &'a NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
-    sidecar: &'a PalsSystemProxyInputsV1,
+    view: SelectedInputView<'a>,
     role: NativeEngineRole,
     lock: &'a InputPin,
     proxy: &'a InputPin,
@@ -53,23 +135,24 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
         owner: &'a NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
         role: NativeEngineRole,
     ) -> Result<Self, ArenaError> {
-        let pair = owner.spec();
-        let sidecar = pair.proxy_inputs().ok_or_else(|| {
-            ArenaError::Invalid("PALS V6 original owner has no proxy sidecar".into())
-        })?;
-        sidecar.validate_for_pair(pair)?;
-        let endpoint = pair.endpoint(role);
-        let lock = linux::pin(&owner.snapshot.pins, &endpoint.startup_lock_artifact)?;
-        let child = linux::pin(
-            &owner.snapshot.pins,
-            &endpoint.startup_lock.config.endpoint.binary,
-        )?;
-        let proxy = linux::pin(&owner.snapshot.pins, &sidecar.proxy_binary).map_err(|_| {
+        Self::from_view(SelectedInputView::from_pair(owner, role)?, role)
+    }
+
+    pub(crate) fn from_smoke(
+        owner: &'a ProxyEntrySmokeSnapshotOwnerV1,
+        role: NativeEngineRole,
+    ) -> Result<Self, ArenaError> {
+        Self::from_view(SelectedInputView::from_smoke(owner, role)?, role)
+    }
+
+    fn from_view(view: SelectedInputView<'a>, role: NativeEngineRole) -> Result<Self, ArenaError> {
+        let lock = linux::pin(view.pins, view.lock_artifact)?;
+        let child = linux::pin(view.pins, view.child_artifact)?;
+        let proxy = linux::pin(view.pins, view.proxy_artifact).map_err(|_| {
             ArenaError::Invalid("PALS V6 proxy is not registered in the original snapshot".into())
         })?;
         let value = Self {
-            owner,
-            sidecar,
+            view,
             role,
             lock,
             proxy,
@@ -83,25 +166,20 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
     /// Separate snapshot copies are not created; executable bytes rely on the
     /// existing full prelaunch verification of this same NativeLaunchOwner.
     pub(crate) fn verify_unchanged(&self) -> Result<(), ArenaError> {
-        let pair = self.owner.spec();
-        self.sidecar.validate_for_pair(pair)?;
-        let endpoint = pair.endpoint(self.role);
-        let snapshot = &self.owner.snapshot;
+        if let Some((pair, sidecar)) = self.view.paired {
+            sidecar.validate_for_pair(pair)?;
+        }
+        let snapshot = &self.view;
         verify_snapshot_root(snapshot)?;
         linux::verify_input_directories(
             &snapshot.directory,
             &snapshot.input_directory,
             &snapshot.input_subdirectories,
         )?;
-        verify_named_pin(snapshot, self.lock, &endpoint.startup_snapshot_path, false)?;
-        verify_named_pin(snapshot, self.child, &endpoint.binary_snapshot_path, true)?;
-        verify_named_pin(
-            snapshot,
-            self.proxy,
-            &self.sidecar.proxy_snapshot_path,
-            true,
-        )?;
-        let bytes = endpoint.startup_lock.canonical_bytes()?;
+        verify_named_pin(snapshot, self.lock, snapshot.startup_path, false)?;
+        verify_named_pin(snapshot, self.child, snapshot.child_path, true)?;
+        verify_named_pin(snapshot, self.proxy, snapshot.proxy_path, true)?;
+        let bytes = snapshot.startup_lock.canonical_bytes()?;
         verify_held_bytes(&self.lock.file, &bytes)?;
         // Recheck names and ancestors after the read; this is an observation,
         // not a claim that an independently writable filesystem is immutable.
@@ -111,14 +189,9 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
             &snapshot.input_directory,
             &snapshot.input_subdirectories,
         )?;
-        verify_named_pin(snapshot, self.lock, &endpoint.startup_snapshot_path, false)?;
-        verify_named_pin(snapshot, self.child, &endpoint.binary_snapshot_path, true)?;
-        verify_named_pin(
-            snapshot,
-            self.proxy,
-            &self.sidecar.proxy_snapshot_path,
-            true,
-        )?;
+        verify_named_pin(snapshot, self.lock, snapshot.startup_path, false)?;
+        verify_named_pin(snapshot, self.child, snapshot.child_path, true)?;
+        verify_named_pin(snapshot, self.proxy, snapshot.proxy_path, true)?;
         Ok(())
     }
 
@@ -139,7 +212,7 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
     }
 }
 
-fn verify_snapshot_root(snapshot: &Snapshot) -> Result<(), ArenaError> {
+fn verify_snapshot_root(snapshot: &SelectedInputView<'_>) -> Result<(), ArenaError> {
     if !snapshot.path.is_absolute() {
         return Err(invalid("PALS V6 snapshot root is not absolute"));
     }
@@ -154,7 +227,7 @@ fn verify_snapshot_root(snapshot: &Snapshot) -> Result<(), ArenaError> {
         .into_std_file()
         .metadata()
         .map_err(|_| invalid("PALS V6 snapshot root metadata unavailable"))?;
-    let named = std::fs::symlink_metadata(&snapshot.path)
+    let named = std::fs::symlink_metadata(snapshot.path)
         .map_err(|_| invalid("PALS V6 snapshot root pathname unavailable"))?;
     if !held.is_dir()
         || !capability.is_dir()
@@ -169,7 +242,7 @@ fn verify_snapshot_root(snapshot: &Snapshot) -> Result<(), ArenaError> {
 }
 
 fn verify_named_pin(
-    snapshot: &Snapshot,
+    snapshot: &SelectedInputView<'_>,
     pin: &InputPin,
     relative: &str,
     executable: bool,

@@ -44,6 +44,11 @@ pub use system_v6::*;
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::{CancelSourceObservation, compiled_cancel_source_observation};
 #[cfg(target_os = "linux")]
+pub(crate) use system_v6::{
+    LockedNoGameSmokePlanV1, NO_GAME_SMOKE_PLAN_DOMAIN, NoGameExecutionStartV1,
+    NoGameSmokeBudgetV1, NoGameSmokeEndpointV1, NoGameSmokePlanV1,
+};
+#[cfg(target_os = "linux")]
 pub(crate) use system_v6::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::{ProxyEntrySmokeSnapshotOwnerV1, prepare_proxy_entry_smoke_snapshot_v1};

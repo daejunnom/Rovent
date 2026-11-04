@@ -189,6 +189,11 @@ fn spec_digest(spec: &ProxyEntryFunctionalSmokeSpecV1) -> Result<String, ArenaEr
 fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
     &[
         ("arena_smoke", include_bytes!("proxy_entry_smoke.rs")),
+        ("arena_no_game_plan", include_bytes!("no_game_plan.rs")),
+        (
+            "arena_endpoint_snapshot",
+            include_bytes!("endpoint_snapshot.rs"),
+        ),
         (
             "arena_smoke_preparation",
             include_bytes!("smoke_preparation.rs"),

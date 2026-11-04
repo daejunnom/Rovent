@@ -4,7 +4,7 @@
 //! be converted into a paired `NativeLaunchOwner` or start a process. Observe
 //! source files, Fastchess, opening and the other role are not read here.
 
-use super::{LockedPalsSystemArenaPairV6, PalsV6ExecutionStart};
+use super::no_game_plan::{LockedNoGameSmokePlanV1, NoGameExecutionStartV1};
 use crate::{
     ArenaError,
     native_launch::{
@@ -43,8 +43,8 @@ pub(crate) enum SmokePreparationUnobserved {
 /// start, system provider, source mapping or physical-completion capability.
 pub(crate) struct ProxyEntrySmokeSnapshotOwnerV1 {
     _lease: NativeAdmissionLease,
-    pub(crate) execution: Arc<PalsV6ExecutionStart>,
-    pub(crate) pair: LockedPalsSystemArenaPairV6,
+    pub(crate) execution: Arc<NoGameExecutionStartV1>,
+    pub(crate) plan: LockedNoGameSmokePlanV1,
     pub(crate) role: NativeEngineRole,
     pub(crate) directory: Dir,
     pub(crate) input_directory: Dir,
@@ -112,15 +112,11 @@ fn add_input(
 }
 
 fn selected_inputs(
-    pair: &LockedPalsSystemArenaPairV6,
-    role: NativeEngineRole,
+    plan: &LockedNoGameSmokePlanV1,
 ) -> Result<(Vec<PlannedInput>, SmokePreparedSourceObservation), ArenaError> {
-    let endpoint = pair.endpoint(role);
+    let input = plan.input();
+    let endpoint = &input.endpoint;
     endpoint.startup_lock.verify()?;
-    let sidecar = pair
-        .proxy_inputs()
-        .ok_or_else(|| invalid("smoke proxy sidecar missing"))?;
-    sidecar.validate_for_pair(pair)?;
     let mut inputs = BTreeMap::new();
     add_input(
         &mut inputs,
@@ -136,8 +132,8 @@ fn selected_inputs(
     )?;
     add_input(
         &mut inputs,
-        &sidecar.proxy_binary,
-        &sidecar.proxy_snapshot_path,
+        &input.proxy_binary,
+        &input.proxy_snapshot_path,
         true,
     )?;
     for asset in &endpoint.startup_lock.config.assets {
@@ -148,12 +144,23 @@ fn selected_inputs(
             asset.purpose == PalsStartupAssetPurposeV5::ExternalBinary,
         )?;
     }
+    let source_observation = match endpoint.startup_lock.config.source_policy {
+        PalsSystemSourcePolicyV6::Strict => {
+            for files in endpoint.source_files.values() {
+                for file in files {
+                    add_input(&mut inputs, &file.artifact, &file.snapshot_path, false)?;
+                }
+            }
+            SmokePreparedSourceObservation::StrictInputsPinned
+        }
+        PalsSystemSourcePolicyV6::Observe => SmokePreparedSourceObservation::ObserveUnknown,
+    };
     if let Some(environment) = &endpoint.environment {
         // Native preparation normally supplies a generated name when this
         // launcher has no explicit snapshot mapping. Preserve that behavior
         // in a smoke-specific namespace without reading another role.
-        let name = if let Some(name) = pair.snapshot_relative_path(&environment.launcher) {
-            name
+        let name = if let Some(existing) = inputs.get(&environment.launcher.path) {
+            format!("inputs/{}", existing.name)
         } else {
             // Pick a free generated basename rather than reserving a magic
             // path that might be a legitimate selected asset name.
@@ -167,17 +174,6 @@ fn selected_inputs(
         };
         add_input(&mut inputs, &environment.launcher, &name, true)?;
     }
-    let source_observation = match endpoint.startup_lock.config.source_policy {
-        PalsSystemSourcePolicyV6::Strict => {
-            for files in endpoint.source_files.values() {
-                for file in files {
-                    add_input(&mut inputs, &file.artifact, &file.snapshot_path, false)?;
-                }
-            }
-            SmokePreparedSourceObservation::StrictInputsPinned
-        }
-        PalsSystemSourcePolicyV6::Observe => SmokePreparedSourceObservation::ObserveUnknown,
-    };
     let runtime = &endpoint.startup_lock.config.system_runtime_lock.runtime;
     runtime.validate()?;
     if let NativeRuntimeSourceV6::SystemCuda(system) = runtime {
@@ -198,10 +194,10 @@ fn selected_inputs(
         .values()
         .try_fold(0u64, |total, input| total.checked_add(input.artifact.bytes))
         .ok_or_else(|| ArenaError::Budget("smoke input size overflow".into()))?;
-    if total > pair.input().budget.max_input_bytes {
+    if total > input.budget.max_input_bytes {
         return Err(ArenaError::Budget("smoke input aggregate exceeded".into()));
     }
-    let budget = &pair.input().budget;
+    let budget = &input.budget;
     let reserved = total
         .checked_add(budget.max_runtime_bytes)
         .and_then(|value| value.checked_add(budget.max_output_bytes))
@@ -213,17 +209,20 @@ fn selected_inputs(
     }
     let inputs: Vec<_> = inputs.into_values().collect();
     let names: Vec<_> = inputs.iter().map(|input| input.name.clone()).collect();
-    linux::snapshot_parents(&names, usize::from(pair.input().budget.max_runtime_depth))?;
+    linux::snapshot_parents(&names, usize::from(input.budget.max_runtime_depth))?;
     Ok((inputs, source_observation))
+}
+
+pub(super) fn validate_selection(plan: &LockedNoGameSmokePlanV1) -> Result<(), ArenaError> {
+    selected_inputs(plan).map(|_| ())
 }
 
 /// Retain the original execution Arc and normal single-active admission lease.
 /// Preparation does not prove a child receipt consumer or permit a run.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
-    pair: &LockedPalsSystemArenaPairV6,
-    execution: &Arc<PalsV6ExecutionStart>,
-    role: NativeEngineRole,
+    plan: &LockedNoGameSmokePlanV1,
+    execution: &Arc<NoGameExecutionStartV1>,
     owner_id: [u8; 16],
     owner_epoch: u64,
     source_root: &Path,
@@ -234,7 +233,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
         receipt_version: 1,
         policy_envelope: None,
         execution_ready: false,
-        input_sha256: pair.sha256().into(),
+        input_sha256: plan.sha256().into(),
         output_directory: if native_launch::safe_output_basename(output_directory) {
             output_directory.into()
         } else {
@@ -258,22 +257,21 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
             return Err(invalid("smoke attempt requires a safe unique basename"));
         }
         execution.require_running()?;
-        if execution.pair_sha256() != pair.sha256()
-            || !execution.matches_deadline_identity(owner_id, owner_epoch)
-        {
+        if !execution.matches(plan, owner_id, owner_epoch) {
             return Err(invalid("smoke original execution identity differs"));
         }
-        let (inputs, source_observation) = selected_inputs(pair, role)?;
+        let role = plan.input().declared_role;
+        let (inputs, source_observation) = selected_inputs(plan)?;
         let names: Vec<_> = inputs.iter().map(|item| item.name.clone()).collect();
         let parents =
-            linux::snapshot_parents(&names, usize::from(pair.input().budget.max_runtime_depth))?;
+            linux::snapshot_parents(&names, usize::from(plan.input().budget.max_runtime_depth))?;
         let sources = inputs
             .iter()
             .map(|item| {
                 execution.require_running()?;
                 let file = item
                     .artifact
-                    .open_verified(source_root, pair.input().budget.max_input_bytes)?;
+                    .open_verified(source_root, plan.input().budget.max_input_bytes)?;
                 execution.require_running()?;
                 Ok(file)
             })
@@ -349,7 +347,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
                     .ok_or_else(|| invalid("smoke input filename invalid"))?,
                 path.join(&relative),
                 item.executable,
-                pair.input().budget.max_input_bytes,
+                plan.input().budget.max_input_bytes,
             )?;
             let receipt = NativeSnapshotReceipt {
                 snapshot_relative_path: relative.to_string_lossy().into_owned(),
@@ -368,7 +366,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
         linux::readable_directory_pin(&input_directory)?
             .set_permissions(Permissions::from_mode(0o500))
             .map_err(|_| io("cannot close smoke input directory"))?;
-        let runtime_name = &pair.endpoint(role).startup_lock.config.runtime_directory;
+        let runtime_name = &plan.input().endpoint.startup_lock.config.runtime_directory;
         directory
             .create_dir(runtime_name)
             .map_err(|_| io("cannot create smoke runtime root"))?;
@@ -387,7 +385,7 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
         Ok(ProxyEntrySmokeSnapshotOwnerV1 {
             _lease: lease,
             execution: Arc::clone(execution),
-            pair: pair.clone(),
+            plan: plan.clone(),
             role,
             directory,
             input_directory,
@@ -434,50 +432,59 @@ pub(crate) fn prepare_proxy_entry_smoke_snapshot_v1(
 mod tests {
     use super::*;
     use crate::pals_adaptive_launch::system_v6::{
-        PALS_SYSTEM_PROXY_INPUTS_V1_DOMAIN, PalsSystemProxyInputsV1, pair::tests::fixture,
+        no_game_plan::{
+            NO_GAME_SMOKE_PLAN_DOMAIN, NoGameSmokeBudgetV1, NoGameSmokeEndpointV1,
+            NoGameSmokePlanV1,
+        },
+        pair::tests::fixture,
     };
 
     #[test]
     fn smoke_plan_selects_role_inputs_without_fastchess_or_other_lock() {
-        let pair = fixture().lock().unwrap();
-        let pair_sha256 = pair.sha256().to_owned();
-        let mut proxy = pair.input().runner.binary.clone();
+        let mut pair = fixture();
+        pair.budget.max_child_processes = 2;
+        // Paired execution retains its five-process requirement; this test
+        // registers only an independent direct-child NoGame plan.
+        assert!(pair.clone().lock().is_err());
+        let mut proxy = pair.runner.binary.clone();
         proxy.path = "test/independent-proxy".into();
-        let pair = pair
-            .with_proxy_inputs(PalsSystemProxyInputsV1 {
-                domain: PALS_SYSTEM_PROXY_INPUTS_V1_DOMAIN.into(),
-                pair_sha256,
-                proxy_binary: proxy.clone(),
-                proxy_snapshot_path: "inputs/test/independent-proxy".into(),
-            })
-            .unwrap();
-        let (inputs, source) = selected_inputs(&pair, NativeEngineRole::Baseline).unwrap();
+        let plan = NoGameSmokePlanV1 {
+            domain: NO_GAME_SMOKE_PLAN_DOMAIN.into(),
+            declared_role: NativeEngineRole::Baseline,
+            endpoint: NoGameSmokeEndpointV1::from(&pair.endpoints[0]),
+            proxy_binary: proxy.clone(),
+            proxy_snapshot_path: "inputs/test/independent-proxy".into(),
+            budget: NoGameSmokeBudgetV1 {
+                max_input_bytes: 1 << 30,
+                max_runtime_bytes: 4 << 20,
+                max_output_bytes: 4 << 20,
+                max_artifact_bytes: (1 << 30) + (8 << 20),
+                max_child_processes: 2,
+                max_runtime_files: 16,
+                max_runtime_depth: 4,
+                address_space_per_process_bytes: 1 << 30,
+            },
+            paired_source_sha256: None,
+        }
+        .lock()
+        .unwrap();
+        let (inputs, source) = selected_inputs(&plan).unwrap();
         let paths: Vec<_> = inputs
             .iter()
             .map(|input| input.artifact.path.as_str())
             .collect();
         assert!(paths.contains(&proxy.path.as_str()));
-        assert!(
-            paths.contains(
-                &pair
-                    .endpoint(NativeEngineRole::Baseline)
-                    .startup_lock_artifact
-                    .path
-                    .as_str()
-            )
-        );
-        assert!(
-            !paths.contains(
-                &pair
-                    .endpoint(NativeEngineRole::Candidate)
-                    .startup_lock_artifact
-                    .path
-                    .as_str()
-            )
-        );
-        assert!(!paths.contains(&pair.input().runner.binary.path.as_str()));
-        assert!(!paths.contains(&pair.input().opening_artifact.path.as_str()));
+        assert!(paths.contains(&pair.endpoints[0].startup_lock_artifact.path.as_str()));
+        assert!(!paths.contains(&pair.endpoints[1].startup_lock_artifact.path.as_str()));
+        assert!(!paths.contains(&pair.runner.binary.path.as_str()));
+        assert!(!paths.contains(&pair.opening_artifact.path.as_str()));
+        assert_eq!(plan.input().budget.max_child_processes, 2);
         assert_eq!(source, SmokePreparedSourceObservation::ObserveUnknown);
+        let execution = NoGameExecutionStartV1::begin(&plan, [7; 16], 1).unwrap();
+        assert!(execution.matches(&plan, [7; 16], 1));
+        assert!(!execution.matches(&plan, [8; 16], 1));
+        assert!(execution.started() < execution.run_until());
+        assert!(execution.run_until() < execution.cleanup_until());
     }
 
     #[test]

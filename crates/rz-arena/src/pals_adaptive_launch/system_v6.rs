@@ -34,6 +34,13 @@ mod direct_smoke_launch;
 #[cfg(target_os = "linux")]
 pub(crate) use direct_smoke_launch::DirectSmokeBinding;
 mod execution_start;
+#[cfg(target_os = "linux")]
+mod no_game_plan;
+#[cfg(target_os = "linux")]
+pub(crate) use no_game_plan::{
+    LockedNoGameSmokePlanV1, NO_GAME_SMOKE_PLAN_DOMAIN, NoGameExecutionStartV1,
+    NoGameSmokeBudgetV1, NoGameSmokeEndpointV1, NoGameSmokePlanV1,
+};
 mod pair;
 mod pair_native;
 #[cfg(target_os = "linux")]
