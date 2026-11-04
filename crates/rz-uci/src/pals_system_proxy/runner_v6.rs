@@ -129,6 +129,9 @@ pub(super) struct PalsProxySupervisorV6 {
     // The exact channel remains with this original supervisor even on error.
     cancel_receiver: Option<CancelReceiverV1>,
     no_game_cancel_receiver: Option<NoGameCancelReceiverV1>,
+    // Captured from the same launch that supplies the child argv. A receiver
+    // is temporarily moved while the cancellation service is running.
+    no_game_cleanup_deadline_selected: bool,
     cancel_service_failure: Option<String>,
     max_line: usize,
     pub stage: ProxyStageV6,
@@ -168,6 +171,7 @@ impl PalsProxySupervisorV6 {
         cancelled: Arc<AtomicBool>,
         finish_cancelled: Arc<AtomicBool>,
     ) -> Self {
+        let no_game_cleanup_deadline_selected = launch.no_game_session_report;
         Self {
             _binary: Arc::clone(&launch.binary),
             wall_time_max_ms: launch.lock.config.window.wall_time_max_ms,
@@ -186,6 +190,7 @@ impl PalsProxySupervisorV6 {
             finish_cancelled,
             cancel_receiver: None,
             no_game_cancel_receiver: None,
+            no_game_cleanup_deadline_selected,
             cancel_service_failure: None,
             max_line,
             stage: ProxyStageV6::Configured,
@@ -391,10 +396,17 @@ impl PalsProxySupervisorV6 {
         self.stage = ProxyStageV6::Authenticated;
         self.check_run()?;
         self.stage = ProxyStageV6::GrantingImage;
-        self.child
-            .as_mut()
-            .expect("spawned child")
-            .grant_original_image()?;
+        if self.no_game_cleanup_deadline_selected {
+            self.child
+                .as_mut()
+                .expect("spawned child")
+                .grant_original_image_with_cleanup(self.finish_until)?;
+        } else {
+            self.child
+                .as_mut()
+                .expect("spawned child")
+                .grant_original_image()?;
+        }
         self.stage = ProxyStageV6::ImageAcknowledged;
         self.check_run()?;
         self.stage = ProxyStageV6::AttachingInput;
