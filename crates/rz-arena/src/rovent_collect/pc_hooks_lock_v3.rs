@@ -335,6 +335,22 @@ struct PcBridgeStateV3 {
     deferred: Vec<Arc<Mutex<RoventPcDeferredCleanupV3>>>,
 }
 
+/// Same-launch native admission fence. It does not prove teacher, output, or
+/// game completion and cannot be constructed without the original bridge.
+pub(super) struct PcGameAdmissionSealV3 {
+    game: Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>,
+    _native: RoventPcCollectionNativeFenceV3,
+}
+
+impl PcGameAdmissionSealV3 {
+    pub(super) fn matches_game(
+        &self,
+        game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>,
+    ) -> bool {
+        Arc::ptr_eq(&self.game, game)
+    }
+}
+
 /// Manager callbacks only exchange bounded state; setup runs on the separate
 /// supervisor. The same bridge, native owner and inputs must remain retained.
 pub(crate) struct RoventPcCollectionBridgeV3 {
@@ -401,6 +417,21 @@ impl RoventPcCollectionBridgeV3 {
 
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
     pub(super) fn game_authority(&self) -> &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>> { &self.game }
+    /// Fence only new admission on this original native launch. Root drain,
+    /// teacher custody and durable publication remain independent.
+    pub(super) fn try_game_admission_seal(
+        self: &Arc<Self>,
+        fence: RoventPcCollectionNativeFenceV3,
+    ) -> Result<PcGameAdmissionSealV3, (RoventPcCollectionNativeFenceV3, &'static str)> {
+        let Some(owner) = self.native_owner.get().and_then(Weak::upgrade) else {
+            return Err((fence, "P-C V3 original native owner absent"));
+        };
+        let hooks: Arc<dyn RoventPcCollectionHooksV3> = self.clone();
+        if !fence.matches_original_owner(&owner) || !fence.matches_original_hooks(&hooks) {
+            return Err((fence, "P-C V3 native fence belongs to another owner"));
+        }
+        Ok(PcGameAdmissionSealV3 { game: Arc::clone(&self.game), _native: fence })
+    }
     pub(crate) fn startup(&self) -> Option<&RoventStartupControl> { self.startup.get() }
     pub(crate) fn capture_registration(&self) -> &RoventNativeCaptureRegistration { &self.registration }
 
