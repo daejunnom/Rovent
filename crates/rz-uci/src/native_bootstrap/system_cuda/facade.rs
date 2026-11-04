@@ -425,6 +425,19 @@ impl Lc0SupervisedSession {
         self.supervisor.original_service_succeeded()
     }
 
+    /// Renew a finite control/observation window on this original session.
+    /// The original parent must still be live, the runtime lock and process
+    /// identity must match, and an already retired endpoint stays retired.
+    /// This does not retry native work or authorize process/session release.
+    pub fn renew_control_window(&mut self, window: std::time::Duration) -> io::Result<Instant> {
+        if self.endpoint_retirement_started {
+            return Err(io::Error::other(
+                "LC0 listener retirement closed control renewal",
+            ));
+        }
+        self.supervisor.renew_control_window(&self.lock, window)
+    }
+
     /// Publish a bounded, non-authoritative classification even when startup
     /// failed before any finish receipt existed. Original errors, descriptors,
     /// and the same native owner remain in this process on every outcome.

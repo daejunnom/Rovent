@@ -104,6 +104,31 @@ fn remaining(until: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "LC0 control deadline expired"))
 }
 
+// Plan a new finite observation window without modifying the existing one.
+// A failed identity/liveness check must leave this proposed value unapplied.
+fn proposed_control_deadline(
+    current: Instant,
+    now: Instant,
+    window: Duration,
+) -> io::Result<Instant> {
+    if window.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LC0 control window must be nonzero",
+        ));
+    }
+    let proposed = now.checked_add(window).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "LC0 control window overflows")
+    })?;
+    if proposed <= current || proposed <= now {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LC0 control window must extend the original deadline",
+        ));
+    }
+    Ok(proposed)
+}
+
 fn read_frame(stream: &mut UnixStream, until: Instant) -> io::Result<ControlRequest> {
     let mut frame = Vec::with_capacity(256);
     loop {
@@ -246,6 +271,49 @@ fn service_failure(error: &EngineError) -> &'static str {
 }
 
 impl Lc0ControlSupervisor {
+    /// Extend only this same owner's finite control window. Neither a live
+    /// parent nor a new deadline is session release or a physical GPU fence.
+    /// All previous V1/V2 replay state, observations and errors stay intact.
+    pub(super) fn renew_control_window(
+        &mut self,
+        lock: &SystemRuntimeLockV6,
+        window: Duration,
+    ) -> io::Result<Instant> {
+        let proposed = proposed_control_deadline(self.control_until, Instant::now(), window)?;
+        // Keep the original validation error as the returned error's source;
+        // callers must retain it without exposing private runtime diagnostics.
+        lock.verify().map_err(io::Error::other)?;
+        let ordinal = match &lock.runtime {
+            NativeRuntimeSourceV6::SystemCuda(spec) => spec.cuda_device_id,
+            _ => return Err(io::Error::other("LC0 control renewal requires system CUDA")),
+        };
+        let parent = self
+            .owner
+            .custody
+            .parent
+            .as_ref()
+            .ok_or_else(|| io::Error::other("LC0 original parent is unavailable"))?;
+        if !parent.matches(
+            self.owner.custody.process_epoch,
+            &lock.canonical_sha256,
+            ordinal,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "LC0 control renewal differs from the original parent",
+            ));
+        }
+        parent.ensure_live()?;
+        if Instant::now() >= proposed {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "LC0 control renewal expired before installation",
+            ));
+        }
+        self.control_until = proposed;
+        Ok(proposed)
+    }
+
     pub(super) fn project_original(&self) -> ControlProjection {
         let release = |value: Option<&Poll<Result<SessionReleased, PhysicalFailure>>>| match value {
             None => Lc0ObservedRelease::NotObserved,
@@ -871,6 +939,19 @@ impl Lc0ControlSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewed_control_deadline_is_finite_and_never_shortens_original() {
+        let now = Instant::now();
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap();
+        let renewed = proposed_control_deadline(expired, now, Duration::from_secs(2)).unwrap();
+        assert!(renewed > now && renewed > expired);
+
+        let active = now.checked_add(Duration::from_secs(2)).unwrap();
+        assert!(proposed_control_deadline(active, now, Duration::from_secs(1)).is_err());
+        assert!(proposed_control_deadline(expired, now, Duration::ZERO).is_err());
+        assert!(proposed_control_deadline(expired, now, Duration::MAX).is_err());
+    }
 
     #[test]
     fn versioned_frame_keeps_v1_bytes_and_reads_one_message() {
