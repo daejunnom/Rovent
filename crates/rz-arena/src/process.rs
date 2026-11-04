@@ -24,6 +24,13 @@ type LoadedImageVerifier<'a> = &'a mut dyn FnMut(&File) -> Result<(), ()>;
 pub(crate) type SpawnControl<'a> =
     &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<(), ArenaError>;
 
+/// A separate nonblocking cleanup operation. Its deadline is the earlier of
+/// the original whole window and the existing shutdown limit. It is observed
+/// only while the original child reservation remains under this supervisor.
+/// A callback must return promptly; this synchronous API cannot preempt one.
+pub(crate) type CleanupControl<'a> =
+    &'a mut dyn FnMut(&SpawnCustody, Instant) -> Result<(), ArenaError>;
+
 pub const MAX_ORIGINAL_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
 /// A process-local original clock. No serialized duration reconstructs this
@@ -878,9 +885,46 @@ pub(crate) fn supervise_tree_observed_with_spawn_and_control<'v>(
     spawned: Option<&'v mut SpawnCustody>,
     control: Option<SpawnControl<'v>>,
 ) -> Result<ProcessOutput, ArenaError> {
-    if control.is_some() && spawned.is_none() {
+    supervise_tree_observed_with_controls(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        stdout_observer,
+        spawned,
+        control,
+        None,
+        None,
+    )
+}
+
+/// Opt in to a separate cleanup control while retaining the original child.
+/// The original window is mandatory for this path; existing callers continue
+/// using the historical execution-only control and relative limits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_tree_observed_with_controls<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    stdout_observer: Option<StdoutObserver<'_>>,
+    spawned: Option<&'v mut SpawnCustody>,
+    control: Option<SpawnControl<'v>>,
+    cleanup_control: Option<CleanupControl<'v>>,
+    original: Option<OriginalProcessWindow>,
+) -> Result<ProcessOutput, ArenaError> {
+    if (control.is_some() || cleanup_control.is_some()) && spawned.is_none() {
         return Err(ArenaError::Invalid(
             "owner control requires original externally retained spawn custody".into(),
+        ));
+    }
+    if cleanup_control.is_some() && original.is_none() {
+        return Err(ArenaError::Invalid(
+            "cleanup control requires an original process window".into(),
         ));
     }
     limits.validate()?;
@@ -910,6 +954,8 @@ pub(crate) fn supervise_tree_observed_with_spawn_and_control<'v>(
             linux::InvocationIo {
                 spawned,
                 control,
+                cleanup_control,
+                original,
                 ..Default::default()
             },
         )
@@ -924,6 +970,8 @@ pub(crate) fn supervise_tree_observed_with_spawn_and_control<'v>(
             stdout_observer,
             spawned,
             control,
+            cleanup_control,
+            original,
         );
         Err(ArenaError::Invalid(
             "native process supervision currently requires Linux".into(),
@@ -1229,6 +1277,7 @@ fn supervise_original_input(
                 numerical_environment,
                 spawned: None,
                 control: None,
+                cleanup_control: None,
             },
         )?;
         let returned = Instant::now();
@@ -1288,6 +1337,7 @@ mod linux {
         pub numerical_environment: Option<OriginalNumericalEnvironment>,
         pub spawned: Option<&'v mut SpawnCustody>,
         pub control: Option<SpawnControl<'v>>,
+        pub cleanup_control: Option<CleanupControl<'v>>,
     }
 
     #[derive(Clone, Copy)]
@@ -1351,6 +1401,7 @@ mod linux {
             numerical_environment,
             spawned,
             mut control,
+            mut cleanup_control,
         } = io;
         let mut local_custody = SpawnCustody::default();
         let custody = spawned.unwrap_or(&mut local_custody);
@@ -1755,6 +1806,104 @@ mod linux {
                     // This never joins a reader blocked by an escaped child.
                     evidence(&mut receipt, "process.cleanup_unverified");
                     break;
+                }
+            }
+            // The opt-in cleanup callback runs only after the existing
+            // termination signal/kill decisions. It neither changes the stop
+            // reason nor supplies a new grace period. Recheck an observed
+            // terminal leader without reaping before using its reservation.
+            if let (Some(shutdown_at), Some(callback), Some(window)) =
+                (shutdown, cleanup_control.as_deref_mut(), original)
+            {
+                let cleanup_until = shutdown_at
+                    .checked_add(grace.saturating_mul(2))
+                    .map(|deadline| deadline.min(window.whole));
+                let owner_valid = if ownership_lost || (!leader_done && !owner_live_this_tick) {
+                    false
+                } else {
+                    match waitid(
+                        Id::Pid(group),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ) {
+                        Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => true,
+                        Ok(WaitStatus::StillAlive) if !leader_done => true,
+                        Err(Errno::EINTR) => false,
+                        _ => {
+                            ownership_lost = true;
+                            evidence(&mut receipt, "process.cleanup_control_ownership_lost");
+                            false
+                        }
+                    }
+                };
+                if ownership_lost {
+                    // A potentially recycled numeric PID must not be signaled.
+                    break;
+                }
+                if let Some(deadline) = cleanup_until
+                    && owner_valid
+                    && Instant::now() < deadline
+                {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        callback(custody, deadline)
+                    }));
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            evidence(&mut receipt, &format!("process.cleanup_control:{error}"));
+                            cleanup_control = None;
+                        }
+                        Err(_) => {
+                            evidence(&mut receipt, "process.cleanup_control:panic");
+                            cleanup_control = None;
+                        }
+                    }
+                    // The callback is outside the process owner's control.
+                    // Do not signal a numeric group after losing the original
+                    // wait relationship while it was running.
+                    match waitid(
+                        Id::Pid(group),
+                        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                    ) {
+                        Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => {}
+                        Ok(WaitStatus::StillAlive) if !leader_done => {}
+                        Err(Errno::EINTR) => {
+                            ownership_lost = true;
+                            evidence(&mut receipt, "process.cleanup_control_wait_interrupted");
+                            break;
+                        }
+                        _ => {
+                            ownership_lost = true;
+                            evidence(&mut receipt, "process.cleanup_control_ownership_lost");
+                            break;
+                        }
+                    }
+                    // A slow callback cannot renew either deadline; enforce
+                    // already-due signals immediately on return.
+                    if Instant::now() >= window.whole {
+                        evidence(&mut receipt, "process.original_whole_window_expired");
+                        if stop.is_none() || stop == Some(ProcessStop::Exited) {
+                            stop = Some(ProcessStop::WallLimit);
+                        }
+                        signal(
+                            group,
+                            Signal::SIGKILL,
+                            &mut receipt,
+                            "process.kill_original_whole",
+                        );
+                        break;
+                    }
+                    let half = window.whole.duration_since(window.execution) / 2;
+                    if !killed
+                        && (shutdown_at.elapsed() >= grace
+                            || Instant::now() >= window.execution + half)
+                    {
+                        signal(group, Signal::SIGKILL, &mut receipt, "process.kill");
+                        killed = true;
+                    }
+                    if shutdown_at.elapsed() >= grace.saturating_mul(2) {
+                        evidence(&mut receipt, "process.cleanup_unverified");
+                        break;
+                    }
                 }
             }
             std::thread::sleep(POLL);
@@ -2653,6 +2802,53 @@ mod linux {
             assert_eq!(calls, 0);
             assert!(spawned.child().is_none());
             assert!(!spawned.pending.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn cleanup_control_observes_original_owner_without_replacing_cancel() {
+            let root = OriginalTestDirectory::new();
+            let cwd = root.file();
+            let program = File::open("/bin/sleep").unwrap();
+            let watch = original_watch();
+            let limits = original_limits();
+            let started = Instant::now();
+            let execution = started + Duration::from_millis(limits.wall_ms);
+            let whole = execution + Duration::from_millis(limits.shutdown_grace_ms * 2);
+            let window = OriginalProcessWindow::new(started, execution, whole).unwrap();
+            let mut spawned = SpawnCustody::default();
+            let cancelled = AtomicBool::new(false);
+            let mut active = |_: &SpawnCustody, _: Instant| {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            };
+            let mut cleanup_calls = 0;
+            let mut cleanup = |owner: &SpawnCustody, deadline: Instant| {
+                assert!(owner.pending.load(Ordering::Acquire));
+                assert!(owner.child().is_some());
+                assert!(Instant::now() < deadline && deadline <= whole);
+                cleanup_calls += 1;
+                Err(ArenaError::Invalid("cleanup test failure".into()))
+            };
+            let result = crate::process::supervise_tree_observed_with_controls(
+                &program,
+                &["10".into()],
+                &cwd,
+                limits,
+                Some(&cancelled),
+                &watch,
+                None,
+                Some(&mut spawned),
+                Some(&mut active),
+                Some(&mut cleanup),
+                Some(window),
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Cancelled);
+            assert_eq!(cleanup_calls, 1);
+            assert!(result.receipt.errors.iter().any(|error| {
+                error.starts_with("process.cleanup_control:")
+                    && error.contains("cleanup test failure")
+            }));
         }
 
         #[test]
