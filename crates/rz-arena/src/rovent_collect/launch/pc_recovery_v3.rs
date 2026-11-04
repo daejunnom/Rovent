@@ -92,6 +92,15 @@ fn original_runs_v3() -> &'static Mutex<Vec<Arc<PcRunRecoverySlotV3>>> {
 #[derive(Clone)]
 pub(crate) struct PcRunRecoveryKeyV3(Arc<PcRunRecoverySlotV3>);
 
+/// A point-in-time view of this same registered owner, not completion proof.
+pub(crate) struct PcRecoverySnapshotV3 {
+    pub(crate) recovery: PcRunRecoveryKeyV3,
+    pub(crate) owners: Arc<PcCollectionOwnersV3>,
+    pub(crate) output: Arc<ManagedOutputOwnerV3>,
+    pub(crate) outcome_key: RoventPcCollectionRecoveryKeyV3,
+    pub(crate) state: PcRunRecoveryStateV3,
+}
+
 impl PcRunRecoveryKeyV3 {
     /// Prepare before any launch callback or native/resource admission.
     /// A mismatched owner is returned untouched to the caller.
@@ -176,6 +185,66 @@ impl PcRunRecoveryKeyV3 {
             .iter()
             .find(|slot| Arc::ptr_eq(&slot.supervisor, supervisor))
             .map(|slot| Self(Arc::clone(slot))))
+    }
+
+    /// Observe the exact original supervisor and its per-run custody without
+    /// conflating contention with missing registration or poisoned state.
+    /// No global lock is held while the original slot is accessed.
+    pub(crate) fn try_recovery_snapshot_for_supervisor(
+        supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>,
+    ) -> Result<PcDriverPollV3<Option<PcRecoverySnapshotV3>>, PcDriverEvidenceErrorV3> {
+        let slot = {
+            let registry = match original_runs_v3().try_lock() {
+                Ok(registry) => registry,
+                Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(PcDriverEvidenceErrorV3::Poisoned("recovery registry"));
+                }
+            };
+            registry
+                .iter()
+                .find(|entry| Arc::ptr_eq(&entry.supervisor, supervisor))
+                .map(Arc::clone)
+        };
+        let Some(slot) = slot else {
+            return Ok(PcDriverPollV3::Ready(None));
+        };
+        let guard = match slot.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery slot"));
+            }
+        };
+        let original = guard
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        let outcome_key = original
+            .outcome_key
+            .as_ref()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid(
+                "original outcome key missing",
+            ))?;
+        if !Arc::ptr_eq(original.owners.supervisor(), supervisor)
+            || !original.output.matches_inputs(original.owners.inputs())
+            || !outcome_key.matches_collection(original.owners.native())
+        {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "original recovery identities differ",
+            ));
+        }
+        let owners = Arc::clone(&original.owners);
+        let output = Arc::clone(&original.output);
+        let outcome_key = outcome_key.clone();
+        let state = original.state;
+        drop(guard);
+        Ok(PcDriverPollV3::Ready(Some(PcRecoverySnapshotV3 {
+            recovery: Self(slot),
+            owners,
+            output,
+            outcome_key,
+            state,
+        })))
     }
 
     /// Serialize the one transition into execution for this original slot.
