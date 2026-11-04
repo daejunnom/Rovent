@@ -20,6 +20,8 @@ pub(crate) use endpoint_snapshot::verify_original_proxy_snapshots;
 #[cfg(target_os = "linux")]
 pub(crate) use invocation::PalsV6RoleSockets;
 #[cfg(target_os = "linux")]
+pub(crate) use proxy_entry_smoke::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
+#[cfg(target_os = "linux")]
 mod deadline_control;
 mod deadline_grant;
 mod deadline_sources;
@@ -28,6 +30,8 @@ mod pair;
 mod pair_native;
 #[cfg(target_os = "linux")]
 mod preflight;
+#[cfg(target_os = "linux")]
+mod proxy_entry_smoke;
 mod proxy_inputs;
 pub use deadline_sources::*;
 pub use execution_start::*;
