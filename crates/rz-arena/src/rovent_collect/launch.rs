@@ -61,6 +61,8 @@ pub mod partial_game_v2;
 mod pc_cli_managed_v3;
 mod pc_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod caller_source_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_lock_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
