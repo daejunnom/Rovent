@@ -64,7 +64,11 @@ pub(super) fn sensitive(path: &Path) -> bool {
     })
 }
 
-pub(super) fn validate_descriptor(fd: &OwnedFd, needs_read: bool, needs_write: bool) -> io::Result<()> {
+pub(super) fn validate_descriptor(
+    fd: &OwnedFd,
+    needs_read: bool,
+    needs_write: bool,
+) -> io::Result<()> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
     let descriptor_flags = fcntl(fd, FcntlArg::F_GETFD).map_err(io::Error::other)?;
     if !FdFlag::from_bits_truncate(descriptor_flags).contains(FdFlag::FD_CLOEXEC) {
