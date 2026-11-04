@@ -88,7 +88,7 @@ pub(super) struct SpeculativeRouteV3 {
     registration_owner: Arc<()>,
     route_owner: Arc<()>,
     admission: RoventCollectionRootAdmissionV3,
-    sender: mpsc::SyncSender<SubmittedTeacherQueryV3>,
+    sender: mpsc::SyncSender<Arc<SubmittedTeacherQueryV3>>,
     tickets: Mutex<HashMap<RequestId, Arc<SpeculativeTicketV3>>>,
     maximum_tickets: usize,
     unattributed: AtomicU64,
@@ -111,7 +111,7 @@ impl SpeculativeRootV3 {
         maximum_tickets: usize,
         root_revoked: Arc<AtomicBool>,
         registration_owner: Arc<()>,
-    ) -> Result<(Self, mpsc::Receiver<SubmittedTeacherQueryV3>), ArenaError> {
+    ) -> Result<(Self, mpsc::Receiver<Arc<SubmittedTeacherQueryV3>>), ArenaError> {
         if !(1..=16).contains(&channel_capacity) || !(1..=65_536).contains(&maximum_tickets) {
             return Err(invalid("lock-v3 speculative root channel/ticket capacity"));
         }
@@ -217,7 +217,7 @@ impl SpeculativeRootV3 {
     pub(super) fn try_send(
         &self,
         ticket: &Arc<SpeculativeTicketV3>,
-        query: SubmittedTeacherQueryV3,
+        query: Arc<SubmittedTeacherQueryV3>,
     ) -> Result<(), ArenaError> {
         if !Arc::ptr_eq(&ticket.route_owner, &self.route.route_owner) {
             self.note_unattributed();
