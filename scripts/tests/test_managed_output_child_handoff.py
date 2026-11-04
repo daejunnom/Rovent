@@ -17,7 +17,8 @@ from managed_storage import StorageError
 from rovent_cgroup_owner import CgroupOwner
 from storage_guard import CatalogGuard
 from rovent_v3_input_snapshot import OriginalControlInput, open_directory
-from rovent_v3_collection_parent import OriginalCollectionProcess
+from rovent_v3_collection_parent import (OriginalCollectionProcess, OriginalCollectionSupervisor,
+                                         OriginalCollectionWindow)
 
 _PRESERVED_UNKNOWN = []
 
@@ -331,6 +332,90 @@ print("cleanup-ack")
             original_input.close()
         self.assertEqual(result, (124, True, None))
         self.assertEqual(payload, b"cleanup-ack\n")
+
+    def test_collection_creator_owns_input_lease_and_launched_child(self):
+        # Real managed lease, input FDs, child and socket; cgroup is a fixture.
+        self.handoff.revoke()
+        self.lease.finish(status="fixture-replaced", tree_gone=True)
+        self.finished = True
+        self.handoff = None
+        root = self.root / "collection-input"
+        (root / "inputs").mkdir(parents=True)
+        output_path = self.root / "collection-output"
+        (root / "inputs" / "plan.json").write_text(json.dumps({
+            "schema": "rz-rovent-collection-lock-v3-launch/1",
+            "output_directory": str(output_path),
+        }))
+        executable_fd = os.open(sys.executable, os.O_RDONLY)
+        window = OriginalCollectionWindow(work_budget_ns=5_000_000_000,
+                                          cleanup_budget_ns=2_000_000_000)
+        session = OriginalCollectionSupervisor(
+            input_root=root, plan_path="inputs/plan.json", output=output_path,
+            checkout_root=self.source, reserve_bytes=1024 * 1024, binary_fd=executable_fd,
+            window=window, bootstrap_budget_ms=1000)
+        self.scope.admit_waiting_child_borrowed = lambda _pid, fd: os.write(fd, b"R")
+        settled = False
+        try:
+            with patch("rovent_v3_collection_parent.CgroupOwner.prepare", return_value=self.scope):
+                session.prepare()
+            self.group, self.handoff = session.process.group, session.process.handoff
+            source = '''
+import json, os, socket, sys
+args = dict(value.split("=", 1) for value in sys.argv[1:])
+s = socket.socket(fileno=int(args["--v3-managed-output-channel-fd"]))
+nonce = os.urandom(16).hex()
+s.send(json.dumps({"schema":"rz-managed-output-lease/2", "sequence":1,
+                   "session_id":nonce}).encode())
+reply = json.loads(s.recv(4096))
+assert reply["session_id"] == nonce and reply["plan"]["path"] == args["--v3-plan"]
+print("creator-ack")
+'''
+            with tempfile.TemporaryFile(mode="w+b", dir=self.root) as output:
+                result = session.run(["-c", source], self.root, os.environ.copy(), lambda: None,
+                                     cleanup_request_start=lambda: None,
+                                     cleanup_request_poll=lambda: False, stdout=output)
+                output.seek(0)
+                payload = output.read()
+            self.assertEqual(result, (0, True, None))
+            self.assertEqual(payload, b"creator-ack\n")
+            self.assertIs(session.lease, session.process.handoff._lease)
+            session.lease.resume_live()
+            session.lease.finish(status="test-complete", tree_gone=True)
+            session.process.close_settled_process_fds()
+            session.input.close()
+            os.close(session.input_dir_fd)
+            session.input_dir_fd = None
+            window.close()
+            self.handoff = None
+            settled = True
+        finally:
+            os.close(executable_fd)
+            if not settled:
+                # Never let a failed fixture erase an active or uncertain owner.
+                self.tmp._finalizer.detach()
+                _PRESERVED_UNKNOWN.append((self.tmp, session))
+                self.handoff = None
+                self.group = None
+
+    def test_collection_creator_retains_binary_and_original_clock_before_prepare(self):
+        executable_fd = os.open(sys.executable, os.O_RDONLY)
+        original = os.fstat(executable_fd)
+        window = OriginalCollectionWindow(work_budget_ns=5_000_000_000,
+                                          cleanup_budget_ns=2_000_000_000)
+        try:
+            session = OriginalCollectionSupervisor(
+                input_root=self.root, plan_path="inputs/plan.json", output=self.root / "new-output",
+                checkout_root=self.source, reserve_bytes=1024 * 1024, binary_fd=executable_fd,
+                window=window, bootstrap_budget_ms=1000)
+            os.close(executable_fd)
+            executable_fd = None
+            retained = os.fstat(session._binary_fd)
+            self.assertEqual((retained.st_dev, retained.st_ino), (original.st_dev, original.st_ino))
+            session.close_unstarted()
+        finally:
+            if executable_fd is not None:
+                os.close(executable_fd)
+            window.close()
 
     def test_grandchild_cannot_claim_direct_child_lease(self):
         source = '''

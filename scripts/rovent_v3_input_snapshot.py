@@ -105,6 +105,7 @@ class OriginalControlInput:
 
     def __init__(self, base, rel):
         self._directory = self._file = None
+        self._fd_close_state = {}
         try:
             # Keep the selector used by the first open, not a later path to
             # the same inode. It is an input identity, not write authority.
@@ -166,11 +167,17 @@ class OriginalControlInput:
     def close(self):
         failure = None
         for field in ("_file", "_directory"):
+            if self._fd_close_state.get(field) == "unknown":
+                if failure is None:
+                    failure = RuntimeError("original control input FD close remains unknown")
+                continue
             fd = getattr(self, field, None)
             if fd is not None:
                 setattr(self, field, None)
+                self._fd_close_state[field] = "unknown"
                 try:
                     os.close(fd)
+                    self._fd_close_state[field] = "closed"
                 except OSError as error:
                     if failure is None:
                         failure = error
