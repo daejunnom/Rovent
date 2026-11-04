@@ -2415,6 +2415,10 @@ where
     /// this ticket ahead of any later collection dispatch until it resolves.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_busy_ticket: Option<RoleTicketEnvelope>,
+    /// Original non-clone native packet awaiting the same observer's Busy
+    /// callback. It remains ahead of every later packet until resolved.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_pending_event: Option<TicketNativeEvent<B::Output>>,
     /// The first collection-only failure is retained even if the bounded
     /// diagnostic history rolls over. It is not a native completion result.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -3714,6 +3718,16 @@ where
             false
         }
     }
+    fn collection_event_pending(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            self.collection_pending_event.is_some()
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            false
+        }
+    }
     fn has_collection_v2(&self) -> bool {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
@@ -4475,11 +4489,51 @@ where
             Err(error) => self.record_failure(error.at_semantic_stage("poll_auxiliary")),
         }
         for _ in 0..MAX_EVENT_DRAIN {
-            let Some(event) = self.native.poll() else {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let event = self
+                .collection_pending_event
+                .take()
+                .or_else(|| self.native.poll());
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            let event = self.native.poll();
+            let Some(event) = event else {
                 break;
             };
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let collection_result = self.collection_observer_v2.as_mut().map(|observer| {
+                let verifier = self.native.native_acceptance_verifier();
+                self.collection_admission_v2
+                    .as_ref()
+                    .zip(verifier.as_ref())
+                    .ok_or_else(|| {
+                        AdaptiveCollectionError::new(
+                            AdaptiveCollectionStage::NativeEvent,
+                            "NativeOwnerUnavailable",
+                            "original admission or native verifier unavailable",
+                        )
+                    })
+                    .and_then(|(admission, verifier)| {
+                        collection::VersionedCollectionNativeEventWitness::new(
+                            admission, verifier, &event,
+                        )
+                    })
+                    .and_then(|witness| observer.try_native_event(witness))
+            });
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if matches!(
+                collection_result.as_ref(),
+                Some(Ok(collection::AdaptiveCollectionBoundaryV2::Busy))
+            ) {
+                self.collection_pending_event = Some(event);
+                break;
+            }
             changed = true;
-            if let Err(error) = self.native_event(event) {
+            let event_result = self.native_event(event);
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if let Some(Err(error)) = collection_result {
+                self.record_failure(error.into());
+            }
+            if let Err(error) = event_result {
                 self.physical_event_error(error.at_semantic_stage("native_event"))?;
             }
         }
@@ -4833,30 +4887,6 @@ where
         let mut collection_failures = Vec::new();
         if let Some(observer) = &mut self.collection_observer {
             if let Err(error) = observer.native_event(&event) {
-                collection_failures.push(error);
-            }
-        }
-        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if let Some(observer) = &mut self.collection_observer_v2 {
-            let verifier = self.native.native_acceptance_verifier();
-            let result = self
-                .collection_admission_v2
-                .as_ref()
-                .zip(verifier.as_ref())
-                .ok_or_else(|| {
-                    AdaptiveCollectionError::new(
-                        AdaptiveCollectionStage::NativeEvent,
-                        "NativeOwnerUnavailable",
-                        "original admission or native verifier unavailable",
-                    )
-                })
-                .and_then(|(admission, verifier)| {
-                    collection::VersionedCollectionNativeEventWitness::new(
-                        admission, verifier, &event,
-                    )
-                })
-                .and_then(|witness| observer.native_event(witness));
-            if let Err(error) = result {
                 collection_failures.push(error);
             }
         }
@@ -9898,6 +9928,7 @@ where
             && self.own.iter().all(|slot| slot.joined)
             && self.external_owner_closed()
             && self.deferred.is_empty()
+            && !self.collection_event_pending()
             && self.nnuec_cleanup_settled()
             && self.utility_cleanup_settled()
             && self.native_frontier_events.is_empty()
@@ -9936,6 +9967,7 @@ where
             && self.external_owner_closed()
             && self.driver.auxiliary_shutdown_confirmed()
             && self.deferred.is_empty()
+            && !self.collection_event_pending()
             && self.nnuec_cleanup_settled()
             && self.utility_cleanup_settled()
             && self.native_frontier_events.is_empty()
@@ -9975,13 +10007,20 @@ where
                     )
                     .chain(self.collection_v2_abandon_custody.iter().copied())
                     .collect::<Vec<_>>();
-                let result = observer.settled(&tickets);
-                self.collection_v2_settlement = Some(result.clone());
-                if result.is_ok() {
-                    self.collection_v2_abandon_custody.clear();
-                }
-                if let Err(error) = result {
-                    self.record_failure(error.into());
+                match observer.try_settled(&tickets) {
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Busy) => {
+                        // The same tickets and roles remain here until this
+                        // exact observer confirms settlement or reports error.
+                        return Ok(changed);
+                    }
+                    Ok(collection::AdaptiveCollectionBoundaryV2::Ready) => {
+                        self.collection_v2_settlement = Some(Ok(()));
+                        self.collection_v2_abandon_custody.clear();
+                    }
+                    Err(error) => {
+                        self.collection_v2_settlement = Some(Err(error.clone()));
+                        self.record_failure(error.into());
+                    }
                 }
             }
             let retired = self.registry.retire_revoked_after_worker_join()?;
@@ -10042,6 +10081,7 @@ where
                     .is_some_and(|fence| fence.permits_reuse())
             }),
             auxiliary_shutdown_confirmed: self.driver.auxiliary_shutdown_confirmed()
+                && !self.collection_event_pending()
                 && self.nnuec_cleanup_settled()
                 && self.utility_cleanup_settled()
                 && self.nnuec_pending.is_none()

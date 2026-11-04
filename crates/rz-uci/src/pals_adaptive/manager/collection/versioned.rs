@@ -234,13 +234,19 @@ impl RoventRootRankingAcceptanceV3 {
 }
 
 /// Observation only: the collection observer owns no teacher or GPU fence.
+/// Every `try_*` method returning `Busy` must leave that witness unapplied;
+/// the caller retains and retries the same original evidence with this owner.
+/// Independently committed captures may remain committed. A retry must not
+/// repeat native acceptance or Search consumption.
 #[cfg(target_os = "linux")]
 pub trait AdaptiveCollectionObserverV3<Q, O>: Send {
     fn admitted(
         &mut self,
         admission: &RoventCollectionRootAdmissionV3,
     ) -> Result<(), AdaptiveCollectionError>;
-    /// `Captured` is valid only when this exact ticket was actually captured.
+    /// `Captured` admits the original reservation for this exact ticket. The
+    /// native capture occurs later and must be independently confirmed before
+    /// the ticket's collection retirement.
     /// A validator ticket omitted by policy must remain explicitly unsupported
     /// until the native lifecycle has a distinct non-capture disposition;
     /// it must not masquerade as a capture or disable the entire root.
@@ -340,6 +346,25 @@ pub trait AdaptiveCollectionObserverV3<Q, O>: Send {
         observation: RoleOnlySearchConsumptionV2,
     ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
         self.consumed(accepted, observation)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
+
+    fn try_adaptive_root_ranking(
+        &mut self,
+        accepted: &RoventRootRankingAcceptanceV3,
+        input: &FrameInput<ReviewView, Q>,
+        output: &O,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.adaptive_root_ranking(accepted, input, output)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
+
+    fn try_adaptive_consumed(
+        &mut self,
+        accepted: RoventCollectionConsumedWitnessV3<'_>,
+        after_error_readback: bool,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.adaptive_consumed(accepted, after_error_readback)
             .map(|()| AdaptiveCollectionBoundaryV2::Ready)
     }
 
@@ -664,6 +689,23 @@ impl<Q, O> VersionedCollectionObserver<Q, O> {
             _ => Err(mismatch(AdaptiveCollectionStage::Accepted)),
         }
     }
+    pub(crate) fn try_adaptive_root_ranking(
+        &mut self,
+        witness: &VersionedRootRankingAcceptance,
+        input: &FrameInput<ReviewView, Q>,
+        output: &O,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        match (self, witness) {
+            (Self::V2(o), VersionedRootRankingAcceptance::V2(w)) => o
+                .adaptive_root_ranking(w, input, output)
+                .map(|()| AdaptiveCollectionBoundaryV2::Ready),
+            #[cfg(target_os = "linux")]
+            (Self::V3(o), VersionedRootRankingAcceptance::V3(w)) => {
+                o.try_adaptive_root_ranking(w, input, output)
+            }
+            _ => Err(mismatch(AdaptiveCollectionStage::Accepted)),
+        }
+    }
     pub(crate) fn adaptive_consumed(
         &mut self,
         witness: VersionedCollectionConsumedWitness<'_>,
@@ -676,6 +718,22 @@ impl<Q, O> VersionedCollectionObserver<Q, O> {
             #[cfg(target_os = "linux")]
             (Self::V3(o), VersionedCollectionConsumedWitness::V3(w)) => {
                 o.adaptive_consumed(w, after_error)
+            }
+            _ => Err(mismatch(AdaptiveCollectionStage::Accepted)),
+        }
+    }
+    pub(crate) fn try_adaptive_consumed(
+        &mut self,
+        witness: VersionedCollectionConsumedWitness<'_>,
+        after_error: bool,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        match (self, witness) {
+            (Self::V2(o), VersionedCollectionConsumedWitness::V2(w)) => o
+                .adaptive_consumed(w, after_error)
+                .map(|()| AdaptiveCollectionBoundaryV2::Ready),
+            #[cfg(target_os = "linux")]
+            (Self::V3(o), VersionedCollectionConsumedWitness::V3(w)) => {
+                o.try_adaptive_consumed(w, after_error)
             }
             _ => Err(mismatch(AdaptiveCollectionStage::Accepted)),
         }
