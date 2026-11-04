@@ -139,6 +139,12 @@ impl RoventTeacherRouteRetirementV3 {
                 || !recovery.matches_route_pump(&self.route, &self.pump) {
                 return Ok(Some(false));
             }
+            match recovery.try_matches_closed_custody(&self.route, &self.pump) {
+                Ok(Some(true)) => {},
+                Ok(Some(false)) => return Ok(Some(false)),
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(invalid(error)),
+            }
             match recovery.consumer_route_retirement() {
                 PcConsumerRetirementV3::Ready => {},
                 PcConsumerRetirementV3::Pending | PcConsumerRetirementV3::Rejected
