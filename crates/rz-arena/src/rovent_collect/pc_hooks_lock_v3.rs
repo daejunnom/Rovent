@@ -1354,7 +1354,7 @@ struct PcV3LaunchClosure {
     _native_owner: Arc<RoventPcCollectionLaunchOwnerV3>,
     // Captured while the same bridge state lock still protects the verified
     // roots. This alone is not game closure or publication authority.
-    _verified_admissions: Vec<RoventCollectionRootAdmissionV3>,
+    _verified_admissions: Option<Vec<RoventCollectionRootAdmissionV3>>,
 }
 
 /// Non-cloneable authorization for stopping the exact original supervisor
@@ -1727,9 +1727,14 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
             }
         }
         let mut admissions = Vec::new();
-        admissions.try_reserve_exact(state.roots.len())
-            .map_err(|_| AdaptiveManagerError::Capacity("P-C V3 closure admission allocation"))?;
-        admissions.extend(state.roots.iter().map(|slot| slot.admission.clone()));
+        let admissions = if admissions.try_reserve_exact(state.roots.len()).is_ok() {
+            admissions.extend(state.roots.iter().map(|slot| slot.admission.clone()));
+            Some(admissions)
+        } else {
+            // Optional game evidence must not block independently proven
+            // physical cleanup. The game closure remains unavailable.
+            None
+        };
         drop(state);
         Ok(Some(Box::new(PcV3LaunchClosure {
             _bridge: bridge,
