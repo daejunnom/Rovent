@@ -106,8 +106,7 @@ pub(super) fn prepare_cpu_v6(
             max_depth: engine.config().max_depth,
             evaluation_namespace: cpu_evaluation_namespace_digest(&engine)
                 .map_err(|error| failure("SystemV6CpuValueNamespace", &error))?,
-            search_conditions: cpu_search_conditions_digest(&engine)
-                .map_err(|error| failure("SystemV6CpuSearchConditions", &error))?,
+            search_conditions: cpu_search_conditions_digest(&engine),
         };
         own_workers.push(PersistentCpuOwner { engine, profile });
     }
