@@ -112,7 +112,14 @@ impl PalsSystemDriverLifecycleV6 {
             }
             Err(error) => {
                 self.first_finish_failure = Some(error);
-                FinishObservationV6::Incomplete
+                if matches!(
+                    self.driver.finish_observation(),
+                    V6FacadeFinishObservation::Panicked
+                ) {
+                    FinishObservationV6::PanicRetained
+                } else {
+                    FinishObservationV6::Incomplete
+                }
             }
         }
     }
@@ -170,16 +177,22 @@ impl PalsSystemDriverLifecycleV6 {
     /// itself retains original state if its internal lock is busy or finish is
     /// incomplete. No retry changes the original search/request deadline.
     pub(super) fn finish_until(&mut self, until: Instant) -> FinishObservationV6 {
-        if self.served.is_none() {
-            return FinishObservationV6::ServiceNotReturned;
-        }
         if self.closed_receipt.is_some() {
             return FinishObservationV6::OwnerScopesClosed;
+        }
+        if matches!(
+            self.driver.finish_observation(),
+            V6FacadeFinishObservation::Panicked
+        ) {
+            return FinishObservationV6::PanicRetained;
         }
         // A partial failure may have consumed a worker join handle. Its
         // absence on a later call cannot prove that the original join worked.
         if self.first_finish_failure.is_some() || self.incomplete_receipt.is_some() {
             return FinishObservationV6::Incomplete;
+        }
+        if self.served.is_none() {
+            return FinishObservationV6::ServiceNotReturned;
         }
         // The protocol owns the only service handle; its finish_session call
         // is issued after the original UCI worker drain. A returned service
