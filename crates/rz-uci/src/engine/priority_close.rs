@@ -116,6 +116,10 @@ impl PriorityCloseOwner {
     pub(super) fn observer(&self) -> PriorityCloseObserver {
         PriorityCloseObserver(Arc::clone(&self.0))
     }
+
+    pub(super) fn matches(&self, handle: &PriorityCloseHandle) -> bool {
+        Arc::ptr_eq(&self.0, &handle.0)
+    }
 }
 impl Drop for PriorityCloseOwner {
     fn drop(&mut self) {

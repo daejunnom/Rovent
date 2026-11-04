@@ -2886,16 +2886,30 @@ fn retain_diagnostic(
     }
     Ok(())
 }
-/// Independent input, timer, search and physical evaluator owners have bounded
-/// event/worker counts. CPU/mock success does not assert NN/GPU support.
-pub fn serve<O: Write, D: Write>(
+// Shared startup owner; async integration must retain these same fields rather
+// than reconstructing a Session or stopping the timer after a yielded output.
+struct PreparedEngine {
+    owner: Arc<Mutex<Owner>>,
+    session: Session<RulesUciPort>,
     events: Receiver<Event>,
     sender: SyncSender<Event>,
-    protocol: &mut O,
-    diagnostics: &mut D,
+    settings: EngineSettings,
+    timer_stop: Arc<std::sync::atomic::AtomicBool>,
+    timer: JoinHandle<()>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_owner: Option<priority_cancel::PriorityCancelOwner>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_close_owner: Option<priority_close::PriorityCloseOwner>,
+    #[cfg(feature = "pals-adaptive")]
+    dispatch_close_observer: Option<priority_close::PriorityCloseObserver>,
+}
+
+fn prepare_engine(
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
     process: EngineProcess,
     settings: EngineSettings,
-) -> Result<(), EngineError> {
+) -> Result<PreparedEngine, EngineError> {
     let EngineProcess {
         factory,
         driver,
@@ -3056,6 +3070,48 @@ pub fn serve<O: Write, D: Write>(
             thread::sleep(Duration::from_millis(1));
         }
     });
+    Ok(PreparedEngine {
+        owner,
+        session,
+        events,
+        sender,
+        settings,
+        timer_stop,
+        timer,
+        #[cfg(feature = "pals-adaptive")]
+        priority_owner: _priority_owner,
+        #[cfg(feature = "pals-adaptive")]
+        priority_close_owner: _priority_close_owner,
+        #[cfg(feature = "pals-adaptive")]
+        dispatch_close_observer,
+    })
+}
+
+/// Independent input, timer, search and physical evaluator owners have bounded
+/// event/worker counts. CPU/mock success does not assert NN/GPU support.
+pub fn serve<O: Write, D: Write>(
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
+    protocol: &mut O,
+    diagnostics: &mut D,
+    process: EngineProcess,
+    settings: EngineSettings,
+) -> Result<(), EngineError> {
+    let PreparedEngine {
+        owner,
+        mut session,
+        events,
+        sender,
+        settings,
+        timer_stop,
+        timer,
+        #[cfg(feature = "pals-adaptive")]
+            priority_owner: _priority_owner,
+        #[cfg(feature = "pals-adaptive")]
+            priority_close_owner: _priority_close_owner,
+        #[cfg(feature = "pals-adaptive")]
+        dispatch_close_observer,
+    } = prepare_engine(events, sender, process, settings)?;
     let handler_owner = Arc::clone(&owner);
     let dispatch_owner = Arc::clone(&owner);
     let result = serve_events_with_handler(
