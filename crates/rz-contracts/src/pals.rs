@@ -3,6 +3,7 @@
 
 pub mod cancel_control_v1;
 pub mod deadline_grant_v1;
+pub mod proxy_entry_smoke_grant_v1;
 
 use crate::{
     ByteBudget, CancelToken, ClockDomain, Color, ContractError, Deadline, Digest, ErrorCode,
