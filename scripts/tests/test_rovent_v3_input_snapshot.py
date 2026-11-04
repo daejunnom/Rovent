@@ -114,7 +114,10 @@ class SnapshotOwnershipTests(unittest.TestCase):
             chunk = original_read(fd, size)
             if chunk and not changed:
                 changed = True
-                path.write_bytes(bytes(value ^ 1 for value in data))
+                # Keep the already-read bytes unchanged, but make the source
+                # descriptor's size observably different on every filesystem.
+                # Same-size writes may have identical timestamp resolution.
+                path.write_bytes(b"")
             return chunk
 
         with mock.patch.object(snapshot.os, "read", side_effect=change_after_first_read):
