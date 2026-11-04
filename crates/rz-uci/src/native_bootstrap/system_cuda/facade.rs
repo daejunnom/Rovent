@@ -268,6 +268,44 @@ pub struct Lc0PendingSupervisor {
     ticket_token: Arc<()>,
 }
 
+/// Pre-native failure keeps the same pending ticket and, if authentication
+/// completed, the same authenticated parent connection. An authentication
+/// error closes its accepted stream and preserves the original I/O error.
+pub enum Lc0PendingFailureCause {
+    TicketMismatch,
+    Accept(io::Error),
+    Authentication(io::Error),
+    Asset(NativeBootstrapError),
+    Custody(NativeBootstrapError),
+}
+
+#[must_use]
+pub struct Lc0PendingFailure {
+    pending: Lc0PendingSupervisor,
+    cause: Lc0PendingFailureCause,
+    authenticated_parent: Option<Arc<ConnectedParent>>,
+}
+
+impl Lc0PendingFailure {
+    pub fn cause(&self) -> &Lc0PendingFailureCause {
+        &self.cause
+    }
+
+    pub fn parent_authenticated(&self) -> bool {
+        self.authenticated_parent.is_some()
+    }
+
+    /// Operates on the original listener and ticket. On failure the original
+    /// failure object and listener remain owned by the caller.
+    pub fn retire_listener_before_native(
+        &self,
+        listener: &mut Lc0ParentListener,
+        until: Instant,
+    ) -> io::Result<()> {
+        listener.retire_before_auth(&self.pending, until)
+    }
+}
+
 /// Owns the original authenticated parent, startup custody and worker.
 /// This is not an OS-process lifetime manager; dropping it or exiting on an
 /// unknown physical result is not safe. No resource is copied to a cache.
@@ -393,6 +431,78 @@ impl Lc0PendingSupervisor {
         self.authenticate_inner(stream, until, Some(Arc::clone(&listener.receipt_token)))
     }
 
+    /// Additive pre-native entry that retains the original ticket and error
+    /// after failed admission. An accepted stream may close on authentication
+    /// error; once authenticated, the same parent is retained even if asset
+    /// validation or custody construction fails.
+    pub fn authenticate_parent_preserving_failure(
+        self,
+        listener: &Lc0ParentListener,
+        until: Instant,
+    ) -> Result<Lc0SupervisedSession, Lc0PendingFailure> {
+        if !Arc::ptr_eq(&self.ticket_token, &listener.ticket_token) {
+            return Err(Lc0PendingFailure {
+                pending: self,
+                cause: Lc0PendingFailureCause::TicketMismatch,
+                authenticated_parent: None,
+            });
+        }
+        let stream = match listener.accept_parent(until.min(self.control_until)) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Err(Lc0PendingFailure {
+                    pending: self,
+                    cause: Lc0PendingFailureCause::Accept(error),
+                    authenticated_parent: None,
+                });
+            }
+        };
+        let parent = match self
+            .pending
+            .authenticate(stream, until.min(self.control_until))
+        {
+            Ok(parent) => parent,
+            Err(error) => {
+                return Err(Lc0PendingFailure {
+                    pending: self,
+                    cause: Lc0PendingFailureCause::Authentication(error),
+                    authenticated_parent: None,
+                });
+            }
+        };
+        let asset = match MaiaAsset::load(
+            &self.config.source_weights,
+            &self.config.onnx_model,
+            &self.config.export_manifest,
+        ) {
+            Ok(asset) => asset,
+            Err(error) => {
+                return Err(Lc0PendingFailure {
+                    pending: self,
+                    cause: Lc0PendingFailureCause::Asset(error.into()),
+                    authenticated_parent: Some(parent),
+                });
+            }
+        };
+        let custody = match Lc0SystemStartupCustody::new(
+            asset,
+            Arc::clone(&parent),
+            self.epoch,
+            &self.lock,
+            &self.config,
+        ) {
+            Ok(custody) => custody,
+            Err(error) => {
+                return Err(Lc0PendingFailure {
+                    pending: self,
+                    cause: Lc0PendingFailureCause::Custody(error.into()),
+                    authenticated_parent: Some(parent),
+                });
+            }
+        };
+        Ok(self.into_supervised_session(custody, Some(Arc::clone(&listener.receipt_token))))
+    }
+
     /// This stream must come from the listener owned by the original process
     /// supervisor. Any error here occurs before ORT/session native entry.
     pub fn authenticate(
@@ -420,7 +530,15 @@ impl Lc0PendingSupervisor {
         )?;
         let custody =
             Lc0SystemStartupCustody::new(asset, parent, self.epoch, &self.lock, &self.config)?;
-        Ok(Lc0SupervisedSession {
+        Ok(self.into_supervised_session(custody, receipt_token))
+    }
+
+    fn into_supervised_session(
+        self,
+        custody: Lc0SystemStartupCustody,
+        receipt_token: Option<Arc<()>>,
+    ) -> Lc0SupervisedSession {
+        Lc0SupervisedSession {
             supervisor: Lc0ControlSupervisor::new(
                 Lc0SystemSessionOwner::new(custody),
                 self.control_until,
@@ -437,7 +555,7 @@ impl Lc0PendingSupervisor {
             endpoint_retirement_started: false,
             epoch: self.epoch,
             publications: PublicationObservations::default(),
-        })
+        }
     }
 }
 

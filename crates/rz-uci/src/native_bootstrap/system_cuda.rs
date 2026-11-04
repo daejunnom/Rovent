@@ -48,8 +48,9 @@ mod facade;
 mod profile;
 mod projection;
 pub use facade::{
-    Lc0AsyncAdmission, Lc0AsyncInputs, Lc0ParentListener, Lc0PendingSupervisor, Lc0ReceiptOwner,
-    Lc0SupervisedSession, parent_preflight,
+    Lc0AsyncAdmission, Lc0AsyncInputs, Lc0ParentListener, Lc0PendingFailure,
+    Lc0PendingFailureCause, Lc0PendingSupervisor, Lc0ReceiptOwner, Lc0SupervisedSession,
+    parent_preflight,
 };
 pub use projection::{
     Lc0ObservedPublication, Lc0ObservedRelease, Lc0ObservedService, Lc0OriginalSessionObservation,
@@ -107,7 +108,7 @@ impl Lc0PendingParent {
     }
 
     pub(super) fn authenticate(
-        self,
+        &self,
         stream: UnixStream,
         until: Instant,
     ) -> io::Result<Arc<ConnectedParent>> {
