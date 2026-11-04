@@ -108,6 +108,17 @@ pub struct OriginalProcessInput<'a> {
     pub window: OriginalProcessWindow,
 }
 
+/// The existing supervisor drains directly into these same caller-owned
+/// buffers for smoke paths. They are transferred into `ProcessOutput` only
+/// on normal return; an error/unwind retains the bytes alongside the caller's
+/// original custody and observation. This is not a physical-completion proof.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct OriginalSmokeOutputBuffers {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 /// The caller owns this observation before entering the smoke supervisor and
 /// retains it even if supervision returns an error or unwinds. It describes
 /// transport only; it does not seal input contents or establish UCI/model,
@@ -117,6 +128,7 @@ pub(crate) struct OriginalSmokeTransportObservation {
     window: OriginalProcessWindow,
     transport: OriginalProcessObservation,
     pre_signal: PreSignalObservation,
+    output: OriginalSmokeOutputBuffers,
     started: bool,
     returned: bool,
 }
@@ -129,6 +141,7 @@ impl OriginalSmokeTransportObservation {
             window: input.window,
             transport: OriginalProcessObservation::new(input.bytes.len()),
             pre_signal: PreSignalObservation::default(),
+            output: OriginalSmokeOutputBuffers::default(),
             started: false,
             returned: false,
         })
@@ -140,6 +153,14 @@ impl OriginalSmokeTransportObservation {
 
     pub(crate) fn pre_signal(&self) -> &PreSignalObservation {
         &self.pre_signal
+    }
+
+    pub(crate) fn buffered_stdout(&self) -> &[u8] {
+        &self.output.stdout
+    }
+
+    pub(crate) fn buffered_stderr(&self) -> &[u8] {
+        &self.output.stderr
     }
 
     pub(crate) fn stdin_closed_after_input(&self) -> bool {
@@ -178,6 +199,7 @@ pub(crate) struct OriginalSmokeUciObservation {
     window: OriginalProcessWindow,
     transport: OriginalProcessObservation,
     pre_signal: PreSignalObservation,
+    output: OriginalSmokeOutputBuffers,
     dialogue: SmokeUciDialogue,
     started: bool,
     returned: bool,
@@ -192,6 +214,7 @@ impl OriginalSmokeUciObservation {
                 b"uci\n".len() + b"isready\n".len() + b"quit\n".len(),
             ),
             pre_signal: PreSignalObservation::default(),
+            output: OriginalSmokeOutputBuffers::default(),
             dialogue: SmokeUciDialogue::default(),
             started: false,
             returned: false,
@@ -202,6 +225,12 @@ impl OriginalSmokeUciObservation {
     }
     pub(crate) fn pre_signal(&self) -> &PreSignalObservation {
         &self.pre_signal
+    }
+    pub(crate) fn buffered_stdout(&self) -> &[u8] {
+        &self.output.stdout
+    }
+    pub(crate) fn buffered_stderr(&self) -> &[u8] {
+        &self.output.stderr
     }
     pub(crate) fn attempt_started(&self) -> bool {
         self.started
@@ -1359,6 +1388,7 @@ pub(crate) fn supervise_smoke_input_in_original_window<'v>(
             commands: Some(input.bytes),
             original: Some(input.window),
             observation: Some(&mut observation.transport),
+            smoke_output: Some(&mut observation.output),
             spawned: Some(&mut *spawned),
             control: Some(&mut guarded_control),
             cleanup_control: has_cleanup.then_some(&mut guarded_cleanup as CleanupControl<'_>),
@@ -1456,6 +1486,7 @@ pub(crate) fn supervise_smoke_uci_in_original_window<'v>(
             dialogue: Some(&mut observation.dialogue),
             original: Some(window),
             observation: Some(&mut observation.transport),
+            smoke_output: Some(&mut observation.output),
             spawned: Some(&mut *spawned),
             control: Some(&mut guarded_control),
             cleanup_control: has_cleanup.then_some(&mut guarded_cleanup as CleanupControl<'_>),
@@ -1775,6 +1806,7 @@ fn supervise_original_input(
                 pre_signal: None,
                 pre_signal_observation: None,
                 dialogue: None,
+                smoke_output: None,
             },
         )?;
         let returned = Instant::now();
@@ -1829,6 +1861,7 @@ mod linux {
     pub(super) struct InvocationIo<'a, 'b, 'v> {
         pub commands: Option<&'a [u8]>,
         pub dialogue: Option<&'b mut SmokeUciDialogue>,
+        pub smoke_output: Option<&'b mut OriginalSmokeOutputBuffers>,
         pub original: Option<OriginalProcessWindow>,
         pub observation: Option<&'b mut OriginalProcessObservation>,
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
@@ -1896,6 +1929,7 @@ mod linux {
         let InvocationIo {
             commands,
             mut dialogue,
+            smoke_output,
             original,
             mut observation,
             mut verify_loaded,
@@ -1909,6 +1943,14 @@ mod linux {
         if commands.is_some() && dialogue.is_some() {
             return Err(ArenaError::Invalid(
                 "smoke dialogue and batch stdin cannot share one process".into(),
+            ));
+        }
+        if smoke_output
+            .as_ref()
+            .is_some_and(|output| !output.stdout.is_empty() || !output.stderr.is_empty())
+        {
+            return Err(ArenaError::Invalid(
+                "original smoke output buffers are not fresh".into(),
             ));
         }
         let mut local_custody = SpawnCustody::default();
@@ -2026,8 +2068,10 @@ mod linux {
         } else {
             None
         };
-        let mut out = Vec::new();
-        let mut err = Vec::new();
+        let mut local_output = OriginalSmokeOutputBuffers::default();
+        let output = smoke_output.unwrap_or(&mut local_output);
+        let out = &mut output.stdout;
+        let err = &mut output.stderr;
         let mut shutdown = None;
         let mut pre_signal_until = None;
         let mut term_sent = false;
@@ -2186,8 +2230,8 @@ mod linux {
             let stdout_open = stdout.is_some();
             let stderr_open = stderr.is_some();
             let drained = [
-                drain(&mut stdout, &mut out, limits.max_output_bytes, &mut receipt),
-                drain(&mut stderr, &mut err, limits.max_output_bytes, &mut receipt),
+                drain(&mut stdout, out, limits.max_output_bytes, &mut receipt),
+                drain(&mut stderr, err, limits.max_output_bytes, &mut receipt),
             ];
             stdout_eof |= stdout_open && stdout.is_none() && drained[0].is_ok();
             stderr_eof |= stderr_open && stderr.is_none() && drained[1].is_ok();
@@ -2212,7 +2256,7 @@ mod linux {
             if stop.is_none()
                 && let Some(dialogue) = dialogue.as_deref_mut()
             {
-                dialogue.observe_stdout(&out);
+                dialogue.observe_stdout(out);
             }
             // Observe only newly retained bytes; the raw pipe budget and later
             // provider/clock acceptance still own the complete unchanged output.
@@ -2629,8 +2673,8 @@ mod linux {
         let pending_child = retain_child.then_some(child);
         Ok(ProcessOutput {
             receipt,
-            stdout: out,
-            stderr: err,
+            stdout: std::mem::take(out),
+            stderr: std::mem::take(err),
             pending_child,
         })
     }
@@ -3382,6 +3426,19 @@ mod linux {
         const SMOKE_ADAPTER_READY: &str = ".rz-smoke-input-adapter-ready";
         const SMOKE_ADAPTER_CHILD: &str = "process::linux::tests::smoke_input_adapter_mock_child";
 
+        /// If this fixture cannot prove that its own mock was reaped, keep
+        /// the exact Child handle alive for the rest of this test process.
+        /// This does not assert group or device completion.
+        fn retain_unresolved_smoke_mock(child: std::process::Child) {
+            use std::sync::{Mutex, OnceLock};
+            static UNRESOLVED: OnceLock<Mutex<Vec<std::process::Child>>> = OnceLock::new();
+            let mut owner = UNRESOLVED
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner.push(child);
+        }
+
         /// Only the owned temporary cwd provides the mode file. A normal
         /// workspace test run does not read stdin or start this mock worker.
         #[test]
@@ -3389,6 +3446,18 @@ mod linux {
             let Ok(mode) = std::fs::read_to_string(SMOKE_ADAPTER_MODE) else {
                 return;
             };
+            if mode == "capture-before-unwind" {
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input).unwrap();
+                let mut error = std::io::stderr().lock();
+                error.write_all(b"mock-stderr-before-unwind\n").unwrap();
+                error.flush().unwrap();
+                let mut output = std::io::stdout().lock();
+                output.write_all(b"mock-stdout-before-unwind\n").unwrap();
+                output.flush().unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+                return;
+            }
             if mode == "dialogue" || mode == "early-ready" || mode == "partial-response" {
                 use std::io::BufRead;
                 let input = std::io::stdin();
@@ -3578,8 +3647,112 @@ mod linux {
             assert!(!observation.isready_sent() && !observation.quit_sent());
             assert!(output.stdout.ends_with(b"ucio"));
             assert!(observation.transport().stdout_eof());
+            assert!(observation.buffered_stdout().is_empty());
+            assert!(observation.buffered_stderr().is_empty());
             assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
             std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_output_buffers_survive_unwind_with_original_child() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"capture-before-unwind").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let input = OriginalProcessInput {
+                bytes: b"uci\n",
+                window,
+            };
+            let mut observation = OriginalSmokeTransportObservation::new(input).unwrap();
+            let mut custody = SpawnCustody::default();
+            let mut accumulated = Vec::new();
+            let mut trigger = |bytes: &[u8]| {
+                accumulated.extend_from_slice(bytes);
+                if accumulated
+                    .windows(b"mock-stdout-before-unwind".len())
+                    .any(|part| part == b"mock-stdout-before-unwind")
+                {
+                    panic!("smoke output observation fixture");
+                }
+            };
+            observation.started = true;
+            let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                linux::supervise(
+                    &program,
+                    &[
+                        "--exact".into(),
+                        SMOKE_ADAPTER_CHILD.into(),
+                        "--nocapture".into(),
+                    ],
+                    root.file(),
+                    limits,
+                    None,
+                    Some(linux::ArtifactObservation::Tree(&original_watch())),
+                    Some(&mut trigger),
+                    linux::InvocationIo {
+                        commands: Some(input.bytes),
+                        original: Some(window),
+                        observation: Some(&mut observation.transport),
+                        smoke_output: Some(&mut observation.output),
+                        spawned: Some(&mut custody),
+                        ..Default::default()
+                    },
+                )
+            }));
+            let pending_in_original = custody.pending.load(Ordering::Acquire);
+            let held = custody.take_child();
+            let retained_original = held.is_some();
+            // No failure below may abandon this fixture's exact mock child.
+            // An unexpected normal result may hold it in ProcessOutput.
+            let unexpected_pending = match &mut result {
+                Ok(Ok(output)) => output.pending_child.take(),
+                _ => None,
+            };
+            let mut reaped = true;
+            for mut child in held.into_iter().chain(unexpected_pending) {
+                match child.try_wait() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let _ = child.kill();
+                        if child.wait().is_err() {
+                            reaped = false;
+                            retain_unresolved_smoke_mock(child);
+                        }
+                    }
+                    Err(_) => {
+                        reaped = false;
+                        retain_unresolved_smoke_mock(child);
+                    }
+                }
+            }
+            if reaped {
+                std::fs::remove_file(mode).unwrap();
+            }
+            assert!(result.is_err());
+            assert!(observation.attempt_started() && !observation.attempt_returned());
+            assert!(
+                observation
+                    .buffered_stdout()
+                    .windows(b"mock-stdout-before-unwind".len())
+                    .any(|part| part == b"mock-stdout-before-unwind")
+            );
+            assert!(
+                observation
+                    .buffered_stderr()
+                    .windows(b"mock-stderr-before-unwind".len())
+                    .any(|part| part == b"mock-stderr-before-unwind")
+            );
+            assert!(pending_in_original && retained_original && reaped);
+            // This fixture only reaps its exact mock child; it makes no GPU or
+            // general descendant/physical-completion assertion.
         }
 
         #[test]
