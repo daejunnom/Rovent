@@ -182,7 +182,6 @@ impl PendingPolicyPublicationV3 {
 
 pub(super) struct PendingPolicyPreparationFailureV3 {
     pub(super) error: ArenaError,
-    pub(super) row: RoventRetiredLockV3Record,
     pub(super) panic_payload: Option<Box<dyn std::any::Any + Send>>,
 }
 impl RoventCorpusProducerLockV3 {
@@ -571,11 +570,19 @@ impl RoventCorpusProducerLockV3 {
     /// Produce an opaque candidate while retaining the row, capsule and
     /// one-shot teacher evidence. This is not a target commit or publication;
     /// the exact root/ticket cancellation gate must still guard writer append.
-    pub(super) fn prepare_policy_publication(
+    pub(super) fn prepare_policy_publication_in_slots(
         &mut self,
-        row: RoventRetiredLockV3Record,
-    ) -> Result<PendingPolicyPublicationV3, Box<PendingPolicyPreparationFailureV3>> {
+        row_slot: &mut Option<RoventRetiredLockV3Record>,
+        pending_slot: &mut Option<PendingPolicyPublicationV3>,
+    ) -> Result<(), Box<PendingPolicyPreparationFailureV3>> {
         let build = || -> Result<_, ArenaError> {
+            check(
+                pending_slot.is_none(),
+                "lock-v3 policy candidate slot is occupied",
+            )?;
+            let row = row_slot
+                .as_ref()
+                .ok_or_else(|| invalid("lock-v3 original row slot is empty"))?;
             let prepared = row
                 .prepared_policy
                 .as_ref()
@@ -598,7 +605,7 @@ impl RoventCorpusProducerLockV3 {
                     && row.record.0.head_sources.is_empty(),
                 "lock-v3 staged policy custody differs or is canceled",
             )?;
-            prepared.sealed().capsule().matches_original_row(&row)?;
+            prepared.sealed().capsule().matches_original_row(row)?;
             let sequence = self
                 .original
                 .original
@@ -621,20 +628,20 @@ impl RoventCorpusProducerLockV3 {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
             Ok(Ok((candidate, sequence))) => {
                 self.original.original.sequence = sequence;
-                Ok(PendingPolicyPublicationV3 {
+                let row = row_slot.take().expect("validated original row slot");
+                *pending_slot = Some(PendingPolicyPublicationV3 {
                     row,
                     candidate,
                     capability: None,
-                })
+                });
+                Ok(())
             }
             Ok(Err(error)) => Err(Box::new(PendingPolicyPreparationFailureV3 {
                 error,
-                row,
                 panic_payload: None,
             })),
             Err(payload) => Err(Box::new(PendingPolicyPreparationFailureV3 {
                 error: invalid("lock-v3 policy candidate preparation panicked"),
-                row,
                 panic_payload: Some(payload),
             })),
         }
