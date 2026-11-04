@@ -523,6 +523,7 @@ pub(crate) struct SupervisorStartCustodyV3 {
     native: Option<Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
     stop: Arc<AtomicBool>,
     admitted: Arc<AtomicBool>,
+    stop_authorization: Option<super::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3>,
     until: Instant,
     state: SupervisorThreadStateV3,
     thread: Option<std::thread::JoinHandle<Result<(), String>>>,
@@ -583,6 +584,7 @@ impl SupervisorStartCustodyV3 {
             native: None,
             stop: Arc::new(AtomicBool::new(false)),
             admitted: Arc::new(AtomicBool::new(false)),
+            stop_authorization: None,
             until,
             state: SupervisorThreadStateV3::Prepared,
             thread: None,
@@ -744,8 +746,33 @@ impl SupervisorStartCustodyV3 {
     pub(crate) fn matches_supervisor(&self, supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>) -> bool {
         Arc::ptr_eq(&self.supervisor, supervisor)
     }
-    pub(crate) fn request_stop(&self) {
+    /// Stop only after the original bridge has sealed root quiescence. On a
+    /// mismatch the caller receives the very same authorization back.
+    pub(crate) fn authorize_stop(
+        &mut self,
+        authorization: super::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3,
+    ) -> Result<
+        (),
+        (
+            super::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3,
+            &'static str,
+        ),
+    > {
+        let Some(native) = self.native.as_ref() else {
+            return Err((authorization, "P-C supervisor native owner absent"));
+        };
+        if self.state != SupervisorThreadStateV3::Running {
+            return Err((authorization, "P-C supervisor driver is not running"));
+        }
+        if self.stop_authorization.is_some() {
+            return Err((authorization, "P-C supervisor stop already authorized"));
+        }
+        if !authorization.matches_original(&self.supervisor, native) {
+            return Err((authorization, "P-C supervisor stop authorization differs"));
+        }
+        self.stop_authorization = Some(authorization);
         self.stop.store(true, Ordering::Release);
+        Ok(())
     }
     pub(crate) fn result(&self) -> Option<&Result<(), String>> {
         self.result.as_ref()
@@ -851,6 +878,22 @@ impl SupervisorStartCustodyV3 {
 }
 
 impl PcWorkerSupervisorV3 {
+    /// These are only identity and in-memory handoff observations. The bridge
+    /// must separately close admission and verify its queue and physical proof.
+    pub(crate) fn matches_original_bridge(&self, bridge: &Arc<RoventPcCollectionBridgeV3>) -> bool {
+        Arc::ptr_eq(&self.bridge, bridge)
+    }
+
+    pub(crate) fn pending_root_absent(&self) -> bool {
+        self.pending_root.is_none()
+    }
+
+    pub(crate) fn owns_recovery(&self, recovery: &Arc<Mutex<PcRootRecoveryV3>>) -> bool {
+        self.roots
+            .iter()
+            .any(|original| Arc::ptr_eq(original, recovery))
+    }
+
     /// Same in-memory game output owner; no durable sink is implied.
     pub(crate) fn output_owner(&self) -> Option<PolicyOutputOwnerV3> {
         self.pipeline
