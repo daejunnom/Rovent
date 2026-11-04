@@ -169,6 +169,162 @@ fn validate_smoke_protocol_input(input: &[u8]) -> Result<(), ArenaError> {
     Ok(())
 }
 
+/// A protocol observation retained by the original smoke owner. Response lines
+/// are read after their command was sent; UCI has no request ID, so this cannot
+/// prove when the peer generated buffered output or establish causality. No
+/// field here is model readiness, an arena result, or physical-completion.
+#[cfg(target_os = "linux")]
+pub(crate) struct OriginalSmokeUciObservation {
+    window: OriginalProcessWindow,
+    transport: OriginalProcessObservation,
+    pre_signal: PreSignalObservation,
+    dialogue: SmokeUciDialogue,
+    started: bool,
+    returned: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl OriginalSmokeUciObservation {
+    pub(crate) fn new(window: OriginalProcessWindow) -> Self {
+        Self {
+            window,
+            transport: OriginalProcessObservation::new(
+                b"uci\n".len() + b"isready\n".len() + b"quit\n".len(),
+            ),
+            pre_signal: PreSignalObservation::default(),
+            dialogue: SmokeUciDialogue::default(),
+            started: false,
+            returned: false,
+        }
+    }
+    pub(crate) fn transport(&self) -> &OriginalProcessObservation {
+        &self.transport
+    }
+    pub(crate) fn pre_signal(&self) -> &PreSignalObservation {
+        &self.pre_signal
+    }
+    pub(crate) fn attempt_started(&self) -> bool {
+        self.started
+    }
+    pub(crate) fn attempt_returned(&self) -> bool {
+        self.returned
+    }
+    pub(crate) fn uci_sent(&self) -> bool {
+        self.dialogue.uci_sent
+    }
+    pub(crate) fn uciok_observed(&self) -> bool {
+        self.dialogue.uciok_observed
+    }
+    pub(crate) fn isready_sent(&self) -> bool {
+        self.dialogue.isready_sent
+    }
+    pub(crate) fn readyok_observed(&self) -> bool {
+        self.dialogue.readyok_observed
+    }
+    pub(crate) fn quit_sent(&self) -> bool {
+        self.dialogue.quit_sent
+    }
+    /// Observed writes and received protocol lines only; callers must still
+    /// assess process/pipe termination and any independent physical scope.
+    pub(crate) fn uci_exchange_observed(&self) -> bool {
+        self.uci_sent()
+            && self.uciok_observed()
+            && self.isready_sent()
+            && self.readyok_observed()
+            && self.quit_sent()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SmokeUciPhase {
+    #[default]
+    SendUci,
+    WaitUciOk,
+    SendIsReady,
+    WaitReadyOk,
+    SendQuit,
+    Done,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct SmokeUciDialogue {
+    phase: SmokeUciPhase,
+    command_offset: usize,
+    written: usize,
+    scan_offset: usize,
+    line_start: usize,
+    response_fence: usize,
+    uci_sent: bool,
+    uciok_observed: bool,
+    isready_sent: bool,
+    readyok_observed: bool,
+    quit_sent: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl SmokeUciDialogue {
+    fn command(&self) -> Option<&'static [u8]> {
+        match self.phase {
+            SmokeUciPhase::SendUci => Some(b"uci\n"),
+            SmokeUciPhase::SendIsReady => Some(b"isready\n"),
+            SmokeUciPhase::SendQuit => Some(b"quit\n"),
+            _ => None,
+        }
+    }
+
+    fn wrote(&mut self, count: usize, observed_stdout_len: usize) {
+        self.command_offset += count;
+        self.written += count;
+        if self
+            .command()
+            .is_none_or(|command| self.command_offset != command.len())
+        {
+            return;
+        }
+        self.command_offset = 0;
+        self.response_fence = observed_stdout_len;
+        self.phase = match self.phase {
+            SmokeUciPhase::SendUci => {
+                self.uci_sent = true;
+                SmokeUciPhase::WaitUciOk
+            }
+            SmokeUciPhase::SendIsReady => {
+                self.isready_sent = true;
+                SmokeUciPhase::WaitReadyOk
+            }
+            SmokeUciPhase::SendQuit => {
+                self.quit_sent = true;
+                SmokeUciPhase::Done
+            }
+            phase => phase,
+        };
+    }
+
+    /// Scan the already bounded, retained stdout buffer once. An incomplete
+    /// earlier line crossing a new-command fence cannot answer that command.
+    fn observe_stdout(&mut self, stdout: &[u8]) {
+        while self.scan_offset < stdout.len() {
+            let at = self.scan_offset;
+            self.scan_offset += 1;
+            if stdout[at] != b'\n' {
+                continue;
+            }
+            let line = stdout[self.line_start..at].trim_ascii();
+            let eligible = self.line_start >= self.response_fence;
+            if eligible && self.phase == SmokeUciPhase::WaitUciOk && line == b"uciok" {
+                self.uciok_observed = true;
+                self.phase = SmokeUciPhase::SendIsReady;
+            } else if eligible && self.phase == SmokeUciPhase::WaitReadyOk && line == b"readyok" {
+                self.readyok_observed = true;
+                self.phase = SmokeUciPhase::SendQuit;
+            }
+            self.line_start = self.scan_offset;
+        }
+    }
+}
+
 /// 수치 캡처의 고정 FP32 조건만 전달한다. 임의 환경이나 부모의 CUDA/
 /// 인증/검색 경로를 상속하는 접점이 아니며 기존 실행의 환경은 보존한다.
 #[derive(Clone, Copy, Debug)]
@@ -1220,6 +1376,103 @@ pub(crate) fn supervise_smoke_input_in_original_window<'v>(
     result
 }
 
+/// Observe the UCI startup dialogue over the same live child pipes. Response
+/// lines are received after each command is fully written; output already in a
+/// kernel pipe may have been generated earlier. The original owner's bounded
+/// nonblocking controls and deadlines remain authoritative. Sending quit or
+/// seeing `readyok` does not attest model or physical finish.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_smoke_uci_in_original_window<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    window: OriginalProcessWindow,
+    spawned: &'v mut SpawnCustody,
+    mut control: SpawnControl<'v>,
+    mut cleanup_control: Option<CleanupControl<'v>>,
+    mut pre_signal: Option<PreSignalControl<'v>>,
+    observation: &'v mut OriginalSmokeUciObservation,
+) -> Result<ProcessOutput, ArenaError> {
+    if observation.started
+        || observation.window.started != window.started
+        || observation.window.execution != window.execution
+        || observation.window.whole != window.whole
+    {
+        return Err(ArenaError::Invalid(
+            "smoke UCI observation does not match this fresh original window".into(),
+        ));
+    }
+    window.check_before_spawn(limits)?;
+    watch.validate()?;
+    if !directory
+        .metadata()
+        .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+        .is_dir()
+    {
+        return Err(ArenaError::Invalid(
+            "original smoke cwd handle must be a directory".into(),
+        ));
+    }
+    let directory = directory
+        .try_clone()
+        .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+    let has_cleanup = cleanup_control.is_some();
+    let has_pre_signal = pre_signal.is_some();
+    let mut guarded_control = |owner: &SpawnCustody, until: Instant| match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| control(owner, until)),
+    ) {
+        Ok(result) => result,
+        Err(_) => Err(ArenaError::Io("process.smoke_run_control:panic".into())),
+    };
+    let mut guarded_cleanup = |owner: &SpawnCustody, until: Instant| {
+        cleanup_control
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_cleanup_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    let mut guarded_pre_signal = |owner: &SpawnCustody, until: Instant| {
+        pre_signal
+            .as_deref_mut()
+            .ok_or_else(|| ArenaError::Io("process.smoke_pre_signal_control_missing".into()))?(
+            owner, until,
+        )
+    };
+    observation.started = true;
+    observation.transport.original_supervisor_entry_ns = window.elapsed_ns(Instant::now());
+    let result = linux::supervise(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        Some(linux::ArtifactObservation::Tree(watch)),
+        None,
+        linux::InvocationIo {
+            dialogue: Some(&mut observation.dialogue),
+            original: Some(window),
+            observation: Some(&mut observation.transport),
+            spawned: Some(&mut *spawned),
+            control: Some(&mut guarded_control),
+            cleanup_control: has_cleanup.then_some(&mut guarded_cleanup as CleanupControl<'_>),
+            pre_signal: has_pre_signal.then_some(&mut guarded_pre_signal as PreSignalControl<'_>),
+            pre_signal_observation: has_pre_signal.then_some(&mut observation.pre_signal),
+            ..Default::default()
+        },
+    );
+    let returned = Instant::now();
+    observation.transport.original_finished_ns = window.elapsed_ns(returned);
+    observation.transport.finished_before_whole = returned < window.whole;
+    observation.transport.cancelled_at_return =
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    observation.returned = true;
+    result
+}
+
 /// Finite UCI preflight input through the same pinned ELF/process-group owner.
 /// Commands are written nonblocking; the wall/output/tree bounds remain active.
 pub fn supervise_protocol_in_directory(
@@ -1521,6 +1774,7 @@ fn supervise_original_input(
                 cleanup_control: None,
                 pre_signal: None,
                 pre_signal_observation: None,
+                dialogue: None,
             },
         )?;
         let returned = Instant::now();
@@ -1574,6 +1828,7 @@ mod linux {
     #[derive(Default)]
     pub(super) struct InvocationIo<'a, 'b, 'v> {
         pub commands: Option<&'a [u8]>,
+        pub dialogue: Option<&'b mut SmokeUciDialogue>,
         pub original: Option<OriginalProcessWindow>,
         pub observation: Option<&'b mut OriginalProcessObservation>,
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
@@ -1640,6 +1895,7 @@ mod linux {
     ) -> Result<ProcessOutput, ArenaError> {
         let InvocationIo {
             commands,
+            mut dialogue,
             original,
             mut observation,
             mut verify_loaded,
@@ -1650,6 +1906,11 @@ mod linux {
             mut pre_signal,
             mut pre_signal_observation,
         } = io;
+        if commands.is_some() && dialogue.is_some() {
+            return Err(ArenaError::Invalid(
+                "smoke dialogue and batch stdin cannot share one process".into(),
+            ));
+        }
         let mut local_custody = SpawnCustody::default();
         let custody = spawned.unwrap_or(&mut local_custody);
         if custody.child.is_some() || custody.pending.load(Ordering::Acquire) {
@@ -1697,7 +1958,7 @@ mod linux {
                 numerical_environment
                     .map(|OriginalNumericalEnvironment::Fp32Tf32Off| ("NVIDIA_TF32_OVERRIDE", "0")),
             )
-            .stdin(if commands.is_some() {
+            .stdin(if commands.is_some() || dialogue.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -1886,6 +2147,38 @@ mod linux {
                     }
                 }
             }
+            if stop.is_none()
+                && (original.is_none() || loaded_image_checked)
+                && let (Some(pipe), Some(dialogue)) = (stdin.as_mut(), dialogue.as_deref_mut())
+                && let Some(command) = dialogue.command()
+            {
+                match pipe.write(&command[dialogue.command_offset..]) {
+                    Ok(0) => {
+                        evidence(&mut receipt, "process.smoke_uci_write_zero");
+                        stop = Some(ProcessStop::IoFailure);
+                    }
+                    Ok(n) => {
+                        if dialogue.written == 0
+                            && let (Some(window), Some(o)) = (original, observation.as_deref_mut())
+                        {
+                            o.first_input_written_ns = window.elapsed_ns(Instant::now());
+                        }
+                        dialogue.wrote(n, out.len());
+                        if dialogue.phase == SmokeUciPhase::Done {
+                            stdin = None;
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        evidence(&mut receipt, "process.smoke_uci_write");
+                        stop = Some(ProcessStop::IoFailure);
+                    }
+                }
+            }
             // Each pass drains a finite amount from each pipe, preserving time,
             // cancellation and process checks even under continuous output.
             let prior_out = out.len();
@@ -1909,6 +2202,17 @@ mod linux {
                     }
                     _ => {}
                 }
+            }
+            if stop.is_none()
+                && dialogue.is_some()
+                && original.is_some_and(|window| Instant::now() >= window.execution)
+            {
+                stop = Some(ProcessStop::WallLimit);
+            }
+            if stop.is_none()
+                && let Some(dialogue) = dialogue.as_deref_mut()
+            {
+                dialogue.observe_stdout(&out);
             }
             // Observe only newly retained bytes; the raw pipe budget and later
             // provider/clock acceptance still own the complete unchanged output.
@@ -2300,9 +2604,17 @@ mod linux {
         receipt.stdout_bytes = out.len() as u64;
         receipt.stderr_bytes = err.len() as u64;
         if let Some(o) = observation {
-            o.written_bytes = Some(input_offset);
-            o.stdin_closed_after_input =
-                commands.is_some_and(|bytes| input_offset == bytes.len()) && stdin.is_none();
+            o.written_bytes = Some(
+                dialogue
+                    .as_deref()
+                    .map_or(input_offset, |state| state.written),
+            );
+            o.stdin_closed_after_input = (commands
+                .is_some_and(|bytes| input_offset == bytes.len())
+                || dialogue
+                    .as_deref()
+                    .is_some_and(|state| state.phase == SmokeUciPhase::Done))
+                && stdin.is_none();
             o.stdout_eof = stdout_eof;
             o.stderr_eof = stderr_eof;
             o.ownership_lost = ownership_lost;
@@ -3077,6 +3389,45 @@ mod linux {
             let Ok(mode) = std::fs::read_to_string(SMOKE_ADAPTER_MODE) else {
                 return;
             };
+            if mode == "dialogue" || mode == "early-ready" || mode == "partial-response" {
+                use std::io::BufRead;
+                let input = std::io::stdin();
+                let mut input = input.lock();
+                let mut output = std::io::stdout().lock();
+                let mut line = String::new();
+                input.read_line(&mut line).unwrap();
+                assert_eq!(line, "uci\n");
+                // The Rust test harness may have written its own nonterminated
+                // test label before this child's protocol output.
+                output.write_all(b"\n").unwrap();
+                if mode == "partial-response" {
+                    output.write_all(b"ucio").unwrap();
+                    output.flush().unwrap();
+                    // Avoid a test-harness suffix turning the partial line
+                    // into a fictitious complete protocol response.
+                    std::process::exit(0);
+                }
+                if mode == "early-ready" {
+                    output.write_all(b"readyok\n").unwrap();
+                }
+                output.write_all(b"uci").unwrap();
+                output.flush().unwrap();
+                output.write_all(b"ok\n").unwrap();
+                output.flush().unwrap();
+                line.clear();
+                input.read_line(&mut line).unwrap();
+                assert_eq!(line, "isready\n");
+                if mode == "early-ready" {
+                    // A zero exit still cannot make the missing readyok true.
+                    return;
+                }
+                output.write_all(b"readyok\n").unwrap();
+                output.flush().unwrap();
+                line.clear();
+                input.read_line(&mut line).unwrap();
+                assert_eq!(line, "quit\n");
+                return;
+            }
             let mut input = Vec::new();
             std::io::stdin().read_to_end(&mut input).unwrap();
             let mut output = std::io::stdout().lock();
@@ -3089,6 +3440,160 @@ mod linux {
                 // this mock never represents native or GPU work.
                 std::thread::sleep(Duration::from_secs(30));
             }
+        }
+
+        #[test]
+        fn smoke_uci_dialogue_waits_for_real_responses_before_next_command() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"dialogue").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let mut control = |_: &SpawnCustody, _: Instant| Ok(());
+            let output = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert!(observation.uci_sent() && observation.uciok_observed());
+            assert!(observation.isready_sent() && observation.readyok_observed());
+            assert!(observation.quit_sent());
+            assert_eq!(output.receipt.stop, ProcessStop::Exited);
+            assert_eq!(output.receipt.exit_code, Some(0));
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(output.pending_child.is_none());
+            assert_eq!(
+                observation.transport().written_bytes(),
+                Some(b"uci\n".len() + b"isready\n".len() + b"quit\n".len())
+            );
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_uci_does_not_accept_early_ready_or_invent_quit() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"early-ready").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let mut control = |_: &SpawnCustody, _: Instant| Ok(());
+            let output = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert!(observation.uci_sent() && observation.uciok_observed());
+            assert!(observation.isready_sent());
+            assert!(!observation.readyok_observed() && !observation.quit_sent());
+            assert_eq!(output.receipt.exit_code, Some(0));
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_uci_preserves_partial_response_on_eof() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"partial-response").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let mut control = |_: &SpawnCustody, _: Instant| Ok(());
+            let output = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert!(observation.uci_sent());
+            assert!(!observation.uciok_observed());
+            assert!(!observation.isready_sent() && !observation.quit_sent());
+            assert!(output.stdout.ends_with(b"ucio"));
+            assert!(observation.transport().stdout_eof());
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_uci_ignores_response_line_started_before_command_fence() {
+            let mut state = SmokeUciDialogue::default();
+            state.wrote(b"uci\n".len(), 0);
+            let first = b"uciok\nready";
+            state.observe_stdout(first);
+            assert!(state.uciok_observed);
+            state.wrote(b"isready\n".len(), first.len());
+            state.observe_stdout(b"uciok\nreadyok\n");
+            assert!(!state.readyok_observed);
+            state.observe_stdout(b"uciok\nreadyok\nreadyok\n");
+            assert!(state.readyok_observed);
         }
 
         #[test]
