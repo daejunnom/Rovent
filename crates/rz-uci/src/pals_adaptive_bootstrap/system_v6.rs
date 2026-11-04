@@ -2,6 +2,9 @@
 use super::*;
 use crate::pals_adaptive_startup::{PalsSystemStartupOptionsV6, PinnedPalsSystemStartupV6};
 
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod cpu_prepare;
+
 /// The receipt directory is derived from the exact held startup root, never
 /// from a caller-provided pathname or a different supervisor's writer.
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
@@ -23,6 +26,94 @@ struct PalsSystemReceiptPublicationV6 {
 struct PalsSystemNativeStartV6 {
     service: ActualService,
     receipt_publication: mpsc::Receiver<PalsSystemReceiptPublicationV6>,
+    startup_snapshot: mpsc::Receiver<
+        Result<
+            crate::pals_native::startup_system_v6::PalsSystemNativeSnapshotV6,
+            rz_eval::error::BackendError,
+        >,
+    >,
+}
+
+/// One original startup scope. Once the native worker is spawned this value
+/// must stay with the live process until the same worker's physical outcome
+/// is resolved; dropping it or observing an EOF is not a completion fence.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+#[must_use]
+struct PalsSystemStartupCustodyV6 {
+    cpu: cpu_prepare::PalsSystemCpuPreparationV6,
+    parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
+    native: PalsSystemNativeStartV6,
+}
+
+/// Return the original owned values on both pre-entry failure and failed
+/// thread creation. In particular, never discard the latter's recovery key
+/// or its potentially unstarted thread in an error conversion.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+#[allow(dead_code)]
+enum PalsSystemStartupRejectionV6 {
+    BeforeNative {
+        cpu: cpu_prepare::PalsSystemCpuPreparationV6,
+        parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+        admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
+        observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+        error: std::io::Error,
+    },
+    NativeSpawn {
+        cpu: cpu_prepare::PalsSystemCpuPreparationV6,
+        parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+        admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
+        failure: crate::pals_native::ticketed::FactoryStartupSpawnRejection<
+            crate::pals_native::startup_system_v6::PalsSystemFactoryCustodyV6,
+        >,
+    },
+}
+
+/// Join the already prepared CPU and native factory to the same owner and
+/// original admission. This is still an internal handoff; the executable and
+/// arena guards must stay active until its supervisor and shutdown consumer
+/// retain every branch, including unwinds and unknown physical completion.
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+#[allow(dead_code)]
+fn start_owned_system_native_v6(
+    cpu: cpu_prepare::PalsSystemCpuPreparationV6,
+    parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+) -> Result<PalsSystemStartupCustodyV6, PalsSystemStartupRejectionV6> {
+    if let Err(error) = cpu
+        .original_source
+        .check_native_admission(&parent, &admission)
+    {
+        return Err(PalsSystemStartupRejectionV6::BeforeNative {
+            cpu,
+            parent,
+            admission,
+            observer,
+            error,
+        });
+    }
+    let clock = cpu.clock.runtime_clock();
+    match spawn_system_native_v6(
+        Arc::clone(&cpu.original_source),
+        Arc::clone(&parent),
+        Arc::clone(&admission),
+        clock,
+        observer,
+    ) {
+        Ok(native) => Ok(PalsSystemStartupCustodyV6 {
+            cpu,
+            parent,
+            admission,
+            native,
+        }),
+        Err(failure) => Err(PalsSystemStartupRejectionV6::NativeSpawn {
+            cpu,
+            parent,
+            admission,
+            failure,
+        }),
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
@@ -94,6 +185,7 @@ impl PalsSystemReceiptOwnerV6 {
 fn spawn_system_native_v6(
     owner: Arc<PinnedPalsSystemStartupV6>,
     parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
     clock: rz_runtime::contracts::ContractSystemClock,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
 ) -> Result<
@@ -116,8 +208,9 @@ fn spawn_system_native_v6(
     let pending_capacity = endpoint.coordinator.slices.role_tickets_max as usize;
     let command_capacity = endpoint.coordinator.slices.worker_commands_max as usize;
     let receipt_owner = Arc::clone(&owner);
-    let custody = PalsSystemFactoryCustodyV6::new(owner, observer, Arc::clone(&parent));
+    let custody = PalsSystemFactoryCustodyV6::new(owner, observer, Arc::clone(&parent), admission);
     let (receipt_sender, receipt_publication) = mpsc::sync_channel(1);
+    let (snapshot_sender, startup_snapshot) = mpsc::sync_channel(1);
     let service = TicketedNativeService::spawn_with_startup_custody(
         custody,
         move |factory| {
@@ -125,7 +218,11 @@ fn spawn_system_native_v6(
                 .map_err(|error| RoleFailure::Backend(error.to_string()))?;
             PalsSystemFactoryCustodyV6::initialize_sessions(factory, &parent)
                 .map_err(|error| RoleFailure::Backend(error.to_string()))?;
+            let snapshot = factory.parts().0.startup_snapshot();
             PalsSystemFactoryCustodyV6::prepare_ticket(factory, clock)?;
+            if snapshot_sender.try_send(snapshot).is_err() {
+                eprintln!("PALS system startup snapshot publication unavailable");
+            }
             let publication = match PalsSystemReceiptOwnerV6::open(
                 Arc::clone(&receipt_owner),
                 Arc::clone(&parent),
@@ -168,6 +265,7 @@ fn spawn_system_native_v6(
     Ok(PalsSystemNativeStartV6 {
         service,
         receipt_publication,
+        startup_snapshot,
     })
 }
 

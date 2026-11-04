@@ -5,6 +5,8 @@
 //! evidence until shutdown is resolved. Process exit, pipe EOF, timeout and
 //! a UCI `bestmove` are not GPU completion and do not authorize killing it.
 
+#[allow(dead_code)]
+pub(crate) mod finish;
 mod parent;
 #[allow(dead_code)]
 mod protocol;
@@ -36,6 +38,8 @@ pub struct PalsProxyLaunchV6 {
     startup_lock_path: PathBuf,
     parent_socket_path: PathBuf,
     lock: PalsSystemStartupLockV6,
+    startup_until: Instant,
+    startup_cancelled: Arc<AtomicBool>,
 }
 
 /// The verified input inode is opened once and kept for all child executions
@@ -74,8 +78,24 @@ impl PalsProxyLaunchV6 {
         startup_lock_path: PathBuf,
         parent_socket_path: PathBuf,
         lock: PalsSystemStartupLockV6,
+        startup_until: Instant,
+        startup_cancelled: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         lock.verify().map_err(io::Error::other)?;
+        let now = Instant::now();
+        let max_until = now
+            .checked_add(std::time::Duration::from_millis(
+                lock.config.native_options.startup_ms,
+            ))
+            .ok_or_else(|| invalid("PALS startup deadline overflow"))?;
+        if startup_cancelled.load(Ordering::Acquire)
+            || startup_until <= now
+            || startup_until > max_until
+        {
+            return Err(invalid(
+                "PALS original startup control is canceled, expired or exceeds the lock",
+            ));
+        }
         if !matches!(
             &lock.config.system_runtime_lock.runtime,
             NativeRuntimeSourceV6::SystemCuda(_)
@@ -93,7 +113,25 @@ impl PalsProxyLaunchV6 {
             startup_lock_path,
             parent_socket_path,
             lock,
+            startup_until,
+            startup_cancelled,
         })
+    }
+
+    fn check_startup_control(&self) -> io::Result<()> {
+        if self.startup_cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PALS original startup canceled",
+            ));
+        }
+        if Instant::now() >= self.startup_until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "PALS original startup deadline expired",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -218,6 +256,26 @@ pub struct DirectPalsChildV6 {
     exit: Option<ExitStatus>,
     owner_scope: Arc<()>,
     socket_retired: bool,
+    startup_until: Instant,
+    startup_cancelled: Arc<AtomicBool>,
+    image_grant: ImageGrantState,
+}
+
+// Failed and partial grants are retained by the same child owner. Even a
+// failed write may have admitted native execution, so it cannot be retried or
+// translated into a safe shutdown without the original physical evidence.
+enum ImageGrantState {
+    NotAttempted,
+    Acknowledged(parent::PalsPostImageParentV6),
+    Failed(parent::PalsPostImageFailureV6),
+}
+
+/// An admission observation only; none of these states proves GPU completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PalsImageGrantObservationV6 {
+    NotAttempted,
+    Acknowledged,
+    Failed { grant_may_have_been_sent: bool },
 }
 
 /// Opaque same-owner physical release evidence. Child exit, socket EOF,
@@ -269,10 +327,21 @@ fn retire_socket_if_unchanged(path: &Path, device: u64, inode: u64) -> io::Resul
 }
 
 impl DirectPalsChildV6 {
+    pub fn image_grant_observation(&self) -> PalsImageGrantObservationV6 {
+        match &self.image_grant {
+            ImageGrantState::NotAttempted => PalsImageGrantObservationV6::NotAttempted,
+            ImageGrantState::Acknowledged(_) => PalsImageGrantObservationV6::Acknowledged,
+            ImageGrantState::Failed(failure) => PalsImageGrantObservationV6::Failed {
+                grant_may_have_been_sent: failure.grant_may_have_been_sent,
+            },
+        }
+    }
+
     /// Bind a socket in the caller's private 0700 directory, then directly
     /// spawn the original executable with independent stdio pipes. Successful
     /// spawn does not authenticate the child or establish native readiness.
     pub fn spawn(launch: PalsProxyLaunchV6) -> io::Result<Self> {
+        launch.check_startup_control()?;
         launch.binary.verify_held_metadata()?;
         let metadata = fs::symlink_metadata(&launch.binary.private_cwd)?;
         let pinned_cwd = launch.binary.cwd.metadata()?;
@@ -334,6 +403,16 @@ impl DirectPalsChildV6 {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Err(error) = launch.check_startup_control() {
+            let cleanup =
+                retire_socket_if_unchanged(&launch.parent_socket_path, socket.dev(), socket.ino());
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "PALS startup canceled before spawn: {error}; socket retained: {cleanup}"
+                ))),
+            };
+        }
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -367,12 +446,15 @@ impl DirectPalsChildV6 {
             exit: None,
             owner_scope: Arc::new(()),
             socket_retired: false,
+            startup_until: launch.startup_until,
+            startup_cancelled: launch.startup_cancelled,
+            image_grant: ImageGrantState::NotAttempted,
         })
     }
 
     /// Authenticate only the directly spawned child and the original lock.
     /// Errors leave this exact owner and child with the caller for recovery.
-    pub fn authenticate(&mut self, until: Instant, cancelled: &AtomicBool) -> io::Result<()> {
+    pub fn authenticate(&mut self) -> io::Result<()> {
         if self.channel.is_some() {
             return Err(invalid("PALS direct child already authenticated"));
         }
@@ -388,8 +470,8 @@ impl DirectPalsChildV6 {
             self.lock.config.process_generation,
             &self.lock.canonical_sha256,
             runtime.cuda_device_id,
-            until,
-            cancelled,
+            self.startup_until,
+            self.startup_cancelled.as_ref(),
         )?);
         self.reobserve_authenticated_image()
     }
@@ -460,20 +542,62 @@ impl DirectPalsChildV6 {
         })
     }
 
+    /// Admit native startup only after the original parent's image check and
+    /// the matching child acknowledgement. On failure, the original child,
+    /// control stream and image FD (if any) remain owned by `self`.
+    pub fn grant_original_image(&mut self) -> io::Result<()> {
+        if !matches!(self.image_grant, ImageGrantState::NotAttempted) {
+            return Err(invalid("PALS image grant already attempted"));
+        }
+        // Both descriptors stay with this same owner; this temporary clone is
+        // not exposed to another process or independent accept loop.
+        let listener = self.listener.try_clone()?;
+        let until = self.startup_until;
+        let cancelled = Arc::clone(&self.startup_cancelled);
+        match parent::grant_after_original_image(&listener, self, until, cancelled.as_ref()) {
+            Ok(grant) => {
+                self.image_grant = ImageGrantState::Acknowledged(grant);
+                Ok(())
+            }
+            Err(failure) => {
+                let error = io::Error::new(failure.error.kind(), failure.error.to_string());
+                self.image_grant = ImageGrantState::Failed(failure);
+                Err(error)
+            }
+        }
+    }
+
     fn require_authenticated_parent(&mut self) -> io::Result<()> {
+        if self.startup_cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PALS startup cancelled before input admission",
+            ));
+        }
+        if Instant::now() >= self.startup_until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "PALS startup expired before input admission",
+            ));
+        }
         if !self.image_after_auth_verified {
             return Err(invalid(
                 "PALS child image was not verified after authentication",
             ));
         }
-        self.channel
+        let initial = self
+            .channel
             .as_ref()
-            .ok_or_else(|| invalid("PALS parent is not authenticated"))?
-            .ensure_live(&mut self.child)
+            .ok_or_else(|| invalid("PALS parent is not authenticated"))?;
+        match &self.image_grant {
+            ImageGrantState::Acknowledged(grant) => grant.ensure_live(initial, &mut self.child),
+            ImageGrantState::NotAttempted => Err(invalid("PALS image grant is not acknowledged")),
+            ImageGrantState::Failed(_) => Err(invalid("PALS image grant failed; owner retained")),
+        }
     }
 
-    /// Transfer stdin only after the original child has authenticated its
-    /// direct parent. This handshake does not imply native/provider readiness.
+    /// Transfer stdin only after the original child authenticated its parent
+    /// and acknowledged this owner's image grant. This is not readiness.
     pub fn take_stdin(&mut self) -> io::Result<PalsDirectChildInputPipeV6> {
         self.require_authenticated_parent()?;
         let stdin =

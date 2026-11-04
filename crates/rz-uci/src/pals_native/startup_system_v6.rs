@@ -87,6 +87,78 @@ pub(crate) struct PalsSystemVirtualObservationV6 {
     pub numerical_acceptance: Option<[u8; 32]>,
 }
 
+/// Startup data from this exact successfully created V6 factory. Actual
+/// numerical comparison, physical lifetime and graph placement remain unknown;
+/// this snapshot is not a V5 content-admission or arena-acceptance record.
+#[cfg(feature = "onnx-cuda")]
+#[derive(Clone, Debug)]
+pub(crate) struct PalsSystemNativeSnapshotV6 {
+    pub process_generation: u64,
+    pub registered_model_epoch: u64,
+    pub weights: rz_contracts::Digest,
+    pub export_manifest: rz_contracts::Digest,
+    pub backend: rz_contracts::Digest,
+    pub encoding: rz_contracts::Digest,
+    pub rules_semantics: rz_contracts::Digest,
+    pub runtime_binary: rz_contracts::Digest,
+    pub system_runtime_identity: rz_contracts::Digest,
+    pub model_source: PalsSystemSourceObservationV6,
+    pub sessions: Arc<[rz_eval::pals_onnx::PalsAppliedSessionSettings]>,
+    pub validator_loaded: bool,
+    pub approximate_warm: bool,
+    pub numerical_acceptance: Option<rz_contracts::Digest>,
+    pub physical_completion: rz_experiments::PhysicalCompletionV6,
+}
+
+#[cfg(feature = "onnx-cuda")]
+impl PalsSystemNativeSnapshotV6 {
+    /// Construct the same search namespace as the existing virtual-review
+    /// backend from the identity observed by this factory. This does not
+    /// grant numerical acceptance, provider placement or physical release.
+    pub(crate) fn role_model_identity(&self) -> String {
+        format!(
+            "pals-native-virtual-v3:{}:{}:{}",
+            hex(self.export_manifest.0),
+            hex(self.weights.0),
+            hex(self.backend.0),
+        )
+    }
+
+    pub(crate) fn model_value_identity(
+        &self,
+    ) -> Result<rz_search::pals::value::ModelValueIdentity, rz_search::pals::engine::RoleError>
+    {
+        let identity = rz_search::pals::value::ModelValueIdentity {
+            semantics: rz_search::pals::value::MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: self.role_model_identity(),
+            encoding: format!("{}:{}", virtual_review::ENCODING, hex(self.encoding.0)),
+            precision: "fp32_tf32_off".into(),
+            model_epoch: self.weights.0,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub(crate) fn adaptive_model_namespace(
+        &self,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace,
+        rz_search::pals::engine::RoleError,
+    > {
+        use sha2::{Digest as _, Sha256};
+
+        // This ABI key identifies the encoding used by the ticket backend;
+        // the registered encoding digest above has a different domain.
+        rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace::new(
+            self.model_value_identity()?,
+            self.weights,
+            rz_contracts::Digest(Sha256::digest(virtual_review::ENCODING.as_bytes()).into()),
+            rz_contracts::PrecisionProfile::Fp32,
+            1,
+        )
+    }
+}
+
 /// Retains the real startup owner, same startup deadline and cancellation for
 /// every source read. The backend must retain this Arc for its full lifetime.
 pub(crate) struct PalsSystemVirtualSourcesV6 {
@@ -269,6 +341,7 @@ pub(crate) struct PalsSystemFactoryCustodyV6 {
     ticket: Option<crate::pals_native::ticketed::NativeVirtualReviewTicketBackend>,
     observer: Option<Box<dyn crate::pals_native::ticketed::VirtualReviewCollectionObserver>>,
     parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
     physical_reservation: Option<rz_eval::worker::PhysicalRecoveryReservation>,
     physical_key: Option<rz_eval::worker::PhysicalRecoveryKey>,
 }
@@ -279,6 +352,7 @@ impl PalsSystemFactoryCustodyV6 {
         owner: Arc<PinnedPalsSystemStartupV6>,
         observer: Option<Box<dyn crate::pals_native::ticketed::VirtualReviewCollectionObserver>>,
         parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+        admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
     ) -> Self {
         use rz_eval::pals_onnx::virtual_review::VirtualReviewStartupCustody;
 
@@ -298,6 +372,7 @@ impl PalsSystemFactoryCustodyV6 {
             ticket: None,
             observer,
             parent,
+            admission,
             physical_reservation: None,
             physical_key: None,
         }
@@ -362,12 +437,16 @@ impl PalsSystemFactoryCustodyV6 {
         let sources = Arc::clone(&owner.sources);
         let (startup, observation) = sources.inspect_and_load_system_cuda_with(|system| {
             owner.system_owner = Some(system.clone());
-            parent.ensure_live().map_err(|_| {
-                fail(
-                    FailureKind::BackendUnavailable,
-                    "PALS original system supervisor is no longer live",
-                )
-            })?;
+            owner
+                .sources
+                .owner
+                .check_native_admission(parent, &owner.admission)
+                .map_err(|_| {
+                    fail(
+                        FailureKind::BackendUnavailable,
+                        "PALS original post-image admission is unavailable",
+                    )
+                })?;
             let runtime = rz_eval::onnx::OrtRuntime::load_system_cuda_with_entry(system, || {
                 entry.mark_native_entered()
             })?;
@@ -469,6 +548,7 @@ impl PalsSystemFactoryCustodyV6 {
             VirtualReviewArtifactKind::Fresh
         };
         let source_owner = Arc::clone(&owner.sources.owner);
+        let admission = Arc::clone(&owner.admission);
         let manifest_sha = source_owner
             .asset(Purpose::ExportManifest)
             .map_err(transport)?
@@ -484,13 +564,14 @@ impl PalsSystemFactoryCustodyV6 {
             kind,
             None,
             &mut || {
-                source_owner.source_window().map_err(transport_source)?;
-                parent.ensure_live().map_err(|_| {
-                    fail(
-                        FailureKind::BackendUnavailable,
-                        "PALS original system supervisor is no longer live",
-                    )
-                })?;
+                source_owner
+                    .check_native_admission(parent, &admission)
+                    .map_err(|_| {
+                        fail(
+                            FailureKind::BackendUnavailable,
+                            "PALS original post-image admission is unavailable",
+                        )
+                    })?;
                 entry.mark_native_entered();
                 Ok(())
             },
@@ -573,6 +654,68 @@ impl PalsSystemFactoryCustodyV6 {
         )?;
         owner.ticket = Some(ticket);
         Ok(())
+    }
+
+    /// Construct before the backend leaves this original factory. Values are
+    /// read from actual session and runtime owners, not from hoped-for results.
+    pub(crate) fn startup_snapshot(&self) -> Result<PalsSystemNativeSnapshotV6, BackendError> {
+        let backend = self.review.backend().ok_or_else(|| {
+            BackendError::new(
+                FailureKind::BackendUnavailable,
+                FailureStage::Backend,
+                "PALS original native backend is unavailable",
+            )
+        })?;
+        let runtime = self
+            .startup
+            .as_ref()
+            .ok_or_else(|| {
+                BackendError::new(
+                    FailureKind::BackendUnavailable,
+                    FailureStage::Backend,
+                    "PALS original system runtime is unavailable",
+                )
+            })?
+            .runtime();
+        let system_identity = runtime.cuda_runtime_identity().ok_or_else(|| {
+            BackendError::new(
+                FailureKind::IdentityMismatch,
+                FailureStage::Backend,
+                "PALS original CUDA runtime identity is unavailable",
+            )
+        })?;
+        let observation = self.observation.as_ref().ok_or_else(|| {
+            BackendError::new(
+                FailureKind::BackendUnavailable,
+                FailureStage::Admission,
+                "PALS original model source observation is unavailable",
+            )
+        })?;
+        if self.ready_mappings.is_none() {
+            return Err(BackendError::new(
+                FailureKind::BackendUnavailable,
+                FailureStage::Backend,
+                "PALS original runtime mapping observation is unavailable",
+            ));
+        }
+        let endpoint = &self.sources.owner.lock().config.endpoint;
+        Ok(PalsSystemNativeSnapshotV6 {
+            process_generation: self.sources.owner.lock().config.process_generation,
+            registered_model_epoch: endpoint.model.epoch,
+            weights: rz_contracts::Digest(backend.model_epoch()),
+            export_manifest: rz_contracts::Digest(backend.manifest_digest()),
+            backend: rz_contracts::Digest(backend.backend_digest()),
+            encoding: rz_contracts::Digest(virtual_review::registered_encoding_sha256()),
+            rules_semantics: rz_contracts::Digest(backend.rules_input_semantic_digest()),
+            runtime_binary: rz_contracts::Digest(backend.runtime_binary_digest()),
+            system_runtime_identity: rz_contracts::Digest(system_identity),
+            model_source: observation.model_source_evidence,
+            sessions: backend.applied_session_settings(),
+            validator_loaded: backend.validator_present(),
+            approximate_warm: backend.approximate_warm_capable(),
+            numerical_acceptance: None,
+            physical_completion: rz_experiments::PhysicalCompletionV6::Unknown,
+        })
     }
 
     /// Transfer only the ticket already prepared by this same factory. The
@@ -661,5 +804,54 @@ impl crate::pals_native::ticketed::FactoryStartupRecovery for PalsSystemFactoryC
             Some(ticket) => ticket.release_quarantined(proof, until),
             None => Ok(crate::pals_native::ticketed::TicketNativeRelease::Unknown),
         }
+    }
+}
+
+#[cfg(all(test, feature = "onnx-cuda"))]
+mod namespace_tests {
+    use super::*;
+    use rz_contracts::Digest;
+
+    fn snapshot() -> PalsSystemNativeSnapshotV6 {
+        PalsSystemNativeSnapshotV6 {
+            process_generation: 11,
+            registered_model_epoch: 4,
+            weights: Digest([1; 32]),
+            export_manifest: Digest([2; 32]),
+            backend: Digest([3; 32]),
+            encoding: Digest([4; 32]),
+            rules_semantics: Digest([5; 32]),
+            runtime_binary: Digest([6; 32]),
+            system_runtime_identity: Digest([7; 32]),
+            model_source: PalsSystemSourceObservationV6::Missing,
+            sessions: Vec::new().into(),
+            validator_loaded: false,
+            approximate_warm: false,
+            numerical_acceptance: None,
+            physical_completion: rz_experiments::PhysicalCompletionV6::Unknown,
+        }
+    }
+
+    #[test]
+    fn namespace_tracks_loaded_identity_without_granting_acceptance() {
+        let original = snapshot();
+        let namespace = original.adaptive_model_namespace().unwrap();
+        let value = original.model_value_identity().unwrap();
+        assert_eq!(value.model_epoch, original.weights.0);
+        assert!(value.encoding.ends_with(&hex(original.encoding.0)));
+        let mut different = original.clone();
+        different.weights = Digest([8; 32]);
+        assert_ne!(namespace, different.adaptive_model_namespace().unwrap());
+        different = original.clone();
+        different.backend = Digest([9; 32]);
+        assert_ne!(namespace, different.adaptive_model_namespace().unwrap());
+        different = original.clone();
+        different.encoding = Digest([10; 32]);
+        assert_ne!(namespace, different.adaptive_model_namespace().unwrap());
+        assert!(original.numerical_acceptance.is_none());
+        assert_eq!(
+            original.physical_completion,
+            rz_experiments::PhysicalCompletionV6::Unknown
+        );
     }
 }

@@ -14,19 +14,27 @@ use nix::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    fs::File,
     io::{self, Read, Write},
     os::{
         fd::{AsFd, AsRawFd},
+        unix::fs::MetadataExt,
         unix::net::{UnixListener, UnixStream},
     },
     process::Child,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 const REQUEST_SCHEMA: &str = "rz-rovent-parent-admission/1";
 const ACK_SCHEMA: &str = "rz-rovent-parent-admission-ack/1";
 const SCOPE: &str = "parent-child-connection-not-gpu-fence";
+const IMAGE_GRANT_SCHEMA: &str = "rz-pals-system-image-grant/1";
+const IMAGE_ACK_SCHEMA: &str = "rz-pals-system-image-grant-ack/1";
+const IMAGE_SCOPE: &str = "same-child-image-observed-not-gpu-fence";
 const FRAME_LIMIT: usize = 4096;
 
 #[derive(Serialize)]
@@ -49,6 +57,27 @@ struct Ack {
     scope: String,
 }
 
+#[derive(Serialize)]
+struct ImageGrant<'a> {
+    schema: &'static str,
+    child_pid: u32,
+    process_epoch: u64,
+    lock_sha256: &'a str,
+    cuda_ordinal: i32,
+    scope: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageAck {
+    schema: String,
+    child_pid: u32,
+    process_epoch: u64,
+    lock_sha256: String,
+    cuda_ordinal: i32,
+    scope: String,
+}
+
 /// The caller retains this exact stream together with its original `Child`.
 /// A second connection, child JSON report, or a completed handshake is never
 /// substituted for physical GPU completion or a process exit observation.
@@ -59,6 +88,25 @@ pub(super) struct AuthenticatedChildChannel {
     process_epoch: u64,
     lock_sha256: String,
     cuda_ordinal: i32,
+    scope: Arc<()>,
+}
+
+/// The same original child, initial channel, distinct barrier channel, and
+/// observed mapped-image FD remain owned. This is not physical completion.
+pub(super) struct PalsPostImageParentV6 {
+    initial_scope: Arc<()>,
+    control: AuthenticatedChildChannel,
+    mapped_image: File,
+}
+
+/// After a grant write starts, delivery may be ambiguous even if later I/O
+/// fails. The caller must keep this exact channel, mapped FD and child alive
+/// as potentially native-entered; it must not kill or infer completion.
+pub(super) struct PalsPostImageFailureV6 {
+    pub error: io::Error,
+    pub retained_control: Option<AuthenticatedChildChannel>,
+    pub mapped_image: Option<File>,
+    pub grant_may_have_been_sent: bool,
 }
 
 fn invalid(detail: &'static str) -> io::Error {
@@ -208,6 +256,55 @@ fn read_ack(stream: &mut UnixStream, until: Instant, cancelled: &AtomicBool) -> 
     serde_json::from_slice(&frame).map_err(|_| invalid("invalid child admission acknowledgement"))
 }
 
+fn read_image_ack(
+    stream: &mut UnixStream,
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<ImageAck> {
+    let mut frame = Vec::with_capacity(256);
+    loop {
+        stream.set_read_timeout(Some(next_poll(until, cancelled)?))?;
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "image grant ack channel closed",
+                ));
+            }
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if frame.len() < FRAME_LIMIT - 1 => frame.push(byte[0]),
+            Ok(_) => return Err(invalid("image grant ack exceeds bound")),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    serde_json::from_slice(&frame).map_err(|_| invalid("invalid image grant acknowledgement"))
+}
+
+fn validate_image_ack(ack: &ImageAck, initial: &AuthenticatedChildChannel) -> io::Result<()> {
+    if ack.schema != IMAGE_ACK_SCHEMA
+        || ack.child_pid != initial.child_pid
+        || ack.process_epoch != initial.process_epoch
+        || ack.lock_sha256 != initial.lock_sha256
+        || ack.cuda_ordinal != initial.cuda_ordinal
+        || ack.scope != IMAGE_SCOPE
+    {
+        return Err(invalid(
+            "image grant acknowledgement differs from original child",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_ack(ack: &Ack, pid: u32, epoch: u64, lock: &str, ordinal: i32) -> io::Result<()> {
     if ack.schema != ACK_SCHEMA
         || ack.scope != SCOPE
@@ -269,6 +366,7 @@ impl AuthenticatedChildChannel {
             process_epoch: epoch,
             lock_sha256: lock_sha256.to_owned(),
             cuda_ordinal,
+            scope: Arc::new(()),
         })
     }
 
@@ -346,9 +444,179 @@ pub(super) fn accept_and_authenticate_child(
     }
 }
 
+fn observe_exact_child_image(
+    child: &mut Child,
+    binary: &super::PalsProxyBinaryPinV6,
+) -> io::Result<File> {
+    binary.verify_held_metadata()?;
+    if child.try_wait()?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "child exited before image grant",
+        ));
+    }
+    let image = File::open(format!("/proc/{}/exe", child.id()))?;
+    let metadata = image.metadata()?;
+    if !metadata.is_file()
+        || metadata.dev() != binary.image_device
+        || metadata.ino() != binary.image_inode
+    {
+        return Err(invalid("original child image differs from held binary"));
+    }
+    binary.verify_held_metadata()?;
+    Ok(image)
+}
+
+/// On a second authenticated channel, reobserve the directly held child's
+/// mapped image and send a grant bound to that child's original scope. The
+/// caller must retain every returned owner on error, particularly when any
+/// grant bytes may have reached the child. This is not a physical fence.
+pub(super) fn grant_after_original_image(
+    listener: &UnixListener,
+    owner: &mut super::DirectPalsChildV6,
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> Result<PalsPostImageParentV6, PalsPostImageFailureV6> {
+    let before_control = |error| PalsPostImageFailureV6 {
+        error,
+        retained_control: None,
+        mapped_image: None,
+        grant_may_have_been_sent: false,
+    };
+    if !owner.image_after_auth_verified {
+        return Err(before_control(invalid(
+            "child image was not verified after initial authentication",
+        )));
+    }
+    let initial = owner
+        .channel
+        .as_ref()
+        .ok_or_else(|| before_control(invalid("initial child channel unavailable")))?;
+    let child = &mut owner.child;
+    let binary = &owner.binary;
+    initial.ensure_live(child).map_err(before_control)?;
+    let mut control = accept_and_authenticate_child(
+        listener,
+        child,
+        initial.process_epoch,
+        &initial.lock_sha256,
+        initial.cuda_ordinal,
+        until,
+        cancelled,
+    )
+    .map_err(before_control)?;
+    let mapped_image = match observe_exact_child_image(child, binary) {
+        Ok(image) => image,
+        Err(error) => {
+            return Err(PalsPostImageFailureV6 {
+                error,
+                retained_control: Some(control),
+                mapped_image: None,
+                grant_may_have_been_sent: false,
+            });
+        }
+    };
+    let grant = ImageGrant {
+        schema: IMAGE_GRANT_SCHEMA,
+        child_pid: initial.child_pid,
+        process_epoch: initial.process_epoch,
+        lock_sha256: &initial.lock_sha256,
+        cuda_ordinal: initial.cuda_ordinal,
+        scope: IMAGE_SCOPE,
+    };
+    let bytes = match serde_json::to_vec(&grant) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(PalsPostImageFailureV6 {
+                error: invalid("cannot encode image grant"),
+                retained_control: Some(control),
+                mapped_image: Some(mapped_image),
+                grant_may_have_been_sent: false,
+            });
+        }
+    };
+    // Even a short/failed write may have delivered a complete frame. Mark
+    // uncertainty before the first byte and retain the original owner.
+    let mut grant_may_have_been_sent = false;
+    let result = (|| -> io::Result<()> {
+        initial.ensure_live(child)?;
+        control.ensure_live(child)?;
+        next_poll(until, cancelled)?;
+        grant_may_have_been_sent = true;
+        write_frame(&mut control.stream, &bytes, until, cancelled)?;
+        let ack = read_image_ack(&mut control.stream, until, cancelled)?;
+        validate_image_ack(&ack, initial)?;
+        next_poll(until, cancelled)?;
+        control.stream.set_read_timeout(None)?;
+        control.stream.set_write_timeout(None)?;
+        initial.ensure_live(child)?;
+        control.ensure_live(child)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return Err(PalsPostImageFailureV6 {
+            error,
+            retained_control: Some(control),
+            mapped_image: Some(mapped_image),
+            grant_may_have_been_sent,
+        });
+    }
+    Ok(PalsPostImageParentV6 {
+        initial_scope: Arc::clone(&initial.scope),
+        control,
+        mapped_image,
+    })
+}
+
+impl PalsPostImageParentV6 {
+    /// Confirm this same initial socket and child remain live. The pinned
+    /// observed image is held, but a future exec or concurrent inode writer is
+    /// not excluded by this liveness check.
+    pub(super) fn ensure_live(
+        &self,
+        initial: &AuthenticatedChildChannel,
+        child: &mut Child,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.initial_scope, &initial.scope) {
+            return Err(invalid("image grant belongs to another original channel"));
+        }
+        let _ = self.mapped_image.metadata()?;
+        initial.ensure_live(child)?;
+        self.control.ensure_live(child)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_ack_cannot_change_the_original_child_scope() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let initial = AuthenticatedChildChannel {
+            stream,
+            child_pid: 7,
+            child_uid: geteuid().as_raw(),
+            process_epoch: 8,
+            lock_sha256: "lock".into(),
+            cuda_ordinal: 1,
+            scope: Arc::new(()),
+        };
+        let mut ack = ImageAck {
+            schema: IMAGE_ACK_SCHEMA.into(),
+            child_pid: 7,
+            process_epoch: 8,
+            lock_sha256: "lock".into(),
+            cuda_ordinal: 1,
+            scope: IMAGE_SCOPE.into(),
+        };
+        assert!(validate_image_ack(&ack, &initial).is_ok());
+        ack.child_pid = 6;
+        assert!(validate_image_ack(&ack, &initial).is_err());
+        ack.child_pid = 7;
+        ack.scope = "gpu-complete".into();
+        assert!(validate_image_ack(&ack, &initial).is_err());
+    }
 
     /// The outer test launches only this helper in a separate test process.
     /// When run normally it does nothing and requires no CUDA or model.
