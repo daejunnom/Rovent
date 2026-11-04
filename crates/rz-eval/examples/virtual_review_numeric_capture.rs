@@ -2544,7 +2544,7 @@ fn execute(
     let mut initial_partial_failure: Option<String> = None;
     #[cfg(not(target_os = "linux"))]
     let initial_partial_failure: Option<String> = None;
-    let mut work_fn = || -> Result<Vec<(PathBuf, PathBuf)>> {
+    let work_fn = || -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut outputs = (0..plan.groups.len()).map(|_| None).collect::<Vec<_>>();
         let mut bytes = 0u64;
         let mut completion = 0u64;
