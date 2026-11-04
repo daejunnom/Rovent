@@ -1012,6 +1012,11 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
     pub fn output_snapshot_at_recovery(&self) -> Option<OutputSnapshot> {
         self.output_snapshot_at_recovery
     }
+    /// Actual shared observation read by the original output owner after its
+    /// writer thread joined. This remains separate from the pre-join sample.
+    pub fn final_output_observation(&self) -> Option<OutputSnapshot> {
+        self.driver.final_output_observation()
+    }
     pub fn output_recovery(
         &self,
     ) -> Option<&Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>> {
