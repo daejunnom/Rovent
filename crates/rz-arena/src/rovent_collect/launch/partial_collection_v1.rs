@@ -23,7 +23,7 @@ const MAX_RECORDS: usize = 65_536;
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 256;
 const MAX_REFERENCE_BYTES: usize = 4096;
-const MAX_FAILURE_ROW_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_FAILURE_ROW_BYTES: u64 = 8 * 1024 * 1024;
 const FAILURE_DOMAIN: &str = "rz-rovent-partial-failure-evidence/1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -39,6 +39,7 @@ pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
 /// Separate declaration for the original input-lock /2 Collection route.
 /// It cannot reconstruct a root admission or claim teacher completion.
 pub const ROVENT_COLLECTION_LOCK_V2_LAUNCH_PLAN: &str = "rz-rovent-collection-lock-v2-launch/1";
+const ROVENT_LOCK_V2_PLAN_MAX_BYTES: u64 = 256 << 10;
 mod cohort;
 mod cohort_audit;
 mod cohort_driver;
@@ -48,7 +49,10 @@ mod own_nnuec_lock_v2;
 pub(crate) mod own_publisher_v2;
 mod partial_collection_v1;
 pub mod partial_followup_v1;
+pub mod partial_game_v2;
 mod pc_lock_v2;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod teacher_fixture_identity_v1;
 pub use partial_collection_v1::{
     PartialCollectionReader, PartialCollectionReceipt, PartialCollectionSpec, read_partial_receipt,
     visit_partial_chunk,
@@ -361,7 +365,7 @@ pub fn load_rovent_collection_lock_v2_plan(
         pin.path.starts_with("inputs/") && valid_relative(&pin.path),
         "Collection /2 plan must be an original private input",
     )?;
-    let raw = read_pin(input_directory, pin, 256 << 10)?;
+    let raw = read_pin(input_directory, pin, ROVENT_LOCK_V2_PLAN_MAX_BYTES)?;
     Ok(rz_experiments::decode_json(
         std::str::from_utf8(&raw).map_err(|_| invalid("Collection /2 plan UTF8"))?,
     )?)
