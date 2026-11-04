@@ -65,6 +65,7 @@ pub(super) struct ProxySupervisorObservationV6 {
     /// Transport failure only; not a cancellation or physical completion.
     pub cancel_control_failure: Option<CancelFailureObservation>,
     pub no_game_cancel_failure: Option<NoGameCancelFailure>,
+    pub cancel_service_failure: Option<String>,
 }
 
 #[must_use = "retain the original child, relay and process while physical completion is unknown"]
@@ -88,6 +89,7 @@ pub(super) struct PalsProxySupervisorV6 {
     // The exact channel remains with this original supervisor even on error.
     cancel_receiver: Option<CancelReceiverV1>,
     no_game_cancel_receiver: Option<NoGameCancelReceiverV1>,
+    cancel_service_failure: Option<String>,
     max_line: usize,
     pub stage: ProxyStageV6,
     pub failed_stage: Option<ProxyStageV6>,
@@ -143,6 +145,7 @@ impl PalsProxySupervisorV6 {
             finish_cancelled,
             cancel_receiver: None,
             no_game_cancel_receiver: None,
+            cancel_service_failure: None,
             max_line,
             stage: ProxyStageV6::Configured,
             failed_stage: None,
@@ -212,6 +215,54 @@ impl PalsProxySupervisorV6 {
         }
     }
 
+    /// Continue polling the original receiver while a bounded startup or
+    /// finish exchange waits. No descriptor is cloned: both receivers are
+    /// returned to their original slots even when the operation unwinds.
+    fn with_cancel_service<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> io::Result<T> {
+        if self.cancel_receiver.is_none() && self.no_game_cancel_receiver.is_none() {
+            return Ok(operation(self));
+        }
+        let mut game = self.cancel_receiver.take();
+        let mut no_game = self.no_game_cancel_receiver.take();
+        let done = AtomicBool::new(false);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            std::thread::scope(|scope| {
+                let worker = std::thread::Builder::new()
+                    .name("pals-cancel-drain".into())
+                    .spawn_scoped(scope, || {
+                        while !done.load(Ordering::Acquire) {
+                            if let Some(receiver) = game.as_mut() {
+                                let _ = receiver.poll();
+                            }
+                            if let Some(receiver) = no_game.as_mut() {
+                                let _ = receiver.poll();
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    })?;
+                let result = catch_unwind(AssertUnwindSafe(|| operation(self)));
+                done.store(true, Ordering::Release);
+                let worker_panicked = worker.join().is_err();
+                Ok((result, worker_panicked))
+            })
+        }));
+        self.cancel_receiver = game;
+        self.no_game_cancel_receiver = no_game;
+        match outcome {
+            Ok(Ok((result, worker_panicked))) => {
+                if worker_panicked && self.cancel_service_failure.is_none() {
+                    self.cancel_service_failure = Some("original cancel service panicked".into());
+                }
+                match result {
+                    Ok(value) => Ok(value),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            Ok(Err(error)) => Err(error),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     fn check_run(&self) -> io::Result<()> {
         let registered_run_end = self
             .bound_reference
@@ -247,15 +298,17 @@ impl PalsProxySupervisorV6 {
             return self.stage;
         }
         self.poll_cancel_control();
-        match catch_unwind(AssertUnwindSafe(|| self.start_inner())) {
-            Ok(Ok(())) => self.stage,
-            Ok(Err(error)) => {
+        match self
+            .with_cancel_service(|owner| catch_unwind(AssertUnwindSafe(|| owner.start_inner())))
+        {
+            Ok(Ok(Ok(()))) => self.stage,
+            Ok(Ok(Err(error))) | Err(error) => {
                 self.failed_stage = Some(self.stage);
                 self.failure = Some(error);
                 self.stage = ProxyStageV6::Failed;
                 self.stage
             }
-            Err(payload) => {
+            Ok(Err(payload)) => {
                 self.failed_stage = Some(self.stage);
                 self.panic_payload = Some(payload);
                 self.stage = ProxyStageV6::Panicked;
@@ -396,6 +449,7 @@ impl PalsProxySupervisorV6 {
             physical_completion: "unknown",
             cancel_control_failure,
             no_game_cancel_failure,
+            cancel_service_failure: self.cancel_service_failure.clone(),
         })
     }
 
@@ -489,23 +543,25 @@ impl PalsProxySupervisorV6 {
         }
         self.runtime_finish_attempted = true;
         self.runtime_finish_stream = Some(stream);
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            match (&mut self.child, &mut self.runtime_finish_stream) {
-                (Some(child), Some(stream)) => finish::observe_finish_claim(
-                    child,
-                    stream,
-                    self.finish_until,
-                    self.finish_cancelled.as_ref(),
-                ),
-                _ => Err(io::Error::other(
-                    "original child or finish stream unavailable",
-                )),
-            }
-        }));
+        let result = self.with_cancel_service(|owner| {
+            catch_unwind(AssertUnwindSafe(|| {
+                match (&mut owner.child, &mut owner.runtime_finish_stream) {
+                    (Some(child), Some(stream)) => finish::observe_finish_claim(
+                        child,
+                        stream,
+                        owner.finish_until,
+                        owner.finish_cancelled.as_ref(),
+                    ),
+                    _ => Err(io::Error::other(
+                        "original child or finish stream unavailable",
+                    )),
+                }
+            }))
+        });
         match result {
-            Ok(Ok(claim)) => self.runtime_finish = Some(claim),
-            Ok(Err(error)) => self.runtime_finish_error = Some(error),
-            Err(payload) => self.runtime_finish_panic = Some(payload),
+            Ok(Ok(Ok(claim))) => self.runtime_finish = Some(claim),
+            Ok(Ok(Err(error))) | Err(error) => self.runtime_finish_error = Some(error),
+            Ok(Err(payload)) => self.runtime_finish_panic = Some(payload),
         }
         Ok(())
     }
@@ -547,35 +603,39 @@ impl PalsProxySupervisorV6 {
             Some(PalsImageGrantObservationV6::Acknowledged) => {}
         }
         self.session_release_attempted = true;
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let child = self
-                .child
-                .as_mut()
-                .ok_or_else(|| io::Error::other("original child unavailable"))?;
-            let stream = child
-                .accept_original_finish_stream(self.finish_until, self.finish_cancelled.as_ref())?;
-            self.session_release_stream = Some(stream);
-            let stream = self
-                .session_release_stream
-                .as_mut()
-                .expect("original finish stream retained");
-            finish::observe_session_release_claim(
-                child,
-                stream,
-                self.finish_until,
-                self.finish_cancelled.as_ref(),
-            )
-        }));
+        let result = self.with_cancel_service(|owner| {
+            catch_unwind(AssertUnwindSafe(|| {
+                let child = owner
+                    .child
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("original child unavailable"))?;
+                let stream = child.accept_original_finish_stream(
+                    owner.finish_until,
+                    owner.finish_cancelled.as_ref(),
+                )?;
+                owner.session_release_stream = Some(stream);
+                let stream = owner
+                    .session_release_stream
+                    .as_mut()
+                    .expect("original finish stream retained");
+                finish::observe_session_release_claim(
+                    child,
+                    stream,
+                    owner.finish_until,
+                    owner.finish_cancelled.as_ref(),
+                )
+            }))
+        });
         match result {
-            Ok(Ok(claim)) => {
+            Ok(Ok(Ok(claim))) => {
                 self.session_release = Some(claim);
                 SessionReleaseObservationV6::ClaimRecorded
             }
-            Ok(Err(error)) => {
+            Ok(Ok(Err(error))) | Err(error) => {
                 self.session_release_error = Some(error);
                 SessionReleaseObservationV6::TransportUnknown
             }
-            Err(payload) => {
+            Ok(Err(payload)) => {
                 self.session_release_panic = Some(payload);
                 SessionReleaseObservationV6::Panicked
             }

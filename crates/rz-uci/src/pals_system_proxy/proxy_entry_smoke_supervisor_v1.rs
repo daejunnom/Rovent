@@ -38,6 +38,7 @@ pub(super) struct NoGamePreparedSupervisorV1 {
     pub bundle: ProxyEntryNoGameAdmittedBundleV1,
     pub receipt: ProxyEntryNoGameSmokeReceiptV1,
     supervisor: PalsProxySupervisorV6,
+    cancel_attached: bool,
 }
 
 impl NoGamePreparedSupervisorV1 {
@@ -49,22 +50,30 @@ impl NoGamePreparedSupervisorV1 {
         stream: UnixStream,
     ) -> Result<(), (io::Error, UnixStream)> {
         let receiver = NoGameCancelReceiverV1::from_original_bundle(stream, &self.bundle)?;
-        self.supervisor
-            .attach_no_game_cancel(receiver)
-            .map_err(|receiver| {
-                (
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "NoGame cancel supervisor rejected owner",
-                    ),
-                    receiver.into_stream(),
-                )
-            })
+        match self.supervisor.attach_no_game_cancel(receiver) {
+            Ok(()) => {
+                self.cancel_attached = true;
+                Ok(())
+            }
+            Err(receiver) => Err((
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "NoGame cancel supervisor rejected owner",
+                ),
+                receiver.into_stream(),
+            )),
+        }
     }
 
     /// Preparation is not execution authority; the caller must independently
     /// admit the listener and preserve this owner on every outcome.
     pub(super) fn start_once(&mut self) -> io::Result<ProxyStageV6> {
+        if !self.cancel_attached {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NoGame original cancel channel missing",
+            ));
+        }
         let window = &self.bundle.window;
         if window.cancelled.load(Ordering::Acquire)
             || window.cleanup_cancelled.load(Ordering::Acquire)
@@ -230,5 +239,6 @@ pub(super) fn prepare_supervisor(
         bundle,
         receipt,
         supervisor,
+        cancel_attached: false,
     })
 }
