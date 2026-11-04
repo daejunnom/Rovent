@@ -582,9 +582,75 @@ pub(crate) struct PcSupervisorJoinedProofV3 {
     panicked: bool,
 }
 
+/// Driver execution status only; this is not a game, output, or GPU result.
+/// A panic payload remains in the original custody retained by the proof.
+#[derive(Debug)]
+pub(crate) enum PcSupervisorDriverObservationV3 {
+    Completed,
+    Failed {
+        first_error: Option<String>,
+        run_error: Option<String>,
+    },
+    Panicked {
+        first_error: Option<String>,
+    },
+}
+
 impl PcSupervisorJoinedProofV3 {
     pub(crate) fn panicked(&self) -> bool {
         self.panicked
+    }
+
+    /// Read the same joined driver's actual outcome without waiting. A join
+    /// alone, or the absence of a panic, does not establish driver success.
+    pub(crate) fn try_driver_observation(
+        &self,
+    ) -> Result<PcDriverPollV3<PcSupervisorDriverObservationV3>, PcDriverEvidenceErrorV3> {
+        let custody = driver_evidence_lock!(self.custody, "custody");
+        if !Arc::ptr_eq(&custody.supervisor, &self.supervisor)
+            || !custody
+                .native
+                .as_ref()
+                .is_some_and(|native| Arc::ptr_eq(native, &self.native))
+            || custody.thread.is_some()
+            || !custody
+                .stop_authorization
+                .as_ref()
+                .is_some_and(|authorization| {
+                    authorization.matches_original(&self.supervisor, &self.native)
+                })
+        {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "P-C joined original custody differs",
+            ));
+        }
+        let observation = match custody.state {
+            SupervisorThreadStateV3::Joined if !self.panicked && custody.panic.is_none() => {
+                let Some(result) = custody.result.as_ref() else {
+                    return Err(PcDriverEvidenceErrorV3::Invalid(
+                        "P-C joined driver result absent",
+                    ));
+                };
+                match (custody.first_error.as_ref(), result) {
+                    (None, Ok(())) => PcSupervisorDriverObservationV3::Completed,
+                    (first_error, result) => PcSupervisorDriverObservationV3::Failed {
+                        first_error: first_error.cloned(),
+                        run_error: result.as_ref().err().cloned(),
+                    },
+                }
+            }
+            SupervisorThreadStateV3::JoinPanicked if self.panicked && custody.panic.is_some() => {
+                PcSupervisorDriverObservationV3::Panicked {
+                    first_error: custody.first_error.clone(),
+                }
+            }
+            _ => {
+                return Err(PcDriverEvidenceErrorV3::Invalid(
+                    "P-C joined driver state differs",
+                ));
+            }
+        };
+        Ok(PcDriverPollV3::Ready(observation))
     }
 
     /// Nonblocking retirement of only this joined driver's registry owner.
@@ -1553,9 +1619,11 @@ impl PcWorkerSupervisorV3 {
                 .map_err(|error| error.to_string())?;
                 self.pipeline = Some(PolicyRowPipelineOwnerV3::new(writer));
             }
-            match self.bridge.game_authority().try_bind_pipeline(
-                self.pipeline.as_ref().expect("pipeline retained"),
-            ) {
+            match self
+                .bridge
+                .game_authority()
+                .try_bind_pipeline(self.pipeline.as_ref().expect("pipeline retained"))
+            {
                 super::game_authority_v3::GameStepV3::Ready
                 | super::game_authority_v3::GameStepV3::Existing => {}
                 super::game_authority_v3::GameStepV3::Busy => return Ok(()),
@@ -1664,8 +1732,10 @@ fn prepare_root_step_v3(
     if state.published {
         return Ok(PcPrepareStepV3::Published);
     }
-    if bridge.game_authority().abort_requested() && state.route.is_none()
-        && state.worker.is_none() && state.worker_key.is_none()
+    if bridge.game_authority().abort_requested()
+        && state.route.is_none()
+        && state.worker.is_none()
+        && state.worker_key.is_none()
         && state.prepared.is_none()
     {
         state.abort_before_route = true;
@@ -1678,7 +1748,9 @@ fn prepare_root_step_v3(
         }));
         if let Err(payload) = result {
             state.panic = Some(payload);
-            state.failure.get_or_insert_with(|| "P-C V3 pre-route abort drain panicked".into());
+            state
+                .failure
+                .get_or_insert_with(|| "P-C V3 pre-route abort drain panicked".into());
         }
         return Ok(PcPrepareStepV3::Pending);
     }
@@ -2241,9 +2313,15 @@ impl PcRootRecoveryV3 {
         if self.aggregate.is_some() {
             return true;
         }
-        if self.panic.is_some() || self.route.is_some() || self.receiver.is_some()
-            || self.owner.is_some() || self.pump.is_some() || self.worker.is_some()
-            || self.worker_key.is_some() || self.prepared.is_some() || self.published
+        if self.panic.is_some()
+            || self.route.is_some()
+            || self.receiver.is_some()
+            || self.owner.is_some()
+            || self.pump.is_some()
+            || self.worker.is_some()
+            || self.worker_key.is_some()
+            || self.prepared.is_some()
+            || self.published
         {
             return false;
         }
@@ -2261,12 +2339,17 @@ impl PcRootRecoveryV3 {
         let Ok(mut session) = session.try_lock() else {
             return false;
         };
-        if !session.original_admission().same_original_admission(&self.admission) {
-            self.failure.get_or_insert_with(|| "P-C V3 abort session admission differs".into());
+        if !session
+            .original_admission()
+            .same_original_admission(&self.admission)
+        {
+            self.failure
+                .get_or_insert_with(|| "P-C V3 abort session admission differs".into());
             return false;
         }
         if let Err(error) = session.request_shutdown(deadline) {
-            self.failure.get_or_insert_with(|| format!("P-C V3 abort shutdown: {error}"));
+            self.failure
+                .get_or_insert_with(|| format!("P-C V3 abort shutdown: {error}"));
             return false;
         }
         let actors: Vec<String> = session.registration().teachers.keys().cloned().collect();
@@ -2294,7 +2377,8 @@ impl PcRootRecoveryV3 {
             }
             Ok(None) => false,
             Err(error) => {
-                self.failure.get_or_insert_with(|| format!("P-C V3 abort aggregate: {error}"));
+                self.failure
+                    .get_or_insert_with(|| format!("P-C V3 abort aggregate: {error}"));
                 false
             }
         }
