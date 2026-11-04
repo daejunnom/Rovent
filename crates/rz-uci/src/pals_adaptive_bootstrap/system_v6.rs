@@ -5,6 +5,8 @@ use crate::pals_adaptive_startup::{PalsSystemStartupOptionsV6, PinnedPalsSystemS
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod before_native_recovery;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod child_entry;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod cpu_prepare;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod driver_assemble;

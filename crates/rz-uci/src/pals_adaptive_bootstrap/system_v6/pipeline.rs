@@ -136,6 +136,9 @@ impl V6Pipeline {
     pub(super) fn observation(&self) -> V6PipelineObservation {
         self.state
     }
+    pub(super) fn original_cleanup_until(&self) -> Instant {
+        self.original_cleanup_until
+    }
     pub(super) fn failure(&self) -> Option<&V6PipelineFailure> {
         self.failure.as_ref()
     }

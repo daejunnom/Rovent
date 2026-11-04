@@ -12,6 +12,10 @@ pub fn compiled_pals_system_v6_execution_source_digest() -> String {
     let files: &[(&str, &[u8])] = &[
         ("execution_digest", include_bytes!("system_v6_execution.rs")),
         (
+            "child_entry",
+            include_bytes!("../pals_adaptive_bootstrap/system_v6/child_entry.rs"),
+        ),
+        (
             "cpu_prepare",
             include_bytes!("../pals_adaptive_bootstrap/system_v6/cpu_prepare.rs"),
         ),
