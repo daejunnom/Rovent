@@ -198,6 +198,7 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
             "arena_smoke_preparation",
             include_bytes!("smoke_preparation.rs"),
         ),
+        ("arena_smoke_sockets", include_bytes!("no_game_sockets.rs")),
         (
             "arena_smoke_deadline",
             include_bytes!("smoke_deadline_control.rs"),

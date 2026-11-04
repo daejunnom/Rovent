@@ -29,14 +29,14 @@ use std::{
 
 static NEXT_SOCKET_SET: AtomicU64 = AtomicU64::new(0);
 
-struct SocketOwner {
-    name: String,
-    listener: Arc<UnixListener>,
+pub(super) struct SocketOwner {
+    pub(super) name: String,
+    pub(super) listener: Arc<UnixListener>,
     inode: u64,
 }
 
 impl SocketOwner {
-    fn bind(name: String) -> Result<Self, ArenaError> {
+    pub(super) fn bind(name: String) -> Result<Self, ArenaError> {
         let address = SocketAddr::from_abstract_name(name.as_bytes())
             .map_err(|_| ArenaError::Invalid("invalid V6 abstract listener name".into()))?;
         let listener = UnixListener::bind_addr(&address)
@@ -56,7 +56,7 @@ impl SocketOwner {
         Ok(result)
     }
 
-    fn verify(&self) -> Result<(), ArenaError> {
+    pub(super) fn verify(&self) -> Result<(), ArenaError> {
         let address = self
             .listener
             .local_addr()
@@ -71,6 +71,13 @@ impl SocketOwner {
         }
         Ok(())
     }
+}
+
+pub(super) fn next_socket_prefix() -> Result<String, ArenaError> {
+    let sequence = NEXT_SOCKET_SET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| ArenaError::Budget("V6 socket name sequence exhausted".into()))?;
+    Ok(format!("rz-v6-{}-{sequence}", std::process::id()))
 }
 
 struct RoleSockets {
@@ -114,10 +121,7 @@ impl PalsV6RoleSockets {
             .cwd
             .metadata()
             .map_err(|_| ArenaError::Io("V6 original cwd metadata unavailable".into()))?;
-        let sequence = NEXT_SOCKET_SET
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| ArenaError::Budget("V6 socket name sequence exhausted".into()))?;
-        let prefix = format!("rz-v6-{}-{sequence}", std::process::id());
+        let prefix = next_socket_prefix()?;
         let role = |label: &str| -> Result<RoleSockets, ArenaError> {
             Ok(RoleSockets {
                 grant: SocketOwner::bind(format!("{prefix}-{label}-grant"))?,

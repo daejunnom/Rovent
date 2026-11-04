@@ -14,11 +14,15 @@ mod endpoint_snapshot;
 #[cfg(target_os = "linux")]
 mod invocation;
 #[cfg(target_os = "linux")]
+mod no_game_sockets;
+#[cfg(target_os = "linux")]
 pub(crate) use cancel_sources::{CancelSourceObservation, compiled_cancel_source_observation};
 #[cfg(target_os = "linux")]
 pub(crate) use endpoint_snapshot::verify_original_proxy_snapshots;
 #[cfg(target_os = "linux")]
 pub(crate) use invocation::PalsV6RoleSockets;
+#[cfg(target_os = "linux")]
+pub(crate) use no_game_sockets::NoGameRoleSocketsV1;
 #[cfg(target_os = "linux")]
 pub(crate) use proxy_entry_smoke::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
 #[cfg(target_os = "linux")]
