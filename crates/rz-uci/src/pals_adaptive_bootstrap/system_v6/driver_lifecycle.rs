@@ -7,6 +7,7 @@
 use super::driver_assemble::V6PreAdmissionOwner;
 use super::driver_facade::{V6DriverFacade, V6FacadeFinishObservation};
 use super::driver_prepare::{OriginalReceiptState, OriginalSnapshotState};
+use super::resource_observation::StartupResourceObservationV6;
 use crate::{
     engine::EngineError,
     pals_adaptive::AdaptiveSessionProcessReceipt,
@@ -42,6 +43,10 @@ pub(super) struct PalsSystemDriverLifecycleV6 {
     first_finish_failure: Option<SearchSessionFailure>,
     incomplete_receipt: Option<AdaptiveSessionProcessReceipt>,
     closed_receipt: Option<AdaptiveSessionProcessReceipt>,
+    startup_resources: Option<StartupResourceObservationV6>,
+    resource_observation_panic: Option<Box<dyn std::any::Any + Send>>,
+    resource_publication: Option<Result<(), String>>,
+    resource_publication_panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl PalsSystemDriverLifecycleV6 {
@@ -63,6 +68,10 @@ impl PalsSystemDriverLifecycleV6 {
             first_finish_failure: None,
             incomplete_receipt: None,
             closed_receipt: None,
+            startup_resources: None,
+            resource_observation_panic: None,
+            resource_publication: None,
+            resource_publication_panic: None,
         })
     }
 
@@ -93,6 +102,90 @@ impl PalsSystemDriverLifecycleV6 {
         cancelled: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Option<bool>, SearchSessionFailure> {
         self.driver.start_checker(until, cancelled)
+    }
+
+    /// Diagnostic readback is independent of checker and NN success. The
+    /// original driver and source remain held even if the observer panics.
+    pub(super) fn observe_startup_resources(&mut self, until: Instant) {
+        if self.startup_resources.is_some() || self.resource_observation_panic.is_some() {
+            return;
+        }
+        let Some(original) = self.original.transferred.as_ref() else {
+            return;
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.driver.observe_startup_resources(original, until)
+        })) {
+            Ok(observation) => self.startup_resources = Some(observation),
+            Err(payload) => self.resource_observation_panic = Some(payload),
+        }
+    }
+
+    /// Publish only through the exact factory's original receipt owner. A
+    /// pending/missing writer or failed write is a separate diagnostic and
+    /// never changes the result of model execution.
+    pub(super) fn publish_startup_resources(&mut self) {
+        if self.resource_publication.is_some()
+            || self.resource_publication_panic.is_some()
+            || (self.startup_resources.is_none() && self.resource_observation_panic.is_none())
+        {
+            return;
+        }
+        self.poll_original_startup_receipt();
+        let Some(original) = self.original.transferred.as_ref() else {
+            return;
+        };
+        let publication = match &original.original_receipt {
+            OriginalReceiptState::Pending => return,
+            OriginalReceiptState::Disconnected => {
+                self.resource_publication =
+                    Some(Err("original receipt publisher disconnected".into()));
+                return;
+            }
+            OriginalReceiptState::Observed(publication) => publication,
+        };
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+                let owner = publication
+                    .owner
+                    .as_ref()
+                    .ok_or_else(|| "original receipt owner unavailable".to_owned())?;
+                if !Arc::ptr_eq(&owner.owner, &original.cpu.original_source)
+                    || !Arc::ptr_eq(&owner.parent, &original.parent)
+                {
+                    return Err("resource receipt owner differs from original lifecycle".into());
+                }
+                owner
+                    .parent
+                    .ensure_live()
+                    .map_err(|error| error.to_string())?;
+                let observation = match &self.startup_resources {
+                    Some(value) => value.to_receipt_json(),
+                    None => serde_json::json!({
+                        "domain": "rz-pals-system-v6-startup-resource-observation/1",
+                        "observation": "observer_panicked",
+                        "gpu_physical_completion": "unknown",
+                        "numeric_acceptance": false,
+                        "performance_acceptance": false,
+                    }),
+                };
+                let bytes = serde_json::to_vec(&observation).map_err(|error| error.to_string())?;
+                owner
+                    .writer
+                    .write_bytes("pals-startup-resources.v6.json", &bytes)
+            }));
+        match result {
+            Ok(value) => self.resource_publication = Some(value),
+            Err(payload) => self.resource_publication_panic = Some(payload),
+        }
+    }
+
+    pub(super) fn startup_resources(&self) -> Option<&StartupResourceObservationV6> {
+        self.startup_resources.as_ref()
+    }
+
+    pub(super) fn resource_publication(&self) -> Option<&Result<(), String>> {
+        self.resource_publication.as_ref()
     }
 
     /// Only the pipeline's pre-service state may call this. An arbitrary

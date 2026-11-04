@@ -54,6 +54,14 @@ pub(super) struct V6DriverFacade {
 }
 
 impl V6DriverFacade {
+    pub(super) fn observe_startup_resources(
+        &self,
+        original: &super::driver_assemble::V6TransferredOwners,
+        until: Instant,
+    ) -> super::resource_observation::StartupResourceObservationV6 {
+        super::resource_observation::observe_startup_v6(original, &self.driver, until)
+    }
+
     /// Move in the actual driver: the facade never exposes a concrete handle.
     pub(super) fn new(driver: ActualDriver) -> Self {
         Self {
@@ -214,7 +222,9 @@ impl SearchSessionDriver for V6DriverFacade {
         }
         // Retain the original panic while dropping only this facade's guard
         // normally; a separately poisoned driver remains unknown.
-        let result = catch_unwind(AssertUnwindSafe(|| self.driver.start_checker(deadline, cancel)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.driver.start_checker(deadline, cancel)
+        }));
         drop(state);
         match result {
             Ok(result) => result,

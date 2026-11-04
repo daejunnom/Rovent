@@ -36,6 +36,10 @@ pub fn compiled_pals_system_v6_execution_source_digest() -> String {
             include_bytes!("../pals_adaptive_bootstrap/system_v6/pipeline.rs"),
         ),
         (
+            "resource_observation",
+            include_bytes!("../pals_adaptive_bootstrap/system_v6/resource_observation.rs"),
+        ),
+        (
             "failed_startup_drain",
             include_bytes!("../pals_adaptive_bootstrap/system_v6/failed_startup_drain.rs"),
         ),

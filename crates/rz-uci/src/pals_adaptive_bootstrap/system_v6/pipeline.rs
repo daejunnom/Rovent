@@ -496,6 +496,7 @@ impl V6Pipeline {
                 self.state = V6PipelineObservation::Failed;
                 return self.state;
             }
+            lifecycle.observe_startup_resources(until);
             self.checker_start = Some(result);
         }
         self.state = V6PipelineObservation::ServiceInProgress;
@@ -511,6 +512,9 @@ impl V6Pipeline {
         }));
         match result {
             Ok(result) => {
+                // A delayed diagnostic writer may have arrived while UCI ran.
+                // Missing or failed publication never changes service outcome.
+                lifecycle.publish_startup_resources();
                 // Called once while retaining the lifecycle, including errors.
                 if lifecycle.record_service_outcome(result).is_err() {
                     return self.fail(V6PipelineFailure::LifecycleAdmission);
@@ -519,6 +523,7 @@ impl V6Pipeline {
                 self.state
             }
             Err(payload) => {
+                lifecycle.publish_startup_resources();
                 self.service_panic = Some(payload);
                 self.fail(V6PipelineFailure::ServicePanic)
             }

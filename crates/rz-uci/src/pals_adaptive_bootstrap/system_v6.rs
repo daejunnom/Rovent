@@ -18,6 +18,8 @@ mod driver_prepare;
 mod failed_startup_drain;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod pipeline;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod resource_observation;
 
 /// The receipt directory is derived from the exact held startup root, never
 /// from a caller-provided pathname or a different supervisor's writer.
