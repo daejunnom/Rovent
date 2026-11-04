@@ -3252,7 +3252,7 @@ fn run_native(mut arguments: Vec<String>) -> Result<(), Box<dyn std::error::Erro
                 parent_preflight = Some(value.to_owned());
             }
             false
-        } else if let Some(value) = argument.strip_prefix("--lc0-supervised=") {
+        } else if let Some(value) = argument.strip_prefix("--lc0-parent-session=") {
             if supervised.is_some() {
                 supervised = Some("duplicate".to_owned());
             } else {
@@ -3272,16 +3272,20 @@ fn run_native(mut arguments: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         if config.provider() != NativeProvider::Cuda {
             return Err("LC0 supervised service requires explicit system CUDA".into());
         }
-        let (epoch, seconds) = specification
-            .split_once(':')
-            .ok_or("LC0 supervised service requires EPOCH:SECONDS")?;
-        let epoch: u64 = epoch.parse()?;
-        let seconds: u64 = seconds.parse()?;
-        if epoch == 0 || !(1..=3600).contains(&seconds) {
-            return Err("LC0 supervised epoch or duration is invalid".into());
+        let mut fields = specification.split(':');
+        let epoch: u64 = fields.next().ok_or("missing LC0 epoch")?.parse()?;
+        let run_seconds: u64 = fields.next().ok_or("missing LC0 run time")?.parse()?;
+        let cleanup_seconds: u64 = fields.next().ok_or("missing LC0 cleanup time")?.parse()?;
+        if epoch == 0 || run_seconds == 0 || cleanup_seconds == 0 || fields.next().is_some() {
+            return Err("LC0 parent session requires EPOCH:RUN_SECONDS:CLEANUP_SECONDS".into());
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-        return run_lc0_supervised(config, epoch, Duration::from_secs(seconds));
+        return run_lc0_supervised(
+            config,
+            epoch,
+            Duration::from_secs(run_seconds),
+            Duration::from_secs(cleanup_seconds),
+        );
         #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux")))]
         return Err("LC0 supervised service requires Linux, onnx-cuda and pals-adaptive".into());
     }
@@ -3454,9 +3458,10 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
 fn run_lc0_supervised(
-    _config: NativeConfig,
-    _epoch: u64,
-    _window: Duration,
+    config: NativeConfig,
+    epoch: u64,
+    run_window: Duration,
+    cleanup_window: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // This check is deliberately before endpoint creation, opening assets,
     // starting a writer or entering a native provider.
@@ -3465,10 +3470,291 @@ fn run_lc0_supervised(
             "LC0 supervised service custody is not available; no runtime was started".into(),
         );
     }
-    // The eventual caller must keep the original session, listener and
-    // receipts together across every timeout and unwind; do not bypass this
-    // barrier until native finish and parent-loss custody are wired.
-    Err("LC0 supervised service caller is not yet available; no runtime was started".into())
+    if config.profiling_requested() {
+        return Err(
+            "LC0 supervised output profiling is not connected; no runtime was started".into(),
+        );
+    }
+    use rz_uci::{
+        native_bootstrap::{Lc0AsyncInputs, Lc0PendingSupervisor, Lc0ReceiptOwner},
+        runner::async_output::{AsyncOutputOwner, StartError},
+    };
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+
+    let start = std::time::Instant::now();
+    let run_until = start
+        .checked_add(run_window)
+        .ok_or("LC0 run deadline overflow")?;
+    let cleanup_until = run_until
+        .checked_add(cleanup_window)
+        .ok_or("LC0 cleanup deadline overflow")?;
+    let pending = Lc0PendingSupervisor::capture(&config, epoch, cleanup_until)?;
+    let receipts = Lc0ReceiptOwner::open_for_config(&config)?;
+    let mut listener = pending.prepare_parent_listener(&receipts)?;
+    if let Err(error) = listener.bind(cleanup_until) {
+        if let Err(cleanup_error) = listener.retire_before_auth(&pending, cleanup_until) {
+            hold_lc0_pre_native((pending, listener, receipts, error, cleanup_error));
+        }
+        return Err(Box::new(error));
+    }
+    let notice = match pending.admission_notice(&listener) {
+        Ok(notice) => notice,
+        Err(error) => {
+            if let Err(cleanup_error) = listener.retire_before_auth(&pending, cleanup_until) {
+                hold_lc0_pre_native((pending, listener, receipts, error, cleanup_error));
+            }
+            return Err(Box::new(error));
+        }
+    };
+    if let Err(error) = writeln!(io::stderr().lock(), "{notice}") {
+        if let Err(cleanup_error) = listener.retire_before_auth(&pending, cleanup_until) {
+            hold_lc0_pre_native((pending, listener, receipts, error, cleanup_error));
+        }
+        return Err(Box::new(error));
+    }
+    let mut session = match pending.authenticate_parent_preserving_failure(&listener, cleanup_until)
+    {
+        Ok(session) => session,
+        Err(failure) => {
+            if let Err(cleanup_error) =
+                failure.retire_listener_before_native(&mut listener, cleanup_until)
+            {
+                hold_lc0_pre_native((failure, listener, receipts, cleanup_error));
+            }
+            return Err(Box::new(failure));
+        }
+    };
+    let cancelled = AtomicBool::new(false);
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.prepare_private_until(run_until, &cancelled)
+    }));
+    match prepared {
+        Ok(Ok(())) => {}
+        evidence => hold_lc0_session(
+            session,
+            listener,
+            receipts,
+            evidence,
+            run_until,
+            cleanup_until,
+            false,
+        ),
+    }
+    let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        AsyncOutputOwner::start(
+            ProfiledWrite::new(io::stdout(), None),
+            io::stderr(),
+            8,
+            1024 * 1024,
+        )
+    })) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error @ StartError::Invalid { .. })) | Ok(Err(error @ StartError::Spawn { .. })) => {
+            hold_lc0_session(
+                session,
+                listener,
+                receipts,
+                error,
+                run_until,
+                cleanup_until,
+                false,
+            )
+        }
+        Err(payload) => hold_lc0_session(
+            session,
+            listener,
+            receipts,
+            payload,
+            run_until,
+            cleanup_until,
+            false,
+        ),
+    };
+    let (sender, events) = engine::event_channel();
+    let input = sender.clone();
+    let input_limit = config.engine_settings().parser.max_line_bytes;
+    let input_thread = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        thread::Builder::new()
+            .name("lc0-uci-input".into())
+            .spawn(move || forward_lines(&mut io::stdin().lock(), &input, input_limit))
+    })) {
+        Ok(Ok(worker)) => worker,
+        Ok(Err(error)) => hold_lc0_session(
+            session,
+            listener,
+            receipts,
+            (error, output, events, sender),
+            run_until,
+            cleanup_until,
+            false,
+        ),
+        Err(payload) => hold_lc0_session(
+            session,
+            listener,
+            receipts,
+            (payload, output, events, sender),
+            run_until,
+            cleanup_until,
+            false,
+        ),
+    };
+    let inputs = Lc0AsyncInputs {
+        events,
+        sender,
+        output,
+        max_output_bytes: 1024 * 1024,
+        poll_interval: Duration::from_millis(5),
+    };
+    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.start_async_service(inputs)
+    }));
+    let running = matches!(
+        started,
+        Ok(Ok(rz_uci::native_bootstrap::Lc0AsyncAdmission::Started))
+    );
+    hold_lc0_session(
+        session,
+        listener,
+        receipts,
+        (started, input_thread),
+        run_until,
+        cleanup_until,
+        running,
+    )
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+fn hold_lc0_pre_native<T>(_original_owners_and_error: T) -> ! {
+    loop {
+        thread::park_timeout(Duration::from_secs(1));
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+fn hold_lc0_session<T>(
+    mut session: rz_uci::native_bootstrap::Lc0SupervisedSession,
+    listener: rz_uci::native_bootstrap::Lc0ParentListener,
+    receipts: rz_uci::native_bootstrap::Lc0ReceiptOwner,
+    _original_evidence: T,
+    run_until: std::time::Instant,
+    cleanup_until: std::time::Instant,
+    mut running: bool,
+) -> ! {
+    use rz_uci::native_bootstrap::Lc0AsyncFinishStatus;
+    use rz_uci::runner::async_events::AsyncServeStatus;
+    let mut original_panic: Option<Box<dyn std::any::Any + Send>> = None;
+    let mut first_control_error: Option<io::Error> = None;
+    let mut parent_error: Option<io::Error> = None;
+    let mut renewal_error: Option<io::Error> = None;
+    let mut control_until = cleanup_until;
+    let mut renewed = false;
+    let mut finish_terminal = false;
+    let mut finish_status: Option<Lc0AsyncFinishStatus> = None;
+    let mut receipt_error: Option<String> = None;
+    loop {
+        if original_panic.is_some() {
+            thread::park_timeout(Duration::from_secs(1));
+            continue;
+        }
+        let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let now = std::time::Instant::now();
+            if now >= run_until || parent_error.is_some() {
+                if let Some(close) = session.async_close_handle() {
+                    let _ = close.request();
+                }
+            }
+            if running {
+                let until = now.checked_add(Duration::from_millis(5)).unwrap_or(now);
+                if !matches!(
+                    session.drive_async_until(until),
+                    Some(AsyncServeStatus::Yielded)
+                ) {
+                    running = false;
+                }
+            }
+            // Drive may consume its entire slice. Give control and finish
+            // their own current-time-based bounded slices.
+            let now = std::time::Instant::now();
+            if renewal_error.is_none() && now >= control_until {
+                if renewed {
+                    renewal_error = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "LC0 renewed control window ended",
+                    ));
+                } else {
+                    renewed = true;
+                    match session.renew_control_window(Duration::from_secs(30)) {
+                        Ok(until) => control_until = until,
+                        Err(error) => {
+                            renewal_error = Some(error);
+                            if let Err(error) = session.original_parent_liveness() {
+                                parent_error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+            if renewal_error.is_none() && parent_error.is_none() && now < control_until {
+                let until = now
+                    .checked_add(Duration::from_millis(5))
+                    .unwrap_or(now)
+                    .min(control_until);
+                if let Err(error) = session.handle_parent_control_versioned(&listener, until)
+                    && error.kind() != io::ErrorKind::TimedOut
+                {
+                    if first_control_error.is_none() {
+                        first_control_error = Some(error);
+                    }
+                    if let Err(error) = session.original_parent_liveness() {
+                        parent_error = Some(error);
+                    }
+                }
+            }
+            let now = std::time::Instant::now();
+            if !running && !finish_terminal {
+                // Use the registered cleanup window; do not turn a slow
+                // native collection into a 250 ms artificial failure.
+                let until = if now < cleanup_until {
+                    cleanup_until
+                } else {
+                    now.checked_add(cleanup_until.duration_since(run_until))
+                        .unwrap_or(now)
+                };
+                let status = session.try_finish_async(until);
+                finish_terminal = !matches!(
+                    status,
+                    Lc0AsyncFinishStatus::ServicePending
+                        | Lc0AsyncFinishStatus::CpuPending
+                        | Lc0AsyncFinishStatus::WriterPending
+                );
+                finish_status = Some(status);
+                if status == Lc0AsyncFinishStatus::NativeCollected {
+                    if let Err(error) = session.publish_runtime_receipt(&receipts, true) {
+                        receipt_error = Some(error);
+                    }
+                    if let Err(error) = session.publish_finish_observation(&receipts)
+                        && receipt_error.is_none()
+                    {
+                        receipt_error = Some(error);
+                    }
+                }
+            }
+            let _ = &receipts;
+            let _ = &finish_status;
+            let _ = &receipt_error;
+        }));
+        if let Err(payload) = tick {
+            if original_panic.is_none() {
+                original_panic = Some(payload);
+            }
+            running = false;
+        }
+        // The native finish and writer evidence are not yet sufficient to
+        // authorize a return. Keep the original objects through timeouts,
+        // parent loss, and unknown physical completion without a busy loop.
+        thread::park_timeout(Duration::from_millis(50));
+    }
 }
 
 fn serve_process(

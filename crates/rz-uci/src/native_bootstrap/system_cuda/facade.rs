@@ -22,8 +22,9 @@ use crate::{
     engine::{
         EngineProcess, PriorityCloseHandle, ProcessClock,
         async_engine::{
-            self, AsyncEngineRun, AsyncEngineStartFailure, EngineTimerJoinStatus,
-            EngineWriterRecoveryStatus, UnstartedWriterCloseStatus, UnstartedWriterRecoveryStatus,
+            AsyncEngineRun, AsyncEngineStartFailure, AsyncEngineStartSlot, EngineTimerJoinStatus,
+            EngineWriterRecoveryStatus, InPlacePreflightStatus, InPlaceTimerStatus,
+            InPlaceTransferStatus, UnstartedWriterCloseStatus, UnstartedWriterRecoveryStatus,
         },
     },
     native_profile::ProfiledWrite,
@@ -38,6 +39,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 type Lc0Output = AsyncOutputOwner<ProfiledWrite<std::io::Stdout>, std::io::Stderr>;
 type Lc0Run = AsyncEngineRun<ProfiledWrite<std::io::Stdout>, std::io::Stderr>;
 type Lc0StartFailure = AsyncEngineStartFailure<ProfiledWrite<std::io::Stdout>, std::io::Stderr>;
+type Lc0StartSlot = AsyncEngineStartSlot<ProfiledWrite<std::io::Stdout>, std::io::Stderr>;
 
 /// Inputs transferred only after this original supervisor accepts admission.
 /// The caller retains its original parent, listener, receipt owner and process.
@@ -61,10 +63,24 @@ enum Lc0AsyncCustody {
         _error: rz_contracts::ContractError,
     },
     StartFailed(Lc0StartFailure),
+    Slot {
+        slot: Lc0StartSlot,
+        close: PriorityCloseHandle,
+        stage: Lc0SlotStage,
+    },
     Running {
         run: Lc0Run,
         close: PriorityCloseHandle,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Lc0SlotStage {
+    Created,
+    Preflight(InPlacePreflightStatus),
+    Timer(InPlaceTimerStatus),
+    Install(InPlaceTransferStatus),
+    Running,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +88,23 @@ pub enum Lc0AsyncAdmission {
     Started,
     RetainedFailure,
     Unknown,
+}
+
+/// CPU, writer and native collection are separate observations. None of
+/// these variants establishes device-wide physical completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lc0AsyncFinishStatus {
+    NoRun,
+    ServicePending,
+    ServiceFailed,
+    CpuPending,
+    CpuFailed,
+    WriterPending,
+    WriterFailed,
+    WriterUnknown,
+    NativeCollected,
+    NativeCollectionFailed,
+    AlreadyAttempted,
 }
 
 /// Exercise original parent and receipt plumbing without opening model assets,
@@ -286,6 +319,31 @@ pub struct Lc0PendingFailure {
     authenticated_parent: Option<Arc<ConnectedParent>>,
 }
 
+impl std::fmt::Debug for Lc0PendingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Lc0PendingFailure(pre-native; original error retained)")
+    }
+}
+
+impl std::fmt::Display for Lc0PendingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LC0 parent admission failed before native entry")
+    }
+}
+
+impl std::error::Error for Lc0PendingFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            Lc0PendingFailureCause::TicketMismatch => None,
+            Lc0PendingFailureCause::Accept(error)
+            | Lc0PendingFailureCause::Authentication(error) => Some(error),
+            Lc0PendingFailureCause::Asset(error) | Lc0PendingFailureCause::Custody(error) => {
+                Some(error)
+            }
+        }
+    }
+}
+
 impl Lc0PendingFailure {
     pub fn cause(&self) -> &Lc0PendingFailureCause {
         &self.cause
@@ -313,6 +371,8 @@ impl Lc0PendingFailure {
 pub struct Lc0SupervisedSession {
     supervisor: Lc0ControlSupervisor,
     async_custody: Option<Lc0AsyncCustody>,
+    slot_start_panic: Option<Box<dyn std::any::Any + Send>>,
+    async_finish_attempted: bool,
     lock: SystemRuntimeLockV6,
     config: NativeConfig,
     owners: Arc<OwnerRegistry>,
@@ -544,6 +604,8 @@ impl Lc0PendingSupervisor {
                 self.control_until,
             ),
             async_custody: None,
+            slot_start_panic: None,
+            async_finish_attempted: false,
             lock: self.lock,
             config: self.config,
             owners: Arc::new(OwnerRegistry::default()),
@@ -636,6 +698,11 @@ impl Lc0SupervisedSession {
             ));
         }
         self.supervisor.renew_control_window(&self.lock, window)
+    }
+
+    /// An individual bad control frame must not be promoted to parent loss.
+    pub fn original_parent_liveness(&self) -> io::Result<()> {
+        self.supervisor.original_parent_liveness()
     }
 
     /// Publish a bounded, non-authoritative classification even when startup
@@ -889,7 +956,11 @@ impl Lc0SupervisedSession {
             Err(error) => return Err((error, inputs)),
         };
         let clock = ProcessClock::new(rz_contracts::ProcessEpoch(self.epoch));
-        let mut process = EngineProcess::new(factory, Arc::clone(&self.owners), clock);
+        let mut process = EngineProcess::new(factory, Arc::clone(&self.owners), clock)
+            .with_identity(crate::EngineIdentity {
+                name: "RoveZero LC0 weights ONNX CUDA integration".into(),
+                author: "RoveZero contributors".into(),
+            });
         let close = match process.install_priority_close() {
             Ok(close) => close,
             Err(error) => {
@@ -901,30 +972,52 @@ impl Lc0SupervisedSession {
                 return Ok(Lc0AsyncAdmission::RetainedFailure);
             }
         };
-        self.async_custody = Some(Lc0AsyncCustody::Starting);
+        let max_output_bytes = inputs.max_output_bytes;
+        let poll_interval = inputs.poll_interval;
+        let slot = AsyncEngineStartSlot::new(
+            process,
+            inputs.events,
+            inputs.sender,
+            inputs.output,
+            close.clone(),
+            self.config.engine_settings(),
+        );
+        self.async_custody = Some(Lc0AsyncCustody::Slot {
+            slot,
+            close,
+            stage: Lc0SlotStage::Created,
+        });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            async_engine::start_async(
-                inputs.events,
-                inputs.sender,
-                process,
-                self.config.engine_settings(),
-                inputs.output,
-                close.clone(),
-                inputs.max_output_bytes,
-                inputs.poll_interval,
-            )
+            let Some(Lc0AsyncCustody::Slot { slot, stage, .. }) = self.async_custody.as_mut()
+            else {
+                return false;
+            };
+            let status = slot.preflight();
+            *stage = Lc0SlotStage::Preflight(status);
+            if status != InPlacePreflightStatus::Ready {
+                return false;
+            }
+            let status = slot.try_start_timer();
+            *stage = Lc0SlotStage::Timer(status);
+            if status != InPlaceTimerStatus::Started {
+                return false;
+            }
+            match slot.try_install_run(max_output_bytes, poll_interval) {
+                Ok(()) => {
+                    *stage = Lc0SlotStage::Running;
+                    true
+                }
+                Err(status) => {
+                    *stage = Lc0SlotStage::Install(status);
+                    false
+                }
+            }
         }));
         match outcome {
-            Ok(Ok(run)) => {
-                self.async_custody = Some(Lc0AsyncCustody::Running { run, close });
-                Ok(Lc0AsyncAdmission::Started)
-            }
-            Ok(Err(error)) => {
-                self.async_custody = Some(Lc0AsyncCustody::StartFailed(error));
-                Ok(Lc0AsyncAdmission::RetainedFailure)
-            }
+            Ok(true) => Ok(Lc0AsyncAdmission::Started),
+            Ok(false) => Ok(Lc0AsyncAdmission::RetainedFailure),
             Err(payload) => {
-                self.async_custody = Some(Lc0AsyncCustody::StartPanicked(payload));
+                self.slot_start_panic = Some(payload);
                 Ok(Lc0AsyncAdmission::Unknown)
             }
         }
@@ -935,6 +1028,7 @@ impl Lc0SupervisedSession {
     pub fn drive_async_until(&mut self, until: Instant) -> Option<AsyncServeStatus> {
         match self.async_custody.as_mut()? {
             Lc0AsyncCustody::Running { run, .. } => run.drive_until(until),
+            Lc0AsyncCustody::Slot { slot, .. } => slot.original_run_mut()?.drive_until(until),
             _ => None,
         }
     }
@@ -942,10 +1036,11 @@ impl Lc0SupervisedSession {
     /// An interrupted transfer is not a completed admission. The marker does
     /// not assert that values moved into a panicking start were recovered.
     pub fn async_start_outcome_unknown(&self) -> bool {
-        matches!(
-            self.async_custody.as_ref(),
-            Some(Lc0AsyncCustody::Starting | Lc0AsyncCustody::StartPanicked(_))
-        )
+        self.slot_start_panic.is_some()
+            || matches!(
+                self.async_custody.as_ref(),
+                Some(Lc0AsyncCustody::Starting | Lc0AsyncCustody::StartPanicked(_))
+            )
     }
 
     /// Borrow the exact engine setup failure and its retained input owners.
@@ -961,6 +1056,7 @@ impl Lc0SupervisedSession {
     pub(crate) fn request_unstarted_writer_close(&mut self) -> Option<UnstartedWriterCloseStatus> {
         match self.async_custody.as_mut()? {
             Lc0AsyncCustody::StartFailed(error) => Some(error.request_unstarted_writer_close()),
+            Lc0AsyncCustody::Slot { slot, .. } => Some(slot.request_idle_writer_close()),
             _ => None,
         }
     }
@@ -970,6 +1066,7 @@ impl Lc0SupervisedSession {
     pub(crate) fn try_recover_unstarted_writer(&mut self) -> Option<UnstartedWriterRecoveryStatus> {
         match self.async_custody.as_mut()? {
             Lc0AsyncCustody::StartFailed(error) => Some(error.try_recover_unstarted_writer()),
+            Lc0AsyncCustody::Slot { slot, .. } => Some(slot.try_recover_idle_writer()),
             _ => None,
         }
     }
@@ -985,6 +1082,7 @@ impl Lc0SupervisedSession {
     > {
         match self.async_custody.as_ref()? {
             Lc0AsyncCustody::StartFailed(error) => error.unstarted_writer_recovery(),
+            Lc0AsyncCustody::Slot { slot, .. } => slot.idle_writer_recovery(),
             _ => None,
         }
     }
@@ -993,7 +1091,85 @@ impl Lc0SupervisedSession {
     pub fn async_close_handle(&self) -> Option<PriorityCloseHandle> {
         match self.async_custody.as_ref()? {
             Lc0AsyncCustody::Running { close, .. } => Some(close.clone()),
+            Lc0AsyncCustody::Slot { close, .. } => Some(close.clone()),
             _ => None,
+        }
+    }
+
+    /// Advance the original normal UCI run's final collection once. All
+    /// output and CPU checks refer to that same run and its joined writer.
+    /// A failed or unknown stage remains retained and is never treated as
+    /// success. NativeCollected is not a physical-completion witness.
+    pub fn try_finish_async(&mut self, until: Instant) -> Lc0AsyncFinishStatus {
+        if self.async_finish_attempted {
+            return Lc0AsyncFinishStatus::AlreadyAttempted;
+        }
+        if self.slot_start_panic.is_some() {
+            return Lc0AsyncFinishStatus::ServiceFailed;
+        }
+        let run = match self.async_custody.as_mut() {
+            Some(Lc0AsyncCustody::Running { run, .. }) => run,
+            Some(Lc0AsyncCustody::Slot { slot, .. }) => match slot.original_run_mut() {
+                Some(run) => run,
+                None => return Lc0AsyncFinishStatus::NoRun,
+            },
+            _ => return Lc0AsyncFinishStatus::NoRun,
+        };
+        match run.last_exit() {
+            None => return Lc0AsyncFinishStatus::ServicePending,
+            Some(exit)
+                if exit.status == AsyncServeStatus::OutputQueued
+                    && exit.failure.is_none()
+                    && exit.cleanup_failures.is_empty() => {}
+            Some(exit) if exit.status == AsyncServeStatus::Yielded => {
+                return Lc0AsyncFinishStatus::ServicePending;
+            }
+            Some(_) => return Lc0AsyncFinishStatus::ServiceFailed,
+        }
+        if !run.session_closed() || run.pending_count() != 0 {
+            return Lc0AsyncFinishStatus::ServicePending;
+        }
+        match run.try_join_timer_after_workers() {
+            EngineTimerJoinStatus::Joined => {}
+            EngineTimerJoinStatus::NotReady
+            | EngineTimerJoinStatus::WaitingWorkers
+            | EngineTimerJoinStatus::WaitingTimer => return Lc0AsyncFinishStatus::CpuPending,
+            _ => return Lc0AsyncFinishStatus::CpuFailed,
+        }
+        match run.try_recover_writer() {
+            EngineWriterRecoveryStatus::Recovered => {}
+            EngineWriterRecoveryStatus::DriverNotSealed | EngineWriterRecoveryStatus::Pending => {
+                return Lc0AsyncFinishStatus::WriterPending;
+            }
+            EngineWriterRecoveryStatus::WorkerPanicked => {
+                return Lc0AsyncFinishStatus::WriterFailed;
+            }
+            EngineWriterRecoveryStatus::OriginalRecoveryMissing => {
+                return Lc0AsyncFinishStatus::WriterUnknown;
+            }
+        }
+        let Some(Ok(recovery)) = run.output_recovery() else {
+            return Lc0AsyncFinishStatus::WriterUnknown;
+        };
+        if recovery.failure.is_some() || recovery.partial.is_some() {
+            return Lc0AsyncFinishStatus::WriterFailed;
+        }
+        let Some(snapshot) = run.final_output_observation() else {
+            return Lc0AsyncFinishStatus::WriterUnknown;
+        };
+        if snapshot.failed || snapshot.call_completion_unknown {
+            return Lc0AsyncFinishStatus::WriterFailed;
+        }
+        if !snapshot.worker_finished
+            || !snapshot.close_requested
+            || snapshot.accepted_batches != snapshot.completed_batches
+        {
+            return Lc0AsyncFinishStatus::WriterUnknown;
+        }
+        self.async_finish_attempted = true;
+        match self.supervisor.finish_service(until, Ok(())) {
+            Ok(()) => Lc0AsyncFinishStatus::NativeCollected,
+            Err(_) => Lc0AsyncFinishStatus::NativeCollectionFailed,
         }
     }
 
@@ -1002,6 +1178,9 @@ impl Lc0SupervisedSession {
     pub(crate) fn try_join_async_timer(&mut self) -> Option<EngineTimerJoinStatus> {
         match self.async_custody.as_mut()? {
             Lc0AsyncCustody::Running { run, .. } => Some(run.try_join_timer_after_workers()),
+            Lc0AsyncCustody::Slot { slot, .. } => {
+                Some(slot.original_run_mut()?.try_join_timer_after_workers())
+            }
             _ => None,
         }
     }
@@ -1011,6 +1190,9 @@ impl Lc0SupervisedSession {
     pub(crate) fn try_recover_async_writer(&mut self) -> Option<EngineWriterRecoveryStatus> {
         match self.async_custody.as_mut()? {
             Lc0AsyncCustody::Running { run, .. } => Some(run.try_recover_writer()),
+            Lc0AsyncCustody::Slot { slot, .. } => {
+                Some(slot.original_run_mut()?.try_recover_writer())
+            }
             _ => None,
         }
     }
@@ -1027,6 +1209,7 @@ impl Lc0SupervisedSession {
     > {
         match self.async_custody.as_ref()? {
             Lc0AsyncCustody::Running { run, .. } => run.output_recovery(),
+            Lc0AsyncCustody::Slot { slot, .. } => slot.original_run()?.output_recovery(),
             _ => None,
         }
     }

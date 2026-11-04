@@ -273,6 +273,17 @@ fn service_failure(error: &EngineError) -> &'static str {
 }
 
 impl Lc0ControlSupervisor {
+    /// Query only the original authenticated parent's current liveness. An
+    /// individual control connection's failure does not imply parent loss.
+    pub(super) fn original_parent_liveness(&self) -> io::Result<()> {
+        self.owner
+            .custody
+            .parent
+            .as_ref()
+            .ok_or_else(|| io::Error::other("LC0 original parent is unavailable"))?
+            .ensure_live()
+    }
+
     /// Extend only this same owner's finite control window. Neither a live
     /// parent nor a new deadline is session release or a physical GPU fence.
     /// All previous V1/V2 replay state, observations and errors stay intact.
@@ -578,11 +589,16 @@ impl Lc0ControlSupervisor {
         self.finish_service(until, served)
     }
 
-    fn finish_service(
+    pub(super) fn finish_service(
         &mut self,
         until: Instant,
         served: Result<(), EngineError>,
     ) -> Result<(), NativeBootstrapError> {
+        if self.state != ServiceState::Serving {
+            return Err(NativeBootstrapError::Config(
+                "LC0 original service is not awaiting final collection",
+            ));
+        }
         // Keep the original error in the supervisor until the finish report
         // takes it. A panic during collection must not drop the service error.
         self.service_failure_projection = served.as_ref().err().map(service_failure);

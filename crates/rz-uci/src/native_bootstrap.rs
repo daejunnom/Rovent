@@ -55,10 +55,10 @@ use std::{
 mod system_cuda;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
 pub use system_cuda::{
-    Lc0AsyncAdmission, Lc0AsyncInputs, Lc0ObservedPublication, Lc0ObservedRelease,
-    Lc0ObservedService, Lc0OriginalSessionObservation, Lc0ParentListener, Lc0PendingFailure,
-    Lc0PendingFailureCause, Lc0PendingSupervisor, Lc0ReceiptOwner, Lc0SupervisedSession,
-    parent_preflight as lc0_parent_preflight,
+    Lc0AsyncAdmission, Lc0AsyncFinishStatus, Lc0AsyncInputs, Lc0ObservedPublication,
+    Lc0ObservedRelease, Lc0ObservedService, Lc0OriginalSessionObservation, Lc0ParentListener,
+    Lc0PendingFailure, Lc0PendingFailureCause, Lc0PendingSupervisor, Lc0ReceiptOwner,
+    Lc0SupervisedSession, parent_preflight as lc0_parent_preflight,
 };
 
 const MAX_PATH_BYTES: usize = 4096;

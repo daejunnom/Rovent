@@ -48,7 +48,7 @@ mod facade;
 mod profile;
 mod projection;
 pub use facade::{
-    Lc0AsyncAdmission, Lc0AsyncInputs, Lc0ParentListener, Lc0PendingFailure,
+    Lc0AsyncAdmission, Lc0AsyncFinishStatus, Lc0AsyncInputs, Lc0ParentListener, Lc0PendingFailure,
     Lc0PendingFailureCause, Lc0PendingSupervisor, Lc0ReceiptOwner, Lc0SupervisedSession,
     parent_preflight,
 };
