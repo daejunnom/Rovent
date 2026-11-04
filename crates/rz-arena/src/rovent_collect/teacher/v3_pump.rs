@@ -334,6 +334,20 @@ impl TeacherPumpV3 {
         {
             return Ok(Some(false));
         }
+        // A same-root custody handoff preserves input but does not by
+        // itself establish a terminal or a post-route custody receipt.
+        if let Some(custody) = &self.registered_closed_custody {
+            let custody = match custody.0.try_lock() {
+                Ok(custody) => custody,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(invalid("V3 closed input custody poisoned"));
+                }
+            };
+            if !custody.originals.is_empty() {
+                return Ok(Some(false));
+            }
+        }
         let receiver = match self.receiver.try_lock() {
             Ok(receiver) => receiver,
             Err(TryLockError::WouldBlock) => return Ok(None),
