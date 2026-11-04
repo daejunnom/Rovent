@@ -170,10 +170,11 @@ pub(super) fn prepare_entry(
     };
     let mut supervisor = prepare_supervisor(prepared, max_line)
         .map_err(|(error, owner)| NoGameEntryFailureV1::Supervisor { error, owner })?;
+    let cancel_until = until.min(supervisor.bundle.window.startup_until);
     let stream = match supervisor
         .bundle
         .lock_admission
-        .open_direct_arena_stream(&cancel_path, until)
+        .open_direct_arena_stream(&cancel_path, cancel_until)
     {
         Ok(stream) => stream,
         Err((error, stream)) => {
