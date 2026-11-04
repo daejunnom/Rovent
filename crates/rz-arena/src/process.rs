@@ -3458,7 +3458,11 @@ mod linux {
                 std::thread::sleep(Duration::from_secs(30));
                 return;
             }
-            if mode == "dialogue" || mode == "early-ready" || mode == "partial-response" {
+            if mode == "dialogue"
+                || mode == "early-ready"
+                || mode == "partial-response"
+                || mode == "cancel-wait"
+            {
                 use std::io::BufRead;
                 let input = std::io::stdin();
                 let mut input = input.lock();
@@ -3486,6 +3490,18 @@ mod linux {
                 line.clear();
                 input.read_line(&mut line).unwrap();
                 assert_eq!(line, "isready\n");
+                if mode == "cancel-wait" {
+                    output.write_all(b"info string pending-smoke\n").unwrap();
+                    output.flush().unwrap();
+                    let mut error = std::io::stderr().lock();
+                    error.write_all(b"mock-pending-stderr\n").unwrap();
+                    error.flush().unwrap();
+                    // The original owner observes this after both writes; it
+                    // requests cancellation without relying on a sleep.
+                    std::fs::write(SMOKE_ADAPTER_READY, b"ready").unwrap();
+                    std::thread::sleep(Duration::from_secs(30));
+                    return;
+                }
                 if mode == "early-ready" {
                     // A zero exit still cannot make the missing readyok true.
                     return;
@@ -3560,6 +3576,111 @@ mod linux {
                 Some(b"uci\n".len() + b"isready\n".len() + b"quit\n".len())
             );
             std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_uci_cancel_during_ready_preserves_original_output_and_owner() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            let ready = root.0.join(SMOKE_ADAPTER_READY);
+            std::fs::write(&mode, b"cancel-wait").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let mut observation = OriginalSmokeUciObservation::new(window);
+            let mut custody = SpawnCustody::default();
+            let cancelled = AtomicBool::new(false);
+            let mut observed_child_pid = None;
+            let mut control = |owner: &SpawnCustody, until: Instant| {
+                if ready.is_file() {
+                    let child = owner
+                        .child()
+                        .expect("same original child during cancellation");
+                    assert!(owner.pending.load(Ordering::Acquire));
+                    assert_eq!(owner.last_spawn_pid, Some(child.id()));
+                    assert!(until <= window.execution);
+                    observed_child_pid = Some(child.id());
+                    cancelled.store(true, Ordering::Release);
+                }
+                Ok(())
+            };
+            let attempt = supervise_smoke_uci_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                Some(&cancelled),
+                &original_watch(),
+                window,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            );
+            let mut output = match attempt {
+                Ok(output) => output,
+                Err(error) => {
+                    let unresolved = custody.pending.load(Ordering::Acquire);
+                    if let Some(child) = custody.take_child() {
+                        retain_unresolved_smoke_mock(child);
+                    } else if !unresolved {
+                        let _ = std::fs::remove_file(&ready);
+                        let _ = std::fs::remove_file(&mode);
+                    }
+                    panic!("smoke UCI cancellation supervisor failed: {error}");
+                }
+            };
+            let unresolved_child = output.pending_child.take();
+            let retained_unknown = unresolved_child.is_some();
+            if let Some(child) = unresolved_child {
+                // Unknown is not completion; retain the exact mock owner.
+                retain_unresolved_smoke_mock(child);
+            }
+            if !retained_unknown && output.receipt.group_cleanup == CleanupStatus::Gone {
+                let _ = std::fs::remove_file(&ready);
+                let _ = std::fs::remove_file(&mode);
+            }
+            assert!(cancelled.load(Ordering::Acquire));
+            assert_eq!(observed_child_pid, Some(output.receipt.pid));
+            assert_eq!(custody.last_spawn_pid, Some(output.receipt.pid));
+            assert_eq!(output.receipt.stop, ProcessStop::Cancelled);
+            assert_eq!(output.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(!retained_unknown);
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert!(observation.uci_sent() && observation.uciok_observed());
+            assert!(observation.isready_sent());
+            assert!(!observation.readyok_observed() && !observation.quit_sent());
+            assert!(!observation.uci_exchange_observed());
+            assert_eq!(
+                observation.transport().written_bytes(),
+                Some(b"uci\n".len() + b"isready\n".len())
+            );
+            assert!(
+                output
+                    .stdout
+                    .windows(b"info string pending-smoke\n".len())
+                    .any(|part| part == b"info string pending-smoke\n")
+            );
+            assert!(
+                output
+                    .stderr
+                    .windows(b"mock-pending-stderr\n".len())
+                    .any(|part| part == b"mock-pending-stderr\n")
+            );
+            assert!(observation.buffered_stdout().is_empty());
+            assert!(observation.buffered_stderr().is_empty());
+            // Group cleanup is a CPU process observation, not a GPU fence.
         }
 
         #[test]
