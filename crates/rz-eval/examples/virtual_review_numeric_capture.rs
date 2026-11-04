@@ -12,6 +12,8 @@ use rz_eval::pals_model::virtual_review::{
     self as model, PalsVirtualReviewInput, ReviewExecutionIdentity,
 };
 use rz_eval::pals_model::{PalsCandidateToken, PalsModelProfile, PalsRawOutput, PalsRole};
+#[cfg(target_os = "linux")]
+use rz_eval::pals_onnx::virtual_review::SystemPlacementObservation;
 use rz_eval::pals_onnx::virtual_review::{
     PalsVirtualReviewOnnxBackend, VirtualReviewExecutionMode, VirtualReviewInvocation,
     VirtualReviewNativeCommand as Command, VirtualReviewNativeResult as Outcome,
@@ -357,6 +359,13 @@ struct Config {
     system_cuda_config: Option<PathBuf>,
     #[serde(default)]
     system_cuda_config_sha256: Option<String>,
+    /// Separate, explicitly pinned V3 static graph inventory. Its presence
+    /// admits only the exact metadata/control CPU nodes checked at session
+    /// initialization; it is not a runtime or physical completion witness.
+    #[serde(default)]
+    system_cuda_inventory: Option<PathBuf>,
+    #[serde(default)]
+    system_cuda_inventory_sha256: Option<String>,
     gpu_device_id: i32,
     gpu_arena_bytes: usize,
     deadline_seconds: u64,
@@ -413,14 +422,52 @@ impl Config {
                     "system CUDA requires its own config and no legacy bundle/control".into(),
                 );
             }
+            match (
+                &self.system_cuda_inventory,
+                &self.system_cuda_inventory_sha256,
+            ) {
+                (None, None) => {}
+                (Some(path), Some(digest)) if path.is_absolute() => {
+                    pin(digest)?;
+                }
+                _ => {
+                    return Err("system CUDA control requires an absolute inventory and SHA".into());
+                }
+            }
             selected.validate_system_execution_selection()?;
         } else {
-            if self.system_cuda_config.is_some() || self.system_cuda_config_sha256.is_some() {
+            if self.system_cuda_config.is_some()
+                || self.system_cuda_config_sha256.is_some()
+                || self.system_cuda_inventory.is_some()
+                || self.system_cuda_inventory_sha256.is_some()
+            {
                 return Err("system config is only supported by cuda-system".into());
             }
             selected.validate_execution_selection(profile, profile.is_some())?;
         }
         Ok(selected)
+    }
+}
+
+/// Mapping unavailability is a typed observation, not an inferred kernel
+/// result. A verified witness remains scoped to this owner and profile window.
+#[cfg(target_os = "linux")]
+fn system_placement_observation_json(
+    observation: &SystemPlacementObservation,
+) -> serde_json::Value {
+    match observation {
+        SystemPlacementObservation::Verified(witness) => serde_json::json!({
+            "status":"verified", "witness":witness,
+            "physical_completion":"requires_same_native_owner_completion"
+        }),
+        SystemPlacementObservation::MappingUnavailable => serde_json::json!({
+            "status":"mapping_unavailable", "gpu_kernel_placement":"unknown",
+            "physical_completion":"unknown"
+        }),
+        SystemPlacementObservation::UnregisteredOrPreexistingMappings => serde_json::json!({
+            "status":"unregistered_or_preexisting_mappings", "gpu_kernel_placement":"unknown",
+            "physical_completion":"unknown"
+        }),
     }
 }
 
@@ -926,6 +973,57 @@ fn write_exclusive_bounded(path: &Path, value: &impl Serialize, limit: usize) ->
     file.sync_all()?;
     Ok(bytes.len() as u64)
 }
+
+fn publish_system_placement_witness(
+    root: &Path,
+    name: &str,
+    observation: &serde_json::Value,
+) -> Result<Option<String>> {
+    if observation.get("status").and_then(|value| value.as_str()) != Some("verified") {
+        return Ok(None);
+    }
+    let witness = observation
+        .get("witness")
+        .ok_or("verified system V3 placement lacks its witness")?;
+    let bytes = serde_json::to_vec(witness)?;
+    write_exclusive_bounded(&root.join(name), witness, POLICY_LIMIT)?;
+    Ok(Some(hex(asset::sha256(&bytes))))
+}
+
+/// Save the actual first P/C observation immediately as explicitly partial
+/// evidence. Later case failure or worker cleanup failure must not erase it.
+/// This file neither certifies the capture as complete nor proves GPU/process
+/// completion; the joined final observation uses a separate schema and path.
+fn publish_initial_system_placement_partial(
+    root: &Path,
+    plan_sha256: &str,
+    inventory_sha256: &str,
+    manifest_sha256: &str,
+    observation: &serde_json::Value,
+) -> Result<u64> {
+    let witness_sha = observation
+        .get("witness")
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map(|bytes| hex(asset::sha256(&bytes)));
+    write_exclusive_bounded(
+        &root.join("initial-system-cuda-placement.partial.json"),
+        &serde_json::json!({
+            "schema":"rovezero.virtual-system-cuda-placement-partial.v1",
+            "status":"partial_observation",
+            "stage":"first_registered_role_coverage",
+            "plan_sha256":plan_sha256,
+            "inventory_sha256":inventory_sha256,
+            "manifest_sha256":manifest_sha256,
+            "observation":observation,
+            "embedded_witness_sha256":witness_sha,
+            "capture_completion":"not_established",
+            "physical_completion":"not_attested",
+            "process_exit":"not_observed"
+        }),
+        LIMIT,
+    )
+}
 fn write_pending(path: &Path, value: &impl Serialize, remaining: u64) -> Result<u64> {
     let bytes = serde_json::to_vec(value)?;
     if bytes.is_empty() || bytes.len() > LIMIT || bytes.len() as u64 > remaining {
@@ -1051,6 +1149,7 @@ fn execute(config: Config) -> Result<()> {
     let selected = config.execution_config()?;
     let is_cuda = matches!(selected.provider, Provider::Cuda { .. });
     let system_cuda = config.provider == "cuda-system";
+    let system_control = system_cuda && config.system_cuda_inventory.is_some();
     for path in [
         &config.case_plan,
         &config.export_manifest,
@@ -1062,6 +1161,7 @@ fn execute(config: Config) -> Result<()> {
     .chain(config.cuda_bundle.as_ref())
     .chain(config.cuda_inventory.as_ref())
     .chain(config.system_cuda_config.as_ref())
+    .chain(config.system_cuda_inventory.as_ref())
     {
         if !path.is_absolute() {
             return Err("all configured capture asset/output paths must be absolute".into());
@@ -1199,10 +1299,10 @@ fn execute(config: Config) -> Result<()> {
     }
     let order = capture_order(
         &plan.groups,
-        is_cuda && !system_cuda,
+        is_cuda && (!system_cuda || system_control),
         mode == VirtualReviewExecutionMode::Collection,
     )?;
-    let mut profiling_window = (is_cuda && !system_cuda).then(|| CudaProfilingWindow {
+    let mut profiling_window = (is_cuda && (!system_cuda || system_control)).then(|| CudaProfilingWindow {
         scope: "original planned cases only; profiles close at first registered role coverage, not full-run kernel coverage",
         actual_cases: order.slots[..order.profile_cases].iter().map(|slot| {
             let group = &plan.groups[slot.group];
@@ -1249,7 +1349,16 @@ fn execute(config: Config) -> Result<()> {
             return Err("CPU cannot carry CUDA assets".into());
         }
     }
-    let control: Option<PalsCudaControlPolicy> = None;
+    let control = match (
+        &config.system_cuda_inventory,
+        &config.system_cuda_inventory_sha256,
+    ) {
+        (Some(path), Some(digest)) => Some(PalsCudaControlPolicy::from_virtual_review_inventory(
+            path, digest,
+        )?),
+        (None, None) => None,
+        _ => return Err("system CUDA control inventory selection is incomplete".into()),
+    };
     let runtime = if system_cuda {
         #[cfg(target_os = "linux")]
         {
@@ -1391,10 +1500,18 @@ fn execute(config: Config) -> Result<()> {
     let policy_observation = loaded_policy_observation(
         &backend,
         config.cudnn_conv_search.as_deref(),
-        is_cuda && !system_cuda,
+        is_cuda && (!system_cuda || system_control),
     )?;
     let mut worker = backend.into_worker()?;
     let mut system_mapping = None;
+    #[cfg(target_os = "linux")]
+    let mut system_placement: Option<(serde_json::Value, serde_json::Value)> = None;
+    #[cfg(not(target_os = "linux"))]
+    let system_placement: Option<(serde_json::Value, serde_json::Value)> = None;
+    #[cfg(target_os = "linux")]
+    let mut initial_partial_failure: Option<String> = None;
+    #[cfg(not(target_os = "linux"))]
+    let initial_partial_failure: Option<String> = None;
     let work = (|| -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut outputs = (0..plan.groups.len()).map(|_| None).collect::<Vec<_>>();
         let mut bytes = 0u64;
@@ -1406,6 +1523,8 @@ fn execute(config: Config) -> Result<()> {
             .map(GroupCapture::from)
             .collect::<Vec<_>>();
         let mut first_placement = None;
+        #[cfg(target_os = "linux")]
+        let mut first_system_placement = None;
         for (index, slot) in order.slots.iter().enumerate() {
             let actual_nn_inputs = capture_case(
                 &mut worker,
@@ -1432,6 +1551,42 @@ fn execute(config: Config) -> Result<()> {
                         _ => return Err("actual initial V3 placement witness absent".into()),
                     },
                 );
+            }
+            #[cfg(target_os = "linux")]
+            if system_control && index + 1 == order.profile_cases {
+                let first_observation = match command(
+                    &mut worker,
+                    Command::ObserveSystemVirtualCudaPlacement,
+                    until,
+                )? {
+                    Outcome::SystemVirtualCudaPlacementObserved(observation) => {
+                        system_placement_observation_json(&observation)
+                    }
+                    _ => return Err("system V3 placement observation absent".into()),
+                };
+                let saved = output_owner.verify().and_then(|()| {
+                    publish_initial_system_placement_partial(
+                        root,
+                        &config.case_plan_sha256,
+                        config
+                            .system_cuda_inventory_sha256
+                            .as_deref()
+                            .ok_or("system CUDA inventory digest absent")?,
+                        &b.export_manifest_sha256,
+                        &first_observation,
+                    )
+                    .map(|_| ())
+                });
+                if let Err(error) = saved {
+                    let detail = error.to_string().chars().take(1024).collect::<String>();
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "RZ_NUMERIC_INITIAL_PLACEMENT_PARTIAL_FAILURE={}",
+                        serde_json::json!({"detail":detail,"capture_completion":"not_established", "physical_completion":"unknown"})
+                    );
+                    initial_partial_failure = Some(detail);
+                }
+                first_system_placement = Some(first_observation);
             }
             let group = &mut groups[slot.group];
             if group.remaining.iter().any(Option::is_some) {
@@ -1509,6 +1664,23 @@ fn execute(config: Config) -> Result<()> {
                 }
                 _ => return Err("system runtime mapping observation unavailable".into()),
             }
+            #[cfg(target_os = "linux")]
+            if system_control {
+                let final_observation = match command(
+                    &mut worker,
+                    Command::ObserveSystemVirtualCudaPlacement,
+                    until,
+                )? {
+                    Outcome::SystemVirtualCudaPlacementObserved(observation) => {
+                        system_placement_observation_json(&observation)
+                    }
+                    _ => return Err("final system V3 placement observation absent".into()),
+                };
+                system_placement = Some((
+                    first_system_placement.ok_or("first system V3 placement observation absent")?,
+                    final_observation,
+                ));
+            }
         } else {
             match command(&mut worker, Command::VerifyRuntime, until)? {
                 Outcome::RuntimeVerified => {}
@@ -1575,6 +1747,39 @@ fn execute(config: Config) -> Result<()> {
                 write_exclusive_bounded(
                     &root.join("system-runtime-mapping.json"),
                     observation,
+                    POLICY_LIMIT,
+                )?;
+            }
+            if let Some((first, final_observation)) = &system_placement {
+                // Preserve the actual typed witness in its own unchanged
+                // representation. Unknown mappings have no invented witness.
+                let first_witness_sha = publish_system_placement_witness(
+                    root,
+                    "initial-virtual-system-cuda-placement.json",
+                    first,
+                )?;
+                let witness_sha = publish_system_placement_witness(
+                    root,
+                    "actual-virtual-system-cuda-placement.json",
+                    final_observation,
+                )?;
+                write_exclusive_bounded(
+                    &root.join("system-cuda-placement-observation.json"),
+                    &serde_json::json!({
+                        "schema":"rovezero.virtual-system-cuda-placement-observation.v1",
+                        "plan_sha256":config.case_plan_sha256,
+                        "inventory_sha256":config.system_cuda_inventory_sha256,
+                        "manifest_sha256":b.export_manifest_sha256,
+                        "first_registered_role_coverage_status":first.get("status"),
+                        "initial_witness_sha256":first_witness_sha,
+                        "initial_partial_observation":if initial_partial_failure.is_some() {"write_failed"} else {"written"},
+                        "initial_partial_error":initial_partial_failure,
+                        "final_status":final_observation.get("status"),
+                        "witness_sha256":witness_sha,
+                        "profile_scope":"original planned cases through first registered role coverage",
+                        "physical_completion":"requires_same_native_owner_completion",
+                        "process_exit":"requires_external_supervisor"
+                    }),
                     POLICY_LIMIT,
                 )?;
             }
@@ -2175,6 +2380,8 @@ mod tests {
             cuda_inventory_sha256: Some("a".repeat(64)),
             system_cuda_config: None,
             system_cuda_config_sha256: None,
+            system_cuda_inventory: None,
+            system_cuda_inventory_sha256: None,
             gpu_device_id: 0,
             gpu_arena_bytes: 1024 * 1024,
             deadline_seconds: 1,
@@ -2192,8 +2399,71 @@ mod tests {
         config.cuda_inventory = None;
         config.cuda_inventory_sha256 = None;
         assert!(config.execution_config().is_ok());
+        config.system_cuda_inventory = Some(PathBuf::from("/tmp/inventory.json"));
+        assert!(config.execution_config().is_err());
+        config.system_cuda_inventory_sha256 = Some("a".repeat(64));
+        assert!(config.execution_config().is_ok());
+        config.system_cuda_inventory = Some(PathBuf::from("relative-inventory.json"));
+        assert!(config.execution_config().is_err());
+        config.system_cuda_inventory = Some(PathBuf::from("/tmp/inventory.json"));
+        config.system_cuda_inventory_sha256 = Some("not-a-pin".into());
+        assert!(config.execution_config().is_err());
+        config.system_cuda_inventory = None;
+        config.system_cuda_inventory_sha256 = None;
         config.cudnn_conv_search = Some("experimental_default".into());
         assert!(config.execution_config().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_placement_mapping_unknown_is_not_a_witness_or_completion() {
+        for (observation, expected) in [
+            (
+                SystemPlacementObservation::MappingUnavailable,
+                "mapping_unavailable",
+            ),
+            (
+                SystemPlacementObservation::UnregisteredOrPreexistingMappings,
+                "unregistered_or_preexisting_mappings",
+            ),
+        ] {
+            let value = system_placement_observation_json(&observation);
+            assert_eq!(value["status"], expected);
+            assert_eq!(value["gpu_kernel_placement"], "unknown");
+            assert_eq!(value["physical_completion"], "unknown");
+            assert!(value.get("witness").is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_system_placement_partial_survives_later_failure_without_completion_claim() {
+        let output = OwnedOutputRootTestDirectory::new();
+        let observation =
+            system_placement_observation_json(&SystemPlacementObservation::MappingUnavailable);
+        publish_initial_system_placement_partial(
+            &output.path,
+            "plan",
+            "inventory",
+            "manifest",
+            &observation,
+        )
+        .unwrap();
+
+        // A later case can fail before joined/final publication. The initial
+        // on-disk evidence must still be readable and remain explicitly partial.
+        let later: Result<()> = Err("later case failed".into());
+        assert!(later.is_err());
+        let path = output
+            .path
+            .join("initial-system-cuda-placement.partial.json");
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["status"], "partial_observation");
+        assert_eq!(value["observation"]["status"], "mapping_unavailable");
+        assert_eq!(value["capture_completion"], "not_established");
+        assert_eq!(value["physical_completion"], "not_attested");
+        assert_eq!(value["process_exit"], "not_observed");
+        assert!(value["embedded_witness_sha256"].is_null());
     }
 
     #[test]
