@@ -2540,7 +2540,7 @@ impl OwnPalsOnnxCollectionDriver {
                 model_weights_sha256: registry.checkpoint_sha256.clone(),
             },
             cpu_profile_sha256: cpu_source.cpu_profile_sha256.clone(),
-            implementation_sha256: actual_binary,
+            implementation_sha256: actual_binary.sha256.clone(),
             encoding_sha256: registry.encoding_sha256.clone(),
             encoder_source_sha256: registry.encoder_source_sha256.clone(),
             configuration,
