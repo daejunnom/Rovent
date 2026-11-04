@@ -75,6 +75,7 @@ pub(crate) struct OwnRootRecoveryV3 {
     )>,
     pub(super) next_actor: usize,
     pub(super) published: bool,
+    pub(super) route_unlinked: bool,
     pub(super) failure: Option<String>,
     pub(super) shutdown_failure: Option<AdaptiveCollectionError>,
     pub(super) shutdown_failure_count: u64,
@@ -120,6 +121,7 @@ impl OwnRootRecoveryV3 {
             diagnostics: Vec::new(),
             next_actor: 0,
             published: false,
+            route_unlinked: false,
             failure: None,
             shutdown_failure: None,
             shutdown_failure_count: 0,
@@ -356,6 +358,23 @@ impl OwnWorkerSupervisorV3 {
                 let mut root = original.lock().map_err(|_| "Own /3 recovery poisoned")?;
                 if root.failure.is_none() {
                     root.failure = Some(error.into());
+                }
+            }
+            let already_unlinked = original
+                .try_lock()
+                .map(|root| root.route_unlinked)
+                .unwrap_or(true);
+            if !already_unlinked {
+                match self.bridge.try_retire_route(&admission) {
+                    Ok(Some(true)) => {}
+                    Ok(Some(false) | None) => {}
+                    Err(error) => {
+                        if let Ok(mut root) = original.try_lock() {
+                            if root.failure.is_none() {
+                                root.failure = Some(error.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }

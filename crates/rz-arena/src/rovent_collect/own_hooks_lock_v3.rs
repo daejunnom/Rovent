@@ -78,7 +78,7 @@ impl RoventOwnTeacherRouteRetirementV3 {
     pub(crate) fn with_original_route(
         &self,
         requested: &SpeculativeRootV3,
-        _unlink: impl FnOnce(),
+        unlink: impl FnOnce(),
     ) -> Result<Option<bool>, ArenaError> {
         if !self.route.same_original_route(requested) {
             return Ok(Some(false));
@@ -110,7 +110,7 @@ impl RoventOwnTeacherRouteRetirementV3 {
         {
             return Ok(Some(false));
         }
-        let recovery = match self.recovery.try_lock() {
+        let mut recovery = match self.recovery.try_lock() {
             Ok(root) => root,
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Poisoned(_)) => return Err(invalid("Own /3 recovery poisoned")),
@@ -167,7 +167,8 @@ impl RoventOwnTeacherRouteRetirementV3 {
         let (admission, _, settlement, fence) = handoff.parts_mut();
         if !admission.same_original_admission(&slot.admission)
             || settlement.is_err()
-            || !fence.permits_semantic_closure()
+            || fence.authority != admission.root_admission().authority()
+            || !fence.permits_root_reuse()
             || !handoff
                 .teacher_aggregate_ack()
                 .is_some_and(|ack| ack.matches_admission(&slot.admission))
@@ -181,10 +182,15 @@ impl RoventOwnTeacherRouteRetirementV3 {
         };
         match pump.try_retirement_ready(&self.route)? {
             Some(true) => {
-                // A native callback can prepare and send outside the ticket
-                // accounting lock. Until its whole-return fence is proven or
-                // a same-route send gate is held, do not unlink the route.
-                Ok(Some(false))
+                // This Own bridge has the concrete RoventNativeBackend. Its
+                // observer send is synchronous within run_owned, while the
+                // same worker issues this original root-quiesce fence only
+                // after run_owned returns. Unknown/panic cannot issue it.
+                // Guards remain held through this exact route unlink.
+                unlink();
+                drop(_consumer);
+                recovery.route_unlinked = true;
+                Ok(Some(true))
             }
             other => Ok(other),
         }
