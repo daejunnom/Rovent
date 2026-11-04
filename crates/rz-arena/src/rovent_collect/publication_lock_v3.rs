@@ -114,23 +114,23 @@ pub(super) fn publish_lock_v3_payloads_speculative(
     )
 }
 
-/// The hook is only a live-output observation; it does not provide game,
-/// native, teacher, or accelerator authority.
-pub(super) fn publish_lock_v3_payloads_speculative_with_hook(
+/// Managed /3 callers provide their already-bound game authority, which is
+/// invoked only at the original final commit point.
+pub(super) fn publish_lock_v3_payloads_managed_with_authorize(
     directory: &cap_std::fs::Dir,
     until: std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
     manifest: &RoventCorpusManifestLockV3,
     index: &RoventCorpusIndexLockV3,
     admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
-    game_gate: &std::sync::atomic::AtomicU64,
+    authorize: impl FnOnce() -> Result<(), ArenaError>,
     hook: impl FnMut(
         publication::RoventPublicationHookEventV3,
         publication::RoventPublicationHookPhaseV3,
     ) -> Result<(), ArenaError>,
 ) -> Result<RoventLockV3Publication, ArenaError> {
-    publish_lock_v3_payloads_speculative_impl(
-        directory, until, cancel, manifest, index, admissions, game_gate, true, hook,
+    publish_lock_v3_payloads_authorized_with_hook(
+        directory, until, cancel, manifest, index, admissions, authorize, true, hook,
     )
 }
 

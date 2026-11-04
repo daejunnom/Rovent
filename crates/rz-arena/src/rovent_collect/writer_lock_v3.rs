@@ -474,26 +474,26 @@ impl FinishedRoventCorpusLockV3 {
     }
 
     /// The managed owner supplies the live checks and keeps its original
-    /// directory private; the caller must also supply the original game gate.
-    pub(crate) fn publish_atomic_speculative_with_hook(
+    /// directory private; the caller supplies the original game authority.
+    pub(super) fn publish_atomic_managed_with_authorize(
         &self,
         directory: &cap_std::fs::Dir,
         until: std::time::Instant,
         cancel: &std::sync::atomic::AtomicBool,
-        game_gate: &std::sync::atomic::AtomicU64,
+        authorize: impl FnOnce() -> Result<(), ArenaError>,
         hook: impl FnMut(
             publication::RoventPublicationHookEventV3,
             publication::RoventPublicationHookPhaseV3,
         ) -> Result<(), ArenaError>,
     ) -> Result<RoventLockV3Publication, ArenaError> {
-        publication_lock_v3::publish_lock_v3_payloads_speculative_with_hook(
+        publication_lock_v3::publish_lock_v3_payloads_managed_with_authorize(
             directory,
             until,
             cancel,
             &self.manifest,
             &self.index,
             &self.admissions,
-            game_gate,
+            authorize,
             hook,
         )
     }

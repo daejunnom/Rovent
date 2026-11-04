@@ -989,20 +989,31 @@ impl ManagedOutputOwnerV3 {
     }
 
     /// Publish the finished writer through this same live output owner. The
-    /// original game gate is supplied by the game owner, never reconstructed
+    /// original game guard is supplied by the game owner, never reconstructed
     /// here. Partial output and the caller's original finished writer remain
     /// retained on any failure; this proves neither lease nor GPU completion.
-    pub(crate) fn checked_publish_corpus(
-        &self,
+    pub(crate) fn checked_publish_corpus<S>(
+        self: &Arc<Self>,
         finished: &crate::rovent_collect::writer_lock_v3::FinishedRoventCorpusLockV3,
+        pipeline: &crate::rovent_collect::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3,
+        game_guard: &mut crate::rovent_collect::game_authority_v3::GamePublishGuardV3<S>,
         until: Instant,
         cancel: &std::sync::atomic::AtomicBool,
-        game_gate: &std::sync::atomic::AtomicU64,
     ) -> Result<
         rz_experiments::rovent_corpus_lock_v3::publication::RoventLockV3Publication,
         ManagedOutputWriteErrorV3,
     > {
         use crate::rovent_collect::publication::RoventPublicationHookPhaseV3;
+        match game_guard.try_matches_output_pipeline(self, pipeline) {
+            Ok(Some(true)) => {}
+            Ok(None) => return Err(ManagedOutputWriteErrorV3::Busy),
+            Ok(Some(false)) => {
+                return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                    "managed publication original game or pipeline differs".into(),
+                ));
+            }
+            Err(error) => return Err(ManagedOutputWriteErrorV3::BeforeWrite(error.into())),
+        }
         if !finished.matches_original_manifest(self.inputs.manifest()) {
             return Err(ManagedOutputWriteErrorV3::BeforeWrite(
                 "managed publication original writer differs".into(),
@@ -1049,11 +1060,16 @@ impl ManagedOutputOwnerV3 {
             })?
             .try_clone()
             .map_err(|error| ManagedOutputWriteErrorV3::BeforeWrite(error.to_string()))?;
-        let result = finished.publish_atomic_speculative_with_hook(
+        let result = finished.publish_atomic_managed_with_authorize(
             &directory,
             deadline,
             cancel,
-            game_gate,
+            || match game_guard.try_grant() {
+                crate::rovent_collect::game_authority_v3::GameStepV3::Ready => Ok(()),
+                step => Err(invalid(format!(
+                    "managed publication original game authority: {step:?}"
+                ))),
+            },
             |event, phase| {
                 state.observation.verify_live(deadline).map_err(io)?;
                 state.check_chunks_binding().map_err(io)?;
