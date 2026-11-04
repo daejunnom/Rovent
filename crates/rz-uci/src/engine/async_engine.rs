@@ -236,6 +236,25 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
             if owner.fence_failure.is_some() || !owner.pending_failures.is_empty() {
                 return EngineTimerJoinStatus::RetainedFailure;
             }
+            match owner.diagnostics.try_lock() {
+                Ok(receipts) if !receipts.is_empty() => {
+                    return EngineTimerJoinStatus::RetainedFailure;
+                }
+                Ok(_) => {}
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return EngineTimerJoinStatus::WaitingWorkers;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.cleanup_failure = Some(
+                        failure(
+                            contract::ErrorCode::BackendFailure,
+                            "worker diagnostics owner poisoned during cleanup",
+                        )
+                        .into(),
+                    );
+                    return EngineTimerJoinStatus::Failed;
+                }
+            }
         }
         self.timer_stop.store(true, Ordering::Release);
         if !self.timer.as_ref().is_some_and(JoinHandle::is_finished) {
