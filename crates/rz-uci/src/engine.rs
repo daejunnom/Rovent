@@ -1,6 +1,8 @@
 //! Concrete Rules → UCI → search → common evaluation assembly.
 //! Model loading and physical execution remain the injected factory's responsibility.
 
+#[cfg(feature = "pals-adaptive")]
+pub mod async_engine;
 pub mod diagnostics;
 #[cfg(feature = "pals-adaptive")]
 mod priority_cancel;
@@ -2904,75 +2906,116 @@ struct PreparedEngine {
     dispatch_close_observer: Option<priority_close::PriorityCloseObserver>,
 }
 
+struct PrepareEngineFailure {
+    error: EngineError,
+    process: EngineProcess,
+    events: Receiver<Event>,
+    sender: SyncSender<Event>,
+}
+
 fn prepare_engine(
     events: Receiver<Event>,
     sender: SyncSender<Event>,
     process: EngineProcess,
     settings: EngineSettings,
-) -> Result<PreparedEngine, EngineError> {
+) -> Result<PreparedEngine, PrepareEngineFailure> {
+    // No original process fields are moved until every fallible, pre-worker
+    // setup succeeds. On rejection the caller receives the same process and
+    // event endpoints; this does not attest native or output completion.
+    let setup = (|| -> Result<_, EngineError> {
+        if settings.max_workers == 0
+            || settings.shutdown_limit.is_zero()
+            || settings.search.max_simulations == 0
+            || (process.factory.is_some() && settings.search.max_simulations > 4096)
+            || process.factory.is_some() == process.driver.is_some()
+        {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "finite workers/drain/work and exactly one search startup required",
+            )
+            .into());
+        }
+        let scope = if let Some(factory) = &process.factory {
+            let profile = factory.profile();
+            crate::contracts::SessionScope::Evaluation(contract::AcceptanceScope {
+                game: contract::GameGeneration(1),
+                root: contract::RootGeneration(0),
+                model: profile.model.handle(),
+                encoding: profile.model.encoding().handle,
+                backend: profile.backend,
+            })
+        } else {
+            crate::contracts::SessionScope::Search(contract::pals::SearchAuthority {
+                epoch: process.clock.epoch(),
+                game: contract::GameGeneration(1),
+                root: contract::RootGeneration(0),
+                implementation: process
+                    .driver
+                    .as_ref()
+                    .expect("validated driver startup")
+                    .implementation(),
+            })
+        };
+        let session_owner = crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
+            scope,
+            process.clock.epoch(),
+            process.clock.b_clock(),
+            settings.search,
+            settings.max_workers,
+        )?;
+        let goal = process
+            .driver
+            .as_ref()
+            .and_then(|driver| driver.search_goal_capability());
+        let semantics = process.driver.as_ref().map_or(
+            crate::bridge::NodeBudgetSemantics::LegacySimulations,
+            |driver| driver.node_budget_semantics(),
+        );
+        let mut session = Session::new(
+            RulesUciPort::new(Arc::clone(&process.owners), settings.position),
+            process.identity.clone(),
+            vec![OptionSpec {
+                name: "Ponder".into(),
+                kind: OptionKind::Check { default: false },
+            }],
+            settings.parser,
+        )
+        .map_err(EngineError::Session)?;
+        session
+            .set_search_goal_capability(goal)
+            .map_err(EngineError::Session)?;
+        session
+            .set_node_budget_semantics(semantics)
+            .map_err(EngineError::Session)?;
+        Ok((scope, session_owner, session))
+    })();
+    let (scope, session_owner, session) = match setup {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(PrepareEngineFailure {
+                error,
+                process,
+                events,
+                sender,
+            });
+        }
+    };
     let EngineProcess {
         factory,
         driver,
-        owners,
+        owners: _,
         clock,
-        identity,
+        identity: _,
         go_admission_observer,
         #[cfg(feature = "pals-adaptive")]
         priority_cancel,
         #[cfg(feature = "pals-adaptive")]
         priority_close,
     } = process;
-    // Keep the unique mailbox owner until all existing shutdown work ends.
     #[cfg(feature = "pals-adaptive")]
     let _priority_owner = priority_cancel;
     #[cfg(feature = "pals-adaptive")]
     let _priority_close_owner = priority_close;
-    if settings.max_workers == 0
-        || settings.shutdown_limit.is_zero()
-        || settings.search.max_simulations == 0
-        || (factory.is_some() && settings.search.max_simulations > 4096)
-        || factory.is_some() == driver.is_some()
-    {
-        return Err(failure(
-            contract::ErrorCode::InvalidInput,
-            "finite workers/drain/work and exactly one search startup required",
-        )
-        .into());
-    }
-    let scope = if let Some(factory) = &factory {
-        let profile = factory.profile();
-        crate::contracts::SessionScope::Evaluation(contract::AcceptanceScope {
-            game: contract::GameGeneration(1),
-            root: contract::RootGeneration(0),
-            model: profile.model.handle(),
-            encoding: profile.model.encoding().handle,
-            backend: profile.backend,
-        })
-    } else {
-        crate::contracts::SessionScope::Search(contract::pals::SearchAuthority {
-            epoch: clock.epoch(),
-            game: contract::GameGeneration(1),
-            root: contract::RootGeneration(0),
-            implementation: driver
-                .as_ref()
-                .expect("validated driver startup")
-                .implementation(),
-        })
-    };
-    let session_owner = crate::contracts::ContractSessionOwner::new_scope_with_cancel_history(
-        scope,
-        clock.epoch(),
-        clock.b_clock(),
-        settings.search,
-        settings.max_workers,
-    )?;
-    let goal_capability = driver
-        .as_ref()
-        .and_then(|driver| driver.search_goal_capability());
-    let node_budget_semantics = driver.as_ref().map_or(
-        crate::bridge::NodeBudgetSemantics::LegacySimulations,
-        |driver| driver.node_budget_semantics(),
-    );
     let owner = Arc::new(Mutex::new(Owner {
         session_owner,
         active: None,
@@ -2996,22 +3039,6 @@ fn prepare_engine(
         go_admission_observer,
         go_sequence: 0,
     }));
-    let mut session = Session::new(
-        RulesUciPort::new(owners, settings.position),
-        identity,
-        vec![OptionSpec {
-            name: "Ponder".into(),
-            kind: OptionKind::Check { default: false },
-        }],
-        settings.parser,
-    )
-    .map_err(EngineError::Session)?;
-    session
-        .set_search_goal_capability(goal_capability)
-        .map_err(EngineError::Session)?;
-    session
-        .set_node_budget_semantics(node_budget_semantics)
-        .map_err(EngineError::Session)?;
     let timer_owner = Arc::clone(&owner);
     let timer_events = sender.clone();
     let timer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3111,7 +3138,7 @@ pub fn serve<O: Write, D: Write>(
             priority_close_owner: _priority_close_owner,
         #[cfg(feature = "pals-adaptive")]
         dispatch_close_observer,
-    } = prepare_engine(events, sender, process, settings)?;
+    } = prepare_engine(events, sender, process, settings).map_err(|failure| failure.error)?;
     let handler_owner = Arc::clone(&owner);
     let dispatch_owner = Arc::clone(&owner);
     let result = serve_events_with_handler(
