@@ -1002,11 +1002,14 @@ impl RoventNativeCaptureRegistration {
                 );
             }
         };
-        if let Err(error) = check(
-            registered.len() < 16 && !registered.contains_key(&ticket.id),
-            "capture input registration duplicate/cap",
-        ) {
-            return LockV3RegistrationAttempt::Failed(error, reservation);
+        if registered.contains_key(&ticket.id) {
+            return LockV3RegistrationAttempt::Failed(
+                invalid("lock-v3 capture input registration duplicate"),
+                reservation,
+            );
+        }
+        if registered.len() >= 16 {
+            return LockV3RegistrationAttempt::Busy(reservation);
         }
         registered.insert(
             ticket.id,
