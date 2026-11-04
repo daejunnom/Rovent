@@ -212,6 +212,10 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
             include_bytes!("smoke_cancel_sender.rs"),
         ),
         (
+            "arena_smoke_reobserve",
+            include_bytes!("smoke_reobserve_sender.rs"),
+        ),
+        (
             "arena_direct_smoke_launch",
             include_bytes!("direct_smoke_launch.rs"),
         ),
