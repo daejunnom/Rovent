@@ -1,5 +1,11 @@
 //! 독립 Collection CPU_T의 원 pinned launch 소유자 초안이다.
 //! P-C 검색에 R을 추가하거나 기존 profiled R guard를 낮추지 않는다.
+// Rejected launches and pending retirements return the original actor/worker
+// and its recovery reservation intact. In particular, retirement can be
+// polled repeatedly: boxing each rejection would add an allocation at every
+// pending poll and alter the custody path. Keep these owner-bearing values
+// inline until their lifetime is redesigned and independently validated.
+#![allow(clippy::result_large_err, clippy::large_enum_variant)]
 use super::*;
 use crate::rovent_root_admission::RoventRootAdmission;
 use rz_runtime::contracts::ContractClock;

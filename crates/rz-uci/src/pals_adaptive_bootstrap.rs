@@ -116,7 +116,9 @@ struct DeploymentDiagnosticHooksV5 {
 pub struct AdaptiveBootstrapError {
     pub stage: &'static str,
     pub detail: String,
-    pub cleanup_failures: Option<NativeCleanupFailures>,
+    // Cleanup reports contain diagnostic vectors, not a live worker owner.
+    // Allocate their container only when a failure actually produced them.
+    pub cleanup_failures: Option<Box<NativeCleanupFailures>>,
 }
 /// Distinct errors observed while draining the original rejected native owner.
 #[derive(Debug, Default)]
@@ -1227,7 +1229,7 @@ fn prepare_actual(
             || cleanup.missing_required_snapshots != 0
             || cleanup.missing_original_reports != 0
         {
-            error.cleanup_failures = Some(cleanup);
+            error.cleanup_failures = Some(Box::new(cleanup));
         }
         error
     })?;

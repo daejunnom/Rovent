@@ -1042,8 +1042,12 @@ where
                 let parts = match parts {
                     Ok(parts) => parts,
                     Err(rejected) => {
+                        // Keep the original failure separate from the fact
+                        // that the retained manager's physical state is not
+                        // yet settled. The formatter bounds its output.
+                        let failure = retained_cause("AdaptivePersistentTransfer", &rejected.error);
                         *state = SessionState::Manager(rejected.manager);
-                        return Err(SearchSessionFailure::physical_completion_unknown());
+                        return Err(failure);
                     }
                 };
                 let (native, cpu, external, driver, continuation, receipt) =
@@ -4352,7 +4356,6 @@ impl SearchSessionFailure {
 // unbounded format! allocation. The original truncation suffix is retained;
 // the JSON observation applies its own 512-byte field limit separately.
 // A cause projection never certifies completion.
-#[cfg(any(test, all(feature = "pals-adaptive", feature = "onnx-cpu")))]
 fn retained_cause(code: &'static str, cause: &dyn std::fmt::Debug) -> SearchSessionFailure {
     SearchSessionFailure::debug(code, cause).unknown_if_unclosed()
 }

@@ -5,6 +5,11 @@
 //! create the session's preparation actor and materialize its real researcher.
 //! Unknown transfers retain all original owners rather than replacing them.
 
+// Root and admission errors return the original owned session, state, or
+// acknowledgement for recovery. Reboxing these paths would change their
+// ownership and allocation behavior, including repeated pending polls.
+#![allow(clippy::result_large_err, clippy::large_enum_variant)]
+
 #[cfg(feature = "pals-adaptive-diagnostics")]
 pub(crate) mod diagnostics;
 pub mod handoff_escrow_v2;
