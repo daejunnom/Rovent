@@ -1,4 +1,5 @@
 import errno
+import gc
 import hashlib
 import json
 import os
@@ -87,8 +88,14 @@ class ParentTransportTests(unittest.TestCase):
             handshake.advance(selectors.EVENT_WRITE)
 
     def release_quarantined(self, expected):
-        custody = transport._DROPPED_UNCERTAIN_ADMISSIONS.pop()
-        self.assertIs(custody._socket, expected)
+        # Retained original exceptions may hold traceback cycles. Collection
+        # here is test-only; production does not request a Full GC.
+        gc.collect()
+        admissions = transport._DROPPED_UNCERTAIN_ADMISSIONS
+        index = next((i for i, value in enumerate(admissions)
+                      if value._socket is expected), None)
+        self.assertIsNotNone(index, "this exact admission was not retained")
+        custody = admissions.pop(index)
         expected.close()
         custody._socket = None
         return custody
@@ -189,7 +196,8 @@ class ParentTransportTests(unittest.TestCase):
         self.assertIsInstance(handshake.original_error, InterruptedError)
         self.assertFalse(fake.closed)
         del handshake
-        self.release_quarantined(fake)
+        custody = self.release_quarantined(fake)
+        self.assertIsInstance(custody.original_error, InterruptedError)
 
     def test_deadline_before_or_after_send_preserves_the_correct_scope(self):
         before = FakeSocket(self.pid)
