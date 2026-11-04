@@ -53,6 +53,9 @@ mod partial_collection_v1;
 pub mod partial_followup_v1;
 pub mod partial_game_followup_v2;
 pub mod partial_game_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+#[allow(dead_code)]
+mod pc_cli_managed_v3;
 mod pc_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_lock_v3;
@@ -93,6 +96,8 @@ pub use pc_lock_v2::{
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(unused_imports)]
 pub(crate) use pc_lock_v3::ManagedOutputOwnerV3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub(crate) use pc_lock_v3::ManagedOutputWriteErrorV3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 pub(crate) use pc_lock_v3::PcCollectionOwnersV3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
