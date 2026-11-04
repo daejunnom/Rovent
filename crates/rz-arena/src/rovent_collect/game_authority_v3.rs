@@ -17,7 +17,8 @@ const PUBLICATION_GRANTED: u64 = 2;
 const NO_DATA_FINISHED: u64 = 4;
 const ADMISSION_SEALED: u64 = 8;
 const PUBLICATION_NOT_STARTED: u64 = 16;
-const DISPATCH_CLAIM: u64 = 32;
+const GAME_CLOSED: u64 = 32;
+const DISPATCH_CLAIM: u64 = 64;
 const CONTROL_FLAGS: u64 = DISPATCH_CLAIM - 1;
 const EFFECT_CLAIM: u64 = 1u64 << 32;
 const DISPATCH_MASK: u64 = (EFFECT_CLAIM - 1) & !CONTROL_FLAGS;
@@ -125,6 +126,7 @@ pub(super) enum GameStepV3 {
     Busy,
     Closed,
     Aborted,
+    Failed,
     Unknown,
     Capacity,
     Foreign,
@@ -687,6 +689,16 @@ impl<S> GameAuthorityV3<S> {
         }
         match state.phase {
             PhaseV3::AdmissionSealed => {
+                match self.control.compare_exchange(
+                    ADMISSION_SEALED,
+                    ADMISSION_SEALED | GAME_CLOSED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {}
+                    Err(actual) if actual & ABORT_REQUESTED != 0 => return GameStepV3::Aborted,
+                    Err(_) => return GameStepV3::Unknown,
+                }
                 state.phase = PhaseV3::Closed;
                 GameStepV3::Ready
             }
@@ -739,6 +751,150 @@ impl GameAuthorityV3<super::pc_worker_v3::PcWorkerSupervisorV3> {
             return GameStepV3::Foreign;
         }
         self.try_seal_validated_admission()
+    }
+
+    /// Close only the same P-C game's admission and semantic root set. The
+    /// original proof revalidates its fence, joined/retired root owners and
+    /// observer drains without blocking while this game lock is held. This
+    /// is not durable output, GPU completion or capture-sender execution
+    /// evidence; those remain independently held by their original owners.
+    pub(super) fn try_close_pc(
+        self: &Arc<Self>,
+        proof: &super::pc_hooks_lock_v3::PcGameClosureProofV3,
+        error_destination: &mut Option<super::ArenaError>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if !proof.matches_game(self) {
+            return GameStepV3::Foreign;
+        }
+        if self.abort_requested() {
+            return GameStepV3::Aborted;
+        }
+        let mut state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if self.abort_requested() {
+            return GameStepV3::Aborted;
+        }
+        if state.phase != PhaseV3::AdmissionSealed && state.phase != PhaseV3::Closed {
+            return GameStepV3::Closed;
+        }
+        if !state.pending.is_empty()
+            || !state.dispatching.is_empty()
+            || state.effects.iter().any(|effect| effect.active)
+            || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
+        {
+            return GameStepV3::Busy;
+        }
+        let Some(supervisor) = state.supervisor.as_ref().and_then(Weak::upgrade) else {
+            return GameStepV3::Foreign;
+        };
+        let Some(pipeline) = state.pipeline.as_ref() else {
+            return GameStepV3::Foreign;
+        };
+        if !proof.matches_supervisor(&supervisor)
+            || !proof.matches_pipeline(pipeline)
+            || state.output.as_ref().and_then(Weak::upgrade).is_none()
+            || !proof.matches_roots(&state.admitted)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_observers() {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        if state.phase == PhaseV3::Closed {
+            return GameStepV3::Existing;
+        }
+        match self.control.compare_exchange(
+            ADMISSION_SEALED,
+            ADMISSION_SEALED | GAME_CLOSED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {}
+            Err(actual) if actual & ABORT_REQUESTED != 0 => return GameStepV3::Aborted,
+            Err(_) => return GameStepV3::Unknown,
+        }
+        state.phase = PhaseV3::Closed;
+        GameStepV3::Ready
+    }
+
+    /// Install one guard directly into caller-retained custody. The same P-C
+    /// proof is rechecked; this does not create a generic closure proof or
+    /// attest output durability, physical device release or capture drain.
+    pub(super) fn try_begin_publication_pc(
+        self: &Arc<Self>,
+        proof: &super::pc_hooks_lock_v3::PcGameClosureProofV3,
+        destination: &mut Option<GamePublishGuardV3<super::pc_worker_v3::PcWorkerSupervisorV3>>,
+        error_destination: &mut Option<super::ArenaError>,
+    ) -> GameStepV3 {
+        if error_destination.is_some() {
+            return GameStepV3::Failed;
+        }
+        if destination.is_some() {
+            return GameStepV3::Busy;
+        }
+        if !proof.matches_game(self) {
+            return GameStepV3::Foreign;
+        }
+        if self.abort_requested() {
+            return GameStepV3::Aborted;
+        }
+        let mut state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if state.phase != PhaseV3::Closed {
+            return GameStepV3::Closed;
+        }
+        if !state.pending.is_empty()
+            || !state.dispatching.is_empty()
+            || state.effects.iter().any(|effect| effect.active)
+            || self.control.load(Ordering::SeqCst) & !CONTROL_FLAGS != 0
+        {
+            return GameStepV3::Busy;
+        }
+        let Some(supervisor) = state.supervisor.as_ref().and_then(Weak::upgrade) else {
+            return GameStepV3::Foreign;
+        };
+        let Some(pipeline) = state.pipeline.as_ref() else {
+            return GameStepV3::Foreign;
+        };
+        if !proof.matches_supervisor(&supervisor)
+            || !proof.matches_pipeline(pipeline)
+            || state.output.as_ref().and_then(Weak::upgrade).is_none()
+            || !proof.matches_roots(&state.admitted)
+        {
+            return GameStepV3::Foreign;
+        }
+        match proof.try_revalidate_observers() {
+            Ok(Some(true)) => {}
+            Ok(None) => return GameStepV3::Busy,
+            Ok(Some(false)) => return GameStepV3::Foreign,
+            Err(error) => {
+                *error_destination = Some(error);
+                return GameStepV3::Failed;
+            }
+        }
+        if self.abort_requested() {
+            return GameStepV3::Aborted;
+        }
+        let owner = Arc::clone(self);
+        state.phase = PhaseV3::Preparing;
+        *destination = Some(GamePublishGuardV3 {
+            owner,
+            resolved: false,
+        });
+        GameStepV3::Ready
     }
 }
 
@@ -1285,8 +1441,8 @@ impl<S> GamePublishGuardV3<S> {
             return GameStepV3::Unknown;
         }
         match self.owner.control.compare_exchange(
-            ADMISSION_SEALED,
-            ADMISSION_SEALED | PUBLICATION_NOT_STARTED,
+            ADMISSION_SEALED | GAME_CLOSED,
+            ADMISSION_SEALED | GAME_CLOSED | PUBLICATION_NOT_STARTED,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
@@ -1316,8 +1472,8 @@ impl<S> GamePublishGuardV3<S> {
             return GameStepV3::Unknown;
         }
         match self.owner.control.compare_exchange(
-            ADMISSION_SEALED,
-            ADMISSION_SEALED | NO_DATA_FINISHED,
+            ADMISSION_SEALED | GAME_CLOSED,
+            ADMISSION_SEALED | GAME_CLOSED | NO_DATA_FINISHED,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
@@ -1346,8 +1502,8 @@ impl<S> GamePublishGuardV3<S> {
             return GameStepV3::Unknown;
         }
         match self.owner.control.compare_exchange(
-            ADMISSION_SEALED,
-            ADMISSION_SEALED | PUBLICATION_GRANTED,
+            ADMISSION_SEALED | GAME_CLOSED,
+            ADMISSION_SEALED | GAME_CLOSED | PUBLICATION_GRANTED,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
