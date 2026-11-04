@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 /// Bounded JSONL assembly with the original /3 root owners held until finish.
 pub struct RoventCorpusWriterLockV3 {
+    identity: WriterIdentityV3,
     manifest: RoventCorpusManifestLockV3,
     original_manifest: Option<Arc<RoventCorpusManifestLockV3>>,
     lock: rz_experiments::RoventInputLockV3,
@@ -29,6 +30,15 @@ pub struct RoventCorpusWriterLockV3 {
     // A caught panic during gated append may have changed part of the writer.
     // Keep the original payload and prohibit flush, retry, or finish.
     uncertain_append: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// Identity of one original writer; it grants no publication authority.
+#[derive(Clone)]
+pub(crate) struct WriterIdentityV3(Arc<()>);
+impl WriterIdentityV3 {
+    pub(super) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// The caller always retains the original pending row. Busy is retryable;
@@ -120,6 +130,7 @@ impl RoventCorpusWriterLockV3 {
         )?;
         let manifest_sha256 = manifest.sha256(&lock)?;
         Ok(Self {
+            identity: WriterIdentityV3(Arc::new(())),
             manifest: manifest.clone(),
             original_manifest: None,
             index: RoventCorpusIndexLockV3 {
@@ -160,6 +171,10 @@ impl RoventCorpusWriterLockV3 {
         self.original_manifest
             .as_ref()
             .is_some_and(|original| Arc::ptr_eq(original, manifest))
+    }
+
+    pub(super) fn original_identity(&self) -> WriterIdentityV3 {
+        self.identity.clone()
     }
 
     pub(super) fn matches_synced_chunks(&self, receipts: &[RoventCorpusChunk]) -> bool {
@@ -364,7 +379,9 @@ impl RoventCorpusWriterLockV3 {
             return Err(Box::new((error, self)));
         }
         Ok(FinishedRoventCorpusLockV3 {
+            identity: self.identity,
             manifest: self.manifest,
+            original_manifest: self.original_manifest,
             index: self.index,
             admissions: self.admissions,
         })
@@ -397,7 +414,9 @@ impl RoventCorpusWriterLockV3 {
         current.validate_finish()?;
         let current = owner.take().expect("validated original writer slot");
         *finished = Some(FinishedRoventCorpusLockV3 {
+            identity: current.identity,
             manifest: current.manifest,
+            original_manifest: current.original_manifest,
             index: current.index,
             admissions: current.admissions,
         });
@@ -407,12 +426,26 @@ impl RoventCorpusWriterLockV3 {
 
 /// An assembled corpus only; it cannot recreate live admission or completion.
 pub struct FinishedRoventCorpusLockV3 {
+    identity: WriterIdentityV3,
     manifest: RoventCorpusManifestLockV3,
+    original_manifest: Option<Arc<RoventCorpusManifestLockV3>>,
     index: RoventCorpusIndexLockV3,
     admissions: BTreeMap<String, Arc<LockV3PublicationSource>>,
 }
 
 impl FinishedRoventCorpusLockV3 {
+    pub(super) fn matches_original_writer(&self, writer: &WriterIdentityV3) -> bool {
+        self.identity.same_original(writer)
+    }
+    pub(super) fn matches_original_manifest(
+        &self,
+        manifest: &Arc<RoventCorpusManifestLockV3>,
+    ) -> bool {
+        self.original_manifest
+            .as_ref()
+            .is_some_and(|original| Arc::ptr_eq(original, manifest))
+    }
+
     pub fn manifest(&self) -> &RoventCorpusManifestLockV3 {
         &self.manifest
     }
@@ -437,6 +470,31 @@ impl FinishedRoventCorpusLockV3 {
             &self.index,
             &self.admissions,
             game_gate,
+        )
+    }
+
+    /// The managed owner supplies the live checks and keeps its original
+    /// directory private; the caller must also supply the original game gate.
+    pub(crate) fn publish_atomic_speculative_with_hook(
+        &self,
+        directory: &cap_std::fs::Dir,
+        until: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+        game_gate: &std::sync::atomic::AtomicU64,
+        hook: impl FnMut(
+            publication::RoventPublicationHookEventV3,
+            publication::RoventPublicationHookPhaseV3,
+        ) -> Result<(), ArenaError>,
+    ) -> Result<RoventLockV3Publication, ArenaError> {
+        publication_lock_v3::publish_lock_v3_payloads_speculative_with_hook(
+            directory,
+            until,
+            cancel,
+            &self.manifest,
+            &self.index,
+            &self.admissions,
+            game_gate,
+            hook,
         )
     }
 

@@ -101,6 +101,33 @@ pub(super) fn publish_lock_v3_payloads_speculative(
     admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
     game_gate: &std::sync::atomic::AtomicU64,
 ) -> Result<RoventLockV3Publication, ArenaError> {
+    publish_lock_v3_payloads_speculative_with_hook(
+        directory,
+        until,
+        cancel,
+        manifest,
+        index,
+        admissions,
+        game_gate,
+        |_, _| Ok(()),
+    )
+}
+
+/// The hook is only a live-output observation; it does not provide game,
+/// native, teacher, or accelerator authority.
+pub(super) fn publish_lock_v3_payloads_speculative_with_hook(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    manifest: &RoventCorpusManifestLockV3,
+    index: &RoventCorpusIndexLockV3,
+    admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
+    game_gate: &std::sync::atomic::AtomicU64,
+    hook: impl FnMut(
+        publication::RoventPublicationHookEventV3,
+        publication::RoventPublicationHookPhaseV3,
+    ) -> Result<(), ArenaError>,
+) -> Result<RoventLockV3Publication, ArenaError> {
     use super::collection_hooks_core_v2::{
         GAME_HAS_ABORT, GAME_IDLE, GAME_PHASE_MASK, GAME_PUBLICATION_GRANTED,
     };
@@ -111,7 +138,7 @@ pub(super) fn publish_lock_v3_payloads_speculative(
             && expected & GAME_PHASE_MASK == GAME_IDLE,
         "speculative /3 publication game is aborted, busy, or already authorized",
     )?;
-    publish_lock_v3_payloads_authorized(
+    publish_lock_v3_payloads_authorized_with_hook(
         directory,
         until,
         cancel,
@@ -129,6 +156,7 @@ pub(super) fn publish_lock_v3_payloads_speculative(
                 .map_err(|_| invalid("speculative /3 publication game changed or was aborted"))?;
             Ok(())
         },
+        hook,
     )
 }
 
@@ -140,6 +168,31 @@ fn publish_lock_v3_payloads_authorized(
     index: &RoventCorpusIndexLockV3,
     admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
     authorize: impl FnOnce() -> Result<(), ArenaError>,
+) -> Result<RoventLockV3Publication, ArenaError> {
+    publish_lock_v3_payloads_authorized_with_hook(
+        directory,
+        until,
+        cancel,
+        manifest,
+        index,
+        admissions,
+        authorize,
+        |_, _| Ok(()),
+    )
+}
+
+fn publish_lock_v3_payloads_authorized_with_hook(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    manifest: &RoventCorpusManifestLockV3,
+    index: &RoventCorpusIndexLockV3,
+    admissions: &BTreeMap<String, Arc<LockV3PublicationSource>>,
+    authorize: impl FnOnce() -> Result<(), ArenaError>,
+    hook: impl FnMut(
+        publication::RoventPublicationHookEventV3,
+        publication::RoventPublicationHookPhaseV3,
+    ) -> Result<(), ArenaError>,
 ) -> Result<RoventLockV3Publication, ArenaError> {
     check(
         !admissions.is_empty(),
@@ -156,7 +209,7 @@ fn publish_lock_v3_payloads_authorized(
     let manifest_bytes =
         serde_json::to_vec(manifest).map_err(|error| invalid(error.to_string()))?;
     let index_bytes = serde_json::to_vec(index).map_err(|error| invalid(error.to_string()))?;
-    publication::publish_original_payloads_authorized(
+    publication::publish_original_payloads_authorized_with_hook(
         directory,
         until,
         cancel,
@@ -204,5 +257,6 @@ fn publish_lock_v3_payloads_authorized(
             Ok(result)
         },
         authorize,
+        hook,
     )
 }

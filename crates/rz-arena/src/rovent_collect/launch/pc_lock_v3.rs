@@ -619,6 +619,8 @@ struct ManagedOutputStateV3 {
     chunks: Option<Dir>,
     uncertain: bool,
     completed_writes: u64,
+    publication_attempted: bool,
+    original_writer: Option<crate::rovent_collect::writer_lock_v3::WriterIdentityV3>,
     closed: Option<ManagedOutputCloseStatusV3>,
 }
 
@@ -749,6 +751,8 @@ impl ManagedOutputOwnerV3 {
                 chunks: None,
                 uncertain: false,
                 completed_writes: 0,
+                publication_attempted: false,
+                original_writer: None,
                 closed: None,
             }),
             deadline,
@@ -781,6 +785,36 @@ impl ManagedOutputOwnerV3 {
 
     pub(crate) fn matches_inputs(&self, inputs: &Arc<PreparedPcCollectionInputsV3>) -> bool {
         Arc::ptr_eq(&self.inputs, inputs)
+    }
+
+    /// Register only the pipeline's retained original writer before output
+    /// starts. Busy is retryable and does not modify either owner.
+    pub(crate) fn try_register_original_writer(
+        &self,
+        writer: &crate::rovent_collect::writer_lock_v3::WriterIdentityV3,
+    ) -> Result<bool, &'static str> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("managed output state poisoned");
+            }
+        };
+        if state.closed.is_some() || state.uncertain {
+            return Err("managed output writer registration unavailable");
+        }
+        if let Some(original) = &state.original_writer {
+            return if original.same_original(writer) {
+                Ok(true)
+            } else {
+                Err("managed output writer differs")
+            };
+        }
+        if state.publication_attempted || state.completed_writes != 0 {
+            return Err("managed output writer registration is too late");
+        }
+        state.original_writer = Some(writer.clone());
+        Ok(true)
     }
 
     /// Close admission to further writes only after the caller has stopped its
@@ -932,6 +966,94 @@ impl ManagedOutputOwnerV3 {
                 Ok(())
             }
             Err(error) if attempted => {
+                Err(ManagedOutputWriteErrorV3::AfterAttempt(error.to_string()))
+            }
+            Err(error) => Err(ManagedOutputWriteErrorV3::BeforeWrite(error.to_string())),
+        }
+    }
+
+    /// Publish the finished writer through this same live output owner. The
+    /// original game gate is supplied by the game owner, never reconstructed
+    /// here. Partial output and the caller's original finished writer remain
+    /// retained on any failure; this proves neither lease nor GPU completion.
+    pub(crate) fn checked_publish_corpus(
+        &self,
+        finished: &crate::rovent_collect::writer_lock_v3::FinishedRoventCorpusLockV3,
+        until: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+        game_gate: &std::sync::atomic::AtomicU64,
+    ) -> Result<
+        rz_experiments::rovent_corpus_lock_v3::publication::RoventLockV3Publication,
+        ManagedOutputWriteErrorV3,
+    > {
+        use crate::rovent_collect::publication::RoventPublicationHookPhaseV3;
+        if !finished.matches_original_manifest(self.inputs.manifest()) {
+            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                "managed publication original writer differs".into(),
+            ));
+        }
+        let deadline = until.min(self.deadline);
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ManagedOutputWriteErrorV3::Busy);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(ManagedOutputWriteErrorV3::AfterAttempt(
+                    "managed output state poisoned".into(),
+                ));
+            }
+        };
+        if state.uncertain || state.publication_attempted {
+            return Err(ManagedOutputWriteErrorV3::AfterAttempt(
+                "managed publication already attempted or uncertain".into(),
+            ));
+        }
+        if !state
+            .original_writer
+            .as_ref()
+            .is_some_and(|writer| finished.matches_original_writer(writer))
+        {
+            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                "managed publication original writer owner differs".into(),
+            ));
+        }
+        if !state.authorized || state.closed.is_some() {
+            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                "managed publication not authorized or closed".into(),
+            ));
+        }
+        let directory = state
+            .directory
+            .as_ref()
+            .ok_or_else(|| {
+                ManagedOutputWriteErrorV3::BeforeWrite(
+                    "managed publication original output directory missing".into(),
+                )
+            })?
+            .try_clone()
+            .map_err(|error| ManagedOutputWriteErrorV3::BeforeWrite(error.to_string()))?;
+        let result = finished.publish_atomic_speculative_with_hook(
+            &directory,
+            deadline,
+            cancel,
+            game_gate,
+            |event, phase| {
+                state.observation.verify_live(deadline).map_err(io)?;
+                state.check_chunks_binding().map_err(io)?;
+                if phase == RoventPublicationHookPhaseV3::Before && event.is_mutation() {
+                    state.publication_attempted = true;
+                    state.uncertain = true;
+                }
+                Ok(())
+            },
+        );
+        match result {
+            Ok(receipt) => {
+                state.uncertain = false;
+                Ok(receipt)
+            }
+            Err(error) if state.publication_attempted => {
                 Err(ManagedOutputWriteErrorV3::AfterAttempt(error.to_string()))
             }
             Err(error) => Err(ManagedOutputWriteErrorV3::BeforeWrite(error.to_string())),
