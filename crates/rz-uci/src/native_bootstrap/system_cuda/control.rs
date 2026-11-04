@@ -954,6 +954,130 @@ mod tests {
     }
 
     #[test]
+    fn renewal_keeps_same_owner_sequences_and_rejects_lost_parent() {
+        use rz_experiments::{SystemLibrarySpecV6, SystemPlatformV6, SystemRuntimeSpecV6};
+        use sha2::{Digest as _, Sha256};
+        use std::{io::BufRead, thread};
+
+        // A same-process socket peer exercises the real parent handshake and
+        // liveness paths without a model, a CUDA provider or an external child.
+        let libraries: Vec<_> = ["ort-core", "ort-provider-cuda"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| SystemLibrarySpecV6 {
+                role: role.into(),
+                requested_path: format!("/fixture/{role}.so"),
+                canonical_path: format!("/fixture/{role}.so"),
+                version: None,
+                sha256: format!("{:x}", Sha256::digest(role.as_bytes())),
+                bytes: 1,
+                device: 1,
+                inode: (index + 1) as u64,
+                required_mapping: true,
+            })
+            .collect();
+        let lock =
+            SystemRuntimeLockV6::new(NativeRuntimeSourceV6::SystemCuda(SystemRuntimeSpecV6 {
+                platform: SystemPlatformV6::Linux,
+                libraries,
+                system_identity_sha256: format!("{:x}", Sha256::digest(b"fixture runtime")),
+                cuda_device_id: 0,
+                cuda_arena_bytes: 1024,
+                startup_ms: 1000,
+                drain_ms: 200,
+                capture_max_libraries: 2,
+                capture_max_file_bytes: 2,
+                capture_max_total_bytes: 2,
+                capture_timeout_ms: 100,
+            }))
+            .unwrap();
+        let epoch = 7;
+        let pid = std::process::id();
+        let (child, mut peer) = UnixStream::pair().unwrap();
+        let request = serde_json::json!({
+            "schema": "rz-rovent-parent-admission/1", "child_pid": pid,
+            "process_epoch": epoch, "lock_sha256": lock.canonical_sha256.clone(),
+            "cuda_ordinal": 0,
+        });
+        let peer_worker = thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            peer.write_all(format!("{request}\n").as_bytes()).unwrap();
+            let mut reader = std::io::BufReader::new(peer);
+            let mut ack = String::new();
+            reader.read_line(&mut ack).unwrap();
+            assert!(!ack.is_empty());
+            reader.into_inner()
+        });
+        let parent = ConnectedParent::authenticate(
+            child,
+            pid,
+            i32::try_from(pid).unwrap(),
+            epoch,
+            &lock.canonical_sha256,
+            0,
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        let peer = peer_worker.join().unwrap();
+        let custody = Lc0SystemStartupCustody {
+            asset: None,
+            system: None,
+            runtime: None,
+            startup: None,
+            model: None,
+            ready: None,
+            worker: None,
+            reservation: None,
+            recovery_key: None,
+            session_release: None,
+            parent: Some(Arc::new(parent)),
+            process_epoch: epoch,
+            execution_experiments: ExecutionExperiments::default(),
+            raw_cache: false,
+            phase: Lc0SystemStartupPhase::BeforeOrtCall,
+            ort_entry_observed: false,
+            attempted: false,
+        };
+        let old_deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let mut supervisor =
+            Lc0ControlSupervisor::new(Lc0SystemSessionOwner::new(custody), old_deadline);
+        supervisor.last_control = Some((
+            4,
+            ControlOperation::Status,
+            serde_json::json!({"fixture": 1}),
+        ));
+        supervisor.last_observation_v2 = Some((6, serde_json::json!({"fixture": 2})));
+        supervisor.setup_failure = Some(NativeBootstrapError::Config("retained fixture error"));
+        let renewed = supervisor
+            .renew_control_window(&lock, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(supervisor.last_control.as_ref().unwrap().0, 4);
+        assert_eq!(supervisor.last_observation_v2.as_ref().unwrap().0, 6);
+        assert!(matches!(
+            supervisor.setup_failure.as_ref(),
+            Some(NativeBootstrapError::Config(_))
+        ));
+
+        let mut bad_lock = lock.clone();
+        bad_lock.canonical_sha256 = format!("{:x}", Sha256::digest(b"different lock"));
+        assert!(
+            supervisor
+                .renew_control_window(&bad_lock, Duration::from_secs(3))
+                .is_err()
+        );
+        assert_eq!(supervisor.control_until, renewed);
+        drop(peer);
+        assert!(
+            supervisor
+                .renew_control_window(&lock, Duration::from_secs(3))
+                .is_err()
+        );
+        assert_eq!(supervisor.control_until, renewed);
+        assert_eq!(supervisor.last_control.as_ref().unwrap().0, 4);
+        assert_eq!(supervisor.last_observation_v2.as_ref().unwrap().0, 6);
+    }
+
+    #[test]
     fn versioned_frame_keeps_v1_bytes_and_reads_one_message() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         let v1 = serde_json::json!({
