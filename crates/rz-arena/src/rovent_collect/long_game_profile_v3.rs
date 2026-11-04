@@ -52,6 +52,14 @@ impl LongGameProfileV3 {
         Ok(())
     }
 
+    /// The profile's canonical representation is its compact JSON object in
+    /// the declaration order above. Original input bytes are pinned separately;
+    /// whitespace or key order in an input file is not a semantic error.
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, LongGameCanonicalErrorV3> {
+        self.validate().map_err(LongGameCanonicalErrorV3::Profile)?;
+        serde_json::to_vec(self).map_err(LongGameCanonicalErrorV3::Encoding)
+    }
+
     /// A looser registered ceiling is valid: a tighter independent limit still
     /// applies. These values are not a reservation or an ownership proof.
     pub(crate) fn effective_root_worker_limit(&self) -> u64 {
@@ -64,6 +72,12 @@ impl LongGameProfileV3 {
         self.effective_root_worker_limit()
             .min(u64::from(self.maximum_simultaneous_teacher_roots))
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum LongGameCanonicalErrorV3 {
+    Profile(LongGameProfileErrorV3),
+    Encoding(serde_json::Error),
 }
 
 /// Keeps an original root admission and its original owner together while an
