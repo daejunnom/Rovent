@@ -76,6 +76,8 @@ pub(crate) struct SmokeControlProgress {
     pub request_read: Option<usize>,
     pub grant_written: Option<usize>,
     pub retained_grants: usize,
+    pub interrupted_grants: usize,
+    pub no_game_run_closed: bool,
     pub first_failure: Option<String>,
 }
 
@@ -91,6 +93,10 @@ pub(crate) struct SmokeDeadlineControl {
     child: Option<(u32, ProcessIdentity)>,
     peer: Option<SmokePeer>,
     retained_grants: Vec<SmokePeer>,
+    // A stream interrupted by NoGame stop remains owned even when its phase
+    // or physical delivery is unknown; it is never resumed as a new Run.
+    interrupted_grants: Vec<SmokePeer>,
+    no_game_run_closed: bool,
     first_failure: Option<String>,
     cancel_peer: Option<smoke_cancel_sender::SmokeCancelPeer>,
     cancel_failure: Option<ArenaError>,
@@ -219,6 +225,8 @@ impl SmokeDeadlineControl {
             child: None,
             peer: None,
             retained_grants: Vec::new(),
+            interrupted_grants: Vec::new(),
+            no_game_run_closed: false,
             first_failure: None,
             cancel_peer: None,
             cancel_failure: None,
@@ -309,6 +317,8 @@ impl SmokeDeadlineControl {
             child: None,
             peer: None,
             retained_grants: Vec::new(),
+            interrupted_grants: Vec::new(),
+            no_game_run_closed: false,
             first_failure: None,
             cancel_peer: None,
             cancel_failure: None,
@@ -328,6 +338,8 @@ impl SmokeDeadlineControl {
             request_read: self.peer.as_ref().map(|peer| peer.read),
             grant_written: self.peer.as_ref().map(|peer| peer.written),
             retained_grants: self.retained_grants.len(),
+            interrupted_grants: self.interrupted_grants.len(),
+            no_game_run_closed: self.no_game_run_closed,
             first_failure: self.first_failure.clone(),
         }
     }
@@ -353,6 +365,9 @@ impl SmokeDeadlineControl {
         until: Instant,
         cleanup: bool,
     ) -> Result<Option<SmokeGrantObservation>, ArenaError> {
+        if cleanup && matches!(&self.binding, SmokeBinding::NoGame { .. }) {
+            self.close_no_game_run();
+        }
         if let Some(error) = &self.first_failure {
             return Err(ArenaError::Io(format!("smoke_control_sticky:{error}")));
         }
@@ -511,6 +526,17 @@ impl SmokeDeadlineControl {
             let scope = ProxyEntrySmokeRequest::decode(&peer.request)
                 .map_err(failure)?
                 .scope;
+            if self.no_game_run_closed && scope.phase == ProxyEntrySmokePhase::Run {
+                if self.interrupted_grants.len() >= self.scopes.len() {
+                    return Err(failure("smoke_interrupted_grant_capacity"));
+                }
+                let interrupted = self
+                    .peer
+                    .take()
+                    .ok_or_else(|| failure("smoke_peer_missing"))?;
+                self.interrupted_grants.push(interrupted);
+                return Ok(None);
+            }
             let deadline = phase_deadline(
                 scope.phase,
                 run_until,
@@ -544,6 +570,17 @@ impl SmokeDeadlineControl {
             let scope = ProxyEntrySmokeRequest::decode(&peer.request)
                 .map_err(failure)?
                 .scope;
+            if self.no_game_run_closed && scope.phase == ProxyEntrySmokePhase::Run {
+                if self.interrupted_grants.len() >= self.scopes.len() {
+                    return Err(failure("smoke_interrupted_grant_capacity"));
+                }
+                let interrupted = self
+                    .peer
+                    .take()
+                    .ok_or_else(|| failure("smoke_peer_missing"))?;
+                self.interrupted_grants.push(interrupted);
+                return Ok(None);
+            }
             let index = self
                 .scopes
                 .iter()
@@ -607,6 +644,40 @@ impl SmokeDeadlineControl {
         };
         self.retained_grants.push(completed);
         Ok(Some(observation))
+    }
+
+    fn close_no_game_run(&mut self) {
+        if self.no_game_run_closed {
+            return;
+        }
+        self.no_game_run_closed = true;
+        let known_cleanup = self.peer.as_ref().is_some_and(|peer| {
+            peer.read == PROXY_ENTRY_SMOKE_REQUEST_BYTES
+                && ProxyEntrySmokeRequest::decode(&peer.request)
+                    .is_ok_and(|request| request.scope == self.scopes[1])
+        });
+        if !known_cleanup {
+            if let Some(peer) = self.peer.take() {
+                self.interrupted_grants.push(peer);
+            }
+        }
+    }
+
+    /// Offsets are transport observations; a partially written grant has
+    /// unknown delivery, even if its requested phase can be decoded.
+    pub(crate) fn no_game_interrupted_grants(
+        &self,
+    ) -> impl Iterator<Item = (usize, usize, usize, Option<ProxyEntrySmokePhase>)> + '_ {
+        self.interrupted_grants.iter().map(|peer| {
+            let phase = if peer.read == PROXY_ENTRY_SMOKE_REQUEST_BYTES {
+                ProxyEntrySmokeRequest::decode(&peer.request)
+                    .ok()
+                    .map(|request| request.scope.phase)
+            } else {
+                None
+            };
+            (peer.challenge_written, peer.read, peer.written, phase)
+        })
     }
 }
 

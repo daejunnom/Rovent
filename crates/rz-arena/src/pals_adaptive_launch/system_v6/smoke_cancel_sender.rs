@@ -36,6 +36,9 @@ impl SmokeDeadlineControl {
         custody: &SpawnCustody,
         callback_until: Instant,
     ) -> SmokeCancelProgress {
+        if matches!(&self.binding, SmokeBinding::NoGame { .. }) {
+            self.close_no_game_run();
+        }
         if self
             .cancel_peer
             .as_ref()
