@@ -430,7 +430,9 @@ impl RoventOwnCollectionBridgeV3 {
                     slot.requested = true;
                     return Ok(true);
                 }
-                GameDispatchOutcomeV3::Full if !receipt.abort_observed() => {
+                GameDispatchOutcomeV3::Full
+                    if !receipt.abort_observed() && !receipt.seal_observed() =>
+                {
                     return match GameDispatchFullSummaryV3::try_merge_in_slots(
                         &mut slot.dispatch_full,
                         &mut slot.dispatch_receipt,
