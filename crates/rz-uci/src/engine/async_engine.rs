@@ -21,6 +21,19 @@ pub struct AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 
     pub close: PriorityCloseHandle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineTimerJoinStatus {
+    NotReady,
+    WaitingWorkers,
+    WaitingTimer,
+    UnsupportedDriver,
+    RetainedFailure,
+    Failed,
+    /// CPU worker handles and original timer were joined. Writer and native
+    /// physical completion are not inferred by this observation.
+    Joined,
+}
+
 /// Owns the *same* UCI session, pending output, timer and process owner across
 /// time slices. A terminal/unknown result stays here for inspection. Dropping
 /// this owner is not a shutdown or physical-completion operation.
@@ -28,8 +41,11 @@ pub struct AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 
 pub struct AsyncEngineRun<O: Write + Send + 'static, D: Write + Send + 'static> {
     driver: Driver<O, D>,
     _owner: Arc<Mutex<Owner>>,
-    _timer_stop: Arc<std::sync::atomic::AtomicBool>,
-    _timer: JoinHandle<()>,
+    timer_stop: Arc<std::sync::atomic::AtomicBool>,
+    timer: Option<JoinHandle<()>>,
+    timer_joined: bool,
+    cleanup_failure: Option<EngineError>,
+    timer_panic: Option<Box<dyn std::any::Any + Send>>,
     _priority_close_owner: priority_close::PriorityCloseOwner,
     close: PriorityCloseHandle,
     last_exit: Option<AsyncServeExit<EngineError>>,
@@ -127,8 +143,11 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
     Ok(AsyncEngineRun {
         driver,
         _owner: owner,
-        _timer_stop: timer_stop,
-        _timer: timer,
+        timer_stop,
+        timer: Some(timer),
+        timer_joined: false,
+        cleanup_failure: None,
+        timer_panic: None,
         _priority_close_owner: close_owner,
         close,
         last_exit: None,
@@ -163,6 +182,85 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
         self.last_exit = Some(exit);
         Some(status)
     }
+    /// Advance only the original CPU worker/timer cleanup; never waits for a
+    /// writer or declares native/GPU completion. On failure the original error
+    /// or panic payload remains in this run and this method does not retry.
+    pub fn try_join_timer_after_workers(&mut self) -> EngineTimerJoinStatus {
+        if self.cleanup_failure.is_some() || self.timer_panic.is_some() {
+            return EngineTimerJoinStatus::Failed;
+        }
+        if self.timer_joined {
+            return EngineTimerJoinStatus::Joined;
+        }
+        if !self.last_exit.as_ref().is_some_and(|exit| {
+            exit.status == AsyncServeStatus::OutputQueued
+                && exit.failure.is_none()
+                && exit.cleanup_failures.is_empty()
+        }) || !self.driver.session_closed()
+            || !self.driver.pending().is_empty()
+        {
+            return EngineTimerJoinStatus::NotReady;
+        }
+        {
+            let mut owner = match self._owner.try_lock() {
+                Ok(owner) => owner,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return EngineTimerJoinStatus::WaitingWorkers;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.cleanup_failure = Some(
+                        failure(
+                            contract::ErrorCode::BackendFailure,
+                            "UCI owner poisoned during cleanup",
+                        )
+                        .into(),
+                    );
+                    return EngineTimerJoinStatus::Failed;
+                }
+            };
+            if owner.driver.is_some() {
+                // The independent search-driver finish_session fence is not
+                // implemented by this LC0-only cleanup path.
+                return EngineTimerJoinStatus::UnsupportedDriver;
+            }
+            if let Err(error) = owner.reap_workers(true) {
+                self.cleanup_failure = Some(error);
+                return EngineTimerJoinStatus::Failed;
+            }
+            if !owner.workers.is_empty() || owner.active.is_some() {
+                return EngineTimerJoinStatus::WaitingWorkers;
+            }
+            if owner.fence_failure.is_some() || !owner.pending_failures.is_empty() {
+                return EngineTimerJoinStatus::RetainedFailure;
+            }
+        }
+        self.timer_stop.store(true, Ordering::Release);
+        if !self.timer.as_ref().is_some_and(JoinHandle::is_finished) {
+            return EngineTimerJoinStatus::WaitingTimer;
+        }
+        match self
+            .timer
+            .take()
+            .expect("finished original timer retained")
+            .join()
+        {
+            Ok(()) => {
+                self.timer_joined = true;
+                EngineTimerJoinStatus::Joined
+            }
+            Err(payload) => {
+                self.timer_panic = Some(payload);
+                EngineTimerJoinStatus::Failed
+            }
+        }
+    }
+    pub fn cleanup_failure(&self) -> Option<&EngineError> {
+        self.cleanup_failure.as_ref()
+    }
+    pub fn has_original_timer_panic(&self) -> bool {
+        self.timer_panic.is_some()
+    }
+
     pub fn last_exit(&self) -> Option<&AsyncServeExit<EngineError>> {
         self.last_exit.as_ref()
     }
