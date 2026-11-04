@@ -236,7 +236,19 @@ class CgroupOwner:
                 raise CgroupOwnerError("original output child was already granted")
             self._admit_waiting_child_locked(pid, release_fd)
 
-    def _admit_waiting_child_locked(self, pid: int, release_fd: int) -> None:
+    def admit_waiting_child_borrowed(self, pid: int, release_fd: int) -> None:
+        """Admit through an FD retained and closed by the original caller."""
+        with self._admission_gate:
+            if self._admission_closed:
+                raise CgroupOwnerError("original workload admission is closed")
+            if (self._output_group is not None and
+                    (self._output_group._child is None or self._output_group._child.pid != pid)):
+                raise CgroupOwnerError("workload is reserved for another original child")
+            if self._output_group is not None and self._last_granted_child is not None:
+                raise CgroupOwnerError("original output child was already granted")
+            self._admit_waiting_child_locked(pid, release_fd, close_release_fd=False)
+
+    def _admit_waiting_child_locked(self, pid: int, release_fd: int, *, close_release_fd=True) -> None:
         """Move the direct, unreaped barrier child before permitting its exec."""
         self.admission_outcome = "rejected_before_grant"
         self._last_granted_child = None
@@ -262,7 +274,8 @@ class CgroupOwner:
             self._last_granted_child = pid
         finally:
             # EOF makes a still-waiting shim exit without executing native.
-            os.close(release_fd)
+            if close_release_fd:
+                os.close(release_fd)
 
     def confirms_granted_child(self, pid: int) -> bool:
         """Observe this original scope's last completed barrier grant only."""

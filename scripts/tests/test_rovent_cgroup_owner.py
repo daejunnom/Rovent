@@ -36,6 +36,23 @@ class CgroupOwnerTests(unittest.TestCase):
                 for fd in owner._fds.values():
                     os.close(fd)
 
+    def test_borrowed_pregrant_rejection_leaves_original_barrier_with_caller(self):
+        with tempfile.TemporaryDirectory() as root:
+            owner = self.make_owner(root)
+            read_fd, write_fd = os.pipe()
+            try:
+                with self.assertRaises(subject.CgroupOwnerError):
+                    owner.admit_waiting_child_borrowed(-1, write_fd)
+                self.assertEqual(owner.admission_outcome, "rejected_before_grant")
+                os.fstat(write_fd)
+                os.write(write_fd, b"x")
+                self.assertEqual(os.read(read_fd, 1), b"x")
+            finally:
+                os.close(write_fd)
+                os.close(read_fd)
+                for fd in owner._fds.values():
+                    os.close(fd)
+
     def test_close_admission_prevents_new_barrier_before_empty_observation(self):
         with tempfile.TemporaryDirectory() as root:
             owner = self.make_owner(root)

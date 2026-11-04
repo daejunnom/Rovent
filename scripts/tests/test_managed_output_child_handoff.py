@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from managed_storage import StorageError
 from rovent_cgroup_owner import CgroupOwner
 from storage_guard import CatalogGuard
 from rovent_v3_input_snapshot import OriginalControlInput, open_directory
+from rovent_v3_collection_parent import OriginalCollectionProcess
 
 _PRESERVED_UNKNOWN = []
 
@@ -199,6 +201,59 @@ print("ok")
                 self.assertFalse(self.scope.owns_output_group(self.group))
         finally:
             os.close(source_fd)
+
+    def test_collection_parent_passes_original_owners_and_both_deadlines(self):
+        # Real child and FDs; the cgroup barrier and membership are fixtures.
+        self.handoff.revoke()
+        data = json.dumps({"schema": "rz-rovent-collection-lock-v3-launch/1",
+                           "output_directory": str(self.lease.output)}).encode()
+        (self.source / "plan").write_bytes(data)
+        source_fd = open_directory(self.source)
+        try:
+            original_input = OriginalControlInput(source_fd, Path("plan"))
+        finally:
+            os.close(source_fd)
+        executable_fd = os.open(sys.executable, os.O_RDONLY)
+        now = time.monotonic_ns()
+        work, cleanup = now + 5_000_000_000, now + 7_000_000_000
+        try:
+            owner = OriginalCollectionProcess(self.key, self.scope, original_input,
+                                              executable_fd, work, cleanup)
+        finally:
+            os.close(executable_fd)
+        self.group, self.handoff = owner.group, owner.handoff
+
+        def admit(pid, fd):
+            self.assertEqual(pid, self.group._child.pid)
+            os.write(fd, b"R")
+        self.scope.admit_waiting_child_borrowed = admit
+        source = '''
+import json, os, socket, sys, time
+args = dict(value.split("=", 1) for value in sys.argv[1:])
+fd = int(args["--v3-managed-output-channel-fd"])
+s = socket.socket(fileno=fd)
+nonce = os.urandom(16).hex()
+s.send(json.dumps({"schema":"rz-managed-output-lease/2", "sequence":1,
+                   "session_id":nonce}).encode())
+reply = json.loads(s.recv(4096))
+assert reply["session_id"] == nonce
+assert reply["plan"]["path"] == args["--v3-plan"]
+assert int(args["--v3-work-deadline-monotonic-ns"]) < int(args["--v3-cleanup-deadline-monotonic-ns"])
+assert time.monotonic_ns() < int(args["--v3-work-deadline-monotonic-ns"])
+print("ok")
+'''
+        with tempfile.TemporaryFile(mode="w+b", dir=self.root) as output:
+            result = owner.run(["-c", source], self.root, os.environ.copy(),
+                               lambda: None, lambda: False, stdout=output)
+            output.seek(0)
+            payload = output.read()
+        if result[1]:
+            self.lease.finish(status="test-complete", tree_gone=True)
+            self.finished = True
+            owner.close_settled_process_fds()
+            original_input.close()
+        self.assertEqual(result, (0, True, None))
+        self.assertEqual(payload, b"ok\n")
 
     def test_grandchild_cannot_claim_direct_child_lease(self):
         source = '''
