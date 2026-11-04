@@ -321,6 +321,7 @@ pub struct RoventBoardCollectionWorkerV3 {
     admission: RoventCollectionRootAdmissionV3,
     sender: mpsc::SyncSender<RoventBoardRootHandoffV3>,
     received: Arc<Mutex<Option<RoventBoardRootHandoffV3>>>,
+    task_custody: Arc<Mutex<Option<RoventBoardRootWorkerTaskV3>>>,
     thread: Option<std::thread::JoinHandle<Box<dyn Any + Send>>>,
 }
 
@@ -333,23 +334,71 @@ impl RoventBoardCollectionWorkerKeyV3 {
     pub fn same_original(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    /// Registry observation only. Missing or Reserved never establishes
+    /// that a thread did not start or that physical work has completed.
+    pub fn observe(&self) -> RoventBoardWorkerRecoveryObservationV3 {
+        let slots = match quarantined_board_workers_v3().try_lock() {
+            Ok(slots) => slots,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return RoventBoardWorkerRecoveryObservationV3::Busy;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return RoventBoardWorkerRecoveryObservationV3::Poisoned;
+            }
+        };
+        match slots.iter().find(|slot| slot.matches(self)) {
+            Some(BoardWorkerSlotV3::Reserved(_)) => {
+                RoventBoardWorkerRecoveryObservationV3::Reserved
+            }
+            Some(BoardWorkerSlotV3::Staged(stage)) => {
+                RoventBoardWorkerRecoveryObservationV3::Staged(stage.phase)
+            }
+            Some(BoardWorkerSlotV3::Quarantined(_)) => {
+                RoventBoardWorkerRecoveryObservationV3::Worker
+            }
+            None => RoventBoardWorkerRecoveryObservationV3::Missing,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventBoardWorkerRecoveryObservationV3 {
+    Reserved,
+    Staged(RoventBoardWorkerStagePhaseV3),
+    Worker,
+    Missing,
+    Busy,
+    Poisoned,
 }
 struct QuarantinedBoardWorkerV3 {
     key: RoventBoardCollectionWorkerKeyV3,
     admission: RoventCollectionRootAdmissionV3,
     sender: mpsc::SyncSender<RoventBoardRootHandoffV3>,
     received: Arc<Mutex<Option<RoventBoardRootHandoffV3>>>,
+    task_custody: Arc<Mutex<Option<RoventBoardRootWorkerTaskV3>>>,
     thread: std::thread::JoinHandle<Box<dyn Any + Send>>,
+}
+struct QuarantinedBoardWorkerStageV3 {
+    key: RoventBoardCollectionWorkerKeyV3,
+    admission: RoventCollectionRootAdmissionV3,
+    sender: mpsc::SyncSender<RoventBoardRootHandoffV3>,
+    received: Arc<Mutex<Option<RoventBoardRootHandoffV3>>>,
+    receiver: Option<RoventBoardRootHandoffReceiverV3>,
+    task: Arc<Mutex<Option<RoventBoardRootWorkerTaskV3>>>,
+    phase: RoventBoardWorkerStagePhaseV3,
+    failure: Option<std::io::Error>,
 }
 enum BoardWorkerSlotV3 {
     Reserved(RoventBoardCollectionWorkerKeyV3),
     Quarantined(QuarantinedBoardWorkerV3),
+    Staged(QuarantinedBoardWorkerStageV3),
 }
 impl BoardWorkerSlotV3 {
     fn matches(&self, key: &RoventBoardCollectionWorkerKeyV3) -> bool {
         let owner = match self {
             Self::Reserved(owner) => owner,
             Self::Quarantined(owner) => &owner.key,
+            Self::Staged(owner) => &owner.key,
         };
         Arc::ptr_eq(&owner.0, &key.0)
     }
@@ -359,9 +408,9 @@ fn quarantined_board_workers_v3() -> &'static Mutex<Vec<BoardWorkerSlotV3>> {
     WORKERS.get_or_init(|| Mutex::new(Vec::new()))
 }
 fn release_board_worker_slot_v3(key: &RoventBoardCollectionWorkerKeyV3) {
-    let mut slots = quarantined_board_workers_v3()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let Ok(mut slots) = quarantined_board_workers_v3().lock() else {
+        return;
+    };
     if let Some(index) = slots.iter().position(|slot| slot.matches(key)) {
         slots.swap_remove(index);
     }
@@ -373,12 +422,342 @@ pub struct RoventBoardCollectionWorkerSpawnFailureV3 {
     pub task: RoventBoardRootWorkerTaskV3,
 }
 
+/// StartingUnknown never authorizes a retry or claims that no thread exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventBoardWorkerStagePhaseV3 {
+    Ready,
+    StartingUnknown,
+    Running,
+    Failed,
+    FailedTaken,
+    Transferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventBoardWorkerStageStartV3 {
+    Started,
+    Failed,
+}
+
+pub struct RoventBoardWorkerStagePrepareFailureV3 {
+    pub admission: RoventCollectionRootAdmissionV3,
+    pub error: std::io::Error,
+}
+
+pub struct RoventBoardWorkerStageStartRejectionV3 {
+    pub reason: &'static str,
+    pub task: RoventBoardRootWorkerTaskV3,
+}
+
+/// Own this stage and its key in the supervisor before starting a thread.
+/// Drop moves unresolved task/handle custody to the existing worker registry.
+#[must_use]
+pub struct RoventBoardCollectionWorkerStageV3 {
+    key: RoventBoardCollectionWorkerKeyV3,
+    admission: RoventCollectionRootAdmissionV3,
+    sender: mpsc::SyncSender<RoventBoardRootHandoffV3>,
+    received: Arc<Mutex<Option<RoventBoardRootHandoffV3>>>,
+    receiver: Option<RoventBoardRootHandoffReceiverV3>,
+    task: Arc<Mutex<Option<RoventBoardRootWorkerTaskV3>>>,
+    thread: Option<std::thread::JoinHandle<Box<dyn Any + Send>>>,
+    phase: RoventBoardWorkerStagePhaseV3,
+    failure: Option<std::io::Error>,
+}
+
 pub enum RoventBoardCollectionWorkerJoinFailureV3 {
     Busy,
+    TaskCustodyUnknown,
+    CustodyPoisoned,
+    RegistryPoisoned,
+    RegistryUnknown,
     WrongRoot,
     AlreadyJoined,
     Panicked(Box<dyn Any + Send>),
     CompletedWithoutHandoff(Box<dyn Any + Send>),
+}
+
+impl RoventBoardCollectionWorkerStageV3 {
+    fn retain_unregistered(&mut self) {
+        if self.phase == RoventBoardWorkerStagePhaseV3::Running && self.thread.is_none() {
+            self.phase = RoventBoardWorkerStagePhaseV3::StartingUnknown;
+        }
+        let original = QuarantinedBoardWorkerStageV3 {
+            key: self.key.clone(),
+            admission: self.admission.clone(),
+            sender: self.sender.clone(),
+            received: Arc::clone(&self.received),
+            receiver: self.receiver.take(),
+            task: Arc::clone(&self.task),
+            phase: self.phase,
+            failure: self.failure.take(),
+        };
+        // Registry loss/poison prevents keyed recovery. Preserve every
+        // original component and report invariant/physical unknown instead.
+        std::mem::forget((original, self.thread.take()));
+    }
+
+    /// No thread is started. The caller must retain this original stage and
+    /// its key in supervisor custody before calling `start`.
+    pub fn prepare(
+        admission: RoventCollectionRootAdmissionV3,
+    ) -> Result<Self, RoventBoardWorkerStagePrepareFailureV3> {
+        let key = RoventBoardCollectionWorkerKeyV3(Arc::new(()));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let received = Arc::new(Mutex::new(None));
+        let worker_receiver = RoventBoardRootHandoffReceiverV3 {
+            receiver,
+            admission: admission.clone(),
+            received: Arc::clone(&received),
+        };
+        let task = Arc::new(Mutex::new(None));
+        {
+            let mut slots = match quarantined_board_workers_v3().lock() {
+                Ok(slots) => slots,
+                Err(_) => {
+                    return Err(RoventBoardWorkerStagePrepareFailureV3 {
+                        admission,
+                        error: std::io::Error::other("original worker registry poisoned"),
+                    });
+                }
+            };
+            if let Err(error) = slots.try_reserve(1) {
+                return Err(RoventBoardWorkerStagePrepareFailureV3 {
+                    admission,
+                    error: std::io::Error::other(error),
+                });
+            }
+            slots.push(BoardWorkerSlotV3::Reserved(key.clone()));
+        }
+        Ok(Self {
+            key,
+            admission,
+            sender,
+            received,
+            receiver: Some(worker_receiver),
+            task,
+            thread: None,
+            phase: RoventBoardWorkerStagePhaseV3::Ready,
+            failure: None,
+        })
+    }
+
+    pub fn recovery_key(&self) -> RoventBoardCollectionWorkerKeyV3 {
+        self.key.clone()
+    }
+    pub fn phase(&self) -> RoventBoardWorkerStagePhaseV3 {
+        self.phase
+    }
+    pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+
+    /// Reclaim only the same dropped stage. StartingUnknown is deliberately
+    /// not restartable: the platform may have started an unobserved thread.
+    pub fn recover(key: &RoventBoardCollectionWorkerKeyV3) -> Option<Self> {
+        let mut slots = quarantined_board_workers_v3().lock().ok()?;
+        let index = slots.iter().position(|slot| slot.matches(key))?;
+        if !matches!(&slots[index], BoardWorkerSlotV3::Staged(_)) {
+            return None;
+        }
+        let BoardWorkerSlotV3::Staged(owner) =
+            std::mem::replace(&mut slots[index], BoardWorkerSlotV3::Reserved(key.clone()))
+        else {
+            unreachable!()
+        };
+        Some(Self {
+            key: owner.key,
+            admission: owner.admission,
+            sender: owner.sender,
+            received: owner.received,
+            receiver: owner.receiver,
+            task: owner.task,
+            thread: None,
+            phase: owner.phase,
+            failure: owner.failure,
+        })
+    }
+
+    /// Store the original task and mark StartingUnknown before invoking the
+    /// platform. Only a returned Err proves no handle was returned; an unwind
+    /// during spawn is retained as unknown. Once Ok returns, the very next
+    /// operation installs the returned handle in this same stage.
+    pub fn start(
+        &mut self,
+        task: RoventBoardRootWorkerTaskV3,
+    ) -> Result<RoventBoardWorkerStageStartV3, RoventBoardWorkerStageStartRejectionV3> {
+        if self.phase != RoventBoardWorkerStagePhaseV3::Ready || self.receiver.is_none() {
+            return Err(RoventBoardWorkerStageStartRejectionV3 {
+                reason: "original stage is not ready",
+                task,
+            });
+        }
+        {
+            let mut slot = match self.task.lock() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    self.phase = RoventBoardWorkerStagePhaseV3::StartingUnknown;
+                    return Err(RoventBoardWorkerStageStartRejectionV3 {
+                        reason: "original task custody poisoned",
+                        task,
+                    });
+                }
+            };
+            if slot.is_some() {
+                return Err(RoventBoardWorkerStageStartRejectionV3 {
+                    reason: "original task already retained",
+                    task,
+                });
+            }
+            *slot = Some(task);
+        }
+        let worker_task = Arc::clone(&self.task);
+        self.phase = RoventBoardWorkerStagePhaseV3::StartingUnknown;
+        let receiver = self.receiver.take().expect("checked original receiver");
+        let started = std::thread::Builder::new()
+            .name("rovent-own-collection-v3".to_owned())
+            .spawn(move || {
+                let task = match worker_task.lock() {
+                    Ok(mut slot) => match slot.take() {
+                        Some(task) => task,
+                        None => {
+                            return Box::new("original staged task unavailable")
+                                as Box<dyn Any + Send>;
+                        }
+                    },
+                    Err(_) => {
+                        return Box::new("original staged task custody poisoned")
+                            as Box<dyn Any + Send>;
+                    }
+                };
+                task(receiver)
+            });
+        match started {
+            Ok(thread) => {
+                self.thread = Some(thread);
+                self.phase = RoventBoardWorkerStagePhaseV3::Running;
+                Ok(RoventBoardWorkerStageStartV3::Started)
+            }
+            Err(error) => {
+                self.failure = Some(error);
+                self.phase = RoventBoardWorkerStagePhaseV3::Failed;
+                Ok(RoventBoardWorkerStageStartV3::Failed)
+            }
+        }
+    }
+
+    /// An actual spawn Err preserves both the error and the original task.
+    pub fn take_failed_start(&mut self) -> Option<(std::io::Error, RoventBoardRootWorkerTaskV3)> {
+        if self.phase != RoventBoardWorkerStagePhaseV3::Failed {
+            return None;
+        }
+        let mut slot = self.task.lock().ok()?;
+        if slot.is_none() || self.failure.is_none() {
+            return None;
+        }
+        let task = slot.take().expect("checked failed task");
+        let failure = self.failure.take().expect("checked failed spawn error");
+        self.phase = RoventBoardWorkerStagePhaseV3::FailedTaken;
+        Some((failure, task))
+    }
+
+    /// A task stored before entering spawn can be reclaimed only while the
+    /// exact stage remains Ready with its original receiver.
+    pub fn take_unstarted_task(&mut self) -> Option<RoventBoardRootWorkerTaskV3> {
+        if self.phase != RoventBoardWorkerStagePhaseV3::Ready || self.receiver.is_none() {
+            return None;
+        }
+        self.task.lock().ok()?.take()
+    }
+
+    /// Move the original installed handle to the legacy worker owner. The
+    /// worker's Drop quarantines it by the already published key.
+    pub fn take_worker(&mut self) -> Option<RoventBoardCollectionWorkerV3> {
+        if self.phase != RoventBoardWorkerStagePhaseV3::Running {
+            return None;
+        }
+        let key = self.key.clone();
+        let admission = self.admission.clone();
+        let sender = self.sender.clone();
+        let received = Arc::clone(&self.received);
+        let task_custody = Arc::clone(&self.task);
+        let thread = self.thread.take()?;
+        let worker = RoventBoardCollectionWorkerV3 {
+            key,
+            admission,
+            sender,
+            received,
+            task_custody,
+            thread: Some(thread),
+        };
+        self.phase = RoventBoardWorkerStagePhaseV3::Transferred;
+        Some(worker)
+    }
+}
+
+impl Drop for RoventBoardCollectionWorkerStageV3 {
+    fn drop(&mut self) {
+        if self.phase == RoventBoardWorkerStagePhaseV3::Transferred {
+            return;
+        }
+        let has_task = match self.task.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(_) => {
+                self.phase = RoventBoardWorkerStagePhaseV3::StartingUnknown;
+                true
+            }
+        };
+        let mut slots = match quarantined_board_workers_v3().lock() {
+            Ok(slots) => slots,
+            Err(_) => {
+                self.retain_unregistered();
+                return;
+            }
+        };
+        let Some(index) = slots.iter().position(|slot| slot.matches(&self.key)) else {
+            self.retain_unregistered();
+            return;
+        };
+        if !matches!(&slots[index], BoardWorkerSlotV3::Reserved(_)) {
+            self.retain_unregistered();
+            return;
+        }
+        if let Some(thread) = self.thread.take() {
+            slots[index] = BoardWorkerSlotV3::Quarantined(QuarantinedBoardWorkerV3 {
+                key: self.key.clone(),
+                admission: self.admission.clone(),
+                sender: self.sender.clone(),
+                received: Arc::clone(&self.received),
+                task_custody: Arc::clone(&self.task),
+                thread,
+            });
+        } else if has_task
+            || matches!(
+                self.phase,
+                RoventBoardWorkerStagePhaseV3::StartingUnknown
+                    | RoventBoardWorkerStagePhaseV3::Failed
+                    | RoventBoardWorkerStagePhaseV3::Running
+            )
+            || (self.phase == RoventBoardWorkerStagePhaseV3::Ready && self.receiver.is_none())
+        {
+            if self.phase == RoventBoardWorkerStagePhaseV3::Running
+                || (self.phase == RoventBoardWorkerStagePhaseV3::Ready && self.receiver.is_none())
+            {
+                self.phase = RoventBoardWorkerStagePhaseV3::StartingUnknown;
+            }
+            slots[index] = BoardWorkerSlotV3::Staged(QuarantinedBoardWorkerStageV3 {
+                key: self.key.clone(),
+                admission: self.admission.clone(),
+                sender: self.sender.clone(),
+                received: Arc::clone(&self.received),
+                receiver: self.receiver.take(),
+                task: Arc::clone(&self.task),
+                phase: self.phase,
+                failure: self.failure.take(),
+            });
+        } else {
+            slots.swap_remove(index);
+        }
+    }
 }
 
 impl RoventBoardCollectionWorkerV3 {
@@ -392,9 +771,16 @@ impl RoventBoardCollectionWorkerV3 {
     ) -> Result<Self, RoventBoardCollectionWorkerSpawnFailureV3> {
         let key = RoventBoardCollectionWorkerKeyV3(Arc::new(()));
         {
-            let mut slots = quarantined_board_workers_v3()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut slots = match quarantined_board_workers_v3().lock() {
+                Ok(slots) => slots,
+                Err(_) => {
+                    return Err(RoventBoardCollectionWorkerSpawnFailureV3 {
+                        admission,
+                        error: std::io::Error::other("original worker registry poisoned"),
+                        task,
+                    });
+                }
+            };
             if let Err(error) = slots.try_reserve(1) {
                 return Err(RoventBoardCollectionWorkerSpawnFailureV3 {
                     admission,
@@ -431,6 +817,7 @@ impl RoventBoardCollectionWorkerV3 {
                 admission,
                 sender,
                 received,
+                task_custody: slot,
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -459,9 +846,7 @@ impl RoventBoardCollectionWorkerV3 {
 
     /// Recover only the original process-local worker matching this token.
     pub fn recover(key: &RoventBoardCollectionWorkerKeyV3) -> Option<Self> {
-        let mut workers = quarantined_board_workers_v3()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut workers = quarantined_board_workers_v3().lock().ok()?;
         let index = workers.iter().position(|slot| slot.matches(key))?;
         if !matches!(&workers[index], BoardWorkerSlotV3::Quarantined(_)) {
             return None;
@@ -477,6 +862,7 @@ impl RoventBoardCollectionWorkerV3 {
             admission: owner.admission,
             sender: owner.sender,
             received: owner.received,
+            task_custody: owner.task_custody,
             thread: Some(owner.thread),
         })
     }
@@ -490,10 +876,9 @@ impl RoventBoardCollectionWorkerV3 {
     > {
         let same_admission = match handoff.try_lock() {
             Ok(guard) => guard.admission.same_original_admission(&self.admission),
-            Err(std::sync::TryLockError::Poisoned(error)) => error
-                .into_inner()
-                .admission
-                .same_original_admission(&self.admission),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventBoardCollectionWorkerJoinFailureV3::CustodyPoisoned);
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Err(RoventBoardCollectionWorkerJoinFailureV3::Busy);
             }
@@ -508,28 +893,42 @@ impl RoventBoardCollectionWorkerV3 {
         if !thread.is_finished() {
             return Ok(None);
         }
+        match self.task_custody.try_lock() {
+            Ok(task) if task.is_none() => {}
+            Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventBoardCollectionWorkerJoinFailureV3::TaskCustodyUnknown);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(RoventBoardCollectionWorkerJoinFailureV3::Busy);
+            }
+        }
         let received_handoff = match self.received.try_lock() {
             Ok(guard) => guard
                 .as_ref()
                 .is_some_and(|received| Arc::ptr_eq(received, handoff)),
-            Err(std::sync::TryLockError::Poisoned(error)) => error
-                .into_inner()
-                .as_ref()
-                .is_some_and(|received| Arc::ptr_eq(received, handoff)),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventBoardCollectionWorkerJoinFailureV3::CustodyPoisoned);
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Err(RoventBoardCollectionWorkerJoinFailureV3::Busy);
             }
         };
         let mut slots = match quarantined_board_workers_v3().try_lock() {
             Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventBoardCollectionWorkerJoinFailureV3::RegistryPoisoned);
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Err(RoventBoardCollectionWorkerJoinFailureV3::Busy);
             }
         };
-        if let Some(index) = slots.iter().position(|slot| slot.matches(&self.key)) {
-            slots.swap_remove(index);
+        let Some(index) = slots.iter().position(|slot| slot.matches(&self.key)) else {
+            return Err(RoventBoardCollectionWorkerJoinFailureV3::RegistryUnknown);
+        };
+        if !matches!(&slots[index], BoardWorkerSlotV3::Reserved(_)) {
+            return Err(RoventBoardCollectionWorkerJoinFailureV3::RegistryUnknown);
         }
+        slots.swap_remove(index);
         drop(slots);
         // Do not hold the shared worker registry during OS thread join; even
         // a finished thread can still be completing thread-local teardown.
@@ -559,15 +958,20 @@ impl RoventBoardCollectionWorkerV3 {
 impl Drop for RoventBoardCollectionWorkerV3 {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
-            let mut slots = quarantined_board_workers_v3()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
             let owner = QuarantinedBoardWorkerV3 {
                 key: self.key.clone(),
                 admission: self.admission.clone(),
                 sender: self.sender.clone(),
                 received: Arc::clone(&self.received),
+                task_custody: Arc::clone(&self.task_custody),
                 thread,
+            };
+            let mut slots = match quarantined_board_workers_v3().lock() {
+                Ok(slots) => slots,
+                Err(_) => {
+                    std::mem::forget(owner);
+                    return;
+                }
             };
             if let Some(slot) = slots.iter_mut().find(|slot| slot.matches(&self.key)) {
                 if matches!(slot, BoardWorkerSlotV3::Reserved(_)) {
