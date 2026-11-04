@@ -32,6 +32,10 @@ pub fn compiled_pals_system_v6_execution_source_digest() -> String {
             include_bytes!("../pals_adaptive_bootstrap/system_v6/driver_lifecycle.rs"),
         ),
         (
+            "pipeline",
+            include_bytes!("../pals_adaptive_bootstrap/system_v6/pipeline.rs"),
+        ),
+        (
             "admission",
             include_bytes!("../pals_adaptive/session_driver/admission_system_v6.rs"),
         ),
@@ -72,9 +76,12 @@ pub(super) fn execution_source_observation(
 
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 pub(super) fn require_execution_source(
+    policy: rz_experiments::PalsSystemSourcePolicyV6,
     observation: PalsSystemSourceObservationV6,
 ) -> std::io::Result<()> {
-    if observation == PalsSystemSourceObservationV6::Verified {
+    if policy == rz_experiments::PalsSystemSourcePolicyV6::Observe
+        || observation == PalsSystemSourceObservationV6::Verified
+    {
         Ok(())
     } else {
         Err(std::io::Error::other(
@@ -103,9 +110,11 @@ mod tests {
             execution_source_observation(&declared, &compiled),
             PalsSystemSourceObservationV6::Verified
         );
+        let first = if compiled.starts_with('0') { '1' } else { '0' };
+        let different = format!("{first}{}", &compiled[1..]);
         declared.insert(
             PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT.to_owned(),
-            format!("{compiled}x"),
+            different,
         );
         assert_eq!(
             execution_source_observation(&declared, &compiled),
@@ -116,8 +125,11 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
     #[test]
     fn native_admission_requires_the_new_execution_observation() {
-        assert!(require_execution_source(PalsSystemSourceObservationV6::Missing).is_err());
-        assert!(require_execution_source(PalsSystemSourceObservationV6::Mismatch).is_err());
-        assert!(require_execution_source(PalsSystemSourceObservationV6::Verified).is_ok());
+        use rz_experiments::PalsSystemSourcePolicyV6::{Observe, Strict};
+        assert!(require_execution_source(Strict, PalsSystemSourceObservationV6::Missing).is_err());
+        assert!(require_execution_source(Strict, PalsSystemSourceObservationV6::Mismatch).is_err());
+        assert!(require_execution_source(Strict, PalsSystemSourceObservationV6::Verified).is_ok());
+        assert!(require_execution_source(Observe, PalsSystemSourceObservationV6::Missing).is_ok());
+        assert!(require_execution_source(Observe, PalsSystemSourceObservationV6::Mismatch).is_ok());
     }
 }

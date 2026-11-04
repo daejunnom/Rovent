@@ -529,7 +529,10 @@ impl PinnedPalsSystemStartupV6 {
         parent: &Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
         admission: &crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6,
     ) -> std::io::Result<()> {
-        super::system_v6_execution::require_execution_source(self.system_v6_execution_source)?;
+        super::system_v6_execution::require_execution_source(
+            self.lock.config.source_policy,
+            self.system_v6_execution_source,
+        )?;
         self.source_window()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         admission.ensure_permitted(parent, self.original_until, &self.original_cancelled)

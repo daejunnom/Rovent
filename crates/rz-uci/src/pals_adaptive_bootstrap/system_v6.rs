@@ -12,6 +12,8 @@ mod driver_facade;
 mod driver_lifecycle;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod driver_prepare;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod pipeline;
 
 /// The receipt directory is derived from the exact held startup root, never
 /// from a caller-provided pathname or a different supervisor's writer.
@@ -28,6 +30,7 @@ struct PalsSystemReceiptOwnerV6 {
 struct PalsSystemReceiptPublicationV6 {
     owner: Option<PalsSystemReceiptOwnerV6>,
     startup_write: Result<(), String>,
+    execution_source_write: Result<(), String>,
 }
 
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
@@ -180,6 +183,40 @@ impl PalsSystemReceiptOwnerV6 {
             &self.owner.lock().config.system_runtime_lock,
         )
     }
+
+    /// A separate observation does not change the older runtime receipt or
+    /// claim equivalence of the entire workspace or supervisor executable.
+    fn write_execution_source(&self) -> Result<(), String> {
+        use crate::pals_adaptive_startup::{
+            PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT, PalsSystemSourceObservationV6,
+            compiled_pals_system_v6_execution_source_digest,
+        };
+        self.parent
+            .ensure_live()
+            .map_err(|error| error.to_string())?;
+        let lock = self.owner.lock();
+        let observation = match self.owner.system_v6_execution_source() {
+            PalsSystemSourceObservationV6::Verified => "verified",
+            PalsSystemSourceObservationV6::Missing => "unknown",
+            PalsSystemSourceObservationV6::Mismatch => "mismatch",
+        };
+        let value = serde_json::json!({
+            "domain": "rz-pals-system-v6-execution-source-observation/1",
+            "scope": "rz-pals-system-v6-execution-source/1",
+            "process_id": std::process::id(),
+            "process_generation": lock.config.process_generation,
+            "lock_sha256": lock.canonical_sha256,
+            "source_policy": lock.config.source_policy,
+            "declared_digest": lock.config.source_components.get(PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT),
+            "compiled_digest": compiled_pals_system_v6_execution_source_digest(),
+            "observation": observation,
+            "parent_executable_verified": false,
+            "gpu_physical_completion": "unknown",
+        });
+        let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+        self.writer
+            .write_bytes("pals-execution-source.v6.json", &bytes)
+    }
 }
 
 /// Construct the native worker with the original system CUDA factory custody.
@@ -236,6 +273,7 @@ fn spawn_system_native_v6(
                 Arc::clone(&parent),
             ) {
                 Ok(writer) => {
+                    let execution_source_write = writer.write_execution_source();
                     let startup_write = factory
                         .parts()
                         .0
@@ -245,11 +283,13 @@ fn spawn_system_native_v6(
                     PalsSystemReceiptPublicationV6 {
                         owner: Some(writer),
                         startup_write,
+                        execution_source_write,
                     }
                 }
                 Err(error) => PalsSystemReceiptPublicationV6 {
                     owner: None,
-                    startup_write: Err(error),
+                    startup_write: Err(error.clone()),
+                    execution_source_write: Err(error),
                 },
             };
             // Never block a native owner on a diagnostic consumer. The

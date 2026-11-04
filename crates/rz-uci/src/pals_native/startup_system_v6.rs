@@ -441,11 +441,12 @@ impl PalsSystemFactoryCustodyV6 {
                 .sources
                 .owner
                 .check_native_admission(parent, &owner.admission)
-                .map_err(|_| {
+                .map_err(|cause| {
                     fail(
                         FailureKind::BackendUnavailable,
-                        "PALS original post-image admission is unavailable",
+                        "PALS native source or parent admission failed",
                     )
+                    .with_external_cause(CauseCode::ModelLoad, &cause)
                 })?;
             let runtime = rz_eval::onnx::OrtRuntime::load_system_cuda_with_entry(system, || {
                 entry.mark_native_entered()
@@ -566,11 +567,12 @@ impl PalsSystemFactoryCustodyV6 {
             &mut || {
                 source_owner
                     .check_native_admission(parent, &admission)
-                    .map_err(|_| {
+                    .map_err(|cause| {
                         fail(
                             FailureKind::BackendUnavailable,
-                            "PALS original post-image admission is unavailable",
+                            "PALS native source or parent admission failed",
                         )
+                        .with_external_cause(CauseCode::ModelLoad, &cause)
                     })?;
                 entry.mark_native_entered();
                 Ok(())
