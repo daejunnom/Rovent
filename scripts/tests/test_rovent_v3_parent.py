@@ -18,7 +18,7 @@ import rovent_v3_parent as parent
 
 
 FAKE_CHILD = r'''
-import json, os, socket, sys
+import json, os, socket, sys, time
 from pathlib import Path
 
 def option(prefix):
@@ -28,6 +28,26 @@ epoch = int(option("--process-epoch="))
 lock = option("--test-lock=")
 variant = option("--test-variant=")
 pid = os.getpid()
+if variant in ("admission_before", "admission_tail", "admission_unobserved"):
+    # The test parent creates this marker only after its real /proc image
+    # observation; do not assume an image-observation time interval.
+    deadline = time.monotonic() + 5
+    while variant != "admission_unobserved" and not Path("image-observed").exists():
+        if time.monotonic() >= deadline:
+            sys.exit(4)
+        time.sleep(0.005)
+    evidence = {"schema":"rz-rovent-resource-pre-native-admission/1",
+        "process_id":pid, "process_generation":epoch,
+        "reason":"resource_plan_provenance", "native_scope_started":False}
+    print(json.dumps({"schema":"rz-rovent-native-system-resource-run-failure/3",
+        "resource_state_poisoned":False, "control_panic_payload_retained":False,
+        "automatic_cleanup":False, "training_executed":False, "product_finish":None,
+        "session_evidence":"scope_unavailable", "pre_native_admission":evidence}),
+        file=sys.stderr, flush=True)
+    if variant == "admission_tail":
+        sys.stderr.write('{"schema":')
+        sys.stderr.flush()
+    sys.exit(1)
 directory = Path("fake-control")
 directory.mkdir()
 fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -52,6 +72,16 @@ assert request == {"schema":"rz-rovent-parent-admission/1", "child_pid":pid,
 ack = dict(request, schema="rz-rovent-parent-admission-ack/1",
     scope="parent-child-connection-not-gpu-fence")
 channel.sendall(json.dumps(ack).encode() + b"\n")
+if variant == "factory_before":
+    evidence = {"schema":"rz-rovent-factory-pre-native-observation/1", "process_id":pid,
+        "process_generation":epoch, "input_lock_sha256":lock, "resource_scope_started":True,
+        "native_entry":"not_entered_by_original_factory", "physical_completion":"not_inferred"}
+    print(json.dumps({"schema":"rz-rovent-native-system-resource-run-failure/3",
+        "resource_state_poisoned":False, "control_panic_payload_retained":False,
+        "automatic_cleanup":False, "training_executed":False, "product_finish":None,
+        "session_evidence":"before_native", "factory_pre_native":evidence}),
+        file=sys.stderr, flush=True)
+    sys.exit(1)
 commands = []
 for command in sys.stdin:
     command = command.strip()
@@ -90,6 +120,26 @@ sys.exit(2 if variant in ("failure", "unknown") else 0)
 
 
 class NoticeTests(unittest.TestCase):
+    def test_typed_before_native_evidence_requires_original_identity_and_scope(self):
+        pid, epoch, lock = 123, 19, hashlib.sha256(os.urandom(32)).hexdigest()
+        common = {"schema": "rz-rovent-native-system-resource-run-failure/3",
+                  "resource_state_poisoned": False, "control_panic_payload_retained": False,
+                  "automatic_cleanup": False, "training_executed": False, "product_finish": None}
+        admission = {"schema": "rz-rovent-resource-pre-native-admission/1", "process_id": pid,
+                     "process_generation": epoch, "reason": "resource_plan_provenance",
+                     "native_scope_started": False}
+        record = {**common, "session_evidence": "scope_unavailable", "pre_native_admission": admission}
+        self.assertEqual(parent._pre_native_evidence(record, pid, epoch, lock), "resource_admission_before_scope")
+        self.assertIsNone(parent._pre_native_evidence(record, pid + 1, epoch, lock))
+        self.assertIsNone(parent._pre_native_evidence({**record, "resource_state_poisoned": True}, pid, epoch, lock))
+        factory = {"schema": "rz-rovent-factory-pre-native-observation/1", "process_id": pid,
+                   "process_generation": epoch, "input_lock_sha256": lock, "resource_scope_started": True,
+                   "native_entry": "not_entered_by_original_factory", "physical_completion": "not_inferred"}
+        record = {**common, "session_evidence": "before_native", "factory_pre_native": factory}
+        self.assertEqual(parent._pre_native_evidence(record, pid, epoch, lock), "factory_before_native")
+        self.assertIsNone(parent._pre_native_evidence(record, pid, epoch, "other-lock"))
+        self.assertIsNone(parent._pre_native_evidence({**record, "pre_native_admission": admission}, pid, epoch, lock))
+
     def test_notice_requires_exact_original_identity_and_route(self):
         pid, epoch, lock = 123, 19, hashlib.sha256(os.urandom(32)).hexdigest()
         notice = {"schema": parent.NOTICE_SCHEMA, "process_id": pid, "process_epoch": epoch,
@@ -192,6 +242,73 @@ class ParentCpuFixtureTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed_or_incomplete")
         self.assertEqual(result["error_type"], "child_resource_run_failed")
 
+    def test_contained_typed_pre_native_failures_finish_without_fabricating_session(self):
+        import multiprocessing
+        for variant, expected in (("admission_before", "resource_admission_before_scope"),
+                                  ("factory_before", "factory_before_native")):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                command, output = self.command(root, variant)
+                args = argparse_namespace_for_cancel(Path(command[3]), root, output)
+                # Reuse the exact fixture CLI values while running the parent
+                # in a bounded child so a regression cannot hang this suite.
+                args.binary = Path(command[3])
+                args.binary_bytes = int(command[5])
+                args.binary_sha256 = command[7]
+                args.epoch = int(command[13])
+                args.lock_sha256 = command[15]
+                args.seconds = 8
+                args.cleanup_seconds = 2
+                args.native_args = command[command.index("--") + 1:]
+                context = multiprocessing.get_context("fork")
+                result_queue = context.Queue()
+                process = context.Process(target=_run_fixture_with_containment, args=(args, result_queue))
+                process.start()
+                process.join(15)
+                try:
+                    self.assertFalse(process.is_alive(), "before-native fixture retained an owner")
+                    result, outcome, report = result_queue.get(timeout=2)
+                    self.assertEqual(result, 1)
+                    self.assertTrue(outcome["before_native"])
+                    self.assertFalse(outcome["session_reported"])
+                    self.assertEqual(outcome["pre_native_evidence"], expected)
+                    self.assertEqual(outcome["stderr_tail"], "none")
+                    self.assertEqual(outcome["output_drain"], "eof_observed")
+                    self.assertEqual(report["physical_completion"], "native_not_entered_by_original_product")
+                    self.assertEqual(report["gpu_device_fence"], "not_observed")
+                    self.assertEqual(report["error_type"], "child_resource_run_failed")
+                finally:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(5)
+                    result_queue.close()
+
+    def test_pre_native_requires_observed_image_and_complete_stderr(self):
+        import multiprocessing
+        for variant in ("admission_tail", "admission_unobserved"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                command, output = self.command(root, variant)
+                args = argparse_namespace_for_cancel(Path(command[3]), root, output)
+                args.binary_bytes, args.binary_sha256 = int(command[5]), command[7]
+                args.epoch, args.lock_sha256 = int(command[13]), command[15]
+                args.seconds, args.cleanup_seconds = 8, 2
+                args.native_args = command[command.index("--") + 1:]
+                context = multiprocessing.get_context("fork")
+                result_queue = context.Queue()
+                process = context.Process(target=_run_fixture_with_containment, args=(args, result_queue))
+                process.start()
+                try:
+                    kind, _, report = result_queue.get(timeout=12)
+                    self.assertEqual(kind, "quarantined")
+                    self.assertEqual(report["physical_completion"], "unknown")
+                    self.assertTrue(process.is_alive(), "unproven owner must stay retained")
+                finally:
+                    if process.is_alive():
+                        process.kill()  # CPU-only fixture owner, never a GPU process.
+                    process.join(5)
+                    result_queue.close()
+
     def test_unobserved_session_keeps_original_owner_after_cpu_fixture_exits(self):
         # The child here is a CPU-only Python fixture. Forced test cleanup is
         # confined to this fixture and is not a GPU completion procedure.
@@ -245,6 +362,45 @@ def argparse_namespace_for_cancel(binary, root, output):
                      "--input-lock=inputs/lock", "--resource-plan=inputs/plan",
                      "--resource-plan-sha256=unused", "--resource-plan-bytes=1"],
     )
+
+
+def _run_fixture_with_containment(args, result_queue):
+    class FixtureContainment:
+        admission_outcome = "not_attempted"
+
+        def admit_waiting_child(self, _pid, fd):
+            self.admission_outcome = "granted"
+            os.write(fd, b"R")
+            os.close(fd)
+
+        def workload_empty(self):
+            return True
+
+    outcome = {}
+    reports = []
+    def capture_report(value):
+        reports.append(value)
+        if value.get("status") == "quarantined_original_owner_retained":
+            result_queue.put(("quarantined", {}, value))
+
+    parent._report = capture_report
+    real_stat = os.stat
+
+    def observe_image(path, *positional, **keywords):
+        if ("--test-variant=admission_unobserved" in args.native_args
+                and isinstance(path, str) and path.startswith("/proc/") and path.endswith("/exe")):
+            raise FileNotFoundError("fixture image was not observed")
+        result = real_stat(path, *positional, **keywords)
+        if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/exe"):
+            (Path(args.cwd) / "image-observed").touch()
+        return result
+
+    try:
+        with mock.patch.object(parent.os, "stat", side_effect=observe_image):
+            result = parent.run(args, containment=FixtureContainment(), outcome=outcome)
+        result_queue.put((result, outcome, reports[-1]))
+    except BaseException as error:
+        result_queue.put(("error", {"error_type": type(error).__name__}, {}))
 
 
 if __name__ == "__main__":

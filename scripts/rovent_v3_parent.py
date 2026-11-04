@@ -81,6 +81,47 @@ def _exit_observed(pid):
     return status is not None and status.si_pid == pid
 
 
+def _pre_native_evidence(value, pid, epoch, lock_sha256):
+    """Decode only the original V3 producer's typed before-native records.
+
+    The admission record has no input-lock digest; the caller retains that
+    limitation rather than treating it as a factory or device-fence proof.
+    """
+    if (not isinstance(value, dict)
+            or value.get("schema") != "rz-rovent-native-system-resource-run-failure/3"
+            or value.get("resource_state_poisoned") is not False
+            or value.get("control_panic_payload_retained") is not False
+            or value.get("automatic_cleanup") is not False
+            or value.get("training_executed") is not False
+            or value.get("product_finish") is not None):
+        return None
+    admission = value.get("pre_native_admission")
+    factory = value.get("factory_pre_native")
+    if (admission is None) == (factory is None):
+        return None
+    observation = admission if admission is not None else factory
+    if (not isinstance(observation, dict)
+            or type(observation.get("process_id")) is not int or observation["process_id"] != pid
+            or type(observation.get("process_generation")) is not int
+            or observation["process_generation"] != epoch):
+        return None
+    if admission is not None:
+        if (observation.get("schema") == "rz-rovent-resource-pre-native-admission/1"
+                and observation.get("reason") == "resource_plan_provenance"
+                and observation.get("native_scope_started") is False
+                and value.get("session_evidence") == "scope_unavailable"):
+            return "resource_admission_before_scope"
+        return None
+    if (observation.get("schema") == "rz-rovent-factory-pre-native-observation/1"
+            and observation.get("input_lock_sha256") == lock_sha256
+            and observation.get("resource_scope_started") is True
+            and observation.get("native_entry") == "not_entered_by_original_factory"
+            and observation.get("physical_completion") == "not_inferred"
+            and value.get("session_evidence") == "before_native"):
+        return "factory_before_native"
+    return None
+
+
 def run(args, *, containment=None, started=None, outcome=None):
     started = time.monotonic() if started is None else started
     run_until = started + args.seconds
@@ -128,6 +169,9 @@ def run(args, *, containment=None, started=None, outcome=None):
     line_overflow = {"stdout": False, "stderr": False}
     log_write_errors = {}
     product_finish = None
+    pre_native_evidence = None
+    pre_native_conflicting = False
+    pre_native_accepted = False
     cancelled = False
     previous_handlers = {}
 
@@ -152,6 +196,7 @@ def run(args, *, containment=None, started=None, outcome=None):
 
     def line(name, raw):
         nonlocal notice_seen, pending_route, error, state, quarantine_notice, product_finish
+        nonlocal pre_native_evidence, pre_native_conflicting
         text = raw.decode("utf-8", errors="replace").strip()
         if name == "stderr" and raw.startswith(b"{"):
             try:
@@ -177,6 +222,12 @@ def run(args, *, containment=None, started=None, outcome=None):
                 failed_receipt = value.get("schema") == "rz-rovent-native-system-resource-run-failure/3"
                 if failed_receipt:
                     error = error or "child_resource_run_failed"
+                    observed = _pre_native_evidence(value, process.pid, args.epoch, args.lock_sha256)
+                    if observed is not None:
+                        if pre_native_evidence is not None:
+                            pre_native_conflicting = True
+                        else:
+                            pre_native_evidence = observed
                 finish = value.get("product_finish")
                 if (authenticated and image_verified and not quarantine_notice
                         and (failed_receipt or (type(value.get("process_id")) is int and value["process_id"] == process.pid
@@ -323,12 +374,30 @@ def run(args, *, containment=None, started=None, outcome=None):
                     # after this original product reports session finish and
                     # the same process group has no live members.
                     workload_empty = containment is None or containment.workload_empty()
-                    if product_finish is not None and not _group_has_live_members(process.pid) and workload_empty:
+                    # A pre-native producer record is useful only for the
+                    # same pinned image and a fully drained, contained child.
+                    # An admission record predates parent authentication and
+                    # does not itself bind an input-lock digest.
+                    accepted_pre_native = (
+                        containment is not None and pre_native_evidence is not None
+                        and not pre_native_conflicting and not quarantine_notice
+                        and image_verified and not readers_open
+                        and not line_overflow["stderr"] and not log_truncated["stderr"]
+                        and not pending["stderr"]
+                        and (pre_native_evidence != "factory_before_native" or authenticated)
+                    )
+                    if ((product_finish is not None or accepted_pre_native)
+                            and not _group_has_live_members(process.pid) and workload_empty):
                         process.wait()
                         owner_reaped = True
+                        pre_native_accepted = accepted_pre_native and product_finish is None
                         if outcome is not None:
-                            outcome.update(session_reported=True, group_gone=True,
-                                           workload_empty=workload_empty)
+                            outcome.update(session_reported=product_finish is not None,
+                                           before_native=pre_native_accepted,
+                                           pre_native_evidence=pre_native_evidence if pre_native_accepted else None,
+                                           stderr_tail="incomplete_line" if pending["stderr"] else "none",
+                                           output_drain="unknown_trailing_bytes" if output_drain_unknown else "eof_observed",
+                                           group_gone=True, workload_empty=workload_empty)
                         break
                     if not quarantine_reported:
                         quarantine_reported = True
@@ -447,7 +516,13 @@ def run(args, *, containment=None, started=None, outcome=None):
                  "uci": evidence, "stdout_bytes": bytes_seen["stdout"], "stderr_bytes": bytes_seen["stderr"],
                  "quarantine_observed": quarantine_notice,
                  "output_drain": "unknown_trailing_bytes" if output_drain_unknown else "eof_observed",
-                 "physical_completion": "session_reported_by_original_product",
+                 "stderr_tail": "incomplete_line" if pending["stderr"] else "none",
+                 "physical_completion": ("native_not_entered_by_original_product"
+                                         if pre_native_accepted else "session_reported_by_original_product"),
+                 "pre_native_evidence": pre_native_evidence if pre_native_accepted else None,
+                 "pre_native_lock_binding": ("not_in_admission_record" if pre_native_accepted
+                                             and pre_native_evidence == "resource_admission_before_scope"
+                                             else "factory_reported" if pre_native_accepted else "not_applicable"),
                  "move_legality": "not_evaluated", "log_truncated": log_truncated,
                  "line_overflow": line_overflow, "log_write_errors": log_write_errors,
                  "numeric_acceptance": "not_evaluated", "gpu_device_fence": "not_observed",
@@ -513,6 +588,17 @@ def run(args, *, containment=None, started=None, outcome=None):
         if channel is not None:
             channel.close()
         selector.close()
+        # Popen's PIPE objects outlive the selector. Close them only after the
+        # original child was actually waited; unresolved owners stay in the
+        # quarantine loop above with their transport intact.
+        if process is not None and process.returncode is not None:
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError as close_error:
+                        _report({"schema": REPORT_SCHEMA, "status": "stdio_close_failed",
+                                 "error_type": type(close_error).__name__})
         for stream in streams.values():
             stream.close()
         if binary_fd is not None:
@@ -889,7 +975,8 @@ def run_managed(plan_path):
         native_attempted = True
         native_outcome["spawned"] = False
         result = run(smoke, containment=owner, started=started, outcome=native_outcome)
-        original_child_unsettled = not (native_outcome.get("session_reported") is True
+        original_child_unsettled = not ((native_outcome.get("session_reported") is True
+                                         or native_outcome.get("before_native") is True)
                                         and native_outcome.get("group_gone") is True
                                         and native_outcome.get("workload_empty") is True)
         if original_child_unsettled:
@@ -898,7 +985,14 @@ def run_managed(plan_path):
             "schema": "rz-rovent-v3-managed-parent-observation/1",
             "output": str(output), "input_lock_sha256": lock_sha,
             "smoke_result": result,
-            "session": "reported_by_original_product",
+            "session": ("not_entered_by_original_product" if native_outcome.get("before_native")
+                        else "reported_by_original_product"),
+            "pre_native_evidence": native_outcome.get("pre_native_evidence"),
+            "pre_native_lock_binding": ("not_in_admission_record"
+                                        if native_outcome.get("pre_native_evidence") == "resource_admission_before_scope"
+                                        else "factory_reported" if native_outcome.get("before_native") else "not_applicable"),
+            "stderr_tail": native_outcome.get("stderr_tail", "unknown"),
+            "output_drain": native_outcome.get("output_drain", "unknown"),
             "original_process_group": "no_live_members_observed",
             "original_workload_cgroup": "empty_observed",
             "gpu_device_fence": "not_observed",
@@ -927,7 +1021,9 @@ def run_managed(plan_path):
         lease.finish(status=finish_status, tree_gone=True)
         lease_observation = lease.live_finish_observation()
         _report({"schema": "rz-rovent-v3-managed-parent-result/1", "output": str(output),
-                 "smoke_result": result, "session": "reported_by_original_product",
+                 "smoke_result": result, "session": ("not_entered_by_original_product"
+                 if native_outcome.get("before_native") else "reported_by_original_product"),
+                 "pre_native_evidence": native_outcome.get("pre_native_evidence"),
                  "gpu_device_fence": "not_observed", "lease_finish": lease_observation["phase"],
                  "lease_marker": str(output / ".rovezero-output.json"),
                  "managed_observation": str(receipt_path) if receipt_error is None else None,
