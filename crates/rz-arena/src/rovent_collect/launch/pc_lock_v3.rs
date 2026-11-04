@@ -1044,7 +1044,7 @@ impl PreparedPcCollectionInputsV3 {
         deadline: Instant,
     ) -> Result<Self, ArenaError> {
         check(
-            observation.matches_plan(plan_pin.bytes, &plan_pin.sha256),
+            observation.matches_plan(&plan_pin.path, plan_pin.bytes, &plan_pin.sha256),
             "Collection /3 original observed plan differs",
         )?;
         observation.verify_live(deadline).map_err(io)?;
