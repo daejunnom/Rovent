@@ -399,6 +399,12 @@ impl PcCollectionRunV3 {
         if !self.joined_offered && self.pending_joined.is_none() {
             self.pending_joined = self.try_join_driver()?;
         }
+        if !self.joined_offered && self.pending_joined.is_none() {
+            // Even a pre-auth native failure can leave this separately
+            // registered driver in Prepared/NoWorker custody. Its explicit
+            // proof-and-release path is distinct from a native result.
+            return Ok(None);
+        }
         if let Some(proof) = self.pending_joined.take() {
             if let Err(proof) = self.outcome.offer_joined_driver(&self.owners, proof) {
                 self.pending_joined = Some(proof);
