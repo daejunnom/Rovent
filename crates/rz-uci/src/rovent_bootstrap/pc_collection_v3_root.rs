@@ -763,7 +763,7 @@ mod admission_observation_tests {
         context.cancellation.cancel();
         assert!(matches!(
             crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
-            Ok(false)
+            Err(RoventV3FrontierAttachFailure::Rejected(error)) if error.code == "RootCanceled"
         ));
         drop(lock);
     }
@@ -775,7 +775,7 @@ mod admission_observation_tests {
         let lock = context.current.lock().expect("original authority");
         assert!(matches!(
             crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
-            Ok(false)
+            Err(RoventV3FrontierAttachFailure::Rejected(error)) if error.code == "RootDeadline"
         ));
         drop(lock);
     }
@@ -790,7 +790,7 @@ mod admission_observation_tests {
         context.control.cancellation.store(true, Ordering::Release);
         assert!(matches!(
             crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
-            Ok(false)
+            Err(RoventV3FrontierAttachFailure::Rejected(error)) if error.code == "RootCanceled"
         ));
         context.control.cancellation.store(false, Ordering::Release);
         let mut replacement = context.authority;
@@ -798,7 +798,7 @@ mod admission_observation_tests {
         *context.current.lock().expect("original authority") = SessionScope::Search(replacement);
         assert!(matches!(
             crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
-            Ok(false)
+            Err(RoventV3FrontierAttachFailure::Rejected(error)) if error.code == "RootAuthorityClosed"
         ));
     }
 
