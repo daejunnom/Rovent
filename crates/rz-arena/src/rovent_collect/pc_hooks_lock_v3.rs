@@ -8,7 +8,7 @@ use super::teacher::v3_pump::TeacherPumpV3;
 use super::teacher::v3_session::TeacherSessionStagingV3;
 use super::native_capture::RoventNativeCaptureRegistration;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
-use super::pc_worker_v3::{ClaimedUnstartedPollV3, PcRootRecoveryV3};
+use super::pc_worker_v3::{ClaimedUnstartedPollV3, PcConsumerRetirementV3, PcRootRecoveryV3};
 use super::{ArenaError, invalid};
 use rz_uci::pals_adaptive::{AdaptiveCollectionBoundaryV2, AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3,
     AdaptiveManagerError, RoventCollectionRootAdmissionV3, RoventNoCaptureRootCapabilityV3,
@@ -95,6 +95,7 @@ pub(crate) struct RoventTeacherRouteRetirementV3 {
     ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
     route: SpeculativeRootV3,
     pump: Arc<Mutex<TeacherPumpV3>>,
+    recovery: Arc<Mutex<PcRootRecoveryV3>>,
 }
 
 impl RoventTeacherRouteRetirementV3 {
@@ -103,8 +104,9 @@ impl RoventTeacherRouteRetirementV3 {
         ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
         route: SpeculativeRootV3,
         pump: Arc<Mutex<TeacherPumpV3>>,
+        recovery: Arc<Mutex<PcRootRecoveryV3>>,
     ) -> Result<Option<Self>, ArenaError> {
-        let proof = Self { ledger, route, pump };
+        let proof = Self { ledger, route, pump, recovery };
         match proof.matches_original_route(&proof.route)? {
             Some(true) => Ok(Some(proof)),
             Some(false) | None => Ok(None),
@@ -126,6 +128,22 @@ impl RoventTeacherRouteRetirementV3 {
         };
         let Some(root) = ledger.roots.iter().find(|root|
             self.route.matches_admission(&root.admission)) else { return Ok(Some(false)); };
+        {
+            let recovery = match self.recovery.try_lock() {
+                Ok(value) => value,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 original consumer custody poisoned")),
+            };
+            if !recovery.matches_admission(&root.admission)
+                || !recovery.matches_route_pump(&self.route, &self.pump) {
+                return Ok(Some(false));
+            }
+            match recovery.consumer_route_retirement() {
+                PcConsumerRetirementV3::Ready => {},
+                PcConsumerRetirementV3::Pending | PcConsumerRetirementV3::Rejected
+                | PcConsumerRetirementV3::Unknown => return Ok(Some(false)),
+            }
+        }
         if root.worker_reserved || root.teacher_reserved { return Ok(Some(false)); }
         let Some(joined_owner) = &root.joined else { return Ok(Some(false)); };
         let joined = match joined_owner.try_lock() {
@@ -769,13 +787,36 @@ impl RoventPcCollectionBridgeV3 {
         if slot.route_retirement.is_some() { return Ok(true); }
         let Some(route) = slot.route.as_ref() else { return Ok(false); };
         let Some(pump) = slot.pump.as_ref() else { return Ok(false); };
+        let Some(recovery) = slot.recovery.as_ref() else { return Ok(false); };
         let Some(proof) = RoventTeacherRouteRetirementV3::try_prepare(
-            Arc::clone(&self.ledger), route.clone(), Arc::clone(pump),
+            Arc::clone(&self.ledger), route.clone(), Arc::clone(pump), Arc::clone(recovery),
         )? else { return Ok(false); };
         match self.registration.try_unlink_finished_speculative_root_v3(route, &proof)? {
             Some(true) => { slot.route_retirement = Some(proof); Ok(true) }
             Some(false) | None => Ok(false),
         }
+    }
+
+    /// Keep consumer semantic rejection and unknown distinct from physical
+    /// teacher/native evidence and from this route's separate unlink status.
+    pub(crate) fn try_consumer_retirement(
+        &self, admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<PcConsumerRetirementV3>, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(invalid("P-C V3 root custody poisoned")),
+        };
+        let slot = state.roots.iter().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or_else(|| invalid("P-C V3 consumer root absent"))?;
+        let Some(recovery) = &slot.recovery else { return Ok(None); };
+        let recovery = match recovery.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(invalid("P-C V3 consumer recovery poisoned")),
+        };
+        if !recovery.matches_admission(admission) { return Err(invalid("P-C V3 consumer root differs")); }
+        Ok(Some(recovery.consumer_route_retirement()))
     }
 }
 
