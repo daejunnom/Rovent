@@ -785,7 +785,7 @@ mod linux {
         bounded.cleanup_until = bounded.until + Duration::from_secs(1);
         verify_binary_descriptor(&artifact, &file, &bounded).unwrap();
 
-        artifact.sha256 = "0".repeat(64);
+        artifact.sha256 = hex(Sha256::digest(b"different declared payload").into());
         assert_eq!(
             verify_binary_descriptor(&artifact, &file, &bounded)
                 .unwrap_err()
