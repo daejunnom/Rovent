@@ -746,7 +746,15 @@ impl RoventNnuecCollectionBridgeV2 {
                 self.defer_before_start(port, admission, reason)
             }
             Ok(super::collection_hooks_core_v2::CoreUnstartedSealV2::Busy) => {
-                Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission })
+                // Contention on the original attempt lock does not prove
+                // that its observer installation has not started. A later
+                // admission has not entered this original bridge, however,
+                // and must not be revoked as though it owned that attempt.
+                if original.same_original_admission(&admission) {
+                    Ok(RoventNnuecCollectionAdmissionOutcomeV2::PendingUncertain { admission })
+                } else {
+                    Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission })
+                }
             }
             Ok(super::collection_hooks_core_v2::CoreUnstartedSealV2::Unknown) => {
                 Err(RoventNnuecCollectionAdmissionFailureV2 {
