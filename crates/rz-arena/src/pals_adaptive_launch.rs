@@ -35,6 +35,8 @@ pub use numerical::*;
 pub use numerical::{pals_numerical_input_tensors_v5, pals_numerical_tensor_digest_v5};
 pub use storage::*;
 #[cfg(target_os = "linux")]
+pub(crate) use system_v6::DirectSmokeBinding;
+#[cfg(target_os = "linux")]
 pub(crate) use system_v6::PalsV6RoleSockets;
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::verify_original_proxy_snapshots;
@@ -43,6 +45,8 @@ pub use system_v6::*;
 pub(crate) use system_v6::{CancelSourceObservation, compiled_cancel_source_observation};
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
+#[cfg(target_os = "linux")]
+pub(crate) use system_v6::{SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation};
 
 pub const PALS_ARENA_V5_DOMAIN: &str = "rz-pals-arena-launch-v5/1";
 pub const PALS_STAGING_BYTES_V5: u64 = 18 << 30;

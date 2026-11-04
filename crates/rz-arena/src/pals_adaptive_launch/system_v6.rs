@@ -23,8 +23,16 @@ pub(crate) use invocation::PalsV6RoleSockets;
 pub(crate) use proxy_entry_smoke::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEIPT_FILE};
 #[cfg(target_os = "linux")]
 mod deadline_control;
+#[cfg(target_os = "linux")]
+pub(crate) use deadline_control::{
+    SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation,
+};
 mod deadline_grant;
 mod deadline_sources;
+#[cfg(target_os = "linux")]
+mod direct_smoke_launch;
+#[cfg(target_os = "linux")]
+pub(crate) use direct_smoke_launch::DirectSmokeBinding;
 mod execution_start;
 mod pair;
 mod pair_native;

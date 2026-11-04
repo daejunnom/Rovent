@@ -11,7 +11,7 @@ use crate::{ArenaError, NativeLaunchOwner};
 use rz_experiments::{NativeEngineRole, NativeRuntimeSourceV6};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
-use std::sync::Arc;
+use std::{os::unix::fs::MetadataExt, sync::Arc};
 
 const SPEC_DOMAIN: &str = "rz-pals-proxy-entry-functional-smoke-spec/1";
 const LOCK_DOMAIN: &str = "rz-pals-proxy-entry-functional-smoke-lock/1";
@@ -93,6 +93,9 @@ pub(crate) struct ProxyEntryFunctionalSmokeReceiptV1 {
 /// serializable declaration. No `Instant` crosses the process boundary.
 pub(crate) struct ProxyEntryFunctionalSmokeOwnerV1 {
     execution: Arc<PalsV6ExecutionStart>,
+    identity: Arc<()>,
+    cwd_device: u64,
+    cwd_inode: u64,
     lock: ProxyEntryFunctionalSmokeLockV1,
     receipt: ProxyEntryFunctionalSmokeReceiptV1,
 }
@@ -187,8 +190,33 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
     &[
         ("arena_smoke", include_bytes!("proxy_entry_smoke.rs")),
         (
+            "arena_smoke_deadline",
+            include_bytes!("smoke_deadline_control.rs"),
+        ),
+        (
+            "arena_direct_smoke_launch",
+            include_bytes!("direct_smoke_launch.rs"),
+        ),
+        ("arena_process", include_bytes!("../../process.rs")),
+        (
+            "smoke_grant_wire",
+            include_bytes!("../../../../rz-contracts/src/pals/proxy_entry_smoke_grant_v1.rs"),
+        ),
+        (
             "proxy_smoke",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_v1.rs"),
+        ),
+        (
+            "proxy_no_game_smoke",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/proxy_entry_no_game_smoke_v1.rs"
+            ),
+        ),
+        (
+            "proxy_smoke_grant_channel",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_channel_v1.rs"
+            ),
         ),
         (
             "proxy_module",
@@ -300,6 +328,11 @@ impl ProxyEntryFunctionalSmokeOwnerV1 {
             .ok_or_else(|| invalid("smoke proxy sidecar missing"))?;
         sidecar.validate_for_pair(pair)?;
         PalsV6EndpointSnapshot::from_original(owner, role)?;
+        let cwd = owner
+            .snapshot
+            .cwd
+            .metadata()
+            .map_err(|_| invalid("smoke original cwd metadata unavailable"))?;
         let sidecar_sha256 = pair
             .proxy_inputs_sha256()
             .ok_or_else(|| invalid("smoke registered proxy sidecar digest missing"))?;
@@ -362,6 +395,9 @@ impl ProxyEntryFunctionalSmokeOwnerV1 {
         let receipt = ProxyEntryFunctionalSmokeReceiptV1::new(spec_sha256.clone());
         Ok(Self {
             execution: Arc::clone(execution),
+            identity: Arc::new(()),
+            cwd_device: cwd.dev(),
+            cwd_inode: cwd.ino(),
             lock: ProxyEntryFunctionalSmokeLockV1 {
                 domain: LOCK_DOMAIN.into(),
                 spec,
@@ -379,6 +415,50 @@ impl ProxyEntryFunctionalSmokeOwnerV1 {
     }
     pub(crate) fn execution(&self) -> &Arc<PalsV6ExecutionStart> {
         &self.execution
+    }
+
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+
+    /// Reconnect only to the same original execution allocation and cwd.
+    /// This checks the declaration and snapshot, not a child/game identity.
+    pub(crate) fn verify_original_binding(
+        &self,
+        owner: &NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
+        execution: &Arc<PalsV6ExecutionStart>,
+        role: NativeEngineRole,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+    ) -> Result<(), ArenaError> {
+        self.lock.verify()?;
+        let pair = owner.spec();
+        let endpoint = pair.endpoint(role);
+        let expected_role = match role {
+            NativeEngineRole::Baseline => "baseline",
+            NativeEngineRole::Candidate => "candidate",
+        };
+        let id: String = owner_id.iter().map(|b| format!("{b:02x}")).collect();
+        let cwd = owner
+            .snapshot
+            .cwd
+            .metadata()
+            .map_err(|_| invalid("smoke original cwd metadata unavailable"))?;
+        if !Arc::ptr_eq(&self.execution, execution)
+            || !execution.matches_deadline_identity(owner_id, owner_epoch)
+            || (cwd.dev(), cwd.ino()) != (self.cwd_device, self.cwd_inode)
+            || pair.sha256() != self.lock.spec.pair_sha256
+            || pair.proxy_inputs_sha256() != Some(self.lock.spec.proxy_sidecar_sha256.as_str())
+            || self.lock.spec.declared_role != expected_role
+            || self.lock.spec.owner_id_hex != id
+            || self.lock.spec.owner_epoch != owner_epoch
+            || self.lock.spec.process_generation != endpoint.startup_lock.config.process_generation
+            || self.lock.spec.startup_lock_sha256 != endpoint.startup_lock.canonical_sha256
+        {
+            return Err(invalid("smoke original owner or endpoint differs"));
+        }
+        PalsV6EndpointSnapshot::from_original(owner, role)?;
+        Ok(())
     }
 
     /// This records an unverified claim, never authoritative process evidence.

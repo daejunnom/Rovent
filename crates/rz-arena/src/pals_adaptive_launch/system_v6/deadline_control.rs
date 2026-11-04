@@ -28,6 +28,12 @@ use std::{
     time::Instant,
 };
 
+#[path = "smoke_deadline_control.rs"]
+mod smoke_deadline_control;
+pub(crate) use smoke_deadline_control::{
+    SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation,
+};
+
 const MAX_ADMISSIONS: usize = 256;
 
 fn failure(stage: &'static str) -> ArenaError {
