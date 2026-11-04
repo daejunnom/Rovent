@@ -8,7 +8,8 @@ use super::{
     PalsImageGrantObservationV6, PalsProxyBinaryPinV6, PalsProxyLaunchV6,
     finish::{self, PalsRuntimeFinishClaimV6, PalsSessionReleaseClaimV6},
     relay::{
-        PalsUciRelayV6, RelayInputCleanupStartV6, RelayInputCleanupStopV6, RelayPipeObservationV6,
+        PalsUciRelayV6, RelayInputCleanupReportV6, RelayInputCleanupStartV6,
+        RelayInputCleanupStopV6, RelayPipeObservationV6,
     },
 };
 use std::{
@@ -342,24 +343,67 @@ impl PalsProxySupervisorV6 {
     /// Joining relay threads is not child or GPU completion. A timeout keeps
     /// every unjoined thread and original pipe in the same relay owner.
     pub(super) fn join_relay_until(&mut self, until: Instant) -> bool {
-        let now = Instant::now();
-        match &mut self.relay {
-            Some(relay) => {
-                if self.cancelled.load(Ordering::Acquire) || now >= self.run_until {
-                    relay.cancel_input();
-                }
-                let until = until.min(self.finish_until);
-                // Wake the supervisor no later than the input deadline so it
-                // can stop input while output continues through cleanup.
-                let until = if now < self.run_until {
-                    until.min(self.run_until)
-                } else {
-                    until
-                };
-                relay.join_until(until)
+        let until = until.min(self.finish_until);
+        loop {
+            if self.poll().is_err() {
+                return false;
             }
-            None => true,
+            let now = Instant::now();
+            let Some(relay) = self.relay.as_mut() else {
+                return true;
+            };
+            let step = now
+                .checked_add(Duration::from_millis(5))
+                .unwrap_or(until)
+                .min(until);
+            if relay.join_until(step) {
+                // A worker can finish during join after the previous poll
+                // reported WaitingForInputJoin. Poll again so its original
+                // writer gets a cleanup opportunity before declaring relay
+                // threads settled.
+                if self.poll().is_err() {
+                    return false;
+                }
+                let waiting_for_writer = matches!(
+                    self.input_cleanup_start,
+                    Some(RelayInputCleanupStartV6::WaitingForInputJoin)
+                );
+                let settled = self
+                    .relay
+                    .as_mut()
+                    .is_none_or(|relay| relay.join_until(Instant::now()));
+                if !waiting_for_writer && settled {
+                    return true;
+                }
+            }
+            if Instant::now() >= until {
+                return false;
+            }
         }
+    }
+
+    fn finish_read_allowed(&self) -> bool {
+        let input_retired = matches!(
+            self.input_cleanup_stop.as_ref(),
+            Some(
+                RelayInputCleanupStopV6::QuitAlreadyForwarded
+                    | RelayInputCleanupStopV6::StopAndQuitForwarded
+            )
+        );
+        let still_needs_poll = self.relay.is_some()
+            && matches!(
+                self.input_cleanup_start,
+                None | Some(RelayInputCleanupStartV6::WaitingForInputJoin)
+            );
+        !still_needs_poll && (input_retired || Instant::now() >= self.run_until)
+    }
+
+    /// The exact report retains partial byte counts, late-write facts and
+    /// panic payload. It is not evidence of child or GPU completion.
+    pub(super) fn input_cleanup_report(&mut self) -> Option<&RelayInputCleanupReportV6> {
+        self.relay
+            .as_mut()
+            .and_then(PalsUciRelayV6::poll_input_cleanup)
     }
 
     /// The stream must be an exclusive, already authenticated same-child
@@ -369,7 +413,7 @@ impl PalsProxySupervisorV6 {
         &mut self,
         stream: UnixStream,
     ) -> Result<(), UnixStream> {
-        if self.runtime_finish_attempted {
+        if self.runtime_finish_attempted || !self.finish_read_allowed() {
             return Err(stream);
         }
         self.runtime_finish_attempted = true;
@@ -409,14 +453,9 @@ impl PalsProxySupervisorV6 {
         // being supervised. Before that deadline, wait until the single
         // input writer actually forwarded quit; afterwards continue trying
         // to preserve any independent release evidence even on input error.
-        let input_retired = matches!(
-            self.input_cleanup_stop.as_ref(),
-            Some(
-                RelayInputCleanupStopV6::QuitAlreadyForwarded
-                    | RelayInputCleanupStopV6::StopAndQuitForwarded
-            )
-        );
-        if !input_retired && Instant::now() < self.run_until {
+        if !self.finish_read_allowed() {
+            // Continue polling until the single input writer is recovered or
+            // a terminal cleanup state is known before blocking on a claim.
             return SessionReleaseObservationV6::NotReady;
         }
         match self

@@ -1189,7 +1189,7 @@ mod tests {
         let (source, _source_writer) = pipe().unwrap();
         let (sink_reader, sink) = pipe().unwrap();
         write(&sink, b"go ").unwrap();
-        let leg = RelayLeg::new(source, sink, Framing::UciLines, false);
+        let leg = RelayLeg::new(source, sink, Framing::UciInput, false);
         let mut slot = leg.job.lock().unwrap();
         let job = slot.as_mut().unwrap();
         job.line = b"go nodes 2\n".to_vec();
@@ -1214,7 +1214,7 @@ mod tests {
     fn cleanup_cancel_keeps_unforwarded_input_and_sends_no_control() {
         let (source, _source_writer) = pipe().unwrap();
         let (sink_reader, sink) = pipe().unwrap();
-        let leg = RelayLeg::new(source, sink, Framing::UciLines, false);
+        let leg = RelayLeg::new(source, sink, Framing::UciInput, false);
         let mut slot = leg.job.lock().unwrap();
         let job = slot.as_mut().unwrap();
         job.line = b"go nodes 7\n".to_vec();
