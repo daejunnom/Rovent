@@ -512,7 +512,7 @@ pub(super) fn publish_original_payloads_authorized<
     ) -> Result<P, ArenaError>,
     authorize: impl FnOnce() -> Result<(), ArenaError>,
 ) -> Result<P, ArenaError> {
-    publish_original_payloads_authorized_with_hook(
+    publish_original_payloads_inner(
         directory,
         until,
         cancel,
@@ -520,6 +520,7 @@ pub(super) fn publish_original_payloads_authorized<
         build,
         authorize,
         |_, _| Ok(()),
+        false,
     )
 }
 
@@ -585,13 +586,68 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
         u64,
     ) -> Result<P, ArenaError>,
     authorize: impl FnOnce() -> Result<(), ArenaError>,
-    mut hook: impl FnMut(
+    hook: impl FnMut(
         RoventPublicationHookEventV3,
         RoventPublicationHookPhaseV3,
     ) -> Result<(), ArenaError>,
 ) -> Result<P, ArenaError> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    publish_original_payloads_inner(
+        directory, until, cancel, material, build, authorize, hook, false,
+    )
+}
+
+/// Managed callers retain no-follow directory capabilities and require leaf
+/// chunk names; legacy entry points retain their previous path semantics.
+#[cfg(target_os = "linux")]
+pub(super) fn publish_original_payloads_authorized_with_managed_hook<
+    P: serde::Serialize,
+    S: PublicationSourceBytes,
+>(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    material: RoventPublicationMaterial<'_, S>,
+    build: impl FnOnce(
+        RoventPublicationFile,
+        RoventPublicationFile,
+        Vec<RoventPublicationFile>,
+        Vec<RoventPublicationAdmission>,
+        u64,
+    ) -> Result<P, ArenaError>,
+    authorize: impl FnOnce() -> Result<(), ArenaError>,
+    hook: impl FnMut(
+        RoventPublicationHookEventV3,
+        RoventPublicationHookPhaseV3,
+    ) -> Result<(), ArenaError>,
+) -> Result<P, ArenaError> {
+    publish_original_payloads_inner(
+        directory, until, cancel, material, build, authorize, hook, true,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn publish_original_payloads_inner<P: serde::Serialize, S: PublicationSourceBytes>(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    material: RoventPublicationMaterial<'_, S>,
+    build: impl FnOnce(
+        RoventPublicationFile,
+        RoventPublicationFile,
+        Vec<RoventPublicationFile>,
+        Vec<RoventPublicationAdmission>,
+        u64,
+    ) -> Result<P, ArenaError>,
+    authorize: impl FnOnce() -> Result<(), ArenaError>,
+    mut outer_hook: impl FnMut(
+        RoventPublicationHookEventV3,
+        RoventPublicationHookPhaseV3,
+    ) -> Result<(), ArenaError>,
+    managed: bool,
+) -> Result<P, ArenaError> {
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
     use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
     fn io(error: std::io::Error) -> ArenaError {
         ArenaError::Io(error.to_string())
     }
@@ -614,6 +670,42 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
             }
         }
     }
+    // Retain every managed directory capability for the entire publication.
+    // These checks observe naming around each hook; they do not exclude a
+    // concurrent rename in between observations.
+    let held = std::cell::RefCell::new(Vec::<(&'static str, cap_std::fs::Dir)>::new());
+    let check_held = || -> Result<(), ArenaError> {
+        for (name, capability) in held.borrow().iter() {
+            let original = capability
+                .try_clone()
+                .map_err(io)?
+                .into_std_file()
+                .metadata()
+                .map_err(io)?;
+            let current = directory
+                .open_dir_nofollow(name)
+                .map_err(io)?
+                .into_std_file()
+                .metadata()
+                .map_err(io)?;
+            check(
+                original.is_dir()
+                    && current.is_dir()
+                    && (original.dev(), original.ino()) == (current.dev(), current.ino()),
+                "managed publication directory binding changed",
+            )?;
+        }
+        Ok(())
+    };
+    let mut hook = |event, phase| {
+        // Always call the liveness observer even when a name check fails.
+        let before = check_held();
+        let live = outer_hook(event, phase);
+        let after = check_held();
+        before?;
+        live?;
+        after
+    };
     let active = || -> Result<(), ArenaError> {
         check(
             !cancel.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < until,
@@ -624,6 +716,7 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
     fn put(
         directory: &cap_std::fs::Dir,
         path: &str,
+        publication_path: &str,
         bytes: &[u8],
         hook: &mut impl FnMut(
             RoventPublicationHookEventV3,
@@ -633,7 +726,7 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
         use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
         use std::io::Write;
         check(
-            relative_file(path) && !bytes.is_empty(),
+            relative_file(path) && relative_file(publication_path) && !bytes.is_empty(),
             "publication owned relative payload",
         )?;
         let mut options = cap_std::fs::OpenOptions::new();
@@ -655,11 +748,20 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
             "publication payload is not regular",
         )?;
         Ok(RoventPublicationFile {
-            path: path.into(),
+            path: publication_path.into(),
             sha256: hex(Digest(Sha256::digest(bytes).into())),
             bytes: bytes.len() as u64,
         })
     }
+    let chunk_directory = if managed {
+        let value = directory.open_dir_nofollow("chunks").map_err(io)?;
+        held.borrow_mut()
+            .push(("chunks", value.try_clone().map_err(io)?));
+        check_held()?;
+        Some(value)
+    } else {
+        None
+    };
     let mut payload_bytes =
         material.manifest_bytes.len() as u64 + material.index_bytes.len() as u64;
     let mut chunks = Vec::with_capacity(material.chunks.len());
@@ -673,7 +775,22 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
         pin.validate()?;
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
-        let mut file = directory.open_with(&pin.path, &options).map_err(io)?;
+        let mut file = if let Some(chunks) = &chunk_directory {
+            let leaf = pin
+                .path
+                .strip_prefix("chunks/")
+                .ok_or_else(|| invalid("managed chunk directory differs"))?;
+            check(
+                relative_file(leaf) && !leaf.contains('/'),
+                "managed chunk is not a single leaf",
+            )?;
+            check_held()?;
+            let file = chunks.open_with(leaf, &options).map_err(io)?;
+            check_held()?;
+            file
+        } else {
+            directory.open_with(&pin.path, &options).map_err(io)?
+        };
         let metadata = file.metadata().map_err(io)?;
         check(
             metadata.is_file()
@@ -713,6 +830,16 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
         RoventPublicationHookEventV3::CreateDirectory,
         || directory.create_dir("input-locks").map_err(io),
     )?;
+    let input_directory = if managed {
+        let value = directory.open_dir_nofollow("input-locks").map_err(io)?;
+        held.borrow_mut()
+            .push(("input-locks", value.try_clone().map_err(io)?));
+        check_held()?;
+        Some(value)
+    } else {
+        None
+    };
+    let mut bundle_directory = None;
     if material
         .admissions
         .values()
@@ -723,6 +850,13 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
             RoventPublicationHookEventV3::CreateDirectory,
             || directory.create_dir("runtime-bundles").map_err(io),
         )?;
+        if managed {
+            let value = directory.open_dir_nofollow("runtime-bundles").map_err(io)?;
+            held.borrow_mut()
+                .push(("runtime-bundles", value.try_clone().map_err(io)?));
+            check_held()?;
+            bundle_directory = Some(value);
+        }
     }
     let mut locks: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
     let mut bundles: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
@@ -733,9 +867,18 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
         let input_lock = match locks.get(canonical) {
             Some(pin) => pin.clone(),
             None => {
+                let name = format!("{canonical}.json");
+                if managed {
+                    check(
+                        relative_file(&name) && !name.contains('/'),
+                        "managed lock is not a single leaf",
+                    )?;
+                }
+                let path = format!("input-locks/{name}");
                 let pin = put(
-                    directory,
-                    &format!("input-locks/{canonical}.json"),
+                    input_directory.as_ref().unwrap_or(directory),
+                    if managed { &name } else { &path },
+                    &path,
                     source.lock_bytes(),
                     &mut hook,
                 )?;
@@ -750,9 +893,18 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
             Some(match bundles.get(&original.sha256) {
                 Some(pin) => pin.clone(),
                 None => {
+                    let name = format!("{}.json", original.sha256);
+                    if managed {
+                        check(
+                            relative_file(&name) && !name.contains('/'),
+                            "managed bundle is not a single leaf",
+                        )?;
+                    }
+                    let path = format!("runtime-bundles/{name}");
                     let pin = put(
-                        directory,
-                        &format!("runtime-bundles/{}.json", original.sha256),
+                        bundle_directory.as_ref().unwrap_or(directory),
+                        if managed { &name } else { &path },
+                        &path,
                         bytes,
                         &mut hook,
                     )?;
@@ -781,12 +933,14 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
     let manifest = put(
         directory,
         ROVENT_PUBLICATION_MANIFEST,
+        ROVENT_PUBLICATION_MANIFEST,
         material.manifest_bytes,
         &mut hook,
     )?;
     active()?;
     let index = put(
         directory,
+        ROVENT_PUBLICATION_INDEX,
         ROVENT_PUBLICATION_INDEX,
         material.index_bytes,
         &mut hook,
@@ -799,13 +953,23 @@ pub(super) fn publish_original_payloads_authorized_with_hook<
     )?;
     let pending = "publication.pending.json";
     active()?;
-    put(directory, pending, &raw, &mut hook)?;
+    put(directory, pending, pending, &raw, &mut hook)?;
     let original_directory = crate::pals_collect_v3::training_process::directory_file(directory)?;
     for name in ["chunks", "input-locks", "runtime-bundles"] {
         if name == "runtime-bundles" && bundles.is_empty() {
             continue;
         }
-        let subdirectory = directory.open_dir(name).map_err(io)?;
+        let subdirectory = if managed {
+            held.borrow()
+                .iter()
+                .find(|(held_name, _)| *held_name == name)
+                .ok_or_else(|| invalid("managed publication directory missing"))?
+                .1
+                .try_clone()
+                .map_err(io)?
+        } else {
+            directory.open_dir(name).map_err(io)?
+        };
         let subdirectory = crate::pals_collect_v3::training_process::directory_file(&subdirectory)?;
         guarded(
             &mut hook,
