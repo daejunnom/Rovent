@@ -2,7 +2,8 @@
 //! Fastchess game, prove CUDA completion, or change the exact-spawn control.
 
 use super::super::{
-    LockedPalsSystemArenaPairV6, PalsV6ExecutionStart, PalsV6RoleSockets,
+    LockedPalsSystemArenaPairV6, NoGameExecutionStartV1, NoGameRoleSocketsV1, PalsV6ExecutionStart,
+    PalsV6RoleSockets, ProxyEntrySmokeSnapshotOwnerV1,
     proxy_entry_smoke::ProxyEntryFunctionalSmokeOwnerV1,
 };
 use super::{
@@ -67,10 +68,7 @@ pub(crate) struct SmokeControlProgress {
 
 /// Retain this exact owner and any partial stream on failure/unknown closure.
 pub(crate) struct SmokeDeadlineControl {
-    _smoke: Arc<Mutex<ProxyEntryFunctionalSmokeOwnerV1>>,
-    smoke_identity: Arc<()>,
-    execution: Arc<PalsV6ExecutionStart>,
-    _role_sockets: Arc<PalsV6RoleSockets>,
+    binding: SmokeBinding,
     listener: Arc<UnixListener>,
     role: NativeEngineRole,
     proxy_pin: Arc<File>,
@@ -83,7 +81,131 @@ pub(crate) struct SmokeDeadlineControl {
     first_failure: Option<String>,
 }
 
+enum SmokeBinding {
+    Paired {
+        smoke: Arc<Mutex<ProxyEntryFunctionalSmokeOwnerV1>>,
+        identity: Arc<()>,
+        execution: Arc<PalsV6ExecutionStart>,
+        sockets: Arc<PalsV6RoleSockets>,
+    },
+    NoGame {
+        owner: Arc<ProxyEntrySmokeSnapshotOwnerV1>,
+        execution: Arc<NoGameExecutionStartV1>,
+        sockets: Arc<NoGameRoleSocketsV1>,
+    },
+}
+
+impl SmokeBinding {
+    fn run_until(&self) -> Instant {
+        match self {
+            Self::Paired { execution, .. } => execution.run_until(),
+            Self::NoGame { execution, .. } => execution.run_until(),
+        }
+    }
+
+    fn cleanup_until(&self) -> Instant {
+        match self {
+            Self::Paired { execution, .. } => execution.cleanup_until(),
+            Self::NoGame { execution, .. } => execution.cleanup_until(),
+        }
+    }
+
+    fn verify_grant_listener(&self, role: NativeEngineRole) -> Result<(), ArenaError> {
+        match self {
+            Self::Paired { sockets, .. } => sockets.verify_role_grant_listener(role),
+            Self::NoGame { sockets, .. } if sockets.role() == role => {
+                sockets.verify_grant_listener()
+            }
+            Self::NoGame { .. } => Err(failure("smoke_role_changed")),
+        }
+    }
+}
+
 impl SmokeDeadlineControl {
+    /// Construct from the same independent NoGame owner, without admitting a
+    /// paired plan or treating role/channel names as peer or spawn evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_no_game(
+        owner: &Arc<ProxyEntrySmokeSnapshotOwnerV1>,
+        execution: &Arc<NoGameExecutionStartV1>,
+        sockets: &Arc<NoGameRoleSocketsV1>,
+        proxy_pin: &Arc<File>,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+        request_ids: [u64; 2],
+    ) -> Result<Self, ArenaError> {
+        if request_ids.contains(&0) || request_ids[0] == request_ids[1] {
+            return Err(failure("smoke_request_ids"));
+        }
+        if !Arc::ptr_eq(&owner.execution, execution)
+            || !execution.matches(&owner.plan, owner_id, owner_epoch)
+        {
+            return Err(failure("smoke_original_execution_differs"));
+        }
+        execution.require_running()?;
+        sockets.verify_original(owner, execution)?;
+        let plan = owner.plan.input();
+        let endpoint_pin = linux::pin(&owner.pins, &plan.proxy_binary)?;
+        let original = endpoint_pin
+            .file
+            .metadata()
+            .map_err(|_| failure("smoke_proxy_pin"))?;
+        let actual = proxy_pin
+            .metadata()
+            .map_err(|_| failure("smoke_proxy_pin"))?;
+        if !actual.is_file() || (original.dev(), original.ino()) != (actual.dev(), actual.ino()) {
+            return Err(failure("smoke_proxy_pin_differs"));
+        }
+        let lock_sha256 = decode_sha256(&plan.endpoint.startup_lock.canonical_sha256)?;
+        let role = owner.role;
+        let role_wire = match role {
+            NativeEngineRole::Baseline => DeadlineRole::Baseline,
+            NativeEngineRole::Candidate => DeadlineRole::Candidate,
+        };
+        let scopes = [ProxyEntrySmokePhase::Run, ProxyEntrySmokePhase::Cleanup].map(|phase| {
+            ProxyEntrySmokeScope {
+                policy: ProxyEntrySmokePolicy::ProxyEntryFunctionalSmokeV1,
+                owner_id,
+                owner_epoch,
+                role: role_wire,
+                generation: plan.endpoint.startup_lock.config.process_generation,
+                request_id: request_ids[match phase {
+                    ProxyEntrySmokePhase::Run => 0,
+                    ProxyEntrySmokePhase::Cleanup => 1,
+                }],
+                lock_sha256,
+                phase,
+            }
+        });
+        for scope in &scopes {
+            scope.validate().map_err(failure)?;
+        }
+        let challenge = ProxyEntrySmokeChallenge {
+            run: scopes[0].clone(),
+            cleanup: scopes[1].clone(),
+        }
+        .encode()
+        .map_err(failure)?;
+        execution.require_running()?;
+        Ok(Self {
+            binding: SmokeBinding::NoGame {
+                owner: Arc::clone(owner),
+                execution: Arc::clone(execution),
+                sockets: Arc::clone(sockets),
+            },
+            listener: Arc::clone(sockets.listener(false)),
+            role,
+            proxy_pin: Arc::clone(proxy_pin),
+            scopes,
+            challenge,
+            used: [false; 2],
+            child: None,
+            peer: None,
+            retained_grants: Vec::new(),
+            first_failure: None,
+        })
+    }
+
     /// The request IDs are explicitly registered by this original launcher;
     /// they identify requests and are not observations of a process or game.
     #[allow(clippy::too_many_arguments)]
@@ -154,10 +276,12 @@ impl SmokeDeadlineControl {
         let smoke_identity = Arc::clone(smoke_guard.identity());
         drop(smoke_guard);
         Ok(Self {
-            _smoke: Arc::clone(smoke),
-            smoke_identity,
-            execution: Arc::clone(execution),
-            _role_sockets: Arc::clone(sockets),
+            binding: SmokeBinding::Paired {
+                smoke: Arc::clone(smoke),
+                identity: smoke_identity,
+                execution: Arc::clone(execution),
+                sockets: Arc::clone(sockets),
+            },
             listener: Arc::clone(sockets.listener(role, false)),
             role,
             proxy_pin: Arc::clone(proxy_pin),
@@ -224,17 +348,37 @@ impl SmokeDeadlineControl {
         callback_until: Instant,
         cleanup: bool,
     ) -> Result<Option<SmokeGrantObservation>, ArenaError> {
-        let smoke_guard = match self._smoke.try_lock() {
-            Ok(owner) => owner,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(failure("smoke_owner_poisoned"));
+        let _smoke_guard = match &self.binding {
+            SmokeBinding::Paired {
+                smoke, identity, ..
+            } => {
+                let guard = match smoke.try_lock() {
+                    Ok(owner) => owner,
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(failure("smoke_owner_poisoned"));
+                    }
+                };
+                if !Arc::ptr_eq(guard.identity(), identity) {
+                    return Err(failure("smoke_owner_replaced"));
+                }
+                Some(guard)
+            }
+            SmokeBinding::NoGame {
+                owner,
+                execution,
+                sockets,
+            } => {
+                if !Arc::ptr_eq(&owner.execution, execution)
+                    || sockets.role() != owner.role
+                    || !execution.matches_plan(&owner.plan)
+                {
+                    return Err(failure("smoke_owner_replaced"));
+                }
+                None
             }
         };
-        if !Arc::ptr_eq(smoke_guard.identity(), &self.smoke_identity) {
-            return Err(failure("smoke_owner_replaced"));
-        }
-        if Instant::now() >= self.execution.cleanup_until() {
+        if Instant::now() >= self.binding.cleanup_until() {
             return Err(failure("smoke_original_deadline"));
         }
         let pid = custody
@@ -273,7 +417,7 @@ impl SmokeDeadlineControl {
         {
             return Err(failure("smoke_proxy_image_differs"));
         }
-        self._role_sockets.verify_role_grant_listener(self.role)?;
+        self.binding.verify_grant_listener(self.role)?;
 
         if self.peer.is_none() {
             let (stream, _) = match self.listener.accept() {
@@ -299,8 +443,8 @@ impl SmokeDeadlineControl {
                 .set_nonblocking(true)
                 .map_err(|_| failure("smoke_peer_nonblocking"))?;
         }
-        let run_until = self.execution.run_until();
-        let cleanup_until = self.execution.cleanup_until();
+        let run_until = self.binding.run_until();
+        let cleanup_until = self.binding.cleanup_until();
         let peer = self
             .peer
             .as_mut()

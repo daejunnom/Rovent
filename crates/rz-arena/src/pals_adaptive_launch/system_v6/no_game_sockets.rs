@@ -97,6 +97,9 @@ impl NoGameRoleSocketsV1 {
             &self.grant.listener
         }
     }
+    pub(crate) fn verify_grant_listener(&self) -> Result<(), ArenaError> {
+        self.grant.verify()
+    }
     pub(crate) fn grant_name(&self) -> &str {
         &self.grant.name
     }
