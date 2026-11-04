@@ -155,6 +155,7 @@ pub(crate) struct PcRootRecoveryV3 {
     sealed_abort_no_scope: bool,
     aborted_pre_route_release: Option<Result<(), &'static str>>,
     aborted_no_scope_release: Option<Result<(), &'static str>>,
+    aborted_unclaimed_stage_release: Option<Result<(), &'static str>>,
     diagnostics: Vec<(String, TeacherDiagnostics)>,
     prepared: Option<PcPreparedRootV3>,
     custodian: TeacherRecoveryCustodianV3,
@@ -218,6 +219,7 @@ impl PcRootRecoveryV3 {
             sealed_abort_no_scope: false,
             aborted_pre_route_release: None,
             aborted_no_scope_release: None,
+            aborted_unclaimed_stage_release: None,
             diagnostics: Vec::new(),
             prepared: None,
             custodian: TeacherRecoveryCustodianV3::new(),
@@ -2474,6 +2476,9 @@ fn prepare_root_step_v3(
         state.abort_before_route = true;
     }
     if state.abort_before_route {
+        if state.aborted_unclaimed_stage_release.is_some() {
+            return Ok(PcPrepareStepV3::Pending);
+        }
         if state.stage.is_none() && state.panic.is_none() && state.aborted_no_scope_release.is_none() {
             // No stage is invented here. The bridge separately proves the
             // original one-shot no-scope receipt and exact quota ownership.
@@ -2501,6 +2506,58 @@ fn prepare_root_step_v3(
                 }
             }
             return Ok(PcPrepareStepV3::Pending);
+        }
+        // A published scope source is distinct from an entered scope claim.
+        // Only its original sealed proof permits the bridge's no-scope ACK.
+        if state.stage.is_some() && state.panic.is_none() {
+            let sealed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.try_seal_aborted_unclaimed_stage()
+            }));
+            match sealed {
+                Ok(Ok(None)) => return Ok(PcPrepareStepV3::Pending),
+                Ok(Ok(Some(false))) => {},
+                Ok(Err(error)) => {
+                    state.aborted_unclaimed_stage_release = Some(Err(error));
+                    state.failure.get_or_insert_with(|| error.into());
+                    return Ok(PcPrepareStepV3::Pending);
+                }
+                Err(payload) => {
+                    let error = "P-C V3 unclaimed-stage proof panicked";
+                    state.panic = Some(payload);
+                    state.aborted_unclaimed_stage_release = Some(Err(error));
+                    state.failure.get_or_insert_with(|| error.into());
+                    return Ok(PcPrepareStepV3::Pending);
+                }
+                Ok(Ok(Some(true))) => {
+                    // The bridge re-locks this exact recovery and retains its
+                    // own one-shot ACK; do not hold the recovery guard here.
+                    drop(state);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        bridge.try_release_aborted_unclaimed_stage(&admission, recovery)
+                    }));
+                    let mut state = recovery.lock().map_err(|_| "P-C V3 recovery poisoned")?;
+                    match outcome {
+                        Ok(Ok(Some(true))) => state.aborted_unclaimed_stage_release = Some(Ok(())),
+                        Ok(Ok(None)) => {},
+                        Ok(Ok(Some(false))) => {
+                            let error = "P-C V3 unclaimed-stage abort release rejected";
+                            state.aborted_unclaimed_stage_release = Some(Err(error));
+                            state.failure.get_or_insert_with(|| error.into());
+                        }
+                        Ok(Err(error)) => {
+                            state.aborted_unclaimed_stage_release = Some(Err(error));
+                            state.failure.get_or_insert_with(|| error.into());
+                        }
+                        Err(payload) => {
+                            let error = "P-C V3 unclaimed-stage abort release panicked";
+                            state.panic = Some(payload);
+                            state.aborted_unclaimed_stage_release = Some(Err(error));
+                            state.failure.get_or_insert_with(|| error.into());
+                        }
+                    }
+                    return Ok(PcPrepareStepV3::Pending);
+                }
+            }
         }
         // Preserve the exact session and recovery custodian. A claim or spawn
         // with an unknown outcome is never promoted to a no-worker result.
