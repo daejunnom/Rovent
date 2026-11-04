@@ -2,6 +2,7 @@
 import json
 from contextlib import nullcontext
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -54,16 +55,19 @@ class ManagedProcessSpawnTests(unittest.TestCase):
         start = time.monotonic()
         work, cleanup = start + 0.2, start + 2.0
         group = OwnedProcessGroup()
+        def stop_original_group():
+            os.killpg(group._child.pid, signal.SIGTERM)
+            return True
         with mock.patch("managed_process._finish_owned_group", wraps=managed_process._finish_owned_group) as drain:
             result = run_group(
                 [self.python, "-c", "import time; time.sleep(30)"], self.root,
                 os.environ.copy(), 30, lambda: None, owned_group=group,
                 absolute_deadline=work, cleanup_absolute_deadline=cleanup,
-                on_stop=lambda: True,
+                on_stop=stop_original_group,
             )
         self.assertEqual(result, (124, True, None))
         self.assertEqual(drain.call_args.args[3], cleanup)
-        self.assertLessEqual(drain.call_args.args[2], cleanup)
+        self.assertEqual(drain.call_args.args[2], cleanup)
 
     def test_cleanup_before_work_deadline_never_spawns(self):
         start = time.monotonic()

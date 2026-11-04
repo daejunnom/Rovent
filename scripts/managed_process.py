@@ -457,7 +457,10 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                 absolute_deadline = time.monotonic() + 3.0
                 graceful_drain_deadline = time.monotonic() + 1.0
             else:
-                graceful_drain_deadline = min(time.monotonic() + 1.0, cleanup_absolute_deadline)
+                # The caller explicitly registered the original cleanup
+                # ceiling. Do not shorten it with the legacy one-second
+                # grace or silently create a later deadline.
+                graceful_drain_deadline = cleanup_absolute_deadline
         gone, result, cleanup_error = _finish_owned_group(
             child, on_tick, graceful_drain_deadline,
             cleanup_absolute_deadline if cleanup_absolute_deadline is not None else absolute_deadline)
