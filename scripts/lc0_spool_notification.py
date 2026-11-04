@@ -13,17 +13,49 @@ import os
 import threading
 
 
+# Uncertain constructor cleanup remains owned even if the caller drops the
+# exception. No close is retried by descriptor number from this registry.
+_QUARANTINED_INITIALIZATIONS = []
+
+
+class NotificationInitializationCleanupError(Exception):
+    """Retain the original setup error and uncertain one-shot FD closes."""
+
+    def __init__(self, original, cleanup_failures):
+        super().__init__("notification initialization cleanup is uncertain")
+        self.original = original
+        self.cleanup_failures = cleanup_failures
+
+
 class CoalescedSpoolNotification:
     def __init__(self, writer):
         if not isinstance(writer, threading.Thread):
             raise TypeError("notification requires its original writer thread")
-        self._read, self._write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
         self._writer = writer
         self._lock = threading.Lock()
         self._first_error = None
+        self._close_errors = []
         self._coalesced = 0
         self._close_started = False
         self._close_status = "open"
+        self._read = None
+        self._write = None
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            self._read = read_fd
+            self._write = write_fd
+        except BaseException as original:
+            failures = []
+            for fd in (read_fd, write_fd):
+                try:
+                    os.close(fd)
+                except BaseException as error:
+                    failures.append((fd, error))
+            if failures:
+                retained = NotificationInitializationCleanupError(original, tuple(failures))
+                _QUARANTINED_INITIALIZATIONS.append(retained)
+                raise retained from original
+            raise
 
     def fileno(self):
         with self._lock:
@@ -75,7 +107,7 @@ class CoalescedSpoolNotification:
         with self._lock:
             return {"first_error_type": (type(self._first_error).__name__
                                          if self._first_error is not None else None),
-                    "first_error_errno": (self._first_error.errno
+                    "first_error_errno": (getattr(self._first_error, "errno", None)
                                           if self._first_error is not None else None),
                     "coalesced": self._coalesced,
                     "close_status": self._close_status}
@@ -83,6 +115,10 @@ class CoalescedSpoolNotification:
     def original_error(self):
         with self._lock:
             return self._first_error
+
+    def original_close_errors(self):
+        with self._lock:
+            return tuple(self._close_errors)
 
     def close_after_writer(self):
         """Close once only after the original writer thread is not alive.
@@ -106,15 +142,17 @@ class CoalescedSpoolNotification:
                 return False
             self._close_started = True
             self._close_status = "unknown"
-        error = None
+        failures = []
         for fd in (self._read, self._write):
             try:
                 os.close(fd)
-            except OSError as caught:
-                if error is None:
-                    error = caught
-        if error is not None:
-            self._retain_error(error)
+            except BaseException as caught:
+                failures.append((fd, caught))
+        if failures:
+            with self._lock:
+                self._close_errors.extend(failures)
+                if self._first_error is None:
+                    self._first_error = failures[0][1]
             return False
         with self._lock:
             self._close_status = "closed"

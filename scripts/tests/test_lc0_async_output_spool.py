@@ -28,6 +28,168 @@ def wait_state(spool, wanted, timeout=3):
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux positional writes and selector pipe")
 class AsyncOutputSpoolTests(unittest.TestCase):
+    def test_non_io_notification_setup_failure_closes_unstarted_output_dup(self):
+        original_dup = os.dup
+        duplicated = []
+        failure = MemoryError("fixture notification setup")
+
+        def tracked_dup(fd):
+            result = original_dup(fd)
+            duplicated.append(result)
+            return result
+
+        with tempfile.TemporaryFile() as output, mock.patch.object(async_spool.os, "dup", tracked_dup), mock.patch.object(
+            async_spool, "CoalescedSpoolNotification", side_effect=failure
+        ):
+            with self.assertRaises(MemoryError) as raised:
+                async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
+                                              max_queue_bytes=16, max_queue_items=2)
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(len(duplicated), 1)
+            with self.assertRaises(OSError) as closed:
+                os.fstat(duplicated[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            os.fstat(output.fileno())
+
+    def test_unstarted_cleanup_failure_retains_original_and_close_error(self):
+        original_dup, original_close = os.dup, os.close
+        duplicated = []
+        setup_error = MemoryError("fixture notification setup")
+        close_error = OSError(errno.EIO, "fixture uncertain close")
+
+        def tracked_dup(fd):
+            result = original_dup(fd)
+            duplicated.append(result)
+            return result
+
+        def failing_close(fd):
+            if fd in duplicated:
+                raise close_error
+            return original_close(fd)
+
+        with tempfile.TemporaryFile() as output:
+            with mock.patch.object(async_spool.os, "dup", tracked_dup), mock.patch.object(
+                async_spool.os, "close", failing_close
+            ), mock.patch.object(async_spool, "CoalescedSpoolNotification", side_effect=setup_error):
+                with self.assertRaises(async_spool.AsyncSpoolInitializationCleanupError) as raised:
+                    async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
+                                                  max_queue_bytes=16, max_queue_items=2)
+            error = raised.exception
+            self.assertIs(error.original, setup_error)
+            self.assertEqual(len(error.cleanup_failures), 1)
+            self.assertEqual(error.cleanup_failures[0][0], duplicated[0])
+            self.assertIs(error.cleanup_failures[0][1], close_error)
+            owner = async_spool._QUARANTINED_WRITERS.pop()
+            self.assertIs(owner._original_failure, setup_error)
+            self.assertEqual(owner.original_initialization_cleanup_failures(), error.cleanup_failures)
+            self.assertIsNone(owner.observation()["notification"]["first_error_type"])
+            os.fstat(duplicated[0])
+            # The test double proves it did not close; production cannot infer this.
+            original_close(duplicated[0])
+            owner._fd = None
+
+    def test_attempted_thread_start_failure_keeps_owner_even_without_ident(self):
+        failure = RuntimeError("fixture start failure")
+        with tempfile.TemporaryFile() as output, mock.patch.object(threading.Thread, "start", side_effect=failure):
+            with self.assertRaises(RuntimeError) as raised:
+                async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
+                                              max_queue_bytes=16, max_queue_items=2)
+            self.assertIs(raised.exception, failure)
+            owner = async_spool._QUARANTINED_WRITERS.pop()
+            self.assertIs(owner._original_failure, failure)
+            self.assertIsNone(owner._thread.ident)
+            os.fstat(owner._fd)
+            # The mock proves no thread was created; this is fixture-only cleanup.
+            self.assertTrue(owner._notification.close_before_writer())
+            os.close(owner._fd)
+            owner._fd = None
+
+    def test_notification_post_pipe_setup_failure_closes_both_fds(self):
+        original_pipe2 = os.pipe2
+        opened = []
+        failure = RuntimeError("fixture pipe initialization")
+
+        def tracked_pipe2(flags):
+            result = original_pipe2(flags)
+            opened.extend(result)
+            return result
+
+        class Broken(lc0_spool_notification.CoalescedSpoolNotification):
+            def __setattr__(self, name, value):
+                if name == "_write" and type(value) is int:
+                    raise failure
+                super().__setattr__(name, value)
+
+        with mock.patch.object(lc0_spool_notification.os, "pipe2", tracked_pipe2):
+            with self.assertRaises(RuntimeError) as raised:
+                Broken(threading.Thread(target=lambda: None))
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(len(opened), 2)
+        for fd in opened:
+            with self.assertRaises(OSError) as closed:
+                os.fstat(fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_notification_init_close_failure_keeps_both_error_scopes(self):
+        original_pipe2, original_close = os.pipe2, os.close
+        opened = []
+        setup_error = RuntimeError("fixture pipe initialization")
+        close_error = OSError(errno.EIO, "fixture uncertain close")
+
+        def tracked_pipe2(flags):
+            result = original_pipe2(flags)
+            opened.extend(result)
+            return result
+
+        def failing_close(fd):
+            if opened and fd == opened[0]:
+                raise close_error
+            return original_close(fd)
+
+        class Broken(lc0_spool_notification.CoalescedSpoolNotification):
+            def __setattr__(self, name, value):
+                if name == "_write" and type(value) is int:
+                    raise setup_error
+                super().__setattr__(name, value)
+
+        with mock.patch.object(lc0_spool_notification.os, "pipe2", tracked_pipe2), mock.patch.object(
+            lc0_spool_notification.os, "close", failing_close
+        ):
+            with self.assertRaises(lc0_spool_notification.NotificationInitializationCleanupError) as raised:
+                Broken(threading.Thread(target=lambda: None))
+        error = raised.exception
+        self.assertIs(error.original, setup_error)
+        self.assertIs(lc0_spool_notification._QUARANTINED_INITIALIZATIONS.pop(), error)
+        self.assertEqual(error.cleanup_failures[0][0], opened[0])
+        self.assertIs(error.cleanup_failures[0][1], close_error)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(opened[1])
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        # The mock proves the first close did not run; not a production inference.
+        original_close(opened[0])
+
+    def test_notification_close_errors_are_separate_and_never_retried(self):
+        original_close = os.close
+        notification = lc0_spool_notification.CoalescedSpoolNotification(threading.Thread(target=lambda: None))
+        read_fd, write_fd = notification._read, notification._write
+        first_error = OSError(errno.EIO, "fixture read close")
+        second_error = OSError(errno.EBADF, "fixture write close")
+        attempted = []
+
+        def failing_close(fd):
+            attempted.append(fd)
+            raise first_error if fd == read_fd else second_error
+
+        with mock.patch.object(lc0_spool_notification.os, "close", failing_close):
+            self.assertFalse(notification.close_before_writer())
+            self.assertFalse(notification.close_before_writer())
+        self.assertEqual(attempted, [read_fd, write_fd])
+        self.assertEqual(notification.observation()["close_status"], "unknown")
+        self.assertEqual(notification.original_close_errors(), ((read_fd, first_error), (write_fd, second_error)))
+        # Both fake closes raised before the real calls, so this fixture owns them.
+        original_close(read_fd)
+        original_close(write_fd)
+
     def test_blocked_write_does_not_block_offer_cancel_or_retain_late_bytes(self):
         entered = threading.Event()
         release = threading.Event()

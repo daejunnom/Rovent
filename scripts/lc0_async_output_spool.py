@@ -21,6 +21,15 @@ from lc0_spool_notification import CoalescedSpoolNotification
 _QUARANTINED_WRITERS = []
 
 
+class AsyncSpoolInitializationCleanupError(Exception):
+    """Retain the setup error and every uncertain one-shot cleanup failure."""
+
+    def __init__(self, original, cleanup_failures):
+        super().__init__("output writer initialization cleanup is uncertain")
+        self.original = original
+        self.cleanup_failures = cleanup_failures
+
+
 class AsyncOutputSpool:
     """One original FD and one non-daemon writer; no implicit timeout cleanup.
 
@@ -41,7 +50,7 @@ class AsyncOutputSpool:
         if any(type(value) is not int or value <= 0 for value in
                (max_bytes, max_queue_bytes, max_queue_items)):
             raise ValueError("spool and queue bounds must be positive integers")
-        self._fd = os.dup(fd)
+        self._fd = None
         self._max_bytes = max_bytes
         self._max_queue_bytes = max_queue_bytes
         self._max_queue_items = max_queue_items
@@ -56,6 +65,7 @@ class AsyncOutputSpool:
         self._last_errors = (None, None)
         self._failure = None
         self._original_failure = None
+        self._initialization_cleanup_failures = ()
         self._terminal = None
         self._terminal_applied = False
         self._finish_requested = False
@@ -65,22 +75,52 @@ class AsyncOutputSpool:
         self._thread = threading.Thread(target=self._run_guarded, name="lc0-output-writer", daemon=False)
         self._notification = None
         self._notification_init_error = None
+        start_invoked = False
+        created_notification = None
+        owned_fd = os.dup(fd)
         try:
-            self._notification = CoalescedSpoolNotification(self._thread)
-        except (OSError, AttributeError) as error:
-            # The owning selector can use its bounded tick. This failure does
-            # not alter the original output operation or another execution.
-            self._notification_init_error = error
-        try:
-            self._thread.start()
-        except BaseException:
-            if self._thread.ident is None:
-                if self._notification is not None:
-                    self._notification.close_before_writer()
-                os.close(self._fd)
-                self._fd = None
+            self._fd = owned_fd
+            try:
+                created_notification = CoalescedSpoolNotification(self._thread)
+            except (OSError, AttributeError) as error:
+                # The owning selector can use its bounded tick. This failure
+                # does not alter another execution or the output operation.
+                self._notification_init_error = error
             else:
+                self._notification = created_notification
+            # Once start is called, even `ident is None` does not establish
+            # that no native thread was created (start may be interrupted).
+            start_invoked = True
+            self._thread.start()
+        except BaseException as original:
+            if start_invoked:
+                # No assumed stop, close, or retry: retain the same owner even
+                # when the attempted start's actual physical result is unknown.
+                self._failure = type(original).__name__
+                self._original_failure = original
                 _QUARANTINED_WRITERS.append(self)
+                raise
+            failures = []
+            if created_notification is not None:
+                try:
+                    if not created_notification.close_before_writer():
+                        failures.extend(created_notification.original_close_errors())
+                        if not failures:
+                            failures.append((None, RuntimeError("notification cleanup unknown")))
+                except BaseException as error:
+                    failures.append((None, error))
+            try:
+                os.close(owned_fd)
+            except BaseException as error:
+                failures.append((owned_fd, error))
+            else:
+                self._fd = None
+            if failures:
+                self._failure = type(original).__name__
+                self._original_failure = original
+                self._initialization_cleanup_failures = tuple(failures)
+                _QUARANTINED_WRITERS.append(self)
+                raise AsyncSpoolInitializationCleanupError(original, self._initialization_cleanup_failures) from original
             raise
 
     def offer(self, data):
@@ -171,7 +211,8 @@ class AsyncOutputSpool:
                 "physical_gpu_completion": "not_observed",
             }
         result["notification"] = (self._notification.observation() if self._notification
-                                  else {"first_error_type": type(self._notification_init_error).__name__,
+                                  else {"first_error_type": (type(self._notification_init_error).__name__
+                                                             if self._notification_init_error is not None else None),
                                         "first_error_errno": getattr(self._notification_init_error, "errno", None),
                                         "coalesced": 0, "close_status": "unavailable"})
         return result
@@ -207,6 +248,11 @@ class AsyncOutputSpool:
         """
         with self._condition:
             return (self._original_failure, *self._last_errors)
+
+    def original_initialization_cleanup_failures(self):
+        """Return the exact one-shot FD cleanup failures, if any."""
+        with self._condition:
+            return self._initialization_cleanup_failures
 
     def _run_guarded(self):
         # An unexpected failure in bookkeeping or notification must retain
