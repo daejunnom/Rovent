@@ -14,13 +14,13 @@ use super::teacher::v3_policy_consumer::{
     TeacherPolicyConsumerOwnerV3, TeacherPolicyConsumerProgressV3, TeacherPolicyConsumerStartV3,
     TeacherProcessedOwnerV3,
 };
-use super::teacher::v3_pump::{TeacherPumpSetupErrorV3, TeacherPumpStepV3, TeacherPumpV3};
+use super::teacher::v3_pump::{TeacherPumpSetupErrorV3, TeacherPumpV3};
 use super::teacher::v3_session::{
     RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherSessionStageStateV3,
     TeacherSessionStagingV3, TeacherStartErrorV3,
 };
 use super::writer_lock_v3::RoventCorpusWriterLockV3;
-use super::{ArenaError, invalid};
+use super::{invalid, ArenaError};
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionError, RoventBoardCollectionWorkerKeyV3,
     RoventBoardCollectionWorkerSpawnFailureV3, RoventBoardCollectionWorkerV3,
@@ -900,17 +900,18 @@ impl OwnRootRecoveryV3 {
                     if self.pump_failure.is_none() {
                         self.pump_failure = Some(error);
                     }
-                    return false;
                 }
-                Ok(
-                    TeacherPumpStepV3::OutputBackpressure
-                    | TeacherPumpStepV3::Completed
-                    | TeacherPumpStepV3::Rejected,
-                ) => return false,
                 Ok(_) => {}
             }
-            if pump.has_pending() {
-                return false;
+            // Semantic output may be held while other actors terminate.
+            // Keep their original terminals in the bounded pump backlog and
+            // independently attempt the physical worker join below. This does
+            // not retire the route or mark the held output as consumed.
+            if let Err(error) = pump.try_drain_pending() {
+                self.pump_failure_count = self.pump_failure_count.saturating_add(1);
+                if self.pump_failure.is_none() {
+                    self.pump_failure = Some(error);
+                }
             }
         }
         let Ok(mut session) = session.try_lock() else {
