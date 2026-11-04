@@ -6,15 +6,17 @@
 use super::{
     cancel_control_v1::CancelReceiverV1,
     cli_v6::OriginalProxyWindowV6,
-    deadline_grant::{PendingDeadlineGrant, ReceivedDeadlineGrant},
+    deadline_grant::{PendingDeadlineGrant, ReceivedDeadlineGrant, assemble_window_from_refs},
     runner_v6::PalsProxySupervisorV6,
 };
+use crate::pals_adaptive_startup::{PalsSystemSourceObservationV6, PinnedPalsSystemStartupV6};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use rz_contracts::pals::deadline_grant_v1::{DeadlineScope, GRANT_BYTES, REQUEST_BYTES};
 use std::{
     fs::File,
     io::{self, Read, Write},
     os::unix::{fs::MetadataExt, net::UnixStream},
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
@@ -324,6 +326,76 @@ impl PendingOriginalArenaGrant {
     }
 }
 
+/// Each received grant and its original socket stay owned together. This
+/// input is returned intact on any assembly or peer-observation failure.
+pub(super) struct OriginalArenaGrantInputs {
+    pub startup: RetainedOriginalArenaGrant,
+    pub run: RetainedOriginalArenaGrant,
+    pub cleanup: RetainedOriginalArenaGrant,
+}
+
+/// A one-shot projection of three original grants; all source streams and
+/// original observations remain with this bundle for the entire scope.
+pub(super) struct OriginalArenaGrantBundle {
+    pub inputs: OriginalArenaGrantInputs,
+    pub window: OriginalProxyWindowV6,
+    pub observations: [PalsSystemSourceObservationV6; 3],
+}
+
+impl OriginalArenaGrantInputs {
+    fn verify_same_original_peer(&self) -> io::Result<()> {
+        let peer = self.startup.peer;
+        if self.run.peer != peer || self.cleanup.peer != peer {
+            return Err(invalid("grant peer observations differ"));
+        }
+        for grant in [&self.startup, &self.run, &self.cleanup] {
+            if observe_peer(&grant.stream)? != peer {
+                return Err(invalid("original grant peer or ancestry changed"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The old bytes-only assembly remains available. This stricter path
+    /// consumes this owner only on success, never reconstructing grant bytes
+    /// or replacing original streams. Socket retention is not proof the remote
+    /// endpoint is open, nor proof of role-listener provenance.
+    pub(super) fn assemble(
+        self,
+        source: &PinnedPalsSystemStartupV6,
+        cancelled: &Arc<AtomicBool>,
+        cleanup_cancelled: &Arc<AtomicBool>,
+    ) -> Result<OriginalArenaGrantBundle, (io::Error, Self)> {
+        let result = (|| {
+            self.verify_same_original_peer()?;
+            let projection = assemble_window_from_refs(
+                source,
+                &self.startup.grant,
+                &self.run.grant,
+                &self.cleanup.grant,
+                Arc::clone(cancelled),
+                Arc::clone(cleanup_cancelled),
+            )?;
+            self.verify_same_original_peer()?;
+            if Instant::now() >= projection.0.startup_until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original startup deadline expired",
+                ));
+            }
+            Ok(projection)
+        })();
+        match result {
+            Ok((window, observations)) => Ok(OriginalArenaGrantBundle {
+                inputs: self,
+                window,
+                observations,
+            }),
+            Err(error) => Err((error, self)),
+        }
+    }
+}
+
 fn matches_original_run_window(
     grant: &ReceivedDeadlineGrant,
     window: &OriginalProxyWindowV6,
@@ -398,6 +470,72 @@ mod tests {
     use rz_contracts::pals::deadline_grant_v1::{DeadlinePhase, DeadlineRole};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
+    #[test]
+    fn mismatched_recorded_peer_is_rejected_without_losing_original_streams() {
+        use rz_contracts::pals::deadline_grant_v1::DeadlineGrant;
+        let identity = ProcessIdentity {
+            parent: 1,
+            group: 2,
+            start_ticks: 3,
+        };
+        let peer = OriginalArenaPeerObservation {
+            pid: 4,
+            uid: 5,
+            gid: 6,
+            proxy: identity,
+            fastchess_pid: 7,
+            fastchess: identity,
+            arena: identity,
+        };
+        let grant = |phase, request_id, observed_peer| {
+            let scope = DeadlineScope {
+                owner_id: [1; 16],
+                owner_epoch: 2,
+                role: DeadlineRole::Baseline,
+                game: 0,
+                generation: 3,
+                request_id,
+                lock_sha256: [5; 32],
+                phase,
+            };
+            let (pending, _) = PendingDeadlineGrant::begin(scope.clone()).unwrap();
+            let bytes = DeadlineGrant {
+                scope,
+                remaining_ns: 60_000_000_000,
+            }
+            .encode()
+            .unwrap();
+            let grant = pending.accept(&bytes).unwrap();
+            let (stream, _other) = UnixStream::pair().unwrap();
+            RetainedOriginalArenaGrant {
+                grant,
+                stream,
+                peer: observed_peer,
+            }
+        };
+        let mut different = peer;
+        different.arena.start_ticks += 1;
+        let inputs = OriginalArenaGrantInputs {
+            startup: grant(DeadlinePhase::Startup, 1, peer),
+            run: grant(DeadlinePhase::Run, 2, peer),
+            cleanup: grant(DeadlinePhase::Cleanup, 3, different),
+        };
+        let fds = [
+            inputs.startup.stream.as_raw_fd(),
+            inputs.run.stream.as_raw_fd(),
+            inputs.cleanup.stream.as_raw_fd(),
+        ];
+        assert!(inputs.verify_same_original_peer().is_err());
+        assert_eq!(
+            fds,
+            [
+                inputs.startup.stream.as_raw_fd(),
+                inputs.run.stream.as_raw_fd(),
+                inputs.cleanup.stream.as_raw_fd()
+            ]
+        );
+    }
+
     #[test]
     fn assembled_window_never_extends_the_original_run_grant() {
         use rz_contracts::pals::deadline_grant_v1::DeadlineGrant;

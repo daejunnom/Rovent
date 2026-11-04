@@ -87,6 +87,29 @@ pub(super) fn assemble_window(
     super::cli_v6::OriginalProxyWindowV6,
     [PalsSystemSourceObservationV6; 3],
 )> {
+    assemble_window_from_refs(
+        source,
+        &startup,
+        &run,
+        &cleanup,
+        cancelled,
+        cleanup_cancelled,
+    )
+}
+
+/// Same validation and conservative projection as the consuming legacy
+/// wrapper. The original received grants remain with the caller on failure.
+pub(super) fn assemble_window_from_refs(
+    source: &PinnedPalsSystemStartupV6,
+    startup: &ReceivedDeadlineGrant,
+    run: &ReceivedDeadlineGrant,
+    cleanup: &ReceivedDeadlineGrant,
+    cancelled: Arc<AtomicBool>,
+    cleanup_cancelled: Arc<AtomicBool>,
+) -> io::Result<(
+    super::cli_v6::OriginalProxyWindowV6,
+    [PalsSystemSourceObservationV6; 3],
+)> {
     let same_scope = |left: &DeadlineScope, right: &DeadlineScope| {
         left.owner_id == right.owner_id
             && left.owner_epoch == right.owner_epoch
@@ -159,7 +182,7 @@ impl ReceivedDeadlineGrant {
     /// Observe/verify source only after the very same startup is pinned.
     /// This binds scope to that lock; it does not prove peer or GPU ownership.
     pub(super) fn bind_source(
-        self,
+        &self,
         source: &PinnedPalsSystemStartupV6,
     ) -> io::Result<(Instant, PalsSystemSourceObservationV6)> {
         let lock = source.lock();
