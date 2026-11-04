@@ -39,6 +39,7 @@ struct RootQuotaV3 {
     teacher_seal_unknown: bool,
     teacher_seal_panic: Option<Box<dyn std::any::Any + Send>>,
     teacher_seal_error: Option<AdaptiveCollectionError>,
+    unstarted_recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
 }
 
 pub(crate) enum PcQuotaOutcomeV3 {
@@ -159,6 +160,7 @@ impl PcRootQuotaLedgerV3 {
             admission: admission.clone(), worker_reserved: true, teacher_reserved: false,
             joined: None, retired_teacher_handoff: None, unclaimed_teacher_ack: None,
             teacher_seal_unknown: false, teacher_seal_panic: None, teacher_seal_error: None,
+            unstarted_recovery: None,
         });
         PcQuotaOutcomeV3::Reserved
     }
@@ -268,6 +270,7 @@ struct PcRootSlotV3 {
     admission: RoventCollectionRootAdmissionV3,
     requested: bool,
     installed: bool,
+    unstarted_terminal: bool,
     recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
     owner: Option<RoventCollectionOwnerLockV3>,
     route: Option<SpeculativeRootV3>,
@@ -388,14 +391,14 @@ impl RoventPcCollectionBridgeV3 {
         ledger.reserve_teacher(admission)
     }
 
-    /// Recover only this definitely unstarted root's teacher quota. The
-    /// original no-scope acknowledgement is kept in the ledger; this neither
-    /// settles the native root nor reissues the one-shot teacher scope.
+    /// Recover this terminal unstarted root's teacher and uncreated-worker
+    /// quota. The original no-scope acknowledgement and sealed recovery stay
+    /// in the ledger; this neither settles native work nor reissues the scope.
     pub(crate) fn try_release_unstarted_teacher(
         &self, admission: &RoventCollectionRootAdmissionV3,
         recovery: &Arc<Mutex<PcRootRecoveryV3>>,
     ) -> Result<Option<bool>, &'static str> {
-        let original = match recovery.try_lock() {
+        let mut original = match recovery.try_lock() {
             Ok(owner) => owner,
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(_) => return Err("P-C V3 recovery owner poisoned"),
@@ -404,16 +407,23 @@ impl RoventPcCollectionBridgeV3 {
             return Err("P-C V3 teacher is not proven unstarted");
         }
         {
-            let state = match self.state.try_lock() {
+            let mut state = match self.state.try_lock() {
                 Ok(state) => state,
                 Err(TryLockError::WouldBlock) => return Ok(None),
                 Err(_) => return Err("P-C V3 roots poisoned"),
             };
-            let slot = state.roots.iter().find(|slot| slot.admission.same_original_admission(admission))
+            let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(admission))
                 .ok_or("P-C V3 original request absent")?;
             if !slot.recovery.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, recovery)) {
                 return Err("P-C V3 recovery owner changed");
             }
+            if slot.installed || slot.worker.is_some() || slot.route.is_some() || slot.observer.is_some() {
+                return Err("P-C V3 native installation or worker already exists");
+            }
+            if !original.seal_definitely_unstarted() {
+                return Err("P-C V3 original failure cannot be sealed unstarted");
+            }
+            slot.unstarted_terminal = true;
         }
         let mut ledger = match self.ledger.try_lock() {
             Ok(ledger) => ledger,
@@ -423,7 +433,8 @@ impl RoventPcCollectionBridgeV3 {
         let root = ledger.roots.iter_mut().find(|root| root.admission.same_original_admission(admission))
             .ok_or("P-C V3 quota root absent")?;
         if let Some(ack) = &root.unclaimed_teacher_ack {
-            return if !root.teacher_reserved && !root.teacher_seal_unknown
+            return if !root.teacher_reserved && !root.worker_reserved && !root.teacher_seal_unknown
+                && root.unstarted_recovery.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, recovery))
                 && ack.matches_admission(admission) && ack.is_sealed_no_scope() {
                 Ok(Some(true))
             } else { Err("P-C V3 retained no-scope witness is unresolved") };
@@ -438,6 +449,8 @@ impl RoventPcCollectionBridgeV3 {
                 root.unclaimed_teacher_ack = Some(ack);
                 root.teacher_seal_unknown = false;
                 root.teacher_reserved = false;
+                root.unstarted_recovery = Some(Arc::clone(recovery));
+                root.worker_reserved = false;
                 Ok(Some(true))
             }
             Ok(Ok(ack)) => {
@@ -504,7 +517,8 @@ impl RoventPcCollectionBridgeV3 {
                 Err(TryLockError::WouldBlock) => return PcPreparedOutcomeV3::Busy(original),
                 Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 recovery poisoned", original),
             };
-            if !recovery.matches_prepared(&original.admission, &original.route, &original.stage, &original.pump) {
+            if !recovery.matches_prepared(&original.admission, &original.route, &original.stage,
+                &original.pump, &original.owner, &original.worker) {
                 drop(recovery);
                 return PcPreparedOutcomeV3::Rejected("P-C V3 recovery members differ", original);
             }
@@ -728,13 +742,16 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                     PcQuotaOutcomeV3::Busy | PcQuotaOutcomeV3::Exhausted => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
                     _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 duplicate root reservation"), admission)),
                 }
-                state.roots.push(PcRootSlotV3 { admission: admission.clone(), requested: false, installed: false, recovery: None,
+                state.roots.push(PcRootSlotV3 { admission: admission.clone(), requested: false, installed: false, unstarted_terminal: false, recovery: None,
                     owner: None, route: None, route_retirement: None, stage: None, pump: None, observer: None, worker: None,
                     handoff: None, joined: None, custody_taken: false, returned: None, join_failure: None, join_panic: None });
                 state.roots.len() - 1
             }
         };
         let slot = &mut state.roots[index];
+        if slot.unstarted_terminal {
+            return Err(failure(AdaptiveManagerError::Invalid("P-C V3 original root failed before worker startup"), admission));
+        }
         if !slot.requested {
             match self.requests.try_send(admission.clone()) {
                 Ok(()) => slot.requested = true,
@@ -847,6 +864,36 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
         };
         if !state.deferred.is_empty() { return Ok(None); }
         for slot in &state.roots {
+            if slot.unstarted_terminal {
+                if slot.installed || slot.worker.is_some() || slot.route.is_some()
+                    || slot.observer.is_some() || slot.stage.is_some() || slot.pump.is_some() {
+                    return Err(AdaptiveManagerError::Invalid("P-C V3 unstarted root acquired owners"));
+                }
+                let ledger = match self.ledger.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err(AdaptiveManagerError::Invalid("P-C V3 ledger poisoned")),
+                };
+                let Some(root) = ledger.roots.iter().find(|root|
+                    root.admission.same_original_admission(&slot.admission)) else {
+                    return Err(AdaptiveManagerError::Invalid("P-C V3 unstarted root missing"));
+                };
+                let (Some(recovery), Some(original), Some(ack)) =
+                    (&slot.recovery, &root.unstarted_recovery, &root.unclaimed_teacher_ack)
+                    else { return Ok(None); };
+                if !Arc::ptr_eq(recovery, original) || root.worker_reserved || root.teacher_reserved
+                    || root.teacher_seal_unknown || !ack.matches_admission(&slot.admission)
+                    || !ack.is_sealed_no_scope() {
+                    return Err(AdaptiveManagerError::Invalid("P-C V3 unstarted proof differs"));
+                }
+                let recovery = match recovery.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err(AdaptiveManagerError::Invalid("P-C V3 unstarted recovery poisoned")),
+                };
+                if !recovery.is_sealed_unstarted() { return Ok(None); }
+                continue;
+            }
             let (Some(route), Some(proof), Some(_returned)) =
                 (&slot.route, &slot.route_retirement, &slot.returned) else { return Ok(None); };
             match proof.matches_original_route(route) {
