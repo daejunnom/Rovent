@@ -13,14 +13,28 @@ type Handler =
 type Dispatch = Box<dyn FnMut(Effect<RulesSearchPosition>) -> Result<(), EngineError> + Send>;
 type Driver<O, D> = AsyncServeDriver<RulesUciPort, O, D, Handler, Dispatch>;
 
-/// All unstarted original inputs are returned on an ordinary setup rejection.
-pub struct AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 'static> {
-    pub error: EngineError,
-    pub process: EngineProcess,
-    pub events: Receiver<Event>,
-    pub sender: SyncSender<Event>,
-    pub output: AsyncOutputOwner<O, D>,
-    pub close: PriorityCloseHandle,
+/// Original inputs or the already-started timer/session remain together with
+/// their error. Prepared custody does not claim the timer or device is done.
+pub enum AsyncEngineStartFailure<O: Write + Send + 'static, D: Write + Send + 'static> {
+    Unstarted {
+        error: EngineError,
+        process: EngineProcess,
+        events: Receiver<Event>,
+        sender: SyncSender<Event>,
+        output: AsyncOutputOwner<O, D>,
+        close: PriorityCloseHandle,
+    },
+    Prepared {
+        error: EngineError,
+        custody: AsyncPreparedStartFailure<O, D>,
+    },
+}
+/// The original prepared owner and all still-owned output inputs. This is a
+/// retained failure, not a release or re-admission authority.
+pub struct AsyncPreparedStartFailure<O: Write + Send + 'static, D: Write + Send + 'static> {
+    _prepared: PreparedEngine,
+    _output: AsyncOutputOwner<O, D>,
+    _close: PriorityCloseHandle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,7 +93,7 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
     // and other independent paths do not consult this guard.
     const ORIGINAL_CUSTODY_DROP_RECOVERY_IMPLEMENTED: bool = false;
     if !ORIGINAL_CUSTODY_DROP_RECOVERY_IMPLEMENTED {
-        return Err(AsyncEngineStartFailure {
+        return Err(AsyncEngineStartFailure::Unstarted {
             error: failure(
                 contract::ErrorCode::UnsupportedContract,
                 "async engine original custody recovery unavailable",
@@ -99,7 +113,7 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
             .as_ref()
             .is_some_and(|owner| owner.matches(&close))
     {
-        return Err(AsyncEngineStartFailure {
+        return Err(AsyncEngineStartFailure::Unstarted {
             error: failure(
                 contract::ErrorCode::InvalidInput,
                 "async output bounds or original close owner invalid",
@@ -112,10 +126,10 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
             close,
         });
     }
-    let prepared = match prepare_engine(events, sender, process, settings) {
+    let mut prepared = match prepare_engine(events, sender, process, settings) {
         Ok(prepared) => prepared,
         Err(rejected) => {
-            return Err(AsyncEngineStartFailure {
+            return Err(AsyncEngineStartFailure::Unstarted {
                 error: rejected.error,
                 process: rejected.process,
                 events: rejected.events,
@@ -124,6 +138,38 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
                 close,
             });
         }
+    };
+    // Recoverable invariant failure: the timer may already exist. Return its
+    // same prepared owner, session, endpoints and output, without stopping it
+    // or asserting that a device or writer has completed.
+    let Some(close_owner) = prepared.priority_close_owner.take() else {
+        return Err(AsyncEngineStartFailure::Prepared {
+            error: failure(
+                contract::ErrorCode::IdentityMismatch,
+                "prepared close owner missing",
+            )
+            .into(),
+            custody: AsyncPreparedStartFailure {
+                _prepared: prepared,
+                _output: output,
+                _close: close,
+            },
+        });
+    };
+    let Some(observer) = prepared.dispatch_close_observer.take() else {
+        prepared.priority_close_owner = Some(close_owner);
+        return Err(AsyncEngineStartFailure::Prepared {
+            error: failure(
+                contract::ErrorCode::IdentityMismatch,
+                "prepared close observer missing",
+            )
+            .into(),
+            custody: AsyncPreparedStartFailure {
+                _prepared: prepared,
+                _output: output,
+                _close: close,
+            },
+        });
     };
     let PreparedEngine {
         owner,
@@ -134,13 +180,9 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
         timer_stop,
         timer,
         priority_owner: _,
-        priority_close_owner,
-        dispatch_close_observer,
+        priority_close_owner: _,
+        dispatch_close_observer: _,
     } = prepared;
-    // Validated against this process before preparation. The owner is moved,
-    // never replaced with another handle that happens to share an epoch.
-    let close_owner = priority_close_owner.expect("validated original close owner");
-    let observer = dispatch_close_observer.expect("validated original close observer");
     let handler_owner = Arc::clone(&owner);
     let handler: Handler = Box::new(move |session, event| {
         handler_owner
