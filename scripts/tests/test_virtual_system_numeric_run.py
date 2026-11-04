@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if sys.platform == "linux":
     import fcntl
     import virtual_system_numeric_run as numeric_runner
-    from managed_process import ProcessNotSpawned, run_group
+    from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
     from virtual_system_numeric_run import (capture_cleanup_partition, capture_process_status, observe_unresolved_owned,
                                             output_lease_tree_observation,
                                             require_capture_window, snapshot_file)
@@ -58,7 +58,8 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         self.assertEqual(child_deadline + group_reserve, 20_000_000_000)
 
     def test_late_exit_observation_preserves_exit_without_claiming_deadline(self):
-        custody = {"status": "session_released", "native_authorization": "sent", "error": None}
+        custody = {"status": "session_released", "native_authorization": "sent", "error": None,
+                   "peer_pid_verified": True}
         self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "before_deadline"}, custody),
                          "capture_process_completed")
         self.assertEqual(capture_process_status(0, True, None, {"exit_observation_timing": "at_or_after_deadline"}, custody),
@@ -219,6 +220,7 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         def rejected_child(*args, **kwargs):
             peer = socket.socket(fileno=os.dup(kwargs["pass_fds"][-1]))
             try:
+                kwargs["owned_group"]._bind(mock.Mock(pid=os.getpid()))
                 kwargs["on_spawn"]()
                 peer.send(b"PENDING")
                 peer.send(b"NO_NATIVE_ENTRY")
@@ -262,6 +264,43 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         channel.child.setblocking(False)
         with self.assertRaises(BlockingIOError):
             channel.child.recv(64)
+
+    def test_quarantined_owner_can_later_report_original_session_release(self):
+        channel = CustodyTransport(allow_native=lambda: True)
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.child.send(b"NATIVE_READY")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"ALLOW_NATIVE")
+        channel.child.send(b"UNKNOWN")
+        channel.poll()
+        self.assertEqual(channel.child.recv(64), b"REOBSERVE")
+        channel.child.send(b"UNRESOLVED")
+        channel.poll()
+        self.assertEqual(channel.state["status"], "unresolved")
+        channel.child.send(b"SESSION_RELEASED")
+        channel.poll()
+        self.assertEqual(channel.state["status"], "session_released")
+        self.assertIsNone(channel.state["error"])
+
+    def test_native_grant_interruption_remains_in_flight(self):
+        channel = CustodyTransport(allow_native=lambda: True)
+        self.addCleanup(channel.close)
+        channel.child.send(b"PENDING")
+        channel.child.send(b"NATIVE_READY")
+        with mock.patch.object(channel, "_send", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                channel.poll()
+        self.assertEqual(channel.state["native_authorization"], "send_in_flight")
+
+    def test_packet_from_other_pid_cannot_authorize_release(self):
+        channel = CustodyTransport(allow_native=lambda: True)
+        self.addCleanup(channel.close)
+        channel._expected_pid = os.getpid() + 100000
+        channel.child.send(b"PENDING")
+        channel.poll()
+        self.assertEqual(channel.state["error"], "original_child_credentials_mismatch")
+        self.assertFalse(channel.state["peer_pid_verified"])
 
     def test_stop_closes_native_admission_but_keeps_recovery_channel(self):
         channel = CustodyTransport(allow_native=lambda: True)
@@ -313,6 +352,7 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
 
     def test_private_channel_child_handshake_uses_lightweight_supervisor_tick(self):
         channel = CustodyTransport(allow_native=lambda: True)
+        owner = OwnedProcessGroup()
         self.addCleanup(channel.close)
         environment = os.environ.copy()
         environment["TEST_CUSTODY_FD"] = str(channel.child_fd())
@@ -329,7 +369,8 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         code, gone, failure = run_group(
             [str(Path(sys.executable).resolve()), "-c", program], self.root, environment,
             10, lambda: None, pass_fds=(channel.child_fd(),),
-            on_spawn=channel.child_started, on_tick=channel.poll,
+            on_spawn=lambda: channel.child_started(owner._child.pid), on_tick=channel.poll,
+            owned_group=owner,
             verify_before_spawn=True, absolute_deadline=deadline,
             deadline_observation=observation,
         )
@@ -337,6 +378,7 @@ class SystemNumericFdHandoffTests(unittest.TestCase):
         self.assertEqual((code, gone, failure), (0, True, None))
         self.assertEqual(channel.state["events"], ["PENDING", "NATIVE_READY", "SESSION_RELEASED"])
         self.assertEqual(channel.state["native_authorization"], "sent")
+        self.assertTrue(channel.state["peer_pid_verified"])
         self.assertEqual(observation["exit_observation_timing"], "before_deadline")
 
     def test_sealed_snapshot_keeps_actual_bytes_when_source_changes(self):

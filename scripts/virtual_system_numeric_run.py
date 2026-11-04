@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sys
 import time
@@ -22,6 +23,7 @@ from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
 from managed_storage import checked
 from pals_followup_run import outside_git, sha, unique_object, observe_resources
 from virtual_custody_transport import CustodyTransport
+from virtual_quarantine_owner import retain_original_owner
 
 
 def require_capture_window(config, supervisor_deadline_ns, *, now_ns=None):
@@ -52,7 +54,8 @@ def capture_process_status(code, gone, failure, observation, custody):
         return "capture_process_failed_or_incomplete"
     if observation.get("exit_observation_timing") != "before_deadline":
         return "capture_process_completed_deadline_unknown"
-    if (custody.get("status") != "session_released"
+    if (custody.get("peer_pid_verified") is not True
+            or custody.get("status") != "session_released"
             or custody.get("native_authorization") != "sent"
             or custody.get("error") is not None):
         return "capture_process_completed_custody_unknown"
@@ -292,7 +295,7 @@ def main(argv=None):
         admission_error = None
         def acquire_output_and_allow_native():
             nonlocal lease, admission_error
-            if time.monotonic_ns() + cleanup_ns >= deadline_ns:
+            if stop_signals or time.monotonic_ns() + cleanup_ns >= deadline_ns:
                 return False
             try:
                 if lease is not None:
@@ -306,7 +309,7 @@ def main(argv=None):
                 raise
             # Acquiring the original lease may itself consume the remaining
             # window. Never grant output creation or native entry after it.
-            return time.monotonic_ns() + cleanup_ns < deadline_ns
+            return not stop_signals and time.monotonic_ns() + cleanup_ns < deadline_ns
 
         transport = CustodyTransport(
             allow_native=acquire_output_and_allow_native,
@@ -321,12 +324,24 @@ def main(argv=None):
         env["ROVEZERO_CHILD_CLEANUP_DEADLINE_MONOTONIC_NS"] = str(child_cleanup_deadline_ns)
         def producer_spawned():
             receipt["producer_spawned"] = True
-            transport.child_started()
+            transport.child_started(group._child.pid)
         def transport_poll():
             try:
                 transport.poll()
             except Exception as error:
                 transport.stop_sending(f"poll:{type(error).__name__}")
+        stop_signals = []
+        stop_signal_delivered = [False]
+        def owner_tick():
+            if stop_signals and not stop_signal_delivered[0]:
+                stop_signal_delivered[0] = True
+                transport.close_native_admission()
+                raise KeyboardInterrupt(f"supervisor received signal {stop_signals[0]}")
+            transport_poll()
+            if stop_signals and not stop_signal_delivered[0]:
+                stop_signal_delivered[0] = True
+                transport.close_native_admission()
+                raise KeyboardInterrupt(f"supervisor received signal {stop_signals[0]}")
         def producer_check():
             try:
                 if admission_error is not None:
@@ -336,13 +351,62 @@ def main(argv=None):
             except BaseException:
                 transport.close_native_admission()
                 raise
+        def stop_and_retain_unresolved():
+            def publish_quarantine(record):
+                receipt["status"] = "quarantined_original_owner"
+                receipt["quarantine_owner"] = dict(record)
+                receipt["producer_stop_cause"] = group.stop_cause
+                receipt["supervisor_stop_signal"] = stop_signals[0] if stop_signals else None
+                receipt_file.seek(0)
+                receipt_file.truncate()
+                json.dump(receipt, receipt_file, sort_keys=True, ensure_ascii=False, allow_nan=False)
+                receipt_file.write("\n")
+                receipt_file.flush()
+                os.fsync(receipt_file.fileno())
+            while True:
+                try:
+                    transport.close_native_admission()
+                    transport_poll()
+                    custody = transport.state
+                    if (custody.get("native_authorization") not in {"sent", "send_in_flight"}
+                            or (custody.get("peer_pid_verified") is True
+                                and custody.get("status") in {"session_released", "owner_recovered", "no_native_entry"}
+                                and custody.get("terminal_observation_valid") is True)):
+                        return None
+                    original = group._child
+                    if original is None:
+                        raise RuntimeError("original spawned process owner is unavailable")
+                    state = retain_original_owner(original, transport, publish_quarantine)
+                    receipt["quarantine_owner"] = state
+                    return state["state"] == "original_owner_release_observed"
+                except BaseException as error:
+                    # Once native admission was granted, an observation or
+                    # interruption is not a release. Keep the same owners and
+                    # retry the quarantine path without starting work.
+                    if transport.state.get("native_authorization") not in {"sent", "send_in_flight"}:
+                        raise
+                    errors = receipt.setdefault("quarantine_setup_errors", [])
+                    if len(errors) < 16:
+                        errors.append({"type": type(error).__name__, "message": str(error)[:1024]})
+                    try:
+                        time.sleep(1)
+                    except BaseException:
+                        pass
+        def request_supervisor_stop(signum, _frame):
+            if not stop_signals:
+                stop_signals.append(signum)
+        old_signal_handlers = {}
         try:
+            # Normal external stop requests must go through the original owner
+            # path. SIGKILL, OOM and host loss remain outside this guarantee.
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                old_signal_handlers[sig] = signal.signal(sig, request_supervisor_stop)
             code, gone, failure = run_group([f"/proc/self/fd/{binary_fd}", f"/proc/self/fd/{config_image}"],
                                             args.binary.parent, env, remaining, producer_check,
                                             pass_fds=(binary_fd, config_image, transport.child_fd()), on_spawn=producer_spawned,
                                             verify_before_spawn=True, absolute_deadline=deadline,
-                                            deadline_observation=observation, on_tick=transport_poll,
-                                            on_stop=transport.close_native_admission, owned_group=group,
+                                            deadline_observation=observation, on_tick=owner_tick,
+                                            on_stop=stop_and_retain_unresolved, owned_group=group,
                                             graceful_drain_deadline=child_cleanup_deadline_ns / 1_000_000_000)
             # Preserve the original tuple before any transport cleanup.
             receipt.update(producer_result_observed=True, producer_exit_code=code,
@@ -370,6 +434,8 @@ def main(argv=None):
                 "type": type(error.__cause__).__name__, "message": str(error.__cause__)}
             raise
         finally:
+            for sig, previous in old_signal_handlers.items():
+                signal.signal(sig, previous)
             for label, operation in (("poll", transport.poll), ("close", transport.close)):
                 try:
                     operation()
@@ -378,6 +444,12 @@ def main(argv=None):
                         "operation": label, "type": type(error).__name__, "message": str(error)})
                     transport.state["error"] = f"{label}:{type(error).__name__}"
         receipt["status"] = capture_process_status(code, gone, failure, observation, transport.state)
+        if stop_signals:
+            # waitid can observe child exit before the next signal-aware tick;
+            # preserve the outcome without assuming their actual order.
+            receipt["supervisor_stop_signal"] = stop_signals[0]
+            if receipt["status"] == "capture_process_completed":
+                receipt["status"] = "capture_process_stop_requested_timing_unknown"
     except BaseException as error:
         first_error = error
         receipt.update(status="supervisor_error", wrapper_error={"type": type(error).__name__, "message": str(error)})
@@ -411,6 +483,10 @@ def main(argv=None):
         receipt["elapsed_seconds"] = time.monotonic() - start
         receipt_error = None
         try:
+            # A quarantined run may already have written an interim receipt.
+            # Publish one final JSON document while keeping its incident data.
+            receipt_file.seek(0)
+            receipt_file.truncate()
             json.dump(receipt, receipt_file, sort_keys=True, ensure_ascii=False, allow_nan=False)
             receipt_file.write("\n")
             receipt_file.flush()

@@ -98,6 +98,7 @@ class OwnedProcessGroup:
         self._exit_code = None
         self.cleanup_error = None
         self.stop_error = None
+        self.stop_cause = None
 
     def _assert_available(self):
         if os.getpid() != self._owner_pid or self._child is not None or self._completed:
@@ -344,8 +345,10 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                 requested_exit = 124
                 break
             time.sleep(0.1)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         requested_exit = 130
+        if str(exc):
+            failure = str(exc)
     except Exception as exc:
         requested_exit, failure = 125, str(exc)
     except BaseException as exc:
@@ -359,15 +362,28 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         # interrupted; do not infer anything about a Popen that raised itself.
         if owned_group._child is None:
             owned_group._bind(child)
+        stop_result = None
         if requested_exit is not None and on_stop is not None:
+            owned_group.stop_cause = {"requested_exit_code": requested_exit,
+                                      "original_supervisor_error": failure}
             try:
-                on_stop()
+                stop_result = on_stop()
             except BaseException as exc:
                 owned_group.stop_error = {"kind": "callback", "error_type": type(exc).__name__,
                                           "message": str(exc)}
                 # A failed stop hook cannot establish that admission closed.
                 # Never run another transport tick on that uncertain channel.
                 on_tick = None
+        if stop_result is False:
+            # The original child exited without an owner-release observation.
+            # Do not turn that loss into permission to signal its group or to
+            # assert process-tree/GPU completion.
+            return requested_exit, False, failure
+        if stop_result is True:
+            # A retained original owner was released after the work deadline.
+            # Give that same child a separate, bounded process-drain window.
+            absolute_deadline = time.monotonic() + 3.0
+            graceful_drain_deadline = time.monotonic() + 1.0
         gone, result, cleanup_error = _finish_owned_group(
             child, on_tick, graceful_drain_deadline, absolute_deadline)
         owned_group.cleanup_error = cleanup_error

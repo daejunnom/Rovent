@@ -467,6 +467,22 @@ class ManagedProcessSpawnTests(unittest.TestCase):
         self.assertEqual(ticks, [1])
         self.assertEqual(owner.stop_error["message"], "stop failed")
 
+    def test_unreleased_original_owner_is_never_signalled_during_stop(self):
+        owner = OwnedProcessGroup()
+        child = mock.Mock(pid=123456, returncode=None)
+
+        def fail_tick():
+            raise ValueError("original")
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.os.waitid", return_value=None), \
+             mock.patch("managed_process.os.killpg") as killpg:
+            result = run_group([self.python], self.root, os.environ.copy(), 10, lambda: None,
+                               owned_group=owner, on_tick=fail_tick, on_stop=lambda: False)
+        self.assertEqual(result, (125, False, "original"))
+        killpg.assert_not_called()
+        child.wait.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

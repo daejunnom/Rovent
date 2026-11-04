@@ -1532,6 +1532,27 @@ impl Error for CapturePanicFailure {}
 
 #[cfg(target_os = "linux")]
 impl SystemCaptureWorker {
+    fn finish_preserving_owner(&mut self, work_until: Instant, cleanup_until: Instant) -> Result<()> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finish_supervised(work_until, cleanup_until)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                // Do not unwind through the original worker/lease after a
+                // cleanup panic. Its partially advanced state cannot safely be
+                // retried or reconstructed; retain both it and the payload.
+                let _original_panic_payload = payload;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "RZ_CUSTODY_QUARANTINE=cleanup_panic_original_owner_retained"
+                );
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+        }
+    }
+
     fn send_supervisor(&self, packet: &[u8]) {
         if let Err(error) = self.supervisor.send(packet) {
             // A transport failure is evidence, never a substitute for the
@@ -1723,7 +1744,20 @@ impl SystemCaptureWorker {
         let mut recovery_failures = 0u32;
         let mut first_recovery_failure = None;
         let mut retire_failed = false;
-        while Instant::now() < cleanup_until {
+        let mut quarantine_notified = false;
+        loop {
+            if !quarantine_notified && Instant::now() >= cleanup_until {
+                if !unknown_sent {
+                    self.send_supervisor(b"UNKNOWN");
+                    unknown_sent = true;
+                }
+                Self::report_recovery_control_failure(
+                    recovery_failures,
+                    &first_recovery_failure,
+                );
+                self.send_supervisor(b"UNRESOLVED");
+                quarantine_notified = true;
+            }
             match self.finish(Instant::now()) {
                 Ok(()) => {
                     Self::report_recovery_control_failure(
@@ -1731,7 +1765,7 @@ impl SystemCaptureWorker {
                         &first_recovery_failure,
                     );
                     self.send_release_proof();
-                    return Ok(());
+                    return if quarantine_notified { Err(first_error) } else { Ok(()) };
                 }
                 Err(error) if self.quarantined && quarantine_error.is_none() => {
                     quarantine_error = Some(error);
@@ -1758,9 +1792,10 @@ impl SystemCaptureWorker {
                             &first_recovery_failure,
                         );
                         self.send_release_proof();
-                        return Ok(());
+                        return if quarantine_notified { Err(first_error) } else { Ok(()) };
                     }
                     if quarantined
+                        && !quarantine_notified
                         && pending_observe.is_none()
                         && pending_release.is_none()
                         && !released
@@ -1781,7 +1816,11 @@ impl SystemCaptureWorker {
                             });
                         }
                     }
-                    self.send_supervisor(b"PENDING");
+                    // A request already queued before the quarantine notice
+                    // must not move the supervisor back out of that state.
+                    if !quarantine_notified {
+                        self.send_supervisor(b"PENDING");
+                    }
                 }
                 Some(Ok(_)) => {
                     let _ = writeln!(
@@ -1882,21 +1921,15 @@ impl SystemCaptureWorker {
                     None => first_error,
                 });
             }
-            std::thread::sleep(Duration::from_millis(10));
+            // After the finite work/cleanup windows, retain this exact owner
+            // without retrying model work. Only an exceptional physical-
+            // unknown owner can stay alive here; normal joins return above.
+            std::thread::sleep(if quarantine_notified {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(10)
+            });
         }
-        if !unknown_sent {
-            self.send_supervisor(b"UNKNOWN");
-        }
-        Self::report_recovery_control_failure(recovery_failures, &first_recovery_failure);
-        self.send_supervisor(b"UNRESOLVED");
-        Err(match quarantine_error {
-            Some(error) => Box::new(CaptureAndCleanupFailure {
-                primary_stage: "physical_quarantine",
-                primary: error,
-                cleanup: first_error,
-            }),
-            None => first_error,
-        })
     }
 
     fn send_release_proof(&self) {
@@ -1950,7 +1983,7 @@ fn finish(worker: &mut Worker, work_until: Instant, until: Instant) -> Result<()
     match worker {
         Worker::Legacy(worker) => finish_legacy(worker, until),
         #[cfg(target_os = "linux")]
-        Worker::System(worker) => worker.finish_supervised(work_until, until),
+        Worker::System(worker) => worker.finish_preserving_owner(work_until, until),
     }
 }
 
@@ -2484,7 +2517,7 @@ fn execute(
                         .checked_add(Duration::from_secs(config.cleanup_seconds))
                         .unwrap_or(registered)
                         .min(registered);
-                    return match owner.finish_supervised(until, cleanup_until) {
+                    return match owner.finish_preserving_owner(until, cleanup_until) {
                         Ok(()) => Err(startup),
                         Err(cleanup) => Err(Box::new(CaptureAndCleanupFailure {
                             primary_stage: "startup",
