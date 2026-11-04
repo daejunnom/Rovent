@@ -21,10 +21,17 @@ use std::{
 use crate::{
     engine::{
         EngineProcess, PriorityCloseHandle, ProcessClock,
-        async_engine::{self, AsyncEngineRun, AsyncEngineStartFailure, EngineTimerJoinStatus},
+        async_engine::{
+            self, AsyncEngineRun, AsyncEngineStartFailure, EngineTimerJoinStatus,
+            EngineWriterRecoveryStatus,
+        },
     },
     native_profile::ProfiledWrite,
-    runner::{Event, async_events::AsyncServeStatus, async_output::AsyncOutputOwner},
+    runner::{
+        Event,
+        async_events::AsyncServeStatus,
+        async_output::{AsyncOutputOwner, OutputRecovery},
+    },
 };
 use std::sync::mpsc::{Receiver, SyncSender};
 
@@ -817,6 +824,31 @@ impl Lc0SupervisedSession {
     pub(crate) fn try_join_async_timer(&mut self) -> Option<EngineTimerJoinStatus> {
         match self.async_custody.as_mut()? {
             Lc0AsyncCustody::Running { run, .. } => Some(run.try_join_timer_after_workers()),
+            _ => None,
+        }
+    }
+
+    /// Poll the original writer without blocking or replacing the run. A
+    /// recovered writer is independent of native session and GPU completion.
+    pub(crate) fn try_recover_async_writer(&mut self) -> Option<EngineWriterRecoveryStatus> {
+        match self.async_custody.as_mut()? {
+            Lc0AsyncCustody::Running { run, .. } => Some(run.try_recover_writer()),
+            _ => None,
+        }
+    }
+
+    /// Keep the exact output, queued batches, partial bytes, errors or writer
+    /// panic in the original run. Merely borrowing them does not replay output.
+    pub(crate) fn async_writer_recovery(
+        &self,
+    ) -> Option<
+        &Result<
+            OutputRecovery<ProfiledWrite<std::io::Stdout>, std::io::Stderr>,
+            Box<dyn std::any::Any + Send>,
+        >,
+    > {
+        match self.async_custody.as_ref()? {
+            Lc0AsyncCustody::Running { run, .. } => run.output_recovery(),
             _ => None,
         }
     }
