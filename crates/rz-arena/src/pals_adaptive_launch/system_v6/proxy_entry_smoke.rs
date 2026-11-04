@@ -229,6 +229,20 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
             ),
         ),
         (
+            "proxy_smoke_prepare",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_prepare_v1.rs"
+            ),
+        ),
+        (
+            "proxy_smoke_expected_argv",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy/smoke_expected_argv_v1.rs"),
+        ),
+        (
+            "proxy_smoke_lock",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_lock_v1.rs"),
+        ),
+        (
             "proxy_module",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy.rs"),
         ),
