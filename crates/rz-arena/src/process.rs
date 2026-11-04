@@ -108,6 +108,67 @@ pub struct OriginalProcessInput<'a> {
     pub window: OriginalProcessWindow,
 }
 
+/// The caller owns this observation before entering the smoke supervisor and
+/// retains it even if supervision returns an error or unwinds. It describes
+/// transport only; it does not seal input contents or establish UCI/model,
+/// GPU, resource-policy, or physical-completion success.
+#[cfg(target_os = "linux")]
+pub(crate) struct OriginalSmokeTransportObservation {
+    window: OriginalProcessWindow,
+    transport: OriginalProcessObservation,
+    pre_signal: PreSignalObservation,
+    started: bool,
+    returned: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl OriginalSmokeTransportObservation {
+    pub(crate) fn new(input: OriginalProcessInput<'_>) -> Result<Self, ArenaError> {
+        validate_smoke_protocol_input(input.bytes)?;
+        Ok(Self {
+            window: input.window,
+            transport: OriginalProcessObservation::new(input.bytes.len()),
+            pre_signal: PreSignalObservation::default(),
+            started: false,
+            returned: false,
+        })
+    }
+
+    pub(crate) fn transport(&self) -> &OriginalProcessObservation {
+        &self.transport
+    }
+
+    pub(crate) fn pre_signal(&self) -> &PreSignalObservation {
+        &self.pre_signal
+    }
+
+    pub(crate) fn stdin_closed_after_input(&self) -> bool {
+        self.transport.stdin_closed_after_input
+    }
+
+    /// A started attempt without a return may have unwound. The original
+    /// external custody must be resolved independently in that case.
+    pub(crate) fn attempt_started(&self) -> bool {
+        self.started
+    }
+
+    pub(crate) fn attempt_returned(&self) -> bool {
+        self.returned
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_smoke_protocol_input(input: &[u8]) -> Result<(), ArenaError> {
+    // Match the existing finite UCI preflight bound; no commands are added or
+    // interpreted here. The supervisor closes stdin after these bytes.
+    if input.is_empty() || input.len() > 64 * 1024 || !input.ends_with(b"\n") {
+        return Err(ArenaError::Budget(
+            "finite smoke protocol input requires 1..64KiB and a final newline".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// 수치 캡처의 고정 FP32 조건만 전달한다. 임의 환경이나 부모의 CUDA/
 /// 인증/검색 경로를 상속하는 접점이 아니며 기존 실행의 환경은 보존한다.
 #[derive(Clone, Copy, Debug)]
@@ -1046,6 +1107,99 @@ pub(crate) fn supervise_tree_observed_with_v6_controls<'v>(
             "native process supervision currently requires Linux".into(),
         ))
     }
+}
+
+/// Run a finite, explicitly supplied smoke transcript under the original clock
+/// and the caller's original child/control custody. Input is written once and
+/// stdin is then closed. In particular, proxy input EOF may initiate cleanup:
+/// this function does not wait for `uciok`/`readyok`, synthesize `quit`, or
+/// establish model execution, UCI protocol success, or physical completion.
+///
+/// The caller owns `spawned`, control callbacks, and `observation` even when
+/// this returns an error. A successful `ProcessOutput` retains the same output
+/// and any unresolved process handle under the existing supervisor contract.
+/// Resource profile application and same-owner/role admission remain the
+/// caller's responsibility.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_smoke_input_in_original_window<'v>(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    spawned: &'v mut SpawnCustody,
+    mut control: SpawnControl<'v>,
+    cleanup_control: Option<CleanupControl<'v>>,
+    pre_signal: Option<PreSignalControl<'v>>,
+    observation: &'v mut OriginalSmokeTransportObservation,
+) -> Result<ProcessOutput, ArenaError> {
+    validate_smoke_protocol_input(input.bytes)?;
+    if observation.started
+        || observation.transport.input_bytes != input.bytes.len()
+        || observation.window.started != input.window.started
+        || observation.window.execution != input.window.execution
+        || observation.window.whole != input.window.whole
+    {
+        return Err(ArenaError::Invalid(
+            "smoke observation does not match this fresh original window and input length".into(),
+        ));
+    }
+    input.window.check_before_spawn(limits)?;
+    watch.validate()?;
+    if !directory
+        .metadata()
+        .map_err(|_| ArenaError::Io("process.cwd_metadata".into()))?
+        .is_dir()
+    {
+        return Err(ArenaError::Invalid(
+            "original smoke cwd handle must be a directory".into(),
+        ));
+    }
+    let directory = directory
+        .try_clone()
+        .map_err(|_| ArenaError::Io("process.cwd_clone".into()))?;
+    let has_pre_signal = pre_signal.is_some();
+    // Keep a panicking run callback on the normal original-child cleanup path
+    // so the returned ProcessOutput can still preserve its drained bytes.
+    // Cleanup/pre-signal callbacks already receive this handling in supervise.
+    let mut guarded_control = |owner: &SpawnCustody, until: Instant| match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| control(owner, until)),
+    ) {
+        Ok(result) => result,
+        Err(_) => Err(ArenaError::Io("process.smoke_run_control:panic".into())),
+    };
+    observation.started = true;
+    observation.transport.original_supervisor_entry_ns = input.window.elapsed_ns(Instant::now());
+    let result = linux::supervise(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        Some(linux::ArtifactObservation::Tree(watch)),
+        None,
+        linux::InvocationIo {
+            commands: Some(input.bytes),
+            original: Some(input.window),
+            observation: Some(&mut observation.transport),
+            spawned: Some(spawned),
+            control: Some(&mut guarded_control),
+            cleanup_control,
+            pre_signal,
+            pre_signal_observation: has_pre_signal.then_some(&mut observation.pre_signal),
+            ..Default::default()
+        },
+    );
+    let returned = Instant::now();
+    observation.transport.original_finished_ns = input.window.elapsed_ns(returned);
+    observation.transport.finished_before_whole = returned < input.window.whole;
+    observation.transport.cancelled_at_return =
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    observation.returned = true;
+    result
 }
 
 /// Finite UCI preflight input through the same pinned ELF/process-group owner.
@@ -2892,6 +3046,163 @@ mod linux {
                 max_output_bytes: 256 * 1024,
                 max_child_processes: 1,
             }
+        }
+
+        const SMOKE_ADAPTER_MODE: &str = ".rz-smoke-input-adapter-mode";
+        const SMOKE_ADAPTER_READY: &str = ".rz-smoke-input-adapter-ready";
+        const SMOKE_ADAPTER_CHILD: &str = "process::linux::tests::smoke_input_adapter_mock_child";
+
+        /// Only the owned temporary cwd provides the mode file. A normal
+        /// workspace test run does not read stdin or start this mock worker.
+        #[test]
+        fn smoke_input_adapter_mock_child() {
+            let Ok(mode) = std::fs::read_to_string(SMOKE_ADAPTER_MODE) else {
+                return;
+            };
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).unwrap();
+            let mut output = std::io::stdout().lock();
+            output.write_all(b"mock-input:").unwrap();
+            output.write_all(&input).unwrap();
+            output.flush().unwrap();
+            if mode == "hold" {
+                std::fs::write(SMOKE_ADAPTER_READY, b"ready").unwrap();
+                // The original supervisor owns the deadline and termination;
+                // this mock never represents native or GPU work.
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+
+        #[test]
+        fn smoke_input_adapter_writes_exact_bytes_and_observes_eof() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            std::fs::write(&mode, b"echo").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let bytes = b"uci\nisready\n";
+            let input = OriginalProcessInput { bytes, window };
+            let mut observation = OriginalSmokeTransportObservation::new(input).unwrap();
+            let mut custody = SpawnCustody::default();
+            let mut control = |owner: &SpawnCustody, until: Instant| {
+                assert!(owner.pending.load(Ordering::Acquire));
+                assert!(owner.child().is_some());
+                assert!(until <= window.execution);
+                Ok(())
+            };
+            let result = supervise_smoke_input_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                input,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::Exited);
+            assert_eq!(result.receipt.exit_code, Some(0));
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(result.pending_child.is_none());
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert_eq!(observation.transport().written_bytes(), Some(bytes.len()));
+            assert!(observation.transport.stdin_closed_after_input);
+            assert!(observation.transport().stdout_eof());
+            assert!(
+                result
+                    .stdout
+                    .windows(b"mock-input:uci\nisready\n".len())
+                    .any(|part| { part == b"mock-input:uci\nisready\n" })
+            );
+            // No synthetic quit or successful chess/model observation is made.
+            assert!(!result.stdout.windows(5).any(|part| part == b"quit\n"));
+            std::fs::remove_file(mode).unwrap();
+        }
+
+        #[test]
+        fn smoke_input_adapter_catches_control_panic_and_retains_output() {
+            let root = OriginalTestDirectory::new();
+            let mode = root.0.join(SMOKE_ADAPTER_MODE);
+            let ready = root.0.join(SMOKE_ADAPTER_READY);
+            std::fs::write(&mode, b"hold").unwrap();
+            let program = File::open(std::env::current_exe().unwrap()).unwrap();
+            let limits = original_limits();
+            let start = Instant::now();
+            let window = OriginalProcessWindow::new(
+                start,
+                start + Duration::from_millis(limits.wall_ms),
+                start + Duration::from_millis(limits.wall_ms + limits.shutdown_grace_ms * 2),
+            )
+            .unwrap();
+            let input = OriginalProcessInput {
+                bytes: b"uci\n",
+                window,
+            };
+            let mut observation = OriginalSmokeTransportObservation::new(input).unwrap();
+            let mut custody = SpawnCustody::default();
+            let mut control = |owner: &SpawnCustody, _: Instant| {
+                assert!(owner.child().is_some());
+                if ready.is_file() {
+                    panic!("smoke control fixture");
+                }
+                Ok(())
+            };
+            let result = supervise_smoke_input_in_original_window(
+                &program,
+                &[
+                    "--exact".into(),
+                    SMOKE_ADAPTER_CHILD.into(),
+                    "--nocapture".into(),
+                ],
+                &root.file(),
+                limits,
+                None,
+                &original_watch(),
+                input,
+                &mut custody,
+                &mut control,
+                None,
+                None,
+                &mut observation,
+            )
+            .unwrap();
+            assert_eq!(result.receipt.stop, ProcessStop::IoFailure);
+            assert!(result.receipt.errors.iter().any(|error| {
+                error.contains("process.owner_control:")
+                    && error.contains("process.smoke_run_control:panic")
+            }));
+            assert!(
+                result
+                    .stdout
+                    .windows(b"mock-input:uci\n".len())
+                    .any(|part| { part == b"mock-input:uci\n" })
+            );
+            assert!(observation.attempt_started() && observation.attempt_returned());
+            assert_eq!(
+                observation.transport().written_bytes(),
+                Some(input.bytes.len())
+            );
+            assert_eq!(custody.last_spawn_pid, Some(result.receipt.pid));
+            assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+            assert!(result.pending_child.is_none());
+            std::fs::remove_file(ready).unwrap();
+            std::fs::remove_file(mode).unwrap();
         }
 
         #[test]
