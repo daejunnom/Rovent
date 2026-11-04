@@ -225,6 +225,12 @@ pub(super) enum LockV3RegistrationAttempt {
     Busy(RoventInputCaptureReservationV3),
     Failed(ArenaError, RoventInputCaptureReservationV3),
 }
+#[cfg(target_os = "linux")]
+pub(super) enum LockV3CancelAttempt {
+    Missing,
+    Busy,
+    Canceled(RoventInputCaptureReservationV3),
+}
 /// Issued only after the original registration owner has atomically removed
 /// this exact unstarted route. It grants no physical completion authority.
 #[cfg(target_os = "linux")]
@@ -523,6 +529,50 @@ impl RoventNativeCaptureRegistration {
                 original: root.clone(),
             },
         )))
+    }
+
+    /// Unlink only the exact route after the original joined root custody,
+    /// teacher aggregate and its bound receiver have all been revalidated.
+    /// The proof and all physical owners stay with the caller on every path.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn try_unlink_finished_speculative_root_v3(
+        &self,
+        root: &SpeculativeRootV3,
+        proof: &super::pc_hooks_lock_v3::RoventTeacherRouteRetirementV3,
+    ) -> Result<Option<bool>, ArenaError> {
+        let registered = match self.registered.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("capture registrations poisoned"));
+            }
+        };
+        let mut roots = match self.speculative_roots_v3.try_lock() {
+            Ok(value) => value,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 speculative root custody poisoned"));
+            }
+        };
+        if !root.same_registration_owner(&self.speculative_owner_v3)
+            || registered.values().any(|entry| matches!(entry,
+                RegisteredInputCapture::LockV3 { admission, .. } if root.matches_admission(admission))) {
+            return Ok(Some(false));
+        }
+        let Some(index) = roots
+            .iter()
+            .position(|entry| entry.same_original_route(root))
+        else {
+            return Ok(Some(false));
+        };
+        match proof.matches_original_route(root)? {
+            None => return Ok(None),
+            Some(false) => return Ok(Some(false)),
+            Some(true) => {}
+        }
+        root.route.installed.store(false, Ordering::Release);
+        roots.remove(index);
+        Ok(Some(true))
     }
     pub(super) fn same_original_owner(&self, other: &Self) -> bool {
         let same = Arc::ptr_eq(&self.registered, &other.registered)
@@ -1234,30 +1284,33 @@ impl RoventNativeCaptureRegistration {
         &self,
         ticket: &RoleTicketEnvelope,
         admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
-    ) -> Result<Option<RoventInputCaptureReservationV3>, ArenaError> {
-        let mut registered = self
-            .registered
-            .lock()
-            .map_err(|_| invalid("Rovent capture registration poisoned"))?;
+    ) -> Result<LockV3CancelAttempt, ArenaError> {
+        let mut registered = match self.registered.try_lock() {
+            Ok(registered) => registered,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(LockV3CancelAttempt::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("Rovent capture registration poisoned"));
+            }
+        };
         match registered.get(&ticket.id) {
-            None => return Ok(None),
+            None => return Ok(LockV3CancelAttempt::Missing),
             Some(RegisteredInputCapture::LockV3 {
                 ticket: original,
                 admission: owner,
+                speculative,
                 ..
-            }) if original == ticket && owner.same_original_admission(admission) => {}
+            }) if original == ticket && owner.same_original_admission(admission) => {
+                if let Some((_, original_ticket)) = speculative {
+                    if original_ticket.try_cancel()?.is_none() {
+                        return Ok(LockV3CancelAttempt::Busy);
+                    }
+                }
+            }
             Some(_) => return Err(invalid("lock-v3 cancellation identity mismatch")),
         }
         match registered.remove(&ticket.id) {
-            Some(RegisteredInputCapture::LockV3 {
-                reservation,
-                speculative,
-                ..
-            }) => {
-                if let Some((_, ticket)) = speculative {
-                    ticket.canceled();
-                }
-                Ok(Some(reservation))
+            Some(RegisteredInputCapture::LockV3 { reservation, .. }) => {
+                Ok(LockV3CancelAttempt::Canceled(reservation))
             }
             _ => unreachable!("checked original lock-v3 registration"),
         }
@@ -1680,7 +1733,7 @@ impl RoventNativeInputObserver {
                                 context.original_cancellation(),
                                 route.root_revoked(),
                                 route.root_canceled(),
-                                route.target_revoke_flag(),
+                                route.target_revocation(),
                             )
                         });
                 let input = RoventCapturedLockInputV3 {
