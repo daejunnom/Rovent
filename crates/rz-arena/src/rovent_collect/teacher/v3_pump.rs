@@ -249,6 +249,10 @@ impl TeacherPumpV3 {
         if !self.closed
             || self.pending_delivery_ack
             || self.held.is_some()
+            // Custody alone is not a terminal or target-revocation proof.
+            // Keep the route until an explicit evidence-preserving handoff
+            // can establish the fate of these original queued capsules.
+            || !self.closed_capsules.is_empty()
             || self.completed.is_some()
             || !self.terminal_backlog.is_empty()
             || self.rejected.is_some()
