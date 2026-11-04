@@ -1388,6 +1388,29 @@ impl PcGameClosureProofV3 {
     /// The stored observer tokens are observations, not a promise that the
     /// owners stayed drained. Reobserve the same roots before game closure.
     pub(super) fn try_revalidate_observers(&self) -> Result<Option<bool>, ArenaError> {
+        let Some(roots) = self.closure.verified_roots.as_ref() else { return Ok(None); };
+        {
+            let state = match self.closure._bridge.state.try_lock() {
+                Ok(state) => state,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(_) => return Err(invalid("P-C V3 original root custody poisoned")),
+            };
+            if state.roots.len() != roots.len() { return Ok(Some(false)); }
+            for root in roots {
+                let Some(slot) = state.roots.iter().find(|slot|
+                    slot.admission.same_original_admission(&root.admission)) else { return Ok(Some(false)); };
+                let (Some(original_owner), Some(owner), Some(route), Some(retirement)) =
+                    (&root.observer, &slot.owner, &slot.route, &slot.route_retirement) else { return Ok(None); };
+                if !root.requires_observer || !original_owner.same_original_owner(owner) {
+                    return Ok(Some(false));
+                }
+                match retirement.matches_original_route(route)? {
+                    Some(true) => {},
+                    None => return Ok(None),
+                    Some(false) => return Ok(Some(false)),
+                }
+            }
+        }
         for (owner, admission, original) in &self.observers {
             if !original.matches_original(owner, admission, &self.pipeline) {
                 return Err(invalid("P-C V3 original observer drain differs"));
