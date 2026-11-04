@@ -478,8 +478,11 @@ impl PalsCudaControlPolicy {
                     .cuda_nodes
                     .checked_add(placement.approved_cpu_control_nodes)
                     != Some(placement.assigned_nodes)
-                || placement.recursive_coverage
-                    != "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run"
+                || (placement.recursive_coverage != NAMED_RECURSIVE_COVERAGE
+                    && !(placement.recursive_coverage == ALL_CUDA_SUMMARY_COVERAGE
+                        && placement.approved_cpu_control_nodes == 0
+                        && graph.required_cuda_dispatch.is_empty()
+                        && placement.approved_transfers.is_empty()))
             {
                 return Err(policy_error(
                     "V3 pre-Run source/provider coverage is invalid",
@@ -500,6 +503,13 @@ impl PalsCudaControlPolicy {
                 &self.graphs[*role],
                 &placement.approved_transfers,
             )?;
+            if placement.recursive_coverage == ALL_CUDA_SUMMARY_COVERAGE
+                && witness.approved_cpu_control_kernels != 0
+            {
+                return Err(policy_error(
+                    "V3 CPU kernel contradicts the recursive all-CUDA summary",
+                ));
+            }
             if witness.neural_kernels == 0 {
                 return Err(policy_error(
                     "V3 role profile has no completed neural kernel",
@@ -1245,6 +1255,115 @@ mod tests {
         ]);
         assert!(value
             .verify_virtual_profiles(&profiles, vec![], [1; 32], [2; 32])
+            .is_err());
+    }
+
+    #[test]
+    fn all_cuda_summary_needs_exact_executed_profiles_and_both_private_roles() {
+        let make_graph = |nodes: &[(&str, &str)]| GraphPolicy {
+            digest: [1; 32],
+            nodes: nodes
+                .iter()
+                .map(|(n, op)| ((*n).into(), (*op).into()))
+                .collect(),
+            controls: BTreeMap::from([("shape".into(), "Shape".into())]),
+            major: nodes
+                .iter()
+                .filter(|(_, op)| *op == "MatMul")
+                .map(|(n, op)| ((*n).into(), (*op).into()))
+                .collect(),
+            proposer_private: BTreeMap::from([("p_nn".into(), "MatMul".into())]),
+            critic_private: BTreeMap::from([("c_nn".into(), "MatMul".into())]),
+            role_transfer: None,
+            required_cuda_dispatch: BTreeSet::new(),
+        };
+        let public = make_graph(&[("nn", "MatMul"), ("shape", "Shape")]);
+        let shared = make_graph(&[("p_nn", "MatMul"), ("c_nn", "MatMul")]);
+        let value = PalsCudaControlPolicy {
+            manifest: [2; 32],
+            inventory: [3; 32],
+            graphs: BTreeMap::from([("public".into(), public), ("shared_pc".into(), shared)]),
+            virtual_layout: Some(VirtualReviewControlLayout {
+                kind: Kind::FreshPc,
+                validator_private: BTreeMap::new(),
+                validator_task_head: BTreeMap::new(),
+                weight_bindings: BTreeMap::new(),
+            }),
+        };
+        let event = |name: &str, op: &str, provider: &str| {
+            json!({
+                "cat":"Node", "name":format!("{name}_kernel_time"),
+                "args":{"provider":provider,"op_name":op,"output_type_shape":[{"int64":[1]}]}
+            })
+        };
+        let profiles = BTreeMap::from([
+            (
+                "public".into(),
+                serde_json::to_vec(&vec![event("nn", "MatMul", CUDA)]).unwrap(),
+            ),
+            (
+                "shared_pc".into(),
+                serde_json::to_vec(&vec![
+                    event("p_nn", "MatMul", CUDA),
+                    event("c_nn", "MatMul", CUDA),
+                ])
+                .unwrap(),
+            ),
+        ]);
+        let placements = ["public", "shared_pc"]
+            .into_iter()
+            .map(|role| PalsGraphPlacement {
+                role: role.into(),
+                graph_sha256: [1; 32],
+                log_sha256: [4; 32],
+                assigned_nodes: 2,
+                cuda_nodes: 2,
+                approved_cpu_control_nodes: 0,
+                optimization: PalsGraphOptimization::Disable,
+                approved_transfers: Vec::new(),
+                recursive_coverage: ALL_CUDA_SUMMARY_COVERAGE.into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(value
+            .verify_virtual_profiles_common(&profiles, placements.clone())
+            .is_ok());
+        let mut cpu = profiles.clone();
+        cpu.insert(
+            "public".into(),
+            serde_json::to_vec(&vec![
+                event("nn", "MatMul", CUDA),
+                event("shape", "Shape", CPU),
+            ])
+            .unwrap(),
+        );
+        assert!(value
+            .verify_virtual_profiles_common(&cpu, placements.clone())
+            .is_err());
+        let mut unknown = profiles.clone();
+        unknown.insert(
+            "public".into(),
+            serde_json::to_vec(&vec![event("unknown", "MatMul", CUDA)]).unwrap(),
+        );
+        assert!(value
+            .verify_virtual_profiles_common(&unknown, placements.clone())
+            .is_err());
+        let mut missing_role = profiles.clone();
+        missing_role.insert(
+            "shared_pc".into(),
+            serde_json::to_vec(&vec![event("p_nn", "MatMul", CUDA)]).unwrap(),
+        );
+        assert!(value
+            .verify_virtual_profiles_common(&missing_role, placements.clone())
+            .is_err());
+        let mut needs_dispatch = value;
+        needs_dispatch
+            .graphs
+            .get_mut("shared_pc")
+            .unwrap()
+            .required_cuda_dispatch
+            .insert("required_role_if".into());
+        assert!(needs_dispatch
+            .verify_virtual_profiles_common(&profiles, placements)
             .is_err());
     }
 }

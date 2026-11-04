@@ -20,6 +20,10 @@ const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NODES: usize = 5000;
 const CUDA: &str = "CUDAExecutionProvider";
 const CPU: &str = "CPUExecutionProvider";
+const NAMED_RECURSIVE_COVERAGE: &str =
+    "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run";
+const ALL_CUDA_SUMMARY_COVERAGE: &str =
+    "ort-1.22-finalize-recursive-all-cuda-summary-before-first-run";
 const CUDA_WARM_GRAPH_NAME: &str = "shared_pc_if_approx_cuda_warm_v2";
 const CUDA_WARM_IF_ANNOTATION: &str = "cuda_warm_if_dispatch_candidate";
 
@@ -345,7 +349,7 @@ impl PalsCudaControlPolicy {
             .graphs
             .get(role)
             .ok_or_else(|| policy_error("unknown placement graph"))?;
-        verify_placement(role, graph, &log)
+        verify_placement_inner(role, graph, &log, self.virtual_layout.is_some())
     }
     pub(super) fn verify_profiles(
         &self,
@@ -1311,13 +1315,53 @@ fn verify_control_transfer(
     }
     Ok(vec![transfer])
 }
+#[cfg(test)]
 fn verify_placement(
     role: &str,
     policy: &GraphPolicy,
     log: &PlacementLog,
 ) -> Result<PalsGraphPlacement, BackendError> {
+    verify_placement_inner(role, policy, log, false)
+}
+
+fn verify_placement_inner(
+    role: &str,
+    policy: &GraphPolicy,
+    log: &PlacementLog,
+    admit_virtual_all_cuda_summary: bool,
+) -> Result<PalsGraphPlacement, BackendError> {
     if log.overflow {
         return Err(policy_error("PALS placement collector overflowed"));
+    }
+    // ORT 1.22's FinalizeSessionState recursively collects all graph and
+    // subgraph providers. Its single-provider log intentionally omits names.
+    // Permit that weaker initialization evidence only for virtual-review V3;
+    // the post-Run verifier must still check each executed node by exact name.
+    // Never describe a summary as an exact-named initialization audit.
+    let all_cuda_summary = (admit_virtual_all_cuda_summary
+        && log.lines.len() == 2
+        && log.transfer_lines.is_empty()
+        // A summary cannot prove that required named role/Warm dispatches
+        // survived ORT graph preparation, even if every remaining node is CUDA.
+        && policy.required_cuda_dispatch.is_empty()
+        && log.lines[0].trim() == "Node placements")
+        .then(|| placement_header(log.lines[1].trim(), "All nodes placed on ["))
+        .flatten()
+        .filter(|(provider, count)| provider == CUDA && (1..=policy.nodes.len()).contains(count));
+    if let Some((_, count)) = all_cuda_summary {
+        return Ok(PalsGraphPlacement {
+            role: role.into(),
+            graph_sha256: policy.digest,
+            log_sha256: asset::sha256(
+                format!("placement\n{}\ncopy\n", log.lines.join("\n")).as_bytes(),
+            ),
+            assigned_nodes: count,
+            cuda_nodes: count,
+            approved_cpu_control_nodes: 0,
+            optimization: PalsGraphOptimization::Disable,
+            approved_transfers: Vec::new(),
+            recursive_coverage: ALL_CUDA_SUMMARY_COVERAGE.into(),
+        });
     }
     let mut began = false;
     let mut headers: BTreeMap<String, usize> = BTreeMap::new();
@@ -1425,8 +1469,7 @@ fn verify_placement(
         approved_cpu_control_nodes: cpu_nodes,
         optimization: PalsGraphOptimization::Disable,
         approved_transfers,
-        recursive_coverage:
-            "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run".into(),
+        recursive_coverage: NAMED_RECURSIVE_COVERAGE.into(),
     })
 }
 fn bounded_metadata_output(value: &serde_json::Value) -> bool {
@@ -2555,6 +2598,56 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn virtual_all_cuda_summary_is_distinct_and_rejects_ambiguous_evidence() {
+        let graph = graph();
+        let summary = format!(
+            "All nodes placed on [{CUDA}]. Number of nodes: {}",
+            graph.nodes.len()
+        );
+        let valid = log(&["Node placements", &summary]);
+        // Legacy callers keep requiring individual source identities.
+        assert!(verify_placement("public", &graph, &valid).is_err());
+        let placement = verify_placement_inner("public", &graph, &valid, true).unwrap();
+        assert_eq!(placement.recursive_coverage, ALL_CUDA_SUMMARY_COVERAGE);
+        assert_eq!(placement.cuda_nodes, graph.nodes.len());
+        assert_eq!(placement.approved_cpu_control_nodes, 0);
+        assert!(placement.approved_transfers.is_empty());
+        let invalid = [
+            format!("All nodes placed on [{CPU}]. Number of nodes: 1"),
+            format!("All nodes placed on [{CUDA}]. Number of nodes: 0"),
+            format!(
+                "All nodes placed on [{CUDA}]. Number of nodes: {}",
+                graph.nodes.len() + 1
+            ),
+        ];
+        for line in &invalid {
+            assert!(verify_placement_inner(
+                "public",
+                &graph,
+                &log(&["Node placements", line]),
+                true
+            )
+            .is_err());
+        }
+        assert!(verify_placement_inner(
+            "public",
+            &graph,
+            &log(&["Node placements", &summary, &summary]),
+            true
+        )
+        .is_err());
+        let mut with_transfer = log(&["Node placements", &summary]);
+        with_transfer
+            .capture_transfer("Add MemcpyFromHost after role_is_critic for CUDAExecutionProvider");
+        assert!(verify_placement_inner("public", &graph, &with_transfer, true).is_err());
+        let mut needs_dispatch = graph.clone();
+        needs_dispatch
+            .required_cuda_dispatch
+            .insert("required_role_if".into());
+        assert!(verify_placement_inner("shared_pc", &needs_dispatch, &valid, true).is_err());
     }
     #[test]
     fn kernel_controls_require_exact_identity_integral_bounded_output_and_real_cuda() {

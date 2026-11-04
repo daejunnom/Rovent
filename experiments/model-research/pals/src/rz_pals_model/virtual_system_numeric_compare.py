@@ -175,9 +175,10 @@ def _control_inventory(inventory, bindings):
 def _control_witness(witness, inventory, bindings, inventory_sha256):
     """Cross-check a producer's witness; do not manufacture fresh GPU evidence.
 
-    The Rust producer is responsible for validating actual named placements and
-    profile events. This reader checks the separately retained declarations,
-    identities and coherent counts; it does not replay ORT's placement gate.
+    The Rust producer validates either actual named placements or ORT's
+    recursive all-CUDA summary, then checks actual named kernel events. This
+    reader checks declarations, identities and coherent counts; it does not
+    replay ORT's placement gate or kernel profiles.
     """
     if (type(witness) is not dict or type(inventory) is not dict
             or witness.get("schema") != "rovezero.pals-virtual-system-cuda-placement.v1"
@@ -200,6 +201,9 @@ def _control_witness(witness, inventory, bindings, inventory_sha256):
     if type(placements) is not list or type(kernels) is not dict or set(kernels) != set(expected_graphs):
         raise ValueError("control witness graph coverage differs")
     seen = set()
+    coverage = {}
+    named_coverage = "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run"
+    summary_coverage = "ort-1.22-finalize-recursive-all-cuda-summary-before-first-run"
     for placement in placements:
         if type(placement) is not dict or type(placement.get("role")) is not str:
             raise ValueError("invalid graph placement")
@@ -213,6 +217,19 @@ def _control_witness(witness, inventory, bindings, inventory_sha256):
                 or type(placement.get("approved_transfers")) is not list):
             raise ValueError("control witness placement identity or counts differ")
         _digest_array(placement.get("log_sha256"), "placement log")
+        kind = placement.get("recursive_coverage")
+        # Older v1 evidence can predate this field. It stays readable without
+        # manufacturing either an exact-names or an all-CUDA observation.
+        if kind is None:
+            coverage[role] = "legacy_unspecified"
+        elif kind == named_coverage:
+            coverage[role] = "exact_named"
+        elif kind == summary_coverage:
+            if counts[2] != 0 or placement["approved_transfers"]:
+                raise ValueError("all-CUDA summary contradicts placement evidence")
+            coverage[role] = "all_cuda_summary"
+        else:
+            raise ValueError("unknown recursive placement coverage")
         seen.add(role)
     if seen != set(expected_graphs):
         raise ValueError("control witness does not cover every graph")
@@ -222,6 +239,10 @@ def _control_witness(witness, inventory, bindings, inventory_sha256):
                 or value["neural_kernels"] <= 0):
             raise ValueError("control witness lacks CUDA neural kernel observations")
         _digest_array(value.get("profile_sha256"), "kernel profile")
+        if (coverage[role] == "all_cuda_summary"
+                and (value.get("approved_cpu_control_kernels") != 0
+                     or value.get("cuda_transfer_kernels") != 0)):
+            raise ValueError("all-CUDA summary contradicts the producer kernel counts")
     if "shared_pc" in kernels:
         pc = kernels["shared_pc"]
         if any(type(pc.get(key)) is not int or pc[key] <= 0
@@ -245,6 +266,7 @@ def _control_witness(witness, inventory, bindings, inventory_sha256):
             "system_runtime_identity_scope": "producer_reported_not_recomputed",
             "declared_device_id": witness["declared_device_id"],
             "graph_roles": sorted(seen), "mapped_roles": mapped,
+            "initialization_coverage": coverage,
             "missing_optional_roles": missing,
             "verification_scope": "producer_witness_fields_and_cross_artifact_identity_only",
             "profiles_replayed": False, "current_mapping": "not_attested",

@@ -201,6 +201,29 @@ class OptionalSystemControlEvidenceTests(unittest.TestCase):
         self.assertEqual(result["current_mapping"], "not_attested")
         self.assertEqual(result["same_numeric_run"], "not_attested")
         self.assertEqual(result["system_runtime_identity_scope"], "producer_reported_not_recomputed")
+        self.assertEqual(set(result["initialization_coverage"].values()), {"legacy_unspecified"})
+
+    def test_all_cuda_summary_is_separate_and_must_match_kernel_counts(self):
+        witness = copy.deepcopy(self.witness)
+        summary = "ort-1.22-finalize-recursive-all-cuda-summary-before-first-run"
+        named = "ort-1.22-finalize-recursive-exact-named-provider-coverage-before-first-run"
+        public, shared = witness["initialization"]
+        public["recursive_coverage"] = summary
+        public["cuda_nodes"] = public["assigned_nodes"]
+        public["approved_cpu_control_nodes"] = 0
+        shared["recursive_coverage"] = named
+        witness["kernels"]["public"]["approved_cpu_control_kernels"] = 0
+        witness["kernels"]["public"]["cuda_transfer_kernels"] = 0
+        result = self.read(witness=witness)
+        self.assertEqual(result["initialization_coverage"],
+                         {"public": "all_cuda_summary", "shared_pc": "exact_named"})
+        witness["kernels"]["public"]["approved_cpu_control_kernels"] = 1
+        with self.assertRaises(ValueError):
+            self.read(witness=witness)
+        witness["kernels"]["public"]["approved_cpu_control_kernels"] = 0
+        public["recursive_coverage"] = "unregistered"
+        with self.assertRaises(ValueError):
+            self.read(witness=witness)
 
     def test_unavailable_mapping_stays_unknown_without_a_witness(self):
         result = self.read("mapping_unavailable", observation_updates={
