@@ -557,6 +557,19 @@ impl PcSupervisorJoinedProofV3 {
     pub(crate) fn panicked(&self) -> bool {
         self.panicked
     }
+
+    /// Keep both original proofs with the caller on pending or failure.
+    /// This retires only the supervisor registry owner, not the observer,
+    /// output, GPU work, or the collection's semantic result.
+    pub(crate) fn release_after_settlement(
+        &self,
+        permit: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3,
+    ) -> Result<bool, &'static str> {
+        if !permit.matches_original_owner(&self.native) {
+            return Err("P-C supervisor settlement belongs to another native owner");
+        }
+        SupervisorStartCustodyV3::release_after_settlement(&self.custody, permit)
+    }
     pub(crate) fn matches_original(
         &self,
         custody: &Arc<Mutex<SupervisorStartCustodyV3>>,
