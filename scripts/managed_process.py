@@ -433,7 +433,8 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                         and cleanup_absolute_deadline is not None and requested_exit == 124
                         and absolute_deadline is not None and time.monotonic() >= absolute_deadline):
                     output_handoff.begin_cleanup_only()
-                    graceful_drain_deadline = cleanup_absolute_deadline
+                    if graceful_drain_deadline is None:
+                        graceful_drain_deadline = cleanup_absolute_deadline
                 else:
                     # Other cancellation and failures close admission as
                     # before; no cleanup continuation is inferred.
@@ -474,7 +475,8 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                 # The caller explicitly registered the original cleanup
                 # ceiling. Do not shorten it with the legacy one-second
                 # grace or silently create a later deadline.
-                graceful_drain_deadline = cleanup_absolute_deadline
+                if graceful_drain_deadline is None:
+                    graceful_drain_deadline = cleanup_absolute_deadline
         gone, result, cleanup_error = _finish_owned_group(
             child, on_tick, graceful_drain_deadline,
             cleanup_absolute_deadline if cleanup_absolute_deadline is not None else absolute_deadline)

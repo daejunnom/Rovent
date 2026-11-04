@@ -73,11 +73,15 @@ class OriginalCollectionProcess:
         if child_pid is not None and _namespace(child_pid) != self._namespace:
             raise RuntimeError("original child time namespace differs")
 
-    def run(self, native_arguments, cwd, env, admission_check, on_stop, *, stdout=None):
+    def run(self, native_arguments, cwd, env, admission_check, on_stop, *, stdout=None,
+            cleanup_signal_ns=None):
         if (self._attempted or self.handoff is None or not callable(admission_check)
                 or not callable(on_stop) or not isinstance(native_arguments, (tuple, list))
                 or any(not isinstance(value, str) or value.startswith("--v3-")
-                       for value in native_arguments)):
+                       for value in native_arguments)
+                or (cleanup_signal_ns is not None and
+                    (type(cleanup_signal_ns) is not int or
+                     not self._work_ns <= cleanup_signal_ns <= self._cleanup_ns))):
             raise ValueError("one original collector execution and explicit stop owner required")
         self._check_namespace()
         work, cleanup = _seconds_not_later(self._work_ns), _seconds_not_later(self._cleanup_ns)
@@ -127,6 +131,8 @@ class OriginalCollectionProcess:
                              pass_fds=inherited, stdout=stdout, on_spawn=admitted,
                              verify_before_spawn=True, absolute_deadline=work,
                              cleanup_absolute_deadline=cleanup, on_tick=tick,
+                             graceful_drain_deadline=(None if cleanup_signal_ns is None
+                                                      else _seconds_not_later(cleanup_signal_ns)),
                              on_stop=on_stop, owned_group=self.group,
                              output_handoff=self.handoff)
         except BaseException as error:

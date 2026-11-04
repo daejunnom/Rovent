@@ -78,6 +78,21 @@ class ManagedProcessSpawnTests(unittest.TestCase):
                           cleanup_absolute_deadline=start + 1)
         popen.assert_not_called()
 
+    def test_explicit_cleanup_signal_time_is_not_replaced_by_ceiling(self):
+        import managed_process
+        start = time.monotonic()
+        work, signal_at, cleanup = start + 0.2, start + 0.4, start + 2.0
+        group = OwnedProcessGroup()
+        with mock.patch("managed_process._finish_owned_group", wraps=managed_process._finish_owned_group) as drain:
+            result = run_group(
+                [self.python, "-c", "import time; time.sleep(30)"], self.root,
+                os.environ.copy(), 30, lambda: None, owned_group=group,
+                absolute_deadline=work, cleanup_absolute_deadline=cleanup,
+                graceful_drain_deadline=signal_at, on_stop=lambda: True,
+            )
+        self.assertEqual(result, (124, True, None))
+        self.assertEqual(drain.call_args.args[2:], (signal_at, cleanup))
+
     def test_success_reports_spawn_once_and_preserves_fd_and_stdout(self):
         callbacks = []
         with tempfile.TemporaryFile(mode="w+b", dir=self.root) as data, \
