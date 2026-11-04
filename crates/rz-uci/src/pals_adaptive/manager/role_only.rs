@@ -207,6 +207,16 @@ pub struct RoleOnlyCollectionV3Rejection<Q, O> {
     pub panic_payload: Option<Box<dyn std::any::Any + Send>>,
 }
 
+/// Installation has not transferred either owner when admission is busy.
+#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub enum RoleOnlyCollectionV3InstallAttempt<Q, O> {
+    Installed,
+    Busy {
+        admission: RoventCollectionRootAdmissionV3,
+        observer: AdaptiveCollectionObserverBoxV3<Q, O>,
+    },
+}
+
 /// Pure role configuration. R counts, R credit and R control are absent by type.
 #[derive(Clone, Copy, Debug)]
 pub struct RoleOnlyManagerRegistration {
@@ -1381,10 +1391,41 @@ where
     pub(crate) fn install_collection_observer_v3(
         &mut self,
         admission: RoventCollectionRootAdmissionV3,
-        mut observer: AdaptiveCollectionObserverBoxV3<Q, B::Output>,
+        observer: AdaptiveCollectionObserverBoxV3<Q, B::Output>,
     ) -> Result<(), RoleOnlyCollectionV3Rejection<Q, B::Output>> {
+        match self.install_collection_observer_v3_inner(admission, observer, false)? {
+            RoleOnlyCollectionV3InstallAttempt::Installed => Ok(()),
+            RoleOnlyCollectionV3InstallAttempt::Busy { .. } => {
+                unreachable!("legacy admission cannot return Busy")
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn try_install_collection_observer_v3(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV3,
+        observer: AdaptiveCollectionObserverBoxV3<Q, B::Output>,
+    ) -> Result<
+        RoleOnlyCollectionV3InstallAttempt<Q, B::Output>,
+        RoleOnlyCollectionV3Rejection<Q, B::Output>,
+    > {
+        self.install_collection_observer_v3_inner(admission, observer, true)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn install_collection_observer_v3_inner(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV3,
+        mut observer: AdaptiveCollectionObserverBoxV3<Q, B::Output>,
+        retry_busy: bool,
+    ) -> Result<
+        RoleOnlyCollectionV3InstallAttempt<Q, B::Output>,
+        RoleOnlyCollectionV3Rejection<Q, B::Output>,
+    > {
         let mut observer_called = false;
         let mut observer_succeeded = false;
+        let mut observer_busy = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || -> Result<(), AdaptiveManagerError> {
                 if self.collection.is_some()
@@ -1423,7 +1464,14 @@ where
                 admission.validate_native_owner(&verifier)?;
                 self.driver.validate_collection_admission_v3(&admission)?;
                 observer_called = true;
-                observer.admitted(&admission)?;
+                if retry_busy {
+                    if observer.try_admitted(&admission)? == AdaptiveCollectionBoundaryV2::Busy {
+                        observer_busy = true;
+                        return Ok(());
+                    }
+                } else {
+                    observer.admitted(&admission)?;
+                }
                 observer_succeeded = true;
                 let verifier = self.native.native_acceptance_verifier().ok_or(
                     AdaptiveManagerError::Invalid("P/C V3 original native verifier absent"),
@@ -1434,6 +1482,12 @@ where
                 Ok(())
             },
         ));
+        if observer_busy && matches!(&result, Ok(Ok(()))) {
+            return Ok(RoleOnlyCollectionV3InstallAttempt::Busy {
+                admission,
+                observer,
+            });
+        }
         let rejected = match result {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some((
@@ -1470,7 +1524,7 @@ where
         }
         self.collection_admission_v2 = Some(VersionedCollectionAdmission::V3(admission));
         self.collection_v2 = Some(VersionedCollectionObserver::V3(observer));
-        Ok(())
+        Ok(RoleOnlyCollectionV3InstallAttempt::Installed)
     }
 
     /// Return the original observer and admission only after the native root

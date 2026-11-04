@@ -4,9 +4,10 @@ use super::RoventStartupControl;
 use super::pc_session::RoventPcSessionManager;
 use crate::pals_adaptive::{
     AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3, AdaptiveManagerError,
-    RoleOnlyCollectionV3Rejection, RoleOnlyShutdownReceipt, RoventCollectionRootAdmissionV3,
-    RoventNativeCollectionOriginV3, RoventNoCaptureRootCapabilityV3,
-    RoventRoleOnlyNoCaptureFenceV3, RoventTeacherScopePhysicalAckV3,
+    RoleOnlyCollectionV3InstallAttempt, RoleOnlyCollectionV3Rejection, RoleOnlyShutdownReceipt,
+    RoventCollectionRootAdmissionV3, RoventNativeCollectionOriginV3,
+    RoventNoCaptureRootCapabilityV3, RoventRoleOnlyNoCaptureFenceV3,
+    RoventTeacherScopePhysicalAckV3,
 };
 use crate::pals_native::ticketed::VirtualReviewTicketOutput;
 use crate::rovent_external_launch::RoventTeacherScopeAggregateAckV3;
@@ -639,6 +640,20 @@ impl RoventPcCollectionAdmissionPortV3<'_> {
     ) -> Result<(), RoleOnlyCollectionV3Rejection<PcPortQuestion, VirtualReviewTicketOutput>> {
         self.manager
             .install_collection_observer_v3(admission, observer)
+    }
+
+    /// Return the original admission and observer on an explicit Busy; no
+    /// observer installation or new ownership is implied by that outcome.
+    pub fn try_install(
+        &mut self,
+        admission: RoventCollectionRootAdmissionV3,
+        observer: AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>,
+    ) -> Result<
+        RoleOnlyCollectionV3InstallAttempt<PcPortQuestion, VirtualReviewTicketOutput>,
+        RoleOnlyCollectionV3Rejection<PcPortQuestion, VirtualReviewTicketOutput>,
+    > {
+        self.manager
+            .try_install_collection_observer_v3(admission, observer)
     }
 }
 
