@@ -746,6 +746,8 @@ struct IndependentNoGameOwners {
     // One binding is moved into one custody owner. Its control owns the same
     // snapshot/execution/socket Arcs and the selected proxy FD.
     _binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    dispatch_identity: Arc<()>,
+    dispatch_reserved: Arc<AtomicBool>,
     envelope: IndependentNoGameSupervisorEnvelope,
     resource: Option<crate::pals_adaptive_launch::NoGameResourceOwnerV1>,
     plan_sha256: String,
@@ -1104,18 +1106,36 @@ fn no_game_raw_bytes(evidence: &IndependentNoGameRawEvidence) -> u64 {
     u64::try_from(process.saturating_add(observation)).unwrap_or(u64::MAX)
 }
 
-/// No producer exists until the original resource/CLI owners are connected.
-/// This keeps the source-level supervisor adapter unreachable in production.
+/// Single-use authority for one prepared owner. A weak identity keeps this
+/// declaration from extending a snapshot/control/GPU lifetime by itself.
 #[cfg(target_os = "linux")]
-enum IndependentNoGameDispatchAdmission {}
+pub(crate) struct IndependentNoGameDispatchAdmission {
+    owner: std::sync::Weak<()>,
+    reservation: Arc<AtomicBool>,
+}
 
 #[cfg(target_os = "linux")]
-enum IndependentNoGameSupervisorOutcome {
+impl Drop for IndependentNoGameDispatchAdmission {
+    fn drop(&mut self) {
+        self.reservation.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameSupervisorOutcome {
     /// The ProcessOutput is retained, but its stop and all higher-level
     /// acceptance conditions remain unassessed.
     ReturnedUnassessed,
     /// The original failure is retained by the same owner.
     FailedRetained,
+}
+
+/// A blocked call has not started a child and preserves the original owner.
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameDispatchOutcome {
+    UnsupportedDeclaredEnvironment,
+    Supervisor(IndependentNoGameSupervisorOutcome),
+    Rejected(ArenaError),
 }
 
 #[cfg(target_os = "linux")]
@@ -1237,6 +1257,8 @@ impl PreparedIndependentNoGameOwner {
         Ok(Self {
             owners: Some(IndependentNoGameOwners {
                 _binding: binding,
+                dispatch_identity: Arc::new(()),
+                dispatch_reserved: Arc::new(AtomicBool::new(false)),
                 envelope,
                 resource: None,
                 plan_sha256,
@@ -1501,8 +1523,91 @@ impl PreparedIndependentNoGameOwner {
         Some(owners.resource.as_ref()?.observe(Some(&self.spawn_custody)))
     }
 
-    /// Source-level link only: admission has no producer until original
-    /// resource, environment and proxy-CLI owners are actually connected.
+    /// Authorize one attempt for this original prepared owner, without
+    /// interpreting resource readback or predicting physical completion.
+    /// This WIP producer is deliberately excluded until the real proxy and
+    /// owner boundary have been integrated and reviewed.
+    #[cfg(any())]
+    pub(crate) fn admit_dispatch(&self) -> Result<IndependentNoGameDispatchAdmission, ArenaError> {
+        if self.evidence_transferred
+            || self.unresolved()
+            || self.original_error.is_some()
+            || self.process.is_some()
+        {
+            return Err(ArenaError::Invalid("NoGame owner is not fresh".into()));
+        }
+        let owners = self
+            .owners
+            .as_ref()
+            .ok_or_else(|| ArenaError::Invalid("NoGame original owner unavailable".into()))?;
+        if owners.observation.is_some() {
+            return Err(ArenaError::Invalid("NoGame attempt already started".into()));
+        }
+        let binding = &owners._binding;
+        binding.execution().require_running()?;
+        binding
+            .sockets()
+            .verify_original(binding.snapshot(), binding.execution())?;
+        binding.execution().require_running()?;
+        owners
+            .dispatch_reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                ArenaError::Invalid("NoGame dispatch admission already reserved".into())
+            })?;
+        Ok(IndependentNoGameDispatchAdmission {
+            owner: Arc::downgrade(&owners.dispatch_identity),
+            reservation: Arc::clone(&owners.dispatch_reserved),
+        })
+    }
+
+    /// Direct caller for the original UCI supervisor. An explicitly declared
+    /// environment cannot be silently discarded. The token is consumed once.
+    pub(crate) fn dispatch(
+        &mut self,
+        admission: IndependentNoGameDispatchAdmission,
+        cancel: Option<&AtomicBool>,
+    ) -> IndependentNoGameDispatchOutcome {
+        let Some(owners) = self.owners.as_ref() else {
+            return IndependentNoGameDispatchOutcome::Rejected(ArenaError::Invalid(
+                "NoGame original owner unavailable".into(),
+            ));
+        };
+        if !admission
+            .owner
+            .upgrade()
+            .is_some_and(|identity| Arc::ptr_eq(&identity, &owners.dispatch_identity))
+        {
+            return IndependentNoGameDispatchOutcome::Rejected(ArenaError::Integrity(
+                "NoGame admission owner differs".into(),
+            ));
+        }
+        let binding = &owners._binding;
+        if binding
+            .snapshot()
+            .plan
+            .input()
+            .endpoint
+            .environment
+            .is_some()
+        {
+            return IndependentNoGameDispatchOutcome::UnsupportedDeclaredEnvironment;
+        }
+        let checked = binding
+            .execution()
+            .require_running()
+            .and_then(|()| {
+                binding
+                    .sockets()
+                    .verify_original(binding.snapshot(), binding.execution())
+            })
+            .and_then(|()| binding.execution().require_running());
+        if let Err(error) = checked {
+            return IndependentNoGameDispatchOutcome::Rejected(error);
+        }
+        IndependentNoGameDispatchOutcome::Supervisor(self.supervise_admitted(&admission, cancel))
+    }
+
     /// Returned results and any unwound observation stay with this owner. An
     /// Ok return means only that ProcessOutput was retained, not that the
     /// process, model, resource policy or physical lifetime succeeded.
