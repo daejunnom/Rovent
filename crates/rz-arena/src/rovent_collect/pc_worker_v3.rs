@@ -7,7 +7,7 @@ use super::capture_router_v3::CaptureRouterV3;
 use super::launch::ManagedOutputOwnerV3;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
 use super::pc_hooks_lock_v3::{
-    PcPreparedOutcomeV3, PcPreparedRootV3, PcQuotaOutcomeV3, PcRootAccountingV3,
+    PcPreparedOutcomeV3, PcPreparedRootV3, PcQuotaOutcomeV3, PcReceivedRootV3, PcRootAccountingV3,
     RoventPcCollectionBridgeV3,
 };
 use super::policy_row_pipeline_v3::{
@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 /// here even if preparation or a worker task is interrupted.
 pub(crate) struct PcRootRecoveryV3 {
     admission: RoventCollectionRootAdmissionV3,
+    received_root: Option<PcReceivedRootV3>,
     stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
     preflight_failure: Option<TeacherPrepareErrorV3>,
     stage_claim_failure: Option<TeacherSessionClaimErrorV3>,
@@ -81,6 +82,7 @@ pub(crate) struct PcRootRecoveryV3 {
     // A game abort is sticky for this original root. This is not a native
     // cancellation, an aggregate acknowledgement, or permission to reuse it.
     abort_before_route: bool,
+    sealed_abort_before_route: bool,
     diagnostics: Vec<(String, TeacherDiagnostics)>,
     prepared: Option<PcPreparedRootV3>,
     custodian: TeacherRecoveryCustodianV3,
@@ -100,6 +102,7 @@ impl PcRootRecoveryV3 {
         let output = pipeline.output_owner();
         Arc::new(Mutex::new(Self {
             admission,
+            received_root: None,
             stage: None,
             preflight_failure: None,
             stage_claim_failure: None,
@@ -128,6 +131,7 @@ impl PcRootRecoveryV3 {
             handoff: None,
             aggregate: None,
             abort_before_route: false,
+            sealed_abort_before_route: false,
             diagnostics: Vec::new(),
             prepared: None,
             custodian: TeacherRecoveryCustodianV3::new(),
@@ -141,6 +145,39 @@ impl PcRootRecoveryV3 {
     }
     pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
         self.admission.same_original_admission(admission)
+    }
+
+    /// Only the retained original receiver witness can establish that this
+    /// recovery was actually received by this bridge. It is not a worker,
+    /// dispatch-completion or physical-completion witness.
+    pub(super) fn matches_received_root(&self, bridge: &Arc<RoventPcCollectionBridgeV3>) -> bool {
+        self.received_root.as_ref().is_some_and(|received|
+            received.matches_original(bridge, &self.admission))
+    }
+
+    /// Retains the real aggregate in this same recovery. The presence of this
+    /// evidence does not itself release quota or attest native/GPU completion.
+    pub(crate) fn aborted_pre_route_aggregate(&self) -> Option<&RoventTeacherScopeAggregateAckV3> {
+        if self.sealed_abort_before_route { self.aggregate.as_ref() } else { None }
+    }
+
+    /// Seal only a known pre-route root whose own session physically retired.
+    /// The ledger must separately validate this same recovery and aggregate.
+    pub(crate) fn seal_aborted_pre_route(&mut self) -> bool {
+        if !self.abort_before_route || !self.teacher_reserved
+            || self.panic.is_some() || self.stage_claim_failure.is_some()
+            || self.worker_spawn_failure.is_some() || self.worker.is_some()
+            || self.worker_key.is_some() || self.handoff.is_some()
+            || self.route.is_some() || self.receiver.is_some() || self.owner.is_some()
+            || self.pump.is_some() || self.pump_setup_unknown || self.pump_setup_failure.is_some()
+            || self.processed.is_some() || self.retained.is_some() || self.consumer.is_some()
+            || self.consumer_setup_unknown || self.prepared.is_some() || self.published
+            || !self.aggregate.as_ref().is_some_and(|ack| ack.matches_admission(&self.admission))
+        {
+            return false;
+        }
+        self.sealed_abort_before_route = true;
+        true
     }
     pub(crate) fn matches_route_pump(
         &self,
@@ -514,7 +551,7 @@ pub(crate) struct PcWorkerSupervisorV3 {
     bridge: Arc<RoventPcCollectionBridgeV3>,
     router: Arc<CaptureRouterV3>,
     roots: Vec<Arc<Mutex<PcRootRecoveryV3>>>,
-    pending_root: Option<RoventCollectionRootAdmissionV3>,
+    pending_root: Option<PcReceivedRootV3>,
     pipeline: Option<PolicyRowPipelineOwnerV3>,
     managed_output: Option<Arc<ManagedOutputOwnerV3>>,
     output_installed: bool,
@@ -1608,9 +1645,13 @@ impl PcWorkerSupervisorV3 {
         if self.pending_root.is_none()
             && self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots)
         {
-            self.pending_root = self.bridge.try_next_root().map_err(str::to_owned)?;
+            let _ = self.bridge.try_receive_root_into(&mut self.pending_root).map_err(str::to_owned)?;
         }
-        if let Some(admission) = self.pending_root.as_ref() {
+        if let Some(received) = self.pending_root.as_ref() {
+            let admission = received.admission();
+            if !received.matches_original(&self.bridge, admission) {
+                return Err("P-C V3 received root owner differs".into());
+            }
             if self.pipeline.is_none() {
                 let writer = RoventCorpusWriterLockV3::new_shared(
                     self.bridge.inputs().manifest(),
@@ -1654,7 +1695,11 @@ impl PcWorkerSupervisorV3 {
                 admission.clone(),
                 self.pipeline.as_ref().expect("pipeline retained").clone(),
             ));
-            self.pending_root.take();
+            // Allocation and vector insertion precede moving the actual
+            // receiver-issued owner out of the supervisor's pending slot.
+            let original = self.roots.last().expect("root inserted");
+            let mut original = original.lock().map_err(|_| "P-C V3 new root poisoned")?;
+            original.received_root = self.pending_root.take();
         }
         for original in &self.roots {
             let outcome = prepare_root_step_v3(
@@ -1729,6 +1774,9 @@ fn prepare_root_step_v3(
         return Ok(PcPrepareStepV3::Pending);
     }
     let mut state = recovery.lock().map_err(|_| "P-C V3 recovery poisoned")?;
+    if !state.matches_received_root(bridge) {
+        return Err("P-C V3 original receiver witness missing or changed".into());
+    }
     if state.published {
         return Ok(PcPrepareStepV3::Published);
     }
