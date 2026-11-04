@@ -13,10 +13,11 @@ use crate::rovent_bootstrap::launch::storage::{
     RoventStorageAdmissionOwners, RoventStorageCompiledCustody, RoventStorageCompiledCustodyV2,
     RoventStorageCompiledCustodyV3, RoventStorageOwnedRuntimeRegistration,
     RoventStorageOwnedRuntimeRegistrationV2, RoventStorageOwnedRuntimeRegistrationV3,
-    RoventStorageRegistrationFailureV2, RoventStorageRegistrationFailureV3,
-    RoventStorageRuntimeError, RoventStorageRuntimeOwnershipFailure,
-    RoventStorageRuntimeOwnershipFailureV2, RoventStorageRuntimeOwnershipFailureV3,
-    RoventStorageRuntimeRegistrationFailure, RoventStorageSetupRejection,
+    RoventStoragePreparedTransferV3, RoventStorageRegistrationFailureV2,
+    RoventStorageRegistrationFailureV3, RoventStorageRuntimeError,
+    RoventStorageRuntimeOwnershipFailure, RoventStorageRuntimeOwnershipFailureV2,
+    RoventStorageRuntimeOwnershipFailureV3, RoventStorageRuntimeRegistrationFailure,
+    RoventStorageSetupRejection, RoventStorageTransferSlotV3,
     own_rovent_storage_runtime_registration, own_rovent_storage_runtime_registration_v2,
     own_rovent_storage_runtime_registration_v3, register_rovent_storage_runtime,
     register_rovent_storage_runtime_v2, register_rovent_storage_runtime_v3,
@@ -54,6 +55,7 @@ enum StorageRegistrationOwner {
     V1(RoventStorageOwnedRuntimeRegistration),
     V2(RoventStorageOwnedRuntimeRegistrationV2),
     V3(RoventStorageOwnedRuntimeRegistrationV3),
+    V3Transfer(Arc<RoventStorageTransferSlotV3>),
 }
 enum StorageInputOwner {
     V1(Arc<RoventInputLock>),
@@ -83,6 +85,16 @@ impl SharedRoventStorageRegistration {
             profile: original.profile().clone(),
             identity: original.identity(),
             original: Mutex::new(StorageRegistrationOwner::V3(original)),
+        }
+    }
+    pub(crate) fn new_prepared_v3(prepared: &RoventStoragePreparedTransferV3) -> Self {
+        Self {
+            input_lock: StorageInputOwner::V3(Arc::clone(prepared.input_lock())),
+            profile: prepared.profile().clone(),
+            identity: prepared.identity(),
+            original: Mutex::new(StorageRegistrationOwner::V3Transfer(Arc::clone(
+                prepared.slot(),
+            ))),
         }
     }
     pub(crate) fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
@@ -143,6 +155,19 @@ impl SharedRoventStorageRegistration {
                 if Arc::ptr_eq(original.owners().input_lock(), lock) =>
             {
                 original.validate_live_admission(admission)
+            }
+            (StorageRegistrationOwner::V3Transfer(slot), StorageInputOwner::V3(lock)) => {
+                let registration = slot.registration.try_lock().map_err(|_| {
+                    RoventStorageRuntimeError::Namespace("V3 registration slot busy or poisoned")
+                })?;
+                match registration.as_ref() {
+                    Some(original) if Arc::ptr_eq(original.owners().input_lock(), lock) => {
+                        original.validate_live_admission(admission)
+                    }
+                    _ => Err(RoventStorageRuntimeError::Namespace(
+                        "V3 registration transfer is incomplete or original lock differs",
+                    )),
+                }
             }
             _ => Err(RoventStorageRuntimeError::Namespace(
                 "V3 admission and original storage owner differ",
@@ -229,6 +254,32 @@ impl SharedRoventStorageRegistration {
     ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection<RoventRootAdmissionV3>> {
         match self.original.try_lock() {
             Ok(mut owner) => {
+                if let (StorageRegistrationOwner::V3Transfer(slot), StorageInputOwner::V3(lock)) =
+                    (&mut *owner, &self.input_lock)
+                {
+                    let mut registration = match slot.registration.try_lock() {
+                        Ok(registration) => registration,
+                        Err(_) => {
+                            return Err(RoventStorageSetupRejection {
+                                error: RoventStorageRuntimeError::Namespace(
+                                    "V3 registration slot busy or poisoned",
+                                ),
+                                admission,
+                            });
+                        }
+                    };
+                    return match registration.as_mut() {
+                        Some(original) if Arc::ptr_eq(original.owners().input_lock(), lock) => {
+                            original.take_unused_idle_setup(admission)
+                        }
+                        _ => Err(RoventStorageSetupRejection {
+                            error: RoventStorageRuntimeError::Namespace(
+                                "V3 transfer incomplete or original lock differs",
+                            ),
+                            admission,
+                        }),
+                    };
+                }
                 let (StorageRegistrationOwner::V3(original), StorageInputOwner::V3(lock)) =
                     (&mut *owner, &self.input_lock)
                 else {
@@ -751,6 +802,64 @@ macro_rules! implement_v3_storage_attachment {
 }
 implement_v3_storage_attachment!(RoventNativeProductDriverV3);
 implement_v3_storage_attachment!(RoventOwnNnuecProductDriverV3);
+
+macro_rules! implement_staged_v3_storage_attachment {
+    ($product:ty) => {
+        impl $product {
+            /// Caller must keep the same transfer slot in its original scope
+            /// until the actual session/archive finish has been confirmed.
+            pub(crate) fn attach_staged_storage_runtime_registration_v3(
+                &self,
+                transfer: &Arc<RoventStorageTransferSlotV3>,
+                boundary: &Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+                requested_clock: &ProcessClock,
+            ) -> Result<(), SearchSessionFailure> {
+                let mut slot = self
+                    .storage_registration
+                    .try_lock()
+                    .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+                let same_owner = Arc::ptr_eq(&self.process, boundary);
+                validate_attachment_selection(
+                    slot.is_some(),
+                    self.physically_closed.load(Ordering::Acquire),
+                    same_owner,
+                    &self.process_clock,
+                    requested_clock,
+                )
+                .map_err(|reason| SearchSessionFailure {
+                    physical_completion: DriverPhysicalCompletion::Unknown,
+                    code: "RoventStorageRuntimeRegistrationV3",
+                    detail: reason.into(),
+                })?;
+                let prepared = transfer
+                    .prepare(boundary, &self.process_clock, self.inner.implementation())
+                    .map_err(|error| {
+                        let mut failure =
+                            SearchSessionFailure::debug("RoventStoragePrepareV3", &error);
+                        failure.physical_completion = DriverPhysicalCompletion::Unknown;
+                        failure
+                    })?;
+                if !std::ptr::eq(self.sources.lock(), prepared.input_lock().as_ref()) {
+                    return Err(SearchSessionFailure {
+                        physical_completion: DriverPhysicalCompletion::Unknown,
+                        code: "RoventStorageRuntimeRegistrationV3",
+                        detail: "product and storage do not retain the same original lock".into(),
+                    });
+                }
+                let shared = Arc::new(SharedRoventStorageRegistration::new_prepared_v3(&prepared));
+                self.inner
+                    .install_prepared_storage_registration_v3(Arc::clone(&shared), prepared)?;
+                *slot = Some(RetainedOnUnknown::new(
+                    shared,
+                    Arc::clone(&self.physically_closed),
+                ));
+                Ok(())
+            }
+        }
+    };
+}
+implement_staged_v3_storage_attachment!(RoventNativeProductDriverV3);
+implement_staged_v3_storage_attachment!(RoventOwnNnuecProductDriverV3);
 
 #[cfg(test)]
 mod tests {

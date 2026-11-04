@@ -4,7 +4,7 @@
 use super::configuration::{ExecutionConfiguration, StartupConfigurationDocument};
 use super::launch::storage::{
     RoventStorageOwnedRuntimeRegistration, RoventStorageOwnedRuntimeRegistrationV2,
-    RoventStorageOwnedRuntimeRegistrationV3,
+    RoventStorageOwnedRuntimeRegistrationV3, RoventStoragePreparedTransferV3,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::{
@@ -2538,6 +2538,72 @@ impl RoventPcSessionDriver {
         *slot = Some(SessionStorageLifecycle::new(Arc::clone(&shared)));
         Ok(shared)
     }
+    pub(crate) fn install_prepared_storage_registration_v3(
+        &self,
+        shared: Arc<SharedRoventStorageRegistration>,
+        prepared: RoventStoragePreparedTransferV3,
+    ) -> Result<(), SearchSessionFailure> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let mut slot = self
+            .storage
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let valid_idle = matches!(&*state, State::Idle(idle)
+            if matches!(idle.custody, IdleCustody::StartupReady)
+                && idle.game.is_none() && idle.owner.as_ref().is_some_and(|owner| owner.stores().generation() == 0 && owner.stores().root().is_none())
+                && idle.native.finished.is_none() && !idle.native.joined
+                && !idle.native.service.is_quarantined() && idle.native.service.occupancy() == 0);
+        if slot.is_some() || self.closed.load(Ordering::Acquire) || !valid_idle {
+            return Err(physical_unknown_at(
+                "RoventPcStorageInstall",
+                "storage requires the unused original native StartupReady owner",
+            ));
+        }
+        let PcSources::V3(sources) = &self.sources else {
+            return Err(physical_unknown_at(
+                "RoventPcStorageNamespace",
+                "original V3 sources required",
+            ));
+        };
+        let same_process = self
+            .process_v3
+            .as_ref()
+            .is_some_and(|process| Arc::ptr_eq(process, prepared.boundary()));
+        let actual = self.clock.runtime_clock();
+        let requested = prepared.clock().runtime_clock();
+        if !same_process
+            || !std::ptr::eq(sources.lock(), prepared.input_lock().as_ref())
+            || self.clock.epoch() != prepared.clock().epoch()
+            || actual.domain() != requested.domain()
+            || actual.origin() != requested.origin()
+            || self.implementation != prepared.implementation()
+        {
+            return Err(physical_unknown_at(
+                "RoventPcStorageNamespace",
+                "V3 session and original storage process, lock, clock or implementation differ",
+            ));
+        }
+        prepared
+            .profile()
+            .validate_for_manifest_v3(&sources.lock().manifest)
+            .map_err(|error| {
+                let mut failure = SearchSessionFailure::debug("RoventPcStorageResources", &error);
+                failure.physical_completion = DriverPhysicalCompletion::Unknown;
+                failure
+            })?;
+        let lifecycle = SessionStorageLifecycle::new(shared);
+        prepared.commit().map_err(|error| {
+            let mut failure = SearchSessionFailure::debug("RoventPcStorageTransfer", &error);
+            failure.physical_completion = DriverPhysicalCompletion::Unknown;
+            failure
+        })?;
+        *slot = Some(lifecycle);
+        Ok(())
+    }
+
     pub fn shared_nnuec_readback(
         &self,
     ) -> Result<Option<RoventPcSharedNnuecReadback>, ContractError> {
