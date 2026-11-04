@@ -2072,9 +2072,21 @@ fn admit_original_inner<'a>(
             },
             control.clone(),
         )
-        .map_err(|failure| error("StorageAdmissionV3", failure.error))?;
-        let compiled = storage::check_rovent_storage_compiled_custody_v3(custody, &view)
-            .map_err(|failure| error("StorageCompiledCustodyV3", failure.error))?;
+        .map_err(|failure| {
+            let cause = error("StorageAdmissionV3", &failure.error);
+            // No native service or archive worker has started at admission.
+            drop(failure.owners);
+            cause
+        })?;
+        let storage_view = boundary
+            .startup_view()
+            .map_err(|failure| error("StorageProcessBoundaryV3", failure))?;
+        let compiled = storage::check_rovent_storage_compiled_custody_v3(custody, &storage_view)
+            .map_err(|failure| {
+                let cause = error("StorageCompiledCustodyV3", &failure.error);
+                drop(failure.custody);
+                cause
+            })?;
         let observation = compiled.source_roles_observation();
         if let Some(writer) = receipt_writer.as_ref() {
             let record = serde_json::json!({
@@ -2218,7 +2230,7 @@ pub(super) fn run_native_admitted(
         control,
         clock,
         collection,
-        storage: _storage,
+        storage,
         selection_file,
         lock_file,
         receipt_writer,
@@ -2227,6 +2239,18 @@ pub(super) fn run_native_admitted(
         go_observer,
         scope_reserved,
     } = original;
+    if storage.is_some()
+        && matches!(
+            sources.topology(),
+            super::super::RoventStartupTopology::ExternalResearcher
+        )
+    {
+        return Err(error(
+            "InputLockUnsupportedV3",
+            "archive-on requires a native PC or own-researcher session",
+        )
+        .into());
+    }
     // Each selected product receives its own original V3 owner. Collection
     // still requires its own V3 owner and remains separate.
     let nnuec_selection = match (
@@ -2475,7 +2499,90 @@ pub(super) fn run_native_admitted(
     if let Some(owner) = collection.as_ref() {
         scope.attach_pin(Box::new(Arc::clone(owner)));
     }
+    // Before native entry, reserve both ends in the original scope. The only
+    // owner transfer is a no-allocation move between these retained slots.
+    let storage_slot = if let Some(original) = storage {
+        let original = Arc::new(std::sync::Mutex::new(Some(original)));
+        scope.attach_pin(Box::new(Arc::clone(&original)));
+        let slot = storage::RoventStorageTransferSlotV3::new_empty();
+        scope.attach_pin(Box::new(Arc::clone(&slot)));
+        let mut retained = original
+            .lock()
+            .map_err(|_| error("StorageCustodyV3", "original storage slot poisoned"))?;
+        slot.adopt_from(&mut retained)
+            .map_err(|failure| error("StorageCustodyV3", failure))?;
+        drop(retained);
+        Some(slot)
+    } else {
+        None
+    };
     scope.arm();
+    macro_rules! attach_storage {
+        ($driver:ident, $custody:ident) => {
+            if let Some(slot) = storage_slot.as_ref() {
+                // Preserve this exact product even if attach panics before it
+                // returns. Neither a failed attach nor a panic is a fence.
+                scope.attach_pin(Box::new(Arc::clone(&$driver)));
+                let attached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    $driver.attach_staged_storage_runtime_registration_v3(slot, &boundary, &clock)
+                }));
+                let failure: Option<(_, Box<dyn std::any::Any + Send>)> = match attached {
+                    Ok(Ok(())) => None,
+                    Ok(Err(failure)) => {
+                        Some((error("StorageAttachV3", &failure.detail), Box::new(failure)))
+                    }
+                    Err(payload) => Some((
+                        error("StorageAttachV3", "storage attachment panicked"),
+                        payload,
+                    )),
+                };
+                if let Some((detail, attach_failure)) = failure {
+                    // Attempt bounded closure on this exact session. An error,
+                    // unavailable result or panic is retained, never a fence.
+                    let close = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        $driver.finish_session(control.cleanup_until)
+                    }));
+                    let confirmed = matches!(
+                        &close,
+                        Ok(Ok(Some(
+                            crate::search_driver::DriverPhysicalCompletion::Confirmed
+                        )))
+                    ) && $driver.physical_close_observation().is_confirmed();
+                    if confirmed {
+                        scope.settled_without_quarantine();
+                        return Err(RoventV3LaunchFailure::Settled {
+                            error: detail,
+                            owner: V3SettledFactoryOwner {
+                                original: Box::new((
+                                    Arc::clone(&$driver),
+                                    Arc::clone(&$custody),
+                                    attach_failure,
+                                    close,
+                                )),
+                                events: Vec::new(),
+                            },
+                        });
+                    }
+                    return Err(RoventV3LaunchFailure::Quarantined {
+                        error: detail,
+                        owner: RoventV3QuarantinedOwner {
+                            cleanup_until: control.cleanup_until,
+                            scope_key: scope.park(
+                                Box::new((
+                                    Arc::clone(&$driver),
+                                    Arc::clone(&$custody),
+                                    attach_failure,
+                                    close,
+                                )),
+                                None,
+                            ),
+                            recovery_key: None,
+                        },
+                    });
+                }
+            }
+        };
+    }
     type SessionReleaseProbe =
         Box<dyn Fn() -> Option<crate::pals_adaptive::NativeSessionReleaseObservation>>;
     // Research-only observation uses the very same model owner and physical
@@ -2728,6 +2835,7 @@ pub(super) fn run_native_admitted(
                     });
                 }
             };
+            attach_storage!(driver, custody);
             let completion = driver.physical_close_observation();
             let original_driver = Arc::clone(&driver);
             let observe_release: SessionReleaseProbe =
@@ -3240,6 +3348,7 @@ pub(super) fn run_native_admitted(
                     });
                 }
             };
+            attach_storage!(driver, custody);
             let completion = driver.physical_close_observation();
             let original_driver = Arc::clone(&driver);
             let observe_release: SessionReleaseProbe =
