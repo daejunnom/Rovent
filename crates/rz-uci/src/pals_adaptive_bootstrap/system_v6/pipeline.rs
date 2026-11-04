@@ -4,6 +4,7 @@
 //! completion is unknown. It is not a replacement for the outer supervisor,
 //! an executable entry point, an OS resource observation, or a GPU fence.
 use super::super::*;
+use super::before_native_recovery::{BeforeNativeRecoveryObservation, BeforeNativeRecoveryV6};
 use super::cpu_prepare::{PalsSystemCpuPreparationV6, prepare_cpu_v6};
 use super::driver_assemble::{
     V6AdmissionObservation, V6PreAdmissionOwner, V6PreparationObservation,
@@ -69,6 +70,7 @@ pub(super) struct V6Pipeline {
     failure: Option<V6PipelineFailure>,
     failed_native_drain: Option<V6FailedStartupDrain>,
     first_failed_native_drain: Option<FailedNativeDrainObservation>,
+    before_native_recovery: Option<BeforeNativeRecoveryV6>,
     state: V6PipelineObservation,
 }
 
@@ -110,6 +112,7 @@ impl V6Pipeline {
             failure: None,
             failed_native_drain: None,
             first_failed_native_drain: None,
+            before_native_recovery: None,
             state: V6PipelineObservation::Initial,
         }
     }
@@ -144,6 +147,18 @@ impl V6Pipeline {
     pub(super) fn failed_native_drain(&self) -> Option<&V6FailedStartupDrain> {
         self.failed_native_drain.as_ref()
     }
+    pub(super) fn before_native_recovery(&self) -> Option<&BeforeNativeRecoveryV6> {
+        self.before_native_recovery.as_ref()
+    }
+    /// Reuse the exact service and recovery key after an actual BeforeNative
+    /// startup outcome; this never asserts any GPU-wide fence.
+    pub(super) fn poll_before_native_recovery(
+        &mut self,
+    ) -> Option<BeforeNativeRecoveryObservation> {
+        self.before_native_recovery
+            .as_mut()
+            .map(BeforeNativeRecoveryV6::poll_once)
+    }
     /// Request shutdown of the same retained native worker after a failed
     /// startup. The caller supplies the original registered cleanup deadline.
     /// This neither clears the failure nor closes external/archive owners.
@@ -155,7 +170,7 @@ impl V6Pipeline {
             return FailedNativeDrainObservation::OwnerUnavailable;
         }
         let service = if let Some(owner) = self.search_owner.as_mut() {
-            Some(&mut owner.custody.native.service)
+            owner.custody.native.service.as_mut()
         } else {
             self.pre_admission
                 .as_mut()
@@ -178,8 +193,11 @@ impl V6Pipeline {
 
     /// One nonblocking event/join observation on the same retained service.
     pub(super) fn poll_failed_native_drain(&mut self) -> FailedNativeDrainObservation {
+        if self.begin_before_native_recovery_if_ready() {
+            return FailedNativeDrainObservation::BeforeNativeRecoveryStarted;
+        }
         let service = if let Some(owner) = self.search_owner.as_mut() {
-            Some(&mut owner.custody.native.service)
+            owner.custody.native.service.as_mut()
         } else {
             self.pre_admission
                 .as_mut()
@@ -190,14 +208,43 @@ impl V6Pipeline {
             _ => FailedNativeDrainObservation::OwnerUnavailable,
         }
     }
+    fn begin_before_native_recovery_if_ready(&mut self) -> bool {
+        if self.before_native_recovery.is_some() {
+            return true;
+        }
+        let before_native = self
+            .search_owner
+            .as_ref()
+            .and_then(|owner| owner.custody.native.service.as_ref())
+            .is_some_and(|service| {
+                service.startup_status() == NativeFactoryStartupStatus::BeforeNative
+            });
+        if before_native {
+            if let Some(service) = self
+                .search_owner
+                .as_mut()
+                .and_then(|owner| owner.custody.native.service.take())
+            {
+                self.before_native_recovery = Some(BeforeNativeRecoveryV6::new(
+                    service,
+                    self.original_cleanup_until,
+                ));
+                return true;
+            }
+        }
+        false
+    }
+
     fn fail(&mut self, failure: V6PipelineFailure) -> V6PipelineObservation {
         self.failure = Some(failure);
         self.state = V6PipelineObservation::Failed;
         // This only starts the same native worker's bounded drain when one
         // was actually retained. A caller must continue polling; no failure
         // or missing physical completion is converted to success here.
-        self.first_failed_native_drain =
-            Some(self.begin_failed_native_drain(self.original_cleanup_until));
+        if !self.begin_before_native_recovery_if_ready() {
+            self.first_failed_native_drain =
+                Some(self.begin_failed_native_drain(self.original_cleanup_until));
+        }
         self.state
     }
 
@@ -264,7 +311,12 @@ impl V6Pipeline {
         }
         let owner = self.search_owner.as_mut().expect("original native owner");
         owner.poll_original_startup();
-        let status = owner.custody.native.service.startup_status();
+        let Some(service) = owner.custody.native.service.as_ref() else {
+            return self.fail(V6PipelineFailure::FactoryNotReady(
+                NativeFactoryStartupStatus::Unobserved,
+            ));
+        };
+        let status = service.startup_status();
         match status {
             NativeFactoryStartupStatus::Pending => return self.state,
             NativeFactoryStartupStatus::Ready => {}

@@ -3,6 +3,8 @@ use super::*;
 use crate::pals_adaptive_startup::{PalsSystemStartupOptionsV6, PinnedPalsSystemStartupV6};
 
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod before_native_recovery;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod cpu_prepare;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod driver_assemble;
@@ -37,7 +39,7 @@ struct PalsSystemReceiptPublicationV6 {
 
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 struct PalsSystemNativeStartV6 {
-    service: ActualService,
+    service: Option<ActualService>,
     receipt_publication: mpsc::Receiver<PalsSystemReceiptPublicationV6>,
     startup_snapshot: mpsc::Receiver<
         Result<
@@ -313,7 +315,7 @@ fn spawn_system_native_v6(
         command_capacity,
     )?;
     Ok(PalsSystemNativeStartV6 {
-        service,
+        service: Some(service),
         receipt_publication,
         startup_snapshot,
     })

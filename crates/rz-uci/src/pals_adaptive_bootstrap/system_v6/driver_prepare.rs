@@ -94,7 +94,14 @@ impl V6SearchPreparationOwner {
 
         // The factory can publish its snapshot before the ticket backend is
         // returned. Keep both observations: a snapshot alone is not Ready.
-        match self.custody.native.service.startup_status() {
+        match self
+            .custody
+            .native
+            .service
+            .as_ref()
+            .ok_or_else(|| boundary("SystemV6NativeOwnerUnavailable"))?
+            .startup_status()
+        {
             NativeFactoryStartupStatus::Ready => {}
             NativeFactoryStartupStatus::Pending => {
                 return Err(boundary("SystemV6FactoryPending"));

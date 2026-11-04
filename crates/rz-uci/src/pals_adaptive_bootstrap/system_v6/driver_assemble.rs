@@ -124,7 +124,7 @@ impl V6PreAdmissionOwner {
     /// admission. An admitted driver owns its own shutdown path instead.
     pub(super) fn failed_native_service(&mut self) -> Option<&mut ActualService> {
         if let Some(owner) = self.owner.as_mut() {
-            return Some(&mut owner.custody.native.service);
+            return owner.custody.native.service.as_mut();
         }
         self.admission_sources
             .as_mut()
@@ -320,7 +320,7 @@ impl V6PreAdmissionOwner {
             declared_registration,
         });
         self.admission_sources = Some(AdaptiveSessionSources {
-            native: service,
+            native: service.expect("native owner checked before transfer"),
             engine,
             cpu: own_workers,
             external: external_worker,
@@ -350,7 +350,13 @@ impl V6PreAdmissionOwner {
         cpu.original_source
             .check_native_admission(&owner.custody.parent, &owner.custody.admission)
             .map_err(|error| failure("SystemV6AssemblyAdmission", &error))?;
-        if owner.custody.native.service.startup_status()
+        if owner
+            .custody
+            .native
+            .service
+            .as_ref()
+            .ok_or_else(|| boundary("SystemV6NativeOwnerUnavailable"))?
+            .startup_status()
             != crate::pals_native::ticketed::NativeFactoryStartupStatus::Ready
         {
             return Err(boundary("SystemV6NativeFactoryNotReady"));

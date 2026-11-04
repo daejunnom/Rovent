@@ -36,6 +36,9 @@ pub(super) enum FailedNativeDrainObservation {
     Panicked,
     OwnerUnavailable,
     OwnerMismatch,
+    /// The same original service was transferred to the existing
+    /// before-native recovery path; no physical fence is implied.
+    BeforeNativeRecoveryStarted,
 }
 
 /// Owned evidence can remain in the pipeline beside its original failure.
