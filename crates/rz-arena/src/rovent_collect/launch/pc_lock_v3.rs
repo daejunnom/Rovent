@@ -640,6 +640,7 @@ impl PcCollectionRunV3 {
 pub(crate) struct ManagedOutputOwnerV3 {
     inputs: Arc<PreparedPcCollectionInputsV3>,
     state: Mutex<ManagedOutputStateV3>,
+    work_until: Instant,
     deadline: Instant,
 }
 
@@ -776,6 +777,7 @@ impl ManagedOutputOwnerV3 {
     pub(super) fn from_observation(
         inputs: Arc<PreparedPcCollectionInputsV3>,
         observation: super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+        work_until: Instant,
         deadline: Instant,
     ) -> Result<
         Self,
@@ -785,7 +787,9 @@ impl ManagedOutputOwnerV3 {
             super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
         ),
     > {
-        if Instant::now() >= deadline
+        if work_until > deadline
+            || Instant::now() >= work_until
+            || Instant::now() >= deadline
             || !inputs
                 .managed_binding
                 .as_ref()
@@ -810,6 +814,7 @@ impl ManagedOutputOwnerV3 {
                 original_writer: None,
                 closed: None,
             }),
+            work_until,
             deadline,
         })
     }
@@ -963,6 +968,12 @@ impl ManagedOutputOwnerV3 {
                 let directory =
                     Dir::from_std_file(state.observation.clone_original_output(self.deadline)?);
                 state.observation.verify_live(self.deadline)?;
+                if Instant::now() >= self.work_until {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "collection work deadline expired",
+                    ));
+                }
                 attempted = true;
                 state.uncertain = true;
                 directory.create_dir("chunks")?;
@@ -975,6 +986,12 @@ impl ManagedOutputOwnerV3 {
             }
             state.observation.verify_live(self.deadline)?;
             state.check_chunks_binding()?;
+            if !attempted && Instant::now() >= self.work_until {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "collection work deadline expired",
+                ));
+            }
             attempted = true;
             state.uncertain = true;
             let mut options = cap_std::fs::OpenOptions::new();
@@ -1122,6 +1139,9 @@ impl ManagedOutputOwnerV3 {
                 state.observation.verify_live(deadline).map_err(io)?;
                 state.check_chunks_binding().map_err(io)?;
                 if phase == RoventPublicationHookPhaseV3::Before && event.is_mutation() {
+                    if !state.publication_attempted && Instant::now() >= self.work_until {
+                        return Err(invalid("collection work deadline expired before publication"));
+                    }
                     state.publication_attempted = true;
                     state.uncertain = true;
                 }

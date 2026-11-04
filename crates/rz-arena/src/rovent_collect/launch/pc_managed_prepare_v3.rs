@@ -170,6 +170,7 @@ pub(crate) fn prepare_managed_pc_v3(
     let output = match ManagedOutputOwnerV3::from_observation(
         Arc::clone(&inputs),
         observation,
+        work_until,
         cleanup_until,
     ) {
         Ok(output) => Arc::new(output),
