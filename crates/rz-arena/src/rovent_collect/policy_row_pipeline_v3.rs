@@ -108,6 +108,17 @@ struct PolicyRootRetainedV3 {
     admission: RoventCollectionRootAdmissionV3,
     maximum: usize,
     completed: Vec<PendingPolicyPublicationV3>,
+    rejected: Vec<RetainedPolicyRejectionV3>,
+}
+
+/// Known row-scoped failure and every original value move together. It does
+/// not establish that the root, worker, teacher or output is complete.
+struct RetainedPolicyRejectionV3 {
+    row: Option<RoventRetiredLockV3Record>,
+    prepared: Option<PreparedTeacherPolicyLockV3>,
+    pending: Option<PendingPolicyPublicationV3>,
+    capability: Option<TargetPublicationV3>,
+    failure: PolicyPipelineFailureV3,
 }
 
 /// Original per-root retention, registered with the supervisor before the
@@ -193,6 +204,7 @@ impl PolicyRootRetainedOwnerV3 {
             admission,
             maximum,
             completed: Vec::new(),
+            rejected: Vec::new(),
         })))))
     }
 
@@ -703,7 +715,7 @@ impl PolicyRowPipelineV3 {
         {
             return Ok(PolicyRetentionOutcomeV3::OtherRoot);
         }
-        if target.completed.len() >= target.maximum {
+        if target.completed.len().saturating_add(target.rejected.len()) >= target.maximum {
             return Ok(PolicyRetentionOutcomeV3::Capacity);
         }
         target
@@ -715,6 +727,69 @@ impl PolicyRowPipelineV3 {
             .take()
             .expect("validated original output");
         target.completed.push(original);
+        Ok(PolicyRetentionOutcomeV3::Transferred)
+    }
+
+    /// Isolate a known row-scoped rejection from the shared game pipeline
+    /// without dropping the row, capability, evidence or failure. Unknown
+    /// writer state stays quarantined on the original pipeline instead.
+    pub(super) fn try_retain_known_rejection(
+        &mut self,
+        target: &PolicyRootRetainedOwnerV3,
+    ) -> Result<PolicyRetentionOutcomeV3, ArenaError> {
+        if self.is_uncertain() {
+            return Ok(PolicyRetentionOutcomeV3::NotReady);
+        }
+        let Some(failure) = self.failure.as_ref() else {
+            return Ok(PolicyRetentionOutcomeV3::NotReady);
+        };
+        if !matches!(
+            failure,
+            PolicyPipelineFailureV3::Stage(_)
+                | PolicyPipelineFailureV3::Prepare(_, _)
+                | PolicyPipelineFailureV3::Bind(_)
+                | PolicyPipelineFailureV3::AppendRejected(_)
+                | PolicyPipelineFailureV3::GateRejected(TargetBeginRejectionV3::Revoked)
+                | PolicyPipelineFailureV3::PolicyUnavailable(_)
+                | PolicyPipelineFailureV3::BeforeAppendPanic(_)
+        ) {
+            return Ok(PolicyRetentionOutcomeV3::NotReady);
+        }
+        let admission = if let Some(pending) = &self.pending {
+            pending.original_admission()
+        } else if let Some(row) = &self.row {
+            row.admission()
+        } else {
+            return Ok(PolicyRetentionOutcomeV3::NotReady);
+        };
+        let mut target = match target.0.try_lock() {
+            Ok(target) => target,
+            Err(TryLockError::WouldBlock) => return Ok(PolicyRetentionOutcomeV3::Busy),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(super::invalid("V3 policy root retention poisoned"));
+            }
+        };
+        if !Arc::ptr_eq(&self.identity, &target.pipeline_identity) {
+            return Err(super::invalid("V3 policy retention pipeline differs"));
+        }
+        if !admission.same_original_admission(&target.admission) {
+            return Ok(PolicyRetentionOutcomeV3::OtherRoot);
+        }
+        if target.completed.len().saturating_add(target.rejected.len()) >= target.maximum {
+            return Ok(PolicyRetentionOutcomeV3::Capacity);
+        }
+        target
+            .rejected
+            .try_reserve(1)
+            .map_err(|_| super::invalid("V3 policy rejection retention allocation"))?;
+        let original = RetainedPolicyRejectionV3 {
+            row: self.row.take(),
+            prepared: self.prepared.take(),
+            pending: self.pending.take(),
+            capability: self.capability.take(),
+            failure: self.failure.take().expect("validated original failure"),
+        };
+        target.rejected.push(original);
         Ok(PolicyRetentionOutcomeV3::Transferred)
     }
 
