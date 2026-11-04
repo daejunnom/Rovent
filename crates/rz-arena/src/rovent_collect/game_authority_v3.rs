@@ -305,12 +305,34 @@ impl<S> GameAuthorityV3<S> {
         self.control.fetch_or(ABORT_REQUESTED, Ordering::SeqCst);
     }
 
+    /// Only observes that no root queue send claim remains after abort.
+    /// Already-sent roots, actor starts, workers and device work still need
+    /// their own cancellation, drain and physical completion evidence.
+    pub(super) fn try_observe_abort_dispatch_quiescent(&self) -> GameStepV3 {
+        if !self.abort_requested() {
+            return GameStepV3::Busy;
+        }
+        let state = match self.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        let control = self.control.load(Ordering::SeqCst);
+        if control & ABORT_REQUESTED == 0 {
+            return GameStepV3::Unknown;
+        }
+        if !state.dispatching.is_empty() || control & !CONTROL_FLAGS != 0 {
+            return GameStepV3::Busy;
+        }
+        GameStepV3::Ready
+    }
+
     /// Claims queue dispatch against the same atomic abort word. The caller
     /// pre-retains `destination` in the root slot; no mutex stays held while
     /// the actual bounded channel send executes.
-    pub(super) fn try_claim_dispatch(
+    pub(super) fn try_claim_dispatch<T: GameDispatchEnvelopeV3>(
         self: &Arc<Self>,
         root: &RoventCollectionRootAdmissionV3,
+        envelope: &T,
         destination: &mut Option<GameDispatchClaimV3<S>>,
     ) -> GameStepV3 {
         if destination.is_some() {
@@ -324,6 +346,10 @@ impl<S> GameAuthorityV3<S> {
             return GameStepV3::Closed;
         }
         if state.dispatch_channel.is_none() {
+            return GameStepV3::Foreign;
+        }
+        let identity = envelope.original_identity();
+        if !identity.matches_root(root) {
             return GameStepV3::Foreign;
         }
         if !state
@@ -382,6 +408,7 @@ impl<S> GameAuthorityV3<S> {
         *destination = Some(GameDispatchClaimV3 {
             owner,
             root: retained_root,
+            envelope: identity,
             send_result: None,
             attempted: false,
             settled: false,
@@ -603,7 +630,29 @@ impl<S> Drop for GameRootReservationV3<S> {
 
 /// Only the actual P-C and Own root envelopes can use this dispatch path.
 pub(super) trait GameDispatchEnvelopeV3: Clone {
-    fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool;
+    fn original_identity(&self) -> GameDispatchEnvelopeIdentityV3;
+}
+
+#[derive(Clone)]
+pub(super) enum GameDispatchEnvelopeIdentityV3 {
+    Pc(RoventCollectionRootAdmissionV3),
+    Own(RoventCollectionRootAdmissionV3, Arc<AtomicBool>),
+}
+impl GameDispatchEnvelopeIdentityV3 {
+    fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
+        match self {
+            Self::Pc(a) | Self::Own(a, _) => a.same_original_admission(root),
+        }
+    }
+    fn same_original(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pc(a), Self::Pc(b)) => a.same_original_admission(b),
+            (Self::Own(a, ac), Self::Own(b, bc)) => {
+                a.same_original_admission(b) && Arc::ptr_eq(ac, bc)
+            }
+            _ => false,
+        }
+    }
 }
 
 pub(super) struct GameDispatchChannelV3<T> {
@@ -619,13 +668,13 @@ impl<T> GameDispatchChannelV3<T> {
     }
 }
 impl GameDispatchEnvelopeV3 for RoventCollectionRootAdmissionV3 {
-    fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
-        self.same_original_admission(root)
+    fn original_identity(&self) -> GameDispatchEnvelopeIdentityV3 {
+        GameDispatchEnvelopeIdentityV3::Pc(self.clone())
     }
 }
 impl GameDispatchEnvelopeV3 for super::own_hooks_lock_v3::OwnRootRequestV3 {
-    fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
-        self.admission.same_original_admission(root)
+    fn original_identity(&self) -> GameDispatchEnvelopeIdentityV3 {
+        GameDispatchEnvelopeIdentityV3::Own(self.admission.clone(), self.revocation_flag())
     }
 }
 
@@ -643,6 +692,7 @@ pub(super) enum GameDispatchOutcomeV3 {
 pub(super) struct GameDispatchReceiptV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
+    envelope: GameDispatchEnvelopeIdentityV3,
     outcome: GameDispatchOutcomeV3,
     abort_observed: bool,
 }
@@ -652,6 +702,9 @@ impl<S> GameDispatchReceiptV3<S> {
     }
     pub(super) fn matches_root(&self, root: &RoventCollectionRootAdmissionV3) -> bool {
         self.root.same_original_admission(root)
+    }
+    pub(super) fn matches_envelope<T: GameDispatchEnvelopeV3>(&self, envelope: &T) -> bool {
+        self.envelope.same_original(&envelope.original_identity())
     }
     pub(super) fn outcome(&self) -> GameDispatchOutcomeV3 {
         self.outcome
@@ -664,6 +717,7 @@ impl<S> GameDispatchReceiptV3<S> {
 pub(super) struct GameDispatchClaimV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     root: RoventCollectionRootAdmissionV3,
+    envelope: GameDispatchEnvelopeIdentityV3,
     send_result: Option<GameDispatchOutcomeV3>,
     attempted: bool,
     settled: bool,
@@ -679,17 +733,7 @@ impl<S> GameDispatchClaimV3<S> {
         channel: &GameDispatchChannelV3<T>,
         envelope: &T,
     ) -> Result<GameDispatchOutcomeV3, GameStepV3> {
-        if let Some(result) = self.send_result {
-            return Ok(result);
-        }
-        if self.settled {
-            return Err(GameStepV3::Unknown);
-        }
-        if self.attempted {
-            self.owner.unknown.store(true, Ordering::SeqCst);
-            return Err(GameStepV3::Unknown);
-        }
-        if !envelope.matches_root(&self.root) {
+        if !self.envelope.same_original(&envelope.original_identity()) {
             return Err(GameStepV3::Foreign);
         }
         {
@@ -701,6 +745,16 @@ impl<S> GameDispatchClaimV3<S> {
             {
                 return Err(GameStepV3::Foreign);
             }
+        }
+        if let Some(result) = self.send_result {
+            return Ok(result);
+        }
+        if self.settled {
+            return Err(GameStepV3::Unknown);
+        }
+        if self.attempted {
+            self.owner.unknown.store(true, Ordering::SeqCst);
+            return Err(GameStepV3::Unknown);
         }
         self.attempted = true;
         let copy = envelope.clone();
@@ -761,6 +815,7 @@ impl<S> GameDispatchClaimV3<S> {
         self.receipt = Some(GameDispatchReceiptV3 {
             owner: Arc::clone(&self.owner),
             root: self.root.clone(),
+            envelope: self.envelope.clone(),
             outcome,
             abort_observed: prior & ABORT_REQUESTED != 0 || self.owner.abort_requested(),
         });
