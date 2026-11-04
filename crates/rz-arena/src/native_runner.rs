@@ -737,6 +737,111 @@ struct NativeRunBundle<S: NativeProviderDeclaration> {
     v6_supervisor: Option<NativeV6Supervisor>,
 }
 
+/// Independent NoGame preparation cannot use NativeRunBundle's paired owner.
+/// Keep the selected snapshot, execution and listeners together, and use the
+/// same quarantine as the paired runner if a future supervised child remains
+/// unresolved. Construction alone neither starts a child nor applies resources.
+#[cfg(target_os = "linux")]
+struct IndependentNoGameOwners {
+    _snapshot: Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
+    _execution: Arc<crate::pals_adaptive_launch::NoGameExecutionStartV1>,
+    _sockets: Arc<crate::pals_adaptive_launch::NoGameRoleSocketsV1>,
+    // The control itself owns these same original Arcs and selected proxy FD.
+    _control: Arc<Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PreparedIndependentNoGameOwner {
+    owners: Option<IndependentNoGameOwners>,
+    process: Option<ProcessOutput>,
+    spawn_custody: crate::process::SpawnCustody,
+    // Vacuously true only while no child has been started. Any future spawn
+    // adapter must clear this before dispatch and restore it only on the
+    // original owner's verified physical fence.
+    physical_fence_confirmed: bool,
+    original_error: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedIndependentNoGameOwner {
+    /// All inputs are borrowed: on rejection the caller still owns the exact
+    /// original Arcs. There is intentionally no process-dispatch method yet.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare(
+        snapshot: &Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
+        execution: &Arc<crate::pals_adaptive_launch::NoGameExecutionStartV1>,
+        sockets: &Arc<crate::pals_adaptive_launch::NoGameRoleSocketsV1>,
+        proxy_pin: &Arc<std::fs::File>,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+        request_ids: [u64; 2],
+    ) -> Result<Self, ArenaError> {
+        let control = crate::pals_adaptive_launch::SmokeDeadlineControl::new_no_game(
+            snapshot,
+            execution,
+            sockets,
+            proxy_pin,
+            owner_id,
+            owner_epoch,
+            request_ids,
+        )?;
+        Ok(Self {
+            owners: Some(IndependentNoGameOwners {
+                _snapshot: Arc::clone(snapshot),
+                _execution: Arc::clone(execution),
+                _sockets: Arc::clone(sockets),
+                _control: Arc::new(Mutex::new(control)),
+            }),
+            process: None,
+            spawn_custody: crate::process::SpawnCustody::default(),
+            physical_fence_confirmed: true,
+            original_error: None,
+        })
+    }
+
+    fn unresolved(&self) -> bool {
+        !self.physical_fence_confirmed
+            || self.spawn_custody.pending.load(Ordering::Acquire)
+            || self.spawn_custody.child().is_some()
+            || self.process.as_ref().is_some_and(|process| {
+                process.receipt.group_cleanup != CleanupStatus::Gone
+                    || process.pending_child.is_some()
+            })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PreparedIndependentNoGameOwner {
+    fn drop(&mut self) {
+        if !self.unresolved() {
+            return;
+        }
+        let physical_lifetime_unknown = !self.physical_fence_confirmed
+            || self.spawn_custody.pending.load(Ordering::Acquire)
+            || self.spawn_custody.child().is_some();
+        crate::native_launch::close_native_admission();
+        let retained = Box::new(RetainedNativeScope {
+            _owner: Box::new(
+                self.owners
+                    .take()
+                    .expect("NoGame owns its original snapshot"),
+            ),
+            process: self.process.take(),
+            spawned_child: self.spawn_custody.take_child(),
+            last_spawn_pid: self.spawn_custody.last_spawn_pid,
+            physical_lifetime_unknown,
+            receipt: None,
+            original_error: self.original_error.take(),
+            guarded_preflight_failures: Vec::new(),
+            interrupted_by_unwind: std::thread::panicking(),
+            guarded_probe_scope: None,
+            _v6_supervisor: None,
+        });
+        let mut slots = QUARANTINE.lock().unwrap_or_else(|error| error.into_inner());
+        retain_in_slot(&mut slots, retained);
+    }
+}
+
 /// Retained inside the same supervisor as the original NoGame control, also
 /// when NativeRunBundle moves an unresolved owner into quarantine. These are
 /// declared endpoint resources; no installation or readback is inferred.
