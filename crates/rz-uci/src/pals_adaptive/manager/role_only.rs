@@ -1482,7 +1482,11 @@ where
                 Ok(())
             },
         ));
-        if observer_busy && matches!(&result, Ok(Ok(()))) {
+        if (observer_busy && matches!(&result, Ok(Ok(()))))
+            || (retry_busy
+                && !observer_called
+                && matches!(&result, Ok(Err(AdaptiveManagerError::AuxiliaryPending))))
+        {
             return Ok(RoleOnlyCollectionV3InstallAttempt::Busy {
                 admission,
                 observer,

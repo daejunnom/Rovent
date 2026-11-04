@@ -309,11 +309,13 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
         let root = admission.root_admission();
         // This can run while the manager owns another lock. Keep contention
         // distinguishable from an actually revoked or expired root.
-        if !root
-            .original_context()
-            .try_accepts()
-            .map_err(AdaptiveManagerError::Contract)?
-        {
+        if !root.original_context().try_accepts().map_err(|error| {
+            if error.code == rz_contracts::ErrorCode::ResourceExhausted {
+                AdaptiveManagerError::AuxiliaryPending
+            } else {
+                AdaptiveManagerError::Contract(error)
+            }
+        })? {
             return Err(AdaptiveManagerError::AdmissionClosed);
         }
         let namespace = admission
