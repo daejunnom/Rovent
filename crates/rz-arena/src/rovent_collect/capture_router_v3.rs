@@ -138,4 +138,53 @@ impl CaptureRouterV3 {
             },
         )
     }
+
+    /// Custody-only access after the caller has verified the original root's
+    /// native fence. Unlike normal dispatch, this remains usable after a
+    /// recorded capture failure. It never makes the input publishable.
+    pub(super) fn try_take_for_cleanup(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+    ) -> Result<CapturePollV3, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(CapturePollV3::Busy),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 capture router poisoned"));
+            }
+        };
+        if let Some(index) = state
+            .retained
+            .iter()
+            .position(|(_, owner)| owner.same_original_admission(admission))
+        {
+            let (captured, owner) = state.retained.remove(index).expect("located capture");
+            if !captured.admission().same_original_admission(&owner) {
+                state.retained.insert(index, (captured, owner));
+                return Err(invalid("lock-v3 cleanup input and admission differ"));
+            }
+            return Ok(CapturePollV3::Ready(captured));
+        }
+        loop {
+            if state.retained.len() >= MAX_ROUTED_CAPTURES {
+                return Ok(CapturePollV3::Busy);
+            }
+            state
+                .retained
+                .try_reserve(1)
+                .map_err(|_| invalid("lock-v3 capture router allocation failed"))?;
+            let Some(input) = state.receiver.take_queued_lock_v3_for_cleanup() else {
+                return Ok(CapturePollV3::Empty);
+            };
+            let (captured, owner) = input.into_original();
+            if !captured.admission().same_original_admission(&owner) {
+                state.retained.push_back((captured, owner));
+                return Err(invalid("lock-v3 cleanup input and admission differ"));
+            }
+            if owner.same_original_admission(admission) {
+                return Ok(CapturePollV3::Ready(captured));
+            }
+            state.retained.push_back((captured, owner));
+        }
+    }
 }
