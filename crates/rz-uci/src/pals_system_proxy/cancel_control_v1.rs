@@ -90,6 +90,11 @@ impl CancelReceiverV1 {
         error
     }
 
+    /// Recover the exact held stream when the supervisor declines ownership.
+    pub(super) fn into_stream(self) -> UnixStream {
+        self.stream
+    }
+
     pub(super) fn first_failure(&self) -> Option<&CancelFailureObservation> {
         self.first_failure.as_ref()
     }

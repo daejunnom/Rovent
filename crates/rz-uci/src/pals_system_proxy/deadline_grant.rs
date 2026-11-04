@@ -16,7 +16,6 @@ use std::{
 
 /// Captured immediately before issuing a request to the original owner.
 /// Neither this timestamp nor the derived deadline is the owner's start time.
-#[derive(Clone)]
 pub(super) struct PendingDeadlineGrant {
     requested_at: Instant,
     scope: DeadlineScope,
@@ -145,6 +144,14 @@ pub(super) fn assemble_window(
 }
 
 impl ReceivedDeadlineGrant {
+    pub(super) fn original_scope(&self) -> &DeadlineScope {
+        &self.scope
+    }
+
+    pub(super) fn requested_at(&self) -> Instant {
+        self.requested_at
+    }
+
     pub(super) fn pinning_deadline(&self) -> Instant {
         self.deadline
     }

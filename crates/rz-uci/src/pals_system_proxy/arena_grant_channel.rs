@@ -3,7 +3,12 @@
 //! does not establish role listener provenance, later peer liveness, or GPU
 //! completion. The executable guard remains closed.
 
-use super::deadline_grant::{PendingDeadlineGrant, ReceivedDeadlineGrant};
+use super::{
+    cancel_control_v1::CancelReceiverV1,
+    cli_v6::OriginalProxyWindowV6,
+    deadline_grant::{PendingDeadlineGrant, ReceivedDeadlineGrant},
+    runner_v6::PalsProxySupervisorV6,
+};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use rz_contracts::pals::deadline_grant_v1::{DeadlineScope, GRANT_BYTES, REQUEST_BYTES};
 use std::{
@@ -134,7 +139,7 @@ pub(super) enum OriginalGrantPoll {
 pub(super) struct PendingOriginalArenaGrant {
     stream: UnixStream,
     peer: OriginalArenaPeerObservation,
-    pending: PendingDeadlineGrant,
+    pending: Option<PendingDeadlineGrant>,
     request: [u8; REQUEST_BYTES],
     written: usize,
     reply: [u8; GRANT_BYTES],
@@ -178,7 +183,7 @@ impl PendingOriginalArenaGrant {
         Ok(Self {
             stream,
             peer,
-            pending,
+            pending: Some(pending),
             request,
             written: 0,
             reply: [0; GRANT_BYTES],
@@ -220,6 +225,12 @@ impl PendingOriginalArenaGrant {
         }
         if let Err(error) = self.verify_owner() {
             return Err(self.fail(error));
+        }
+        if Instant::now() >= self.until {
+            return Err(self.fail(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "arena grant exchange expired",
+            )));
         }
         if self.written < REQUEST_BYTES {
             match self.stream.write(&self.request[self.written..]) {
@@ -280,7 +291,17 @@ impl PendingOriginalArenaGrant {
         if let Err(error) = self.verify_owner() {
             return Err(self.fail(error));
         }
-        let grant = match self.pending.clone().accept(&self.reply) {
+        if Instant::now() >= self.until {
+            return Err(self.fail(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "arena grant exchange expired",
+            )));
+        }
+        let pending = match self.pending.take() {
+            Some(pending) => pending,
+            None => return Err(self.fail(invalid("original pending grant unavailable"))),
+        };
+        let grant = match pending.accept(&self.reply) {
             Ok(grant) => grant,
             Err(reason) => return Err(self.fail(invalid(reason))),
         };
@@ -303,17 +324,71 @@ impl PendingOriginalArenaGrant {
     }
 }
 
+fn matches_original_run_window(
+    grant: &ReceivedDeadlineGrant,
+    window: &OriginalProxyWindowV6,
+) -> bool {
+    grant.original_scope().phase == rz_contracts::pals::deadline_grant_v1::DeadlinePhase::Run
+        && window.run_until <= grant.pinning_deadline()
+        && window.bound_reference <= grant.requested_at()
+}
+
 impl RetainedOriginalArenaGrant {
     /// Compare both held endpoints to the original recorded peer and process
     /// tree. This does not prove the grant channel is still open or that the
     /// cancellation listener belongs to a particular role.
     pub(super) fn verify_cancel_peer(&self, cancel_stream: &UnixStream) -> io::Result<()> {
-        if observe_peer(&self.stream)? != self.peer || observe_peer(cancel_stream)? != self.peer {
+        if observe_peer(&self.stream)? != self.peer
+            || observe_peer(cancel_stream)? != self.peer
+            || observe_peer(&self.stream)? != self.peer
+        {
             return Err(invalid(
                 "cancel socket differs from original arena grant peer",
             ));
         }
         Ok(())
+    }
+
+    /// Transfer the same cancel stream into the original supervisor only after
+    /// comparing it with this retained run grant. The caller must supply the
+    /// original assembled window and prove the role listener's origin; neither
+    /// the scope values nor same peer identity alone establish that origin.
+    /// Every refusal returns the exact stream, preserving both channel owners.
+    pub(super) fn attach_cancel_to_supervisor(
+        &self,
+        cancel_stream: UnixStream,
+        window: &OriginalProxyWindowV6,
+        supervisor: &mut PalsProxySupervisorV6,
+    ) -> Result<(), (io::Error, UnixStream)> {
+        if !matches_original_run_window(&self.grant, window)
+            || Instant::now() >= window.cleanup_until
+        {
+            return Err((
+                invalid("cancel window differs from original run grant"),
+                cancel_stream,
+            ));
+        }
+        if let Err(error) = self.verify_cancel_peer(&cancel_stream) {
+            return Err((error, cancel_stream));
+        }
+        if Instant::now() >= window.cleanup_until {
+            return Err((
+                io::Error::new(io::ErrorKind::TimedOut, "original cleanup deadline expired"),
+                cancel_stream,
+            ));
+        }
+        let receiver = CancelReceiverV1::from_original_window(
+            cancel_stream,
+            self.grant.original_scope().clone(),
+            window,
+        )?;
+        match supervisor.attach_caller_authenticated_cancel(receiver) {
+            Ok(()) => Ok(()),
+            Err(receiver) => Err((
+                invalid("proxy supervisor differs from cancel window"),
+                receiver.into_stream(),
+            )),
+        }
     }
 }
 
@@ -323,6 +398,42 @@ mod tests {
     use rz_contracts::pals::deadline_grant_v1::{DeadlinePhase, DeadlineRole};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
+    #[test]
+    fn assembled_window_never_extends_the_original_run_grant() {
+        use rz_contracts::pals::deadline_grant_v1::DeadlineGrant;
+        use std::sync::{Arc, atomic::AtomicBool};
+        let scope = DeadlineScope {
+            owner_id: [1; 16],
+            owner_epoch: 2,
+            role: DeadlineRole::Baseline,
+            game: 0,
+            generation: 3,
+            request_id: 4,
+            lock_sha256: [5; 32],
+            phase: DeadlinePhase::Run,
+        };
+        let before = Instant::now();
+        let (pending, _) = PendingDeadlineGrant::begin(scope.clone()).unwrap();
+        let response = DeadlineGrant {
+            scope,
+            remaining_ns: 60_000_000_000,
+        }
+        .encode()
+        .unwrap();
+        let grant = pending.accept(&response).unwrap();
+        let mut window = OriginalProxyWindowV6 {
+            bound_reference: before,
+            startup_until: before,
+            run_until: grant.pinning_deadline(),
+            cleanup_until: grant.pinning_deadline(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cleanup_cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(matches_original_run_window(&grant, &window));
+        window.run_until = grant.pinning_deadline() + Duration::from_nanos(1);
+        assert!(!matches_original_run_window(&grant, &window));
+    }
+
     #[test]
     fn process_identity_uses_actual_pid_parent_group_and_start_ticks() {
         let mut fields = vec!["0"; 20];
