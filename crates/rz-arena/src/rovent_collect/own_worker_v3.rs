@@ -45,6 +45,8 @@ pub(crate) struct OwnRootRecoveryV3 {
     pub(super) owner: Option<RoventCollectionOwnerLockV3>,
     pub(super) pump: Option<Arc<Mutex<TeacherPumpV3>>>,
     pub(super) consumer: Option<TeacherPolicyConsumerOwnerV3>,
+    // One root-owned phase; only a successful step advances this cursor.
+    pub(super) consumer_phase: u8,
     pub(super) processed: Option<TeacherProcessedOwnerV3>,
     pub(super) consumer_failure: Option<ArenaError>,
     // The pipeline owns the original packet and detailed failure. This flag
@@ -94,6 +96,7 @@ impl OwnRootRecoveryV3 {
             owner: None,
             pump: None,
             consumer: None,
+            consumer_phase: 0,
             processed: None,
             consumer_failure: None,
             persistence_failure: None,
@@ -824,48 +827,71 @@ impl OwnRootRecoveryV3 {
             TeacherPolicyConsumerV3::try_retain_appended,
             TeacherPolicyConsumerV3::try_retain_processed_completion,
         ];
-        for step in steps {
-            match step(&mut consumer) {
-                Ok(TeacherPolicyConsumerProgressV3::ChunkReady) => {
-                    if self.persistence_failure.is_some() {
+        let Some(step) = steps.get(usize::from(self.consumer_phase)) else {
+            self.consumer_failure = Some(invalid("Own /3 invalid consumer phase"));
+            return;
+        };
+        match step(&mut consumer) {
+            Ok(TeacherPolicyConsumerProgressV3::ChunkReady) => {
+                if self.persistence_failure.is_some() {
+                    return;
+                }
+                let mut pipeline = match self.pipeline.try_lock() {
+                    Ok(Some(pipeline)) => pipeline,
+                    Ok(None) => return,
+                    Err(_) => {
+                        self.persistence_failure = Some("Own /3 output owner poisoned");
                         return;
                     }
-                    let mut pipeline = match self.pipeline.try_lock() {
-                        Ok(Some(pipeline)) => pipeline,
-                        Ok(None) => return,
-                        Err(_) => {
-                            self.persistence_failure = Some("Own /3 output owner poisoned");
-                            return;
-                        }
-                    };
-                    match pipeline.persist_chunk() {
-                        PolicyChunkPersistenceV3::Persisted
-                        | PolicyChunkPersistenceV3::NotReady => {}
-                        PolicyChunkPersistenceV3::Failed => {
-                            self.persistence_failure = Some("Own /3 output write failed");
-                        }
-                        PolicyChunkPersistenceV3::Unknown => {
-                            self.persistence_failure = Some("Own /3 output write outcome unknown");
-                        }
+                };
+                match pipeline.persist_chunk() {
+                    PolicyChunkPersistenceV3::Persisted | PolicyChunkPersistenceV3::NotReady => {}
+                    PolicyChunkPersistenceV3::Failed => {
+                        self.persistence_failure = Some("Own /3 output write failed");
                     }
-                    // Re-observe append on the next worker pass after the
-                    // original pipeline has retained the persistence result.
-                    return;
+                    PolicyChunkPersistenceV3::Unknown => {
+                        self.persistence_failure = Some("Own /3 output write outcome unknown");
+                    }
                 }
-                Ok(
-                    TeacherPolicyConsumerProgressV3::Rejected
-                    | TeacherPolicyConsumerProgressV3::Unknown,
-                ) => {
-                    self.consumer_failure = Some(invalid(
-                        "Own /3 policy consumer rejected or uncertain; original owner retained",
-                    ));
-                    return;
+                // Re-observe append on the next worker pass after the
+                // original pipeline has retained the persistence result.
+            }
+            Ok(
+                TeacherPolicyConsumerProgressV3::Rejected
+                | TeacherPolicyConsumerProgressV3::Unknown,
+            ) => {
+                self.consumer_failure = Some(invalid(
+                    "Own /3 policy consumer rejected or uncertain; original owner retained",
+                ));
+            }
+            Ok(
+                TeacherPolicyConsumerProgressV3::Busy
+                | TeacherPolicyConsumerProgressV3::NotReady
+                | TeacherPolicyConsumerProgressV3::OutputHeld,
+            ) => {}
+            Ok(progress) => {
+                use TeacherPolicyConsumerProgressV3 as Progress;
+                let advanced = matches!(
+                    (self.consumer_phase, progress),
+                    (0, Progress::CompletionStored)
+                        | (1, Progress::Sealed)
+                        | (2, Progress::RowTransferred)
+                        | (3, Progress::Prepared)
+                        | (4, Progress::CandidateReady)
+                        | (5, Progress::CapabilityStored)
+                        | (6, Progress::Appended)
+                        | (7, Progress::AppendedEvidenceStored)
+                        | (8, Progress::CompletionStored)
+                );
+                if advanced {
+                    self.consumer_phase = (self.consumer_phase + 1) % 9;
+                } else {
+                    self.consumer_failure =
+                        Some(invalid("Own /3 unexpected consumer phase outcome"));
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    self.consumer_failure = Some(error);
-                    return;
-                }
+            }
+            Err(error) => {
+                self.consumer_failure = Some(error);
             }
         }
     }
