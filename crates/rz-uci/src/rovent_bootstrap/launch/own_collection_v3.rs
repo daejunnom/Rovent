@@ -297,3 +297,7 @@ impl Drop for RoventOwnCollectionLaunchOwnerV3 {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "own_collection_v3_tests.rs"]
+mod tests;
