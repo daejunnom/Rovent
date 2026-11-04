@@ -275,9 +275,30 @@ struct QuarantinedPcWorkerV3 {
     received: Arc<Mutex<Option<RootHandoffV3>>>,
     thread: std::thread::JoinHandle<Box<dyn Any + Send>>,
 }
-fn quarantined_pc_workers_v3() -> &'static Mutex<Vec<QuarantinedPcWorkerV3>> {
-    static WORKERS: OnceLock<Mutex<Vec<QuarantinedPcWorkerV3>>> = OnceLock::new();
+enum PcWorkerSlotV3 {
+    Reserved(RoventPcCollectionWorkerKeyV3),
+    Quarantined(QuarantinedPcWorkerV3),
+}
+impl PcWorkerSlotV3 {
+    fn matches(&self, key: &RoventPcCollectionWorkerKeyV3) -> bool {
+        let owner = match self {
+            Self::Reserved(owner) => owner,
+            Self::Quarantined(owner) => &owner.key,
+        };
+        Arc::ptr_eq(&owner.0, &key.0)
+    }
+}
+fn quarantined_pc_workers_v3() -> &'static Mutex<Vec<PcWorkerSlotV3>> {
+    static WORKERS: OnceLock<Mutex<Vec<PcWorkerSlotV3>>> = OnceLock::new();
     WORKERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+fn release_pc_worker_slot_v3(key: &RoventPcCollectionWorkerKeyV3) {
+    let mut slots = quarantined_pc_workers_v3()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(index) = slots.iter().position(|slot| slot.matches(key)) {
+        slots.swap_remove(index);
+    }
 }
 
 pub struct RoventPcCollectionWorkerSpawnFailureV3 {
@@ -298,6 +319,21 @@ impl RoventPcCollectionWorkerV3 {
         admission: RoventCollectionRootAdmissionV3,
         task: RoventPcRootWorkerTaskV3,
     ) -> Result<Self, RoventPcCollectionWorkerSpawnFailureV3> {
+        let key = RoventPcCollectionWorkerKeyV3(Arc::new(()));
+        {
+            let mut slots = quarantined_pc_workers_v3()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Err(error) = slots.try_reserve(1) {
+                return Err(RoventPcCollectionWorkerSpawnFailureV3 {
+                    admission,
+                    error: std::io::Error::other(error),
+                    task,
+                });
+            }
+            // Reserve before spawning, so quarantine on Drop does not allocate.
+            slots.push(PcWorkerSlotV3::Reserved(key.clone()));
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         let received = Arc::new(Mutex::new(None));
         let worker_receiver = RoventPcRootHandoffReceiverV3 {
@@ -320,13 +356,14 @@ impl RoventPcCollectionWorkerV3 {
             });
         match thread {
             Ok(thread) => Ok(Self {
-                key: RoventPcCollectionWorkerKeyV3(Arc::new(())),
+                key,
                 admission,
                 sender,
                 received,
                 thread: Some(thread),
             }),
             Err(error) => {
+                release_pc_worker_slot_v3(&key);
                 let task = slot
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -354,10 +391,15 @@ impl RoventPcCollectionWorkerV3 {
         let mut workers = quarantined_pc_workers_v3()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let index = workers
-            .iter()
-            .position(|worker| Arc::ptr_eq(&worker.key.0, &key.0))?;
-        let owner = workers.swap_remove(index);
+        let index = workers.iter().position(|slot| slot.matches(key))?;
+        if !matches!(&workers[index], PcWorkerSlotV3::Quarantined(_)) {
+            return None;
+        }
+        let PcWorkerSlotV3::Quarantined(owner) =
+            std::mem::replace(&mut workers[index], PcWorkerSlotV3::Reserved(key.clone()))
+        else {
+            unreachable!()
+        };
         Some(Self {
             key: owner.key,
             admission: owner.admission,
@@ -387,7 +429,9 @@ impl RoventPcCollectionWorkerV3 {
         if !thread.is_finished() {
             return Ok(None);
         }
-        match self.thread.take().expect("checked V3 worker handle").join() {
+        let result = self.thread.take().expect("checked V3 worker handle").join();
+        release_pc_worker_slot_v3(&self.key);
+        match result {
             Ok(original_worker) => {
                 if !self
                     .received
@@ -415,16 +459,27 @@ impl RoventPcCollectionWorkerV3 {
 impl Drop for RoventPcCollectionWorkerV3 {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
-            quarantined_pc_workers_v3()
+            let mut slots = quarantined_pc_workers_v3()
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(QuarantinedPcWorkerV3 {
-                    key: self.key.clone(),
-                    admission: self.admission.clone(),
-                    sender: self.sender.clone(),
-                    received: Arc::clone(&self.received),
-                    thread,
-                });
+                .unwrap_or_else(|p| p.into_inner());
+            let owner = QuarantinedPcWorkerV3 {
+                key: self.key.clone(),
+                admission: self.admission.clone(),
+                sender: self.sender.clone(),
+                received: Arc::clone(&self.received),
+                thread,
+            };
+            if let Some(slot) = slots.iter_mut().find(|slot| slot.matches(&self.key)) {
+                if matches!(slot, PcWorkerSlotV3::Reserved(_)) {
+                    *slot = PcWorkerSlotV3::Quarantined(owner);
+                } else {
+                    // Never overwrite another retained original on an invariant violation.
+                    std::mem::forget(owner);
+                }
+            } else {
+                // Invariant violation: never detach the original physical owner.
+                std::mem::forget(owner);
+            }
         }
     }
 }

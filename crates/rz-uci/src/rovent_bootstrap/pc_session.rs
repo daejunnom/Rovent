@@ -3800,10 +3800,10 @@ impl RoventPcSessionDriver {
                 }
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
-                return Err(SearchSessionFailure::debug(
-                    "RoventPcV3CollectionRevoke",
-                    &error,
-                ));
+                let mut failure = SearchSessionFailure::debug("RoventPcV3CollectionRevoke", &error);
+                // Revoke failed before this manager's native fence was checked.
+                failure.physical_completion = DriverPhysicalCompletion::Unknown;
+                return Err(failure);
             }
         }
         if v2_hook_started && !v2_hook_revoked {
