@@ -90,6 +90,14 @@ pub(super) struct RoventRetiredLockV3Record {
     // original ticket/root publication gate has been acquired.
     prepared_policy: Option<super::teacher::policy_prepare_v3::PreparedTeacherPolicyLockV3>,
 }
+
+/// The original row remains in its caller-owned slot on both ordinary
+/// rejection and panic. A panic may have changed the row, so the caller must
+/// retain the payload and treat that slot as uncertain rather than retrying.
+pub(super) struct EvidencePublicationFailureV3 {
+    pub(super) error: ArenaError,
+    pub(super) panic_payload: Option<Box<dyn std::any::Any + Send>>,
+}
 impl RoventRetiredLockV3Record {
     /// Borrow the original accepted row for target preparation. This does not
     /// transfer producer custody, publish the row, or authorize a target.
@@ -663,6 +671,45 @@ impl RoventCorpusProducerLockV3 {
             manifest_sha256: row.manifest_sha256,
             admission: row.admission,
         })
+    }
+
+    /// Seal without taking the original row across a fallible operation.
+    /// The output slot is populated only after the original producer's
+    /// evidence-only checks succeed. This is an in-memory handoff, not a
+    /// durable publication or physical completion receipt.
+    pub(super) fn publish_in_slots(
+        &self,
+        row: &mut Option<RoventRetiredLockV3Record>,
+        published: &mut Option<PublishedRoventLockV3Record>,
+    ) -> Result<(), Box<EvidencePublicationFailureV3>> {
+        if row.is_none() || published.is_some() {
+            return Err(Box::new(EvidencePublicationFailureV3 {
+                error: invalid("lock-v3 evidence publication slots unavailable"),
+                panic_payload: None,
+            }));
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.seal_retired(row.as_mut().expect("checked original row"))
+        }));
+        match result {
+            Ok(Ok(())) => {
+                let original = row.take().expect("checked original row");
+                *published = Some(PublishedRoventLockV3Record {
+                    record: original.record,
+                    manifest_sha256: original.manifest_sha256,
+                    admission: original.admission,
+                });
+                Ok(())
+            }
+            Ok(Err(error)) => Err(Box::new(EvidencePublicationFailureV3 {
+                error,
+                panic_payload: None,
+            })),
+            Err(payload) => Err(Box::new(EvidencePublicationFailureV3 {
+                error: invalid("lock-v3 evidence publication panicked"),
+                panic_payload: Some(payload),
+            })),
+        }
     }
 }
 
