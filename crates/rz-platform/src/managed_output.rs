@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Same-process inherited descriptors, retained together. The caller must
 /// establish exclusive inheritance before any other thread can close/reuse
-/// either numeric descriptor. A successful seal alone does not prove a lease.
+/// either numeric descriptor, and prevent other owners from changing the
+/// channel's socket options for its lifetime. A successful seal alone does
+/// not prove a lease.
 pub struct ManagedOutputInheritedFds {
     directory: File,
     channel: UnixDatagram,
@@ -55,6 +57,37 @@ fn socket_cookie(fd: RawFd) -> io::Result<u64> {
         ));
     }
     Ok(cookie)
+}
+
+fn require_no_implicit_pidfd(fd: RawFd) -> io::Result<()> {
+    let mut enabled = 0_i32;
+    let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most the declared i32 length to valid
+    // storage. This is a read-only observation of the socket option.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PASSPIDFD,
+            (&mut enabled as *mut i32).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        // Kernels predating SO_PASSPIDFD cannot attach its implicit pidfd.
+        if error.raw_os_error() == Some(libc::ENOPROTOOPT) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if length as usize != std::mem::size_of::<i32>() || enabled != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "implicit SCM pidfd delivery is unsupported",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +176,7 @@ impl ManagedOutputInheritedFds {
                 "control descriptor is not a Unix seqpacket socket",
             ));
         }
+        require_no_implicit_pidfd(channel.as_raw_fd())?;
         let channel_identity = socket_cookie(channel.as_raw_fd())?;
         setsockopt(&channel, sockopt::PassCred, &true).map_err(io::Error::other)?;
         mark_original_cloexec(directory_fd, directory.as_raw_fd())?;
@@ -228,7 +262,7 @@ impl ManagedOutputInheritedFds {
                 io::ErrorKind::WriteZero,
                 "partial seqpacket send",
             )),
-            Err(nix::errno::Errno::EAGAIN) => Ok(false),
+            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => Ok(false),
             Err(error) => Err(io::Error::other(error)),
         }
     }
@@ -248,6 +282,7 @@ impl ManagedOutputInheritedFds {
         maximum: usize,
         control: &mut [usize],
     ) -> io::Result<Option<ManagedOutputPacket>> {
+        require_no_implicit_pidfd(self.channel.as_raw_fd())?;
         if maximum == 0 || maximum > 4096 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -276,7 +311,10 @@ impl ManagedOutputInheritedFds {
         };
         if count < 0 {
             let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::WouldBlock {
+            return if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
                 Ok(None)
             } else {
                 Err(error)
@@ -469,6 +507,44 @@ mod tests {
         .is_err());
         assert!(directory.metadata().is_ok());
         assert!(stream.peer_addr().is_ok());
+    }
+
+    #[test]
+    fn inherited_socket_with_implicit_pidfd_is_rejected_when_supported() {
+        let directory = File::open(".").expect("existing working directory");
+        let (child, _parent) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("seqpacket pair");
+        let enabled = 1_i32;
+        // SAFETY: the integer pointer is valid for the declared i32 size and
+        // the socket remains owned by the test.
+        let result = unsafe {
+            libc::setsockopt(
+                child.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSPIDFD,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOPROTOOPT)
+            );
+            return;
+        }
+        assert_eq!(
+            ManagedOutputInheritedFds::seal_exclusive(directory.as_raw_fd(), child.as_raw_fd())
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        assert!(directory.metadata().is_ok());
     }
 
     #[test]
