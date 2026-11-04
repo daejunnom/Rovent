@@ -89,6 +89,8 @@ mod collection;
 mod collection_v2_observer;
 #[cfg(test)]
 mod collection_v2_tests;
+#[cfg(target_os = "linux")]
+mod collection_v3;
 mod evidence;
 #[cfg(target_os = "linux")]
 mod go_observer;
@@ -117,6 +119,8 @@ pub use collection::{
     run_own_nnuec_collection_v2_with_resource_admission,
     run_pc_collection_v2_with_resource_admission, run_pc_collection_v2_with_sealed_policy,
 };
+#[cfg(target_os = "linux")]
+pub use collection_v3::RoventPcCollectionLaunchOwnerV3;
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 #[cfg(target_os = "linux")]
 pub(crate) use system_parent::ConnectedParent;
@@ -1296,7 +1300,7 @@ pub fn run_with_v3_resource_admission_retaining_control_slot<'a, C: Send + 'stat
     ) -> Result<(), RoventLaunchError>
     + 'a,
 ) -> ControlledV3Result<C> {
-    run_with_v3_control_slot_inner(arguments, control, None, admit_resource)
+    run_with_v3_control_slot_inner(arguments, control, None, None, admit_resource)
 }
 
 /// The connected variant receives the very stream accepted by the original
@@ -1319,7 +1323,47 @@ pub fn run_with_v3_resource_admission_retaining_connected_control_slot<'a, C: Se
     ) -> Result<(), RoventLaunchError>
     + 'a,
 ) -> ControlledV3Result<C> {
-    run_with_v3_control_slot_inner(arguments, control, Some(parent_stream), admit_resource)
+    run_with_v3_control_slot_inner(
+        arguments,
+        control,
+        Some(parent_stream),
+        None,
+        admit_resource,
+    )
+}
+
+/// Launch /3 P/C Collection with the same controlled resource and parent
+/// owners as the ordinary /3 route. The caller retains the same Collection
+/// owner across the call and its outcome; its presence is not completion or
+/// permission to release teacher or native work.
+#[cfg(target_os = "linux")]
+pub fn run_pc_collection_v3_with_resource_admission_retaining_connected_control_slot<
+    'a,
+    C: Send + 'static,
+>(
+    arguments: Vec<String>,
+    control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    parent_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+    collection: &Arc<RoventPcCollectionLaunchOwnerV3>,
+    admit_resource: impl FnOnce(
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+        std::time::Instant,
+        Option<&Dir>,
+        Option<&std::path::Path>,
+        &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
+) -> ControlledV3Result<C> {
+    run_with_v3_control_slot_inner(
+        arguments,
+        control,
+        Some(parent_stream),
+        Some(Arc::clone(collection)),
+        admit_resource,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1327,6 +1371,7 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
     arguments: Vec<String>,
     control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
     parent_stream: Option<Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>>,
+    collection: Option<Arc<RoventPcCollectionLaunchOwnerV3>>,
     admit_resource: impl FnOnce(
         &Arc<RoventInputLockV3>,
         &Dir,
@@ -1394,7 +1439,18 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
                 )
             }),
         };
-        let original = v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?;
+        let original = match collection {
+            Some(collection) => v3::admit_original_collection(
+                &arguments,
+                lock,
+                root,
+                cwd,
+                lock_file,
+                Some(resource),
+                collection,
+            )?,
+            None => v3::admit_original(&arguments, lock, root, cwd, lock_file, Some(resource))?,
+        };
         Ok::<_, RoventLaunchError>((arguments, original))
     }));
     let (arguments, original) = match admitted {

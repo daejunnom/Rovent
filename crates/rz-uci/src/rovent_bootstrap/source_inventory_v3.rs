@@ -32,6 +32,14 @@ const SYSTEM_RUNTIME_V3_FILES: &[(&str, &[u8])] = &[
         include_bytes!("launch/v3.rs"),
     ),
     (
+        "crates/rz-uci/src/rovent_bootstrap/launch/collection_v3.rs",
+        include_bytes!("launch/collection_v3.rs"),
+    ),
+    (
+        "crates/rz-uci/src/rovent_bootstrap/pc_collection_v3.rs",
+        include_bytes!("pc_collection_v3.rs"),
+    ),
+    (
         "crates/rz-uci/src/rovent_bootstrap/launch/v3_scope.rs",
         include_bytes!("launch/v3_scope.rs"),
     ),

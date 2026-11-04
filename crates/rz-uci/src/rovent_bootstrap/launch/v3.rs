@@ -1635,6 +1635,7 @@ pub(super) struct OriginalV3Inputs<'a> {
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
     control: RoventStartupControl,
     clock: ProcessClock,
+    collection: Option<Arc<super::RoventPcCollectionLaunchOwnerV3>>,
     // Original open descriptors only; no archive worker is started here.
     storage: Option<storage::RoventStorageByteCustody<RoventInputLockV3>>,
     // A legacy selection index is retained through physical completion;
@@ -1658,6 +1659,42 @@ pub(super) fn admit_original<'a>(
     lock_file: File,
     resource: Option<ResourceAdmissionV3<'a>>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
+    admit_original_inner(arguments, lock, root, cwd, lock_file, resource, None)
+}
+
+/// Admit the explicit /3 P/C Collection using the same original process,
+/// resource control and parent stream as ordinary /3 launch.
+#[cfg(target_os = "linux")]
+pub(super) fn admit_original_collection<'a>(
+    arguments: &Arguments,
+    lock: Arc<RoventInputLockV3>,
+    root: Dir,
+    cwd: PathBuf,
+    lock_file: File,
+    resource: Option<ResourceAdmissionV3<'a>>,
+    collection: Arc<super::RoventPcCollectionLaunchOwnerV3>,
+) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
+    admit_original_inner(
+        arguments,
+        lock,
+        root,
+        cwd,
+        lock_file,
+        resource,
+        Some(collection),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn admit_original_inner<'a>(
+    arguments: &Arguments,
+    lock: Arc<RoventInputLockV3>,
+    root: Dir,
+    cwd: PathBuf,
+    lock_file: File,
+    resource: Option<ResourceAdmissionV3<'a>>,
+    collection: Option<Arc<super::RoventPcCollectionLaunchOwnerV3>>,
+) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
     if arguments.storage.is_some()
         || arguments.startup_diagnostics
         || arguments.lifecycle_diagnostics
@@ -1670,12 +1707,27 @@ pub(super) fn admit_original<'a>(
         ));
     }
     if !matches!(
-        lock.manifest.purpose,
-        rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment
+        (lock.manifest.purpose, collection.is_some()),
+        (
+            rz_experiments::RoventPurpose::Validation | rz_experiments::RoventPurpose::Deployment,
+            false
+        ) | (rz_experiments::RoventPurpose::Collection, true)
     ) {
         return Err(error(
             "InputLockUnsupportedV3",
-            "collection requires an original /3 collection owner",
+            "Collection requires its original /3 owner and is not a Validation or Deployment observer",
+        ));
+    }
+    if collection.is_some()
+        && (lock.manifest.engine.mode.has_native_r()
+            || !matches!(
+                &lock.manifest.system_runtime_lock.runtime,
+                NativeRuntimeSourceV6::SystemCuda(_)
+            ))
+    {
+        return Err(error(
+            "InputLockUnsupportedV3",
+            "this /3 Collection entry supports system CUDA P/C only",
         ));
     }
     if arguments.startup_ms > lock.manifest.wall_time_max_ms
@@ -1700,6 +1752,12 @@ pub(super) fn admit_original<'a>(
         cleanup_until,
         cancellation: Arc::new(AtomicBool::new(false)),
     };
+    if let Some(owner) = collection.as_ref() {
+        owner
+            .hooks()
+            .register_startup_control(&control)
+            .map_err(|failure| error("CollectionAdmission", failure))?;
+    }
     let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
     control
         .check()
@@ -1872,27 +1930,40 @@ pub(super) fn admit_original<'a>(
         )?;
         (selection, Some(selection_file))
     };
-    let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
-    let sources = Arc::new(
-        if arguments.strict_source.unwrap_or(false) {
-            RoventPinnedNativeSources::<RoventInputLockV3>::open_v3(
-                Arc::clone(&lock),
-                source_root,
-                cwd,
-                selection,
-                &control,
-            )
-        } else {
-            RoventPinnedNativeSources::<RoventInputLockV3>::open_v3_observational(
-                Arc::clone(&lock),
-                source_root,
-                cwd,
-                selection,
-                &control,
-            )
-        }
-        .map_err(|failure| error("Assets", failure))?,
-    );
+    let sources = if let Some(owner) = collection.as_ref() {
+        super::collection_v3::open_collection_sources(
+            Arc::clone(&lock),
+            root,
+            cwd,
+            selection,
+            &control,
+            owner.teachers().to_vec(),
+            owner.sealed_teacher_indices(),
+            arguments.strict_source.unwrap_or(false),
+        )?
+    } else {
+        let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
+        Arc::new(
+            if arguments.strict_source.unwrap_or(false) {
+                RoventPinnedNativeSources::<RoventInputLockV3>::open_v3(
+                    Arc::clone(&lock),
+                    source_root,
+                    cwd,
+                    selection,
+                    &control,
+                )
+            } else {
+                RoventPinnedNativeSources::<RoventInputLockV3>::open_v3_observational(
+                    Arc::clone(&lock),
+                    source_root,
+                    cwd,
+                    selection,
+                    &control,
+                )
+            }
+            .map_err(|failure| error("Assets", failure))?,
+        )
+    };
     sources
         .configuration()
         .require_supported_native_capabilities()
@@ -2032,6 +2103,7 @@ pub(super) fn admit_original<'a>(
         sources,
         control,
         clock,
+        collection,
         storage,
         selection_file: selection_file.map(Arc::new),
         lock_file: Arc::new(lock_file),
@@ -2145,6 +2217,7 @@ pub(super) fn run_native_admitted(
         sources,
         control,
         clock,
+        collection,
         storage: _storage,
         selection_file,
         lock_file,
@@ -2398,6 +2471,9 @@ pub(super) fn run_native_admitted(
     }
     if let Some(parent) = connected_parent.as_ref() {
         scope.attach_pin(Box::new(Arc::clone(parent)));
+    }
+    if let Some(owner) = collection.as_ref() {
+        scope.attach_pin(Box::new(Arc::clone(owner)));
     }
     scope.arm();
     type SessionReleaseProbe =
@@ -2913,23 +2989,47 @@ pub(super) fn run_native_admitted(
             };
             // The optional shared NNUEC and later native service remain in
             // one registered assembly slot from before native startup.
-            let custody = Arc::new(std::sync::Mutex::new(
-                super::super::product::RoventPcAssemblyV3::new(
+            let assembly = match collection.as_ref() {
+                Some(owner) => super::super::product::RoventPcAssemblyV3::new_collection(
+                    shared_loaded,
+                    Arc::clone(&boundary),
+                    Arc::clone(owner.hooks()),
+                ),
+                None => super::super::product::RoventPcAssemblyV3::new(
                     shared_loaded,
                     Arc::clone(&boundary),
                 ),
-            ));
+            };
+            let custody = Arc::new(std::sync::Mutex::new(assembly));
             scope.attach_pin(Box::new(Arc::clone(&custody)));
-            let prepared = match super::super::prepare_native_v3_retaining_with_parent::<
-                PcPortQuestion,
-            >(
-                Arc::clone(&sources),
-                resources,
-                clock.runtime_clock(),
-                control.clone(),
-                connected_parent.clone(),
-                numeric_observer.take(),
-            ) {
+            let prepared_result = if let Some(owner) = collection.as_ref() {
+                let observer = match owner.observer_proxy() {
+                    Ok(observer) => observer,
+                    Err(failure) => {
+                        scope.mark_before_native();
+                        scope.settled_without_quarantine();
+                        return Err(failure.into());
+                    }
+                };
+                super::collection_v3::prepare_collection_with_parent::<PcPortQuestion>(
+                    Arc::clone(&sources),
+                    resources,
+                    clock.runtime_clock(),
+                    control.clone(),
+                    observer,
+                    connected_parent.clone(),
+                )
+            } else {
+                super::super::prepare_native_v3_retaining_with_parent::<PcPortQuestion>(
+                    Arc::clone(&sources),
+                    resources,
+                    clock.runtime_clock(),
+                    control.clone(),
+                    connected_parent.clone(),
+                    numeric_observer.take(),
+                )
+            };
+            let prepared = match prepared_result {
                 Ok(prepared) => prepared,
                 Err(failure) => {
                     let unknown = runtime_receipt(&lock, arguments.process_epoch, None, false);
