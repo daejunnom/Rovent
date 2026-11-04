@@ -70,10 +70,113 @@ fn assembly_completion_unknown(mut error: SearchSessionFailure) -> SearchSession
     error
 }
 
-// Shared assembly over the original pinned V1/V2 declarations. The session
-// constructors below still own their version-specific admission and custody.
+// Shared board preparation; the /3 profile obtains its root budget only at go.
+#[cfg(target_os = "linux")]
+const ROVENT_OWN_BOARD_V3_SOURCE: &[u8] = include_bytes!("product/own_board_v3.rs");
+
+macro_rules! own_board_hash_version_source {
+    (fixed, $hash:ident) => {};
+    (v3, $hash:ident) => {
+        $hash.update(crate::rovent_bootstrap::product::ROVENT_OWN_BOARD_V3_SOURCE);
+    };
+}
+
+macro_rules! own_board_root_budget {
+    (fixed, $pins:ident) => {
+        rz_eval::asset::parse_sha256(
+            &$pins
+                .lock()
+                .manifest
+                .coordinator
+                .original_root_budget_sha256,
+        )
+        .map(Digest)
+        .map_err(|error| SearchSessionFailure::debug("RoventPcrBudget", &error))
+    };
+    (v3, $pins:ident) => {{
+        let _ = &$pins;
+        Ok::<(), SearchSessionFailure>(())
+    }};
+}
+
+macro_rules! own_board_session_profile {
+    (fixed, $config:ident, $prepared:ident, $namespace:ident, $reciprocal:ident, $peers:ident, $budget:ident) => {{
+        Ok::<_, SearchSessionFailure>(RoventPcrSessionProfile {
+            mode: $prepared.snapshot().mode,
+            maximum_goal_plies: NonZeroU16::new($config.fields().frontier.maximum_goal_plies)
+                .ok_or_else(|| failure("RoventPcrGoal", "zero goal capability"))?,
+            input_lock: $prepared.snapshot().input_lock,
+            root_budget: $budget,
+            selective_policy: Digest(
+                $config.search_configuration_digest().map_err(|error| {
+                    SearchSessionFailure::debug("RoventPcrConfiguration", &error)
+                })?,
+            ),
+            model_namespace: Arc::new($namespace),
+            frontier_limits: $config
+                .fields()
+                .frontier
+                .actual()
+                .map_err(|error| SearchSessionFailure::debug("RoventPcrFrontier", &error))?,
+            reciprocal: $reciprocal
+                .actual($prepared.snapshot().mode, $budget)
+                .map_err(|error| SearchSessionFailure::debug("RoventPcrReciprocal", &error))?,
+            peers: $peers
+                .actual()
+                .map_err(|error| SearchSessionFailure::debug("RoventPcrPeers", &error))?,
+        })
+    }};
+    (v3, $config:ident, $prepared:ident, $namespace:ident, $reciprocal:ident, $peers:ident, $budget:ident) => {{
+        let _ = $budget;
+        let reciprocal = crate::pals_adaptive::RoventOwnReciprocalV3 {
+            recipient: match $reciprocal.recipient {
+                crate::rovent_bootstrap::configuration::Recipient::Proposer => {
+                    rz_contracts::rovent::SearchRecipient::Proposer
+                }
+                crate::rovent_bootstrap::configuration::Recipient::Critic => {
+                    rz_contracts::rovent::SearchRecipient::Critic
+                }
+            },
+            max_questions_per_job: $reciprocal.max_questions_per_job,
+            node_interval: $reciprocal.node_interval,
+            first_question_sequence: $reciprocal.first_question_sequence,
+        };
+        Ok::<_, SearchSessionFailure>(crate::pals_adaptive::RoventOwnPcrSessionProfileV3 {
+            common: crate::pals_adaptive::RoventPcrSessionProfileV3 {
+                mode: $prepared.snapshot().mode,
+                maximum_goal_plies: NonZeroU16::new($config.fields().frontier.maximum_goal_plies)
+                    .ok_or_else(|| {
+                    failure("RoventPcrGoal", "zero goal capability")
+                })?,
+                input_lock: $prepared.snapshot().input_lock,
+                selective_policy: Digest($config.search_configuration_digest().map_err(
+                    |error| SearchSessionFailure::debug("RoventPcrConfiguration", &error),
+                )?),
+                model_namespace: Arc::new($namespace),
+                frontier_limits: $config
+                    .fields()
+                    .frontier
+                    .actual()
+                    .map_err(|error| SearchSessionFailure::debug("RoventPcrFrontier", &error))?,
+                peers: $peers
+                    .actual()
+                    .map_err(|error| SearchSessionFailure::debug("RoventPcrPeers", &error))?,
+            },
+            reciprocal,
+        })
+    }};
+}
+
+// Shared assembly over original declarations; no /1 or /2 root seal is made
+// for /3. Version-specific constructors still own admission and custody.
 macro_rules! build_own_board_pcr {
-    ($pins:expr, $prepared:expr, $clock:expr, $identity:expr) => {{
+    ($pins:expr, $prepared:expr, $clock:expr, $identity:expr) => {
+        build_own_board_pcr!(@actual fixed, $pins, $prepared, $clock, $identity)
+    };
+    (v3, $pins:expr, $prepared:expr, $clock:expr, $identity:expr) => {
+        build_own_board_pcr!(@actual v3, $pins, $prepared, $clock, $identity)
+    };
+    (@actual $kind:ident, $pins:expr, $prepared:expr, $clock:expr, $identity:expr) => {{
         let pins = &$pins;
         let prepared = &$prepared;
         let clock = &$clock;
@@ -225,16 +328,12 @@ macro_rules! build_own_board_pcr {
                     "actual engine policy differs from its registered configuration",
                 ));
             }
-            let root_budget = Digest(
-                rz_eval::asset::parse_sha256(
-                    &pins.lock().manifest.coordinator.original_root_budget_sha256,
-                )
-                .map_err(|error| SearchSessionFailure::debug("RoventPcrBudget", &error))?,
-            );
+            let root_budget = own_board_root_budget!($kind, pins)?;
             let mut hash = Sha256::new();
             hash.update(b"rz-rovent-native-product/1\0");
             hash.update(include_bytes!("product.rs"));
-            hash.update(super::compiled_bootstrap_source_digest());
+            hash.update(crate::rovent_bootstrap::compiled_bootstrap_source_digest());
+            own_board_hash_version_source!($kind, hash);
             hash.update(
                 configuration.configuration_digest().map_err(|error| {
                     SearchSessionFailure::debug("RoventPcrConfiguration", &error)
@@ -254,30 +353,9 @@ macro_rules! build_own_board_pcr {
                 cpu_device_digest: Digest(Sha256::digest(b"native-own-board-host-cpu").into()),
                 external_policy: ExternalSlicePolicy::default(),
             };
-            let profile = RoventPcrSessionProfile {
-                mode: prepared.snapshot().mode,
-                maximum_goal_plies: NonZeroU16::new(
-                    configuration.fields().frontier.maximum_goal_plies,
-                )
-                .ok_or_else(|| failure("RoventPcrGoal", "zero goal capability"))?,
-                input_lock: prepared.snapshot().input_lock,
-                root_budget,
-                selective_policy: Digest(configuration.search_configuration_digest().map_err(
-                    |error| SearchSessionFailure::debug("RoventPcrConfiguration", &error),
-                )?),
-                model_namespace: Arc::new(namespace),
-                frontier_limits: configuration
-                    .fields()
-                    .frontier
-                    .actual()
-                    .map_err(|error| SearchSessionFailure::debug("RoventPcrFrontier", &error))?,
-                reciprocal: reciprocal
-                    .actual(prepared.snapshot().mode, root_budget)
-                    .map_err(|error| SearchSessionFailure::debug("RoventPcrReciprocal", &error))?,
-                peers: peers
-                    .actual()
-                    .map_err(|error| SearchSessionFailure::debug("RoventPcrPeers", &error))?,
-            };
+            let profile = own_board_session_profile!(
+                $kind, configuration, prepared, namespace, reciprocal, peers, root_budget
+            )?;
             Ok((
                 engine,
                 cpu,
@@ -294,6 +372,10 @@ macro_rules! build_own_board_pcr {
 }
 
 type PcrDriver = AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>>;
+#[cfg(target_os = "linux")]
+mod own_board_v3;
+#[cfg(target_os = "linux")]
+pub(crate) use own_board_v3::{RoventOwnBoardAssemblyV3, RoventOwnBoardProductDriverV3};
 mod diagnostics;
 pub(super) mod diagnostics_v2;
 mod storage;
@@ -1217,6 +1299,8 @@ pub(crate) struct RoventPcAssemblyV3 {
     loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
     process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
     driver: Option<Arc<RoventNativeProductDriverV3>>,
+    #[cfg(target_os = "linux")]
+    collection_hooks: Option<Arc<dyn super::pc_collection_v3::RoventPcCollectionHooksV3>>,
 }
 impl RoventPcAssemblyV3 {
     pub(crate) fn new(
@@ -1228,7 +1312,19 @@ impl RoventPcAssemblyV3 {
             loaded,
             process,
             driver: None,
+            #[cfg(target_os = "linux")]
+            collection_hooks: None,
         }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_collection(
+        loaded: Option<LoadedRoventNnuecSource<rz_experiments::RoventInputLockV3>>,
+        process: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
+        hooks: Arc<dyn super::pc_collection_v3::RoventPcCollectionHooksV3>,
+    ) -> Self {
+        let mut assembly = Self::new(loaded, process);
+        assembly.collection_hooks = Some(hooks);
+        assembly
     }
     #[allow(clippy::result_large_err)]
     pub(crate) fn install_prepared(
@@ -1270,6 +1366,31 @@ impl RoventPcAssemblyV3 {
                 .sources(),
         );
         let physically_closed = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        let inner = if self.collection_hooks.is_some() {
+            RoventPcSessionDriver::new_v3_collection_in_slots(
+                &mut self.prepared,
+                &mut self.loaded,
+                Arc::clone(&self.process),
+                clock.clone(),
+                owners,
+                identity,
+                root_policy,
+                &mut self.collection_hooks,
+            )
+        } else {
+            RoventPcSessionDriver::new_v3_in_slots(
+                &mut self.prepared,
+                &mut self.loaded,
+                Arc::clone(&self.process),
+                clock.clone(),
+                owners,
+                identity,
+                root_policy,
+            )
+        }
+        .map_err(assembly_completion_unknown)?;
+        #[cfg(not(target_os = "linux"))]
         let inner = RoventPcSessionDriver::new_v3_in_slots(
             &mut self.prepared,
             &mut self.loaded,
@@ -1294,6 +1415,12 @@ impl RoventPcAssemblyV3 {
 }
 
 impl RoventNativeProductDriverV3 {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn collection_cleanup_observation_v3(
+        &self,
+    ) -> Option<super::pc_collection_v3::RoventPcCleanupObservationV3> {
+        self.inner.collection_cleanup_observation_v3()
+    }
     pub(crate) fn session_release_observation(
         &self,
     ) -> Option<crate::pals_adaptive::NativeSessionReleaseObservation> {

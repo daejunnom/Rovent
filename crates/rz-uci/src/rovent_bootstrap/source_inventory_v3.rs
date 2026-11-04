@@ -40,6 +40,18 @@ const SYSTEM_RUNTIME_V3_FILES: &[(&str, &[u8])] = &[
         include_bytes!("pc_collection_v3.rs"),
     ),
     (
+        "crates/rz-uci/src/rovent_bootstrap/pc_collection_v3_root.rs",
+        include_bytes!("pc_collection_v3_root.rs"),
+    ),
+    (
+        "crates/rz-uci/src/rovent_bootstrap/product/own_board_v3.rs",
+        include_bytes!("product/own_board_v3.rs"),
+    ),
+    (
+        "crates/rz-uci/src/pals_adaptive/session_driver/collection_v3.rs",
+        include_bytes!("../pals_adaptive/session_driver/collection_v3.rs"),
+    ),
+    (
         "crates/rz-uci/src/rovent_bootstrap/launch/v3_scope.rs",
         include_bytes!("launch/v3_scope.rs"),
     ),
