@@ -5,10 +5,12 @@
 //! Transferring a completion here is not a target, publication or fence.
 
 use super::super::observer_lock_v3::{
-    OriginalRouteMatchV3, PipelinePreparationV3, RetiredTransferV3, RoventCollectionOwnerLockV3,
+    OriginalRouteMatchV3, PipelineCapabilityV3, PipelinePreparationV3, RetiredTransferV3,
+    RoventCollectionOwnerLockV3,
 };
 use super::super::policy_row_pipeline_v3::{
-    PolicyPipelineProgressV3, PolicyPrepareOutcomeV3, PolicyRowPipelineOwnerV3,
+    PolicyPipelineProgressV3, PolicyPrepareOutcomeV3, PolicyRetentionOutcomeV3,
+    PolicyRootRetainedOwnerV3, PolicyRowPipelineOwnerV3,
 };
 use super::super::speculative_route_v3::{SpeculativeRootV3, TargetCapabilityTakeV3};
 use super::super::{ArenaError, MAX_CORPUS_ROWS, invalid};
@@ -53,7 +55,9 @@ pub(crate) struct TeacherPolicyConsumerV3 {
     prepared_transferred: bool,
     policy_appended: bool,
     appended_retained: bool,
+    appended_in_output: bool,
     processed: TeacherProcessedOwnerV3,
+    retained: PolicyRootRetainedOwnerV3,
     authority_unknown: bool,
 }
 
@@ -107,6 +111,7 @@ impl TeacherPolicyConsumerOwnerV3 {
         observer: &RoventCollectionOwnerLockV3,
         pipeline: &PolicyRowPipelineOwnerV3,
         processed: &TeacherProcessedOwnerV3,
+        retained: &PolicyRootRetainedOwnerV3,
     ) -> Result<TeacherPolicyConsumerStartV3, ArenaError> {
         let receiver = {
             let pump = match pump.try_lock() {
@@ -155,6 +160,14 @@ impl TeacherPolicyConsumerOwnerV3 {
                 return Err(invalid("V3 processed completion root differs"));
             }
         }
+        match retained
+            .try_matches(pipeline, route.admission())
+            .map_err(invalid)?
+        {
+            Some(true) => {}
+            Some(false) => return Err(invalid("V3 policy retention root or pipeline differs")),
+            None => return Ok(TeacherPolicyConsumerStartV3::Busy),
+        }
         match observer.try_matches_original_route(route)? {
             OriginalRouteMatchV3::Match => {}
             OriginalRouteMatchV3::Different => {
@@ -181,7 +194,9 @@ impl TeacherPolicyConsumerOwnerV3 {
                 prepared_transferred: false,
                 policy_appended: false,
                 appended_retained: false,
+                appended_in_output: false,
                 processed: processed.clone(),
+                retained: retained.clone(),
                 authority_unknown: false,
             }),
         ))))
@@ -202,6 +217,7 @@ impl TeacherPolicyConsumerOwnerV3 {
         observer: &RoventCollectionOwnerLockV3,
         pipeline: &PolicyRowPipelineOwnerV3,
         processed: &TeacherProcessedOwnerV3,
+        retained: &PolicyRootRetainedOwnerV3,
     ) -> Result<Option<bool>, &'static str> {
         let Some(owner) = self.try_lock()? else {
             return Ok(None);
@@ -212,7 +228,8 @@ impl TeacherPolicyConsumerOwnerV3 {
                 && owner.route.same_original_route(route)
                 && owner.observer.same_original_owner(observer)
                 && owner.pipeline.same_owner(pipeline)
-                && owner.processed.same_owner(processed),
+                && owner.processed.same_owner(processed)
+                && owner.retained.same_owner(retained),
         ))
     }
 
@@ -369,6 +386,10 @@ impl TeacherPolicyConsumerV3 {
             PipelinePreparationV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
             PipelinePreparationV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
             PipelinePreparationV3::Failed => TeacherPolicyConsumerProgressV3::Rejected,
+            PipelinePreparationV3::Unknown => {
+                self.authority_unknown = true;
+                TeacherPolicyConsumerProgressV3::Unknown
+            }
         })
     }
 
@@ -380,34 +401,27 @@ impl TeacherPolicyConsumerV3 {
         if self.authority_unknown {
             return Ok(TeacherPolicyConsumerProgressV3::Unknown);
         }
-        let Some(completed) = self.completed.as_ref() else {
+        if self.completed.is_none() {
             return Ok(TeacherPolicyConsumerProgressV3::NotReady);
-        };
+        }
         if !self.prepared_transferred {
             return Ok(TeacherPolicyConsumerProgressV3::NotReady);
         }
-        let ticket = completed.capsule.ticket();
-        let mut pipeline = match self.pipeline.try_lock().map_err(invalid)? {
-            Some(guard) => guard,
-            None => return Ok(TeacherPolicyConsumerProgressV3::Busy),
-        };
-        let Some(destination) = pipeline.empty_capability_slot() else {
-            return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
-        };
         Ok(
-            match self
-                .route
-                .try_take_target_capability_in_slot(&ticket, destination)?
-            {
-                TargetCapabilityTakeV3::Transferred => {
-                    TeacherPolicyConsumerProgressV3::CapabilityStored
-                }
-                TargetCapabilityTakeV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
-                TargetCapabilityTakeV3::AlreadyTaken => {
-                    self.authority_unknown = true;
-                    TeacherPolicyConsumerProgressV3::Unknown
-                }
-                TargetCapabilityTakeV3::Occupied => TeacherPolicyConsumerProgressV3::OutputHeld,
+            match self.observer.try_take_pipeline_capability(&self.pipeline)? {
+                PipelineCapabilityV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
+                PipelineCapabilityV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
+                PipelineCapabilityV3::Outcome(outcome) => match outcome {
+                    TargetCapabilityTakeV3::Transferred => {
+                        TeacherPolicyConsumerProgressV3::CapabilityStored
+                    }
+                    TargetCapabilityTakeV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
+                    TargetCapabilityTakeV3::AlreadyTaken => {
+                        self.authority_unknown = true;
+                        TeacherPolicyConsumerProgressV3::Unknown
+                    }
+                    TargetCapabilityTakeV3::Occupied => TeacherPolicyConsumerProgressV3::OutputHeld,
+                },
             },
         )
     }
@@ -465,11 +479,22 @@ impl TeacherPolicyConsumerV3 {
             self.authority_unknown = true;
             return Ok(TeacherPolicyConsumerProgressV3::Unknown);
         }
-        if !pipeline.transfer_appended() {
-            return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
+        if !self.appended_in_output {
+            if !pipeline.transfer_appended() {
+                return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
+            }
+            self.appended_in_output = true;
         }
-        self.appended_retained = true;
-        Ok(TeacherPolicyConsumerProgressV3::AppendedEvidenceStored)
+        Ok(match pipeline.try_retain_completed(&self.retained)? {
+            PolicyRetentionOutcomeV3::Transferred => {
+                self.appended_retained = true;
+                TeacherPolicyConsumerProgressV3::AppendedEvidenceStored
+            }
+            PolicyRetentionOutcomeV3::Busy => TeacherPolicyConsumerProgressV3::Busy,
+            PolicyRetentionOutcomeV3::NotReady => TeacherPolicyConsumerProgressV3::NotReady,
+            PolicyRetentionOutcomeV3::OtherRoot => TeacherPolicyConsumerProgressV3::NotReady,
+            PolicyRetentionOutcomeV3::Capacity => TeacherPolicyConsumerProgressV3::OutputHeld,
+        })
     }
 
     /// Move the original completion only into the pre-registered root's
@@ -516,6 +541,7 @@ impl TeacherPolicyConsumerV3 {
         self.prepared_transferred = false;
         self.policy_appended = false;
         self.appended_retained = false;
+        self.appended_in_output = false;
         self.seal_state = TeacherPolicySealStepV3::Ready;
         Ok(TeacherPolicyConsumerProgressV3::CompletionStored)
     }
