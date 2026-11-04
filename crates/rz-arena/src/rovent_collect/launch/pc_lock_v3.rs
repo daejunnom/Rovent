@@ -5,10 +5,12 @@
 use super::*;
 use crate::rovent_collect::teacher::v3_session::TeacherRosterEntryV3;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
-use rz_experiments::{RoventActor, RoventInputLockV3, RoventPurpose};
+use rz_experiments::{RoventActor, RoventInputLockV3, RoventPurpose, RoventResearcher};
 use std::os::unix::fs::MetadataExt;
 
 pub const ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN: &str = "rz-rovent-collection-lock-v3-launch/1";
+pub const ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN: &str =
+    "rz-rovent-own-collection-lock-v3-launch/1";
 const PLAN_MAX_BYTES: u64 = 256 << 10;
 const MANIFEST_MAX_BYTES: u64 = 16 << 20;
 
@@ -157,17 +159,42 @@ pub struct PreparedPcCollectionInputsV3 {
     original_manifest: OriginalPinnedFile,
     plan: RoventCollectionLockV3LaunchPlan,
     manifest: Arc<RoventCorpusManifestLockV3>,
+    purpose: CollectionInputsPurposeV3,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CollectionInputsPurposeV3 {
+    Pc,
+    Own,
 }
 
 impl PreparedPcCollectionInputsV3 {
     pub fn open(directory: &Dir, plan_pin: &RoventPublicationFile) -> Result<Self, ArenaError> {
+        Self::open_for(directory, plan_pin, CollectionInputsPurposeV3::Pc)
+    }
+
+    /// Read an explicitly Own-domain plan while retaining the same original
+    /// directory, file descriptors and byte pins used by later validation.
+    pub fn open_own(directory: &Dir, plan_pin: &RoventPublicationFile) -> Result<Self, ArenaError> {
+        Self::open_for(directory, plan_pin, CollectionInputsPurposeV3::Own)
+    }
+
+    fn open_for(
+        directory: &Dir,
+        plan_pin: &RoventPublicationFile,
+        purpose: CollectionInputsPurposeV3,
+    ) -> Result<Self, ArenaError> {
         let original_directory = directory.try_clone().map_err(io)?.into_std_file();
         let original_plan = OriginalPinnedFile::read(directory, plan_pin, PLAN_MAX_BYTES)?;
         let text = std::str::from_utf8(&original_plan.bytes)
             .map_err(|_| invalid("Collection /3 plan UTF8"))?;
         let plan: RoventCollectionLockV3LaunchPlan = rz_experiments::decode_json(text)?;
         check(
-            plan.schema == ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+            plan.schema
+                == match purpose {
+                    CollectionInputsPurposeV3::Pc => ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+                    CollectionInputsPurposeV3::Own => ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+                },
             "Collection /3 explicit launch plan domain",
         )?;
         let original_manifest =
@@ -181,6 +208,7 @@ impl PreparedPcCollectionInputsV3 {
             original_manifest,
             plan,
             manifest,
+            purpose,
         })
     }
 
@@ -226,11 +254,39 @@ impl PreparedPcCollectionInputsV3 {
     /// Validate against the same /3 lock supplied by native resource
     /// admission. This registers no capability and starts no worker.
     pub fn validate_against(&self, lock: &RoventInputLockV3) -> Result<(), ArenaError> {
+        self.validate_for(lock, CollectionInputsPurposeV3::Pc)
+    }
+
+    /// The Own-only path is distinct from the existing P-C validation and
+    /// requires the original lock's actual Own researcher declaration.
+    pub fn validate_own_against(&self, lock: &RoventInputLockV3) -> Result<(), ArenaError> {
+        self.validate_for(lock, CollectionInputsPurposeV3::Own)
+    }
+
+    fn validate_for(
+        &self,
+        lock: &RoventInputLockV3,
+        purpose: CollectionInputsPurposeV3,
+    ) -> Result<(), ArenaError> {
+        check(
+            self.purpose == purpose,
+            "Collection /3 plan purpose differs",
+        )?;
         self.manifest.validate(lock)?;
         self.plan.resource_plan.validate()?;
+        let mode_matches = match purpose {
+            CollectionInputsPurposeV3::Pc => !lock.manifest.engine.mode.has_native_r(),
+            CollectionInputsPurposeV3::Own => {
+                lock.manifest.engine.mode.has_native_r()
+                    && matches!(
+                        &lock.manifest.engine.researcher,
+                        Some(RoventResearcher::Own { .. })
+                    )
+            }
+        };
         check(
             lock.manifest.purpose == RoventPurpose::Collection
-                && !lock.manifest.engine.mode.has_native_r()
+                && mode_matches
                 && self.plan.resource_plan.path.starts_with("inputs/")
                 && valid_relative(&self.plan.resource_plan.path)
                 && (1..=64).contains(&self.plan.maximum_roots)
@@ -256,7 +312,7 @@ impl PreparedPcCollectionInputsV3 {
                 && !self.plan.teacher_slots.is_empty()
                 && self.plan.teacher_slots.len() == self.manifest.registration.teachers.len()
                 && self.plan.teacher_sources.len() == self.manifest.registration.teachers.len(),
-            "Collection /3 finite P-C plan or teacher coverage",
+            "Collection /3 finite plan, mode or teacher coverage",
         )?;
         check(
             Duration::from_nanos(self.plan.teacher_soft_quantum_ns)
@@ -353,6 +409,37 @@ impl PreparedPcCollectionInputsV3 {
         directory: &Dir,
         original_lock_file: &std::fs::File,
     ) -> Result<(), ArenaError> {
+        self.validate_boundary_for(
+            lock,
+            directory,
+            original_lock_file,
+            CollectionInputsPurposeV3::Pc,
+        )
+    }
+
+    /// Own-specific original boundary verification; a PC-domain plan cannot
+    /// be relabelled as Own even when the serialized fields otherwise match.
+    pub fn validate_original_own_boundary(
+        &self,
+        lock: &RoventInputLockV3,
+        directory: &Dir,
+        original_lock_file: &std::fs::File,
+    ) -> Result<(), ArenaError> {
+        self.validate_boundary_for(
+            lock,
+            directory,
+            original_lock_file,
+            CollectionInputsPurposeV3::Own,
+        )
+    }
+
+    fn validate_boundary_for(
+        &self,
+        lock: &RoventInputLockV3,
+        directory: &Dir,
+        original_lock_file: &std::fs::File,
+        purpose: CollectionInputsPurposeV3,
+    ) -> Result<(), ArenaError> {
         let held = self.original_directory.metadata().map_err(io)?;
         let supplied = directory
             .try_clone()
@@ -368,7 +455,7 @@ impl PreparedPcCollectionInputsV3 {
                 && lock_file.is_file(),
             "Collection /3 original resource boundary differs",
         )?;
-        self.validate_against(lock)
+        self.validate_for(lock, purpose)
     }
 
     pub(crate) fn roster(&self) -> Vec<TeacherRosterEntryV3> {
