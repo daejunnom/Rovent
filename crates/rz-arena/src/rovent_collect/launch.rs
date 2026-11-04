@@ -54,6 +54,9 @@ pub mod partial_game_v2;
 mod pc_lock_v2;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod pc_lock_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+#[allow(dead_code)]
+mod pc_recovery_v3;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod teacher_fixture_identity_v1;
 pub use partial_collection_v1::{
