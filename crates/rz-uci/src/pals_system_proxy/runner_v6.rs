@@ -17,7 +17,7 @@ use super::{
 };
 use std::{
     any::Any,
-    io,
+    io::{self, Read, Write},
     os::{fd::OwnedFd, unix::net::UnixStream},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
@@ -26,6 +26,36 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+use rz_contracts::pals::child_reobserve_v1::{
+    CHILD_REOBSERVE_REQUEST_BYTES, CHILD_REOBSERVE_RESPONSE_BYTES, ChildReobserveRequestV1,
+    ChildReobserveResponseV1,
+};
+
+/// The same stream and partial bytes remain with the original supervisor.
+/// A response is a child observation, never a physical-release token.
+struct PendingChildReobserveV1 {
+    request: ChildReobserveRequestV1,
+    sent: [u8; CHILD_REOBSERVE_REQUEST_BYTES],
+    sent_len: usize,
+    received: [u8; CHILD_REOBSERVE_RESPONSE_BYTES],
+    received_len: usize,
+    until: Instant,
+    timed_out: bool,
+    completed_after_window: bool,
+    result: Option<Result<ChildReobserveResponseV1, io::Error>>,
+}
+
+/// Complete original exchange, including any earlier expired wait. It remains
+/// a same-child report and does not confer physical release authority.
+pub(super) struct CompletedChildReobserveV1 {
+    pub request: ChildReobserveRequestV1,
+    pub response: ChildReobserveResponseV1,
+    pub sent: [u8; CHILD_REOBSERVE_REQUEST_BYTES],
+    pub received: [u8; CHILD_REOBSERVE_RESPONSE_BYTES],
+    pub timed_out: bool,
+    pub completed_after_window: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ProxyStageV6 {
@@ -150,6 +180,8 @@ pub(super) struct PalsProxySupervisorV6 {
     runtime_finish_stream: Option<UnixStream>,
     session_release_stream: Option<UnixStream>,
     reobserve_stream: Option<UnixStream>,
+    reobserve_sequence: u64,
+    pending_reobserve: Option<PendingChildReobserveV1>,
     runtime_finish_attempted: bool,
     session_release_attempted: bool,
     input_cleanup_start: Option<RelayInputCleanupStartV6>,
@@ -157,6 +189,208 @@ pub(super) struct PalsProxySupervisorV6 {
 }
 
 impl PalsProxySupervisorV6 {
+    /// Start one observation on the existing authenticated child stream.
+    /// This does not start native work or change either original deadline.
+    pub(super) fn begin_child_reobserve(
+        &mut self,
+        until: Instant,
+        observation_budget_ms: u64,
+    ) -> io::Result<()> {
+        use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
+        if !self.no_game_cleanup_deadline_selected || self.pending_reobserve.is_some() {
+            return Err(io::Error::other(
+                "NoGame child observation unavailable or pending",
+            ));
+        }
+        let now = Instant::now();
+        let left = until
+            .checked_duration_since(now)
+            .filter(|v| !v.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "child observation window expired")
+            })?;
+        let child = self
+            .child
+            .as_ref()
+            .ok_or_else(|| io::Error::other("original child unavailable"))?;
+        let stream = self
+            .reobserve_stream
+            .as_mut()
+            .ok_or_else(|| io::Error::other("original child observation stream unavailable"))?;
+        let peer = getsockopt(&*stream, PeerCredentials).map_err(io::Error::other)?;
+        if peer.pid() != child.child.id() as i32 || peer.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "original child observation peer differs",
+            ));
+        }
+        let sequence = self
+            .reobserve_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("child observation sequence exhausted"))?;
+        let budget_cap = left.as_millis().min(u64::MAX as u128) as u64;
+        let request = ChildReobserveRequestV1 {
+            generation: child.lock.config.process_generation,
+            lock_sha256: child.lock.canonical_sha256.clone(),
+            sequence,
+            observation_budget_ms: observation_budget_ms.min(budget_cap),
+        };
+        let sent = request.encode().map_err(io::Error::other)?;
+        stream.set_nonblocking(true)?;
+        self.reobserve_sequence = sequence;
+        self.pending_reobserve = Some(PendingChildReobserveV1 {
+            request,
+            sent,
+            sent_len: 0,
+            received: [0; CHILD_REOBSERVE_RESPONSE_BYTES],
+            received_len: 0,
+            until,
+            timed_out: false,
+            completed_after_window: false,
+            result: None,
+        });
+        Ok(())
+    }
+
+    /// Perform one nonblocking transfer step. A timeout retains the partial
+    /// bytes; the caller may explicitly resume this same observation later.
+    pub(super) fn poll_child_reobserve(&mut self) -> io::Result<bool> {
+        let pending = self
+            .pending_reobserve
+            .as_mut()
+            .ok_or_else(|| io::Error::other("child observation not started"))?;
+        if pending.result.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= pending.until {
+            pending.timed_out = true;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child observation window expired; partial transfer retained",
+            ));
+        }
+        let stream = self
+            .reobserve_stream
+            .as_mut()
+            .ok_or_else(|| io::Error::other("original child observation stream unavailable"))?;
+        let transfer = (|| -> io::Result<()> {
+            if pending.sent_len < pending.sent.len() {
+                match stream.write(&pending.sent[pending.sent_len..]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "child observation request closed",
+                        ));
+                    }
+                    Ok(count) => pending.sent_len += count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if pending.sent_len != pending.sent.len() {
+                return Ok(());
+            }
+            match stream.read(&mut pending.received[pending.received_len..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "child observation response closed",
+                    ));
+                }
+                Ok(count) => pending.received_len += count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+            if pending.received_len == pending.received.len() {
+                let response = ChildReobserveResponseV1::decode(&pending.received)
+                    .map_err(io::Error::other)?;
+                if !response.matches_request(&pending.request) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "child observation response scope differs",
+                    ));
+                }
+                pending.completed_after_window = Instant::now() >= pending.until;
+                pending.result = Some(Ok(response));
+            }
+            Ok(())
+        })();
+        if let Err(error) = transfer {
+            pending.result = Some(Err(error));
+        }
+        Ok(pending.result.is_some())
+    }
+
+    /// Renew only the observation wait for the same in-flight request. This
+    /// never extends the original Run/cleanup authority or resends a frame.
+    pub(super) fn resume_child_reobserve(&mut self, until: Instant) -> io::Result<()> {
+        let pending = self
+            .pending_reobserve
+            .as_mut()
+            .ok_or_else(|| io::Error::other("child observation not started"))?;
+        if pending.result.is_some() || until <= Instant::now() {
+            return Err(io::Error::other("child observation cannot be resumed"));
+        }
+        pending.until = until;
+        Ok(())
+    }
+
+    pub(super) fn child_reobserve_result(&self) -> Option<&io::Result<ChildReobserveResponseV1>> {
+        self.pending_reobserve.as_ref()?.result.as_ref()
+    }
+
+    /// Inspect exact transferred bytes without moving the original socket.
+    pub(super) fn child_reobserve_progress(
+        &self,
+    ) -> Option<(&ChildReobserveRequestV1, &[u8], &[u8])> {
+        let pending = self.pending_reobserve.as_ref()?;
+        Some((
+            &pending.request,
+            &pending.sent[..pending.sent_len],
+            &pending.received[..pending.received_len],
+        ))
+    }
+
+    /// A late response remains valid as a report, but did not complete in
+    /// this observation window and never implies physical completion.
+    pub(super) fn child_reobserve_completed_after_window(&self) -> Option<bool> {
+        let pending = self.pending_reobserve.as_ref()?;
+        pending.result.as_ref()?.as_ref().ok()?;
+        Some(pending.completed_after_window)
+    }
+
+    /// Only a complete valid response permits a new request on this stream.
+    /// A failed exchange keeps the original partial bytes and error attached.
+    pub(super) fn take_successful_child_reobserve(&mut self) -> Option<CompletedChildReobserveV1> {
+        if !matches!(&self.pending_reobserve.as_ref()?.result, Some(Ok(_))) {
+            return None;
+        }
+        let pending = self.pending_reobserve.take()?;
+        Some(CompletedChildReobserveV1 {
+            request: pending.request,
+            response: pending.result?.ok()?,
+            sent: pending.sent,
+            received: pending.received,
+            timed_out: pending.timed_out,
+            completed_after_window: pending.completed_after_window,
+        })
+    }
+
     /// The three descriptors must be dedicated FIFO endpoints, with no other
     /// reader/writer aliases. Relay validation does not prove exclusivity.
     /// Deadlines are the caller's original registered bounds, not renewed.
@@ -210,6 +444,8 @@ impl PalsProxySupervisorV6 {
             runtime_finish_stream: None,
             session_release_stream: None,
             reobserve_stream: None,
+            reobserve_sequence: 0,
+            pending_reobserve: None,
             runtime_finish_attempted: false,
             session_release_attempted: false,
             input_cleanup_start: None,

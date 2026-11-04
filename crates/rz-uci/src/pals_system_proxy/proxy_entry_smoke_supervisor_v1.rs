@@ -98,6 +98,50 @@ impl NoGamePreparedSupervisorV1 {
         self.supervisor.poll()
     }
 
+    /// Observe the same child without creating a new Run or cleanup grant.
+    pub(super) fn begin_child_reobserve(
+        &mut self,
+        until: Instant,
+        observation_budget_ms: u64,
+    ) -> io::Result<()> {
+        self.supervisor
+            .begin_child_reobserve(until, observation_budget_ms)
+    }
+
+    pub(super) fn poll_child_reobserve(&mut self) -> io::Result<bool> {
+        self.supervisor.poll_child_reobserve()
+    }
+
+    pub(super) fn resume_child_reobserve(&mut self, until: Instant) -> io::Result<()> {
+        self.supervisor.resume_child_reobserve(until)
+    }
+
+    pub(super) fn child_reobserve_result(
+        &self,
+    ) -> Option<&io::Result<rz_contracts::pals::child_reobserve_v1::ChildReobserveResponseV1>> {
+        self.supervisor.child_reobserve_result()
+    }
+
+    pub(super) fn child_reobserve_progress(
+        &self,
+    ) -> Option<(
+        &rz_contracts::pals::child_reobserve_v1::ChildReobserveRequestV1,
+        &[u8],
+        &[u8],
+    )> {
+        self.supervisor.child_reobserve_progress()
+    }
+
+    pub(super) fn child_reobserve_completed_after_window(&self) -> Option<bool> {
+        self.supervisor.child_reobserve_completed_after_window()
+    }
+
+    pub(super) fn take_successful_child_reobserve(
+        &mut self,
+    ) -> Option<super::runner_v6::CompletedChildReobserveV1> {
+        self.supervisor.take_successful_child_reobserve()
+    }
+
     /// This may wait until the original cleanup deadline and records only the
     /// original child's session claim, not a GPU fence.
     pub(super) fn observe_session_release_once(&mut self) -> SessionReleaseObservationV6 {
