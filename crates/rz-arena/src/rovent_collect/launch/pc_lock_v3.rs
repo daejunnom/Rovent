@@ -12,7 +12,7 @@ use crate::rovent_collect::pc_worker_v3::{
 use crate::rovent_collect::teacher::v3_session::TeacherRosterEntryV3;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
 use rz_experiments::{RoventActor, RoventInputLockV3, RoventPurpose, RoventResearcher};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 
 pub const ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN: &str = "rz-rovent-collection-lock-v3-launch/1";
 pub const ROVENT_OWN_COLLECTION_LOCK_V3_LAUNCH_PLAN: &str =
@@ -135,7 +135,21 @@ impl OriginalPinnedFile {
         )?;
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
-        let mut file = directory.open_with(&pin.path, &options).map_err(io)?;
+        // `follow(No)` applies only to the final component. Walk all parent
+        // directories as no-follow capabilities before opening that leaf.
+        let mut parent = directory.try_clone().map_err(io)?;
+        let mut parts = Path::new(&pin.path).components().peekable();
+        let leaf = loop {
+            let part = match parts.next() {
+                Some(Component::Normal(part)) => part,
+                _ => return Err(invalid("Collection /3 invalid input path component")),
+            };
+            if parts.peek().is_none() {
+                break part;
+            }
+            parent = parent.open_dir_nofollow(part).map_err(io)?;
+        };
+        let mut file = parent.open_with(leaf, &options).map_err(io)?;
         let metadata = file.metadata().map_err(io)?;
         check(
             metadata.is_file() && metadata.len() == pin.bytes,
@@ -156,6 +170,76 @@ impl OriginalPinnedFile {
             pin: pin.clone(),
         })
     }
+
+    /// Consume a duplicate of the already inherited original plan FD; never
+    /// reopen the plan pathname or change the shared file-description offset.
+    fn from_original_plan(
+        file: std::fs::File,
+        pin: &RoventPublicationFile,
+        maximum: u64,
+        deadline: Instant,
+    ) -> Result<Self, ArenaError> {
+        pin.validate()?;
+        check(
+            pin.path.starts_with("inputs/") && valid_relative(&pin.path) && pin.bytes <= maximum,
+            "Collection /3 original plan pin",
+        )?;
+        let before = file.metadata().map_err(io)?;
+        check(
+            before.is_file() && before.len() == pin.bytes,
+            "Collection /3 original plan type/size",
+        )?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(
+                usize::try_from(pin.bytes).map_err(|_| invalid("Collection /3 plan length"))?,
+            )
+            .map_err(|_| invalid("Collection /3 plan allocation"))?;
+        let mut buffer = [0_u8; 65536];
+        let mut offset = 0_u64;
+        while offset < pin.bytes {
+            check(
+                Instant::now() < deadline,
+                "Collection /3 original plan deadline",
+            )?;
+            let count = (pin.bytes - offset).min(buffer.len() as u64) as usize;
+            match file.read_at(&mut buffer[..count], offset) {
+                Ok(0) => return Err(invalid("Collection /3 original plan truncated")),
+                Ok(n) => {
+                    bytes.extend_from_slice(&buffer[..n]);
+                    offset += n as u64;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(io(error)),
+            }
+        }
+        let after = file.metadata().map_err(io)?;
+        check(
+            (
+                before.dev(),
+                before.ino(),
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec(),
+            ) == (
+                after.dev(),
+                after.ino(),
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            ) && hex(Digest(Sha256::digest(&bytes).into())) == pin.sha256,
+            "Collection /3 original plan bytes/identity changed",
+        )?;
+        Ok(Self {
+            _file: cap_std::fs::File::from_std(file),
+            bytes,
+            pin: pin.clone(),
+        })
+    }
 }
 
 /// Retains the original plan and manifest owners across resource admission.
@@ -166,6 +250,7 @@ pub struct PreparedPcCollectionInputsV3 {
     plan: RoventCollectionLockV3LaunchPlan,
     manifest: Arc<RoventCorpusManifestLockV3>,
     purpose: CollectionInputsPurposeV3,
+    managed_binding: Option<super::managed_output_fd_v2::OriginalInputBindingV2>,
 }
 
 /// Original owners prepared before resource admission. Constructing this
@@ -340,6 +425,7 @@ impl PcCollectionOwnersV3 {
         )?;
         let validate_owner = Arc::clone(self);
         let start_owner = Arc::clone(self);
+        let validate_output = Arc::clone(output);
         let outcome =
             crate::rovent_resource_scope::launch::run_pc_collection_with_resources_v3_post_auth(
                 pin,
@@ -352,6 +438,14 @@ impl PcCollectionOwnersV3 {
                             |error| rz_uci::rovent_bootstrap::launch::RoventLaunchError {
                                 stage: "collection input validation",
                                 detail: error.to_string(),
+                            },
+                        )?;
+                    validate_output
+                        .authorize_original_boundary(&validate_owner.inputs)
+                        .map_err(
+                            |detail| rz_uci::rovent_bootstrap::launch::RoventLaunchError {
+                                stage: "collection output authorization",
+                                detail: detail.to_owned(),
                             },
                         )
                 }),
@@ -631,19 +725,75 @@ impl PcCollectionRunV3 {
     }
 }
 
-/// An original managed output directory and its `chunks` child, retained with
-/// the same pinned plan owner. There is deliberately no constructor here:
-/// the managed supervisor must first supply a verified original handoff.
-/// A pathname, a duplicate hash or an input-snapshot directory is not one.
+/// Original live supervisor/lease and plan owner; authority is withheld until
+/// the actual native input-lock callback has accepted the same input owner.
 #[allow(dead_code)]
 pub(crate) struct ManagedOutputOwnerV3 {
     inputs: Arc<PreparedPcCollectionInputsV3>,
-    directory: Dir,
-    chunks: Dir,
+    state: Mutex<ManagedOutputStateV3>,
+    deadline: Instant,
+}
+
+struct ManagedOutputStateV3 {
+    observation: super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+    authorized: bool,
+    chunks: Option<Dir>,
+    uncertain: bool,
+}
+
+pub(crate) enum ManagedOutputWriteErrorV3 {
+    Busy,
+    BeforeWrite(String),
+    AfterAttempt(String),
 }
 
 #[allow(dead_code)]
 impl ManagedOutputOwnerV3 {
+    pub(super) fn from_observation(
+        inputs: Arc<PreparedPcCollectionInputsV3>,
+        observation: super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+        deadline: Instant,
+    ) -> Result<Self, ArenaError> {
+        check(
+            Instant::now() < deadline
+                && inputs
+                    .managed_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.same_original(&observation.original_binding())),
+            "Collection output original observation differs",
+        )?;
+        Ok(Self {
+            inputs,
+            state: Mutex::new(ManagedOutputStateV3 {
+                observation,
+                authorized: false,
+                chunks: None,
+                uncertain: false,
+            }),
+            deadline,
+        })
+    }
+
+    /// Only called by the same resource supervisor after its native original
+    /// lock and directory validation. It creates no files and starts no work.
+    fn authorize_original_boundary(
+        &self,
+        inputs: &Arc<PreparedPcCollectionInputsV3>,
+    ) -> Result<(), &'static str> {
+        if !self.matches_inputs(inputs) {
+            return Err("Collection output input owner differs");
+        }
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_| "Collection output state unavailable")?;
+        if state.authorized || state.uncertain {
+            return Err("Collection output authority unavailable");
+        }
+        state.authorized = true;
+        Ok(())
+    }
+
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> {
         &self.inputs
     }
@@ -652,12 +802,99 @@ impl ManagedOutputOwnerV3 {
         Arc::ptr_eq(&self.inputs, inputs)
     }
 
-    pub(crate) fn directory(&self) -> &Dir {
-        &self.directory
-    }
-
-    pub(crate) fn chunks(&self) -> &Dir {
-        &self.chunks
+    /// The packet owner is retained by the caller on every error. Once any
+    /// filesystem mutation is attempted, failures remain uncertain and may
+    /// not be retried as if no output had been created.
+    pub(crate) fn checked_write_chunk(
+        &self,
+        leaf: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> Result<(), ManagedOutputWriteErrorV3> {
+        use std::io::Write;
+        let mut parts = std::path::Path::new(leaf).components();
+        if !matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(_)), None)
+        ) {
+            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                "invalid chunk leaf".into(),
+            ));
+        }
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ManagedOutputWriteErrorV3::Busy);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(ManagedOutputWriteErrorV3::AfterAttempt(
+                    "managed output state poisoned".into(),
+                ));
+            }
+        };
+        if state.uncertain {
+            return Err(ManagedOutputWriteErrorV3::AfterAttempt(
+                "managed output prior mutation uncertain".into(),
+            ));
+        }
+        if !state.authorized {
+            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                "managed output not authorized".into(),
+            ));
+        }
+        let mut attempted = false;
+        let result = (|| -> std::io::Result<()> {
+            state.observation.verify_live(self.deadline)?;
+            if state.chunks.is_none() {
+                let directory =
+                    Dir::from_std_file(state.observation.clone_original_output(self.deadline)?);
+                state.observation.verify_live(self.deadline)?;
+                attempted = true;
+                state.uncertain = true;
+                directory.create_dir("chunks")?;
+                let chunks = directory.open_dir_nofollow("chunks")?;
+                state.observation.verify_live(self.deadline)?;
+                directory.try_clone()?.into_std_file().sync_all()?;
+                state.observation.verify_live(self.deadline)?;
+                state.chunks = Some(chunks);
+            }
+            state.observation.verify_live(self.deadline)?;
+            attempted = true;
+            state.uncertain = true;
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            let mut file = state
+                .chunks
+                .as_ref()
+                .expect("chunks established")
+                .open_with(leaf, &options)?;
+            state.observation.verify_live(self.deadline)?;
+            file.write_all(bytes)?;
+            state.observation.verify_live(self.deadline)?;
+            file.sync_all()?;
+            state.observation.verify_live(self.deadline)?;
+            state
+                .chunks
+                .as_ref()
+                .expect("chunks established")
+                .try_clone()?
+                .into_std_file()
+                .sync_all()?;
+            state.observation.verify_live(self.deadline)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                state.uncertain = false;
+                Ok(())
+            }
+            Err(error) if attempted => {
+                Err(ManagedOutputWriteErrorV3::AfterAttempt(error.to_string()))
+            }
+            Err(error) => Err(ManagedOutputWriteErrorV3::BeforeWrite(error.to_string())),
+        }
     }
 }
 
@@ -668,6 +905,50 @@ enum CollectionInputsPurposeV3 {
 }
 
 impl PreparedPcCollectionInputsV3 {
+    /// Build the original owner from the same /2-inherited directory and plan
+    /// descriptors. This is not native lock acceptance or output permission.
+    pub(super) fn open_from_managed_observation(
+        observation: &mut super::managed_output_fd_v2::ObservedManagedPlanLeaseV2,
+        plan_pin: &RoventPublicationFile,
+        deadline: Instant,
+    ) -> Result<Self, ArenaError> {
+        check(
+            observation.matches_plan(plan_pin.bytes, &plan_pin.sha256),
+            "Collection /3 original observed plan differs",
+        )?;
+        observation.verify_live(deadline).map_err(io)?;
+        let (original_directory, original_plan_file) =
+            observation.clone_original_input().map_err(io)?;
+        let directory = Dir::from_std_file(original_directory.try_clone().map_err(io)?);
+        let original_plan = OriginalPinnedFile::from_original_plan(
+            original_plan_file,
+            plan_pin,
+            PLAN_MAX_BYTES,
+            deadline,
+        )?;
+        let text = std::str::from_utf8(&original_plan.bytes)
+            .map_err(|_| invalid("Collection /3 plan UTF8"))?;
+        let plan: RoventCollectionLockV3LaunchPlan = rz_experiments::decode_json(text)?;
+        check(
+            plan.schema == ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
+            "Collection /3 explicit launch plan domain",
+        )?;
+        let original_manifest =
+            OriginalPinnedFile::read(&directory, &plan.manifest, MANIFEST_MAX_BYTES)?;
+        let text = std::str::from_utf8(&original_manifest.bytes)
+            .map_err(|_| invalid("Collection /3 manifest UTF8"))?;
+        let manifest = Arc::new(RoventCorpusManifestLockV3::from_json(text)?);
+        observation.verify_live(deadline).map_err(io)?;
+        Ok(Self {
+            original_directory,
+            original_plan,
+            original_manifest,
+            plan,
+            manifest,
+            purpose: CollectionInputsPurposeV3::Pc,
+            managed_binding: Some(observation.original_binding()),
+        })
+    }
     pub fn open(directory: &Dir, plan_pin: &RoventPublicationFile) -> Result<Self, ArenaError> {
         Self::open_for(directory, plan_pin, CollectionInputsPurposeV3::Pc)
     }
@@ -708,6 +989,7 @@ impl PreparedPcCollectionInputsV3 {
             plan,
             manifest,
             purpose,
+            managed_binding: None,
         })
     }
 

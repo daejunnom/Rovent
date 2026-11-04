@@ -19,11 +19,9 @@ use super::writer_lock_v3::{
     FinishedRoventCorpusLockV3, PolicyAppendResultV3, RoventCorpusWriterLockV3,
 };
 use super::{ArenaError, MAX_CORPUS_ROWS, RoventChunkPacket};
-use cap_fs_ext::OpenOptionsFollowExt;
 use rz_contracts::Digest;
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
 use sha2::{Digest as _, Sha256};
-use std::io::Write;
 use std::path::Component;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
@@ -495,28 +493,9 @@ impl PolicyRowPipelineV3 {
             return PolicyChunkPersistenceV3::Failed;
         }
         self.chunk_attempted = true;
-        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || -> Result<(), ArenaError> {
-                let mut options = cap_std::fs::OpenOptions::new();
-                options
-                    .write(true)
-                    .create_new(true)
-                    .follow(cap_fs_ext::FollowSymlinks::No);
-                let mut file = output
-                    .chunks()
-                    .open_with(&leaf, &options)
-                    .map_err(|e| super::invalid(e.to_string()))?;
-                file.write_all(&packet.bytes)
-                    .and_then(|_| file.sync_all())
-                    .map_err(|e| super::invalid(e.to_string()))?;
-                output
-                    .chunks()
-                    .try_clone()
-                    .and_then(|directory| directory.into_std_file().sync_all())
-                    .map_err(|e| super::invalid(e.to_string()))?;
-                Ok(())
-            },
-        ));
+        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            output.checked_write_chunk(&leaf, &packet.bytes)
+        }));
         match write {
             Ok(Ok(())) => {
                 self.chunk_receipts.push(receipt);
@@ -524,8 +503,17 @@ impl PolicyRowPipelineV3 {
                 self.chunk_attempted = false;
                 PolicyChunkPersistenceV3::Persisted
             }
-            Ok(Err(error)) => {
-                self.failure = Some(PolicyPipelineFailureV3::ChunkIo(error));
+            Ok(Err(super::launch::ManagedOutputWriteErrorV3::Busy)) => {
+                self.chunk_attempted = false;
+                PolicyChunkPersistenceV3::NotReady
+            }
+            Ok(Err(super::launch::ManagedOutputWriteErrorV3::BeforeWrite(error))) => {
+                self.chunk_attempted = false;
+                self.failure = Some(PolicyPipelineFailureV3::ChunkPrepare(super::invalid(error)));
+                PolicyChunkPersistenceV3::Failed
+            }
+            Ok(Err(super::launch::ManagedOutputWriteErrorV3::AfterAttempt(error))) => {
+                self.failure = Some(PolicyPipelineFailureV3::ChunkIo(super::invalid(error)));
                 PolicyChunkPersistenceV3::Unknown
             }
             Err(payload) => {

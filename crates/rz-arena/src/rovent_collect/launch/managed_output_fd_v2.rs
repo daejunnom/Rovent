@@ -11,6 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,16 @@ pub(super) struct ObservedManagedPlanLeaseV2 {
     session_id: String,
     next_sequence: u64,
     tainted: bool,
+    original_binding: OriginalInputBindingV2,
+}
+
+/// Opaque same-owner identity; possession does not grant output authority.
+#[derive(Clone)]
+pub(super) struct OriginalInputBindingV2(Arc<()>);
+impl OriginalInputBindingV2 {
+    pub(super) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl ObservedManagedPlanLeaseV2 {
@@ -148,6 +159,7 @@ impl ObservedManagedPlanLeaseV2 {
             session_id,
             next_sequence: 1,
             tainted: false,
+            original_binding: OriginalInputBindingV2(Arc::new(())),
         };
         owner.verify_live(deadline)?;
         Ok(owner)
@@ -161,6 +173,21 @@ impl ObservedManagedPlanLeaseV2 {
             self.input.try_clone_directory()?,
             self.input.try_clone_plan()?,
         ))
+    }
+
+    pub(super) fn original_binding(&self) -> OriginalInputBindingV2 {
+        self.original_binding.clone()
+    }
+
+    pub(super) fn matches_plan(&self, bytes: u64, sha256: &str) -> bool {
+        self.plan_original.size == bytes && self.expected_plan_sha256 == sha256
+    }
+
+    /// This is only a duplicate of the original output descriptor. Callers
+    /// still need the actual native input-lock boundary before any mutation.
+    pub(super) fn clone_original_output(&mut self, deadline: Instant) -> io::Result<std::fs::File> {
+        self.verify_live(deadline)?;
+        self.output.try_clone_directory()
     }
 
     pub(super) fn verify_live(&mut self, deadline: Instant) -> io::Result<()> {
