@@ -17,6 +17,7 @@ pub struct RoventCorpusWriterLockV3 {
     manifest: RoventCorpusManifestLockV3,
     original_manifest: Option<Arc<RoventCorpusManifestLockV3>>,
     lock: rz_experiments::RoventInputLockV3,
+    original_native_origin: rz_uci::pals_adaptive::RoventNativeCollectionOriginV3,
     index: RoventCorpusIndexLockV3,
     buffer: Vec<u8>,
     buffer_rows: u64,
@@ -129,6 +130,7 @@ impl RoventCorpusWriterLockV3 {
                 origins: Vec::new(),
             },
             lock,
+            original_native_origin: admission.native_origin().clone(),
             buffer: Vec::new(),
             buffer_rows: 0,
             total_bytes,
@@ -164,6 +166,13 @@ impl RoventCorpusWriterLockV3 {
         self.index.chunks == receipts
     }
 
+    pub(super) fn is_pristine(&self) -> bool {
+        self.index.record_count == 0
+            && self.index.chunks.is_empty()
+            && self.buffer.is_empty()
+            && self.uncertain_append.is_none()
+    }
+
     /// On failure the caller retains the original opaque row and this writer
     /// remains unmodified. No decoded record can issue this capability.
     pub fn append(&mut self, row: &PublishedRoventLockV3Record) -> Result<(), ArenaError> {
@@ -173,7 +182,13 @@ impl RoventCorpusWriterLockV3 {
         )?;
         let admission = row.admission();
         let lock = admission.native_origin().original_input_lock();
-        check(lock == &self.lock, "writer /3 input lock differs")?;
+        check(
+            lock == &self.lock
+                && self
+                    .original_native_origin
+                    .same_original_origin(admission.native_origin()),
+            "writer /3 original native owner or input lock differs",
+        )?;
         check(
             row.manifest_sha256() == self.index.manifest_sha256,
             "writer /3 manifest differs",

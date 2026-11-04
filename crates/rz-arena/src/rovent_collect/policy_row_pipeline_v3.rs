@@ -384,11 +384,12 @@ impl PolicyRowPipelineV3 {
         super::check(
             self.idle()
                 && self.output_directory.is_none()
+                && self.output_chunk.is_none()
+                && self.chunk_receipts.is_empty()
                 && output.matches_inputs(inputs)
-                && self
-                    .writer
-                    .as_ref()
-                    .is_some_and(|writer| writer.matches_original_manifest(inputs.manifest())),
+                && self.writer.as_ref().is_some_and(|writer| {
+                    writer.is_pristine() && writer.matches_original_manifest(inputs.manifest())
+                }),
             "V3 managed output plan, manifest or writer owner differs",
         )?;
         self.output_directory = Some(Arc::clone(output));
