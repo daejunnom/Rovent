@@ -458,7 +458,19 @@ impl PinnedPalsSystemStartupV6 {
         if !metadata.file_type().is_socket() || metadata.uid() != nix::unistd::geteuid().as_raw() {
             return Err(invalid("PALS direct parent socket owner differs"));
         }
-        let address = UnixAddr::new(socket_path).map_err(std::io::Error::other)?;
+        // The child opens its own original root capability; the parent's FD
+        // number is neither inherited nor assumed to be the same here.
+        let root = self
+            .root
+            .try_clone()
+            .map_err(std::io::Error::other)?
+            .into_std_file();
+        let transport = crate::pals_system_proxy::socket_transport_path(socket_path, &root)?;
+        let transport_meta = std::fs::symlink_metadata(&transport)?;
+        if (metadata.dev(), metadata.ino()) != (transport_meta.dev(), transport_meta.ino()) {
+            return Err(invalid("PALS direct parent socket identity changed"));
+        }
+        let address = UnixAddr::new(&transport).map_err(std::io::Error::other)?;
         let descriptor = socket(
             AddressFamily::Unix,
             SockType::Stream,
@@ -506,6 +518,13 @@ impl PinnedPalsSystemStartupV6 {
             }
         }
         check()?;
+        let after = std::fs::symlink_metadata(socket_path)?;
+        let held_after = std::fs::symlink_metadata(&transport)?;
+        if (metadata.dev(), metadata.ino()) != (after.dev(), after.ino())
+            || (metadata.dev(), metadata.ino()) != (held_after.dev(), held_after.ino())
+        {
+            return Err(invalid("PALS direct parent socket changed during connect"));
+        }
         Ok(UnixStream::from(descriptor))
     }
 

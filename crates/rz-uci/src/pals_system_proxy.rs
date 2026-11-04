@@ -19,12 +19,17 @@ pub(crate) fn run_guarded_cli(arguments: &[String]) -> io::Result<()> {
 }
 mod runner_v6;
 
+#[cfg(test)]
+#[path = "pals_system_proxy/long_socket_tests.rs"]
+mod long_socket_tests;
+
 use rz_experiments::{ArtifactRef, NativeRuntimeSourceV6, PalsSystemStartupLockV6};
 use std::{
     fs::{self, File},
     io,
     os::fd::AsRawFd,
     os::unix::{
+        ffi::OsStrExt,
         fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixListener,
     },
@@ -75,6 +80,46 @@ fn controlled_path(path: &Path) -> bool {
         && path
             .components()
             .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+}
+
+/// Linux AF_UNIX pathname capacity includes the trailing NUL. Keep the
+/// historical absolute path when it fits; otherwise resolve the same leaf
+/// through this process's separately held original directory descriptor.
+/// The returned path is transport-only, never a replacement ownership record.
+pub(crate) fn socket_transport_path(absolute: &Path, root: &File) -> io::Result<PathBuf> {
+    const UNIX_PATH_BYTES: usize = 108;
+    if !controlled_path(absolute) {
+        return Err(invalid("invalid PALS socket path"));
+    }
+    if absolute.as_os_str().as_bytes().len() < UNIX_PATH_BYTES {
+        return Ok(absolute.to_owned());
+    }
+    let leaf = absolute
+        .file_name()
+        .ok_or_else(|| invalid("PALS socket leaf missing"))?;
+    let root_meta = root.metadata()?;
+    if !root_meta.is_dir() {
+        return Err(invalid("PALS socket owner is not a directory"));
+    }
+    let named_root = File::open(
+        absolute
+            .parent()
+            .ok_or_else(|| invalid("PALS socket parent missing"))?,
+    )?;
+    let named_meta = named_root.metadata()?;
+    if (root_meta.dev(), root_meta.ino()) != (named_meta.dev(), named_meta.ino()) {
+        return Err(invalid("PALS socket path and directory owner differ"));
+    }
+    let proc_root = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+    let proc_meta = fs::metadata(&proc_root)?;
+    if (root_meta.dev(), root_meta.ino()) != (proc_meta.dev(), proc_meta.ino()) {
+        return Err(invalid("PALS socket directory descriptor changed"));
+    }
+    let shortened = proc_root.join(leaf);
+    if shortened.as_os_str().as_bytes().len() >= UNIX_PATH_BYTES {
+        return Err(invalid("PALS socket leaf exceeds transport capacity"));
+    }
+    Ok(shortened)
 }
 
 impl PalsProxyLaunchV6 {
@@ -372,13 +417,18 @@ impl DirectPalsChildV6 {
         };
         let lock_path = as_text(&launch.startup_lock_path)?;
         let socket_path = as_text(&launch.parent_socket_path)?;
-        let listener = UnixListener::bind(&launch.parent_socket_path)?;
+        let transport_path = socket_transport_path(&launch.parent_socket_path, &launch.binary.cwd)?;
+        let listener = UnixListener::bind(&transport_path)?;
+        let bound = fs::symlink_metadata(&transport_path)?;
         let socket = fs::symlink_metadata(&launch.parent_socket_path).map_err(|error| {
             io::Error::other(format!(
                 "PALS parent socket identity unavailable; preserved: {error}"
             ))
         })?;
-        if !socket.file_type().is_socket() || socket.uid() != nix::unistd::geteuid().as_raw() {
+        if !socket.file_type().is_socket()
+            || socket.uid() != nix::unistd::geteuid().as_raw()
+            || (socket.dev(), socket.ino()) != (bound.dev(), bound.ino())
+        {
             return Err(invalid("PALS parent socket owner differs; path preserved"));
         }
         // The 0700 directory and authenticated peer protect this socket;
