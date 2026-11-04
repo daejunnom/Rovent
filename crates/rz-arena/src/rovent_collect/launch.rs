@@ -104,6 +104,8 @@ pub(crate) use pc_lock_v3::ManagedOutputOwnerV3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 pub(crate) use pc_lock_v3::ManagedOutputWriteErrorV3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub(crate) use pc_lock_v3::ManagedPublicationUnstartedEvidenceV3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 pub(crate) use pc_lock_v3::PcCollectionOwnersV3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 pub use pc_lock_v3::{

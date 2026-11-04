@@ -727,10 +727,31 @@ impl ManagedOutputStateV3 {
 pub(crate) enum ManagedOutputWriteErrorV3 {
     Busy,
     BeforeWrite(String),
+    PublicationBeforeWrite {
+        reason: String,
+        evidence: ManagedPublicationUnstartedEvidenceV3,
+    },
     /// The output has not been mutated by this call, but the original game
     /// authority cannot be observed. This is not an ordinary refusal.
     AuthorityUnknown(String),
     AfterAttempt(String),
+}
+
+/// Nonclone evidence that one matched game/output metadata attempt returned
+/// before its first mutation. Prior chunk writes are a separate scope.
+pub(crate) struct ManagedPublicationUnstartedEvidenceV3 {
+    output: Arc<ManagedOutputOwnerV3>,
+    game: crate::rovent_collect::game_authority_v3::GamePublicationOriginV3,
+}
+
+impl ManagedPublicationUnstartedEvidenceV3 {
+    pub(crate) fn matches_original<S>(
+        &self,
+        output: &Arc<ManagedOutputOwnerV3>,
+        guard: &crate::rovent_collect::game_authority_v3::GamePublishGuardV3<S>,
+    ) -> bool {
+        Arc::ptr_eq(&self.output, output) && guard.matches_original_game(&self.game)
+    }
 }
 
 #[allow(dead_code)]
@@ -1017,11 +1038,7 @@ impl ManagedOutputOwnerV3 {
             }
             Err(error) => return Err(ManagedOutputWriteErrorV3::AuthorityUnknown(error.into())),
         }
-        if !finished.matches_original_manifest(self.inputs.manifest()) {
-            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
-                "managed publication original writer differs".into(),
-            ));
-        }
+        let game_origin = game_guard.original_game_identity();
         let deadline = until.min(self.deadline);
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
@@ -1039,30 +1056,43 @@ impl ManagedOutputOwnerV3 {
                 "managed publication already attempted or uncertain".into(),
             ));
         }
+        let unstarted = |reason: String| ManagedOutputWriteErrorV3::PublicationBeforeWrite {
+            reason,
+            evidence: ManagedPublicationUnstartedEvidenceV3 {
+                output: Arc::clone(self),
+                game: game_origin,
+            },
+        };
+        if !finished.matches_original_manifest(self.inputs.manifest()) {
+            return Err(unstarted(
+                "managed publication original writer differs".into(),
+            ));
+        }
         if !state
             .original_writer
             .as_ref()
             .is_some_and(|writer| finished.matches_original_writer(writer))
         {
-            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+            return Err(unstarted(
                 "managed publication original writer owner differs".into(),
             ));
         }
         if !state.authorized || state.closed.is_some() {
-            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+            return Err(unstarted(
                 "managed publication not authorized or closed".into(),
             ));
         }
-        let directory = state
-            .directory
-            .as_ref()
-            .ok_or_else(|| {
-                ManagedOutputWriteErrorV3::BeforeWrite(
+        let directory = match state.directory.as_ref() {
+            Some(directory) => match directory.try_clone() {
+                Ok(directory) => directory,
+                Err(error) => return Err(unstarted(error.to_string())),
+            },
+            None => {
+                return Err(unstarted(
                     "managed publication original output directory missing".into(),
-                )
-            })?
-            .try_clone()
-            .map_err(|error| ManagedOutputWriteErrorV3::BeforeWrite(error.to_string()))?;
+                ));
+            }
+        };
         let result = finished.publish_atomic_managed_with_authorize(
             &directory,
             deadline,
@@ -1091,7 +1121,7 @@ impl ManagedOutputOwnerV3 {
             Err(error) if state.publication_attempted => {
                 Err(ManagedOutputWriteErrorV3::AfterAttempt(error.to_string()))
             }
-            Err(error) => Err(ManagedOutputWriteErrorV3::BeforeWrite(error.to_string())),
+            Err(error) => Err(unstarted(error.to_string())),
         }
     }
 }
