@@ -12,7 +12,7 @@ use super::{
 use crate::pals_adaptive_startup::{
     PalsSystemStartupOptionsV6, read_control_owned, relative_control_path,
 };
-use cap_fs_ext::{DirExt, MetadataExt as _};
+use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use rz_experiments::PalsSystemStartupLockV6;
 use std::{
@@ -257,8 +257,8 @@ impl ProxyCliInputsV6 {
         let root = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())?;
         let held_root = root.dir_metadata()?;
         if !held_root.is_dir()
-            || held_root.dev() != path_meta.dev()
-            || held_root.ino() != path_meta.ino()
+            || cap_fs_ext::MetadataExt::dev(&held_root) != path_meta.dev()
+            || cap_fs_ext::MetadataExt::ino(&held_root) != path_meta.ino()
         {
             return Err(invalid("PALS proxy root changed during pinning"));
         }
@@ -397,8 +397,8 @@ impl PreparedProxyCliV6 {
             || !path_metadata.is_file()
             || metadata.dev() != self.lock_device
             || metadata.ino() != self.lock_inode
-            || path_metadata.dev() != self.lock_device
-            || path_metadata.ino() != self.lock_inode
+            || cap_fs_ext::MetadataExt::dev(&path_metadata) != self.lock_device
+            || cap_fs_ext::MetadataExt::ino(&path_metadata) != self.lock_inode
             || metadata.len() != self.lock_size
             || self.lock_bytes.len() as u64 != self.lock_size
             || (metadata.mtime(), metadata.mtime_nsec()) != self.lock_mtime
