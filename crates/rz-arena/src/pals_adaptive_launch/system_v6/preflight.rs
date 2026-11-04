@@ -232,7 +232,7 @@ pub(super) fn validate_preflight_record(
         || (!config
             .source_components
             .keys()
-            .any(|key| key != "pals_system_v6")
+            .any(|key| key != "pals_system_v6" && key != "pals_system_v6_execution")
             && record.source_components_observation != SourceObservation::Unknown)
         || (!config.source_components.contains_key("pals_system_v6")
             && record.system_v6_source_observation != SourceObservation::Unknown)

@@ -832,6 +832,35 @@ mod tests {
             }
         }
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preflight_execution_pin_alone_is_not_a_v5_source_observation() {
+        use super::super::preflight::validate_preflight_record;
+        let pair = fixture();
+        let mut config = pair.endpoints[0].startup_lock.config.clone();
+        config.source_components.insert(
+            "pals_system_v6_execution".into(),
+            format!("{:x}", Sha256::digest(b"fixture execution source")),
+        );
+        let lock = PalsSystemStartupLockV6::new(config).unwrap();
+        let mut wire = preflight_wire(&lock, 11);
+        assert!(validate_preflight_record(&lock, 11, &serde_json::to_vec(&wire).unwrap()).is_ok());
+
+        wire["source_components_observation"] = serde_json::json!("verified");
+        assert!(validate_preflight_record(&lock, 11, &serde_json::to_vec(&wire).unwrap()).is_err());
+
+        let mut both = lock.config.clone();
+        both.source_components.insert(
+            "pals_system_v6".into(),
+            format!("{:x}", Sha256::digest(b"fixture boundary source")),
+        );
+        let lock = PalsSystemStartupLockV6::new(both).unwrap();
+        let mut wire = preflight_wire(&lock, 11);
+        assert!(validate_preflight_record(&lock, 11, &serde_json::to_vec(&wire).unwrap()).is_ok());
+        wire["source_components_observation"] = serde_json::json!("verified");
+        assert!(validate_preflight_record(&lock, 11, &serde_json::to_vec(&wire).unwrap()).is_err());
+    }
     #[test]
     fn environment_rejects_loader_injection_and_unbound_device_visibility() {
         for name in ["LD_PRELOAD", "LD_LIBRARY_PATH", "CUDA_VISIBLE_DEVICES"] {
