@@ -1170,6 +1170,20 @@ impl RoventCollectionRootAdmissionV3 {
             RoventTeacherScopeCapabilityV3
         )
     }
+    /// Construct a private, unclaimed shell before the one-shot claim. The
+    /// caller must publish this owner to its recovery slot before `claim`.
+    pub fn stage_teacher_scope(
+        &self,
+        scope: rz_search::external_cpu::process_scope::CollectionProcessScope,
+    ) -> RoventTeacherScopeClaimStageV3 {
+        RoventTeacherScopeClaimStageV3 {
+            capability: Some(RoventTeacherScopeCapabilityV3 {
+                admission: self.clone(),
+                core: TeacherScopeCore::new(scope),
+            }),
+            claimed: false,
+        }
+    }
     pub(crate) fn from_attached_frontier(
         original: &RoventNativeCollectionOriginV3,
         frontier: &RoventFrontier,
@@ -1391,6 +1405,27 @@ impl RoventCollectionRootAdmissionV3 {
         let namespace = &self.original.original.namespace;
         namespace
             .verify(ticket, output, Some(namespace.value_identity()))
+            .map_err(|error| reject(error.to_string()))
+    }
+
+    /// Observe a result already accepted by the actual native registry. This
+    /// identity check grants no dispatch, acceptance or new root authority and
+    /// remains valid after root revocation. Callers must also hold the actual
+    /// non-clone `AcceptedRoleStep` or Search ranking proof.
+    pub(super) fn validate_observed_output(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<(), AdaptiveCollectionError> {
+        if ticket.authority != self.root_admission.authority()
+            || ticket.original_deadline != self.root_admission.hard_deadline()
+            || ticket.view.root_state != self.root_state
+            || (ticket.role == Role::Validator && !self.original.original.snapshot.validator_loaded)
+        {
+            return Err(reject("observed ticket is outside original /3 Collection root"));
+        }
+        let namespace = &self.original.original.namespace;
+        namespace.verify(ticket, output, Some(namespace.value_identity()))
             .map_err(|error| reject(error.to_string()))
     }
     pub(super) fn validate_ranking(
@@ -1776,6 +1811,107 @@ impl RoventTeacherScopeWorkerAckV3 {
 pub struct RoventTeacherScopeCapabilityV3 {
     admission: RoventCollectionRootAdmissionV3,
     core: TeacherScopeCore,
+}
+
+/// Original scope held outside the claim stack. An unclaimed shell cannot
+/// issue permits or attest teacher completion; a claimed shell survives a
+/// post-claim error or unwind with its exact capability still in this owner.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub struct RoventTeacherScopeClaimStageV3 {
+    capability: Option<RoventTeacherScopeCapabilityV3>,
+    claimed: bool,
+}
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+impl RoventTeacherScopeClaimStageV3 {
+    pub fn is_claimed(&self) -> bool {
+        self.claimed
+    }
+
+    pub fn claim(&mut self) -> Result<(), AdaptiveCollectionError> {
+        if self.claimed {
+            return Err(reject("teacher scope stage already claimed"));
+        }
+        let capability = self
+            .capability
+            .as_ref()
+            .ok_or_else(|| reject("teacher scope stage already taken"))?;
+        let admission = &capability.admission;
+        match admission.root_admission.original_context().accepts() {
+            Ok(true) => {}
+            Ok(false) => return Err(reject("teacher scope root is revoked")),
+            Err(error) => return Err(reject(error.to_string())),
+        }
+        let root_digest = admission
+            .root_admission
+            .descriptor()
+            .digest()
+            .map_err(|error| reject(error.to_string()))?;
+        {
+            let scope = capability
+                .core
+                .scope
+                .try_lock()
+                .map_err(|error| match error {
+                    std::sync::TryLockError::WouldBlock => reject("teacher scope stage busy"),
+                    std::sync::TryLockError::Poisoned(_) => reject("teacher scope stage poisoned"),
+                })?;
+            let scope = scope
+                .as_ref()
+                .ok_or_else(|| reject("teacher scope stage owner absent"))?;
+            if !scope.is_unissued_for_root(
+                admission.root_admission.authority(),
+                admission.root_admission.hard_deadline(),
+                admission.root_admission.startup_lock_digest(),
+                root_digest,
+                admission.root_budget,
+            ) {
+                return Err(reject(
+                    "teacher scope is shared, used, closed, or belongs to another root",
+                ));
+            }
+        }
+        if !admission.root_admission.claim_teacher_scope_once() {
+            return Err(reject(
+                "teacher scope already claimed for this original root",
+            ));
+        }
+        // No callback or fallible operation may intervene between the CAS and
+        // recording the one-shot claim in the caller-owned slot.
+        self.claimed = true;
+        match admission.root_admission.original_context().accepts() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(reject("teacher scope root revoked during claim")),
+            Err(error) => Err(reject(error.to_string())),
+        }
+    }
+
+    /// Claimed includes post-check failure: caller must retire this same scope.
+    pub fn take_claimed_capability(&mut self) -> Option<RoventTeacherScopeCapabilityV3> {
+        if !self.claimed {
+            return None;
+        }
+        self.capability.take()
+    }
+
+    /// Before a successful CAS, return the exact original scope without
+    /// making any assertion about its pre-existing issuance state.
+    pub fn take_unclaimed_scope(
+        &mut self,
+    ) -> Option<rz_search::external_cpu::process_scope::CollectionProcessScope> {
+        if self.claimed {
+            return None;
+        }
+        // Poison does not authorize returning an unverified owner for reuse.
+        if self.capability.as_ref()?.core.scope.is_poisoned() {
+            return None;
+        }
+        let capability = self.capability.take()?;
+        capability
+            .core
+            .scope
+            .into_inner()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 }
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
 impl RoventTeacherScopeCapabilityV3 {
