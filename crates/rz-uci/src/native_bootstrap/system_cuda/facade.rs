@@ -667,6 +667,29 @@ impl Lc0SupervisedSession {
         self.supervisor.handle_control(stream, until)
     }
 
+    /// Authenticate the original parent and dispatch a single V1 control or
+    /// read-only V2 projection frame. The V2 snapshot is taken before accept
+    /// and authentication and is explicitly labelled as such in the reply.
+    /// This synchronous method does not run during UCI service.
+    pub fn handle_parent_control_versioned(
+        &mut self,
+        listener: &Lc0ParentListener,
+        until: Instant,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.ticket_token, &listener.ticket_token) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "LC0 listener belongs to another ticket",
+            ));
+        }
+        let snapshot = self
+            .original_session_observation()
+            .map_err(|_| io::Error::other("LC0 original session observation unavailable"))?;
+        let stream = listener.accept_parent(until)?;
+        self.supervisor
+            .handle_control_versioned(stream, until, &snapshot)
+    }
+
     /// Retire only this session's original listener after the caller has
     /// finished using its control endpoint. Same-session settlement is a
     /// necessary condition; it is not a process-wide or device-wide fence.

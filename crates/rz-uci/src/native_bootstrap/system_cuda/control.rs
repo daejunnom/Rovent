@@ -7,7 +7,7 @@
 //! connection and cannot authorize termination, replace a GPU fence, or
 //! silently retry native initialization.
 
-use super::projection::{Lc0ObservedRelease, Lc0ObservedService};
+use super::projection::{Lc0ObservedRelease, Lc0ObservedService, Lc0OriginalSessionObservation};
 use super::*;
 use serde::Deserialize;
 use std::{
@@ -20,6 +20,8 @@ use std::{
 
 const CONTROL_SCHEMA: &str = "rz-lc0-system-control/1";
 const RESPONSE_SCHEMA: &str = "rz-lc0-system-control-response/1";
+const OBSERVATION_SCHEMA_V2: &str = "rz-lc0-system-observation/2";
+const OBSERVATION_RESPONSE_SCHEMA_V2: &str = "rz-lc0-system-observation-response/2";
 const MAX_CONTROL_FRAME: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +51,16 @@ enum ControlOperation {
     Reobserve,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationRequestV2 {
+    schema: String,
+    sequence: u64,
+    process_epoch: u64,
+    lock_sha256: String,
+    cuda_ordinal: i32,
+}
+
 /// Owns the actual session and service outcome together. Caller must retain
 /// this value and its process while release is pending or unknown, including
 /// if the parent disconnects or a diagnostic receipt cannot be written.
@@ -74,6 +86,7 @@ pub(super) struct Lc0ControlSupervisor {
     followup_count: u64,
     control_until: Instant,
     last_control: Option<(u64, ControlOperation, serde_json::Value)>,
+    last_observation_v2: Option<(u64, serde_json::Value)>,
 }
 
 pub(super) struct ControlProjection {
@@ -117,6 +130,35 @@ fn read_frame(stream: &mut UnixStream, until: Instant) -> io::Result<ControlRequ
     }
     serde_json::from_slice(&frame)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid LC0 control frame"))
+}
+
+// The version-aware entry reads exactly one bounded frame and dispatches its
+// original bytes after authentication. Existing V1-only entry remains intact.
+fn read_versioned_frame(stream: &mut UnixStream, until: Instant) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(256);
+    loop {
+        stream.set_read_timeout(Some(remaining(until)?))?;
+        let mut byte = [0];
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "LC0 observation closed",
+                ));
+            }
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if frame.len() < MAX_CONTROL_FRAME - 1 => frame.push(byte[0]),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "LC0 observation frame too large",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(frame)
 }
 
 fn write_frame(
@@ -260,6 +302,7 @@ impl Lc0ControlSupervisor {
             followup_count: 0,
             control_until,
             last_control: None,
+            last_observation_v2: None,
         }
     }
 
@@ -621,6 +664,15 @@ impl Lc0ControlSupervisor {
         let until = until.min(self.control_until);
         let mut stream = self.owner.custody.authenticate_control(stream, until)?;
         let request = read_frame(&mut stream, until)?;
+        self.handle_authenticated_v1(&mut stream, request, until)
+    }
+
+    fn handle_authenticated_v1(
+        &mut self,
+        stream: &mut UnixStream,
+        request: ControlRequest,
+        until: Instant,
+    ) -> io::Result<()> {
         let parent = self
             .owner
             .custody
@@ -650,7 +702,7 @@ impl Lc0ControlSupervisor {
                 }
                 let mut replay = response.clone();
                 replay["observation"] = serde_json::json!("historical_replay");
-                return write_frame(&mut stream, &replay, until);
+                return write_frame(stream, &replay, until);
             }
         }
         let expected = self
@@ -709,7 +761,87 @@ impl Lc0ControlSupervisor {
             "scope": "authenticated original-parent connection; not per-command sender proof or a device-wide GPU fence",
         });
         self.last_control = Some((request.sequence, request.operation, response.clone()));
-        write_frame(&mut stream, &response, until)
+        write_frame(stream, &response, until)
+    }
+
+    /// Version-aware alternative. It authenticates the same original parent,
+    /// reads one bounded frame, then dispatches the original bytes. A V2
+    /// observation has independent replay state and grants no control action.
+    pub(super) fn handle_control_versioned(
+        &mut self,
+        stream: UnixStream,
+        until: Instant,
+        snapshot: &Lc0OriginalSessionObservation,
+    ) -> io::Result<()> {
+        let until = until.min(self.control_until);
+        let mut stream = self.owner.custody.authenticate_control(stream, until)?;
+        let bytes = read_versioned_frame(&mut stream, until)?;
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid LC0 control envelope")
+        })?;
+        match envelope.get("schema").and_then(serde_json::Value::as_str) {
+            Some(CONTROL_SCHEMA) => {
+                let request: ControlRequest = serde_json::from_slice(&bytes).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid LC0 control frame")
+                })?;
+                self.handle_authenticated_v1(&mut stream, request, until)
+            }
+            Some(OBSERVATION_SCHEMA_V2) => {
+                let request: ObservationRequestV2 =
+                    serde_json::from_slice(&bytes).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid LC0 observation frame")
+                    })?;
+                let parent = self
+                    .owner
+                    .custody
+                    .parent
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("LC0 parent missing"))?;
+                parent.ensure_live()?;
+                if request.schema != OBSERVATION_SCHEMA_V2
+                    || !parent.matches(
+                        request.process_epoch,
+                        &request.lock_sha256,
+                        request.cuda_ordinal,
+                    )
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "LC0 observation binding differs",
+                    ));
+                }
+                if let Some((sequence, response)) = &self.last_observation_v2 {
+                    if request.sequence == *sequence {
+                        let mut replay = response.clone();
+                        replay["observation"] = serde_json::json!("historical_replay");
+                        return write_frame(&mut stream, &replay, until);
+                    }
+                }
+                let expected = self
+                    .last_observation_v2
+                    .as_ref()
+                    .map_or(Some(1), |value| value.0.checked_add(1));
+                if Some(request.sequence) != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LC0 observation sequence differs",
+                    ));
+                }
+                let response = serde_json::json!({
+                    "schema": OBSERVATION_RESPONSE_SCHEMA_V2,
+                    "sequence": request.sequence,
+                    "observation": "snapshot_before_authentication",
+                    "session": snapshot,
+                    "scope": "original process-local session observation; not permission to exit or a device-wide fence"
+                });
+                self.last_observation_v2 = Some((request.sequence, response.clone()));
+                write_frame(&mut stream, &response, until)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported LC0 control schema",
+            )),
+        }
     }
 
     /// Serve a caller-owned, already-bound private listener for this original
@@ -739,6 +871,50 @@ impl Lc0ControlSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versioned_frame_keeps_v1_bytes_and_reads_one_message() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let v1 = serde_json::json!({
+            "schema": CONTROL_SCHEMA, "operation": "status", "sequence": 1,
+            "process_epoch": 1, "lock_sha256": "example", "cuda_ordinal": 0,
+        });
+        let v2 = serde_json::json!({
+            "schema": OBSERVATION_SCHEMA_V2, "sequence": 1,
+            "process_epoch": 1, "lock_sha256": "example", "cuda_ordinal": 0,
+        });
+        let first = serde_json::to_vec(&v1).unwrap();
+        let second = serde_json::to_vec(&v2).unwrap();
+        writer.write_all(&first).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.write_all(&second).unwrap();
+        writer.write_all(b"\n").unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let actual_first = read_versioned_frame(&mut reader, until).unwrap();
+        assert_eq!(actual_first, first);
+        assert_eq!(
+            serde_json::from_slice::<ControlRequest>(&actual_first)
+                .unwrap()
+                .schema,
+            CONTROL_SCHEMA
+        );
+        let actual_second = read_versioned_frame(&mut reader, until).unwrap();
+        assert_eq!(actual_second, second);
+        assert_eq!(
+            serde_json::from_slice::<ObservationRequestV2>(&actual_second)
+                .unwrap()
+                .schema,
+            OBSERVATION_SCHEMA_V2
+        );
+    }
+
+    #[test]
+    fn v2_decoder_rejects_duplicate_binding_fields() {
+        let frame = format!(
+            r#"{{"schema":"{OBSERVATION_SCHEMA_V2}","sequence":1,"process_epoch":1,"process_epoch":2,"lock_sha256":"example","cuda_ordinal":0}}"#
+        );
+        assert!(serde_json::from_str::<ObservationRequestV2>(&frame).is_err());
+    }
 
     #[test]
     fn failure_projection_preserves_types_without_native_text() {
