@@ -16,10 +16,12 @@ use rz_experiments::NativeEngineRole;
 use std::{
     fs::File,
     io::{self, Read, Write},
+    ops::Deref,
     os::unix::{
         fs::MetadataExt,
         net::{UnixListener, UnixStream},
     },
+    sync::Arc,
     time::Instant,
 };
 
@@ -110,9 +112,9 @@ pub(crate) struct DeadlinePeerObservation {
 }
 
 pub(crate) struct DeadlineControl<'a> {
-    listener: &'a UnixListener,
-    window: &'a OwnerWindow,
-    proxy_pin: &'a File,
+    listener: OriginalResource<'a, UnixListener>,
+    window: OriginalResource<'a, OwnerWindow>,
+    proxy_pin: OriginalResource<'a, File>,
     owner_id: [u8; 16],
     owner_epoch: u64,
     process_cleanup_until: Instant,
@@ -120,6 +122,22 @@ pub(crate) struct DeadlineControl<'a> {
     admitted: Vec<(DeadlineScope, u32, ProcessIdentity)>,
     used: Vec<DeadlineScope>,
     peer: Option<Peer>,
+}
+
+/// An owned control retains the same kernel handles in its supervisor bundle;
+/// the borrowed form remains available to existing isolated CPU fixtures.
+enum OriginalResource<'a, T> {
+    Borrowed(&'a T),
+    Owned(Arc<T>),
+}
+impl<T> Deref for OriginalResource<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value.as_ref(),
+        }
+    }
 }
 
 impl<'a> DeadlineControl<'a> {
@@ -138,9 +156,9 @@ impl<'a> DeadlineControl<'a> {
             .set_nonblocking(true)
             .map_err(|_| failure("listener_nonblocking"))?;
         Ok(Self {
-            listener,
-            window,
-            proxy_pin,
+            listener: OriginalResource::Borrowed(listener),
+            window: OriginalResource::Borrowed(window),
+            proxy_pin: OriginalResource::Borrowed(proxy_pin),
             owner_id,
             owner_epoch,
             process_cleanup_until,
@@ -496,6 +514,39 @@ impl<'a> DeadlineControl<'a> {
             return Err(failure("peer_identity_changed"));
         }
         Ok(())
+    }
+}
+
+impl DeadlineControl<'static> {
+    /// The caller retains these exact socket/window/file objects in the same
+    /// original scope on unknown physical completion. No endpoint authority or
+    /// cancellation acknowledgement is created by this constructor.
+    pub(crate) fn new_owned(
+        listener: &Arc<UnixListener>,
+        window: &Arc<OwnerWindow>,
+        proxy_pin: &Arc<File>,
+        owner_id: [u8; 16],
+        owner_epoch: u64,
+        process_cleanup_until: Instant,
+    ) -> Result<Self, ArenaError> {
+        if owner_id == [0; 16] || owner_epoch == 0 {
+            return Err(failure("owner_identity"));
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| failure("listener_nonblocking"))?;
+        Ok(Self {
+            listener: OriginalResource::Owned(Arc::clone(listener)),
+            window: OriginalResource::Owned(Arc::clone(window)),
+            proxy_pin: OriginalResource::Owned(Arc::clone(proxy_pin)),
+            owner_id,
+            owner_epoch,
+            process_cleanup_until,
+            fastchess: None,
+            admitted: Vec::new(),
+            used: Vec::new(),
+            peer: None,
+        })
     }
 }
 
