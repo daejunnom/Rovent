@@ -1630,9 +1630,11 @@ pub fn run_native_with_resources_v3(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventNativeResourceRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, false, None).map_err(|error| match error {
-        V3InnerFailure::BeforeControl(failure) | V3InnerFailure::Failed(failure) => failure,
-        V3InnerFailure::Quarantined(quarantine) => quarantine.original_failure,
+    run_native_with_resources_v3_inner(pin, arguments, false, None, None).map_err(|error| {
+        match error {
+            V3InnerFailure::BeforeControl(failure) | V3InnerFailure::Failed(failure) => failure,
+            V3InnerFailure::Quarantined(quarantine) => quarantine.original_failure,
+        }
     })
 }
 
@@ -1642,15 +1644,17 @@ pub fn run_native_with_resources_v3_control(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, true, None).map_err(|error| match error {
-        V3InnerFailure::BeforeControl(failure) => {
-            RoventControlledRunFailure::BeforeControl(failure)
-        }
-        V3InnerFailure::Failed(failure) => RoventControlledRunFailure::Failed(failure),
-        V3InnerFailure::Quarantined(quarantine) => {
-            RoventControlledRunFailure::Quarantined(quarantine)
-        }
-    })
+    run_native_with_resources_v3_inner(pin, arguments, true, None, None).map_err(
+        |error| match error {
+            V3InnerFailure::BeforeControl(failure) => {
+                RoventControlledRunFailure::BeforeControl(failure)
+            }
+            V3InnerFailure::Failed(failure) => RoventControlledRunFailure::Failed(failure),
+            V3InnerFailure::Quarantined(quarantine) => {
+                RoventControlledRunFailure::Quarantined(quarantine)
+            }
+        },
+    )
 }
 
 /// Native/resource observation and the original Collection owner remain
@@ -1698,17 +1702,30 @@ pub fn run_pc_collection_with_resources_v3_control(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
     collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    validate_collection: impl FnOnce(
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+    ) -> Result<(), RoventLaunchError>
+    + Send
+    + 'static,
 ) -> RoventPcCollectionResourceOutcomeV3 {
-    let native = run_native_with_resources_v3_inner(pin, arguments, true, Some(collection))
-        .map_err(|error| match error {
-            V3InnerFailure::BeforeControl(failure) => {
-                RoventControlledRunFailure::BeforeControl(failure)
-            }
-            V3InnerFailure::Failed(failure) => RoventControlledRunFailure::Failed(failure),
-            V3InnerFailure::Quarantined(quarantine) => {
-                RoventControlledRunFailure::Quarantined(quarantine)
-            }
-        });
+    let native = run_native_with_resources_v3_inner(
+        pin,
+        arguments,
+        true,
+        Some(collection),
+        Some(Box::new(validate_collection)),
+    )
+    .map_err(|error| match error {
+        V3InnerFailure::BeforeControl(failure) => {
+            RoventControlledRunFailure::BeforeControl(failure)
+        }
+        V3InnerFailure::Failed(failure) => RoventControlledRunFailure::Failed(failure),
+        V3InnerFailure::Quarantined(quarantine) => {
+            RoventControlledRunFailure::Quarantined(quarantine)
+        }
+    });
     RoventPcCollectionResourceOutcomeV3 {
         native: Some(native),
         collection: Some(Arc::clone(collection)),
@@ -1720,6 +1737,16 @@ fn run_native_with_resources_v3_inner(
     mut arguments: Vec<String>,
     custody_control: bool,
     collection: Option<&Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
+    validate_collection: Option<
+        Box<
+            dyn FnOnce(
+                    &Arc<RoventInputLockV3>,
+                    &Dir,
+                    &std::fs::File,
+                ) -> Result<(), RoventLaunchError>
+                + Send,
+        >,
+    >,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, V3InnerFailure> {
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
@@ -1787,7 +1814,10 @@ fn run_native_with_resources_v3_inner(
                 Arc::clone(&control_slot),
                 parent_stream,
                 $($owner,)?
-                move |lock, _root, _file, _startup_until, cleanup_until, directory, path, slot| {
+                move |lock, root, file, _startup_until, cleanup_until, directory, path, slot| {
+                    if let Some(validate) = validate_collection {
+                        validate(lock, root, file)?;
+                    }
                     let mut state = callback.lock().map_err(|_| RoventLaunchError {
                         stage: "ResourceAdmission",
                         detail: "original resource owner poisoned".into(),
