@@ -439,6 +439,7 @@ dependencies = [
  "rz-eval",
  "rz-experiments",
  "rz-native-loader",
+ "rz-platform",
  "rz-position",
  "rz-search",
  "rz-uci",
