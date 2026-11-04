@@ -12,6 +12,7 @@ import os
 import threading
 
 from lc0_output_spool import OutputSpool
+from lc0_spool_notification import CoalescedSpoolNotification
 
 
 # A stopped writer with unknown ownership must not lose its FD or pending data
@@ -62,11 +63,24 @@ class AsyncOutputSpool:
         self._cancel_observed = False
         self._backpressure_count = 0
         self._thread = threading.Thread(target=self._run, name="lc0-output-writer", daemon=False)
+        self._notification = None
+        self._notification_init_error = None
+        try:
+            self._notification = CoalescedSpoolNotification(self._thread)
+        except (OSError, AttributeError) as error:
+            # The owning selector can use its bounded tick. This failure does
+            # not alter the original output operation or another execution.
+            self._notification_init_error = error
         try:
             self._thread.start()
         except BaseException:
-            os.close(self._fd)
-            self._fd = None
+            if self._thread.ident is None:
+                if self._notification is not None:
+                    self._notification.close_before_writer()
+                os.close(self._fd)
+                self._fd = None
+            else:
+                _QUARANTINED_WRITERS.append(self)
             raise
 
     def offer(self, data):
@@ -136,9 +150,9 @@ class AsyncOutputSpool:
             return True
 
     def observation(self):
-        """Return a bounded snapshot; in-flight write progress is unknown."""
+        """Re-read state after drain; notification and writer snapshots are separate."""
         with self._condition:
-            return {
+            result = {
                 "writer_state": self._state,
                 "writer_thread_alive": self._thread.is_alive(),
                 "queued_items_including_inflight": self._reserved_items,
@@ -156,6 +170,33 @@ class AsyncOutputSpool:
                                                       if self._last_spool is not None else None),
                 "physical_gpu_completion": "not_observed",
             }
+        result["notification"] = (self._notification.observation() if self._notification
+                                  else {"first_error_type": type(self._notification_init_error).__name__,
+                                        "first_error_errno": getattr(self._notification_init_error, "errno", None),
+                                        "coalesced": 0, "close_status": "unavailable"})
+        return result
+
+    def notification_fileno(self):
+        return self._notification.fileno() if self._notification else -1
+
+    def drain_notification(self):
+        """Drain one bounded wakeup batch, then call ``observation``."""
+        return self._notification.drain() if self._notification else None
+
+    def notification_original_error(self):
+        return (self._notification.original_error() if self._notification
+                else self._notification_init_error)
+
+    def release_notification(self):
+        """Unregister from the selector first; close only after writer/FD finish."""
+        with self._condition:
+            if self._state != "stopped" or self._thread.is_alive() or self._fd is not None:
+                raise RuntimeError("original output writer has not fully stopped")
+        return self._notification.close_after_writer() if self._notification else False
+
+    def _signal(self):
+        if self._notification is not None:
+            self._notification.signal()
 
     def original_errors(self):
         """Return retained worker, read and write errors for this same owner.
@@ -176,12 +217,14 @@ class AsyncOutputSpool:
                 self._original_failure = error
                 self._state = "init_failed"
                 _QUARANTINED_WRITERS.append(self)
+            self._signal()
             return
         with self._condition:
             self._spool = spool
             self._last_spool = spool.observation()
             self._last_errors = spool.original_errors()
             self._state = "idle"
+        self._signal()
 
         while True:
             with self._condition:
@@ -207,6 +250,7 @@ class AsyncOutputSpool:
                         break
                     self._condition.wait()
 
+            self._signal()
             try:
                 if operation == "write":
                     spool.accept(self._inflight)
@@ -230,6 +274,7 @@ class AsyncOutputSpool:
                     self._last_errors = spool.original_errors()
                     self._state = "close_unknown" if operation == "close" else "writer_fault"
                     _QUARANTINED_WRITERS.append(self)
+                self._signal()
                 return
 
             with self._condition:
@@ -237,14 +282,21 @@ class AsyncOutputSpool:
                 self._last_errors = spool.original_errors()
                 if operation == "close":
                     self._state = "stopped"
-                    return
-                if operation == "terminal":
+                    stop = True
+                elif operation == "terminal":
                     self._terminal_applied = True
+                    self._state = "idle"
+                    stop = False
                 elif self._last_spool["write_blocked"]:
                     self._state = "write_blocked"
-                    continue
-                elif self._inflight is not None:
-                    self._reserved_bytes -= len(self._inflight)
-                    self._reserved_items -= 1
-                    self._inflight = None
-                self._state = "idle"
+                    stop = False
+                else:
+                    if self._inflight is not None:
+                        self._reserved_bytes -= len(self._inflight)
+                        self._reserved_items -= 1
+                        self._inflight = None
+                    self._state = "idle"
+                    stop = False
+            self._signal()
+            if stop:
+                return
