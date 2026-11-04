@@ -160,3 +160,25 @@ fn panicked_write_retains_batch_and_marks_call_progress_unknown() {
     assert!(partial.call_completion_unknown);
     assert_eq!(partial.batch, batch(b"hello", b""));
 }
+
+#[test]
+fn retained_allocation_limit_returns_the_original_batch() {
+    let owner = match AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 8) {
+        Ok(owner) => owner,
+        Err(_) => panic!("bounded output owner could not start"),
+    };
+    let mut oversized = Vec::with_capacity(64);
+    oversized.push(b'x');
+    match owner.try_submit(OutputBatch {
+        protocol: oversized,
+        diagnostics: Vec::new(),
+    }) {
+        Err(SubmitError::TooLarge(original)) => {
+            assert_eq!(original.protocol, b"x");
+            assert!(original.protocol.capacity() >= 64);
+        }
+        _ => panic!("oversized allocation must remain with its original owner"),
+    }
+    owner.request_close();
+    assert!(recover(owner).failure.is_none());
+}
