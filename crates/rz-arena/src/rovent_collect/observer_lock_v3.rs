@@ -5,7 +5,9 @@
 //! The caller must keep this owner alive through the native worker fence and
 //! preserve it on errors. This is not a teacher or GPU completion receipt.
 use super::capture_router_v3::{CapturePollV3, CaptureRouterV3, FailurePollV3};
-use super::native_capture::{LockV3RegistrationAttempt, RoventFailedCapturedInput};
+use super::native_capture::{
+    LockV3RegistrationAttempt, RoventFailedCapturedInput, RoventUnstartedRouteRollbackV3,
+};
 use super::producer_v3::{
     RoventCorpusProducerLockV3, RoventInputCaptureReservationV3, RoventRetiredLockV3Record,
 };
@@ -30,6 +32,12 @@ use std::{
 
 const MAX_INFLIGHT: usize = 16;
 const MAX_RETIRED: usize = 256;
+
+pub(crate) enum UnstartedRouteDetachV3 {
+    Detached,
+    Busy(RoventUnstartedRouteRollbackV3),
+    Rejected(ArenaError, RoventUnstartedRouteRollbackV3),
+}
 
 struct Staged {
     ticket: RoleTicketEnvelope,
@@ -154,6 +162,47 @@ impl RoventCollectionOwnerLockV3 {
             state.route_admission = Some(admission.clone());
         }
         Ok(Some(()))
+    }
+
+    /// Detach only before the observer is admitted and only with the
+    /// registration's original unstarted rollback witness. The caller must
+    /// serialize install/rollback/detach on the same route owner; this witness
+    /// does not grant native-worker or teacher completion authority.
+    pub(crate) fn try_detach_unstarted_speculative_root(
+        &self,
+        witness: RoventUnstartedRouteRollbackV3,
+    ) -> UnstartedRouteDetachV3 {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return UnstartedRouteDetachV3::Busy(witness);
+            }
+            Err(_) => {
+                return UnstartedRouteDetachV3::Rejected(
+                    invalid("lock-v3 owner poisoned"),
+                    witness,
+                );
+            }
+        };
+        let valid = state.admission.is_none()
+            && !state.settled
+            && state.staged.is_empty()
+            && state.pending.is_empty()
+            && state.handled.is_empty()
+            && state.route_admission.is_some()
+            && state
+                .speculative_root
+                .as_ref()
+                .is_some_and(|route| witness.matches_original_route(route));
+        if !valid {
+            return UnstartedRouteDetachV3::Rejected(
+                invalid("lock-v3 route rollback does not match the unstarted owner"),
+                witness,
+            );
+        }
+        state.speculative_root = None;
+        state.route_admission = None;
+        UnstartedRouteDetachV3::Detached
     }
     pub(crate) fn observer<Q: 'static, O: ProposerRankingOutput + 'static>(
         &self,
@@ -741,6 +790,46 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
     ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
         self.try_apply(AdaptiveCollectionStage::Accepted, |state| {
             state.try_retire(witness)
+        })
+    }
+
+    fn try_adaptive_consumed(
+        &mut self,
+        witness: RovventCollectionConsumedWitnessV3<'_>,
+        _: bool,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::Accepted, |state| {
+            state.try_retire(witness)
+        })
+    }
+
+    fn try_adaptive_root_ranking(
+        &mut self,
+        accepted: &RoventRootRankingAcceptanceV3,
+        _: &FrameInput<ReviewView, Q>,
+        output: &O,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::Accepted, |state| {
+            state.producer()?.validate_admission(accepted.admission())?;
+            let ticket = accepted.ranking().source().ticket;
+            let pending = state
+                .pending
+                .get(&ticket.id)
+                .ok_or_else(|| invalid("lock-v3 ranking not registered"))?;
+            check(
+                pending.ticket == ticket && state.retired.len() < MAX_RETIRED,
+                "lock-v3 ranking identity or capacity",
+            )?;
+            if state.try_drain()? == AdaptiveCollectionBoundaryV2::Busy {
+                return Ok(AdaptiveCollectionBoundaryV2::Busy);
+            }
+            let row = state
+                .producer()?
+                .retire_root_ranking(accepted, output.proposer_ranking_output())?;
+            state.pending.remove(&ticket.id);
+            state.handled.insert(ticket.id, ticket);
+            state.retired.push_back(row);
+            Ok(AdaptiveCollectionBoundaryV2::Ready)
         })
     }
 
