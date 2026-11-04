@@ -372,6 +372,11 @@ impl PcCollectionOwnersV3 {
             if Instant::now() >= self.execution_ceiling {
                 return Err("original collection work deadline expired");
             }
+            // The resource lease above has checked this exact authenticated
+            // gate, native owner, scope and lock. Publish that same lock
+            // identity before any driver can admit a root.
+            self.bridge
+                .bind_input_lock_identity(gate.input_lock_identity())?;
             SupervisorStartCustodyV3::start_verified(
                 &self.driver_custody,
                 &lease,
