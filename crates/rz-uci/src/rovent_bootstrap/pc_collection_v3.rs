@@ -391,6 +391,11 @@ pub enum RoventPcCollectionWorkerJoinFailureV3 {
 }
 
 impl RoventPcCollectionWorkerV3 {
+    /// Identity only; this does not attest worker or teacher completion.
+    pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+
     pub fn spawn(
         admission: RoventCollectionRootAdmissionV3,
         task: RoventPcRootWorkerTaskV3,
@@ -639,6 +644,18 @@ pub enum RoventPcCustodyReturnV3 {
 
 /// Callbacks are nonblocking, root-scoped and retain their original owners.
 pub trait RoventPcCollectionHooksV3: Send + Sync {
+    /// Trusted internal boundary for the installed original hook. `Some`
+    /// must retain the actual evidence for every admitted root, worker,
+    /// teacher and observer; the native fence alone is insufficient.
+    /// `None` leaves all custody in this hook for a later nonblocking retry.
+    /// An error or panic leaves settlement unresolved and is never approval.
+    fn try_finish_launch(
+        &self,
+        _native: &super::launch::RoventPcCollectionNativeFenceV3,
+    ) -> Result<Option<Box<dyn Any + Send>>, AdaptiveManagerError> {
+        Ok(None)
+    }
+
     fn register_startup_control(
         &self,
         control: &RoventStartupControl,

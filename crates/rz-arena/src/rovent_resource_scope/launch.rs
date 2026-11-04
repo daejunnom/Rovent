@@ -1665,9 +1665,90 @@ pub fn run_native_with_resources_v3_control(
 pub struct RoventPcCollectionResourceOutcomeV3 {
     native: Option<Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>>,
     collection: Option<Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
+    settlement: Option<rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3>,
+    recovery: Arc<PcCollectionRecoverySlotV3>,
+}
+
+struct PcCollectionRecoveryOwnersV3 {
+    native: Option<Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>>,
+    collection: Option<Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
+    settlement: Option<rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3>,
+}
+
+struct PcCollectionRecoverySlotV3 {
+    owners: Mutex<Option<PcCollectionRecoveryOwnersV3>>,
+}
+
+impl Drop for PcCollectionRecoverySlotV3 {
+    fn drop(&mut self) {
+        if let Some(owners) = self
+            .owners
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            // Last-resort lifetime guard only if every recovery key was lost.
+            std::mem::forget(owners);
+        }
+    }
+}
+
+/// Keep this same key outside the outcome to recover the original owners if
+/// the outcome is dropped before settlement. It does not establish a fence.
+#[derive(Clone)]
+pub struct RoventPcCollectionRecoveryKeyV3(Arc<PcCollectionRecoverySlotV3>);
+
+impl RoventPcCollectionRecoveryKeyV3 {
+    pub fn try_recover(&self) -> Result<Option<RoventPcCollectionResourceOutcomeV3>, &'static str> {
+        let mut slot = self.0.owners.try_lock().map_err(|failure| match failure {
+            std::sync::TryLockError::WouldBlock => "collection recovery slot busy",
+            std::sync::TryLockError::Poisoned(_) => "collection recovery slot poisoned",
+        })?;
+        let owners = slot.take();
+        drop(slot);
+        Ok(owners.map(|owners| RoventPcCollectionResourceOutcomeV3 {
+            native: owners.native,
+            collection: owners.collection,
+            settlement: owners.settlement,
+            recovery: Arc::clone(&self.0),
+        }))
+    }
+}
+
+/// Original owners after same-session native completion and the installed
+/// hook's launch-wide teacher/observer settlement have both been confirmed.
+/// This is not independent GPU or external process-tree evidence.
+pub struct RoventPcCollectionSettledOutcomeV3 {
+    pub native: Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>,
+    pub collection: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    pub observer: Box<dyn rz_uci::pals_native::ticketed::VirtualReviewCollectionObserver>,
+    pub hook_custody: Box<dyn std::any::Any + Send>,
+    pub observer_poison_observed: bool,
 }
 
 impl RoventPcCollectionResourceOutcomeV3 {
+    pub fn recovery_key(&self) -> RoventPcCollectionRecoveryKeyV3 {
+        RoventPcCollectionRecoveryKeyV3(Arc::clone(&self.recovery))
+    }
+
+    /// Return a permit issued to another holder of this same original owner.
+    /// Rejection returns the unmodified permit and its proof custody.
+    pub fn offer_settlement_permit(
+        &mut self,
+        permit: rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3,
+    ) -> Result<(), rz_uci::rovent_bootstrap::launch::RoventPcCollectionSettlementPermitV3> {
+        if self.settlement.is_some()
+            || !self
+                .collection
+                .as_ref()
+                .is_some_and(|owner| permit.matches_original_owner(owner))
+        {
+            return Err(permit);
+        }
+        self.settlement = Some(permit);
+        Ok(())
+    }
+
     pub fn native_outcome(
         &self,
     ) -> &Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
@@ -1681,17 +1762,94 @@ impl RoventPcCollectionResourceOutcomeV3 {
             .as_ref()
             .expect("collection owner remains retained")
     }
+
+    /// Returns pending without discarding any owner. Hook settlement errors
+    /// retain their original typed cause in `original_collection()`.
+    pub fn try_settle(
+        &mut self,
+    ) -> Result<Option<RoventPcCollectionSettledOutcomeV3>, &'static str> {
+        self.try_settle_inner(false)
+    }
+
+    /// Explicit recovery keeps the observer-panic indication in the result.
+    pub fn try_settle_poisoned(
+        &mut self,
+    ) -> Result<Option<RoventPcCollectionSettledOutcomeV3>, &'static str> {
+        self.try_settle_inner(true)
+    }
+
+    fn try_settle_inner(
+        &mut self,
+        recover_poison: bool,
+    ) -> Result<Option<RoventPcCollectionSettledOutcomeV3>, &'static str> {
+        let owner = self
+            .collection
+            .as_ref()
+            .ok_or("collection already settled")?;
+        if self.settlement.is_none() {
+            self.settlement = owner.try_recover_settlement_permit()?;
+            if self.settlement.is_none() {
+                self.settlement = owner.try_settle_launch()?;
+            }
+        }
+        let Some(permit) = self.settlement.as_mut() else {
+            return Ok(None);
+        };
+        let (observer, observer_poison_observed) = match owner.try_reclaim_observer(permit) {
+            Ok(observer) => (observer, false),
+            Err(
+                rz_uci::rovent_bootstrap::launch::RoventPcObserverReclaimErrorV3::ProxyStillOwned
+                | rz_uci::rovent_bootstrap::launch::RoventPcObserverReclaimErrorV3::CustodyBusy,
+            ) => return Ok(None),
+            Err(rz_uci::rovent_bootstrap::launch::RoventPcObserverReclaimErrorV3::Poisoned)
+                if recover_poison =>
+            {
+                let original = owner
+                    .try_reclaim_poisoned_observer(permit)
+                    .map_err(|_| "poisoned observer custody remains unresolved")?;
+                (original, true)
+            }
+            Err(_) => return Err("observer custody cannot be reclaimed"),
+        };
+        let hook_custody = permit
+            .take_hook_custody()
+            .expect("settlement permit retains original hook custody");
+        let native = self.native.take().expect("native outcome remains retained");
+        let collection = self
+            .collection
+            .take()
+            .expect("original collection remains retained");
+        self.settlement.take();
+        Ok(Some(RoventPcCollectionSettledOutcomeV3 {
+            native,
+            collection,
+            observer,
+            hook_custody,
+            observer_poison_observed,
+        }))
+    }
 }
 
 impl Drop for RoventPcCollectionResourceOutcomeV3 {
     fn drop(&mut self) {
-        // A native result and proxy drop alone do not settle the teacher.
-        // Keep the exact owners until the typed combined recovery path exists.
-        if let Some(owner) = self.collection.take() {
-            std::mem::forget(owner);
+        if self.native.is_none() && self.collection.is_none() && self.settlement.is_none() {
+            return;
         }
-        if let Some(native) = self.native.take() {
-            std::mem::forget(native);
+        let owners = PcCollectionRecoveryOwnersV3 {
+            native: self.native.take(),
+            collection: self.collection.take(),
+            settlement: self.settlement.take(),
+        };
+        let mut slot = self
+            .recovery
+            .owners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(owners);
+        } else {
+            // An invariant violation must never overwrite an original owner.
+            std::mem::forget(owners);
         }
     }
 }
@@ -1729,6 +1887,10 @@ pub fn run_pc_collection_with_resources_v3_control(
     RoventPcCollectionResourceOutcomeV3 {
         native: Some(native),
         collection: Some(Arc::clone(collection)),
+        settlement: None,
+        recovery: Arc::new(PcCollectionRecoverySlotV3 {
+            owners: Mutex::new(None),
+        }),
     }
 }
 

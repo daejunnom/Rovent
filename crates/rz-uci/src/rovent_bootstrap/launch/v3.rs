@@ -3561,6 +3561,9 @@ pub(super) fn run_native_admitted(
             },
         });
     }
+    if let Some(owner) = collection.as_ref() {
+        owner.mark_native_session_finished();
+    }
     scope.mark_product_finished(arguments.process_epoch, &lock.canonical_sha256);
     scope.settled_without_quarantine();
     result.map_err(Into::into)

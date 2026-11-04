@@ -94,6 +94,8 @@ mod collection_v3;
 mod evidence;
 #[cfg(target_os = "linux")]
 mod go_observer;
+#[cfg(target_os = "linux")]
+mod own_collection_v3;
 #[cfg(feature = "native-validation-diagnostics")]
 mod selected_view_observation;
 pub mod storage;
@@ -120,8 +122,16 @@ pub use collection::{
     run_pc_collection_v2_with_resource_admission, run_pc_collection_v2_with_sealed_policy,
 };
 #[cfg(target_os = "linux")]
-pub use collection_v3::RoventPcCollectionLaunchOwnerV3;
+pub use collection_v3::{
+    RoventPcCollectionLaunchOwnerV3, RoventPcCollectionNativeFenceV3,
+    RoventPcCollectionSettlementPermitV3, RoventPcObserverReclaimErrorV3,
+};
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
+#[cfg(target_os = "linux")]
+pub use own_collection_v3::{
+    RoventOwnCollectionHooksV3, RoventOwnCollectionLaunchOwnerV3, RoventOwnCollectionNativeFenceV3,
+    RoventOwnCollectionSettlementPermitV3, RoventOwnObserverReclaimErrorV3,
+};
 #[cfg(target_os = "linux")]
 pub(crate) use system_parent::ConnectedParent;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
