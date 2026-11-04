@@ -753,6 +753,70 @@ mod admission_observation_tests {
     }
 
     #[test]
+    fn frontier_attach_distinguishes_contention_and_cancellation() {
+        let context = context();
+        let lock = context.current.lock().expect("original authority");
+        assert!(matches!(
+            crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
+            Err(RoventV3FrontierAttachFailure::Busy)
+        ));
+        context.cancellation.cancel();
+        assert!(matches!(
+            crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
+            Ok(false)
+        ));
+        drop(lock);
+    }
+
+    #[test]
+    fn frontier_attach_checks_deadline_before_contended_authority() {
+        let mut context = context();
+        context.control.deadline = Instant::now() - Duration::from_secs(1);
+        let lock = context.current.lock().expect("original authority");
+        assert!(matches!(
+            crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
+            Ok(false)
+        ));
+        drop(lock);
+    }
+
+    #[test]
+    fn frontier_attach_checks_actual_authority_and_control_cancellation() {
+        let context = context();
+        assert!(matches!(
+            crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
+            Ok(true)
+        ));
+        context.control.cancellation.store(true, Ordering::Release);
+        assert!(matches!(
+            crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
+            Ok(false)
+        ));
+        context.control.cancellation.store(false, Ordering::Release);
+        let mut replacement = context.authority;
+        replacement.root = RootGeneration(context.authority.root.0 + 1);
+        *context.current.lock().expect("original authority") = SessionScope::Search(replacement);
+        assert!(matches!(
+            crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    fn frontier_attach_does_not_treat_poison_as_contention() {
+        let context = context();
+        let authority = Arc::clone(&context.current);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = authority.lock().unwrap();
+            panic!("exercise authority-owner poisoning");
+        }));
+        assert!(matches!(
+            crate::pals_adaptive::try_v3_frontier_attach_accepts(&context),
+            Err(RoventV3FrontierAttachFailure::Rejected(_))
+        ));
+    }
+
+    #[test]
     fn original_deadline_wins_over_authority_contention() {
         let mut context = context();
         context.control.deadline = Instant::now() - Duration::from_secs(1);
