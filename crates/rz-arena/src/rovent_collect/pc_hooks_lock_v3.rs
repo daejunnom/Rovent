@@ -1375,8 +1375,24 @@ pub(super) struct PcGameClosureProofV3 {
 }
 
 impl PcGameClosureProofV3 {
+    pub(super) fn game(&self) -> &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>> {
+        &self.game
+    }
+
+    pub(super) fn pipeline(&self) -> &super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3 {
+        &self.pipeline
+    }
+
     pub(super) fn matches_game(&self, game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>) -> bool {
         Arc::ptr_eq(&self.game, game)
+    }
+
+    pub(super) fn matches_supervisor(&self, supervisor: &Arc<Mutex<PcWorkerSupervisorV3>>) -> bool {
+        Arc::ptr_eq(&self._supervisor, supervisor)
+    }
+
+    pub(super) fn matches_pipeline(&self, pipeline: &super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3) -> bool {
+        self.pipeline.same_owner(pipeline)
     }
 
     pub(super) fn matches_roots(&self, roots: &[RoventCollectionRootAdmissionV3]) -> bool {
