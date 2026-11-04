@@ -6,6 +6,7 @@
 use super::producer_v2::{
     RoventCapturedInputV2, RoventCorpusProducerV2, RoventInputCaptureReservationV2,
 };
+use super::speculative_route_v3::{TargetPublicationV3, TargetRevocationV3};
 use super::*;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
 use rz_experiments::rovent_corpus_v2::{RoventTargetsV2, RoventTrainingRecordV2};
@@ -122,6 +123,67 @@ pub(super) struct RoventCorpusProducerLockV3 {
     native_retirements: BTreeMap<RequestId, RoleTicketEnvelope>,
     native_observation_failures:
         BTreeMap<RequestId, Vec<rz_uci::pals_native::ticketed::TicketNativeObservationFailure>>,
+}
+
+/// A sealed candidate retained with the exact original row and teacher
+/// evidence. It is not a published row and exposes no public record bytes.
+pub(super) struct PendingPolicyPublicationV3 {
+    row: RoventRetiredLockV3Record,
+    candidate: rz_experiments::rovent_corpus_lock_v3::record::RoventTrainingRecordLockV3,
+    capability: Option<TargetPublicationV3>,
+}
+
+impl PendingPolicyPublicationV3 {
+    pub(super) fn original_admission(&self) -> &RoventCollectionRootAdmissionV3 {
+        &self.row.admission
+    }
+    pub(super) fn original_manifest_sha256(&self) -> &str {
+        &self.row.manifest_sha256
+    }
+    pub(super) fn candidate(
+        &self,
+    ) -> &rz_experiments::rovent_corpus_lock_v3::record::RoventTrainingRecordLockV3 {
+        &self.candidate
+    }
+    pub(super) fn target_capability(&self) -> Option<&TargetPublicationV3> {
+        self.capability.as_ref()
+    }
+    /// Install exactly the original ticket's non-clone target authority.
+    /// On mismatch the caller retains it and this candidate stays unchanged.
+    pub(super) fn bind_target_capability(
+        &mut self,
+        capability: &mut Option<TargetPublicationV3>,
+    ) -> Result<(), ArenaError> {
+        let value = capability
+            .as_ref()
+            .ok_or_else(|| invalid("target capability absent"))?;
+        let prepared = self
+            .row
+            .prepared_policy
+            .as_ref()
+            .ok_or_else(|| invalid("original staged policy absent"))?;
+        let capsule = prepared.sealed().capsule();
+        check(
+            self.capability.is_none()
+                && value.matches(&self.row.admission, &self.row.ticket)
+                && value.matches_revocation(&capsule.root_targets_revoked)
+                && !capsule.is_ticket_canceled(),
+            "target capability differs from original root, ticket or revoke owner",
+        )?;
+        self.capability = capability.take();
+        Ok(())
+    }
+    /// Recover the original row and its staged teacher owner; abandoning the
+    /// candidate does not refund the producer's already reserved sequence.
+    pub(super) fn into_parts(self) -> (RoventRetiredLockV3Record, Option<TargetPublicationV3>) {
+        (self.row, self.capability)
+    }
+}
+
+pub(super) struct PendingPolicyPreparationFailureV3 {
+    pub(super) error: ArenaError,
+    pub(super) row: RoventRetiredLockV3Record,
+    pub(super) panic_payload: Option<Box<dyn std::any::Any + Send>>,
 }
 impl RoventCorpusProducerLockV3 {
     pub(super) fn new_shared(
@@ -506,6 +568,78 @@ impl RoventCorpusProducerLockV3 {
         Ok(())
     }
 
+    /// Produce an opaque candidate while retaining the row, capsule and
+    /// one-shot teacher evidence. This is not a target commit or publication;
+    /// the exact root/ticket cancellation gate must still guard writer append.
+    pub(super) fn prepare_policy_publication(
+        &mut self,
+        row: RoventRetiredLockV3Record,
+    ) -> Result<PendingPolicyPublicationV3, Box<PendingPolicyPreparationFailureV3>> {
+        let build = || -> Result<_, ArenaError> {
+            let prepared = row
+                .prepared_policy
+                .as_ref()
+                .ok_or_else(|| invalid("lock-v3 retired row has no original staged policy"))?;
+            check(
+                Arc::ptr_eq(&row.producer_owner, &self.producer_owner)
+                    && Arc::ptr_eq(&row.manifest_owner, &self.manifest)
+                    && row.admission.same_original_admission(&self.admission)
+                    && prepared.ticket() == row.ticket
+                    && prepared
+                        .sealed()
+                        .evidence()
+                        .admission()
+                        .same_original_admission(&self.admission)
+                    && !prepared.sealed().capsule().is_ticket_canceled()
+                    && row.record.0.targets.policy.is_none()
+                    && row.record.0.targets.wdl.is_none()
+                    && row.record.0.targets.divergence.is_none()
+                    && row.record.0.targets.task.is_none()
+                    && row.record.0.head_sources.is_empty(),
+                "lock-v3 staged policy custody differs or is canceled",
+            )?;
+            prepared.sealed().capsule().matches_original_row(&row)?;
+            let sequence = self
+                .original
+                .original
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| invalid("Rovent collector sequence exhausted"))?;
+            let mut candidate = row.record.clone();
+            let mut target = prepared.target().clone();
+            let mut source = prepared.source().clone();
+            target.observed_sequence = sequence;
+            source.observed_sequence = sequence;
+            candidate.0.targets.policy = Some(target);
+            candidate.0.head_sources.insert("policy".into(), source);
+            candidate.seal(
+                &self.manifest,
+                self.admission.native_origin().original_input_lock(),
+            )?;
+            Ok((candidate, sequence))
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+            Ok(Ok((candidate, sequence))) => {
+                self.original.original.sequence = sequence;
+                Ok(PendingPolicyPublicationV3 {
+                    row,
+                    candidate,
+                    capability: None,
+                })
+            }
+            Ok(Err(error)) => Err(Box::new(PendingPolicyPreparationFailureV3 {
+                error,
+                row,
+                panic_payload: None,
+            })),
+            Err(payload) => Err(Box::new(PendingPolicyPreparationFailureV3 {
+                error: invalid("lock-v3 policy candidate preparation panicked"),
+                row,
+                panic_payload: Some(payload),
+            })),
+        }
+    }
+
     /// Publication of the in-process row does not write files. On failure the
     /// caller gets the original row and its admission back for recovery.
     pub fn publish(
@@ -597,16 +731,14 @@ impl Drop for SpeculativeIssuanceClaimV3 {
 fn claim_speculative_issuance_v3(
     root_revoked: &std::sync::atomic::AtomicBool,
     root_canceled: &std::sync::atomic::AtomicBool,
-    root_targets_revoked: &std::sync::atomic::AtomicBool,
+    targets_open: bool,
     ticket: &SpeculativeTicketAuthorityV3,
 ) -> Result<SpeculativeIssuanceClaimV3, ArenaError> {
     use std::sync::atomic::Ordering;
     root_revoked
         .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| invalid("speculative root is revoked"))?;
-    root_targets_revoked
-        .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| invalid("speculative root targets are revoked"))?;
+    check(targets_open, "speculative root targets are revoked")?;
     root_canceled
         .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| invalid("speculative root teacher admission is closed"))?;
@@ -629,7 +761,7 @@ pub(crate) struct SubmittedTeacherQueryV3 {
     native_cancellation: rz_uci::pals_native::ticketed::NativeTicketCancelObservation,
     root_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     root_canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    root_targets_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    root_targets_revoked: TargetRevocationV3,
 }
 
 impl SubmittedTeacherQueryV3 {
@@ -660,10 +792,7 @@ impl SubmittedTeacherQueryV3 {
     /// Root closure stops new submissions, while an already sealed result may
     /// still join its valid original retirement if its ticket was not revoked.
     pub(crate) fn is_ticket_canceled(&self) -> bool {
-        self.ticket_authority.canceled()
-            || self
-                .root_targets_revoked
-                .load(std::sync::atomic::Ordering::Acquire)
+        self.ticket_authority.canceled() || self.root_targets_revoked.is_revoked()
     }
     pub(crate) fn is_canceled(&self) -> bool {
         self.is_ticket_canceled()
@@ -689,7 +818,7 @@ impl SubmittedTeacherQueryV3 {
         let claim = claim_speculative_issuance_v3(
             &self.root_revoked,
             &self.root_canceled,
-            &self.root_targets_revoked,
+            self.root_targets_revoked.try_observe_open(),
             &self.ticket_authority,
         )?;
         if self.is_canceled() {
@@ -806,7 +935,7 @@ impl RoventCapturedInputV3 {
         native_cancellation: rz_uci::pals_native::ticketed::NativeTicketCancelObservation,
         root_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
         root_canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        root_targets_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        root_targets_revoked: TargetRevocationV3,
     ) -> Result<SubmittedTeacherQueryV3, ArenaError> {
         check(
             self.admission.same_original_admission(&admission),
@@ -869,14 +998,14 @@ mod v3_issuance_tests {
     fn cancel_and_unknown_do_not_reissue_a_ticket() {
         let roots = AtomicBool::new(false);
         let ticket = SpeculativeTicketAuthorityV3::new();
-        let claim = claim_speculative_issuance_v3(&roots, &roots, &roots, &ticket).unwrap();
+        let claim = claim_speculative_issuance_v3(&roots, &roots, true, &ticket).unwrap();
         assert!(ticket.cancel());
         drop(claim);
-        assert!(claim_speculative_issuance_v3(&roots, &roots, &roots, &ticket).is_err());
+        assert!(claim_speculative_issuance_v3(&roots, &roots, true, &ticket).is_err());
 
         let unknown = SpeculativeTicketAuthorityV3::new();
-        drop(claim_speculative_issuance_v3(&roots, &roots, &roots, &unknown).unwrap());
-        assert!(claim_speculative_issuance_v3(&roots, &roots, &roots, &unknown).is_err());
+        drop(claim_speculative_issuance_v3(&roots, &roots, true, &unknown).unwrap());
+        assert!(claim_speculative_issuance_v3(&roots, &roots, true, &unknown).is_err());
     }
 
     #[test]
@@ -885,12 +1014,26 @@ mod v3_issuance_tests {
         let canceled = AtomicBool::new(false);
         let targets = AtomicBool::new(false);
         let ticket = SpeculativeTicketAuthorityV3::new();
-        claim_speculative_issuance_v3(&root, &canceled, &targets, &ticket)
+        claim_speculative_issuance_v3(&root, &canceled, !targets.load(Ordering::Acquire), &ticket)
             .unwrap()
             .rejected();
-        let claim = claim_speculative_issuance_v3(&root, &canceled, &targets, &ticket).unwrap();
+        let claim = claim_speculative_issuance_v3(
+            &root,
+            &canceled,
+            !targets.load(Ordering::Acquire),
+            &ticket,
+        )
+        .unwrap();
         root.store(true, Ordering::Release);
         claim.rejected();
-        assert!(claim_speculative_issuance_v3(&root, &canceled, &targets, &ticket).is_err());
+        assert!(
+            claim_speculative_issuance_v3(
+                &root,
+                &canceled,
+                !targets.load(Ordering::Acquire),
+                &ticket
+            )
+            .is_err()
+        );
     }
 }

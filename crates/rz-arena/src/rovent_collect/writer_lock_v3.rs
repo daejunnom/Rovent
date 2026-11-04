@@ -24,6 +24,20 @@ pub struct RoventCorpusWriterLockV3 {
     record_seals: BTreeSet<String>,
     admissions: BTreeMap<String, Arc<LockV3PublicationSource>>,
     original_admissions: BTreeMap<String, rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3>,
+    // A caught panic during gated append may have changed part of the writer.
+    // Keep the original payload and prohibit flush, retry, or finish.
+    uncertain_append: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// The caller always retains the original pending row. Busy is retryable;
+/// Uncertain retains both original writer and policy owner for recovery.
+pub(super) enum PolicyAppendResultV3 {
+    Appended,
+    Busy,
+    Rejected(ArenaError),
+    /// Candidate cloning panicked before the gate or writer was touched.
+    PreparationPanicked(Box<dyn std::any::Any + Send>),
+    Uncertain,
 }
 
 impl RoventCorpusWriterLockV3 {
@@ -40,6 +54,10 @@ impl RoventCorpusWriterLockV3 {
         &self,
         row: &PublishedRoventLockV3Record,
     ) -> Result<bool, ArenaError> {
+        check(
+            self.uncertain_append.is_none(),
+            "writer /3 append state uncertain",
+        )?;
         let row_bytes = serde_json::to_vec(row.record())
             .map_err(|error| invalid(error.to_string()))?
             .len()
@@ -91,12 +109,17 @@ impl RoventCorpusWriterLockV3 {
             record_seals: BTreeSet::new(),
             admissions: BTreeMap::new(),
             original_admissions: BTreeMap::new(),
+            uncertain_append: None,
         })
     }
 
     /// On failure the caller retains the original opaque row and this writer
     /// remains unmodified. No decoded record can issue this capability.
     pub fn append(&mut self, row: &PublishedRoventLockV3Record) -> Result<(), ArenaError> {
+        check(
+            self.uncertain_append.is_none(),
+            "writer /3 append state uncertain",
+        )?;
         let admission = row.admission();
         let lock = admission.native_origin().original_input_lock();
         check(lock == &self.lock, "writer /3 input lock differs")?;
@@ -184,7 +207,61 @@ impl RoventCorpusWriterLockV3 {
         Ok(())
     }
 
+    /// Serialize a prepared target only while the same original ticket/root
+    /// gate excludes revoke. The gate is held over the actual memory append,
+    /// never over filesystem I/O. The caller retains `pending` in all cases.
+    pub(super) fn try_append_policy(
+        &mut self,
+        pending: &super::producer_v3::PendingPolicyPublicationV3,
+    ) -> PolicyAppendResultV3 {
+        if self.uncertain_append.is_some() {
+            return PolicyAppendResultV3::Uncertain;
+        }
+        let Some(capability) = pending.target_capability() else {
+            return PolicyAppendResultV3::Rejected(invalid("writer /3 target capability absent"));
+        };
+        // Build the temporary opaque row before acquiring the gate; no caller
+        // can retrieve this candidate unless the gate-protected append wins.
+        let temporary = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PublishedRoventLockV3Record {
+                record: pending.candidate().clone(),
+                manifest_sha256: pending.original_manifest_sha256().to_owned(),
+                admission: pending.original_admission().clone(),
+            }
+        })) {
+            Ok(row) => row,
+            Err(payload) => return PolicyAppendResultV3::PreparationPanicked(payload),
+        };
+        let guard = match capability.try_begin_append() {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return PolicyAppendResultV3::Busy,
+            Err(error) => return PolicyAppendResultV3::Rejected(error),
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.append(&temporary))) {
+            Ok(Ok(())) => {
+                guard.committed();
+                PolicyAppendResultV3::Appended
+            }
+            Ok(Err(error)) => {
+                // All ordinary validation errors in append precede mutation.
+                guard.known_not_written();
+                PolicyAppendResultV3::Rejected(error)
+            }
+            Err(payload) => {
+                // An unwind may occur after partial mutation. The unresolved
+                // guard seals this exact target as unknown on Drop.
+                self.uncertain_append = Some(payload);
+                drop(guard);
+                PolicyAppendResultV3::Uncertain
+            }
+        }
+    }
+
     pub fn flush(&mut self) -> Result<Option<RoventChunkPacket>, ArenaError> {
+        check(
+            self.uncertain_append.is_none(),
+            "writer /3 append state uncertain",
+        )?;
         if self.buffer.is_empty() {
             return Ok(None);
         }
@@ -212,7 +289,8 @@ impl RoventCorpusWriterLockV3 {
     pub fn finish(self) -> Result<FinishedRoventCorpusLockV3, Box<(ArenaError, Self)>> {
         let result = (|| {
             check(
-                self.buffer.is_empty()
+                self.uncertain_append.is_none()
+                    && self.buffer.is_empty()
                     && self.index.record_count > 0
                     && !self.admissions.is_empty()
                     && self.index.record_count as usize == self.record_seals.len(),
