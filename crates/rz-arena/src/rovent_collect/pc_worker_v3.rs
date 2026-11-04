@@ -1553,6 +1553,12 @@ impl PcWorkerSupervisorV3 {
             }
             if !self.output_installed {
                 if let Some(output) = self.managed_output.as_ref() {
+                    match self.bridge.game_authority().try_bind_output(output) {
+                        super::game_authority_v3::GameStepV3::Ready
+                        | super::game_authority_v3::GameStepV3::Existing => {}
+                        super::game_authority_v3::GameStepV3::Busy => return Ok(()),
+                        _ => return Err("P-C V3 game output binding rejected".into()),
+                    }
                     if !self.try_install_output(output)? {
                         return Ok(());
                     }
