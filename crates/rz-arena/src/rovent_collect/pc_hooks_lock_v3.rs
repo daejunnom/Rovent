@@ -43,6 +43,7 @@ struct RootQuotaV3 {
     teacher_seal_error: Option<AdaptiveCollectionError>,
     unstarted_recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
     claimed_unstarted_recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
+    aborted_pre_route_recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
 }
 
 pub(crate) enum PcQuotaOutcomeV3 {
@@ -202,7 +203,7 @@ impl PcRootQuotaLedgerV3 {
             admission: admission.clone(), worker_reserved: true, teacher_reserved: false,
             joined: None, retired_teacher_handoff: None, unclaimed_teacher_ack: None,
             teacher_seal_unknown: false, teacher_seal_panic: None, teacher_seal_error: None,
-            unstarted_recovery: None, claimed_unstarted_recovery: None,
+            unstarted_recovery: None, claimed_unstarted_recovery: None, aborted_pre_route_recovery: None,
         });
         PcQuotaOutcomeV3::Reserved
     }
@@ -370,6 +371,7 @@ struct PcRootSlotV3 {
     installed: bool,
     unstarted_terminal: bool,
     claimed_unstarted_terminal: bool,
+    aborted_pre_route_terminal: bool,
     recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
     owner: Option<RoventCollectionOwnerLockV3>,
     route: Option<SpeculativeRootV3>,
@@ -392,6 +394,44 @@ struct PcBridgeStateV3 {
 }
 
 impl PcRootSlotV3 {
+    /// Revalidate only the same game's actual pre-route teacher aggregate.
+    /// This authorizes CPU quota retirement, not native or game success.
+    fn aborted_pre_route_valid(
+        &self,
+        bridge: &Arc<RoventPcCollectionBridgeV3>,
+        root: &RootQuotaV3,
+    ) -> Result<Option<bool>, &'static str> {
+        if !self.aborted_pre_route_terminal || !bridge.game.abort_requested()
+            || !root.admission.same_original_admission(&self.admission)
+            || !self.game_registered || !self.quota_registered || self.dispatch_claim.is_some()
+            || self.dispatch != PcRootDispatchV3::Enqueued || !self.requested
+            || !self.dispatch_receipt.as_ref().is_some_and(|receipt|
+                receipt.matches_game(&bridge.game) && receipt.matches_root(&self.admission)
+                    && receipt.outcome() == super::game_authority_v3::GameDispatchOutcomeV3::Sent)
+            || self.installed || self.worker.is_some() || self.route.is_some()
+            || self.owner.is_some() || self.route_retirement.is_some() || self.stage.is_some() || self.pump.is_some()
+            || self.observer.is_some() || self.handoff.is_some() || self.joined.is_some()
+            || self.custody_taken || self.returned.is_some() || self.join_failure.is_some() || self.join_panic.is_some()
+            || root.worker_reserved || root.teacher_reserved || root.teacher_seal_unknown
+            || root.teacher_seal_panic.is_some() || root.teacher_seal_error.is_some()
+            || root.unclaimed_teacher_ack.is_some() || root.retired_teacher_handoff.is_some()
+            || root.unstarted_recovery.is_some() || root.claimed_unstarted_recovery.is_some()
+            || root.joined.is_some() {
+            return Ok(Some(false));
+        }
+        let (Some(recovery), Some(original)) = (&self.recovery, &root.aborted_pre_route_recovery)
+            else { return Ok(Some(false)); };
+        if !Arc::ptr_eq(recovery, original) { return Ok(Some(false)); }
+        let recovery = match recovery.try_lock() {
+            Ok(recovery) => recovery,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 pre-route recovery poisoned"),
+        };
+        Ok(Some(recovery.matches_admission(&self.admission)
+            && recovery.matches_received_root(bridge)
+            && recovery.aborted_pre_route_aggregate().is_some_and(|ack|
+                ack.matches_admission(&self.admission))))
+    }
     /// Before a dispatch claim exists, observe this exact native root while
     /// holding bridge state then ledger. An authority lock conflict is
     /// Pending; a poisoned/other failure is retained for this root.
@@ -416,7 +456,7 @@ impl PcRootSlotV3 {
                 || root.retired_teacher_handoff.is_some() || root.unclaimed_teacher_ack.is_some()
                 || root.teacher_seal_unknown || root.teacher_seal_panic.is_some()
                 || root.teacher_seal_error.is_some() || root.unstarted_recovery.is_some()
-                || root.claimed_unstarted_recovery.is_some() { return Ok(Some(false)); }
+                || root.claimed_unstarted_recovery.is_some() || root.aborted_pre_route_recovery.is_some() { return Ok(Some(false)); }
             Some(index)
         } else {
             if ledger.roots.iter().any(|root|
@@ -462,7 +502,7 @@ impl PcRootSlotV3 {
                     && root.retired_teacher_handoff.is_none() && root.unclaimed_teacher_ack.is_none()
                     && !root.teacher_seal_unknown && root.teacher_seal_panic.is_none()
                     && root.teacher_seal_error.is_none() && root.unstarted_recovery.is_none()
-                    && root.claimed_unstarted_recovery.is_none()),
+                    && root.claimed_unstarted_recovery.is_none() && root.aborted_pre_route_recovery.is_none()),
         }
     }
 
@@ -497,7 +537,7 @@ impl PcRootSlotV3 {
             || root.retired_teacher_handoff.is_some() || root.unclaimed_teacher_ack.is_some()
             || root.teacher_seal_unknown || root.teacher_seal_panic.is_some()
             || root.teacher_seal_error.is_some() || root.unstarted_recovery.is_some()
-            || root.claimed_unstarted_recovery.is_some() {
+            || root.claimed_unstarted_recovery.is_some() || root.aborted_pre_route_recovery.is_some() {
             return Ok(false);
         }
         // No fallible call or external callback between retaining the exact
@@ -515,7 +555,7 @@ impl PcRootSlotV3 {
             && self.dispatch_claim.is_none()
             && self.dispatch == PcRootDispatchV3::BeforeDispatch
             && !self.requested && !self.installed && !self.unstarted_terminal
-            && !self.claimed_unstarted_terminal && self.recovery.is_none()
+            && !self.claimed_unstarted_terminal && !self.aborted_pre_route_terminal && self.recovery.is_none()
             && self.owner.is_none() && self.route.is_none() && self.route_retirement.is_none()
             && self.stage.is_none() && self.pump.is_none() && self.observer.is_none()
             && self.worker.is_none() && self.handoff.is_none() && self.joined.is_none()
@@ -546,7 +586,7 @@ impl PcRootSlotV3 {
             && root.retired_teacher_handoff.is_none() && root.unclaimed_teacher_ack.is_none()
             && !root.teacher_seal_unknown && root.teacher_seal_panic.is_none()
             && root.teacher_seal_error.is_none() && root.unstarted_recovery.is_none()
-            && root.claimed_unstarted_recovery.is_none())
+            && root.claimed_unstarted_recovery.is_none() && root.aborted_pre_route_recovery.is_none())
     }
 
     /// Called only with this bridge's state and ledger held in that order.
@@ -579,7 +619,7 @@ impl PcRootSlotV3 {
             && self.dispatch_claim.is_none() && self.dispatch_receipt.is_none() && self.dispatch_rejected.is_none()
             && self.root_not_accepting.is_none() && self.root_authority_failure.is_none()
             && !self.requested && !self.installed && !self.quota_registered
-            && !self.unstarted_terminal && !self.claimed_unstarted_terminal
+            && !self.unstarted_terminal && !self.claimed_unstarted_terminal && !self.aborted_pre_route_terminal
             && self.recovery.is_none() && self.owner.is_none() && self.route.is_none()
             && self.route_retirement.is_none() && self.stage.is_none() && self.pump.is_none()
             && self.observer.is_none() && self.worker.is_none() && self.handoff.is_none()
@@ -1016,6 +1056,74 @@ impl RoventPcCollectionBridgeV3 {
         Ok(Some(true))
     }
 
+    /// A game-aborted root may already have started teacher actors before a
+    /// route existed. Retain the same recovery and actual joined aggregate;
+    /// this retires only its own CPU quotas, not native or output custody.
+    pub(crate) fn try_release_aborted_pre_route(
+        self: &Arc<Self>,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<PcRootRecoveryV3>>,
+    ) -> Result<Option<bool>, &'static str> {
+        if !self.game.abort_requested() { return Err("P-C V3 game abort not requested"); }
+        let mut original = match recovery.try_lock() {
+            Ok(owner) => owner,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 pre-route recovery poisoned"),
+        };
+        if !original.matches_admission(admission) || !original.matches_received_root(self) {
+            return Err("P-C V3 pre-route original recovery differs");
+        }
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 roots poisoned"),
+        };
+        let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(admission))
+            .ok_or("P-C V3 pre-route root absent")?;
+        if slot.dispatch_claim.is_some() || slot.dispatch == PcRootDispatchV3::DispatchingUnknown
+            || slot.dispatch_receipt.is_none() || !slot.requested { return Ok(None); }
+        if !slot.recovery.as_ref().is_some_and(|old| Arc::ptr_eq(old, recovery))
+            || !slot.game_registered || !slot.quota_registered
+            || slot.dispatch != PcRootDispatchV3::Enqueued
+            || !slot.dispatch_receipt.as_ref().is_some_and(|receipt|
+                receipt.matches_game(&self.game) && receipt.matches_root(admission)
+                    && receipt.outcome() == super::game_authority_v3::GameDispatchOutcomeV3::Sent)
+            || slot.installed || slot.worker.is_some() || slot.route.is_some()
+            || slot.owner.is_some() || slot.route_retirement.is_some() || slot.stage.is_some() || slot.pump.is_some()
+            || slot.observer.is_some() || slot.handoff.is_some() || slot.joined.is_some()
+            || slot.custody_taken || slot.returned.is_some() || slot.join_failure.is_some() || slot.join_panic.is_some() {
+            return Err("P-C V3 pre-route slot acquired another owner");
+        }
+        if !original.seal_aborted_pre_route() { return Ok(None); }
+        if !original.aborted_pre_route_aggregate().is_some_and(|ack| ack.matches_admission(admission)) {
+            return Err("P-C V3 pre-route aggregate differs");
+        }
+        slot.aborted_pre_route_terminal = true;
+        let mut ledger = match self.ledger.try_lock() {
+            Ok(ledger) => ledger,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 quota ledger poisoned"),
+        };
+        let root = ledger.roots.iter_mut().find(|root| root.admission.same_original_admission(admission))
+            .ok_or("P-C V3 pre-route quota root absent")?;
+        if let Some(old) = &root.aborted_pre_route_recovery {
+            return if Arc::ptr_eq(old, recovery) && !root.teacher_reserved && !root.worker_reserved {
+                Ok(Some(true))
+            } else { Err("P-C V3 pre-route quota recovery differs") };
+        }
+        if !root.teacher_reserved || !root.worker_reserved || root.teacher_seal_unknown
+            || root.teacher_seal_panic.is_some() || root.teacher_seal_error.is_some()
+            || root.unclaimed_teacher_ack.is_some() || root.retired_teacher_handoff.is_some()
+            || root.unstarted_recovery.is_some() || root.claimed_unstarted_recovery.is_some()
+            || root.joined.is_some() {
+            return Err("P-C V3 pre-route quota ownership differs");
+        }
+        root.aborted_pre_route_recovery = Some(Arc::clone(recovery));
+        root.teacher_reserved = false;
+        root.worker_reserved = false;
+        Ok(Some(true))
+    }
+
     /// Publish the exact root recovery owner before route creation, scope
     /// claim, worker startup, or teacher actor spawn. The caller retains its
     /// Arc on Busy or error; this does not itself reserve teacher quota.
@@ -1159,6 +1267,10 @@ impl RoventPcCollectionBridgeV3 {
         };
         let Some(slot) = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(&original.admission))
         else { return PcPreparedOutcomeV3::Rejected("P-C V3 original request absent", original); };
+        if slot.aborted_pre_route_terminal || slot.unstarted_terminal || slot.claimed_unstarted_terminal
+            || slot.root_not_accepting.is_some() || slot.guard_aborted.is_some() || slot.dispatch_rejected.is_some() {
+            return PcPreparedOutcomeV3::Rejected("P-C V3 original root is already terminal", original);
+        }
         if !slot.recovery.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, &original.recovery)) {
             return PcPreparedOutcomeV3::Rejected("P-C V3 original recovery owner missing", original);
         }
@@ -1356,7 +1468,12 @@ impl RoventPcCollectionBridgeV3 {
             if root.worker_reserved || root.teacher_reserved || root.teacher_seal_unknown {
                 return Ok(None);
             }
-            if slot.unstarted_terminal {
+            if slot.aborted_pre_route_terminal {
+                match slot.aborted_pre_route_valid(self, root)? {
+                    Some(true) => {},
+                    Some(false) | None => return Ok(None),
+                }
+            } else if slot.unstarted_terminal {
                 let (Some(owner), Some(ack)) = (&root.unstarted_recovery, &root.unclaimed_teacher_ack)
                     else { return Ok(None); };
                 if !Arc::ptr_eq(owner, recovery) || !ack.matches_admission(&slot.admission)
@@ -1634,7 +1751,7 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                     _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 game reservation differs or is unresolved"), admission)),
                 };
                 state.roots.push(PcRootSlotV3 { admission: admission.clone(), game_reservation: Some(reservation), game_abort: None, guard_aborted: None, dispatch_claim: None, dispatch_receipt: None, dispatch_rejected: None, root_not_accepting: None, root_authority_failure: None, game_registered: false, quota_registered: false,
-                    dispatch: PcRootDispatchV3::BeforeDispatch, requested: false, installed: false, unstarted_terminal: false, claimed_unstarted_terminal: false, recovery: None,
+                    dispatch: PcRootDispatchV3::BeforeDispatch, requested: false, installed: false, unstarted_terminal: false, claimed_unstarted_terminal: false, aborted_pre_route_terminal: false, recovery: None,
                     owner: None, route: None, route_retirement: None, stage: None, pump: None, observer: None, worker: None,
                     handoff: None, joined: None, custody_taken: false, returned: None, join_failure: None, join_panic: None });
                 state.roots.len() - 1
@@ -1703,7 +1820,7 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                 _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 duplicate root reservation"), admission)),
             }
         }
-        if slot.unstarted_terminal || slot.claimed_unstarted_terminal {
+        if slot.unstarted_terminal || slot.claimed_unstarted_terminal || slot.aborted_pre_route_terminal {
             return Err(failure(AdaptiveManagerError::Invalid("P-C V3 original root failed before worker startup"), admission));
         }
         if !slot.requested {
@@ -1862,6 +1979,20 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                 match slot.guard_aborted_no_dispatch_valid(&self.game, &ledger) {
                     Ok(true) => continue,
                     Ok(false) => return Ok(None),
+                    Err(error) => return Err(AdaptiveManagerError::Invalid(error)),
+                }
+            }
+            if slot.aborted_pre_route_terminal {
+                let ledger = match self.ledger.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err(AdaptiveManagerError::Invalid("P-C V3 ledger poisoned")),
+                };
+                let Some(root) = ledger.roots.iter().find(|root|
+                    root.admission.same_original_admission(&slot.admission)) else { return Ok(None); };
+                match slot.aborted_pre_route_valid(&bridge, root) {
+                    Ok(Some(true)) => continue,
+                    Ok(Some(false) | None) => return Ok(None),
                     Err(error) => return Err(AdaptiveManagerError::Invalid(error)),
                 }
             }
