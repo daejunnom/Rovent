@@ -61,6 +61,9 @@ mod pc_lock_v2;
 mod pc_lock_v3;
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 #[allow(dead_code)]
+mod pc_managed_prepare_v3;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+#[allow(dead_code)]
 mod pc_recovery_v3;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod teacher_fixture_identity_v1;
