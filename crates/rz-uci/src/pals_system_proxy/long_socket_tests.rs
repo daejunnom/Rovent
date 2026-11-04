@@ -10,7 +10,7 @@ use std::{
         fd::AsRawFd,
         unix::{
             ffi::OsStrExt,
-            fs::{FileTypeExt, MetadataExt, PermissionsExt},
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt},
             net::{UnixListener, UnixStream},
         },
     },
@@ -111,8 +111,7 @@ fn long_private_root_uses_separately_opened_directory_fds() {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir(&root).unwrap();
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let metadata = fs::symlink_metadata(&root).unwrap();
     let mut fixture = Fixture {
         root: root.clone(),
