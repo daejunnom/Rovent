@@ -46,6 +46,7 @@ struct GameEffectRecordV3 {
     root: RoventCollectionRootAdmissionV3,
     kind: GameEffectKindV3,
     stage: Arc<()>,
+    actor: Option<Arc<()>>,
     active: bool,
 }
 
@@ -56,6 +57,7 @@ pub(super) struct GameEffectSourceV3<S> {
     root: RoventCollectionRootAdmissionV3,
     kind: GameEffectKindV3,
     stage: Arc<()>,
+    actor: Option<Arc<()>>,
     _requires_original_stage: Infallible,
 }
 
@@ -66,7 +68,16 @@ pub(super) struct GameEffectOutcomeV3<S> {
     root: RoventCollectionRootAdmissionV3,
     kind: GameEffectKindV3,
     stage: Arc<()>,
+    actor: Option<Arc<()>>,
     _requires_original_result: Infallible,
+}
+
+fn same_effect_actor(a: &Option<Arc<()>>, b: &Option<Arc<()>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 struct StateV3<S> {
@@ -400,6 +411,9 @@ impl<S> GameAuthorityV3<S> {
         if !Arc::ptr_eq(self, &source.owner) {
             return GameStepV3::Foreign;
         }
+        if (source.kind == GameEffectKindV3::TeacherActor) != source.actor.is_some() {
+            return GameStepV3::Foreign;
+        }
         let mut state = match self.lock() {
             Ok(s) => s,
             Err(e) => return e,
@@ -418,6 +432,7 @@ impl<S> GameAuthorityV3<S> {
             effect.root.same_original_admission(&source.root)
                 && effect.kind == source.kind
                 && Arc::ptr_eq(&effect.stage, &source.stage)
+                && same_effect_actor(&effect.actor, &source.actor)
         }) {
             return GameStepV3::Existing;
         }
@@ -432,6 +447,8 @@ impl<S> GameAuthorityV3<S> {
         let state_root = source.root.clone();
         let stage = Arc::clone(&source.stage);
         let retained_stage = Arc::clone(&source.stage);
+        let actor = source.actor.clone();
+        let retained_actor = source.actor.clone();
         let owner = Arc::clone(self);
         let mut current = self.control.load(Ordering::SeqCst);
         loop {
@@ -462,6 +479,7 @@ impl<S> GameAuthorityV3<S> {
             root: state_root,
             kind: source.kind,
             stage,
+            actor,
             active: true,
         });
         *destination = Some(GameEffectClaimV3 {
@@ -469,6 +487,7 @@ impl<S> GameAuthorityV3<S> {
             root: retained_root,
             kind: source.kind,
             stage: retained_stage,
+            actor: retained_actor,
             resolved: false,
         });
         GameStepV3::Ready
@@ -1061,6 +1080,7 @@ pub(super) struct GameEffectClaimV3<S> {
     root: RoventCollectionRootAdmissionV3,
     kind: GameEffectKindV3,
     stage: Arc<()>,
+    actor: Option<Arc<()>>,
     resolved: bool,
 }
 impl<S> GameEffectClaimV3<S> {
@@ -1071,6 +1091,7 @@ impl<S> GameEffectClaimV3<S> {
             || !self.root.same_original_admission(&result.root)
             || self.kind != result.kind
             || !Arc::ptr_eq(&self.stage, &result.stage)
+            || !same_effect_actor(&self.actor, &result.actor)
         {
             return GameStepV3::Foreign;
         }
@@ -1086,6 +1107,7 @@ impl<S> GameEffectClaimV3<S> {
                 && effect.root.same_original_admission(&self.root)
                 && effect.kind == self.kind
                 && Arc::ptr_eq(&effect.stage, &self.stage)
+                && same_effect_actor(&effect.actor, &self.actor)
         }) else {
             return GameStepV3::Unknown;
         };
