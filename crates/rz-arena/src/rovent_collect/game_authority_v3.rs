@@ -273,14 +273,14 @@ impl<S> GameAuthorityV3<S> {
         self: &Arc<Self>,
         root: &RoventCollectionRootAdmissionV3,
     ) -> RootReservationV3<S> {
-        if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+        if self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0 {
             return RootReservationV3::Rejected(GameStepV3::Aborted);
         }
         let mut state = match self.lock() {
             Ok(s) => s,
             Err(e) => return RootReservationV3::Rejected(e),
         };
-        if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+        if self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0 {
             return RootReservationV3::Rejected(GameStepV3::Aborted);
         }
         if state.phase != PhaseV3::Open {
@@ -604,14 +604,14 @@ impl<S> GameAuthorityV3<S> {
         if !Arc::ptr_eq(&self.identity, &proof.owner) {
             return GameStepV3::Foreign;
         }
-        if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+        if self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0 {
             return GameStepV3::Aborted;
         }
         let mut state = match self.lock() {
             Ok(s) => s,
             Err(e) => return e,
         };
-        if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+        if self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0 {
             return GameStepV3::Aborted;
         }
         if !state.pending.is_empty()
@@ -646,11 +646,11 @@ impl<S> GameAuthorityV3<S> {
         if !Arc::ptr_eq(&self.identity, &proof.owner) {
             return Err(GameStepV3::Foreign);
         }
-        if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+        if self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0 {
             return Err(GameStepV3::Aborted);
         }
         let mut state = self.lock()?;
-        if (self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+        if self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0 {
             return Err(GameStepV3::Aborted);
         }
         if state.phase != PhaseV3::Closed
@@ -732,7 +732,7 @@ impl<S> GameRootReservationV3<S> {
         };
         let root = state.pending.remove(index);
         state.admitted.push(root);
-        if (self.owner.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0) {
+        if self.owner.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0 {
             self.abort_receipt = Some(GameRootAbortReceiptV3 {
                 owner: Arc::clone(&self.owner),
                 root: self.root.clone(),
