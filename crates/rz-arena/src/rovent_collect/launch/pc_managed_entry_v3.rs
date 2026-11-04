@@ -333,6 +333,9 @@ impl ManagedPcEntryResultV3 {
                     *recovered_settled = true;
                     ManagedPcEntryProgressV3::Failed
                 }
+                Ok(Ok(false)) if original_run.before_native_recovered() => {
+                    ManagedPcEntryProgressV3::Failed
+                }
                 Ok(Ok(false)) => ManagedPcEntryProgressV3::Pending,
                 Ok(Err(error)) => {
                     *recovery_error = Some(error);
@@ -375,6 +378,7 @@ impl ManagedPcEntryResultV3 {
                 *settled = true;
                 ManagedPcEntryProgressV3::Settled
             }
+            Ok(Ok(false)) if original.before_native_recovered() => ManagedPcEntryProgressV3::Failed,
             Ok(Ok(false)) => ManagedPcEntryProgressV3::Pending,
             Ok(Err(error)) => {
                 *failure = Some(error);
@@ -399,6 +403,14 @@ impl ManagedPcEntryResultV3 {
     /// Diagnostic only. Errors and panic payloads remain in the original
     /// owner; no raw credentials or source file contents are exposed.
     pub fn observation(&self) -> serde_json::Value {
+        let before_native_recovered = match &self.original {
+            EntryState::Run { original, .. } => original.before_native_recovered(),
+            EntryState::Start {
+                recovered: Some(original),
+                ..
+            } => original.before_native_recovered(),
+            _ => false,
+        };
         let no_worker_close = match &self.original {
             EntryState::Start {
                 output_close: Some(evidence),
@@ -502,6 +514,7 @@ impl ManagedPcEntryResultV3 {
             "recovery_panic":recovery_panic,
             "cleanup_deadline_elapsed":cleanup_deadline_elapsed,
             "owner_settlement":settlement,
+            "before_native_scope_recovered":before_native_recovered,
             "no_worker_output_close":no_worker_close,
             "teacher_completion":"unknown",
             "gpu_physical_completion":"unknown",
