@@ -12,7 +12,7 @@ import time
 
 
 def retain_original_owner(child, transport, publish, *, poll_interval=1.0,
-                          waitid=os.waitid, sleeper=time.sleep):
+                          waitid=None, sleeper=time.sleep):
     """Wait for the original owner's release or loss, without signaling it.
 
     ``publish`` receives the same mutable incident record and should preserve
@@ -20,6 +20,10 @@ def retain_original_owner(child, transport, publish, *, poll_interval=1.0,
     dropping the original owner. A reported session release is only the same
     child's control observation, never a device-wide completion claim.
     """
+    if waitid is None:
+        waitid = getattr(os, "waitid", None)
+        if waitid is None:
+            raise RuntimeError("non-reaping original-owner observation requires Linux waitid")
     record = {
         "state": "quarantined",
         "reason": "original_native_owner_unresolved_after_stop",
