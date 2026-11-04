@@ -8,7 +8,7 @@ use super::teacher::v3_pump::TeacherPumpV3;
 use super::teacher::v3_session::TeacherSessionStagingV3;
 use super::native_capture::RoventNativeCaptureRegistration;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
-use super::pc_worker_v3::{ClaimedUnstartedPollV3, PcConsumerRetirementV3, PcRootRecoveryV3, PcWorkerSupervisorV3};
+use super::pc_worker_v3::{ClaimedUnstartedPollV3, PcConsumerRetirementV3, PcRootRecoveryV3, PcWorkerSupervisorV3, PcSupervisorJoinedProofV3, SupervisorStartCustodyV3};
 use super::{ArenaError, invalid};
 use rz_uci::pals_adaptive::{AdaptiveCollectionBoundaryV2, AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3,
     AdaptiveManagerError, RoleOnlyCollectionV3InstallAttempt, RoventCollectionRootAdmissionV3, RoventNoCaptureRootCapabilityV3,
@@ -595,6 +595,16 @@ pub(super) struct PcGameAdmissionSealV3 {
     _native: RoventPcCollectionNativeFenceV3,
 }
 
+/// The bridge observed the same supervisor's actual non-panicking join.
+/// Weak references avoid a bridge/supervisor ownership cycle. This is not
+/// evidence of successful work, output publication or GPU completion.
+struct PcGameJoinedSealV3 {
+    game: Weak<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>,
+    custody: Weak<Mutex<SupervisorStartCustodyV3>>,
+    supervisor: Weak<Mutex<PcWorkerSupervisorV3>>,
+    native: Weak<RoventPcCollectionLaunchOwnerV3>,
+}
+
 impl PcGameAdmissionSealV3 {
     pub(super) fn matches_game(
         &self,
@@ -615,6 +625,7 @@ pub(crate) struct RoventPcCollectionBridgeV3 {
     startup: OnceLock<RoventStartupControl>,
     native_owner: OnceLock<Weak<RoventPcCollectionLaunchOwnerV3>>,
     game_admission_seal: OnceLock<PcGameAdmissionSealV3>,
+    game_joined_seal: OnceLock<PcGameJoinedSealV3>,
     input_lock_identity: OnceLock<rz_uci::rovent_bootstrap::launch::RoventPcCollectionInputLockIdentityV3>,
     supervisor: OnceLock<Weak<Mutex<PcWorkerSupervisorV3>>>,
     state: Mutex<PcBridgeStateV3>,
@@ -694,7 +705,7 @@ impl RoventPcCollectionBridgeV3 {
         Ok(Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
             ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
-            inputs, game, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), game_admission_seal: OnceLock::new(), input_lock_identity: OnceLock::new(), supervisor: OnceLock::new(),
+            inputs, game, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), game_admission_seal: OnceLock::new(), game_joined_seal: OnceLock::new(), input_lock_identity: OnceLock::new(), supervisor: OnceLock::new(),
             state: Mutex::new(PcBridgeStateV3 { roots, deferred }), requests,
             request_receiver: Mutex::new(receiver),
         }))
@@ -702,6 +713,41 @@ impl RoventPcCollectionBridgeV3 {
 
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> { &self.inputs }
     pub(super) fn game_authority(&self) -> &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>> { &self.game }
+    /// Record only this launch's actual joined driver. A panicked driver is
+    /// kept separate from physical cleanup and cannot grant game closure.
+    pub(super) fn try_bind_game_joined(
+        &self,
+        proof: &PcSupervisorJoinedProofV3,
+        custody: &Arc<Mutex<SupervisorStartCustodyV3>>,
+    ) -> Result<Option<bool>, &'static str> {
+        let Some(native) = self.native_owner.get().and_then(Weak::upgrade) else {
+            return Err("P-C V3 original native owner absent");
+        };
+        let Some(supervisor) = self.supervisor.get().and_then(Weak::upgrade) else {
+            return Err("P-C V3 original supervisor absent");
+        };
+        if !proof.matches_original(custody, &supervisor, &native) {
+            return Err("P-C V3 joined driver belongs to another launch");
+        }
+        if proof.panicked() { return Ok(Some(false)); }
+        if self.game_admission_seal.get().is_none() { return Ok(None); }
+        let candidate = PcGameJoinedSealV3 {
+            game: Arc::downgrade(&self.game),
+            custody: Arc::downgrade(custody),
+            supervisor: Arc::downgrade(&supervisor),
+            native: Arc::downgrade(&native),
+        };
+        if let Err(candidate) = self.game_joined_seal.set(candidate) {
+            let Some(original) = self.game_joined_seal.get() else { return Ok(None); };
+            if !Weak::ptr_eq(&original.game, &candidate.game)
+                || !Weak::ptr_eq(&original.custody, &candidate.custody)
+                || !Weak::ptr_eq(&original.supervisor, &candidate.supervisor)
+                || !Weak::ptr_eq(&original.native, &candidate.native) {
+                return Err("P-C V3 joined driver identity changed");
+            }
+        }
+        Ok(Some(true))
+    }
     /// Bind the lock identity issued by this launch's authenticated gate
     /// before the native driver or any root can be started.
     pub(super) fn bind_input_lock_identity(
