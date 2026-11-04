@@ -110,6 +110,45 @@ fn normal(start: Instant, milliseconds: u64) -> PreparedSearchBinding {
     )
 }
 
+#[cfg(feature = "pals-adaptive")]
+#[test]
+fn nonblocking_observation_preserves_original_clock_under_contention() {
+    let clock = ProcessClock::new(ProcessEpoch(9201));
+    let start = Instant::now();
+    let budget = original(start);
+    let cleanup = budget.output_deadline + Duration::from_secs(1);
+    let (_owner, handle) =
+        RoventPonderClockOwner::new(ticket(), authority(&clock), budget, cleanup, &clock).unwrap();
+    let guard = handle.shared.state.lock().expect("original clock owner");
+    assert!(handle.try_snapshot(start).unwrap().is_none());
+    drop(guard);
+    let observed = handle
+        .try_snapshot(start)
+        .unwrap()
+        .expect("same clock becomes available");
+    assert_eq!(*observed.budget(), budget);
+    assert!(!observed.soft_expired(start));
+}
+
+#[cfg(feature = "pals-adaptive")]
+#[test]
+fn nonblocking_observation_reports_poison_separately_from_busy() {
+    let clock = ProcessClock::new(ProcessEpoch(9201));
+    let start = Instant::now();
+    let budget = original(start);
+    let cleanup = budget.output_deadline + Duration::from_secs(1);
+    let (_owner, handle) =
+        RoventPonderClockOwner::new(ticket(), authority(&clock), budget, cleanup, &clock).unwrap();
+    let poisoned = handle.clone();
+    let _ = std::panic::catch_unwind(move || {
+        let _guard = poisoned.shared.state.lock().unwrap();
+        panic!("exercise clock-owner poisoning");
+    });
+    assert!(
+        matches!(handle.try_snapshot(start), Err(error) if error.code == ErrorCode::BackendFailure)
+    );
+}
+
 #[test]
 fn hit_is_same_ticket_once_and_caps_every_original_boundary() {
     let clock = ProcessClock::new(ProcessEpoch(9201));
@@ -138,6 +177,8 @@ fn hit_is_same_ticket_once_and_caps_every_original_boundary() {
     );
     assert!(handle.wait_changed(observed, Duration::ZERO));
     let snapshot = handle.snapshot(hit_at);
+    #[cfg(feature = "pals-adaptive")]
+    assert_eq!(handle.try_snapshot(hit_at).unwrap(), Some(snapshot));
     let effective = snapshot.budget();
     assert_eq!(effective.start, original.start);
     assert_eq!(effective.soft_deadline, normal.budget().soft_deadline);

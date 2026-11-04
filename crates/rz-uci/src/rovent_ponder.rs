@@ -102,6 +102,10 @@ impl RoventPonderClockSnapshot {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn is_valid_observation(&self) -> bool {
+        self.valid_observation
+    }
     pub fn can_admit(&self, now: Instant) -> bool {
         self.live() && self.budget.can_admit(now.max(self.observed_at))
     }
@@ -265,6 +269,37 @@ impl Drop for RoventPonderClockOwner {
 }
 
 impl RoventPonderClockHandle {
+    /// Observe the same owner clock without waiting on its mutex. `None` is
+    /// temporary contention and must not be treated as a valid clock result.
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn try_snapshot(
+        &self,
+        now: Instant,
+    ) -> Result<Option<RoventPonderClockSnapshot>, ContractError> {
+        let mut state = match self.shared.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(error(
+                    ErrorCode::BackendFailure,
+                    "ponder clock state is poisoned",
+                ));
+            }
+        };
+        let valid_observation =
+            self.shared.process_clock.tick_at(now).is_ok() && now >= self.shared.original.start;
+        if valid_observation {
+            state.observed_at = state.observed_at.max(now);
+        }
+        Ok(Some(RoventPonderClockSnapshot {
+            budget: state.hit.map_or(self.shared.original, |hit| hit.budget),
+            hit: state.hit,
+            closed: state.closed,
+            valid_observation,
+            observed_at: state.observed_at,
+        }))
+    }
+
     pub fn snapshot(&self, now: Instant) -> RoventPonderClockSnapshot {
         match self.shared.state.lock() {
             Ok(mut state) => {

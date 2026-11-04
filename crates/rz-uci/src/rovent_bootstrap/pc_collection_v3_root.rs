@@ -17,6 +17,80 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, atomic::Ordering};
 use std::time::{Duration, Instant};
 
+/// Observe the original clock and authority without waiting on either owner.
+/// Busy does not grant admission, revoke a root, or release any custody.
+fn try_admission_live(
+    context: &SearchSessionContext,
+    phase: ManagerPhase,
+) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveManagerError> {
+    let now = Instant::now();
+    if context.cancellation.is_canceled() || context.control.cancellation.load(Ordering::Acquire) {
+        return Err(AdaptiveManagerError::Contract(
+            rz_contracts::ContractError::new(
+                rz_contracts::ErrorCode::Canceled,
+                rz_contracts::Stage::Admission,
+                "P/C V3 admission canceled",
+            ),
+        ));
+    }
+    if now >= context.control.deadline {
+        return Err(AdaptiveManagerError::Deadline);
+    }
+    if phase != ManagerPhase::Running {
+        return Err(AdaptiveManagerError::AdmissionClosed);
+    }
+    let soft_expired = if let Some(clock) = &context.effective_clock {
+        let Some(snapshot) = clock
+            .try_snapshot(now)
+            .map_err(AdaptiveManagerError::Contract)?
+        else {
+            return Ok(AdaptiveCollectionBoundaryV2::Busy);
+        };
+        if snapshot.is_closed() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
+        if !snapshot.is_valid_observation() {
+            return Err(AdaptiveManagerError::Contract(
+                rz_contracts::ContractError::new(
+                    rz_contracts::ErrorCode::BackendFailure,
+                    rz_contracts::Stage::Admission,
+                    "P/C V3 clock observation invalid",
+                ),
+            ));
+        }
+        snapshot.soft_expired(now)
+    } else {
+        now >= context.control.soft_deadline
+    };
+    if soft_expired {
+        return Err(AdaptiveManagerError::Deadline);
+    }
+    match context.try_accepts() {
+        Ok(true) => Ok(AdaptiveCollectionBoundaryV2::Ready),
+        Ok(false) => {
+            if context.cancellation.is_canceled()
+                || context.control.cancellation.load(Ordering::Acquire)
+            {
+                Err(AdaptiveManagerError::Contract(
+                    rz_contracts::ContractError::new(
+                        rz_contracts::ErrorCode::Canceled,
+                        rz_contracts::Stage::Admission,
+                        "P/C V3 admission canceled",
+                    ),
+                ))
+            } else if Instant::now() >= context.control.deadline {
+                Err(AdaptiveManagerError::Deadline)
+            } else {
+                Err(AdaptiveManagerError::AdmissionClosed)
+            }
+        }
+        Err(error) if error.code == rz_contracts::ErrorCode::ResourceExhausted => {
+            Ok(AdaptiveCollectionBoundaryV2::Busy)
+        }
+        Err(error) => Err(AdaptiveManagerError::Contract(error)),
+    }
+}
+
 /// Handoff and custody may be held by the teacher worker. Never wait on
 /// these locks while driving root completion or while transferring ownership.
 fn try_shared_owner<T>(owner: &Mutex<T>) -> Result<MutexGuard<'_, T>, AdaptiveManagerError> {
@@ -69,6 +143,27 @@ impl PcCollectionRootRunV3 {
         )?;
         self.admission = Some(admission.clone());
         loop {
+            match try_admission_live(context, manager.phase()) {
+                Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                Ok(AdaptiveCollectionBoundaryV2::Busy) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => {
+                    if self.started {
+                        *state
+                            .admission_failure
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) =
+                            Some(RoventPcCollectionAdmissionFailureV3 {
+                                error: error.clone(),
+                                admission: admission.clone(),
+                                owners: Box::new(()),
+                            });
+                    }
+                    return Err(error);
+                }
+            }
             // The hook may panic after taking ownership. Publish the root and
             // its outstanding lease before calling it.
             self.started = true;
@@ -193,28 +288,6 @@ impl PcCollectionRootRunV3 {
                         .unwrap_or_else(|p| p.into_inner()) = Some(failure);
                     return Err(error);
                 }
-            }
-            if !context.accepts().unwrap_or(false)
-                || context.soft_expired(Instant::now())
-                || manager.phase() != ManagerPhase::Running
-            {
-                if self.started {
-                    *state
-                        .admission_failure
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) =
-                        Some(RoventPcCollectionAdmissionFailureV3 {
-                            error: AdaptiveManagerError::Invalid(
-                                "P/C V3 admission remained uncertain",
-                            ),
-                            admission: admission.clone(),
-                            owners: Box::new(()),
-                        });
-                    return Err(AdaptiveManagerError::Invalid(
-                        "P/C V3 admission remained uncertain",
-                    ));
-                }
-                return Err(AdaptiveManagerError::Deadline);
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -617,5 +690,82 @@ impl PcCollectionRootRunV3 {
         self.settled = true;
         state.outstanding.store(false, Ordering::Release);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_observation_tests {
+    use super::*;
+    use crate::contracts::SessionScope;
+    use rz_contracts::{
+        CancelToken, GameGeneration, ProcessEpoch, RootGeneration, pals::SearchAuthority,
+    };
+    use rz_search::driver::SearchControl;
+
+    fn context() -> SearchSessionContext {
+        let authority = SearchAuthority {
+            epoch: ProcessEpoch(1),
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            implementation: Digest([0; 32]),
+        };
+        let until = Instant::now() + Duration::from_secs(60);
+        SearchSessionContext {
+            authority,
+            original_go: None,
+            original_time_budget: None,
+            original_start: None,
+            effective_clock: None,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
+            requested_nodes: None,
+            control: SearchControl::new(until, 1),
+            cancellation: CancelToken::new(),
+            shutdown_deadline: until,
+            current: Arc::new(Mutex::new(SessionScope::Search(authority))),
+        }
+    }
+
+    #[test]
+    fn authority_contention_is_pending_and_cancellation_is_observed_while_locked() {
+        let context = context();
+        let lock = context.current.lock().expect("original authority");
+        assert!(matches!(
+            try_admission_live(&context, ManagerPhase::Running),
+            Ok(AdaptiveCollectionBoundaryV2::Busy)
+        ));
+        context.cancellation.cancel();
+        assert!(
+            matches!(try_admission_live(&context, ManagerPhase::Running), Err(AdaptiveManagerError::Contract(error)) if error.code == rz_contracts::ErrorCode::Canceled)
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn original_deadline_wins_over_authority_contention() {
+        let mut context = context();
+        context.control.deadline = Instant::now() - Duration::from_secs(1);
+        let lock = context.current.lock().expect("original authority");
+        assert!(matches!(
+            try_admission_live(&context, ManagerPhase::Running),
+            Err(AdaptiveManagerError::Deadline)
+        ));
+        drop(lock);
+    }
+
+    #[test]
+    fn original_authority_must_remain_current() {
+        let context = context();
+        assert!(matches!(
+            try_admission_live(&context, ManagerPhase::Running),
+            Ok(AdaptiveCollectionBoundaryV2::Ready)
+        ));
+        let mut replacement = context.authority;
+        replacement.root = RootGeneration(context.authority.root.0 + 1);
+        *context.current.lock().expect("original authority") = SessionScope::Search(replacement);
+        assert!(matches!(
+            try_admission_live(&context, ManagerPhase::Running),
+            Err(AdaptiveManagerError::AdmissionClosed)
+        ));
     }
 }
