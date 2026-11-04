@@ -597,5 +597,66 @@ mod tests {
             panic!("wrong owner")
         };
         assert!(Arc::ptr_eq(process.factory.as_ref().unwrap(), &factory));
+
+        // A caller-supplied writer can already contain data. The refusal
+        // cleanup path must leave such a writer untouched for its real owner.
+        let mut process = EngineProcess::new(
+            factory.clone(),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(82)),
+        );
+        let close = process.install_priority_close().unwrap();
+        let (sender, events) = event_channel();
+        let output = AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 1, 256)
+            .ok()
+            .unwrap();
+        output
+            .try_submit(crate::runner::async_output::OutputBatch {
+                protocol: b"original\n".to_vec(),
+                diagnostics: Vec::new(),
+            })
+            .unwrap();
+        let mut rejected = match start_async(
+            events,
+            sender,
+            process,
+            EngineSettings::default(),
+            output,
+            close,
+            256,
+            Duration::from_millis(1),
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("unsettled custody guard must reject"),
+        };
+        assert_eq!(
+            rejected.request_unstarted_writer_close(),
+            UnstartedWriterCloseStatus::NotIdle
+        );
+        let AsyncEngineStartFailure::Unstarted {
+            output: Some(mut output),
+            ..
+        } = rejected
+        else {
+            panic!("original writer missing")
+        };
+        assert!(!output.observation().close_requested);
+        // This test is the original owner and explicitly drains its own batch.
+        output.request_close();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match output.try_recover() {
+                Ok(Ok(original)) => {
+                    assert_eq!(original.protocol, b"original\n");
+                    break;
+                }
+                Ok(Err(_)) => panic!("output worker panicked"),
+                Err(original) if Instant::now() < deadline => {
+                    output = original;
+                    std::thread::yield_now();
+                }
+                Err(_) => panic!("original output worker failed to join"),
+            }
+        }
     }
 }
