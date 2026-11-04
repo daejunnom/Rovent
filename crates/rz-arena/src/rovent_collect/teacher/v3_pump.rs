@@ -378,6 +378,19 @@ impl TeacherPumpV3 {
     pub(crate) fn take_completed(&mut self) -> Option<TeacherCompletedV3> {
         self.completed.take()
     }
+    /// Move only into a pre-existing, empty external custody slot. No
+    /// callbacks or fallible operations occur between taking and storing the
+    /// original terminal; a full slot leaves it in this pump.
+    pub(crate) fn transfer_completed(
+        &mut self,
+        destination: &mut Option<TeacherCompletedV3>,
+    ) -> bool {
+        if destination.is_some() || self.completed.is_none() {
+            return false;
+        }
+        *destination = self.completed.take();
+        true
+    }
     pub(crate) fn take_rejected(&mut self) -> Option<Box<TeacherRejectedV3>> {
         self.rejected.take()
     }
