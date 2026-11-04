@@ -86,6 +86,24 @@ pub(super) struct ObservedManagedPlanLeaseV2 {
     original_binding: OriginalInputBindingV2,
 }
 
+/// Retains the original owners and first error even when setup did not finish.
+/// A post-request failure is tainted and is not a successful handoff.
+pub(super) enum ManagedPlanLeaseRejectionV2 {
+    BeforeParts {
+        error: io::Error,
+        fds: ManagedCollectionInheritedFds,
+    },
+    BeforeRequest {
+        error: io::Error,
+        output: ManagedOutputInheritedFds,
+        input: ManagedInputInheritedFds,
+    },
+    AfterRequest {
+        error: io::Error,
+        owner: ObservedManagedPlanLeaseV2,
+    },
+}
+
 /// Opaque same-owner identity; possession does not grant output authority.
 #[derive(Clone)]
 pub(super) struct OriginalInputBindingV2(Arc<()>);
@@ -102,7 +120,7 @@ impl ObservedManagedPlanLeaseV2 {
         expected_plan_sha256: String,
         maximum_plan_bytes: u64,
         deadline: Instant,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, ManagedPlanLeaseRejectionV2> {
         if expected_plan_bytes == 0
             || maximum_plan_bytes == 0
             || expected_plan_bytes > maximum_plan_bytes
@@ -111,40 +129,55 @@ impl ObservedManagedPlanLeaseV2 {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid declared plan bound or SHA-256",
-            ));
+            return Err(ManagedPlanLeaseRejectionV2::BeforeParts {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid declared plan bound or SHA-256",
+                ),
+                fds,
+            });
         }
         let (output, input) = fds.into_parts();
-        let peer = output.peer_credentials()?;
-        if peer.pid <= 0 || peer.pid != getppid().as_raw() || peer.uid != geteuid().as_raw() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "managed output peer is not the original direct parent",
-            ));
-        }
-        let plan = input.try_clone_plan()?;
-        let plan_original = plan_metadata(&plan)?;
-        if plan_original.size != expected_plan_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "original plan length differs from declaration",
-            ));
-        }
-        let output_identity = output.directory_identity()?;
-        let input_identity = input.directory_identity()?;
-        let nonce = loop {
-            if Instant::now() >= deadline {
+        let preparation = (|| -> io::Result<_> {
+            let peer = output.peer_credentials()?;
+            if peer.pid <= 0 || peer.pid != getppid().as_raw() || peer.uid != geteuid().as_raw() {
                 return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "managed output /2 session setup deadline elapsed",
+                    io::ErrorKind::PermissionDenied,
+                    "managed output peer is not the original direct parent",
                 ));
             }
-            match managed_output_session_nonce() {
-                Ok(value) => break value,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
+            let plan_original = plan_metadata(&input.try_clone_plan()?)?;
+            if plan_original.size != expected_plan_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "original plan length differs from declaration",
+                ));
+            }
+            let output_identity = output.directory_identity()?;
+            let input_identity = input.directory_identity()?;
+            let nonce = loop {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "managed output /2 session setup deadline elapsed",
+                    ));
+                }
+                match managed_output_session_nonce() {
+                    Ok(value) => break value,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+            Ok((peer, plan_original, output_identity, input_identity, nonce))
+        })();
+        let (peer, plan_original, output_identity, input_identity, nonce) = match preparation {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(ManagedPlanLeaseRejectionV2::BeforeRequest {
+                    error,
+                    output,
+                    input,
+                });
             }
         };
         let session_id = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -161,7 +194,9 @@ impl ObservedManagedPlanLeaseV2 {
             tainted: false,
             original_binding: OriginalInputBindingV2(Arc::new(())),
         };
-        owner.verify_live(deadline)?;
+        if let Err(error) = owner.verify_live(deadline) {
+            return Err(ManagedPlanLeaseRejectionV2::AfterRequest { error, owner });
+        }
         Ok(owner)
     }
 
