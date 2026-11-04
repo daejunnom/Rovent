@@ -111,7 +111,7 @@ impl NoGamePreparedSupervisorV1 {
     }
 }
 
-fn startup_arguments(arguments: &[String]) -> Vec<String> {
+pub(super) fn startup_arguments(arguments: &[String]) -> Vec<String> {
     const SEPARATE: &[&str] = &[
         "--pals-smoke-policy",
         "--pals-smoke-owner-id",

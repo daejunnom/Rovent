@@ -157,6 +157,24 @@ impl NoGameProxyPrepareOwnerV1 {
             .as_ref()
             .map(|(kind, message, raw)| (*kind, message.as_str(), *raw))
     }
+    /// Connect using the same retained lock root and startup deadline.
+    /// The resulting stream is not yet peer- or listener-authenticated.
+    pub(super) fn open_original_arena_stream(
+        &self,
+        socket_path: &std::path::Path,
+        until: Instant,
+    ) -> Result<UnixStream, (io::Error, Option<UnixStream>)> {
+        if !matches!(
+            self.stage,
+            SmokePreparationStageV1::AwaitRunChannel | SmokePreparationStageV1::AwaitCleanupChannel
+        ) {
+            return Err((invalid("NoGame grant channel is not expected"), None));
+        }
+        let Some(lock) = self.lock.as_ref() else {
+            return Err((invalid("NoGame original lock owner missing"), None));
+        };
+        lock.open_direct_arena_stream(socket_path, until)
+    }
     fn fail(&mut self, error: io::Error) -> io::Error {
         if self.first_failure.is_none() {
             self.first_failure = Some((error.kind(), error.to_string(), error.raw_os_error()));

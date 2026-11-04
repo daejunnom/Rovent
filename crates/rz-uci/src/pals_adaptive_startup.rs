@@ -18,6 +18,8 @@ use std::{
 mod search_settings;
 pub use search_settings::*;
 mod system_v6;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) use system_v6::open_held_root_parent_stream_bounded;
 pub(crate) use system_v6::verify_root_identity;
 mod system_v6_deadline_wire;
 mod system_v6_execution;

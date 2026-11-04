@@ -236,6 +236,121 @@ pub struct PinnedPalsSystemStartupV6 {
     assets: Vec<PinnedPalsSystemAssetV6>,
 }
 
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) fn open_held_root_parent_stream_bounded(
+    root: &Dir,
+    private_cwd: &Path,
+    socket_path: &Path,
+    original_parent_pid: i32,
+    until: Instant,
+    check: impl Fn() -> std::io::Result<()>,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use nix::errno::Errno;
+    use nix::poll::{PollFd, PollFlags, poll};
+    use nix::sys::socket::{
+        AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket, sockopt,
+    };
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::{
+        fs::{FileTypeExt, MetadataExt},
+        net::UnixStream,
+    };
+
+    let invalid = |detail| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
+    if original_parent_pid <= 0
+        || (v6_abstract_socket_name(socket_path).is_none()
+            && socket_path.parent() != Some(private_cwd))
+    {
+        return Err(invalid(
+            "PALS direct parent socket differs from private root",
+        ));
+    }
+    let (address, path_identity) = if let Some(name) = v6_abstract_socket_name(socket_path) {
+        // Abstract names contain no filesystem inode. Peer credentials and
+        // the original direct-parent handshake remain independently required.
+        (
+            UnixAddr::new_abstract(name.as_bytes()).map_err(std::io::Error::other)?,
+            None,
+        )
+    } else {
+        let metadata = std::fs::symlink_metadata(socket_path)?;
+        if !metadata.file_type().is_socket() || metadata.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(invalid("PALS direct parent socket owner differs"));
+        }
+        // Each process holds its own directory FD for a long pathname.
+        let root = root
+            .try_clone()
+            .map_err(std::io::Error::other)?
+            .into_std_file();
+        let transport = crate::pals_system_proxy::socket_transport_path(socket_path, &root)?;
+        let transport_meta = std::fs::symlink_metadata(&transport)?;
+        if (metadata.dev(), metadata.ino()) != (transport_meta.dev(), transport_meta.ino()) {
+            return Err(invalid("PALS direct parent socket identity changed"));
+        }
+        (
+            UnixAddr::new(&transport).map_err(std::io::Error::other)?,
+            Some((metadata, transport)),
+        )
+    };
+    let descriptor = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .map_err(std::io::Error::other)?;
+    loop {
+        check()?;
+        if nix::unistd::getppid().as_raw() != original_parent_pid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "PALS original parent changed",
+            ));
+        }
+        match connect(descriptor.as_raw_fd(), &address) {
+            Ok(()) | Err(Errno::EISCONN) => break,
+            Err(Errno::EINPROGRESS) | Err(Errno::EALREADY) => {
+                let mut poll_fd = [PollFd::new(descriptor.as_fd(), PollFlags::POLLOUT)];
+                let wait_ms = until
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(50) as u16;
+                match poll(&mut poll_fd, wait_ms) {
+                    Ok(0) | Err(Errno::EINTR) => continue,
+                    Err(error) => return Err(std::io::Error::other(error)),
+                    Ok(_) => {
+                        check()?;
+                        let socket_error = getsockopt(&descriptor, sockopt::SocketError)
+                            .map_err(std::io::Error::other)?;
+                        if socket_error != 0 {
+                            return Err(std::io::Error::from_raw_os_error(socket_error));
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(Errno::EAGAIN) | Err(Errno::EINTR) => {
+                std::thread::sleep(
+                    std::time::Duration::from_millis(5)
+                        .min(until.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+    }
+    check()?;
+    if let Some((metadata, transport)) = path_identity {
+        let after = std::fs::symlink_metadata(socket_path)?;
+        let held_after = std::fs::symlink_metadata(&transport)?;
+        if (metadata.dev(), metadata.ino()) != (after.dev(), after.ino())
+            || (metadata.dev(), metadata.ino()) != (held_after.dev(), held_after.ino())
+        {
+            return Err(invalid("PALS direct parent socket changed during connect"));
+        }
+    }
+    Ok(UnixStream::from(descriptor))
+}
+
 impl PinnedPalsSystemStartupV6 {
     /// Parse the original V6 lock and hold each original asset FD. All hashing
     /// uses the caller's original deadline and cancellation, with no fallback
@@ -461,113 +576,14 @@ impl PinnedPalsSystemStartupV6 {
         until: Instant,
         check: impl Fn() -> std::io::Result<()>,
     ) -> std::io::Result<std::os::unix::net::UnixStream> {
-        use nix::errno::Errno;
-        use nix::poll::{PollFd, PollFlags, poll};
-        use nix::sys::socket::{
-            AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket, sockopt,
-        };
-        use std::os::fd::{AsFd, AsRawFd};
-        use std::os::unix::{
-            fs::{FileTypeExt, MetadataExt},
-            net::UnixStream,
-        };
-
-        let invalid = |detail| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
-        if original_parent_pid <= 0
-            || (v6_abstract_socket_name(socket_path).is_none()
-                && socket_path.parent() != Some(self.private_cwd()))
-        {
-            return Err(invalid(
-                "PALS direct parent socket differs from private root",
-            ));
-        }
-        let (address, path_identity) = if let Some(name) = v6_abstract_socket_name(socket_path) {
-            // Abstract names contain no filesystem inode. Peer credentials and
-            // the original direct-parent handshake remain independently required.
-            (
-                UnixAddr::new_abstract(name.as_bytes()).map_err(std::io::Error::other)?,
-                None,
-            )
-        } else {
-            let metadata = std::fs::symlink_metadata(socket_path)?;
-            if !metadata.file_type().is_socket()
-                || metadata.uid() != nix::unistd::geteuid().as_raw()
-            {
-                return Err(invalid("PALS direct parent socket owner differs"));
-            }
-            // Each process holds its own directory FD for a long pathname.
-            let root = self
-                .root
-                .try_clone()
-                .map_err(std::io::Error::other)?
-                .into_std_file();
-            let transport = crate::pals_system_proxy::socket_transport_path(socket_path, &root)?;
-            let transport_meta = std::fs::symlink_metadata(&transport)?;
-            if (metadata.dev(), metadata.ino()) != (transport_meta.dev(), transport_meta.ino()) {
-                return Err(invalid("PALS direct parent socket identity changed"));
-            }
-            (
-                UnixAddr::new(&transport).map_err(std::io::Error::other)?,
-                Some((metadata, transport)),
-            )
-        };
-        let descriptor = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-            None,
+        open_held_root_parent_stream_bounded(
+            &self.root,
+            self.private_cwd(),
+            socket_path,
+            original_parent_pid,
+            until,
+            check,
         )
-        .map_err(std::io::Error::other)?;
-        loop {
-            check()?;
-            if nix::unistd::getppid().as_raw() != original_parent_pid {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "PALS original parent changed",
-                ));
-            }
-            match connect(descriptor.as_raw_fd(), &address) {
-                Ok(()) | Err(Errno::EISCONN) => break,
-                Err(Errno::EINPROGRESS) | Err(Errno::EALREADY) => {
-                    let mut poll_fd = [PollFd::new(descriptor.as_fd(), PollFlags::POLLOUT)];
-                    let wait_ms = until
-                        .saturating_duration_since(Instant::now())
-                        .as_millis()
-                        .min(50) as u16;
-                    match poll(&mut poll_fd, wait_ms) {
-                        Ok(0) | Err(Errno::EINTR) => continue,
-                        Err(error) => return Err(std::io::Error::other(error)),
-                        Ok(_) => {
-                            check()?;
-                            let socket_error = getsockopt(&descriptor, sockopt::SocketError)
-                                .map_err(std::io::Error::other)?;
-                            if socket_error != 0 {
-                                return Err(std::io::Error::from_raw_os_error(socket_error));
-                            }
-                            break;
-                        }
-                    }
-                }
-                Err(Errno::EAGAIN) | Err(Errno::EINTR) => {
-                    std::thread::sleep(
-                        std::time::Duration::from_millis(5)
-                            .min(until.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(error) => return Err(std::io::Error::other(error)),
-            }
-        }
-        check()?;
-        if let Some((metadata, transport)) = path_identity {
-            let after = std::fs::symlink_metadata(socket_path)?;
-            let held_after = std::fs::symlink_metadata(&transport)?;
-            if (metadata.dev(), metadata.ino()) != (after.dev(), after.ino())
-                || (metadata.dev(), metadata.ino()) != (held_after.dev(), held_after.ino())
-            {
-                return Err(invalid("PALS direct parent socket changed during connect"));
-            }
-        }
-        Ok(UnixStream::from(descriptor))
     }
 
     /// Open a distinct cleanup control transport for the held startup owner.

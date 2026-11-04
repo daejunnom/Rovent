@@ -87,6 +87,41 @@ pub(super) struct SmokeLockAdmissionFailure {
 }
 
 impl OriginalSmokeLockAdmission {
+    /// Reuse the existing held-root bounded transport before native admission.
+    /// A connection alone does not authenticate the arena or role listener.
+    pub(super) fn open_direct_arena_stream(
+        &self,
+        socket_path: &Path,
+        until: Instant,
+    ) -> Result<std::os::unix::net::UnixStream, (io::Error, Option<std::os::unix::net::UnixStream>)>
+    {
+        if let Err(error) = self.verify_held() {
+            return Err((error, None));
+        }
+        let until = until.min(self.local_until);
+        let result = crate::pals_adaptive_startup::open_held_root_parent_stream_bounded(
+            &self.pin.root,
+            &self.pin.private_cwd,
+            socket_path,
+            nix::unistd::getppid().as_raw(),
+            until,
+            || {
+                self.check_control()?;
+                if Instant::now() >= until {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "NoGame connection deadline expired",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        let stream = result.map_err(|error| (error, None))?;
+        if let Err(error) = self.verify_held() {
+            return Err((error, Some(stream)));
+        }
+        Ok(stream)
+    }
     /// The named root and lock are only declarations beside this same
     /// retained root capability and lock FD; callers must still verify_held.
     pub(super) fn local_paths_and_root_identity(&self) -> io::Result<(PathBuf, PathBuf, u64, u64)> {
