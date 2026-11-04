@@ -34,10 +34,13 @@ class OriginalCollectionProcess:
     group drain, or output completion is uncertain. No lease is finalized here.
     """
 
-    def __init__(self, lease_key, scope, original_input, binary_fd, work_ns, cleanup_ns):
+    def __init__(self, lease_key, scope, original_input, binary_fd, work_ns, cleanup_ns,
+                 *, bootstrap_budget_ms):
         if (sys.platform != "linux" or type(scope) is not CgroupOwner
                 or type(original_input) is not OriginalControlInput
                 or type(binary_fd) is not int or binary_fd < 0
+                or type(bootstrap_budget_ms) is not int
+                or not 0 < bootstrap_budget_ms < 1 << 64
                 or type(work_ns) is not int or type(cleanup_ns) is not int
                 or not 0 < work_ns <= cleanup_ns < 1 << 64
                 or time.monotonic_ns() >= work_ns):
@@ -48,6 +51,7 @@ class OriginalCollectionProcess:
         self._pid = os.getpid()
         self._namespace = _namespace(self._pid)
         self._work_ns, self._cleanup_ns = work_ns, cleanup_ns
+        self._bootstrap_budget_ms = bootstrap_budget_ms
         self._binary_fd = self._barrier_read = self._barrier_write = None
         self._fd_close_state = {}
         self.handoff = None
@@ -90,6 +94,7 @@ class OriginalCollectionProcess:
                      "--v3-managed-output-dir-fd=" + str(output),
                      "--v3-managed-input-dir-fd=" + str(input_dir),
                      "--v3-managed-plan-fd=" + str(plan),
+                     "--v3-bootstrap-budget-ms=" + str(self._bootstrap_budget_ms),
                      "--v3-work-deadline-monotonic-ns=" + str(self._work_ns),
                      "--v3-cleanup-deadline-monotonic-ns=" + str(self._cleanup_ns)]
         command = entry_command(self._binary_fd, self._barrier_read, arguments)

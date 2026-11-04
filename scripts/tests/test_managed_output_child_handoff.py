@@ -216,9 +216,16 @@ print("ok")
         executable_fd = os.open(sys.executable, os.O_RDONLY)
         now = time.monotonic_ns()
         work, cleanup = now + 5_000_000_000, now + 7_000_000_000
+        bootstrap_budget_ms = 500
         try:
+            for invalid_budget in (0, True, 1 << 64):
+                with self.assertRaises(ValueError):
+                    OriginalCollectionProcess(self.key, self.scope, original_input,
+                                              executable_fd, work, cleanup,
+                                              bootstrap_budget_ms=invalid_budget)
             owner = OriginalCollectionProcess(self.key, self.scope, original_input,
-                                              executable_fd, work, cleanup)
+                                              executable_fd, work, cleanup,
+                                              bootstrap_budget_ms=bootstrap_budget_ms)
         finally:
             os.close(executable_fd)
         self.group, self.handoff = owner.group, owner.handoff
@@ -238,12 +245,14 @@ s.send(json.dumps({"schema":"rz-managed-output-lease/2", "sequence":1,
 reply = json.loads(s.recv(4096))
 assert reply["session_id"] == nonce
 assert reply["plan"]["path"] == args["--v3-plan"]
+assert args["--v3-bootstrap-budget-ms"] == args["--expected-budget"]
 assert int(args["--v3-work-deadline-monotonic-ns"]) < int(args["--v3-cleanup-deadline-monotonic-ns"])
 assert time.monotonic_ns() < int(args["--v3-work-deadline-monotonic-ns"])
 print("ok")
 '''
         with tempfile.TemporaryFile(mode="w+b", dir=self.root) as output:
-            result = owner.run(["-c", source], self.root, os.environ.copy(),
+            result = owner.run(["-c", source, "--expected-budget=" + str(bootstrap_budget_ms)],
+                               self.root, os.environ.copy(),
                                lambda: None, lambda: False, stdout=output)
             output.seek(0)
             payload = output.read()
