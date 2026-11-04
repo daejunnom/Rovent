@@ -32,6 +32,7 @@ pub struct AsyncEngineStartSlot<O: Write + Send + 'static, D: Write + Send + 'st
     )>,
     preflight_failure: Option<EngineError>,
     staged: Option<InPlaceStagedEngine>,
+    run: Option<AsyncEngineRun<O, D>>,
 }
 struct InPlaceStagedEngine {
     owner: Arc<Mutex<Owner>>,
@@ -83,6 +84,7 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
             preflight: None,
             preflight_failure: None,
             staged: None,
+            run: None,
         }
     }
     /// Calls only the shared pre-worker setup while all original inputs stay
@@ -235,7 +237,7 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
     /// Transfer the staged exact session/timer and original event/output
     /// endpoints only after every input is present. Any missing field restores
     /// previously taken owners to this same slot; this is not native startup.
-    pub fn try_take_run(
+    fn try_take_run(
         &mut self,
         max_output_bytes: usize,
         poll_interval: Duration,
@@ -338,6 +340,24 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         self.transferred = true;
         Ok(run)
     }
+    /// Keep the original run in this same slot rather than transferring it
+    /// out to a caller which may forget the parent/session custody.
+    pub fn try_install_run(
+        &mut self,
+        max_output_bytes: usize,
+        poll_interval: Duration,
+    ) -> Result<(), InPlaceTransferStatus> {
+        let run = self.try_take_run(max_output_bytes, poll_interval)?;
+        self.run = Some(run);
+        Ok(())
+    }
+    pub fn original_run(&self) -> Option<&AsyncEngineRun<O, D>> {
+        self.run.as_ref()
+    }
+    pub fn original_run_mut(&mut self) -> Option<&mut AsyncEngineRun<O, D>> {
+        self.run.as_mut()
+    }
+
     /// Refusal-only writer drain. A started timer or accepted output remains
     /// outside this idle cleanup path, and no native completion is inferred.
     pub fn request_idle_writer_close(&mut self) -> UnstartedWriterCloseStatus {
