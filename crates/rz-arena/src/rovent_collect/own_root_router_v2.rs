@@ -509,6 +509,16 @@ impl RoventNnuecCollectionHooksV2 for RoventOwnRootRouterV2 {
                         reservation.settled = true;
                         Ok(RoventNnuecCollectionAdmissionOutcomeV2::Installed)
                     }
+                    Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission })
+                        if bridge.before_start_seal_matches(&admission) =>
+                    {
+                        // This exact original attempt was sealed before an
+                        // observer install. A busy no-capture marker does
+                        // not make that already-established fact uncertain.
+                        state.store(READY, Ordering::Release);
+                        reservation.settled = true;
+                        Ok(RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission })
+                    }
                     Ok(
                         RoventNnuecCollectionAdmissionOutcomeV2::Pending { admission }
                         | RoventNnuecCollectionAdmissionOutcomeV2::PendingUncertain { admission },

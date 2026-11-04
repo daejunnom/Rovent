@@ -22,7 +22,11 @@ use rz_uci::rovent_bootstrap::nnuec_session::{
     RoventNnuecCollectionHooksV2, RoventNnuecPendingCollectionV2, RoventNnuecRootHookFailureV2,
     RoventPendingEvidenceDispositionV2,
 };
-use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicBool, mpsc};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -40,6 +44,7 @@ pub(crate) struct RoventNnuecCollectionBridgeV2 {
     pending_stopped: Mutex<PendingCollectionSummaryV2>,
     original_attempt: OnceLock<RoventCollectionRootAdmissionV2>,
     before_start_failure: OnceLock<AdaptiveManagerError>,
+    before_start_sealed: AtomicBool,
     unstarted_sealed: OnceLock<Arc<RoventNnuecPendingCollectionV2>>,
     first_pending_event: OnceLock<Arc<RoventNnuecPendingCollectionV2>>,
 }
@@ -719,6 +724,14 @@ impl RoventNnuecCollectionBridgeV2 {
             .get()
             .is_some_and(|original| original.same_original_admission(admission))
     }
+    /// A prior uncertainty may be relaxed only after this bridge actually
+    /// sealed the same attempt before installing a collection observer.
+    pub(crate) fn before_start_seal_matches(
+        &self,
+        admission: &RoventCollectionRootAdmissionV2,
+    ) -> bool {
+        self.before_start_sealed.load(Ordering::Acquire) && self.matches_original_attempt(admission)
+    }
     pub(crate) fn closed_before_next_admission(
         &self,
         admission: &RoventCollectionRootAdmissionV2,
@@ -743,6 +756,7 @@ impl RoventNnuecCollectionBridgeV2 {
     {
         match self.core.try_seal_unstarted(original) {
             Ok(super::collection_hooks_core_v2::CoreUnstartedSealV2::Sealed) => {
+                self.before_start_sealed.store(true, Ordering::Release);
                 self.defer_before_start(port, admission, reason)
             }
             Ok(super::collection_hooks_core_v2::CoreUnstartedSealV2::Busy) => {
@@ -848,6 +862,7 @@ impl RoventNnuecCollectionBridgeV2 {
                 worker: Mutex::new(None),
                 original_attempt: OnceLock::new(),
                 before_start_failure: OnceLock::new(),
+                before_start_sealed: AtomicBool::new(false),
                 unstarted_sealed: OnceLock::new(),
                 first_pending_event: OnceLock::new(),
                 pending_stopped: Mutex::new(PendingCollectionSummaryV2::new()),
