@@ -17,12 +17,20 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CancelPoll {
     Pending,
     AcknowledgementWritten,
+}
+
+#[derive(Debug)]
+pub(super) struct CancelFailureObservation {
+    pub kind: io::ErrorKind,
+    pub message: String,
+    pub raw_os_error: Option<i32>,
 }
 
 /// Owns one exclusive, already authenticated, dedicated channel. It does not
@@ -36,7 +44,8 @@ pub(super) struct CancelReceiverV1 {
     received: usize,
     ack: Option<([u8; CANCEL_ACK_BYTES], usize)>,
     last_sequence: u64,
-    failed: bool,
+    cleanup_until: Instant,
+    first_failure: Option<CancelFailureObservation>,
 }
 
 impl CancelReceiverV1 {
@@ -65,22 +74,48 @@ impl CancelReceiverV1 {
             received: 0,
             ack: None,
             last_sequence: 0,
-            failed: false,
+            cleanup_until: window.cleanup_until,
+            first_failure: None,
         })
     }
 
     fn fail(&mut self, error: io::Error) -> io::Error {
-        self.failed = true;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(CancelFailureObservation {
+                kind: error.kind(),
+                message: error.to_string(),
+                raw_os_error: error.raw_os_error(),
+            });
+        }
         error
+    }
+
+    pub(super) fn first_failure(&self) -> Option<&CancelFailureObservation> {
+        self.first_failure.as_ref()
+    }
+
+    fn check_cleanup_deadline(&mut self, now: Instant) -> io::Result<()> {
+        if now >= self.cleanup_until {
+            return Err(self.fail(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original cancel cleanup deadline expired",
+            )));
+        }
+        Ok(())
     }
 
     /// Perform bounded nonblocking work. A request is accepted only after its
     /// complete frame, scope and next sequence are verified. The token is set
     /// before ACK transmission; an ACK write failure does not undo cancellation.
     pub(super) fn poll(&mut self) -> io::Result<CancelPoll> {
-        if self.failed {
-            return Err(io::Error::other("original cancel channel is failed"));
+        self.poll_with_clock(Instant::now)
+    }
+
+    fn poll_with_clock(&mut self, mut now: impl FnMut() -> Instant) -> io::Result<CancelPoll> {
+        if let Some(failure) = &self.first_failure {
+            return Err(io::Error::new(failure.kind, failure.message.clone()));
         }
+        self.check_cleanup_deadline(now())?;
         if self.ack.is_none() {
             match self.stream.read(&mut self.request[self.received..]) {
                 Ok(0) => {
@@ -118,6 +153,7 @@ impl CancelReceiverV1 {
             let disposition = if decoded.sequence == self.last_sequence && self.last_sequence != 0 {
                 CancelAckDisposition::Duplicate
             } else if self.last_sequence.checked_add(1) == Some(decoded.sequence) {
+                self.check_cleanup_deadline(now())?;
                 self.last_sequence = decoded.sequence;
                 self.run_cancelled.store(true, Ordering::Release);
                 CancelAckDisposition::Accepted
@@ -142,6 +178,7 @@ impl CancelReceiverV1 {
             self.received = 0;
             self.ack = Some((ack, 0));
         }
+        self.check_cleanup_deadline(now())?;
         let (ack, written) = self.ack.as_mut().expect("ack retained during send");
         match self.stream.write(&ack[*written..]) {
             Ok(0) => {
@@ -262,5 +299,53 @@ mod tests {
         assert_eq!(receiver.poll().unwrap(), CancelPoll::Pending);
         assert!(receiver.poll().is_err());
         assert!(!window.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn original_cleanup_deadline_is_checked_before_receive_cancel_and_ack() {
+        let run_case = |before_checks: usize,
+                        expect_received: usize,
+                        expect_cancelled: bool,
+                        expect_ack: bool| {
+            let (stream, mut owner) = UnixStream::pair().unwrap();
+            let window = window();
+            let mut receiver = CancelReceiverV1::from_original_window(stream, scope(), &window)
+                .ok()
+                .unwrap();
+            let request = CancelRequest {
+                scope: scope(),
+                sequence: 1,
+            }
+            .encode()
+            .unwrap();
+            owner.write_all(&request).unwrap();
+            let mut checks = 0;
+            let error = receiver
+                .poll_with_clock(|| {
+                    checks += 1;
+                    if checks <= before_checks {
+                        window.bound_reference
+                    } else {
+                        window.cleanup_until
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(receiver.received, expect_received);
+            assert_eq!(receiver.ack.is_some(), expect_ack);
+            assert_eq!(window.cancelled.load(Ordering::Acquire), expect_cancelled);
+            assert!(!window.cleanup_cancelled.load(Ordering::Acquire));
+            let repeated = receiver.poll().unwrap_err();
+            assert_eq!(repeated.kind(), error.kind());
+            assert_eq!(repeated.to_string(), error.to_string());
+            let saved = receiver.first_failure().unwrap();
+            assert_eq!(saved.kind, error.kind());
+            assert_eq!(saved.message, error.to_string());
+            assert_eq!(saved.raw_os_error, error.raw_os_error());
+        };
+        // The deterministic clock uses this exact window and does not sleep.
+        run_case(0, 0, false, false);
+        run_case(1, CANCEL_REQUEST_BYTES, false, false);
+        run_case(2, 0, true, true);
     }
 }
