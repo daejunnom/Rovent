@@ -545,6 +545,31 @@ pub(crate) enum SupervisorThreadStateV3 {
     JoinPanicked,
 }
 
+/// Nonblocking observation of the same original driver. Pending means only
+/// lock contention; Ready(None/false) is a completed negative observation.
+pub(crate) enum PcDriverPollV3<T> {
+    Pending,
+    Ready(T),
+}
+
+#[derive(Debug)]
+pub(crate) enum PcDriverEvidenceErrorV3 {
+    Poisoned(&'static str),
+    Invalid(&'static str),
+}
+
+macro_rules! driver_evidence_lock {
+    ($mutex:expr, $name:literal) => {
+        match $mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned($name));
+            }
+        }
+    };
+}
+
 /// Evidence only for this driver's joined thread, not GPU or output success.
 pub(crate) struct PcSupervisorJoinedProofV3 {
     custody: Arc<Mutex<SupervisorStartCustodyV3>>,
@@ -637,6 +662,144 @@ fn supervisor_registry_v3() -> &'static Mutex<Vec<SupervisorRegistryEntryV3>> {
 }
 
 impl SupervisorStartCustodyV3 {
+    /// Nonblocking versions retain the original owners on contention/error.
+    pub(crate) fn try_before_admission_join_proof(
+        owner: &Arc<Mutex<Self>>,
+    ) -> Result<
+        PcDriverPollV3<Option<PcSupervisorBeforeAdmissionJoinProofV3>>,
+        PcDriverEvidenceErrorV3,
+    > {
+        let registry = driver_evidence_lock!(supervisor_registry_v3(), "registry");
+        if !registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.custody, owner))
+        {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "original owner is not registered",
+            ));
+        }
+        let custody = driver_evidence_lock!(owner, "custody");
+        let Some(native) = custody.native.as_ref() else {
+            return Ok(PcDriverPollV3::Ready(None));
+        };
+        if !matches!(
+            custody.state,
+            SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked
+        ) || custody.thread.is_some()
+            || custody.admitted.load(Ordering::Acquire)
+            || !custody.stop.load(Ordering::Acquire)
+            || custody.stop_authorization.is_some()
+            || custody.first_error.is_none()
+        {
+            return Ok(PcDriverPollV3::Ready(None));
+        }
+        Ok(PcDriverPollV3::Ready(Some(
+            PcSupervisorBeforeAdmissionJoinProofV3 {
+                custody: Arc::clone(owner),
+                supervisor: Arc::clone(&custody.supervisor),
+                native: Arc::clone(native),
+                panicked: custody.state == SupervisorThreadStateV3::JoinPanicked,
+            },
+        )))
+    }
+
+    pub(crate) fn try_seal_no_worker(
+        owner: &Arc<Mutex<Self>>,
+        native: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+    ) -> Result<PcDriverPollV3<Option<PcSupervisorNoWorkerProofV3>>, PcDriverEvidenceErrorV3> {
+        let registry = driver_evidence_lock!(supervisor_registry_v3(), "registry");
+        if !registry
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.custody, owner))
+        {
+            return Err(PcDriverEvidenceErrorV3::Invalid(
+                "original owner is not registered",
+            ));
+        }
+        let mut custody = driver_evidence_lock!(owner, "custody");
+        if !matches!(
+            custody.state,
+            SupervisorThreadStateV3::Prepared | SupervisorThreadStateV3::NoWorker
+        ) || custody.thread.is_some()
+            || custody.admitted.load(Ordering::Acquire)
+        {
+            return Ok(PcDriverPollV3::Ready(None));
+        }
+        let original_supervisor = Arc::clone(&custody.supervisor);
+        let mut original = driver_evidence_lock!(original_supervisor, "supervisor");
+        original
+            .bridge
+            .bind_native_owner(native)
+            .map_err(PcDriverEvidenceErrorV3::Invalid)?;
+        original.driver_sealed = true;
+        custody.state = SupervisorThreadStateV3::NoWorker;
+        drop(original);
+        Ok(PcDriverPollV3::Ready(Some(PcSupervisorNoWorkerProofV3 {
+            custody: Arc::clone(owner),
+            supervisor: original_supervisor,
+            native: Arc::clone(native),
+        })))
+    }
+
+    pub(crate) fn try_release_before_admission_join(
+        owner: &Arc<Mutex<Self>>,
+        proof: &PcSupervisorBeforeAdmissionJoinProofV3,
+    ) -> Result<PcDriverPollV3<bool>, PcDriverEvidenceErrorV3> {
+        let mut registry = driver_evidence_lock!(supervisor_registry_v3(), "registry");
+        let Some(index) = registry
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.custody, owner))
+        else {
+            return Ok(PcDriverPollV3::Ready(false));
+        };
+        let custody = driver_evidence_lock!(owner, "custody");
+        let Some(native) = custody.native.as_ref() else {
+            return Ok(PcDriverPollV3::Ready(false));
+        };
+        if !proof.matches_original(owner, &custody.supervisor, native)
+            || !matches!(
+                custody.state,
+                SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked
+            )
+            || custody.thread.is_some()
+            || custody.admitted.load(Ordering::Acquire)
+            || !custody.stop.load(Ordering::Acquire)
+            || custody.stop_authorization.is_some()
+        {
+            return Ok(PcDriverPollV3::Ready(false));
+        }
+        let mut original = driver_evidence_lock!(custody.supervisor, "supervisor");
+        original.driver_sealed = true;
+        drop(original);
+        drop(custody);
+        registry.swap_remove(index);
+        Ok(PcDriverPollV3::Ready(true))
+    }
+
+    pub(crate) fn try_release_no_worker(
+        owner: &Arc<Mutex<Self>>,
+    ) -> Result<PcDriverPollV3<bool>, PcDriverEvidenceErrorV3> {
+        let mut registry = driver_evidence_lock!(supervisor_registry_v3(), "registry");
+        let Some(index) = registry
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.custody, owner))
+        else {
+            return Ok(PcDriverPollV3::Ready(false));
+        };
+        let custody = driver_evidence_lock!(owner, "custody");
+        if custody.state != SupervisorThreadStateV3::NoWorker || custody.thread.is_some() {
+            return Ok(PcDriverPollV3::Ready(false));
+        }
+        let original = driver_evidence_lock!(custody.supervisor, "supervisor");
+        if !original.driver_sealed {
+            return Ok(PcDriverPollV3::Ready(false));
+        }
+        drop(original);
+        drop(custody);
+        registry.swap_remove(index);
+        Ok(PcDriverPollV3::Ready(true))
+    }
+
     /// Reserve exactly one retained owner per original supervisor before
     /// entering the post-auth callback. This creates no thread or teacher.
     pub(crate) fn register(
