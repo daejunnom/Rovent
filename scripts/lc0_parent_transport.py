@@ -69,6 +69,8 @@ class NonblockingParentHandshake:
         self._socket = None
         self._state = "connecting"
         self._error = None
+        self._original_error = None
+        self._connect_failure_errno = None
         self._sent = 0
         self._send_uncertain = False
         self._response = bytearray()
@@ -82,8 +84,8 @@ class NonblockingParentHandshake:
             self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._socket.setblocking(False)
             self._connect()
-        except OSError:
-            self._fail("connect_failed")
+        except OSError as error:
+            self._fail("connect_failed", error)
 
     def _connect(self):
         status = self._socket.connect_ex(self._route)
@@ -96,6 +98,7 @@ class NonblockingParentHandshake:
             self._state = "connecting"
             self._retry_at = None
         else:
+            self._connect_failure_errno = status
             self._fail("connect_failed")
 
     @property
@@ -110,6 +113,15 @@ class NonblockingParentHandshake:
     @property
     def error(self):
         return self._error
+
+    @property
+    def original_error(self):
+        """Original exception, retained locally; do not render its text."""
+        return self._original_error
+
+    @property
+    def connect_failure_errno(self):
+        return self._connect_failure_errno
 
     @property
     def bytes_sent(self):
@@ -147,8 +159,10 @@ class NonblockingParentHandshake:
             self._socket.close()
             self._socket = None
 
-    def _fail(self, code):
+    def _fail(self, code, error=None):
         self._error = self._error or code
+        if self._original_error is None and error is not None:
+            self._original_error = error
         if self.admission_uncertain:
             self._state = "failed_after_send"
         else:
@@ -178,7 +192,9 @@ class NonblockingParentHandshake:
             if self._state == "retry_connect" and time.monotonic() >= self._retry_at:
                 self._connect()
             if self._state == "connecting" and events & selectors.EVENT_WRITE:
-                if self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                status = self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if status:
+                    self._connect_failure_errno = status
                     self._fail("connect_failed")
                     return self._state
                 peer = self._socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
@@ -189,18 +205,21 @@ class NonblockingParentHandshake:
                     return self._state
                 self._state = "writing"
             if self._state == "writing" and events & selectors.EVENT_WRITE:
+                if time.monotonic() >= self._deadline:
+                    self._fail("deadline_expired")
+                    return self._state
                 try:
                     count = self._socket.send(self._request)
                 except BlockingIOError:
                     return self._state
-                except InterruptedError:
+                except InterruptedError as error:
                     # Do not infer whether a native syscall transferred bytes.
                     self._send_uncertain = True
-                    self._fail("send_interrupted")
+                    self._fail("send_interrupted", error)
                     return self._state
-                except OSError:
+                except OSError as error:
                     self._send_uncertain = True
-                    self._fail("send_failed")
+                    self._fail("send_failed", error)
                     return self._state
                 if count <= 0 or count > len(self._request):
                     if count > len(self._request):
@@ -209,6 +228,9 @@ class NonblockingParentHandshake:
                     return self._state
                 self._sent += count
                 del self._request[:count]
+                if time.monotonic() >= self._deadline:
+                    self._fail("deadline_expired")
+                    return self._state
                 if not self._request:
                     self._state = "reading"
             elif self._state == "reading" and events & selectors.EVENT_READ:
@@ -237,8 +259,8 @@ class NonblockingParentHandshake:
                     self._fail("ack_frame_too_large")
         except BlockingIOError:
             pass
-        except (OSError, PreflightError, KeyError, struct.error):
-            self._fail("transport_or_ack_invalid")
+        except (OSError, PreflightError, KeyError, struct.error) as error:
+            self._fail("transport_or_ack_invalid", error)
         return self._state
 
     def take_authenticated_socket(self):

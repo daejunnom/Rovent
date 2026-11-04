@@ -1,5 +1,6 @@
 """CPU-only V2 frame handling; actual peer admission is tested separately."""
 import hashlib
+import errno
 import json
 from pathlib import Path
 import selectors
@@ -7,6 +8,7 @@ import socket
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -22,8 +24,11 @@ class FakeControlSocket:
         self.width = width
         self.sent = bytearray()
         self.received = []
+        self.send_error = None
 
     def send(self, value):
+        if self.send_error is not None:
+            raise self.send_error
         count = min(self.width, len(value))
         self.sent.extend(value[:count])
         return count
@@ -133,6 +138,26 @@ class SessionObservationTests(unittest.TestCase):
         self.observe.advance(selectors.EVENT_WRITE)
         self.assertEqual(self.observe.cancel(), "cancelled_after_send")
         self.assertGreater(self.observe.bytes_sent, 0)
+
+    def test_send_crossing_deadline_keeps_partial_request(self):
+        deadline = self.observe._deadline
+        with mock.patch("lc0_parent_observation.time.monotonic",
+                        side_effect=[deadline - 1, deadline - 1, deadline + 1]):
+            self.observe.advance(selectors.EVENT_WRITE)
+        self.assertEqual(self.observe.state, "failed_after_send")
+        self.assertEqual(self.observe.error, "deadline_expired")
+        self.assertGreater(self.observe.bytes_sent, 0)
+
+    def test_original_send_exception_is_retained_with_custody(self):
+        error = BrokenPipeError(errno.EPIPE, "private transport detail")
+        self.socket.send_error = error
+        self.observe.advance(selectors.EVENT_WRITE)
+        self.assertEqual(self.observe.state, "failed_after_send")
+        self.assertIs(self.observe.original_error, error)
+        custody = self.observe.take_control_custody()
+        self.assertIs(custody.original_error, error)
+        self.observe._socket = custody.socket
+        custody.socket = None
 
     def test_same_socket_cannot_be_reused_for_control(self):
         duplicate = object.__new__(NonblockingParentHandshake)

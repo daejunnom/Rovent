@@ -139,6 +139,19 @@ class ParentTransportTests(unittest.TestCase):
         custody = self.release_quarantined(fake)
         self.assertTrue(custody._response.endswith(b"\n"))
 
+    def test_send_crossing_deadline_retains_sent_wire(self):
+        fake = FakeSocket(self.pid, chunk=1)
+        handshake = self.handshake(fake)
+        deadline = handshake._deadline
+        with mock.patch.object(transport.time, "monotonic", side_effect=[deadline - 1, deadline - 1, deadline + 1]):
+            handshake.advance(selectors.EVENT_WRITE)
+        self.assertEqual(handshake.state, "failed_after_send")
+        self.assertEqual(handshake.error, "deadline_expired")
+        self.assertEqual(handshake.bytes_sent, 1)
+        del handshake
+        custody = self.release_quarantined(fake)
+        self.assertTrue(custody._request)
+
     def test_peer_mismatch_is_rejected_before_sending(self):
         for fake in (FakeSocket(self.pid + 1), FakeSocket(self.pid, peer_uid=os.geteuid() + 1)):
             with self.subTest(peer=(fake.pid, fake.peer_uid)):
@@ -173,6 +186,7 @@ class ParentTransportTests(unittest.TestCase):
         self.assertEqual(handshake.state, "failed_after_send")
         self.assertEqual(handshake.bytes_sent, 0)
         self.assertTrue(handshake.admission_uncertain)
+        self.assertIsInstance(handshake.original_error, InterruptedError)
         self.assertFalse(fake.closed)
         del handshake
         self.release_quarantined(fake)

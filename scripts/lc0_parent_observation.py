@@ -75,6 +75,7 @@ class ControlCustody:
         self.sequence = owner._sequence
         self.state = owner._state
         self.error = owner._error
+        self.original_error = owner._original_error
         self.bytes_sent = owner._sent
         self.send_uncertain = owner._send_uncertain
         self.unsent_request = bytes(owner._request)
@@ -139,6 +140,7 @@ class NonblockingSessionObservation:
         self._value = None
         self._state = "writing"
         self._error = None
+        self._original_error = None
         self._sent = 0
         self._send_uncertain = False
         self._request = bytearray(json.dumps({
@@ -155,6 +157,11 @@ class NonblockingSessionObservation:
     @property
     def error(self):
         return self._error
+
+    @property
+    def original_error(self):
+        """Original exception, retained locally; do not render its text."""
+        return self._original_error
 
     @property
     def bytes_sent(self):
@@ -180,8 +187,10 @@ class NonblockingSessionObservation:
             return selectors.EVENT_READ
         return 0
 
-    def _fail(self, reason):
+    def _fail(self, reason, error=None):
         self._error = self._error or reason
+        if self._original_error is None and error is not None:
+            self._original_error = error
         self._state = "failed_after_send" if self._sent or self._send_uncertain else "failed_before_send"
 
     def cancel(self):
@@ -198,13 +207,16 @@ class NonblockingSessionObservation:
             return self._state
         try:
             if self._state == "writing" and events & selectors.EVENT_WRITE:
+                if time.monotonic() >= self._deadline:
+                    self._fail("deadline_expired")
+                    return self._state
                 try:
                     count = self._socket.send(self._request)
                 except BlockingIOError:
                     return self._state
-                except (InterruptedError, OSError):
+                except (InterruptedError, OSError) as error:
                     self._send_uncertain = True
-                    self._fail("send_unknown")
+                    self._fail("send_unknown", error)
                     return self._state
                 if count <= 0 or count > len(self._request):
                     self._send_uncertain = count > len(self._request)
@@ -212,6 +224,9 @@ class NonblockingSessionObservation:
                     return self._state
                 self._sent += count
                 del self._request[:count]
+                if time.monotonic() >= self._deadline:
+                    self._fail("deadline_expired")
+                    return self._state
                 if not self._request:
                     self._state = "reading"
             elif self._state == "reading" and events & selectors.EVENT_READ:
@@ -237,8 +252,8 @@ class NonblockingSessionObservation:
                     self._fail("response_too_large")
         except BlockingIOError:
             pass
-        except (OSError, PreflightError):
-            self._fail("transport_or_response_invalid")
+        except (OSError, PreflightError) as error:
+            self._fail("transport_or_response_invalid", error)
         return self._state
 
     def take_control_custody(self):
