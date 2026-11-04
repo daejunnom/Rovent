@@ -52,6 +52,8 @@ pub mod partial_followup_v1;
 pub mod partial_game_followup_v2;
 pub mod partial_game_v2;
 mod pc_lock_v2;
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+mod pc_lock_v3;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod teacher_fixture_identity_v1;
 pub use partial_collection_v1::{
@@ -80,6 +82,11 @@ pub use pc_lock_v2::{
     run_rovent_pc_collection_lock_v2_with_sealed_policy,
     run_rovent_pc_collection_lock_v2_with_speculative_teacher,
     run_rovent_pc_collection_lock_v2_with_verified_partial_game,
+};
+#[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+pub use pc_lock_v3::{
+    PreparedPcCollectionInputsV3, RoventCollectionLockV3LaunchPlan,
+    ROVENT_COLLECTION_LOCK_V3_LAUNCH_PLAN,
 };
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
