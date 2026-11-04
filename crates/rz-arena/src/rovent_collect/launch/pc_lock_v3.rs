@@ -961,6 +961,11 @@ impl ManagedOutputOwnerV3 {
                 "managed output not authorized".into(),
             ));
         }
+        if Instant::now() >= self.work_until {
+            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                "collection work deadline expired".into(),
+            ));
+        }
         let mut attempted = false;
         let result = (|| -> std::io::Result<()> {
             state.observation.verify_live(self.deadline)?;
@@ -1095,6 +1100,9 @@ impl ManagedOutputOwnerV3 {
                 game: game_origin,
             },
         };
+        if Instant::now() >= self.work_until {
+            return Err(unstarted("collection work deadline expired before publication".into()));
+        }
         if !finished.matches_original_manifest(self.inputs.manifest()) {
             return Err(unstarted(
                 "managed publication original writer differs".into(),
