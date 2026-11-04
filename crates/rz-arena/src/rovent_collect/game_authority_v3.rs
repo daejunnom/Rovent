@@ -871,6 +871,7 @@ pub(super) struct GameDispatchReceiptV3<S> {
     envelope: GameDispatchEnvelopeIdentityV3,
     outcome: GameDispatchOutcomeV3,
     abort_observed: bool,
+    seal_observed: bool,
 }
 impl<S> GameDispatchReceiptV3<S> {
     pub(super) fn matches_game(&self, game: &Arc<GameAuthorityV3<S>>) -> bool {
@@ -888,11 +889,14 @@ impl<S> GameDispatchReceiptV3<S> {
     pub(super) fn abort_observed(&self) -> bool {
         self.abort_observed
     }
+    pub(super) fn seal_observed(&self) -> bool {
+        self.seal_observed
+    }
 }
 
 /// Bounded aggregation of equivalent known-Full observations only. The
-/// original game owner permanently binds one dispatch channel; abort-observed,
-/// sent, disconnected and uncertain work never enter this summary.
+/// original game owner permanently binds one dispatch channel; abort/seal
+/// observed, sent, disconnected and uncertain work never enter this summary.
 pub(super) struct GameDispatchFullSummaryV3<S> {
     count: u64,
     last: GameDispatchReceiptV3<S>,
@@ -914,7 +918,8 @@ impl<S> GameDispatchFullSummaryV3<S> {
         let Some(next) = receipt.as_ref() else {
             return GameStepV3::Busy;
         };
-        if next.outcome != GameDispatchOutcomeV3::Full || next.abort_observed {
+        if next.outcome != GameDispatchOutcomeV3::Full || next.abort_observed || next.seal_observed
+        {
             return GameStepV3::Foreign;
         }
         if let Some(original) = summary.as_ref() {
@@ -923,6 +928,7 @@ impl<S> GameDispatchFullSummaryV3<S> {
                 || !original.last.envelope.same_original(&next.envelope)
                 || original.last.outcome != GameDispatchOutcomeV3::Full
                 || original.last.abort_observed
+                || original.last.seal_observed
             {
                 return GameStepV3::Foreign;
             }
@@ -1048,6 +1054,7 @@ impl<S> GameDispatchClaimV3<S> {
             envelope: self.envelope.clone(),
             outcome,
             abort_observed: prior & ABORT_REQUESTED != 0 || self.owner.abort_requested(),
+            seal_observed: prior & ADMISSION_SEALED != 0,
         });
         self.settled = true;
         GameStepV3::Ready
