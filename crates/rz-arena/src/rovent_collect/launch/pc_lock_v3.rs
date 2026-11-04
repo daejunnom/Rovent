@@ -7,6 +7,7 @@ use crate::rovent_collect::capture_router_v3::CaptureRouterV3;
 use crate::rovent_collect::pc_hooks_lock_v3::RoventPcCollectionBridgeV3;
 use crate::rovent_collect::pc_worker_v3::{
     PcDriverEvidenceErrorV3, PcDriverPollV3, PcWorkerSupervisorV3, SupervisorStartCustodyV3,
+    SupervisorThreadStateV3,
 };
 use crate::rovent_collect::teacher::v3_session::TeacherRosterEntryV3;
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
@@ -602,7 +603,13 @@ impl PcCollectionRunV3 {
                     return Err("P-C supervisor custody poisoned");
                 }
             };
-            match custody.authorize_stop(authorization) {
+            let authorization_result = match custody.state() {
+                SupervisorThreadStateV3::Joined | SupervisorThreadStateV3::JoinPanicked => {
+                    custody.authorize_already_joined(authorization)
+                }
+                _ => custody.authorize_stop(authorization),
+            };
+            match authorization_result {
                 Ok(()) => self.stop_authorized = true,
                 Err((authorization, reason)) => {
                     self.pending_stop = Some(authorization);
