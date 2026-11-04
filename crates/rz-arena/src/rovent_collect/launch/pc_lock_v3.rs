@@ -527,6 +527,7 @@ impl PcCollectionOwnersV3 {
             recovery_recorded,
             recovery_error,
             settled: false,
+            before_native_recovered: false,
         })
     }
 }
@@ -542,6 +543,7 @@ pub(crate) struct PcCollectionRunV3 {
     recovery_recorded: bool,
     recovery_error: Option<&'static str>,
     settled: bool,
+    before_native_recovered: bool,
 }
 
 impl PcCollectionRunV3 {
@@ -589,6 +591,7 @@ impl PcCollectionRunV3 {
             recovery_recorded,
             recovery_error: None,
             settled: false,
+            before_native_recovered: false,
         })))
     }
 
@@ -633,12 +636,19 @@ impl PcCollectionRunV3 {
             recovery_recorded,
             recovery_error: None,
             settled: false,
+            before_native_recovered: false,
         }))
     }
 
     /// This key names the retained original owner; it is not completion.
     pub(crate) fn recovery_key(&self) -> super::pc_recovery_v3::PcRunRecoveryKeyV3 {
         self.recovery.clone()
+    }
+
+    /// This is only the original pre-native scope recovery observation. It
+    /// does not assert cgroup, output, GPU, or whole-run completion.
+    pub(crate) fn before_native_recovered(&self) -> bool {
+        self.before_native_recovered
     }
 
     /// Observe this run's game join independently of physical settlement.
@@ -692,9 +702,13 @@ impl PcCollectionRunV3 {
                 // This only progresses the original native failure's own
                 // typed reservation recovery. It does not close resources or
                 // mark the failed run as successful.
-                let _ = self
-                    .outcome
-                    .try_recover_original_before_native_until(poll_until);
+                if matches!(
+                    self.outcome
+                        .try_recover_original_before_native_until(poll_until),
+                    Some(rz_uci::rovent_bootstrap::launch::V3BeforeNativeScopeRecovery::Recovered { .. })
+                ) {
+                    self.before_native_recovered = true;
+                }
                 return Ok(false);
             }
             PcDriverPollV3::Ready(false) => {}
