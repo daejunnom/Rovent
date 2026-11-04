@@ -11,6 +11,8 @@ use std::sync::mpsc::{Receiver, SyncSender};
 /// Opt-in bounded output custody. The existing synchronous runner below keeps
 /// its original behavior; consumers must explicitly select and own this path.
 pub mod async_output;
+/// Separate opt-in reducer loop; it never replaces the default transport.
+pub mod async_events;
 
 #[derive(Clone, Debug)]
 pub enum Event {
