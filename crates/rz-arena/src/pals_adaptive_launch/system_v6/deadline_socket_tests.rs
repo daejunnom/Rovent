@@ -10,6 +10,7 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::{Read, Write},
+    os::{linux::net::SocketAddrExt, unix::net::SocketAddr},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -17,6 +18,7 @@ use std::{
 
 const MODE: &str = ".rz-deadline-test-mode";
 const REQUESTS: &str = ".rz-deadline-test-requests";
+const SOCKET_NAME: &str = ".rz-deadline-test-socket-name";
 const FASTCHESS_HELPER: &str =
     "pals_adaptive_launch::system_v6::deadline_control::socket_tests::fastchess_helper";
 const PROXY_HELPER: &str =
@@ -49,9 +51,11 @@ fn proxy_helper() {
         return;
     };
     let requests = fs::read(REQUESTS).unwrap();
+    let socket_name = fs::read(SOCKET_NAME).unwrap();
+    let address = SocketAddr::from_abstract_name(&socket_name).unwrap();
     assert_eq!(requests.len() % REQUEST_BYTES, 0);
     for request in requests.chunks_exact(REQUEST_BYTES) {
-        let mut peer = UnixStream::connect("../deadline.sock").unwrap();
+        let mut peer = UnixStream::connect_addr(&address).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(20)))
             .unwrap();
         peer.write_all(request).unwrap();
@@ -106,16 +110,17 @@ enum Case {
 
 fn run_case(case: Case) {
     let base = std::env::temp_dir().canonicalize().unwrap();
-    let root = base.join(format!(
-        "rz-v6-deadline-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let root = base.join(format!("rz-v6-deadline-{}-{sequence}", std::process::id()));
     fs::create_dir(&root).unwrap();
     let work = root.join("work");
     fs::create_dir(&work).unwrap();
-    let socket_path = root.join("deadline.sock");
-    let listener = UnixListener::bind(&socket_path).unwrap();
+    // Linux abstract names are independent of TMPDIR length and require no
+    // filesystem socket deletion. The listener retains the kernel name.
+    let socket_name = format!("rz-v6-deadline-{}-{sequence}", std::process::id());
+    let address = SocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap();
+    let listener = UnixListener::bind_addr(&address).unwrap();
+    fs::write(work.join(SOCKET_NAME), socket_name.as_bytes()).unwrap();
     let executable = std::env::current_exe().unwrap();
     let pin = File::open(&executable).unwrap();
     let cwd = File::open(&work).unwrap();
@@ -209,9 +214,10 @@ fn run_case(case: Case) {
     )
     .unwrap();
     let rogue = if case == Case::RoguePeer {
-        let path = socket_path.clone();
+        let name = socket_name.clone();
         Some(std::thread::spawn(move || {
-            let mut stream = UnixStream::connect(path).unwrap();
+            let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+            let mut stream = UnixStream::connect_addr(&address).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(20)))
                 .unwrap();
