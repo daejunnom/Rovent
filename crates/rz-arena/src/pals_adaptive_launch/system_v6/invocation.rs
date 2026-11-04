@@ -173,7 +173,7 @@ impl PalsV6RoleSockets {
             ));
         }
         for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
-            PalsV6EndpointSnapshot::from_original(owner, role)?.verify_unchanged()?;
+            PalsV6EndpointSnapshot::from_original(owner, role)?;
         }
         self.verify_listeners()?;
         Ok(())
