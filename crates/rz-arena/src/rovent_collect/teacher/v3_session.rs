@@ -179,6 +179,22 @@ impl TeacherSessionStagingV3 {
             .as_ref()
             .map(|preflight| preflight.scope.is_claimed())
     }
+
+    /// Return the exact failed claim's owner for root-scoped recovery. The
+    /// caller must retain it; this does not prove physical retirement or
+    /// that an unclaimed scope is reusable. An unwind remains unknown.
+    pub(crate) fn take_rejected_owner(&mut self) -> Option<TeacherPrepareOwnerV3> {
+        let issuer = &mut self.preflight.as_mut()?.scope;
+        match self.state {
+            TeacherSessionStageStateV3::BeforeClaimRejected => issuer
+                .take_unclaimed_scope()
+                .map(TeacherPrepareOwnerV3::Unclaimed),
+            TeacherSessionStageStateV3::AfterClaimRejected => issuer
+                .take_claimed_capability()
+                .map(TeacherPrepareOwnerV3::Claimed),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) enum TeacherStartErrorV3 {
