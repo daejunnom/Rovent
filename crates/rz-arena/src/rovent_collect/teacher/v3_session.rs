@@ -22,7 +22,7 @@ use rz_uci::rovent_external_launch::{
     bind_collection_teacher_actor_v3, spawn_bound_collection_teacher_v3,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 pub(crate) struct TeacherRosterEntryV3 {
@@ -131,6 +131,14 @@ pub(crate) struct TeacherScopeEffectOutcomeV3 {
     state: TeacherSessionStageStateV3,
 }
 impl TeacherScopeEffectSourceV3 {
+    /// Identity only; source issuance does not prove dispatch receipt.
+    pub(crate) fn identity_weak(&self) -> Weak<()> {
+        Arc::downgrade(&self.identity)
+    }
+    /// Retaining this identity alone does not grant a stage or game claim.
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
     pub(crate) fn matches_stage_identity(&self, identity: &Arc<()>) -> bool {
         Arc::ptr_eq(&self.identity, identity)
     }
@@ -185,6 +193,10 @@ pub(crate) enum TeacherSessionClaimErrorV3 {
 }
 
 impl TeacherSessionStagingV3 {
+    /// The original stage owns this identity before any scope claim.
+    pub(crate) fn scope_effect_identity_weak(&self) -> Weak<()> {
+        Arc::downgrade(&self.scope_effect_identity)
+    }
     pub(crate) fn state(&self) -> TeacherSessionStageStateV3 {
         self.state
     }
