@@ -123,6 +123,17 @@ mod original_window_tests {
                 self.0.fetch_add(10, Ordering::Relaxed);
                 Ok(())
             }
+            fn pre_signal_enabled(&self) -> bool {
+                true
+            }
+            fn poll_pre_signal(
+                &mut self,
+                _: &crate::process::SpawnCustody,
+                _: std::time::Instant,
+            ) -> Result<crate::process::PreSignalProgress, ArenaError> {
+                self.0.fetch_add(100, Ordering::Relaxed);
+                Ok(crate::process::PreSignalProgress::Acknowledged)
+            }
         }
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let control: Arc<Mutex<Box<dyn NativeV6Control>>> =
@@ -130,11 +141,19 @@ mod original_window_tests {
         let custody = crate::process::SpawnCustody::default();
         let held = control.lock().unwrap();
         poll_v6_control(&control, &custody, std::time::Instant::now(), false).unwrap();
+        assert_eq!(
+            poll_v6_pre_signal(&control, &custody, std::time::Instant::now()).unwrap(),
+            crate::process::PreSignalProgress::Pending { partial: false }
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         drop(held);
         poll_v6_control(&control, &custody, std::time::Instant::now(), false).unwrap();
         poll_v6_control(&control, &custody, std::time::Instant::now(), true).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 11);
+        assert_eq!(
+            poll_v6_pre_signal(&control, &custody, std::time::Instant::now()).unwrap(),
+            crate::process::PreSignalProgress::Acknowledged
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 111);
     }
 }
 
@@ -537,6 +556,22 @@ pub(crate) trait NativeV6Control: Send {
         custody: &crate::process::SpawnCustody,
         until: std::time::Instant,
     ) -> Result<(), ArenaError>;
+    /// Declare support for this control's whole lifetime. A control may
+    /// acquire its original role channels later, after the child is spawned;
+    /// its callback must refuse to send without an authenticated sender.
+    /// Existing controls keep prior behavior.
+    fn pre_signal_enabled(&self) -> bool {
+        false
+    }
+    fn poll_pre_signal(
+        &mut self,
+        _custody: &crate::process::SpawnCustody,
+        _until: std::time::Instant,
+    ) -> Result<crate::process::PreSignalProgress, ArenaError> {
+        Err(ArenaError::Invalid(
+            "V6 pre-signal control unavailable".into(),
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -546,6 +581,8 @@ pub(crate) struct NativeV6Supervisor {
     // If pinned input inspection fails, retain the same owner/control in the
     // normal failure bundle without starting preflight or a child.
     original_pin_error: Option<ArenaError>,
+    pre_signal_enabled: bool,
+    pre_signal_observation: crate::process::PreSignalObservation,
 }
 
 /// Rejected construction returns the exact original control owner. The
@@ -573,10 +610,24 @@ impl NativeV6Supervisor {
         execution: &Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
         control: Box<dyn NativeV6Control>,
     ) -> Result<Self, NativeV6SupervisorRejection> {
-        if !control
-            .original_execution()
-            .is_some_and(|original| Arc::ptr_eq(original, execution))
-        {
+        let capabilities = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (
+                control
+                    .original_execution()
+                    .is_some_and(|original| Arc::ptr_eq(original, execution)),
+                control.pre_signal_enabled(),
+            )
+        }));
+        let (same_owner, pre_signal_enabled) = match capabilities {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(NativeV6SupervisorRejection {
+                    error: ArenaError::Io("V6 control capability observation panicked".into()),
+                    control,
+                });
+            }
+        };
+        if !same_owner {
             return Err(NativeV6SupervisorRejection {
                 error: ArenaError::Integrity(
                     "V6 control and supervisor execution owners differ".into(),
@@ -588,8 +639,28 @@ impl NativeV6Supervisor {
             execution: Arc::clone(execution),
             control: Arc::new(Mutex::new(control)),
             original_pin_error: None,
+            pre_signal_enabled,
+            pre_signal_observation: crate::process::PreSignalObservation::default(),
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn poll_v6_pre_signal(
+    control: &Mutex<Box<dyn NativeV6Control>>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+) -> Result<crate::process::PreSignalProgress, ArenaError> {
+    let mut owner = match control.try_lock() {
+        Ok(owner) => owner,
+        Err(TryLockError::WouldBlock) => {
+            return Ok(crate::process::PreSignalProgress::Pending { partial: false });
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(ArenaError::Io("v6 original control owner poisoned".into()));
+        }
+    };
+    owner.poll_pre_signal(custody, until)
 }
 
 #[cfg(target_os = "linux")]
@@ -1449,6 +1520,18 @@ pub struct NativePairOutput<
     bundle: NativeRunBundle<S>,
 }
 impl<S: NativeProviderDeclaration> NativePairOutput<S> {
+    /// Borrow the same V6 control observation before closing this owner.
+    /// An ACK is not physical completion or a durable receipt.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_pre_signal_observation(
+        &self,
+    ) -> Option<&crate::process::PreSignalObservation> {
+        self.bundle.v6_supervisor.as_ref().and_then(|owner| {
+            owner
+                .pre_signal_enabled
+                .then_some(&owner.pre_signal_observation)
+        })
+    }
     pub fn process(&self) -> &ProcessOutput {
         self.bundle
             .process
@@ -1616,6 +1699,17 @@ pub struct GuardedEvidenceView<'a, A> {
 }
 
 impl<S: NativeProviderDeclaration> NativePairFailure<S> {
+    /// The failure retains this same observation with the original owner.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_pre_signal_observation(
+        &self,
+    ) -> Option<&crate::process::PreSignalObservation> {
+        self.bundle.v6_supervisor.as_ref().and_then(|owner| {
+            owner
+                .pre_signal_enabled
+                .then_some(&owner.pre_signal_observation)
+        })
+    }
     /// Transfer original output and receipt when physical completion is known.
     /// The caller becomes responsible for durable storage of the returned data.
     pub fn take_guarded_evidence(&mut self) -> Option<GuardedPreflightEvidence> {
@@ -2860,16 +2954,26 @@ pub(crate) mod linux {
         }
         .file;
         let process =
-            if let (Some(window), Some(supervisor)) = (v6_window, bundle.v6_supervisor.as_ref()) {
+            if let (Some(window), Some(supervisor)) = (v6_window, bundle.v6_supervisor.as_mut()) {
                 let run_owner = Arc::clone(&supervisor.control);
                 let cleanup_owner = Arc::clone(&supervisor.control);
+                let cancel_owner = Arc::clone(&supervisor.control);
                 let mut run_control = |custody: &crate::process::SpawnCustody, until| {
                     poll_v6_control(&run_owner, custody, until, false)
                 };
                 let mut cleanup_control = |custody: &crate::process::SpawnCustody, until| {
                     poll_v6_control(&cleanup_owner, custody, until, true)
                 };
-                crate::process::supervise_tree_observed_with_controls(
+                let mut pre_signal_control = |custody: &crate::process::SpawnCustody, until| {
+                    poll_v6_pre_signal(&cancel_owner, custody, until)
+                };
+                let pre_signal = supervisor
+                    .pre_signal_enabled
+                    .then_some(&mut pre_signal_control as crate::process::PreSignalControl<'_>);
+                let pre_signal_observation = supervisor
+                    .pre_signal_enabled
+                    .then_some(&mut supervisor.pre_signal_observation);
+                crate::process::supervise_tree_observed_with_v6_controls(
                     runner,
                     &s.invocation.args,
                     &s.cwd,
@@ -2881,6 +2985,8 @@ pub(crate) mod linux {
                     Some(&mut run_control),
                     Some(&mut cleanup_control),
                     Some(window),
+                    pre_signal,
+                    pre_signal_observation,
                 )?
             } else {
                 crate::process::supervise_tree_observed_with_spawn(
