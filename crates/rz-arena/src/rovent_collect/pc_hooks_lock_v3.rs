@@ -343,6 +343,7 @@ struct PcRootSlotV3 {
     game_reservation: Option<super::game_authority_v3::GameRootReservationV3<PcWorkerSupervisorV3>>,
     game_abort: Option<super::game_authority_v3::GameRootAbortReceiptV3<PcWorkerSupervisorV3>>,
     guard_aborted: Option<GuardAbortedNoDispatchV3>,
+    dispatch_claim: Option<super::game_authority_v3::GameDispatchClaimV3<PcWorkerSupervisorV3>>,
     dispatch_receipt: Option<super::game_authority_v3::GameDispatchReceiptV3<PcWorkerSupervisorV3>>,
     dispatch_rejected: Option<DispatchRejectedNoWorkerV3>,
     root_not_accepting: Option<RootNotAcceptingNoDispatchV3>,
@@ -496,6 +497,7 @@ impl PcRootSlotV3 {
 
     fn local_no_worker_owners_absent(&self) -> bool {
         self.game_registered && self.game_reservation.is_none() && self.game_abort.is_none() && self.guard_aborted.is_none()
+            && self.dispatch_claim.is_none()
             && self.dispatch == PcRootDispatchV3::BeforeDispatch
             && !self.requested && !self.installed && !self.unstarted_terminal
             && !self.claimed_unstarted_terminal && self.recovery.is_none()
@@ -559,6 +561,7 @@ impl PcRootSlotV3 {
 
     fn no_dispatch_owners_absent(&self, ledger: &PcRootQuotaLedgerV3) -> bool {
         self.dispatch == PcRootDispatchV3::BeforeDispatch
+            && self.dispatch_claim.is_none() && self.dispatch_receipt.is_none() && self.dispatch_rejected.is_none()
             && self.root_not_accepting.is_none() && self.root_authority_failure.is_none()
             && !self.requested && !self.installed && !self.quota_registered
             && !self.unstarted_terminal && !self.claimed_unstarted_terminal
@@ -1354,7 +1357,7 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                     super::game_authority_v3::RootReservationV3::Rejected(super::game_authority_v3::GameStepV3::Capacity) => return Err(failure(AdaptiveManagerError::Capacity("P-C V3 game root capacity"), admission)),
                     _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 game reservation differs or is unresolved"), admission)),
                 };
-                state.roots.push(PcRootSlotV3 { admission: admission.clone(), game_reservation: Some(reservation), game_abort: None, guard_aborted: None, dispatch_receipt: None, dispatch_rejected: None, root_not_accepting: None, root_authority_failure: None, game_registered: false, quota_registered: false,
+                state.roots.push(PcRootSlotV3 { admission: admission.clone(), game_reservation: Some(reservation), game_abort: None, guard_aborted: None, dispatch_claim: None, dispatch_receipt: None, dispatch_rejected: None, root_not_accepting: None, root_authority_failure: None, game_registered: false, quota_registered: false,
                     dispatch: PcRootDispatchV3::BeforeDispatch, requested: false, installed: false, unstarted_terminal: false, claimed_unstarted_terminal: false, recovery: None,
                     owner: None, route: None, route_retirement: None, stage: None, pump: None, observer: None, worker: None,
                     handoff: None, joined: None, custody_taken: false, returned: None, join_failure: None, join_panic: None });
