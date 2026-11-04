@@ -361,17 +361,20 @@ impl PinnedPalsSystemStartupV6 {
         &self.mapped_executable
     }
 
-    /// Connect to the direct parent's socket using only this startup owner's
-    /// original lock, deadline and cancellation. The caller must capture the
-    /// original PPID at process startup, before opening any native runtime.
-    /// A live authenticated connection is not GPU completion evidence.
+    /// Share the original startup control with same-process worker owners.
+    /// This never creates a new cancellation authority or extends its window.
+    pub(crate) fn original_startup_control(&self) -> (Instant, Arc<AtomicBool>) {
+        (self.original_until, Arc::clone(&self.original_cancelled))
+    }
+
+    /// Open a bounded direct-parent transport. This checks pathname ownership
+    /// but authenticates no peer until `ConnectedParent` validates the stream.
     #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
-    #[allow(dead_code)]
-    pub(crate) fn authenticate_direct_parent(
+    fn open_direct_parent_stream(
         &self,
         socket_path: &Path,
         original_parent_pid: i32,
-    ) -> std::io::Result<Arc<crate::rovent_bootstrap::launch::ConnectedParent>> {
+    ) -> std::io::Result<std::os::unix::net::UnixStream> {
         use nix::errno::Errno;
         use nix::poll::{PollFd, PollFlags, poll};
         use nix::sys::socket::{
@@ -449,13 +452,27 @@ impl PinnedPalsSystemStartupV6 {
         }
         self.source_window()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(UnixStream::from(descriptor))
+    }
+
+    /// Authenticate the captured original parent with the actual peer and the
+    /// same V6 lock. A live connection is not a GPU completion observation.
+    #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+    #[allow(dead_code)]
+    pub(crate) fn authenticate_direct_parent(
+        &self,
+        socket_path: &Path,
+        original_parent_pid: i32,
+    ) -> std::io::Result<Arc<crate::rovent_bootstrap::launch::ConnectedParent>> {
+        let stream = self.open_direct_parent_stream(socket_path, original_parent_pid)?;
         let rz_experiments::NativeRuntimeSourceV6::SystemCuda(runtime) =
             &self.lock.config.system_runtime_lock.runtime
         else {
-            return Err(invalid("PALS direct parent requires system CUDA"));
+            return Err(std::io::Error::other(
+                "PALS direct parent requires system CUDA",
+            ));
         };
-        let stream = UnixStream::from(descriptor);
-        let parent = crate::rovent_bootstrap::launch::ConnectedParent::authenticate(
+        let parent = crate::rovent_bootstrap::launch::ConnectedParent::authenticate_with_cancel(
             stream,
             std::process::id(),
             original_parent_pid,
@@ -463,10 +480,45 @@ impl PinnedPalsSystemStartupV6 {
             &self.lock.canonical_sha256,
             runtime.cuda_device_id,
             self.original_until,
+            Arc::clone(&self.original_cancelled),
         )?;
         self.source_window()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(Arc::new(parent))
+    }
+
+    /// Receive the original parent's post-image grant over a second stream.
+    /// The parent checks the directly owned child's image before issuing the
+    /// grant; the returned capability retains both channels and original
+    /// cancellation. It never attests GPU execution or completion.
+    #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+    #[allow(dead_code)]
+    pub(crate) fn await_parent_image_grant(
+        &self,
+        socket_path: &Path,
+        original_parent_pid: i32,
+        parent: &Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+    ) -> std::io::Result<Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>> {
+        let stream = self.open_direct_parent_stream(socket_path, original_parent_pid)?;
+        let admission = parent.await_pals_post_image_grant(
+            stream,
+            self.original_until,
+            &self.original_cancelled,
+        )?;
+        Ok(Arc::new(admission))
+    }
+
+    /// Check the exact original parent, barrier and cancellation immediately
+    /// before a native call. This does not turn future parent loss into a fence.
+    #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+    pub(crate) fn check_native_admission(
+        &self,
+        parent: &Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
+        admission: &crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6,
+    ) -> std::io::Result<()> {
+        self.source_window()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        admission.ensure_permitted(parent, self.original_until, &self.original_cancelled)
     }
 
     /// Start capturing the system runtime against this exact V6 owner and its

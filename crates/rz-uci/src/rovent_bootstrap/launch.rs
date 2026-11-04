@@ -120,6 +120,8 @@ pub use collection::{
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 #[cfg(target_os = "linux")]
 pub(crate) use system_parent::ConnectedParent;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+pub(crate) use system_parent::PalsPostImageAdmissionV6;
 use v2_external::{ExternalLaunchV2, open_external_launch_v2};
 use v2_rejections::{reject_external_pcr_product_v2, reject_own_nnuec_product_v2};
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
