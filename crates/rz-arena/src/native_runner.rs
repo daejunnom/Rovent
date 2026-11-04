@@ -752,6 +752,8 @@ struct IndependentNoGameOwners {
     observation: Option<crate::process::OriginalSmokeUciObservation>,
     quarantined_error: Option<ArenaError>,
     grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
+    cancel_not_granted: Arc<AtomicBool>,
+    cancel_failure: Arc<std::sync::OnceLock<Arc<ArenaError>>>,
 }
 
 /// Limits and tree-watch declaration derived from this selected snapshot.
@@ -930,6 +932,8 @@ pub(crate) struct IndependentNoGameRawEvidence {
     pub(crate) failures: Vec<String>,
     pub(crate) observation: Option<crate::process::OriginalSmokeUciObservation>,
     pub(crate) grants: Arc<Mutex<[Option<crate::pals_adaptive_launch::SmokeGrantObservation>; 2]>>,
+    pub(crate) cancel_not_granted: bool,
+    pub(crate) cancel_failure: Option<Arc<ArenaError>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1076,6 +1080,56 @@ fn poll_independent_no_game_control(
     Ok(())
 }
 
+/// Cooperatively request cancellation through the very same control that
+/// issued the original NoGame run grant. Acknowledgement is only acceptance,
+/// not process-tree closure, a device fence or permission to release owners.
+#[cfg(target_os = "linux")]
+fn poll_independent_no_game_cancel(
+    control: &Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>,
+    not_granted: &AtomicBool,
+    retained_failure: &std::sync::OnceLock<Arc<ArenaError>>,
+    custody: &crate::process::SpawnCustody,
+    until: std::time::Instant,
+) -> Result<crate::process::PreSignalProgress, ArenaError> {
+    use crate::pals_adaptive_launch::SmokeCancelProgress;
+    let mut original = match control.try_lock() {
+        Ok(value) => value,
+        Err(TryLockError::WouldBlock) => {
+            return Ok(crate::process::PreSignalProgress::Pending { partial: false });
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            let error = Arc::new(ArenaError::Io("NoGame cancel control poisoned".into()));
+            let _ = retained_failure.set(Arc::clone(&error));
+            return Err(ArenaError::Io(error.to_string()));
+        }
+    };
+    match original.poll_no_game_cancel(custody, until) {
+        SmokeCancelProgress::NotGranted => {
+            not_granted.store(true, Ordering::Release);
+            Ok(crate::process::PreSignalProgress::Pending { partial: false })
+        }
+        SmokeCancelProgress::Pending { written, received } => {
+            Ok(crate::process::PreSignalProgress::Pending {
+                partial: written != 0 || received != 0,
+            })
+        }
+        SmokeCancelProgress::Acknowledged => Ok(crate::process::PreSignalProgress::Acknowledged),
+        // The exact typed first failure remains in this same retained control.
+        SmokeCancelProgress::Failed => {
+            if let Some(error) = original.no_game_cancel_failure_owner() {
+                let _ = retained_failure.set(error);
+            }
+            Err(ArenaError::Io(format!(
+                "NoGame cancel failed: {}",
+                original
+                    .no_game_cancel_first_failure()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown".into())
+            )))
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl PreparedIndependentNoGameOwner {
     /// A rejected binding is returned intact. Moving the binding prevents it
@@ -1109,6 +1163,8 @@ impl PreparedIndependentNoGameOwner {
                 observation: None,
                 quarantined_error: None,
                 grants: Arc::new(Mutex::new([None, None])),
+                cancel_not_granted: Arc::new(AtomicBool::new(false)),
+                cancel_failure: Arc::new(std::sync::OnceLock::new()),
             }),
             process: None,
             spawn_custody: crate::process::SpawnCustody::default(),
@@ -1223,6 +1279,9 @@ impl PreparedIndependentNoGameOwner {
         owners.observation = Some(crate::process::OriginalSmokeUciObservation::new(window));
         let run_control = Arc::clone(binding.control());
         let cleanup_control = Arc::clone(binding.control());
+        let cancel_control = Arc::clone(binding.control());
+        let cancel_not_granted = Arc::clone(&owners.cancel_not_granted);
+        let cancel_failure = Arc::clone(&owners.cancel_failure);
         let run_grants = Arc::clone(&owners.grants);
         let cleanup_grants = Arc::clone(&owners.grants);
         let mut run = |custody: &crate::process::SpawnCustody, until| {
@@ -1237,6 +1296,15 @@ impl PreparedIndependentNoGameOwner {
                 true,
             )
         };
+        let mut pre_signal = |custody: &crate::process::SpawnCustody, until| {
+            poll_independent_no_game_cancel(
+                &cancel_control,
+                &cancel_not_granted,
+                &cancel_failure,
+                custody,
+                until,
+            )
+        };
         self.physical_fence_confirmed = false;
         let result = crate::process::supervise_smoke_uci_in_original_window(
             binding.proxy().as_ref(),
@@ -1249,7 +1317,7 @@ impl PreparedIndependentNoGameOwner {
             &mut self.spawn_custody,
             &mut run,
             Some(&mut cleanup),
-            None,
+            Some(&mut pre_signal),
             owners.observation.as_mut().expect("installed observation"),
         );
         match result {
@@ -1283,6 +1351,8 @@ impl PreparedIndependentNoGameOwner {
             && self.original_error.is_none()
             && self.failures.is_empty()
             && owners.observation.is_none()
+            && !owners.cancel_not_granted.load(Ordering::Acquire)
+            && owners.cancel_failure.get().is_none()
         {
             return None;
         }
@@ -1299,6 +1369,8 @@ impl PreparedIndependentNoGameOwner {
             failures: std::mem::take(&mut self.failures),
             observation: owners.observation.take(),
             grants: Arc::clone(&owners.grants),
+            cancel_not_granted: owners.cancel_not_granted.load(Ordering::Acquire),
+            cancel_failure: owners.cancel_failure.get().cloned(),
         })
     }
 }
