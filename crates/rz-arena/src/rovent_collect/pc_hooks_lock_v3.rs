@@ -571,7 +571,8 @@ impl RoventPcCollectionBridgeV3 {
                 Err(TryLockError::Poisoned(_)) => return PcPreparedOutcomeV3::Rejected("P-C V3 session poisoned", original),
             };
             if !session.original_admission().same_original_admission(&original.admission)
-                || !Arc::ptr_eq(session.manifest_lock(), self.inputs.manifest()) {
+                || !Arc::ptr_eq(session.manifest_lock(), self.inputs.manifest())
+                || !session.all_actor_owners_started() {
                 drop(session); return PcPreparedOutcomeV3::Rejected("P-C V3 input or root session differs", original);
             }
         }
