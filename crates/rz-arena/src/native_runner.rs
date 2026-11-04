@@ -1138,6 +1138,58 @@ pub(crate) enum IndependentNoGameDispatchOutcome {
     Rejected(ArenaError),
 }
 
+/// Preserve the original unwind payload separately from the same owner.
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameOwnedDispatch {
+    Returned(IndependentNoGameDispatchOutcome),
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) enum IndependentNoGameOwnedPersistence {
+    Returned(Result<IndependentNoGamePersistence, ArenaError>),
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
+/// This outcome owns the exact original supervisor even when the child or
+/// physical completion remains unknown. Persistence is a separate result.
+#[cfg(target_os = "linux")]
+#[must_use = "retain the original owner while physical completion is unknown"]
+pub(crate) struct IndependentNoGameOwnedOutcome {
+    pub(crate) owner: PreparedIndependentNoGameOwner,
+    pub(crate) dispatch: IndependentNoGameOwnedDispatch,
+    pub(crate) persistence: IndependentNoGameOwnedPersistence,
+}
+
+/// Consume an already issued, same-owner admission. This function does not
+/// produce admission or open the guarded proxy path. Raw evidence is borrowed
+/// from the owner and a failed or panicking write does not replace it.
+#[cfg(target_os = "linux")]
+pub(crate) fn dispatch_independent_no_game_and_persist(
+    mut owner: PreparedIndependentNoGameOwner,
+    admission: IndependentNoGameDispatchAdmission,
+    cancel: Option<&AtomicBool>,
+    evidence_basename: &str,
+) -> IndependentNoGameOwnedOutcome {
+    let dispatch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.dispatch(admission, cancel)
+    })) {
+        Ok(outcome) => IndependentNoGameOwnedDispatch::Returned(outcome),
+        Err(payload) => IndependentNoGameOwnedDispatch::Panicked(payload),
+    };
+    let persistence = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.persist_raw_evidence_with_dispatch(evidence_basename, Some(&dispatch))
+    })) {
+        Ok(outcome) => IndependentNoGameOwnedPersistence::Returned(outcome),
+        Err(payload) => IndependentNoGameOwnedPersistence::Panicked(payload),
+    };
+    IndependentNoGameOwnedOutcome {
+        owner,
+        dispatch,
+        persistence,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn poll_independent_no_game_control(
     control: &Mutex<crate::pals_adaptive_launch::SmokeDeadlineControl>,
@@ -1288,6 +1340,12 @@ impl PreparedIndependentNoGameOwner {
             })
     }
 
+    /// A read-only custody observation for the caller that retains this owner.
+    /// False does not attest model correctness or a device-wide fence.
+    pub(crate) fn physical_or_process_completion_unknown(&self) -> bool {
+        self.unresolved()
+    }
+
     /// A borrow transfers neither custody nor a completion assertion.
     pub(crate) fn process(&self) -> Option<&ProcessOutput> {
         self.process.as_ref()
@@ -1334,6 +1392,14 @@ impl PreparedIndependentNoGameOwner {
         &self,
         basename: &str,
     ) -> Result<IndependentNoGamePersistence, ArenaError> {
+        self.persist_raw_evidence_with_dispatch(basename, None)
+    }
+
+    fn persist_raw_evidence_with_dispatch(
+        &self,
+        basename: &str,
+        dispatch: Option<&IndependentNoGameOwnedDispatch>,
+    ) -> Result<IndependentNoGamePersistence, ArenaError> {
         if !crate::native_launch::safe_output_basename(basename) {
             return Err(ArenaError::Invalid(
                 "NoGame evidence basename invalid".into(),
@@ -1347,7 +1413,8 @@ impl PreparedIndependentNoGameOwner {
         let cap = snapshot.plan.input().budget.max_output_bytes;
         let process = self.process.as_ref();
         let observed = owners.observation.as_ref();
-        if process.is_none()
+        if dispatch.is_none()
+            && process.is_none()
             && observed.is_none()
             && self.original_error.is_none()
             && self.failures.is_empty()
@@ -1412,6 +1479,21 @@ impl PreparedIndependentNoGameOwner {
             Err(TryLockError::WouldBlock) => serde_json::json!({"state":"busy"}),
             Err(TryLockError::Poisoned(_)) => serde_json::json!({"state":"poisoned"}),
         };
+        let dispatch_observation = dispatch.map(|observation| match observation {
+            IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::UnsupportedDeclaredEnvironment) =>
+                serde_json::json!({"state": "unsupported_declared_environment"}),
+            IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::Supervisor(IndependentNoGameSupervisorOutcome::ReturnedUnassessed)) =>
+                serde_json::json!({"state": "returned_unassessed"}),
+            IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::Supervisor(IndependentNoGameSupervisorOutcome::FailedRetained)) =>
+                serde_json::json!({"state": "failed_retained"}),
+            IndependentNoGameOwnedDispatch::Returned(IndependentNoGameDispatchOutcome::Rejected(error)) =>
+                serde_json::json!({"state": "rejected", "error": format!("{error:?}")}),
+            IndependentNoGameOwnedDispatch::Panicked(payload) => {
+                let message = payload.downcast_ref::<String>().map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&'static str>().copied());
+                serde_json::json!({"state": "panicked", "message": message, "payload": if message.is_some() { "string" } else { "opaque_original_retained" }})
+            }
+        });
         let summary = serde_json::to_vec(&serde_json::json!({
             "scope": "original_nogame_observations_not_physical_fence",
             "owner_id": owners._binding.execution().owner_id(),
@@ -1420,6 +1502,7 @@ impl PreparedIndependentNoGameOwner {
             "physical_or_process_completion_unknown": self.unresolved(),
             "process_receipt": process.map(|p| &p.receipt),
             "original_error": self.original_error.as_ref().map(ToString::to_string),
+            "dispatch_observation": dispatch_observation,
             "failures": self.failures,
             "cancel_not_granted": owners.cancel_not_granted.load(Ordering::Acquire),
             "cancel_failure": owners.cancel_failure.get().map(ToString::to_string),
