@@ -2,7 +2,7 @@
 //! This module is not registered or connected to a product bridge. Its
 //! close proof is intentionally unconstructible until an audited bridge
 //! proves the original native fence and all root/producer custody.
-use super::launch::PreparedPcCollectionInputsV3;
+use super::launch::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
 use super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3;
 use rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3;
 use std::convert::Infallible;
@@ -25,6 +25,7 @@ struct StateV3<S> {
     phase: PhaseV3,
     supervisor: Option<Weak<Mutex<S>>>,
     pipeline: Option<PolicyRowPipelineOwnerV3>,
+    output: Option<Weak<ManagedOutputOwnerV3>>,
     first: Option<RoventCollectionRootAdmissionV3>,
     pending: Vec<RoventCollectionRootAdmissionV3>,
     admitted: Vec<RoventCollectionRootAdmissionV3>,
@@ -76,6 +77,7 @@ impl<S> GameAuthorityV3<S> {
                 phase: PhaseV3::Open,
                 supervisor: None,
                 pipeline: None,
+                output: None,
                 first: None,
                 pending: Vec::new(),
                 admitted: Vec::new(),
@@ -123,8 +125,42 @@ impl<S> GameAuthorityV3<S> {
         }
     }
 
+    /// Pin the exact output owner separately from inputs: two output owners
+    /// may legitimately reference the same immutable input plan.
+    pub(super) fn try_bind_output(&self, output: &Arc<ManagedOutputOwnerV3>) -> GameStepV3 {
+        if !output.matches_inputs(&self.inputs) {
+            return GameStepV3::Foreign;
+        }
+        let mut state = match self.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if state.phase != PhaseV3::Open {
+            return GameStepV3::Closed;
+        }
+        let candidate = Arc::downgrade(output);
+        match &state.output {
+            Some(original) if Weak::ptr_eq(original, &candidate) => GameStepV3::Existing,
+            Some(_) => GameStepV3::Foreign,
+            None => {
+                state.output = Some(candidate);
+                GameStepV3::Ready
+            }
+        }
+    }
+
     pub(super) fn matches_inputs(&self, inputs: &Arc<PreparedPcCollectionInputsV3>) -> bool {
         Arc::ptr_eq(&self.inputs, inputs)
+    }
+
+    pub(super) fn same_owner(self: &Arc<Self>, other: &Arc<Self>) -> bool {
+        Arc::ptr_eq(self, other)
+    }
+
+    /// A request observation only; it does not prove that any root has
+    /// observed cancellation or that a worker has physically stopped.
+    pub(super) fn abort_requested(&self) -> bool {
+        self.control.load(Ordering::SeqCst) & ABORT_REQUESTED != 0
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, StateV3<S>>, GameStepV3> {
@@ -238,7 +274,10 @@ impl<S> GameAuthorityV3<S> {
         if !state.pending.is_empty() {
             return GameStepV3::Busy;
         }
-        if state.supervisor.as_ref().and_then(Weak::upgrade).is_none() || state.pipeline.is_none() {
+        if state.supervisor.as_ref().and_then(Weak::upgrade).is_none()
+            || state.pipeline.is_none()
+            || state.output.as_ref().and_then(Weak::upgrade).is_none()
+        {
             return GameStepV3::Foreign;
         }
         match state.phase {
@@ -340,6 +379,33 @@ pub(super) struct GamePublishGuardV3<S> {
     resolved: bool,
 }
 impl<S> GamePublishGuardV3<S> {
+    /// Match the bound owners without taking the pipeline mutex: callers may
+    /// already hold that mutex while passing its original finished writer.
+    /// The pipeline must itself verify its retained output and writer slots.
+    pub(super) fn try_matches_output_pipeline(
+        &self,
+        output: &Arc<ManagedOutputOwnerV3>,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> Result<Option<bool>, &'static str> {
+        let state = match self.owner.lock() {
+            Ok(state) => state,
+            Err(GameStepV3::Busy) => return Ok(None),
+            Err(_) => return Err("V3 game authority state unknown"),
+        };
+        Ok(Some(
+            state.phase == PhaseV3::Preparing
+                && output.matches_inputs(&self.owner.inputs)
+                && state
+                    .output
+                    .as_ref()
+                    .is_some_and(|original| Weak::ptr_eq(original, &Arc::downgrade(output)))
+                && state
+                    .pipeline
+                    .as_ref()
+                    .is_some_and(|original| original.same_owner(pipeline)),
+        ))
+    }
+
     /// The future writer must call this as its authorization immediately
     /// before its real publication commit; it is not durable-write evidence.
     pub(super) fn try_grant(&mut self) -> GameStepV3 {
