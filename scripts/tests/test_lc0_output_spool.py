@@ -21,7 +21,7 @@ class OutputSpoolTests(unittest.TestCase):
         spool = OutputSpool(self.file.fileno(), 5)
         spool.accept(b"abcdefg")
         observed = spool.observation()
-        self.assertEqual((observed["bytes_seen"], observed["bytes_persisted"],
+        self.assertEqual((observed["bytes_seen"], observed["bytes_written"],
                           observed["bytes_truncated"]), (7, 5, 2))
         self.assertFalse(observed["eof_observed"])
         self.assertEqual(os.pread(self.file.fileno(), 10, 0), b"abcde")
@@ -40,7 +40,7 @@ class OutputSpoolTests(unittest.TestCase):
 
         with mock.patch("lc0_output_spool.os.pwrite", side_effect=short_then_error):
             spool.accept(b"abcdef")
-        self.assertEqual(spool.observation()["bytes_persisted"], 2)
+        self.assertEqual(spool.observation()["bytes_written"], 2)
         self.assertEqual(spool.observation()["bytes_pending"], 4)
         with self.assertRaises(RuntimeError):
             spool.close()

@@ -17,8 +17,9 @@ class OutputSpool:
 
     The descriptor must name a new empty regular file owned by the caller.
     Writes use a positional offset so changes to the caller's file position do
-    not reorder the captured stream.  A disk error is sticky evidence, not a
-    claim of EOF; retrying is explicit and only retries the retained bytes.
+    not reorder the captured stream.  Written bytes mean OS-accepted writes,
+    not fsync or durable-storage evidence.  A disk error is sticky evidence,
+    not a claim of EOF; retrying only retries the retained bytes.
     """
 
     def __init__(self, fd: int, max_bytes: int):
@@ -35,7 +36,7 @@ class OutputSpool:
             raise
         self.max_bytes = max_bytes
         self.bytes_seen = 0
-        self.bytes_persisted = 0
+        self.bytes_written = 0
         self.bytes_truncated = 0
         self._pending = bytearray()
         self._first_write_error = None
@@ -49,7 +50,7 @@ class OutputSpool:
         if not isinstance(data, bytes):
             raise TypeError("output data must be bytes")
         self.bytes_seen += len(data)
-        remaining = self.max_bytes - self.bytes_persisted - len(self._pending)
+        remaining = self.max_bytes - self.bytes_written - len(self._pending)
         retained = data[:remaining]
         self._pending.extend(retained)
         self.bytes_truncated += len(data) - len(retained)
@@ -61,12 +62,12 @@ class OutputSpool:
             try:
                 current = os.fstat(self._fd)
                 if ((current.st_dev, current.st_ino) != self._identity
-                        or current.st_size != self.bytes_persisted):
+                        or current.st_size != self.bytes_written):
                     raise OSError("output file identity or size changed")
-                count = os.pwrite(self._fd, self._pending, self.bytes_persisted)
+                count = os.pwrite(self._fd, self._pending, self.bytes_written)
                 if count <= 0 or count > len(self._pending):
                     raise OSError("output file write did not advance")
-                self.bytes_persisted += count
+                self.bytes_written += count
                 del self._pending[:count]
             except OSError as error:
                 if self._first_write_error is None:
@@ -96,7 +97,7 @@ class OutputSpool:
     def observation(self) -> dict[str, object]:
         return {
             "bytes_seen": self.bytes_seen,
-            "bytes_persisted": self.bytes_persisted,
+            "bytes_written": self.bytes_written,
             "bytes_pending": len(self._pending),
             "bytes_truncated": self.bytes_truncated,
             "first_write_error": self._first_write_error,
