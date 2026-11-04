@@ -1136,6 +1136,16 @@ pub(crate) mod linux {
             ));
         }
         spec.validate_execution()?;
+        // Historical bundle declarations remain readable, but new executions
+        // must use the system runtime rather than snapshot CUDA libraries.
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            if spec.engine_view(role)?.cuda_bundle.is_some() {
+                return Err(ArenaError::Invalid(
+                    "legacy CUDA bundle execution is disabled; use a system CUDA runtime profile"
+                        .into(),
+                ));
+            }
+        }
         let input = spec.view();
         let metadata_cap = spec.pair_metadata_cap();
         let stream_cap = pair_stream_cap(input.budget.max_output_bytes, metadata_cap)?;

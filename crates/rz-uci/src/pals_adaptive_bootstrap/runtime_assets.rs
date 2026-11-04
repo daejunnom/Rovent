@@ -123,6 +123,11 @@ pub(crate) fn pin_retained_runtime(
 ) -> Result<RuntimeLibraryPin, BackendError> {
     #[cfg(target_os = "linux")]
     {
+        if roster.plan.cuda.is_some() {
+            return Err(unavailable(
+                "legacy CUDA bundle execution is disabled; use a system CUDA runtime profile",
+            ));
+        }
         let guards = SnapshotGuards::capture(root_path, original_root_capability, &roster.plan)?;
         let cache = RuntimeCache::for_user()?;
         pin_plan(&cache, root_path, &roster.plan, guards)

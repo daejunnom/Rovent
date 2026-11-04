@@ -844,6 +844,20 @@ fn cuda_selection_requires_two_pins_and_rejects_mixed_or_mutable_profiles() {
 }
 
 #[test]
+fn legacy_cuda_config_is_readable_but_cannot_start_or_copy_assets() {
+    let mut arguments = valid_arguments();
+    arguments[0] = "--onnx-cuda".into();
+    arguments.push(format!("--cuda-bundle={PRIVATE_MARKER}/bundle.json"));
+    arguments.push(format!("--cuda-bundle-sha256={}", "ef".repeat(32)));
+    let config = NativeConfig::parse(arguments).unwrap();
+    let error = NativeSessionFactory::load_parts(&OwnerRegistry::default(), &config)
+        .err()
+        .expect("legacy CUDA must fail before opening the synthetic asset paths");
+    assert!(matches!(error, NativeBootstrapError::Config(_)));
+    assert!(error.to_string().contains("legacy CUDA bundle execution is disabled"));
+}
+
+#[test]
 fn system_cuda_selection_is_explicit_and_never_accepts_legacy_receipts_or_cache() {
     let mut system = valid_arguments();
     system[0] = "--onnx-cuda".into();

@@ -1251,6 +1251,11 @@ impl NativeSessionFactory {
                 "system CUDA native entry requires lifecycle custody; no runtime was started",
             ));
         }
+        if config.provider == NativeProvider::Cuda {
+            return Err(NativeBootstrapError::Config(
+                "legacy CUDA bundle execution is disabled; use a system CUDA runtime profile",
+            ));
+        }
         let parts_started = Instant::now();
         let asset = MaiaAsset::load(
             &config.source_weights,

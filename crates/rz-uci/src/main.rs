@@ -1746,6 +1746,12 @@ fn run_native_pals(
             );
         }
     };
+    if provider == "cuda" {
+        return Err(
+            "legacy PALS CUDA bundle execution is disabled; use a system CUDA runtime profile"
+                .into(),
+        );
+    }
     if provider == "cpu"
         && (native.cuda_bundle.is_some()
             || native.cuda_bundle_hash.is_some()
