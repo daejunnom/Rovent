@@ -618,6 +618,34 @@ struct ManagedOutputStateV3 {
     directory: Option<Dir>,
     chunks: Option<Dir>,
     uncertain: bool,
+    completed_writes: u64,
+    closed: Option<ManagedOutputCloseStatusV3>,
+}
+
+/// Facts about calls through this one output owner, not corpus, producer,
+/// parent lease, worker, publication, or GPU completion evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedOutputCloseStatusV3 {
+    NoWrites,
+    WritesAcknowledged { count: u64 },
+    Unknown,
+    UnknownAfterAttempt,
+}
+
+/// Retains the exact original output owner along with its frozen close state.
+pub(crate) struct ManagedOutputCloseEvidenceV3 {
+    owner: Arc<ManagedOutputOwnerV3>,
+    status: ManagedOutputCloseStatusV3,
+}
+
+impl ManagedOutputCloseEvidenceV3 {
+    pub(crate) fn matches_original(&self, owner: &Arc<ManagedOutputOwnerV3>) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
+    }
+
+    pub(crate) fn status(&self) -> ManagedOutputCloseStatusV3 {
+        self.status
+    }
 }
 
 impl ManagedOutputStateV3 {
@@ -720,6 +748,8 @@ impl ManagedOutputOwnerV3 {
                 directory: None,
                 chunks: None,
                 uncertain: false,
+                completed_writes: 0,
+                closed: None,
             }),
             deadline,
         })
@@ -738,7 +768,7 @@ impl ManagedOutputOwnerV3 {
             .state
             .try_lock()
             .map_err(|_| "Collection output state unavailable")?;
-        if state.authorized || state.uncertain {
+        if state.authorized || state.uncertain || state.closed.is_some() {
             return Err("Collection output authority unavailable");
         }
         state.authorized = true;
@@ -751,6 +781,46 @@ impl ManagedOutputOwnerV3 {
 
     pub(crate) fn matches_inputs(&self, inputs: &Arc<PreparedPcCollectionInputsV3>) -> bool {
         Arc::ptr_eq(&self.inputs, inputs)
+    }
+
+    /// Close admission to further writes only after the caller has stopped its
+    /// producers. `None` is a live writer holding this same owner's mutex;
+    /// callers may poll without blocking any other owner. Closing records the
+    /// completed calls already observed and preserves uncertainty on panic or
+    /// an attempted mutation. It does not close the original lease/channel.
+    pub(crate) fn try_close(self: &Arc<Self>) -> Option<ManagedOutputCloseEvidenceV3> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let mut state = error.into_inner();
+                if state.closed.is_none() {
+                    state.closed = Some(if state.uncertain {
+                        ManagedOutputCloseStatusV3::UnknownAfterAttempt
+                    } else {
+                        ManagedOutputCloseStatusV3::Unknown
+                    });
+                }
+                state.uncertain = true;
+                state
+            }
+        };
+        let status = state.closed.unwrap_or_else(|| {
+            if state.uncertain {
+                ManagedOutputCloseStatusV3::UnknownAfterAttempt
+            } else if state.completed_writes == 0 {
+                ManagedOutputCloseStatusV3::NoWrites
+            } else {
+                ManagedOutputCloseStatusV3::WritesAcknowledged {
+                    count: state.completed_writes,
+                }
+            }
+        });
+        state.closed = Some(status);
+        Some(ManagedOutputCloseEvidenceV3 {
+            owner: Arc::clone(self),
+            status,
+        })
     }
 
     /// The packet owner is retained by the caller on every error. Once any
@@ -785,6 +855,11 @@ impl ManagedOutputOwnerV3 {
         if state.uncertain {
             return Err(ManagedOutputWriteErrorV3::AfterAttempt(
                 "managed output prior mutation uncertain".into(),
+            ));
+        }
+        if state.closed.is_some() {
+            return Err(ManagedOutputWriteErrorV3::BeforeWrite(
+                "managed output write admission closed".into(),
             ));
         }
         if !state.authorized {
@@ -847,6 +922,12 @@ impl ManagedOutputOwnerV3 {
         })();
         match result {
             Ok(()) => {
+                let Some(completed) = state.completed_writes.checked_add(1) else {
+                    return Err(ManagedOutputWriteErrorV3::AfterAttempt(
+                        "managed output write count overflow".into(),
+                    ));
+                };
+                state.completed_writes = completed;
                 state.uncertain = false;
                 Ok(())
             }
