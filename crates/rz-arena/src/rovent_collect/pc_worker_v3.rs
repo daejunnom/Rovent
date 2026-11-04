@@ -58,6 +58,7 @@ struct PcScopeEffectSlotsV3 {
     claim: Option<super::game_authority_v3::GameEffectClaimV3<PcWorkerSupervisorV3>>,
     outcome: Option<Result<super::teacher::v3_session::TeacherScopeEffectOutcomeV3,
         super::teacher::v3_session::TeacherScopeEffectClaimFailureV3>>,
+    unclaimed_proof: Option<super::teacher::v3_session::TeacherScopeUnclaimedProofV3>,
     issue_error: Option<TeacherSessionClaimErrorV3>,
     source_error: Option<&'static str>,
     claim_error: Option<&'static str>,
@@ -69,7 +70,7 @@ struct PcScopeEffectSlotsV3 {
 }
 impl PcScopeEffectSlotsV3 {
     fn new() -> Self {
-        Self { proof: None, teacher_source: None, game_source: None, claim: None, outcome: None,
+        Self { proof: None, teacher_source: None, game_source: None, claim: None, outcome: None, unclaimed_proof: None,
             issue_error: None, source_error: None, claim_error: None, completion_error: None,
             source_step: None, claim_step: None, completion_step: None, finished: false }
     }
@@ -271,6 +272,39 @@ impl PcRootRecoveryV3 {
 
     pub(crate) fn is_sealed_abort_no_scope(&self) -> bool { self.sealed_abort_no_scope }
     pub(crate) fn has_teacher_reservation(&self) -> bool { self.teacher_reserved }
+
+    /// Seal only the retained stage/source whose scope claim was never entered.
+    /// The bridge still owns the original no-scope ACK and quota checks.
+    pub(crate) fn try_seal_aborted_unclaimed_stage(&mut self) -> Result<Option<bool>, &'static str> {
+        use super::game_authority_v3::GameStepV3 as G;
+        if !self.abort_before_route || self.panic.is_some() || self.route.is_some()
+            || self.worker.is_some() || self.worker_key.is_some() || self.prepared.is_some()
+            || self.published || self.next_actor != 0 || !self.custodian.keys().is_empty()
+        { return Ok(Some(false)); }
+        let Some(stage_owner) = self.stage.as_ref().map(Arc::clone) else { return Ok(Some(false)); };
+        let mut stage = match stage_owner.try_lock() {
+            Ok(stage) => stage,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 unclaimed stage poisoned"),
+        };
+        let owner = Arc::clone(&self.scope_effects);
+        let mut slots = match owner.try_lock() {
+            Ok(slots) => slots,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 unclaimed scope slots poisoned"),
+        };
+        let PcScopeEffectSlotsV3 { teacher_source, game_source, claim, outcome,
+            claim_step, unclaimed_proof, .. } = &mut *slots;
+        if claim.is_some() || outcome.is_some()
+            || !matches!(*claim_step, None | Some(G::Busy | G::Aborted | G::Closed))
+        { return Ok(Some(false)); }
+        let source = teacher_source.as_ref().or_else(|| game_source.as_ref().and_then(|owner| owner.pc_scope_source()));
+        let Some(source) = source else { return Ok(Some(false)); };
+        if let Some(proof) = unclaimed_proof.as_ref() {
+            return Ok(Some(proof.matches_original(&stage, source, &self.admission)));
+        }
+        Ok(Some(stage.seal_unclaimed_scope_after_source(source, unclaimed_proof)))
+    }
 
     /// Seal only a known pre-route root whose own session physically retired.
     /// The ledger must separately validate this same recovery and aggregate.
@@ -2146,7 +2180,7 @@ fn drive_pc_scope_effect_v3(
     };
     let PcScopeEffectSlotsV3 { proof, teacher_source, game_source, claim, outcome,
         issue_error, source_error, claim_error, completion_error, source_step, claim_step,
-        completion_step, finished } = &mut *slots;
+        completion_step, finished, .. } = &mut *slots;
     if *finished {
         // Effect settlement and a successful scope claim are separate. Keep
         // a known rejected original outcome rejected on every re-observation.
