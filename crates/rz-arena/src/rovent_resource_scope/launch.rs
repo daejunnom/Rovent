@@ -1630,7 +1630,7 @@ pub fn run_native_with_resources_v3(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventNativeResourceRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, false).map_err(|error| match error {
+    run_native_with_resources_v3_inner(pin, arguments, false, None).map_err(|error| match error {
         V3InnerFailure::BeforeControl(failure) | V3InnerFailure::Failed(failure) => failure,
         V3InnerFailure::Quarantined(quarantine) => quarantine.original_failure,
     })
@@ -1642,7 +1642,7 @@ pub fn run_native_with_resources_v3_control(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
-    run_native_with_resources_v3_inner(pin, arguments, true).map_err(|error| match error {
+    run_native_with_resources_v3_inner(pin, arguments, true, None).map_err(|error| match error {
         V3InnerFailure::BeforeControl(failure) => {
             RoventControlledRunFailure::BeforeControl(failure)
         }
@@ -1653,10 +1653,73 @@ pub fn run_native_with_resources_v3_control(
     })
 }
 
+/// Native/resource observation and the original Collection owner remain
+/// together. Native success does not attest teacher or observer settlement.
+/// Until a same-owner settlement API exists, dropping this value quarantines
+/// both original owners instead of treating an unresolved result as closed.
+#[must_use]
+pub struct RoventPcCollectionResourceOutcomeV3 {
+    native: Option<Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure>>,
+    collection: Option<Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
+}
+
+impl RoventPcCollectionResourceOutcomeV3 {
+    pub fn native_outcome(
+        &self,
+    ) -> &Result<RoventNativeSystemResourceRunReceiptV3, RoventControlledRunFailure> {
+        self.native.as_ref().expect("native owner remains retained")
+    }
+
+    pub fn original_collection(
+        &self,
+    ) -> &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3> {
+        self.collection
+            .as_ref()
+            .expect("collection owner remains retained")
+    }
+}
+
+impl Drop for RoventPcCollectionResourceOutcomeV3 {
+    fn drop(&mut self) {
+        // A native result and proxy drop alone do not settle the teacher.
+        // Keep the exact owners until the typed combined recovery path exists.
+        if let Some(owner) = self.collection.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(native) = self.native.take() {
+            std::mem::forget(native);
+        }
+    }
+}
+
+/// Run the original /3 P/C Collection through the same cgroup owner and
+/// authenticated parent used by the ordinary controlled native launch.
+pub fn run_pc_collection_with_resources_v3_control(
+    pin: RoventNativeResourcePlanPin,
+    arguments: Vec<String>,
+    collection: &Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
+) -> RoventPcCollectionResourceOutcomeV3 {
+    let native = run_native_with_resources_v3_inner(pin, arguments, true, Some(collection))
+        .map_err(|error| match error {
+            V3InnerFailure::BeforeControl(failure) => {
+                RoventControlledRunFailure::BeforeControl(failure)
+            }
+            V3InnerFailure::Failed(failure) => RoventControlledRunFailure::Failed(failure),
+            V3InnerFailure::Quarantined(quarantine) => {
+                RoventControlledRunFailure::Quarantined(quarantine)
+            }
+        });
+    RoventPcCollectionResourceOutcomeV3 {
+        native: Some(native),
+        collection: Some(Arc::clone(collection)),
+    }
+}
+
 fn run_native_with_resources_v3_inner(
     pin: RoventNativeResourcePlanPin,
     mut arguments: Vec<String>,
     custody_control: bool,
+    collection: Option<&Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>>,
 ) -> Result<RoventNativeSystemResourceRunReceiptV3, V3InnerFailure> {
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
@@ -1717,11 +1780,13 @@ fn run_native_with_resources_v3_inner(
             BeforeControlV3Outcome, ControlledV3Outcome, ControlledV3Result,
             RoventRetainingLaunchError,
         };
-        let controlled =
-            rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_connected_control_slot(
+        macro_rules! run_controlled {
+            ($entry:path $(, $owner:expr)?) => {
+                $entry(
                 arguments,
                 Arc::clone(&control_slot),
                 parent_stream,
+                $($owner,)?
                 move |lock, _root, _file, _startup_until, cleanup_until, directory, path, slot| {
                     let mut state = callback.lock().map_err(|_| RoventLaunchError {
                         stage: "ResourceAdmission",
@@ -1805,7 +1870,18 @@ fn run_native_with_resources_v3_inner(
                     }
                     Ok(())
                 },
-            );
+            )
+            };
+        }
+        let controlled = match collection {
+            Some(owner) => run_controlled!(
+                rz_uci::rovent_bootstrap::launch::run_pc_collection_v3_with_resource_admission_retaining_connected_control_slot,
+                owner
+            ),
+            None => run_controlled!(
+                rz_uci::rovent_bootstrap::launch::run_with_v3_resource_admission_retaining_connected_control_slot
+            ),
+        };
         let outcome = match controlled {
             ControlledV3Result::BeforeControl { outcome } => {
                 before_control = true;
