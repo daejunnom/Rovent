@@ -72,6 +72,30 @@ impl RoventCorpusWriterLockV3 {
                 .is_some_and(|n| n > MAX_CHUNK_BYTES))
     }
 
+    /// Size check only; the opaque candidate and original target capability
+    /// stay in the caller's slot and no publication authority is exercised.
+    pub(super) fn policy_chunk_flush_required(
+        &self,
+        pending: &super::producer_v3::PendingPolicyPublicationV3,
+    ) -> Result<bool, ArenaError> {
+        check(
+            self.uncertain_append.is_none(),
+            "writer /3 append state uncertain",
+        )?;
+        let row_bytes = serde_json::to_vec(pending.candidate())
+            .map_err(|error| invalid(error.to_string()))?
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| invalid("writer /3 row byte count overflow"))?;
+        Ok(!self.buffer.is_empty()
+            && row_bytes <= MAX_CHUNK_BYTES
+            && self
+                .buffer
+                .len()
+                .checked_add(row_bytes)
+                .is_some_and(|n| n > MAX_CHUNK_BYTES))
+    }
+
     /// Validate against the admitted /3 lock; this is not evidence that the
     /// worker, accelerator, teacher or full collection has completed.
     pub fn new(

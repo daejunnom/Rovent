@@ -30,6 +30,8 @@ pub(super) enum PolicyPipelineFailureV3 {
 
 pub(super) enum PolicyPipelineProgressV3 {
     Appended,
+    /// A complete prior chunk is in the caller's retained output slot.
+    ChunkReady,
     Busy,
     NotReady,
     Failed,
@@ -176,9 +178,39 @@ impl PolicyRowPipelineV3 {
 
     /// Runs only in the retained worker. It never takes an observer or
     /// registration lock while the target gate is held by the writer.
-    pub(super) fn try_append(&mut self) -> PolicyPipelineProgressV3 {
+    pub(super) fn try_append(
+        &mut self,
+        output: &mut Option<RoventChunkPacket>,
+    ) -> PolicyPipelineProgressV3 {
         if self.failure.is_some() || self.appended {
             return PolicyPipelineProgressV3::Failed;
+        }
+        let needs_flush = match (self.writer.as_ref(), self.pending.as_ref()) {
+            (Some(writer), Some(pending)) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    writer.policy_chunk_flush_required(pending)
+                })) {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        self.failure = Some(PolicyPipelineFailureV3::Flush(error));
+                        return PolicyPipelineProgressV3::Failed;
+                    }
+                    Err(payload) => {
+                        self.failure = Some(PolicyPipelineFailureV3::BeforeAppendPanic(payload));
+                        return PolicyPipelineProgressV3::Failed;
+                    }
+                }
+            }
+            _ => return PolicyPipelineProgressV3::NotReady,
+        };
+        if needs_flush {
+            return match self.flush_into(output) {
+                PolicyFlushOutcomeV3::Packet => PolicyPipelineProgressV3::ChunkReady,
+                PolicyFlushOutcomeV3::NotReady => PolicyPipelineProgressV3::NotReady,
+                PolicyFlushOutcomeV3::Empty | PolicyFlushOutcomeV3::Failed => {
+                    PolicyPipelineProgressV3::Failed
+                }
+            };
         }
         let Some(pending) = self.pending.as_mut() else {
             return PolicyPipelineProgressV3::NotReady;
