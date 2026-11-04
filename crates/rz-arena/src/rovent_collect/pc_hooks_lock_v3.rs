@@ -1430,7 +1430,17 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
             };
             match ledger.reserve_worker(&admission) {
                 PcQuotaOutcomeV3::Reserved | PcQuotaOutcomeV3::AlreadyReserved => slot.quota_registered = true,
-                PcQuotaOutcomeV3::Busy | PcQuotaOutcomeV3::Exhausted => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
+                PcQuotaOutcomeV3::Busy => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
+                PcQuotaOutcomeV3::Exhausted => {
+                    // Do not scan on every tick. Only quota contention can
+                    // benefit from retiring other root-local no-dispatch work.
+                    drop(ledger);
+                    drop(state);
+                    if let Err(error) = self.try_recover_nonaccepting_roots() {
+                        return Err(failure(AdaptiveManagerError::Invalid(error), admission));
+                    }
+                    return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission });
+                },
                 _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 duplicate root reservation"), admission)),
             }
         }
