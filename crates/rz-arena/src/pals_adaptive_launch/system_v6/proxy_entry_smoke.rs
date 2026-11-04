@@ -267,6 +267,26 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
             ),
         ),
         (
+            "proxy_smoke_admission",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_admission_v1.rs"
+            ),
+        ),
+        (
+            "proxy_smoke_entry",
+            include_bytes!(
+                "../../../../rz-uci/src/pals_system_proxy/proxy_entry_smoke_entry_v1.rs"
+            ),
+        ),
+        (
+            "proxy_startup_v6",
+            include_bytes!("../../../../rz-uci/src/pals_adaptive_startup/system_v6.rs"),
+        ),
+        (
+            "proxy_startup_module",
+            include_bytes!("../../../../rz-uci/src/pals_adaptive_startup.rs"),
+        ),
+        (
             "proxy_module",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy.rs"),
         ),
