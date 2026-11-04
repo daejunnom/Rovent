@@ -1910,6 +1910,10 @@ pub struct RoventPcCollectionSettledOutcomeV3 {
     pub observer: Box<dyn rz_uci::pals_native::ticketed::VirtualReviewCollectionObserver>,
     pub hook_custody: Box<dyn std::any::Any + Send>,
     pub observer_poison_observed: bool,
+    /// Original driver custody retains any timeout/error or panic separately
+    /// from physical join; it is not a semantic-success observation.
+    #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+    pub(crate) driver_joined: Option<crate::rovent_collect::launch::PcSupervisorJoinedProofV3>,
 }
 
 impl RoventPcCollectionResourceOutcomeV3 {
@@ -2074,13 +2078,15 @@ impl RoventPcCollectionResourceOutcomeV3 {
             .expect("original collection remains retained");
         self.settlement.take();
         #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
-        self.driver_joined.take();
+        let driver_joined = self.driver_joined.take();
         Ok(Some(RoventPcCollectionSettledOutcomeV3 {
             native,
             collection,
             observer,
             hook_custody,
             observer_poison_observed,
+            #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
+            driver_joined,
         }))
     }
 }
