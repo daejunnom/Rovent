@@ -9,16 +9,18 @@ use super::native_capture::{LockV3RegistrationAttempt, RoventFailedCapturedInput
 use super::producer_v3::{
     RoventCorpusProducerLockV3, RoventInputCaptureReservationV3, RoventRetiredLockV3Record,
 };
+use super::speculative_route_v3::SpeculativeRootV3;
 use super::*;
 use crate::pals_collect_v3::{GenerationActionSupportV3, GenerationCaptureWorkScopeV3};
 use rz_experiments::rovent_corpus_lock_v3::record::RoventCorpusManifestLockV3;
 use rz_search::pals::coordinator::FrameInput;
 use rz_uci::pals_adaptive::{
-    AdaptiveCollectionDispatchV2, AdaptiveCollectionError, AdaptiveCollectionObserverBoxV3,
-    AdaptiveCollectionObserverV3, AdaptiveCollectionStage, RoleOnlySearchConsumptionV2,
-    RoventCollectionAcceptedWitnessV3, RoventCollectionConsumedWitnessV3,
-    RoventCollectionDispatchWitnessV3, RoventCollectionNativeEventWitnessV3,
-    RoventCollectionRootAdmissionV3, RoventRootRankingAcceptanceV3,
+    AdaptiveCollectionBoundaryV2, AdaptiveCollectionDispatchV2, AdaptiveCollectionError,
+    AdaptiveCollectionObserverBoxV3, AdaptiveCollectionObserverV3, AdaptiveCollectionStage,
+    RoleOnlySearchConsumptionV2, RoventCollectionAcceptedWitnessV3,
+    RoventCollectionConsumedWitnessV3, RoventCollectionDispatchWitnessV3,
+    RoventCollectionNativeEventWitnessV3, RoventCollectionRootAdmissionV3,
+    RoventRootRankingAcceptanceV3,
 };
 use std::{
     collections::VecDeque,
@@ -44,6 +46,8 @@ struct State {
     registration: RoventNativeCaptureRegistration,
     router: Arc<CaptureRouterV3>,
     admission: Option<RoventCollectionRootAdmissionV3>,
+    route_admission: Option<RoventCollectionRootAdmissionV3>,
+    speculative_root: Option<SpeculativeRootV3>,
     producer: Option<RoventCorpusProducerLockV3>,
     position: Option<Position>,
     history: Vec<BoardMove>,
@@ -91,6 +95,8 @@ impl RoventCollectionOwnerLockV3 {
                 registration,
                 router,
                 admission: None,
+                route_admission: None,
+                speculative_root: None,
                 producer: None,
                 position: None,
                 history: Vec::new(),
@@ -108,6 +114,46 @@ impl RoventCollectionOwnerLockV3 {
     }
     pub(crate) fn capture_registration(&self) -> RoventNativeCaptureRegistration {
         self.registration.clone()
+    }
+    /// Must be installed before this root registers its first ticket.
+    /// None denotes a retryable owner-lock collision, not route installation.
+    pub(crate) fn try_attach_speculative_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        route: &SpeculativeRootV3,
+    ) -> Result<Option<()>, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        check(
+            state
+                .admission
+                .as_ref()
+                .is_none_or(|original| original.same_original_admission(admission))
+                && state
+                    .route_admission
+                    .as_ref()
+                    .is_none_or(|original| original.same_original_admission(admission))
+                && state.registration.owns_speculative_root_v3(route)
+                && route.matches_admission(admission)
+                && state.staged.is_empty()
+                && state.pending.is_empty()
+                && state.handled.is_empty()
+                && !state.settled,
+            "lock-v3 speculative route admission or timing mismatch",
+        )?;
+        if let Some(existing) = &state.speculative_root {
+            check(
+                existing.same_original_route(route),
+                "lock-v3 speculative route changed",
+            )?;
+        } else {
+            state.speculative_root = Some(route.clone());
+            state.route_admission = Some(admission.clone());
+        }
+        Ok(Some(()))
     }
     pub(crate) fn observer<Q: 'static, O: ProposerRankingOutput + 'static>(
         &self,
@@ -150,6 +196,54 @@ struct Observer<Q, O> {
     marker: PhantomData<fn(Q, O)>,
 }
 impl<Q, O> Observer<Q, O> {
+    fn try_dispatch_apply(
+        &self,
+        f: impl FnOnce(&mut State) -> Result<AdaptiveCollectionDispatchV2, ArenaError>,
+    ) -> Result<AdaptiveCollectionDispatchV2, AdaptiveCollectionError> {
+        let mut state = match self.owner.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(AdaptiveCollectionDispatchV2::Busy);
+            }
+            Err(error) => {
+                return Err(AdaptiveCollectionError::new(
+                    AdaptiveCollectionStage::Dispatch,
+                    "RoventLockV3Owner",
+                    error.to_string(),
+                ));
+            }
+        };
+        f(&mut state).map_err(|error| {
+            AdaptiveCollectionError::new(
+                AdaptiveCollectionStage::Dispatch,
+                "RoventLockV3Collection",
+                error.to_string(),
+            )
+        })
+    }
+    fn try_apply(
+        &self,
+        stage: AdaptiveCollectionStage,
+        f: impl FnOnce(&mut State) -> Result<AdaptiveCollectionBoundaryV2, ArenaError>,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        let mut state = match self.owner.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(AdaptiveCollectionBoundaryV2::Busy);
+            }
+            Err(error) => {
+                return Err(AdaptiveCollectionError::new(
+                    stage,
+                    "RoventLockV3Owner",
+                    error.to_string(),
+                ));
+            }
+        };
+        f(&mut state).map_err(|error| {
+            AdaptiveCollectionError::new(stage, "RoventLockV3Collection", error.to_string())
+        })
+    }
+
     fn apply<T>(
         &self,
         stage: AdaptiveCollectionStage,
@@ -169,7 +263,7 @@ impl State {
             .as_mut()
             .ok_or_else(|| invalid("lock-v3 root not admitted"))
     }
-    fn drain(&mut self) -> Result<(), ArenaError> {
+    fn try_drain(&mut self) -> Result<AdaptiveCollectionBoundaryV2, ArenaError> {
         let admission = self
             .admission
             .as_ref()
@@ -178,8 +272,8 @@ impl State {
         loop {
             let capture = match self.router.try_take(&admission)? {
                 CapturePollV3::Ready(capture) => capture,
-                CapturePollV3::Empty => return Ok(()),
-                CapturePollV3::Busy => return Err(invalid("lock-v3 capture router busy")),
+                CapturePollV3::Empty => return Ok(AdaptiveCollectionBoundaryV2::Ready),
+                CapturePollV3::Busy => return Ok(AdaptiveCollectionBoundaryV2::Busy),
             };
             if !capture.admission().same_original_admission(&admission) {
                 self.rejected_captures.push(capture);
@@ -192,7 +286,16 @@ impl State {
             }
         }
     }
-    fn retire(&mut self, witness: RoventCollectionConsumedWitnessV3<'_>) -> Result<(), ArenaError> {
+    fn drain(&mut self) -> Result<(), ArenaError> {
+        match self.try_drain()? {
+            AdaptiveCollectionBoundaryV2::Ready => Ok(()),
+            AdaptiveCollectionBoundaryV2::Busy => Err(invalid("lock-v3 capture router busy")),
+        }
+    }
+    fn try_retire(
+        &mut self,
+        witness: RoventCollectionConsumedWitnessV3<'_>,
+    ) -> Result<AdaptiveCollectionBoundaryV2, ArenaError> {
         let ticket = *witness.accepted().ticket();
         let pending = self
             .pending
@@ -202,12 +305,63 @@ impl State {
             pending.ticket == ticket && pending.accepted && self.retired.len() < MAX_RETIRED,
             "lock-v3 consumption identity or outbox capacity",
         )?;
-        self.drain()?;
+        if self.try_drain()? == AdaptiveCollectionBoundaryV2::Busy {
+            return Ok(AdaptiveCollectionBoundaryV2::Busy);
+        }
         let row = self.producer()?.retire_consumed(witness)?;
         self.pending.remove(&ticket.id);
         self.handled.insert(ticket.id, ticket);
         self.retired.push_back(row);
-        Ok(())
+        Ok(AdaptiveCollectionBoundaryV2::Ready)
+    }
+    fn retire(&mut self, witness: RoventCollectionConsumedWitnessV3<'_>) -> Result<(), ArenaError> {
+        match self.try_retire(witness)? {
+            AdaptiveCollectionBoundaryV2::Ready => Ok(()),
+            AdaptiveCollectionBoundaryV2::Busy => Err(invalid("lock-v3 capture router busy")),
+        }
+    }
+    fn try_abandon(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<AdaptiveCollectionBoundaryV2, ArenaError> {
+        let registered = if let Some(pending) = self.pending.get(&ticket.id) {
+            check(
+                pending.ticket == *ticket,
+                "lock-v3 abandoned ticket differs",
+            )?;
+            true
+        } else if let Some(original) = self.handled.get(&ticket.id) {
+            check(
+                original == ticket,
+                "lock-v3 abandoned handled ticket differs",
+            )?;
+            true
+        } else {
+            if let Some(staged) = self.staged.get(&ticket.id) {
+                check(
+                    staged.ticket == *ticket,
+                    "lock-v3 abandoned staged ticket differs",
+                )?;
+            }
+            false
+        };
+        if registered {
+            if let Some(route) = &self.speculative_root {
+                let admission = self
+                    .admission
+                    .as_ref()
+                    .ok_or_else(|| invalid("lock-v3 admission missing"))?;
+                check(
+                    route.matches_admission(admission),
+                    "lock-v3 abandoned route admission mismatch",
+                )?;
+                if route.try_cancel_ticket(ticket)?.is_none() {
+                    return Ok(AdaptiveCollectionBoundaryV2::Busy);
+                }
+            }
+        }
+        self.abandoned.insert(ticket.id, *ticket);
+        Ok(AdaptiveCollectionBoundaryV2::Ready)
     }
 }
 
@@ -220,6 +374,13 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
             check(
                 state.admission.is_none() && state.producer.is_none(),
                 "lock-v3 owner permits one original root only",
+            )?;
+            check(
+                state
+                    .route_admission
+                    .as_ref()
+                    .is_none_or(|original| original.same_original_admission(admission)),
+                "lock-v3 admitted root differs from sealed speculative route",
             )?;
             let snapshot = admission.rules().rules().snapshot();
             let history = snapshot
@@ -250,7 +411,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
         witness: RoventCollectionDispatchWitnessV3<'_>,
         input: &FrameInput<ReviewView, Q>,
     ) -> Result<AdaptiveCollectionDispatchV2, AdaptiveCollectionError> {
-        self.apply(AdaptiveCollectionStage::Dispatch, |state| {
+        self.try_dispatch_apply(|state| {
             let ticket = *witness.ticket();
             state.producer()?.validate_admission(witness.admission())?;
             check(
@@ -321,6 +482,7 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
                 &ticket,
                 staged.reservation,
                 witness.admission(),
+                state.speculative_root.as_ref(),
             ) {
                 LockV3RegistrationAttempt::Ready => {
                     state.pending.insert(
@@ -445,14 +607,12 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
     }
     fn abandoned(&mut self, ticket: &RoleTicketEnvelope) -> Result<(), AdaptiveCollectionError> {
         self.apply(AdaptiveCollectionStage::Abandoned, |state| {
-            if let Some(pending) = state.pending.get(&ticket.id) {
-                check(
-                    pending.ticket == *ticket,
-                    "lock-v3 abandoned ticket differs",
-                )?;
+            match state.try_abandon(ticket)? {
+                AdaptiveCollectionBoundaryV2::Ready => Ok(()),
+                AdaptiveCollectionBoundaryV2::Busy => {
+                    Err(invalid("lock-v3 speculative cancellation busy"))
+                }
             }
-            state.abandoned.insert(ticket.id, *ticket);
-            Ok(())
         })
     }
     fn settled(&mut self, tickets: &[RoleTicketEnvelope]) -> Result<(), AdaptiveCollectionError> {
@@ -470,6 +630,14 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
                 // router retains it and the returned error remains observable.
                 if let Ok(FailurePollV3::Ready(input)) = state.router.try_take_failure(&admission) {
                     state.failed_captures.push(input);
+                    // Keep earlier queued originals after this root's fence;
+                    // these inputs are evidence only and are not admitted or
+                    // published after the original collection failure.
+                    while let Ok(CapturePollV3::Ready(input)) =
+                        state.router.try_take_for_cleanup(&admission)
+                    {
+                        state.rejected_captures.push(input);
+                    }
                 }
                 return Err(error);
             }
@@ -514,6 +682,148 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserverV3<Q, O> for Observe
             )?;
             state.settled = true;
             Ok(())
+        })
+    }
+
+    fn try_native_event(
+        &mut self,
+        event: RoventCollectionNativeEventWitnessV3<'_, O>,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::NativeEvent, |state| {
+            state.producer()?.validate_admission(event.admission())?;
+            let failed = match event.event() {
+                TicketNativeEvent::Completed {
+                    observation_failures,
+                    ..
+                }
+                | TicketNativeEvent::Retired {
+                    observation_failures,
+                    ..
+                } => !observation_failures.is_empty(),
+                _ => false,
+            };
+            // Never apply the original event until the captures needed by it
+            // have been admitted. Earlier captures drained here stay admitted.
+            if !failed && state.try_drain()? == AdaptiveCollectionBoundaryV2::Busy {
+                return Ok(AdaptiveCollectionBoundaryV2::Busy);
+            }
+            state.producer()?.observe_native_event(event)?;
+            Ok(AdaptiveCollectionBoundaryV2::Ready)
+        })
+    }
+
+    fn try_accepted(
+        &mut self,
+        witness: RoventCollectionAcceptedWitnessV3<'_>,
+        _: &FrameInput<ReviewView, Q>,
+        _: &O,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::Accepted, |state| {
+            state.producer()?.validate_admission(witness.admission())?;
+            let ticket = witness.accepted().ticket();
+            let pending = state
+                .pending
+                .get_mut(&ticket.id)
+                .ok_or_else(|| invalid("lock-v3 acceptance not registered"))?;
+            check(
+                pending.ticket == *ticket && !pending.accepted,
+                "lock-v3 duplicate or changed acceptance",
+            )?;
+            pending.accepted = true;
+            Ok(AdaptiveCollectionBoundaryV2::Ready)
+        })
+    }
+
+    fn try_consumed(
+        &mut self,
+        witness: RoventCollectionConsumedWitnessV3<'_>,
+        _: RoleOnlySearchConsumptionV2,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::Accepted, |state| {
+            state.try_retire(witness)
+        })
+    }
+
+    fn try_abandoned(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::Abandoned, |state| {
+            state.try_abandon(ticket)
+        })
+    }
+
+    fn try_settled(
+        &mut self,
+        tickets: &[RoleTicketEnvelope],
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.try_apply(AdaptiveCollectionStage::Settled, |state| {
+            let admission = state
+                .admission
+                .as_ref()
+                .ok_or_else(|| invalid("lock-v3 admission missing"))?
+                .clone();
+            match state.try_drain() {
+                Ok(AdaptiveCollectionBoundaryV2::Busy) => {
+                    return Ok(AdaptiveCollectionBoundaryV2::Busy);
+                }
+                Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                Err(error) => {
+                    if let Ok(FailurePollV3::Ready(input)) =
+                        state.router.try_take_failure(&admission)
+                    {
+                        state.failed_captures.push(input);
+                        while let Ok(CapturePollV3::Ready(input)) =
+                            state.router.try_take_for_cleanup(&admission)
+                        {
+                            state.rejected_captures.push(input);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+            // No caller settlement evidence has been applied before this point.
+            for ticket in tickets {
+                if let Some(original) = state.handled.get(&ticket.id) {
+                    check(original == ticket, "lock-v3 settled ticket differs")?;
+                    continue;
+                }
+                if let Some(staged) = state.staged.get(&ticket.id) {
+                    check(staged.ticket == *ticket, "lock-v3 staged ticket differs")?;
+                }
+                if let Some(staged) = state.staged.remove(&ticket.id) {
+                    state
+                        .producer()?
+                        .discard_reserved_input(staged.reservation.sequence());
+                }
+                if let Some(reservation) = state
+                    .registration
+                    .cancel_unstarted_lock_v3(ticket, &admission)?
+                {
+                    state
+                        .producer()?
+                        .discard_reserved_input(reservation.sequence());
+                }
+                if let Some(pending) = state.pending.get(&ticket.id) {
+                    check(pending.ticket == *ticket, "lock-v3 pending ticket differs")?;
+                }
+                if let Some(pending) = state.pending.remove(&ticket.id) {
+                    state.producer()?.discard_reserved_input(pending.sequence);
+                    state.producer()?.discard_unpublished(ticket.id);
+                }
+                state.handled.insert(ticket.id, *ticket);
+            }
+            check(
+                state.staged.is_empty()
+                    && state.pending.is_empty()
+                    && state.failed_reservations.is_empty()
+                    && state.failed_captures.is_empty()
+                    && state.rejected_captures.is_empty()
+                    && state.producer()?.incomplete_capture_count() == 0,
+                "lock-v3 fenced root retains unresolved evidence",
+            )?;
+            state.settled = true;
+            Ok(AdaptiveCollectionBoundaryV2::Ready)
         })
     }
 }
