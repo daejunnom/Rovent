@@ -7,7 +7,9 @@
 use super::producer_v3::{
     PendingPolicyPublicationV3, RoventCorpusProducerLockV3, RoventRetiredLockV3Record,
 };
-use super::speculative_route_v3::{TargetBeginRejectionV3, TargetPublicationV3};
+use super::speculative_route_v3::{
+    SpeculativeRootV3, TargetBeginRejectionV3, TargetCapabilityTakeV3, TargetPublicationV3,
+};
 use super::teacher::policy_prepare_v3::{
     PreparedTeacherPolicyLockV3, prepare_teacher_policy_lock_v3_in_slots,
 };
@@ -178,6 +180,29 @@ impl PolicyRowPipelineV3 {
             return None;
         }
         Some(&mut self.capability)
+    }
+
+    /// Transfer only the capability owned by this exact root/ticket directly
+    /// into the original supervisor-retained slot; never return a free cap.
+    pub(super) fn try_take_target_capability(
+        &mut self,
+        route: &SpeculativeRootV3,
+    ) -> Result<Option<TargetCapabilityTakeV3>, ArenaError> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(None);
+        };
+        if !route.matches_admission(pending.original_admission()) {
+            return Err(super::invalid(
+                "policy route differs from original admission",
+            ));
+        }
+        let ticket = pending.ticket();
+        let Some(slot) = self.empty_capability_slot() else {
+            return Ok(None);
+        };
+        route
+            .try_take_target_capability_in_slot(&ticket, slot)
+            .map(Some)
     }
 
     pub(super) fn failure(&self) -> Option<&PolicyPipelineFailureV3> {

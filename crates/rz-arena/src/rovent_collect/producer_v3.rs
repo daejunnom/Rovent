@@ -134,6 +134,9 @@ pub(super) struct PendingPolicyPublicationV3 {
 }
 
 impl PendingPolicyPublicationV3 {
+    pub(super) fn ticket(&self) -> RoleTicketEnvelope {
+        self.row.ticket
+    }
     pub(super) fn original_admission(&self) -> &RoventCollectionRootAdmissionV3 {
         &self.row.admission
     }
