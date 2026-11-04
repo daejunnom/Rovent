@@ -49,6 +49,14 @@ struct SmokePeer {
     written: usize,
 }
 
+/// Validate the same request identity contract before any input is copied.
+pub(crate) fn validate_smoke_request_ids(request_ids: [u64; 2]) -> Result<(), ArenaError> {
+    if request_ids.contains(&0) || request_ids[0] == request_ids[1] {
+        return Err(failure("smoke_request_ids"));
+    }
+    Ok(())
+}
+
 /// Frame delivery only; no process/physical completion is inferred.
 pub(crate) struct SmokeGrantObservation {
     pub scope: ProxyEntrySmokeScope,
@@ -138,9 +146,7 @@ impl SmokeDeadlineControl {
         owner_epoch: u64,
         request_ids: [u64; 2],
     ) -> Result<Self, ArenaError> {
-        if request_ids.contains(&0) || request_ids[0] == request_ids[1] {
-            return Err(failure("smoke_request_ids"));
-        }
+        validate_smoke_request_ids(request_ids)?;
         if !Arc::ptr_eq(&owner.execution, execution)
             || !execution.matches(&owner.plan, owner_id, owner_epoch)
             || !permit.matches(owner)
@@ -226,9 +232,7 @@ impl SmokeDeadlineControl {
         owner_epoch: u64,
         request_ids: [u64; 2],
     ) -> Result<Self, ArenaError> {
-        if request_ids.contains(&0) || request_ids[0] == request_ids[1] {
-            return Err(failure("smoke_request_ids"));
-        }
+        validate_smoke_request_ids(request_ids)?;
         let smoke_guard = smoke.try_lock().map_err(|_| failure("smoke_owner_busy"))?;
         smoke_guard.verify_original_binding(owner, execution, role, owner_id, owner_epoch)?;
         sockets.verify_role_socket_owner(owner, execution, role)?;

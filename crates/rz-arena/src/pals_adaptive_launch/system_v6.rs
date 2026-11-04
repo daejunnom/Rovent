@@ -29,7 +29,7 @@ pub(crate) use proxy_entry_smoke::{ProxyEntryFunctionalSmokeOwnerV1, SMOKE_RECEI
 mod deadline_control;
 #[cfg(target_os = "linux")]
 pub(crate) use deadline_control::{
-    SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation,
+    SmokeControlProgress, SmokeDeadlineControl, SmokeGrantObservation, validate_smoke_request_ids,
 };
 mod deadline_grant;
 mod deadline_sources;
