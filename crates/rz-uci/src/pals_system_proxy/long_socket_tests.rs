@@ -1,7 +1,7 @@
 //! Linux CPU-only transport check for a socket below a long private root.
 //! No model, GPU, production supervisor or inherited child FD is used.
 
-use super::socket_transport_path;
+use super::{retire_socket_if_unchanged, socket_transport_path};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use std::{
     fs::{self, File},
@@ -49,6 +49,7 @@ fn long_socket_child() {
     let absolute = root.join("owner.sock");
     let named_socket = fs::symlink_metadata(&absolute).unwrap();
     assert!(named_socket.file_type().is_socket());
+    assert_eq!(named_socket.uid(), nix::unistd::geteuid().as_raw());
     let address = socket_transport_path(&absolute, &directory).unwrap();
     let mut stream = UnixStream::connect(&address).unwrap();
     stream
@@ -61,6 +62,8 @@ fn long_socket_child() {
     assert_eq!(peer.pid(), nix::unistd::getppid().as_raw());
     assert_eq!(peer.uid(), nix::unistd::geteuid().as_raw());
     let alias_socket = fs::symlink_metadata(&address).unwrap();
+    assert!(alias_socket.file_type().is_socket());
+    assert_eq!(alias_socket.uid(), nix::unistd::geteuid().as_raw());
     assert_eq!(
         (alias_socket.dev(), alias_socket.ino()),
         (named_socket.dev(), named_socket.ino())
@@ -130,6 +133,8 @@ fn long_private_root_uses_separately_opened_directory_fds() {
     ));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let metadata = fs::symlink_metadata(&root).unwrap();
+    assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+    assert_eq!(metadata.mode() & 0o077, 0, "fixture root must be private");
     let mut fixture = Fixture {
         root: root.clone(),
         base,
@@ -162,7 +167,10 @@ fn long_private_root_uses_separately_opened_directory_fds() {
     listener.set_nonblocking(true).unwrap();
     let initial_socket = fs::symlink_metadata(&absolute).unwrap();
     assert!(initial_socket.file_type().is_socket());
+    assert_eq!(initial_socket.uid(), nix::unistd::geteuid().as_raw());
     let alias_socket = fs::symlink_metadata(&address).unwrap();
+    assert!(alias_socket.file_type().is_socket());
+    assert_eq!(alias_socket.uid(), nix::unistd::geteuid().as_raw());
     assert_eq!(
         (alias_socket.dev(), alias_socket.ino()),
         (initial_socket.dev(), initial_socket.ino())
@@ -229,9 +237,81 @@ fn long_private_root_uses_separately_opened_directory_fds() {
     drop(listener);
     let final_socket = fs::symlink_metadata(&absolute).unwrap();
     assert!(final_socket.file_type().is_socket());
+    assert_eq!(final_socket.uid(), nix::unistd::geteuid().as_raw());
     assert_eq!(
         (final_socket.dev(), final_socket.ino()),
         (initial_socket.dev(), initial_socket.ino())
     );
-    fs::remove_file(&absolute).unwrap();
+    retire_socket_if_unchanged(&absolute, initial_socket.dev(), initial_socket.ino()).unwrap();
+}
+
+#[test]
+fn socket_retirement_does_not_delete_replacement_inode() {
+    let base = std::env::temp_dir().canonicalize().unwrap();
+    let root = base.join(format!(
+        "rz-v6-socket-replacement-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let metadata = fs::symlink_metadata(&root).unwrap();
+    assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+    assert_eq!(metadata.mode() & 0o077, 0);
+    let _fixture = Fixture {
+        root: root.clone(),
+        base,
+        identity: (metadata.dev(), metadata.ino()),
+        child: None,
+    };
+    let directory = File::open(&root).unwrap();
+    let selected = root.join("selected.sock");
+    let saved = root.join("original.sock");
+    let selected_address = socket_transport_path(&selected, &directory).unwrap();
+    let original = UnixListener::bind(&selected_address).unwrap();
+    let original_metadata = fs::symlink_metadata(&selected).unwrap();
+    assert!(original_metadata.file_type().is_socket());
+    assert_eq!(original_metadata.uid(), nix::unistd::geteuid().as_raw());
+    fs::rename(&selected, &saved).unwrap();
+    let moved_metadata = fs::symlink_metadata(&saved).unwrap();
+    assert_eq!(
+        (moved_metadata.dev(), moved_metadata.ino()),
+        (original_metadata.dev(), original_metadata.ino())
+    );
+    let replacement = UnixListener::bind(&selected_address).unwrap();
+    let replacement_metadata = fs::symlink_metadata(&selected).unwrap();
+    let replacement_alias = fs::symlink_metadata(&selected_address).unwrap();
+    assert!(replacement_metadata.file_type().is_socket());
+    assert_eq!(replacement_metadata.uid(), nix::unistd::geteuid().as_raw());
+    assert_eq!(
+        (replacement_alias.dev(), replacement_alias.ino()),
+        (replacement_metadata.dev(), replacement_metadata.ino())
+    );
+    assert_ne!(
+        (replacement_metadata.dev(), replacement_metadata.ino()),
+        (original_metadata.dev(), original_metadata.ino())
+    );
+    assert!(
+        retire_socket_if_unchanged(&selected, original_metadata.dev(), original_metadata.ino())
+            .is_err()
+    );
+    let retained = fs::symlink_metadata(&selected).unwrap();
+    assert_eq!(
+        (retained.dev(), retained.ino()),
+        (replacement_metadata.dev(), replacement_metadata.ino())
+    );
+    let retained_original = fs::symlink_metadata(&saved).unwrap();
+    assert_eq!(
+        (retained_original.dev(), retained_original.ino()),
+        (original_metadata.dev(), original_metadata.ino())
+    );
+    drop(replacement);
+    drop(original);
+    // Both files are owned by this fixture; remove each only with its own inode.
+    retire_socket_if_unchanged(
+        &selected,
+        replacement_metadata.dev(),
+        replacement_metadata.ino(),
+    )
+    .unwrap();
+    retire_socket_if_unchanged(&saved, original_metadata.dev(), original_metadata.ino()).unwrap();
 }
