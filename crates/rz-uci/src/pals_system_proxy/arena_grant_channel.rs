@@ -21,10 +21,10 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProcessIdentity {
-    parent: u32,
-    group: u32,
-    start_ticks: u64,
+pub(super) struct ProcessIdentity {
+    pub(super) parent: u32,
+    pub(super) group: u32,
+    pub(super) start_ticks: u64,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -70,7 +70,7 @@ fn parse_process_stat(pid: u32, bytes: &[u8]) -> io::Result<ProcessIdentity> {
     })
 }
 
-fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
+pub(super) fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
     let mut bytes = Vec::new();
     File::open(format!("/proc/{pid}/stat"))?
         .take(4097)
