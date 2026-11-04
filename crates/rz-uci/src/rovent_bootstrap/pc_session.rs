@@ -160,6 +160,31 @@ impl PcSources {
 pub type RoventPcSessionManager =
     RoleOnlyExecutionManager<PcPortQuestion, Backend, PcPortDriver<Model>>;
 type Manager = RoventPcSessionManager;
+#[cfg(target_os = "linux")]
+fn settle_collection_v3_until(
+    root: &mut super::pc_collection_v3_root::PcCollectionRootRunV3,
+    collection: &RoventPcCollectionStateV3,
+    manager: &mut Manager,
+    context: &SearchSessionContext,
+    until: Instant,
+) -> Result<(), AdaptiveManagerError> {
+    let until = until.min(context.shutdown_deadline);
+    let signal = manager.activity_signal();
+    loop {
+        let version = signal.version();
+        match root.settle_after_shutdown(collection, manager, context) {
+            Err(AdaptiveManagerError::AuxiliaryPending) if Instant::now() < until => {
+                signal.wait_changed(
+                    version,
+                    until
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
+            }
+            result => return result,
+        }
+    }
+}
 pub type RoventPcAdmissionObserver = Arc<
     dyn Fn(
             &mut RoventPcSessionManager,
@@ -3985,7 +4010,13 @@ impl RoventPcSessionDriver {
         };
         #[cfg(target_os = "linux")]
         if let Some(collection) = &self.collection_v3 {
-            if let Err(error) = v3_root.settle_after_shutdown(collection, &mut manager, context) {
+            if let Err(error) = settle_collection_v3_until(
+                &mut v3_root,
+                collection,
+                &mut manager,
+                context,
+                context.shutdown_deadline,
+            ) {
                 *collection
                     .cleanup_context
                     .lock()
@@ -4926,10 +4957,12 @@ impl RoventPcSessionDriver {
                                         &error,
                                     ));
                                 }
-                                if let Err(error) = recovery.settle_after_shutdown(
+                                if let Err(error) = settle_collection_v3_until(
+                                    &mut recovery,
                                     collection,
                                     &mut manager,
                                     &context,
+                                    until,
                                 ) {
                                     *collection
                                         .recovery_root

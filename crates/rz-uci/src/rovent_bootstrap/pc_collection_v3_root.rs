@@ -14,8 +14,20 @@ use crate::rovent_root_admission::source_seal::RoventRootAdmissionV3;
 use crate::search_driver::SearchSessionContext;
 use rz_contracts::Digest;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, atomic::Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, atomic::Ordering};
 use std::time::{Duration, Instant};
+
+/// Handoff and custody may be held by the teacher worker. Never wait on
+/// these locks while driving root completion or while transferring ownership.
+fn try_shared_owner<T>(owner: &Mutex<T>) -> Result<MutexGuard<'_, T>, AdaptiveManagerError> {
+    match owner.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::WouldBlock) => Err(AdaptiveManagerError::AuxiliaryPending),
+        Err(TryLockError::Poisoned(_)) => Err(AdaptiveManagerError::Invalid(
+            "P/C V3 shared owner lock poisoned",
+        )),
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct PcCollectionRootRunV3 {
@@ -445,9 +457,7 @@ impl PcCollectionRootRunV3 {
                 admission, observer, settlement, physical,
             )));
             *state.handoff.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&handoff));
-            if !handoff
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+            if !try_shared_owner(&handoff)?
                 .admission
                 .same_original_admission(original)
             {
@@ -459,9 +469,7 @@ impl PcCollectionRootRunV3 {
             self.handoff_sent = true;
             handoff
         };
-        if !handoff
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        if !try_shared_owner(&handoff)?
             .admission
             .same_original_admission(original)
         {
@@ -494,11 +502,7 @@ impl PcCollectionRootRunV3 {
             .as_ref()
             .cloned();
         let custody = if let Some(owner) = existing {
-            if !owner
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .matches_handoff(&handoff)
-            {
+            if !try_shared_owner(&owner)?.matches_handoff(&handoff) {
                 return Err(AdaptiveManagerError::Invalid(
                     "P/C V3 retained joined root differs",
                 ));
@@ -551,9 +555,7 @@ impl PcCollectionRootRunV3 {
                 }
             }
         };
-        if handoff
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        if try_shared_owner(&handoff)?
             .teacher_aggregate_ack()
             .is_none()
         {

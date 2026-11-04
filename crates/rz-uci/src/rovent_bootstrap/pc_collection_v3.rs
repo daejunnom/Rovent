@@ -384,6 +384,8 @@ pub struct RoventPcCollectionWorkerSpawnFailureV3 {
 pub enum RoventPcCollectionWorkerJoinFailureV3 {
     WrongRoot,
     AlreadyJoined,
+    OwnerLockPoisoned,
+    WorkerSlotMissing,
     Panicked(Box<dyn Any + Send>),
     CompletedWithoutHandoff(Box<dyn Any + Send>),
 }
@@ -488,14 +490,17 @@ impl RoventPcCollectionWorkerV3 {
         handoff: &RootHandoffV3,
     ) -> Result<Option<RoventPcCollectionRootCustodyV3>, RoventPcCollectionWorkerJoinFailureV3>
     {
-        if !handoff
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .admission
-            .same_original_admission(&self.admission)
-        {
+        let original = match handoff.try_lock() {
+            Ok(original) => original,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventPcCollectionWorkerJoinFailureV3::OwnerLockPoisoned);
+            }
+        };
+        if !original.admission.same_original_admission(&self.admission) {
             return Err(RoventPcCollectionWorkerJoinFailureV3::WrongRoot);
         }
+        drop(original);
         let thread = self
             .thread
             .as_ref()
@@ -503,17 +508,42 @@ impl RoventPcCollectionWorkerV3 {
         if !thread.is_finished() {
             return Ok(None);
         }
-        let result = self.thread.take().expect("checked V3 worker handle").join();
-        release_pc_worker_slot_v3(&self.key);
+        // Do not consume the JoinHandle until both owner records can be read
+        // and the pre-reserved slot can be released without waiting.
+        let received = match self.received.try_lock() {
+            Ok(received) => received,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventPcCollectionWorkerJoinFailureV3::OwnerLockPoisoned);
+            }
+        };
+        let matches_handoff = received
+            .as_ref()
+            .is_some_and(|received| Arc::ptr_eq(received, handoff));
+        if received.is_some() && !matches_handoff {
+            // Preserve the original handle and its actual received handoff.
+            return Err(RoventPcCollectionWorkerJoinFailureV3::WrongRoot);
+        }
+        drop(received);
+        let mut slots = match quarantined_pc_workers_v3().try_lock() {
+            Ok(slots) => slots,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoventPcCollectionWorkerJoinFailureV3::OwnerLockPoisoned);
+            }
+        };
+        let Some(slot) = slots.iter().position(|slot| matches!(slot, PcWorkerSlotV3::Reserved(key) if Arc::ptr_eq(&key.0, &self.key.0))) else {
+            return Err(RoventPcCollectionWorkerJoinFailureV3::WorkerSlotMissing);
+        };
+        let worker = self.thread.take().expect("checked V3 worker handle");
+        slots.swap_remove(slot);
+        drop(slots);
+        // The original handle remains in this frame. Never hold the shared
+        // registry while an OS join or TLS cleanup completes.
+        let result = worker.join();
         match result {
             Ok(original_worker) => {
-                if !self
-                    .received
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .as_ref()
-                    .is_some_and(|received| Arc::ptr_eq(received, handoff))
-                {
+                if !matches_handoff {
                     return Err(
                         RoventPcCollectionWorkerJoinFailureV3::CompletedWithoutHandoff(
                             original_worker,
