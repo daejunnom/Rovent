@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::process::{self, CleanupStatus, OwnedArtifactTreeWatch, ProcessLimits, ProcessStop};
+use rz_contracts::pals::cancel_control_v1::{
+    CANCEL_ACK_BYTES, CANCEL_REQUEST_BYTES, CancelAck, CancelAckDisposition, CancelRequest,
+};
 use rz_contracts::pals::deadline_grant_v1::{DeadlineGrant, DeadlineRequest, GRANT_BYTES};
 use rz_experiments::{NativeRuntimeSourceV6, PalsSystemStartupLockV6, SystemRuntimeLockV6};
 use sha2::{Digest as _, Sha256};
@@ -19,6 +22,7 @@ use std::{
 const MODE: &str = ".rz-deadline-test-mode";
 const REQUESTS: &str = ".rz-deadline-test-requests";
 const SOCKET_NAME: &str = ".rz-deadline-test-socket-name";
+const CANCEL_SOCKET_NAME: &str = ".rz-deadline-test-cancel-socket-name";
 const FASTCHESS_HELPER: &str =
     "pals_adaptive_launch::system_v6::deadline_control::socket_tests::fastchess_helper";
 const PROXY_HELPER: &str =
@@ -61,7 +65,7 @@ fn proxy_helper() {
         peer.write_all(request).unwrap();
         let mut bytes = [0; GRANT_BYTES];
         let result = peer.read_exact(&mut bytes);
-        if mode != "success" {
+        if mode != "success" && mode != "cancel" {
             // The supervisor intentionally rejects the request or interrupts
             // the partially sent frame. This is not a completed grant.
             assert!(result.is_err());
@@ -70,6 +74,33 @@ fn proxy_helper() {
         result.unwrap();
         let grant = DeadlineGrant::decode(&bytes).unwrap();
         assert_eq!(grant.scope, DeadlineRequest::decode(request).unwrap().scope);
+    }
+    if mode == "cancel" {
+        let name = fs::read(CANCEL_SOCKET_NAME).unwrap();
+        let address = SocketAddr::from_abstract_name(&name).unwrap();
+        // Both channels are opened by the same process that received the run
+        // grant. The second is deliberately offered as a duplicate claim.
+        let mut peer = UnixStream::connect_addr(&address).unwrap();
+        let _duplicate = UnixStream::connect_addr(&address).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut request = [0; CANCEL_REQUEST_BYTES];
+        peer.read_exact(&mut request).unwrap();
+        let request = CancelRequest::decode(&request).unwrap();
+        let ack = CancelAck {
+            scope: request.scope,
+            sequence: request.sequence,
+            disposition: CancelAckDisposition::Accepted,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(ack.len(), CANCEL_ACK_BYTES);
+        peer.write_all(&ack).unwrap();
+        // Keep this actual peer alive until the original supervisor has read
+        // its ACK; EOF/ACK is not a native or GPU completion observation.
+        let mut release = [0; 1];
+        peer.read_exact(&mut release).unwrap();
+        assert_eq!(release, [1]);
     }
 }
 
@@ -101,6 +132,7 @@ fn long_pair() -> LockedPalsSystemArenaPairV6 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Case {
     Success,
+    Cancel,
     WrongRole,
     WrongLock,
     ReusedIdentity,
@@ -120,7 +152,12 @@ fn run_case(case: Case) {
     let socket_name = format!("rz-v6-deadline-{}-{sequence}", std::process::id());
     let address = SocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap();
     let listener = UnixListener::bind_addr(&address).unwrap();
+    let cancel_name = format!("rz-v6-cancel-{}-{sequence}", std::process::id());
+    let cancel_address = SocketAddr::from_abstract_name(cancel_name.as_bytes()).unwrap();
+    let cancel_listener = UnixListener::bind_addr(&cancel_address).unwrap();
+    cancel_listener.set_nonblocking(true).unwrap();
     fs::write(work.join(SOCKET_NAME), socket_name.as_bytes()).unwrap();
+    fs::write(work.join(CANCEL_SOCKET_NAME), cancel_name.as_bytes()).unwrap();
     let executable = std::env::current_exe().unwrap();
     let pin = File::open(&executable).unwrap();
     let cwd = File::open(&work).unwrap();
@@ -206,6 +243,8 @@ fn run_case(case: Case) {
         work.join(MODE),
         if case == Case::Success {
             "success"
+        } else if case == Case::Cancel {
+            "cancel"
         } else if case == Case::RoguePeer {
             "rogue"
         } else {
@@ -227,6 +266,26 @@ fn run_case(case: Case) {
     } else {
         None
     };
+    let cancel_rogue = if case == Case::Cancel {
+        let name = cancel_name.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let thread = std::thread::spawn(move || {
+            let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+            let mut stream = UnixStream::connect_addr(&address).unwrap();
+            ready_tx.send(()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut byte = [0];
+            let _ = stream.read(&mut byte);
+        });
+        // Queue the unrelated peer before the fixture child can connect. It
+        // must be rejected before the one legitimate claim is consumed.
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        Some(thread)
+    } else {
+        None
+    };
     let limits = ProcessLimits {
         wall_ms: 60_000,
         shutdown_grace_ms: 5_000,
@@ -239,6 +298,12 @@ fn run_case(case: Case) {
     let mut grants = Vec::new();
     let mut captured_error = None;
     let mut partial_before = None;
+    let mut cancel_sender: Option<OriginalCancelSender> = None;
+    let mut cancel_wrong_scope = false;
+    let mut cancel_duplicate = false;
+    let mut cancel_wrong_peer = false;
+    let mut cancel_ack = false;
+    let mut cancel_released = false;
     let mut callback = |owner: &SpawnCustody, until: Instant| {
         let observed = if case == Case::PartialCleanup && bound_pid.is_some() {
             None
@@ -298,9 +363,9 @@ fn run_case(case: Case) {
                 let index = control
                     .admitted
                     .iter()
-                    .position(|(scope, _, _)| scope == &request.scope)
+                    .position(|(scope, _, _, _)| scope == &request.scope)
                     .unwrap();
-                let (used_scope, _, _) = control.admitted.remove(index);
+                let (used_scope, _, _, _) = control.admitted.remove(index);
                 control.used.push(used_scope);
                 partial_before = Some(frame.clone());
                 // Explicit controlled phase transition after one actual byte;
@@ -324,6 +389,82 @@ fn run_case(case: Case) {
                 return Err(error);
             }
         }
+        if case == Case::Cancel && grants.len() == 3 {
+            match cancel_listener.accept() {
+                Ok((stream, _)) => {
+                    let peer_pid = getsockopt(&stream, PeerCredentials)
+                        .map_err(|_| failure("fixture_cancel_credentials"))?
+                        .pid();
+                    if u32::try_from(peer_pid).ok() != bound_pid {
+                        match OriginalCancelSender::new(&mut control, owner, stream, &scopes[1], 1)
+                        {
+                            Err((_original, error)) => {
+                                assert!(error.to_string().contains("cancel_peer_credentials"));
+                                cancel_wrong_peer = true;
+                            }
+                            Ok(_) => panic!("unrelated peer was admitted"),
+                        }
+                    } else if cancel_sender.is_none() {
+                        let mut wrong_scope = scopes[1].clone();
+                        wrong_scope.lock_sha256[0] ^= 1;
+                        let stream = match OriginalCancelSender::new(
+                            &mut control,
+                            owner,
+                            stream,
+                            &wrong_scope,
+                            1,
+                        ) {
+                            Err((original, error)) => {
+                                assert!(error.to_string().contains("cancel_scope_not_issued"));
+                                cancel_wrong_scope = true;
+                                original
+                            }
+                            Ok(_) => panic!("wrong scope was admitted"),
+                        };
+                        cancel_sender = Some(
+                            match OriginalCancelSender::new(
+                                &mut control,
+                                owner,
+                                stream,
+                                &scopes[1],
+                                1,
+                            ) {
+                                Ok(sender) => sender,
+                                Err((_original, error)) => return Err(error),
+                            },
+                        );
+                    } else {
+                        match OriginalCancelSender::new(&mut control, owner, stream, &scopes[1], 1)
+                        {
+                            Err((_original, error)) => {
+                                assert!(error.to_string().contains("cancel_scope_not_issued"));
+                                cancel_duplicate = true;
+                            }
+                            Ok(_) => panic!("duplicate original claim was admitted"),
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err(failure("fixture_cancel_accept")),
+            }
+            if let Some(sender) = cancel_sender.as_mut() {
+                if !cancel_ack
+                    && matches!(
+                        sender.poll(&control, owner, until)?,
+                        OriginalCancelProgress::Acknowledged
+                    )
+                {
+                    cancel_ack = true;
+                }
+                if cancel_ack && cancel_duplicate && cancel_wrong_peer && !cancel_released {
+                    match sender.stream.write(&[1]) {
+                        Ok(1) => cancel_released = true,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        _ => return Err(failure("fixture_cancel_release")),
+                    }
+                }
+            }
+        }
         Ok(())
     };
     let output = process::supervise_tree_observed_with_spawn_and_control(
@@ -345,19 +486,26 @@ fn run_case(case: Case) {
     if let Some(rogue) = rogue {
         rogue.join().unwrap();
     }
+    if let Some(rogue) = cancel_rogue {
+        rogue.join().unwrap();
+    }
     assert_eq!(
         output.receipt.group_cleanup,
         CleanupStatus::Gone,
         "owned process group was not confirmed gone"
     );
     match case {
-        Case::Success => {
+        Case::Success | Case::Cancel => {
             assert_eq!(output.receipt.stop, ProcessStop::Exited);
             assert_eq!(output.receipt.exit_code, Some(0));
             assert_eq!(grants.len(), 3);
             for (grant, scope) in grants.iter().zip(&scopes) {
                 assert_eq!(grant.peer_pid, bound_pid.unwrap());
                 assert_eq!(&grant.scope, scope);
+            }
+            if case == Case::Cancel {
+                assert!(cancel_wrong_scope && cancel_wrong_peer && cancel_duplicate);
+                assert!(cancel_ack && cancel_released);
             }
         }
         Case::WrongRole | Case::WrongLock | Case::ReusedIdentity => {
@@ -402,6 +550,11 @@ fn run_case(case: Case) {
 #[test]
 fn original_child_socket_grants_three_bound_phases() {
     run_case(Case::Success);
+}
+
+#[test]
+fn original_run_peer_accepts_one_scoped_cancel_and_acknowledges() {
+    run_case(Case::Cancel);
 }
 
 #[test]
