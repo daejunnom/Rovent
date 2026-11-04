@@ -11,7 +11,7 @@ use super::super::policy_row_pipeline_v3::{
     PolicyPipelineProgressV3, PolicyPrepareOutcomeV3, PolicyRowPipelineOwnerV3,
 };
 use super::super::speculative_route_v3::{SpeculativeRootV3, TargetCapabilityTakeV3};
-use super::super::{ArenaError, MAX_CORPUS_ROWS, RoventChunkPacket, invalid};
+use super::super::{ArenaError, MAX_CORPUS_ROWS, invalid};
 use super::v3_dispatch::TeacherCompletedV3;
 use super::v3_policy::{
     RoventSealedTeacherPolicyV3, TeacherPolicySealRejectionV3, TeacherPolicySealStepV3,
@@ -33,6 +33,7 @@ pub(crate) enum TeacherPolicyConsumerProgressV3 {
     CandidateReady,
     CapabilityStored,
     Appended,
+    AppendedEvidenceStored,
     ChunkReady,
     Rejected,
     Unknown,
@@ -51,6 +52,7 @@ pub(crate) struct TeacherPolicyConsumerV3 {
     seal_state: TeacherPolicySealStepV3,
     prepared_transferred: bool,
     policy_appended: bool,
+    appended_retained: bool,
     processed: TeacherProcessedOwnerV3,
     authority_unknown: bool,
 }
@@ -178,6 +180,7 @@ impl TeacherPolicyConsumerOwnerV3 {
                 seal_state: TeacherPolicySealStepV3::Ready,
                 prepared_transferred: false,
                 policy_appended: false,
+                appended_retained: false,
                 processed: processed.clone(),
                 authority_unknown: false,
             }),
@@ -186,6 +189,31 @@ impl TeacherPolicyConsumerOwnerV3 {
 
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Identity only: the recovery owner must compare this consumer with its
+    /// originally registered root, actor, observer, game pipeline and output
+    /// owners. A match does not establish a worker join or any fence.
+    pub(crate) fn try_matches_registered_owners(
+        &self,
+        session: &Arc<Mutex<RoventCollectionTeacherSessionV3>>,
+        pump: &Arc<Mutex<TeacherPumpV3>>,
+        route: &SpeculativeRootV3,
+        observer: &RoventCollectionOwnerLockV3,
+        pipeline: &PolicyRowPipelineOwnerV3,
+        processed: &TeacherProcessedOwnerV3,
+    ) -> Result<Option<bool>, &'static str> {
+        let Some(owner) = self.try_lock()? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            Arc::ptr_eq(&owner.session, session)
+                && Arc::ptr_eq(&owner.pump, pump)
+                && owner.route.same_original_route(route)
+                && owner.observer.same_original_owner(observer)
+                && owner.pipeline.same_owner(pipeline)
+                && owner.processed.same_owner(processed),
+        ))
     }
 
     pub(crate) fn try_lock(
@@ -384,11 +412,10 @@ impl TeacherPolicyConsumerV3 {
         )
     }
 
-    /// The caller retains the chunk output slot and this consumer owner. A
-    /// returned append does not prove durable storage or physical shutdown.
+    /// The same game pipeline retains the chunk output slot. An append does
+    /// not prove durable storage or physical shutdown.
     pub(crate) fn try_append_policy(
         &mut self,
-        chunk: &mut Option<RoventChunkPacket>,
     ) -> Result<TeacherPolicyConsumerProgressV3, ArenaError> {
         if self.authority_unknown {
             return Ok(TeacherPolicyConsumerProgressV3::Unknown);
@@ -400,7 +427,7 @@ impl TeacherPolicyConsumerV3 {
             Some(guard) => guard,
             None => return Ok(TeacherPolicyConsumerProgressV3::Busy),
         };
-        Ok(match pipeline.try_append(chunk) {
+        Ok(match pipeline.try_append() {
             PolicyPipelineProgressV3::Appended => {
                 self.policy_appended = true;
                 TeacherPolicyConsumerProgressV3::Appended
@@ -416,6 +443,35 @@ impl TeacherPolicyConsumerV3 {
         })
     }
 
+    /// Transfer original appended evidence only into the same pipeline's
+    /// typed game-output owner; no arbitrary destination is accepted.
+    pub(crate) fn try_retain_appended(
+        &mut self,
+    ) -> Result<TeacherPolicyConsumerProgressV3, ArenaError> {
+        if self.authority_unknown {
+            return Ok(TeacherPolicyConsumerProgressV3::Unknown);
+        }
+        if !self.policy_appended {
+            return Ok(TeacherPolicyConsumerProgressV3::NotReady);
+        }
+        if self.appended_retained {
+            return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
+        }
+        let mut pipeline = match self.pipeline.try_lock().map_err(invalid)? {
+            Some(guard) => guard,
+            None => return Ok(TeacherPolicyConsumerProgressV3::Busy),
+        };
+        if pipeline.is_uncertain() {
+            self.authority_unknown = true;
+            return Ok(TeacherPolicyConsumerProgressV3::Unknown);
+        }
+        if !pipeline.transfer_appended() {
+            return Ok(TeacherPolicyConsumerProgressV3::OutputHeld);
+        }
+        self.appended_retained = true;
+        Ok(TeacherPolicyConsumerProgressV3::AppendedEvidenceStored)
+    }
+
     /// Move the original completion only into the pre-registered root's
     /// bounded recovery owner after the same policy was appended. Busy or
     /// full leaves this consumer's original completion intact.
@@ -427,6 +483,7 @@ impl TeacherPolicyConsumerV3 {
         }
         if !self.prepared_transferred
             || !self.policy_appended
+            || !self.appended_retained
             || self.sealed.is_some()
             || self.rejection.is_some()
             || self.panic.is_some()
@@ -458,6 +515,7 @@ impl TeacherPolicyConsumerV3 {
         processed.originals.push(original);
         self.prepared_transferred = false;
         self.policy_appended = false;
+        self.appended_retained = false;
         self.seal_state = TeacherPolicySealStepV3::Ready;
         Ok(TeacherPolicyConsumerProgressV3::CompletionStored)
     }
