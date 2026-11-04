@@ -233,15 +233,16 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
     if output_handoff is not None:
         # Import lazily: the handoff module itself names OwnedProcessGroup.
         # Other process users retain their original code and dependencies.
-        from managed_output_child_handoff import ManagedOutputChildHandoff
-        if (type(output_handoff) is not ManagedOutputChildHandoff
+        from managed_output_child_handoff import ManagedOutputChildHandoff, ManagedCollectionOutputHandoffV2
+        if (type(output_handoff) not in (ManagedOutputChildHandoff, ManagedCollectionOutputHandoffV2)
                 or owned_group is None or output_handoff._group is not owned_group
                 or output_handoff._owner_pid != os.getpid()):
             raise ValueError("output handoff requires its original owned process group")
         pass_fds = tuple(pass_fds)
         output_fds = output_handoff.child_fds
-        if (len(output_fds) != 2 or any(type(fd) is not int or fd < 0 for fd in output_fds)
-                or output_fds[0] == output_fds[1]
+        expected_count = 2 if type(output_handoff) is ManagedOutputChildHandoff else 4
+        if (len(output_fds) != expected_count or any(type(fd) is not int or fd < 0 for fd in output_fds)
+                or len(set(output_fds)) != expected_count
                 or any(pass_fds.count(fd) != 1 for fd in output_fds)):
             raise ValueError("exact original output child descriptors must be passed once")
         for fd in output_fds:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import array
+import hashlib
 from contextlib import contextmanager
 import os
 import socket
@@ -275,12 +276,7 @@ class ManagedOutputChildHandoff:
                                      parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("nonfinite")))
             except (ValueError, UnicodeError, RecursionError) as error:
                 raise StorageError("invalid managed output request encoding") from error
-            if (not isinstance(request, dict) or set(request) != {"schema", "sequence"}
-                    or request["schema"] != _REQUEST.decode("ascii")
-                    or type(request["sequence"]) is not int or request["sequence"] != self._next_sequence
-                    or not 0 < request["sequence"] < 1 << 64):
-                raise StorageError("managed output request sequence or schema differs")
-            self._pending_request = request["sequence"]
+            self._pending_request = self._validate_request(request)
         if os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
             raise StorageError("original collector has already exited")
         self._scope._check_owner()
@@ -298,8 +294,7 @@ class ManagedOutputChildHandoff:
                 info = os.fstat(anchor["output_fd"])
                 if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != anchor["output_id"]:
                     raise StorageError("original output descriptor changed")
-                reply = json.dumps({"schema": _REQUEST.decode("ascii"), "sequence": self._pending_request, "owner_pid": self._owner_pid,
-                                    "device": info.st_dev, "inode": info.st_ino},
+                reply = json.dumps(self._reply(info),
                                    sort_keys=True, separators=(",", ":")).encode("ascii")
         except CatalogBusy:
             # Keep the authenticated request; never grant based on stale rows.
@@ -318,6 +313,18 @@ class ManagedOutputChildHandoff:
         self._next_sequence += 1
         self._pending_request = None
         return True
+
+    def _validate_request(self, request):
+        if (not isinstance(request, dict) or set(request) != {"schema", "sequence"}
+                or request["schema"] != _REQUEST.decode("ascii")
+                or type(request["sequence"]) is not int or request["sequence"] != self._next_sequence
+                or not 0 < request["sequence"] < 1 << 64):
+            raise StorageError("managed output request sequence or schema differs")
+        return request["sequence"]
+
+    def _reply(self, info):
+        return {"schema": _REQUEST.decode("ascii"), "sequence": self._pending_request,
+                "owner_pid": self._owner_pid, "device": info.st_dev, "inode": info.st_ino}
 
     def revoke(self):
         """Close the control channel and local duplicate; preserve the lease."""
@@ -356,5 +363,108 @@ class ManagedOutputChildHandoff:
                 except StorageError:
                     # A finished/unavailable original lease is not recreated.
                     pass
+        if failure is not None:
+            raise failure
+
+
+class ManagedCollectionOutputHandoffV2(ManagedOutputChildHandoff):
+    """Optional original plan and output lease handoff to the same child.
+
+    The input owner must outlive the child. This proves neither exclusive
+    access to the input nor physical GPU completion or writer eligibility.
+    """
+
+    _schema = "rz-managed-output-lease/2"
+
+    def __init__(self, lease_key, group, scope, original_input):
+        from rovent_v3_input_snapshot import OriginalControlInput
+        if type(original_input) is not OriginalControlInput:
+            raise StorageError("original control input owner required")
+        self._input = original_input
+        self._input_directory_fd = self._input_plan_fd = None
+        self._session_id = None
+        try:
+            directory_fd, plan_fd = original_input.borrowed_fds()
+            self._input_directory_fd = os.dup(directory_fd)
+            self._input_plan_fd = os.dup(plan_fd)
+            super().__init__(lease_key, group, scope)
+        except BaseException as error:
+            try:
+                self._close_input_duplicates()
+            except BaseException as close_error:
+                error.add_note("input handoff cleanup also failed: " + str(close_error))
+            raise
+
+    @property
+    def child_fds(self):
+        if self._input_directory_fd is None or self._input_plan_fd is None:
+            raise StorageError("original input child handoff is no longer available")
+        return super().child_fds + (self._input_directory_fd, self._input_plan_fd)
+
+    def mark_dispatch_attempted(self):
+        directory_fd, plan_fd = self._input.borrowed_fds()
+        for source, child in ((directory_fd, self._input_directory_fd), (plan_fd, self._input_plan_fd)):
+            before, duplicate = os.fstat(source), os.fstat(child)
+            if (before.st_dev, before.st_ino) != (duplicate.st_dev, duplicate.st_ino):
+                raise StorageError("original input descriptor changed before dispatch")
+        super().mark_dispatch_attempted()
+
+    def after_spawn(self):
+        super().after_spawn()
+        self._close_input_duplicates()
+
+    def _validate_request(self, request):
+        if (not isinstance(request, dict) or set(request) != {"schema", "sequence", "session_id"}
+                or request["schema"] != self._schema
+                or type(request["sequence"]) is not int or request["sequence"] != self._next_sequence
+                or not 0 < request["sequence"] < 1 << 64
+                or not isinstance(request["session_id"], str)
+                or len(request["session_id"]) != 32
+                or any(c not in "0123456789abcdef" for c in request["session_id"])):
+            raise StorageError("managed collection request sequence or schema differs")
+        if self._session_id is None:
+            self._session_id = request["session_id"]
+        elif self._session_id != request["session_id"]:
+            raise StorageError("managed collection session changed")
+        return request["sequence"]
+
+    def _reply(self, info):
+        directory_fd, plan_fd = self._input.borrowed_fds()
+        data = self._input.bytes
+        directory, plan = os.fstat(directory_fd), os.fstat(plan_fd)
+        return {"schema": self._schema, "sequence": self._pending_request,
+                "session_id": self._session_id, "owner_pid": self._owner_pid,
+                "output": {"device": info.st_dev, "inode": info.st_ino},
+                "input_directory": {"device": directory.st_dev, "inode": directory.st_ino},
+                "plan": {"device": plan.st_dev, "inode": plan.st_ino,
+                         "size": plan.st_size, "sha256": hashlib.sha256(data).hexdigest()}}
+
+    def _close_input_duplicates(self):
+        failure = None
+        for field in ("_input_plan_fd", "_input_directory_fd"):
+            fd = getattr(self, field, None)
+            if fd is not None:
+                setattr(self, field, None)
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            raise failure
+
+    def revoke(self):
+        failure = None
+        try:
+            super().revoke()
+        except BaseException as error:
+            failure = error
+        try:
+            self._close_input_duplicates()
+        except BaseException as error:
+            if failure is not None:
+                failure.add_note("input handoff cleanup also failed: " + str(error))
+            else:
+                failure = error
         if failure is not None:
             raise failure

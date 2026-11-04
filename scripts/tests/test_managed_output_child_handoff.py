@@ -8,12 +8,13 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from managed_output_child_handoff import ManagedOutputChildHandoff
+from managed_output_child_handoff import ManagedOutputChildHandoff, ManagedCollectionOutputHandoffV2
 from managed_outputs import OutputLease
 from managed_process import OwnedProcessGroup, ProcessNotSpawned, run_group
 from managed_storage import StorageError
 from rovent_cgroup_owner import CgroupOwner
 from storage_guard import CatalogGuard
+from rovent_v3_input_snapshot import OriginalControlInput, open_directory
 
 _PRESERVED_UNKNOWN = []
 
@@ -132,6 +133,56 @@ print(json.dumps({"owner_pid": reply["owner_pid"], "checks": 2}))
         self.assertEqual(result, (0, True, None))
         self.assertEqual(json.loads(payload), {"owner_pid": os.getpid(), "checks": 2})
         self.assertEqual(self.handoff.scope_release_observation(), "released")
+
+    def test_collection_child_receives_same_original_input_and_live_lease(self):
+        # Actual child/socket/FDs; cgroup membership remains the test fixture.
+        self.handoff.revoke()
+        data = os.urandom(71)
+        (self.source / "plan").write_bytes(data)
+        source_fd = open_directory(self.source)
+        try:
+            original_input = OriginalControlInput(source_fd, Path("plan"))
+        finally:
+            os.close(source_fd)
+        self.handoff = ManagedCollectionOutputHandoffV2(self.key, self.group, self.scope, original_input)
+        inherited = self.handoff.child_fds
+        source = '''
+import hashlib, json, os, socket, struct, sys
+channel, output, directory, plan = map(int, sys.argv[1:])
+s = socket.socket(fileno=channel)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+nonce = os.urandom(16).hex()
+for seq in (1, 2):
+    s.send(json.dumps({"schema":"rz-managed-output-lease/2", "sequence":seq,
+                       "session_id":nonce}).encode())
+    raw, ancillary, flags, _ = s.recvmsg(4096, socket.CMSG_SPACE(struct.calcsize("3i")))
+    creds = [struct.unpack("3i", v) for level, kind, v in ancillary
+             if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS]
+    assert len(creds) == 1 and creds[0][0] == os.getppid()
+    reply = json.loads(raw)
+    assert reply["schema"] == "rz-managed-output-lease/2" and reply["sequence"] == seq
+    assert reply["session_id"] == nonce and reply["owner_pid"] == os.getppid()
+    for field, fd in (("output", output), ("input_directory", directory), ("plan", plan)):
+        info = os.fstat(fd)
+        assert (reply[field]["device"], reply[field]["inode"]) == (info.st_dev, info.st_ino)
+    actual = os.pread(plan, os.fstat(plan).st_size, 0)
+    assert reply["plan"]["size"] == len(actual)
+    assert reply["plan"]["sha256"] == hashlib.sha256(actual).hexdigest()
+print("ok")
+'''
+        with tempfile.TemporaryFile(mode="w+b", dir=self.root) as output:
+            result = run_group(
+                [str(Path(sys.executable).resolve()), "-c", source, *(str(fd) for fd in inherited)],
+                self.root, os.environ.copy(), 10, lambda: None, pass_fds=inherited,
+                stdout=output, owned_group=self.group, output_handoff=self.handoff)
+            output.seek(0)
+            payload = output.read()
+        if result[1]:
+            self.lease.finish(status="test-complete", tree_gone=True)
+            self.finished = True
+            original_input.close()
+        self.assertEqual(result, (0, True, None))
+        self.assertEqual(payload, b"ok\n")
 
     def test_grandchild_cannot_claim_direct_child_lease(self):
         source = '''
