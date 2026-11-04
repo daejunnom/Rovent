@@ -350,6 +350,10 @@ impl PcCollectionOwnersV3 {
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> {
         &self.inputs
     }
+    /// The same original bridge; this is not settlement or release evidence.
+    pub(crate) fn bridge(&self) -> &Arc<RoventPcCollectionBridgeV3> {
+        &self.bridge
+    }
     pub(crate) fn execution_ceiling(&self) -> Instant {
         self.execution_ceiling
     }
