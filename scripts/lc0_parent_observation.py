@@ -147,6 +147,8 @@ class NonblockingSessionObservation:
             "process_epoch": self._binding[1], "lock_sha256": self._binding[2],
             "cuda_ordinal": self._binding[3],
         }, separators=(",", ":")).encode("utf-8") + b"\n")
+        # Install the slot before transferring the original authenticated FD.
+        self._socket = None
         self._socket = handshake.take_authenticated_socket()
 
     @property
