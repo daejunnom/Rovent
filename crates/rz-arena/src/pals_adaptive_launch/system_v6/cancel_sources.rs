@@ -50,6 +50,22 @@ fn sources() -> &'static [(&'static str, &'static [u8])] {
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/cancel_control_v1.rs"),
         ),
         (
+            "uci_arena_grant_channel",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy/arena_grant_channel.rs"),
+        ),
+        (
+            "uci_deadline_grant",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy/deadline_grant.rs"),
+        ),
+        (
+            "uci_proxy_runner",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy/runner_v6.rs"),
+        ),
+        (
+            "uci_proxy_module",
+            include_bytes!("../../../../rz-uci/src/pals_system_proxy.rs"),
+        ),
+        (
             "uci_proxy_cli",
             include_bytes!("../../../../rz-uci/src/pals_system_proxy/cli_v6.rs"),
         ),
