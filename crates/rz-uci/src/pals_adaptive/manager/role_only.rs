@@ -240,7 +240,13 @@ struct RoleOnlyBinding<Q, O> {
     accepted: Option<AcceptedRoleStep>,
     collection_dispatched: bool,
     collection_abandoned: bool,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_abandon_pending: bool,
     consumption_recorded: bool,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_acceptance_pending: bool,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_consumption_pending: Option<RoleOnlySearchConsumptionV2>,
     // A failed readback after an attempted consume is neither proof of
     // consumption nor proof that the input may be discarded.
     consumption_unknown: bool,
@@ -323,6 +329,8 @@ pub struct RoleOnlyShutdownReceipt {
     pub expired_acceptance_acks: u64,
     pub review_leases: RoventReviewLeaseObservation,
     native_root_fence: Option<NativeRootFence>,
+    observed_native_root_fence: Option<NativeRootFence>,
+    observed_native_finish_report: Option<crate::pals_native::ticketed::TicketNativeFinishReport>,
     close_mode: AdaptiveCloseMode,
     shared_nnuec_required: bool,
     shared_nnuec_closure: Option<Arc<PcSharedReadoutRootClosure>>,
@@ -345,6 +353,18 @@ impl RoleOnlyShutdownReceipt {
     }
     pub fn root_fence(&self) -> Option<NativeRootFence> {
         self.native_root_fence
+    }
+    /// Snapshot written by the original worker; unlike `root_fence`, this is
+    /// observation only and grants no semantic closure or owner reuse.
+    pub fn observed_root_fence(&self) -> Option<NativeRootFence> {
+        self.observed_native_root_fence
+    }
+    /// Original worker's finish-report snapshot. This does not prove that the
+    /// report was consumed, all events were applied, or the worker was joined.
+    pub fn observed_finish_report(
+        &self,
+    ) -> Option<&crate::pals_native::ticketed::TicketNativeFinishReport> {
+        self.observed_native_finish_report.as_ref()
     }
     /// Observation of the original actor/root closure, not a replacement for
     /// the native physical fence or a new evaluator/NN completion authority.
@@ -452,6 +472,8 @@ where
     collection_v2_first_failure: Option<AdaptiveCollectionError>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_busy_ticket: Option<RoleTicketEnvelope>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    collection_pending_events: VecDeque<TicketNativeEvent<B::Output>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_admission_v2: Option<VersionedCollectionAdmission>,
     #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -574,6 +596,8 @@ where
             collection_v2_first_failure: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_v2_busy_ticket: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            collection_pending_events: VecDeque::new(),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_admission_v2: None,
             #[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -1782,7 +1806,13 @@ where
                 accepted: None,
                 collection_dispatched: false,
                 collection_abandoned: false,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                collection_abandon_pending: false,
                 consumption_recorded: false,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                collection_acceptance_pending: false,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                collection_consumption_pending: None,
                 consumption_unknown: false,
             });
             self.counters.native_preparations += 1;
@@ -2053,6 +2083,109 @@ where
                 index += 1;
                 continue;
             }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if self.bindings[index].collection_acceptance_pending {
+                let binding = &self.bindings[index];
+                let observer = self
+                    .collection_v2
+                    .as_mut()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C pending collection observer absent",
+                    ))?;
+                let accepted = binding
+                    .accepted
+                    .as_ref()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C pending accepted proof absent",
+                    ))?;
+                let output = binding
+                    .delivered
+                    .as_ref()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C pending accepted output absent",
+                    ))?;
+                let admission =
+                    self.collection_admission_v2
+                        .as_ref()
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "P/C pending collection admission absent",
+                        ))?;
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("P/C pending native verifier absent"),
+                )?;
+                let witness = VersionedCollectionAcceptedWitness::new(
+                    admission,
+                    &verifier,
+                    accepted,
+                    output.proposer_ranking_output(),
+                )?;
+                match observer.try_accepted(witness, &binding.input, output.as_ref()) {
+                    Ok(AdaptiveCollectionBoundaryV2::Busy) => {
+                        index += 1;
+                        continue;
+                    }
+                    Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                    Err(error) => {
+                        self.collection_v2_first_failure.get_or_insert(error);
+                    }
+                }
+                self.bindings[index].collection_acceptance_pending = false;
+                changed = true;
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if let Some(observation) = self.bindings[index].collection_consumption_pending {
+                let binding = &self.bindings[index];
+                let observer = self
+                    .collection_v2
+                    .as_mut()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C pending collection observer absent",
+                    ))?;
+                let accepted = binding
+                    .accepted
+                    .as_ref()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C pending consumed proof absent",
+                    ))?;
+                let output = binding
+                    .delivered
+                    .as_ref()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C pending consumed output absent",
+                    ))?;
+                let admission =
+                    self.collection_admission_v2
+                        .as_ref()
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "P/C pending collection admission absent",
+                        ))?;
+                let verifier = self.native.native_acceptance_verifier().ok_or(
+                    AdaptiveManagerError::Invalid("P/C pending native verifier absent"),
+                )?;
+                let witness = VersionedCollectionAcceptedWitness::new(
+                    admission,
+                    &verifier,
+                    accepted,
+                    output.proposer_ranking_output(),
+                )?;
+                match observer.try_consumed(
+                    VersionedCollectionConsumedWitness::new(witness),
+                    observation,
+                ) {
+                    Ok(AdaptiveCollectionBoundaryV2::Busy) => {
+                        index += 1;
+                        continue;
+                    }
+                    Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                    Err(error) => {
+                        self.collection_v2_first_failure.get_or_insert(error);
+                    }
+                }
+                self.bindings[index].collection_consumption_pending = None;
+                self.bindings.remove(index);
+                changed = true;
+                continue;
+            }
             let will_consume = self.phase == ManagerPhase::Running
                 && self.failures.is_empty()
                 && self.now().is_ok()
@@ -2074,11 +2207,23 @@ where
                     &mut self.collection_v2,
                     self.bindings[index].ticket.as_ref(),
                 ) {
-                    if let Err(error) = observer.abandoned(ticket) {
-                        self.collection_v2_first_failure.get_or_insert(error);
+                    match observer.try_abandoned(ticket) {
+                        Ok(AdaptiveCollectionBoundaryV2::Busy) => {
+                            self.bindings[index].collection_abandon_pending = true;
+                            index += 1;
+                            continue;
+                        }
+                        Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                        Err(error) => {
+                            self.collection_v2_first_failure.get_or_insert(error);
+                        }
                     }
                 }
                 self.bindings[index].collection_abandoned = true;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                {
+                    self.bindings[index].collection_abandon_pending = false;
+                }
             }
             let binding = &self.bindings[index];
             if will_consume {
@@ -2139,17 +2284,30 @@ where
                             } else {
                                 RoleOnlySearchConsumptionV2::DriverReadbackAfterError
                             };
-                            if let Err(error) = observer.consumed(
+                            match observer.try_consumed(
                                 VersionedCollectionConsumedWitness::new(witness),
                                 observation,
                             ) {
-                                // Consumption already happened. Keep both that
-                                // fact and the observer error without replay.
-                                self.collection_v2_first_failure.get_or_insert(error);
+                                Ok(AdaptiveCollectionBoundaryV2::Busy) => {
+                                    self.bindings[index].collection_consumption_pending =
+                                        Some(observation);
+                                }
+                                Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                                Err(error) => {
+                                    self.collection_v2_first_failure.get_or_insert(error);
+                                }
                             }
                         }
                     }
                     returned?;
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if self.bindings[index]
+                        .collection_consumption_pending
+                        .is_some()
+                    {
+                        index += 1;
+                        continue;
+                    }
                 } else {
                     self.driver
                         .role_discarded(&binding.input, binding.ticket.as_ref())?;
@@ -2649,10 +2807,19 @@ where
                                         accepted,
                                         role_output,
                                     )?;
-                                    if let Err(error) =
-                                        observer.accepted(witness, &binding.input, output.as_ref())
-                                    {
-                                        self.collection_v2_first_failure.get_or_insert(error);
+                                    match observer.try_accepted(
+                                        witness,
+                                        &binding.input,
+                                        output.as_ref(),
+                                    ) {
+                                        Ok(AdaptiveCollectionBoundaryV2::Busy) => {
+                                            self.bindings[index].collection_acceptance_pending =
+                                                true;
+                                        }
+                                        Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                                        Err(error) => {
+                                            self.collection_v2_first_failure.get_or_insert(error);
+                                        }
                                     }
                                 }
                             }
@@ -2828,16 +2995,18 @@ where
         }
         let mut changed = false;
         for _ in 0..MAX_EVENT_DRAIN {
-            let Some(event) = self.native.poll() else {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let event = self
+                .collection_pending_events
+                .pop_front()
+                .or_else(|| self.native.poll());
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            let event = self.native.poll();
+            let Some(event) = event else {
                 break;
             };
-            changed = true;
-            let collection_failure = self
-                .collection
-                .as_mut()
-                .and_then(|observer| observer.native_event(&event).err());
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            let collection_failure_v2 = self.collection_v2.as_mut().and_then(|observer| {
+            let collection_result_v2 = self.collection_v2.as_mut().map(|observer| {
                 let verifier = self.native.native_acceptance_verifier();
                 let witness = self
                     .collection_admission_v2
@@ -2855,12 +3024,36 @@ where
                     });
                 match witness {
                     Ok(witness) => observer
-                        .native_event(witness)
-                        .err()
-                        .map(|error| (error, true)),
-                    Err(error) => Some((error, false)),
+                        .try_native_event(witness)
+                        .map_err(|error| (error, true)),
+                    Err(error) => Err((error, false)),
                 }
             });
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            if matches!(
+                collection_result_v2.as_ref(),
+                Some(Ok(AdaptiveCollectionBoundaryV2::Busy))
+            ) {
+                // Preserve the original non-clone event, including permits and
+                // receipts, until this same owner can accept the witness.
+                self.collection_pending_events.push_front(event);
+                // Continue collecting the owner's FIFO without applying or
+                // cloning any event. On saturation, stop polling and leave
+                // the rest in the original native bounded channel.
+                while self.collection_pending_events.len() < self.native.event_queue_capacity() {
+                    let Some(next) = self.native.poll() else {
+                        break;
+                    };
+                    self.collection_pending_events.push_back(next);
+                    changed = true;
+                }
+                break;
+            }
+            changed = true;
+            let collection_failure = self
+                .collection
+                .as_mut()
+                .and_then(|observer| observer.native_event(&event).err());
             if let Err(error) = self.event(event) {
                 self.record_failure(error);
             }
@@ -2868,7 +3061,7 @@ where
                 self.record_failure(AdaptiveManagerError::Collection(error));
             }
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            if let Some((error, callback)) = collection_failure_v2 {
+            if let Some(Err((error, callback))) = collection_result_v2 {
                 if callback {
                     self.collection_v2_first_failure.get_or_insert(error);
                 } else {
@@ -2892,7 +3085,11 @@ where
         {
             self.begin_close(self.cleanup_until()?, self.close_mode)?;
         }
-        if self.phase == ManagerPhase::Running {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let native_observation_pending = !self.collection_pending_events.is_empty();
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let native_observation_pending = false;
+        if self.phase == ManagerPhase::Running && !native_observation_pending {
             match self.schedule() {
                 Ok(progress) => changed |= progress,
                 Err(error) => self.record_failure(error),
@@ -2942,6 +3139,19 @@ where
                 && self.shared_readout_cleanup_settled()
                 && self.phase != ManagerPhase::Quarantined
             {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if !self.collection_pending_events.is_empty()
+                    || self.bindings.iter().any(|binding| {
+                        binding.collection_acceptance_pending
+                            || binding.collection_abandon_pending
+                            || binding.collection_consumption_pending.is_some()
+                    })
+                {
+                    // Keep the real event and acceptance in their original
+                    // owner until callback delivery; a physical fence does
+                    // not itself establish collection settlement.
+                    return Ok(changed);
+                }
                 if !self.collection_settled {
                     let remaining: Vec<_> = self
                         .bindings
@@ -2956,9 +3166,12 @@ where
                     }
                     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                     if let Some(observer) = &mut self.collection_v2 {
-                        let result = observer.settled(&remaining);
-                        if let Err(error) = result {
-                            self.collection_v2_first_failure.get_or_insert(error);
+                        match observer.try_settled(&remaining) {
+                            Ok(AdaptiveCollectionBoundaryV2::Busy) => return Ok(changed),
+                            Ok(AdaptiveCollectionBoundaryV2::Ready) => {}
+                            Err(error) => {
+                                self.collection_v2_first_failure.get_or_insert(error);
+                            }
                         }
                         self.collection_v2_settlement =
                             Some(match self.collection_v2_first_failure.as_ref() {
@@ -3019,7 +3232,31 @@ where
                 + self.retained_completions.len()
                 + usize::from(self.pending_input.is_some())
                 + usize::from(self.pending_preparation.is_some())
-                + usize::from(!self.shared_readout_cleanup_settled()),
+                + usize::from(!self.shared_readout_cleanup_settled())
+                + {
+                    #[cfg(all(
+                        target_os = "linux",
+                        feature = "pals-adaptive",
+                        feature = "onnx-cpu"
+                    ))]
+                    {
+                        self.collection_pending_events.len()
+                            + usize::from(
+                                matches!(
+                                    self.collection_v2.as_ref(),
+                                    Some(VersionedCollectionObserver::V3(_))
+                                ) && !self.collection_settled,
+                            )
+                    }
+                    #[cfg(not(all(
+                        target_os = "linux",
+                        feature = "pals-adaptive",
+                        feature = "onnx-cpu"
+                    )))]
+                    {
+                        0
+                    }
+                },
             quarantined: self.phase == ManagerPhase::Quarantined
                 || self.native.is_quarantined()
                 || self
@@ -3032,6 +3269,10 @@ where
             expired_acceptance_acks: self.expired_acceptance_acks,
             review_leases: leases,
             native_root_fence: self.native_root_fence,
+            observed_native_root_fence: self.native.root_fence().filter(|fence| {
+                self.root_quiesce_requested && fence.authority() == self.registration.authority
+            }),
+            observed_native_finish_report: self.native.finish_report_snapshot(),
             close_mode: self.close_mode,
             shared_nnuec_required: self.driver.requires_shared_nnuec_readout(),
             shared_nnuec_closure: self

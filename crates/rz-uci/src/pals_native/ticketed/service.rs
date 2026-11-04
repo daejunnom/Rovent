@@ -1810,6 +1810,13 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         self.shared.requires_finish_report
     }
 
+    /// Capacity of this service's bounded native event channel. A consumer
+    /// buffering original events must stop polling when its own bound is full.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn event_queue_capacity(&self) -> usize {
+        EVENTS
+    }
+
     pub fn poll(&self) -> Option<TicketNativeEvent<B::Output>> {
         let event = self.events.as_ref()?.try_recv().ok()?;
         self.shared.pending_reports.fetch_sub(1, Ordering::AcqRel);
