@@ -165,6 +165,7 @@ pub(crate) fn run_original_v3_lifecycle(
     let different = admission(Arc::new(lock.as_ref().clone()), clock, implementation, 2);
     let owner = pc_owner(different.authority(), until);
     let rejected_ptr = std::ptr::from_ref(owner.as_ref());
+    let rejected_store = owner.stores().read_owner();
     let mut rejected = SessionStorageLifecycle::new(shared);
     let failure = rejected
         .prepare_v3(
@@ -190,5 +191,6 @@ pub(crate) fn run_original_v3_lifecycle(
         .into_pc()
         .unwrap_or_else(|_| panic!("original idle owner had a different kind"));
     assert_eq!(std::ptr::from_ref(retained.as_ref()), rejected_ptr);
+    assert!(rejected_store.matches(retained.stores()));
     assert!(rejected.core.first_failure.is_some());
 }
