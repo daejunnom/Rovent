@@ -583,6 +583,9 @@ pub(crate) struct NativeV6Supervisor {
     original_pin_error: Option<ArenaError>,
     pre_signal_enabled: bool,
     pre_signal_observation: crate::process::PreSignalObservation,
+    // Compiled source-byte observation only; it does not attest the separate
+    // proxy executable or affect admission and older canonical records.
+    cancel_source_observation: crate::pals_adaptive_launch::CancelSourceObservation,
 }
 
 /// Rejected construction returns the exact original control owner. The
@@ -641,6 +644,8 @@ impl NativeV6Supervisor {
             original_pin_error: None,
             pre_signal_enabled,
             pre_signal_observation: crate::process::PreSignalObservation::default(),
+            cancel_source_observation:
+                crate::pals_adaptive_launch::compiled_cancel_source_observation(),
         })
     }
 }
@@ -1520,6 +1525,15 @@ pub struct NativePairOutput<
     bundle: NativeRunBundle<S>,
 }
 impl<S: NativeProviderDeclaration> NativePairOutput<S> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_cancel_source_observation(
+        &self,
+    ) -> Option<&crate::pals_adaptive_launch::CancelSourceObservation> {
+        self.bundle
+            .v6_supervisor
+            .as_ref()
+            .map(|owner| &owner.cancel_source_observation)
+    }
     /// Borrow the same V6 control observation before closing this owner.
     /// An ACK is not physical completion or a durable receipt.
     #[cfg(target_os = "linux")]
@@ -1699,6 +1713,15 @@ pub struct GuardedEvidenceView<'a, A> {
 }
 
 impl<S: NativeProviderDeclaration> NativePairFailure<S> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn v6_cancel_source_observation(
+        &self,
+    ) -> Option<&crate::pals_adaptive_launch::CancelSourceObservation> {
+        self.bundle
+            .v6_supervisor
+            .as_ref()
+            .map(|owner| &owner.cancel_source_observation)
+    }
     /// The failure retains this same observation with the original owner.
     #[cfg(target_os = "linux")]
     pub(crate) fn v6_pre_signal_observation(

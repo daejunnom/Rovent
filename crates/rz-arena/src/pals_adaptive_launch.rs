@@ -37,6 +37,8 @@ pub use storage::*;
 #[cfg(target_os = "linux")]
 pub(crate) use system_v6::verify_original_proxy_snapshots;
 pub use system_v6::*;
+#[cfg(target_os = "linux")]
+pub(crate) use system_v6::{CancelSourceObservation, compiled_cancel_source_observation};
 
 pub const PALS_ARENA_V5_DOMAIN: &str = "rz-pals-arena-launch-v5/1";
 pub const PALS_STAGING_BYTES_V5: u64 = 18 << 30;
