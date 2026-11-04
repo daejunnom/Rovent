@@ -62,10 +62,28 @@ where
     pub(super) hooks: Arc<dyn RoventBoardCollectionHooksV3<B>>,
     pub(super) outstanding: AtomicBool,
     pub(super) failure: Mutex<Option<RoventBoardCollectionAdmissionFailureV3>>,
+    pub(super) first_execution_error: Mutex<Option<AdaptiveManagerError>>,
+    pub(super) first_session_failure: Mutex<Option<SearchSessionFailure>>,
+    pub(super) first_collection_error: Mutex<Option<AdaptiveCollectionError>>,
     pub(super) panics: Mutex<Vec<Box<dyn Any + Send>>>,
     pub(super) handoff: Mutex<Option<Arc<Mutex<RoventBoardCollectionHandoffV3<B::Output>>>>>,
+    pub(super) custody: Mutex<Option<Arc<Mutex<RoventBoardCollectionRootCustodyV3<B::Output>>>>>,
     pub(super) no_capture:
         Mutex<Option<(RoventNoCaptureRootCapabilityV3, AdaptiveCollectionError)>>,
+    pub(super) deferred_cleanup: Mutex<Option<Arc<Mutex<RoventBoardDeferredCleanupV3>>>>,
+    pub(super) prior_cleanup_failures: Mutex<Vec<Arc<Mutex<RoventBoardDeferredCleanupV3>>>>,
+    pub(super) recovery_root: Mutex<Option<super::collection_v3_root::OwnCollectionRootRunV3>>,
+    pub(super) cleanup_context: Mutex<Option<SearchSessionContext>>,
+    pub(super) failed_evidence: Mutex<
+        Option<
+            Vec<
+                super::super::manager::RoventFailedCollectionEvidence<
+                    AdaptivePortQuestion,
+                    B::Output,
+                >,
+            >,
+        >,
+    >,
 }
 
 /// Borrows the actual adaptive manager; callers cannot manufacture a root.
@@ -178,6 +196,7 @@ impl<O> RoventBoardCollectionHandoffV3<O> {
 pub struct RoventBoardCollectionRootCustodyV3<O> {
     handoff: Arc<Mutex<RoventBoardCollectionHandoffV3<O>>>,
     original_worker: Box<dyn Any + Send>,
+    worker_key: RoventBoardCollectionWorkerKeyV3,
 }
 
 /// An unresolved marker cleanup retains the same capability and manager
@@ -187,6 +206,7 @@ pub struct RoventBoardDeferredCleanupV3 {
     pub(super) reason: AdaptiveCollectionError,
     pub(super) fence: RoventOwnNoCaptureFenceV3,
     pub(super) failure: RoventBoardDeferredCleanupFailureV3,
+    pub(super) retention_failure: Option<AdaptiveManagerError>,
 }
 
 pub enum RoventBoardDeferredCleanupFailureV3 {
@@ -208,17 +228,25 @@ impl RoventBoardDeferredCleanupV3 {
     pub fn failure(&self) -> &RoventBoardDeferredCleanupFailureV3 {
         &self.failure
     }
+    pub fn retention_failure(&self) -> Option<&AdaptiveManagerError> {
+        self.retention_failure.as_ref()
+    }
 }
 
 impl<O> RoventBoardCollectionRootCustodyV3<O> {
     fn from_joined_worker(
         handoff: Arc<Mutex<RoventBoardCollectionHandoffV3<O>>>,
         original_worker: Box<dyn Any + Send>,
+        worker_key: RoventBoardCollectionWorkerKeyV3,
     ) -> Self {
         Self {
             handoff,
             original_worker,
+            worker_key,
         }
+    }
+    pub fn matches_worker(&self, key: &RoventBoardCollectionWorkerKeyV3) -> bool {
+        Arc::ptr_eq(&self.worker_key.0, &key.0)
     }
     pub fn matches_handoff(&self, handoff: &Arc<Mutex<RoventBoardCollectionHandoffV3<O>>>) -> bool {
         Arc::ptr_eq(&self.handoff, handoff)
@@ -234,8 +262,9 @@ impl<O> RoventBoardCollectionRootCustodyV3<O> {
     ) -> (
         Arc<Mutex<RoventBoardCollectionHandoffV3<O>>>,
         Box<dyn Any + Send>,
+        RoventBoardCollectionWorkerKeyV3,
     ) {
-        (self.handoff, self.original_worker)
+        (self.handoff, self.original_worker, self.worker_key)
     }
 }
 
@@ -347,6 +376,10 @@ pub enum RoventBoardCollectionWorkerJoinFailureV3 {
 }
 
 impl RoventBoardCollectionWorkerV3 {
+    pub fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
+        self.admission.same_original_admission(admission)
+    }
+
     pub fn spawn(
         admission: RoventCollectionRootAdmissionV3,
         task: RoventBoardRootWorkerTaskV3,
@@ -506,6 +539,7 @@ impl RoventBoardCollectionWorkerV3 {
                     RoventBoardCollectionRootCustodyV3::from_joined_worker(
                         Arc::clone(handoff),
                         original_worker,
+                        self.key.clone(),
                     ),
                 ))
             }
@@ -547,6 +581,14 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// Native physical finish is distinct from teacher/capture settlement.
+    /// None retains all original hook custody for a later retry.
+    fn try_finish_launch(
+        &self,
+        _native: &crate::rovent_bootstrap::launch::RoventOwnCollectionNativeFenceV3,
+    ) -> Result<Option<Box<dyn Any + Send>>, AdaptiveManagerError> {
+        Ok(None)
+    }
     fn register_startup_control(
         &self,
         control: &crate::rovent_bootstrap::RoventStartupControl,
@@ -621,6 +663,70 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// Preserve the exact failed bindings after the same manager's root
+    /// fence, before any persistent owner transfer can be attempted.
+    pub(super) fn retain_failed_evidence(
+        &self,
+        manager: &mut AdaptiveSessionManager<B>,
+    ) -> Result<(), AdaptiveManagerError> {
+        if let Some(error) = manager.first_v2_collection_failure() {
+            let mut first = self
+                .first_collection_error
+                .try_lock()
+                .map_err(|_| AdaptiveManagerError::AuxiliaryPending)?;
+            if first.is_none() {
+                *first = Some(error.clone());
+            }
+        }
+        let mut slot = self
+            .failed_evidence
+            .try_lock()
+            .map_err(|_| AdaptiveManagerError::AuxiliaryPending)?;
+        if slot.is_some() {
+            return Ok(());
+        }
+        let original = manager.take_failed_collection_evidence()?;
+        if !original.is_empty() {
+            *slot = Some(original);
+        }
+        Ok(())
+    }
+
+    pub(super) fn remember_session_failure(&self, failure: &SearchSessionFailure) {
+        let mut first = self
+            .first_session_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if first.is_none() {
+            *first = Some(failure.clone());
+        }
+    }
+
+    /// Retain the original root frame and its immutable shutdown context for a
+    /// later same-manager recovery. A previous unresolved frame is never
+    /// replaced by a newer root.
+    pub(super) fn retain_root(
+        &self,
+        frame: &mut Option<super::collection_v3_root::OwnCollectionRootRunV3>,
+        context: &SearchSessionContext,
+    ) -> Result<(), AdaptiveManagerError> {
+        let mut retained = self.recovery_root.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stored_context = self
+            .cleanup_context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if retained.is_some() || stored_context.is_some() {
+            return Err(AdaptiveManagerError::Invalid(
+                "V3 own recovery frame already retained",
+            ));
+        }
+        if frame.is_some() {
+            *stored_context = Some(context.clone());
+            *retained = frame.take();
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_root(
         &self,
         manager: &AdaptiveSessionManager<B>,
@@ -765,6 +871,170 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// Transfer the exact failed bindings to a caller that will preserve
+    /// them. This transfer grants no collection or physical-success status.
+    pub(crate) fn take_board_failed_evidence_v3(
+        &self,
+    ) -> Result<
+        Option<
+            Vec<
+                super::super::manager::RoventFailedCollectionEvidence<
+                    AdaptivePortQuestion,
+                    B::Output,
+                >,
+            >,
+        >,
+        SearchSessionFailure,
+    > {
+        let Some(collection) = self.rovent_collection_v3.as_ref() else {
+            return Ok(None);
+        };
+        collection
+            .failed_evidence
+            .try_lock()
+            .map(|mut slot| slot.take())
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())
+    }
+
+    /// Original first root error is diagnostic and remains distinct from a
+    /// later successful physical cleanup of this same session.
+    pub fn board_collection_first_execution_error_v3(
+        &self,
+    ) -> Result<Option<AdaptiveManagerError>, SearchSessionFailure> {
+        let Some(collection) = self.rovent_collection_v3.as_ref() else {
+            return Ok(None);
+        };
+        collection
+            .first_execution_error
+            .try_lock()
+            .map(|error| error.clone())
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())
+    }
+
+    pub fn board_collection_first_session_failure_v3(
+        &self,
+    ) -> Result<Option<SearchSessionFailure>, SearchSessionFailure> {
+        let Some(collection) = self.rovent_collection_v3.as_ref() else {
+            return Ok(None);
+        };
+        collection
+            .first_session_failure
+            .try_lock()
+            .map(|failure| failure.clone())
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())
+    }
+
+    pub fn board_collection_first_observation_error_v3(
+        &self,
+    ) -> Result<Option<AdaptiveCollectionError>, SearchSessionFailure> {
+        let Some(collection) = self.rovent_collection_v3.as_ref() else {
+            return Ok(None);
+        };
+        collection
+            .first_collection_error
+            .try_lock()
+            .map(|error| error.clone())
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())
+    }
+
+    /// Reobserve only the session's retained V3 root and manager. This is one
+    /// nonblocking cleanup step; a false result remains physically unknown.
+    pub(crate) fn recover_rovent_collection_v3(&self) -> Result<bool, SearchSessionFailure> {
+        let Some(collection) = self.rovent_collection_v3.as_ref() else {
+            return Ok(true);
+        };
+        let mut session = self
+            .state
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let mut retained = collection
+            .recovery_root
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let mut saved_context = collection
+            .cleanup_context
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let Some(frame) = retained.as_mut() else {
+            return Ok(!collection.outstanding.load(Ordering::Acquire) && saved_context.is_none());
+        };
+        let context = saved_context
+            .as_ref()
+            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+        let SessionState::Manager(manager) = &mut *session else {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        };
+        let result = catch_unwind(AssertUnwindSafe(
+            || -> Result<bool, SearchSessionFailure> {
+                match frame.revoke_tick(collection) {
+                    Ok(()) => {}
+                    Err(AdaptiveManagerError::AuxiliaryPending) => return Ok(false),
+                    Err(error) => {
+                        return Err(SearchSessionFailure::debug(
+                            "RoventOwnCollectionRevokeV3",
+                            &error,
+                        )
+                        .unknown_if_unclosed());
+                    }
+                }
+                if manager.phase() == ManagerPhase::Running {
+                    manager
+                        .begin_root_quiesce(context.shutdown_deadline)
+                        .map_err(|error| {
+                            SearchSessionFailure::debug("RoventOwnCollectionDrainV3", &error)
+                                .unknown_if_unclosed()
+                        })?;
+                }
+                if manager.phase() != ManagerPhase::Finished {
+                    manager.tick().map_err(|error| {
+                        SearchSessionFailure::debug("RoventOwnCollectionDrainV3", &error)
+                            .unknown_if_unclosed()
+                    })?;
+                }
+                if manager.phase() != ManagerPhase::Finished {
+                    return Ok(false);
+                }
+                collection
+                    .retain_failed_evidence(manager)
+                    .map_err(|error| {
+                        SearchSessionFailure::debug("RoventOwnCollectionFailedEvidenceV3", &error)
+                            .unknown_if_unclosed()
+                    })?;
+                match frame.settle_tick(collection, manager) {
+                    Ok(true) => Ok(true),
+                    Ok(false) | Err(AdaptiveManagerError::AuxiliaryPending) => Ok(false),
+                    Err(error) => Err(SearchSessionFailure::debug(
+                        "RoventOwnCollectionSettlementV3",
+                        &error,
+                    )
+                    .unknown_if_unclosed()),
+                }
+            },
+        ));
+        match result {
+            Ok(Ok(true)) => {
+                retained.take();
+                saved_context.take();
+                Ok(true)
+            }
+            Ok(Err(failure)) => {
+                collection.remember_session_failure(&failure);
+                Err(failure)
+            }
+            Ok(result) => result,
+            Err(payload) => {
+                collection
+                    .panics
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(payload);
+                let failure = SearchSessionFailure::physical_completion_unknown();
+                collection.remember_session_failure(&failure);
+                Err(failure)
+            }
+        }
+    }
+
     /// Install only the original V3 loaded origin on its idle native owner.
     /// This registers hooks; it does not attest a root, teacher or completion.
     pub fn register_rovent_collection_v3(
@@ -845,9 +1115,18 @@ where
             hooks,
             outstanding: AtomicBool::new(false),
             failure: Mutex::new(None),
+            first_execution_error: Mutex::new(None),
+            first_session_failure: Mutex::new(None),
+            first_collection_error: Mutex::new(None),
             panics: Mutex::new(Vec::new()),
             handoff: Mutex::new(None),
+            custody: Mutex::new(None),
             no_capture: Mutex::new(None),
+            deferred_cleanup: Mutex::new(None),
+            prior_cleanup_failures: Mutex::new(Vec::new()),
+            recovery_root: Mutex::new(None),
+            cleanup_context: Mutex::new(None),
+            failed_evidence: Mutex::new(None),
         });
         Ok(())
     }

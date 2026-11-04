@@ -12,6 +12,8 @@ pub use collection_v2::*;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
 mod collection_v3;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+mod collection_v3_root;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
 pub use collection_v3::*;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
 mod admission_system_v6;
@@ -2463,6 +2465,10 @@ where
         semantic_completion: &mut Option<PalsCompletion>,
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        if self.rovent_collection_v3.is_some() && !self.recover_rovent_collection_v3()? {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
         if self.rovent_collection_v3.is_some() {
             // Do not run a collection root without its original V3 observer,
             // Busy retry and teacher custody paths fully connected.
@@ -3138,6 +3144,11 @@ where
         let mut board_collection_v2_started = false;
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         let mut board_collection_v2_revoked = false;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        let mut board_collection_v3_root = self
+            .rovent_collection_v3
+            .as_ref()
+            .map(|_| collection_v3_root::OwnCollectionRootRunV3::default());
         let admitted = catch_unwind(AssertUnwindSafe(|| {
             if let Some(profile) = &self.rovent {
                 match self.researcher_class {
@@ -3168,6 +3179,63 @@ where
                         ))?,
                     external_source,
                 )?;
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+                if let Some(collection) = &self.rovent_collection_v3 {
+                    let SessionPcrProfile::LateBoundOwn(own) = profile else {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "V3 own collection profile differs",
+                        ));
+                    };
+                    let root = root_admission
+                        .as_ref()
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "V3 own collection root admission missing",
+                        ))?;
+                    let original =
+                        root.original_v3
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "V3 own collection original root missing",
+                            ))?;
+                    let frame =
+                        board_collection_v3_root
+                            .as_mut()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "V3 own collection frame missing",
+                            ))?;
+                    loop {
+                        if context.soft_expired(Instant::now()) {
+                            return Err(AdaptiveManagerError::Deadline);
+                        }
+                        let signal = manager.activity_signal();
+                        let version = signal.version();
+                        match context.try_accepts() {
+                            Ok(true) => {}
+                            Ok(false) => return Err(AdaptiveManagerError::Deadline),
+                            Err(error) if error.code == ErrorCode::ResourceExhausted => {
+                                signal.wait_changed(version, Duration::from_millis(10));
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                        if frame.admit_tick(
+                            collection,
+                            &mut manager,
+                            Arc::clone(original),
+                            root.budget,
+                            own.common.selective_policy,
+                        )? {
+                            break;
+                        }
+                        signal.wait_changed(
+                            version,
+                            context
+                                .shutdown_deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10)),
+                        );
+                    }
+                }
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 if self.rovent_collection_origin_v2.is_some() {
                     let fixed_profile = profile.fixed().ok_or(AdaptiveManagerError::Invalid(
@@ -3258,6 +3326,20 @@ where
                                 hooks.pump()?;
                             }
                         }
+                        #[cfg(all(
+                            feature = "pals-adaptive",
+                            feature = "onnx-cpu",
+                            target_os = "linux"
+                        ))]
+                        if let (Some(collection), Some(frame)) = (
+                            self.rovent_collection_v3.as_ref(),
+                            board_collection_v3_root.as_mut(),
+                        ) {
+                            match frame.pump_or_revoke(collection, manager, context) {
+                                Err(AdaptiveManagerError::AuxiliaryPending) => {}
+                                result => result?,
+                            }
+                        }
                         if let Some(pump) = &self.collection_hooks.cooperative {
                             pump()?;
                         }
@@ -3292,6 +3374,29 @@ where
         let admitted = match admitted {
             Ok(result) => result,
             Err(payload) => {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+                if let Some(collection) = &self.rovent_collection_v3 {
+                    let failure = SearchSessionFailure::physical_completion_unknown();
+                    collection.remember_session_failure(&failure);
+                    collection
+                        .panics
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(payload);
+                    if let Some(frame) = board_collection_v3_root.as_mut() {
+                        let _ = frame.revoke_tick(collection);
+                    }
+                    if collection
+                        .retain_root(&mut board_collection_v3_root, context)
+                        .is_err()
+                    {
+                        if let Some(original) = board_collection_v3_root.take() {
+                            std::mem::forget(original);
+                        }
+                    }
+                    *state = SessionState::Manager(manager);
+                    return Err(failure);
+                }
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 if board_collection_v2_started {
                     self.rovent_collection_panic_v2
@@ -3340,10 +3445,41 @@ where
             }
         }
         if let Err(error) = admitted {
-            let _cleanup = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+            if let (Some(collection), Some(frame)) = (
+                self.rovent_collection_v3.as_ref(),
+                board_collection_v3_root.as_mut(),
+            ) {
+                let mut original = collection
+                    .first_execution_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if original.is_none() {
+                    *original = Some(error.clone());
+                }
+                drop(original);
+                let _ = frame.revoke_tick(collection);
+            }
+            let cleanup = catch_unwind(AssertUnwindSafe(|| {
                 let _ = manager.begin_root_quiesce(context.shutdown_deadline);
                 let _ = drain_root(&mut manager, context.shutdown_deadline);
             }));
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+            if let Err(payload) = cleanup {
+                if let Some(collection) = &self.rovent_collection_v3 {
+                    collection
+                        .panics
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(payload);
+                }
+            }
+            #[cfg(not(all(
+                feature = "pals-adaptive",
+                feature = "onnx-cpu",
+                target_os = "linux"
+            )))]
+            drop(cleanup);
             let _ = self.observe_rovent_root(&manager, context, root_admission.as_ref());
             // Even cleanup panic retains the whole actual manager before any
             // caller-visible failure; a local owner must not unwind and drop.
@@ -3353,16 +3489,42 @@ where
                     .driver()
                     .copy_role_consumption_diagnostic(diagnostic, false);
             }
+            let failure =
+                SearchSessionFailure::debug("AdaptiveRootExecution", &error).unknown_if_unclosed();
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+            if let Some(collection) = &self.rovent_collection_v3 {
+                collection.remember_session_failure(&failure);
+                if collection
+                    .retain_root(&mut board_collection_v3_root, context)
+                    .is_err()
+                {
+                    if let Some(original) = board_collection_v3_root.take() {
+                        std::mem::forget(original);
+                    }
+                }
+            }
             *state = SessionState::Manager(manager);
-            return Err(
-                SearchSessionFailure::debug("AdaptiveRootExecution", &error).unknown_if_unclosed()
-            );
+            return Err(failure);
         }
         let receipt = match self.root_shutdown_receipt(&manager) {
             Ok(receipt) => receipt,
-            Err(_) => {
+            Err(error) => {
+                let failure =
+                    SearchSessionFailure::debug("AdaptiveRootFence", &error).unknown_if_unclosed();
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+                if let Some(collection) = &self.rovent_collection_v3 {
+                    collection.remember_session_failure(&failure);
+                    if collection
+                        .retain_root(&mut board_collection_v3_root, context)
+                        .is_err()
+                    {
+                        if let Some(original) = board_collection_v3_root.take() {
+                            std::mem::forget(original);
+                        }
+                    }
+                }
                 *state = SessionState::Manager(manager);
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(failure);
             }
         };
         if !receipt.permits_root_reuse() || manager.phase() != ManagerPhase::Finished {
@@ -3370,8 +3532,85 @@ where
             // manager. Its cause does not confirm a fence or relax quarantine.
             let failure = failed_root_closure(manager.failures().next());
             let _ = self.observe_rovent_root(&manager, context, root_admission.as_ref());
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+            if let Some(collection) = &self.rovent_collection_v3 {
+                collection.remember_session_failure(&failure);
+                if collection
+                    .retain_root(&mut board_collection_v3_root, context)
+                    .is_err()
+                {
+                    if let Some(original) = board_collection_v3_root.take() {
+                        std::mem::forget(original);
+                    }
+                }
+            }
             *state = SessionState::Manager(manager);
             return Err(failure);
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        if let Some(collection) = &self.rovent_collection_v3 {
+            let settled = if matches!(&receipt, SessionRootFence::Native(_)) {
+                let frame = board_collection_v3_root
+                    .as_mut()
+                    .expect("registered V3 frame");
+                match collection.retain_failed_evidence(&mut manager) {
+                    Err(error) => Err(error),
+                    Ok(()) => loop {
+                        let signal = manager.activity_signal();
+                        let version = signal.version();
+                        let result = match frame.revoke_tick(collection) {
+                            Ok(()) => frame.settle_tick(collection, &mut manager),
+                            Err(AdaptiveManagerError::AuxiliaryPending) => Ok(false),
+                            Err(error) => Err(error),
+                        };
+                        match result {
+                            Ok(true) => break Ok(()),
+                            Ok(false) | Err(AdaptiveManagerError::AuxiliaryPending)
+                                if Instant::now() < context.shutdown_deadline =>
+                            {
+                                signal.wait_changed(
+                                    version,
+                                    context
+                                        .shutdown_deadline
+                                        .saturating_duration_since(Instant::now())
+                                        .min(Duration::from_millis(10)),
+                                );
+                            }
+                            Ok(false) | Err(AdaptiveManagerError::AuxiliaryPending) => {
+                                break Err(AdaptiveManagerError::AuxiliaryPending);
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    },
+                }
+            } else {
+                Err(AdaptiveManagerError::Invalid(
+                    "V3 own root did not retain native fence",
+                ))
+            };
+            if let Err(error) = settled {
+                let failure = SearchSessionFailure::debug("RoventOwnCollectionV3", &error)
+                    .unknown_if_unclosed();
+                collection.remember_session_failure(&failure);
+                let mut first = collection
+                    .first_execution_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if first.is_none() {
+                    *first = Some(error.clone());
+                }
+                drop(first);
+                if collection
+                    .retain_root(&mut board_collection_v3_root, context)
+                    .is_err()
+                {
+                    if let Some(original) = board_collection_v3_root.take() {
+                        std::mem::forget(original);
+                    }
+                }
+                *state = SessionState::Manager(manager);
+                return Err(failure);
+            }
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if board_collection_v2_started {
@@ -3864,11 +4103,7 @@ where
     ) -> Result<AdaptiveSessionProcessReceipt, SearchSessionFailure> {
         self.closed.store(true, Ordering::Release);
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
-        if self
-            .rovent_collection_v3
-            .as_ref()
-            .is_some_and(|owner| owner.outstanding.load(Ordering::Acquire))
-        {
+        if self.rovent_collection_v3.is_some() && !self.recover_rovent_collection_v3()? {
             // Native finish cannot retire a separate V3 observer, marker or
             // teacher. Preserve the exact session for later same-owner drain.
             return Err(SearchSessionFailure::physical_completion_unknown());
@@ -4408,8 +4643,16 @@ where
         let retained = std::mem::replace(state, SessionState::Moving);
         let physically_closed = matches!(retained, SessionState::Closed(_));
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
-        if let Some(owner) = self.rovent_collection_v3.take() {
-            if !physically_closed || owner.outstanding.load(Ordering::Acquire) {
+        if let Some(mut owner) = self.rovent_collection_v3.take() {
+            let failed_evidence_retained = owner
+                .failed_evidence
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_some();
+            if !physically_closed
+                || owner.outstanding.load(Ordering::Acquire)
+                || failed_evidence_retained
+            {
                 // Retain the original observer/teacher owners whenever their
                 // complete scope has not been confirmed by this session.
                 std::mem::forget(owner);
