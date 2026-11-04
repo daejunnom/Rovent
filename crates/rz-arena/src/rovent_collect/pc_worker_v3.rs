@@ -1498,8 +1498,7 @@ impl PcWorkerSupervisorV3 {
         };
         pipeline
             .install_output_directory(self.bridge.inputs(), output)
-            .map_err(|e| e.to_string())?;
-        Ok(true)
+            .map_err(|e| e.to_string())
     }
     pub(crate) fn new(
         bridge: Arc<RoventPcCollectionBridgeV3>,
