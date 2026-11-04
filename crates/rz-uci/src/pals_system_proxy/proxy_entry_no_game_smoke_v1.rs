@@ -92,7 +92,7 @@ impl ProxyEntryFunctionalSmokeV1 {
             let run_scope = inputs.run.scope();
             let cleanup_scope = inputs.cleanup.scope();
             if !same_no_game_scope(run_scope, cleanup_scope)
-                || !inputs.run.same_original_peer(&inputs.cleanup)
+                || !inputs.run.same_original_peer_and_challenge(&inputs.cleanup)
                 || entry > inputs.run.requested_at()
                 || entry > inputs.cleanup.requested_at()
             {

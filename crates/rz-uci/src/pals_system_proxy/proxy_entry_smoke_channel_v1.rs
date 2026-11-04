@@ -274,7 +274,8 @@ impl PendingDirectSmokeChallenge {
         let Some(stream) = self.stream.take() else {
             return Err((invalid("original smoke challenge stream missing"), self));
         };
-        match PendingDirectSmokeGrant::begin(scope, stream, self.until) {
+        match PendingDirectSmokeGrant::begin(scope, observed.challenge.clone(), stream, self.until)
+        {
             Ok(pending) if pending.peer == self.peer => Ok((pending, observed)),
             Ok(pending) => {
                 self.stream = Some(pending.stream);
@@ -296,6 +297,7 @@ pub(super) enum SmokeGrantPoll {
 pub(super) struct PendingDirectSmokeGrant {
     stream: UnixStream,
     peer: OriginalDirectPeer,
+    challenge: ProxyEntrySmokeChallenge,
     scope: ProxyEntrySmokeScope,
     requested_at: Instant,
     request: [u8; PROXY_ENTRY_SMOKE_REQUEST_BYTES],
@@ -310,6 +312,7 @@ pub(super) struct PendingDirectSmokeGrant {
 pub(super) struct OriginalDirectSmokeGrant {
     stream: UnixStream,
     peer: OriginalDirectPeer,
+    challenge: ProxyEntrySmokeChallenge,
     scope: ProxyEntrySmokeScope,
     requested_at: Instant,
     deadline: Instant,
@@ -318,11 +321,23 @@ pub(super) struct OriginalDirectSmokeGrant {
 impl PendingDirectSmokeGrant {
     /// The caller owns role-channel provenance and a finite exchange bound.
     /// Setup refusal returns the exact supplied socket to that same caller.
-    pub(super) fn begin(
+    fn begin(
         scope: ProxyEntrySmokeScope,
+        challenge: ProxyEntrySmokeChallenge,
         stream: UnixStream,
         until: Instant,
     ) -> Result<Self, (io::Error, UnixStream)> {
+        if challenge.validate().is_err()
+            || match scope.phase {
+                ProxyEntrySmokePhase::Run => scope != challenge.run,
+                ProxyEntrySmokePhase::Cleanup => scope != challenge.cleanup,
+            }
+        {
+            return Err((
+                invalid("smoke grant differs from original challenge"),
+                stream,
+            ));
+        }
         if Instant::now() >= until {
             return Err((
                 io::Error::new(io::ErrorKind::TimedOut, "smoke grant exchange expired"),
@@ -348,6 +363,7 @@ impl PendingDirectSmokeGrant {
         Ok(Self {
             stream,
             peer,
+            challenge,
             scope,
             requested_at,
             request,
@@ -488,6 +504,7 @@ impl PendingDirectSmokeGrant {
             Some(deadline) => Ok(OriginalDirectSmokeGrant {
                 stream: self.stream,
                 peer: self.peer,
+                challenge: self.challenge,
                 scope: self.scope,
                 requested_at: self.requested_at,
                 deadline,
@@ -507,8 +524,8 @@ impl OriginalDirectSmokeGrant {
     pub(super) fn requested_at(&self) -> Instant {
         self.requested_at
     }
-    pub(super) fn same_original_peer(&self, other: &Self) -> bool {
-        self.peer == other.peer
+    pub(super) fn same_original_peer_and_challenge(&self, other: &Self) -> bool {
+        self.peer == other.peer && self.challenge == other.challenge
     }
     /// Remote EOF is not interpreted as liveness or physical completion.
     pub(super) fn verify_original_peer(&self) -> io::Result<()> {
@@ -566,6 +583,39 @@ mod tests {
     }
 
     #[test]
+    fn request_must_match_full_original_challenge_and_preserve_fd() {
+        let (stream, _other) = UnixStream::pair().unwrap();
+        let fd = stream.as_raw_fd();
+        let scope = ProxyEntrySmokeScope {
+            policy: ProxyEntrySmokePolicy::ProxyEntryFunctionalSmokeV1,
+            owner_id: [1; 16],
+            owner_epoch: 2,
+            role: DeadlineRole::Baseline,
+            generation: 3,
+            request_id: 4,
+            lock_sha256: [5; 32],
+            phase: ProxyEntrySmokePhase::Run,
+        };
+        let mut run = scope.clone();
+        run.request_id += 1;
+        let mut cleanup = run.clone();
+        cleanup.phase = ProxyEntrySmokePhase::Cleanup;
+        cleanup.request_id += 1;
+        let challenge = ProxyEntrySmokeChallenge { run, cleanup };
+        let (error, stream) = match PendingDirectSmokeGrant::begin(
+            scope,
+            challenge,
+            stream,
+            Instant::now() + Duration::from_secs(30),
+        ) {
+            Ok(_) => panic!("changed request cannot be accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(stream.as_raw_fd(), fd);
+    }
+
+    #[test]
     fn same_process_peer_is_not_direct_arena_parent_and_fd_returns() {
         let (stream, _other) = UnixStream::pair().unwrap();
         let fd = stream.as_raw_fd();
@@ -579,8 +629,16 @@ mod tests {
             lock_sha256: [5; 32],
             phase: ProxyEntrySmokePhase::Run,
         };
+        let mut cleanup = scope.clone();
+        cleanup.phase = ProxyEntrySmokePhase::Cleanup;
+        cleanup.request_id += 1;
+        let challenge = ProxyEntrySmokeChallenge {
+            run: scope.clone(),
+            cleanup,
+        };
         let (_, stream) = match PendingDirectSmokeGrant::begin(
             scope,
+            challenge,
             stream,
             Instant::now() + Duration::from_secs(30),
         ) {
