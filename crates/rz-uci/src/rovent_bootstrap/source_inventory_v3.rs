@@ -40,6 +40,19 @@ const SYSTEM_RUNTIME_V3_FILES: &[(&str, &[u8])] = &[
         include_bytes!("launch/own_collection_v3.rs"),
     ),
     (
+        "crates/rz-uci/src/rovent_bootstrap/launch/go_observer.rs",
+        include_bytes!("launch/go_observer.rs"),
+    ),
+    (
+        "crates/rz-uci/src/rovent_bootstrap/launch/system_parent.rs",
+        include_bytes!("launch/system_parent.rs"),
+    ),
+    #[cfg(all(target_os = "linux", feature = "native-validation-diagnostics"))]
+    (
+        "crates/rz-uci/src/rovent_bootstrap/launch/system_numeric_observation.rs",
+        include_bytes!("launch/system_numeric_observation.rs"),
+    ),
+    (
         "crates/rz-uci/src/rovent_bootstrap/pc_collection_v3.rs",
         include_bytes!("pc_collection_v3.rs"),
     ),
@@ -66,6 +79,14 @@ const SYSTEM_RUNTIME_V3_FILES: &[(&str, &[u8])] = &[
     (
         "crates/rz-uci/src/pals_adaptive/manager/collection/versioned.rs",
         include_bytes!("../pals_adaptive/manager/collection/versioned.rs"),
+    ),
+    (
+        "crates/rz-uci/src/pals_native/ticketed/recovery.rs",
+        include_bytes!("../pals_native/ticketed/recovery.rs"),
+    ),
+    (
+        "crates/rz-uci/src/pals_native/ticketed/service_recovery.rs",
+        include_bytes!("../pals_native/ticketed/service_recovery.rs"),
     ),
     (
         "crates/rz-uci/src/rovent_bootstrap/launch/v3_scope.rs",
