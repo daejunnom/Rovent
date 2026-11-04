@@ -5,6 +5,7 @@
 use super::{
     cli_v6::OriginalProxyWindowV6,
     proxy_entry_smoke_channel_v1::OriginalDirectSmokeGrant,
+    proxy_entry_smoke_lock_v1::OriginalSmokeLockAdmission,
     proxy_entry_smoke_v1::{ProxyEntryFunctionalSmokeV1, local_startup_cap, source_observation},
 };
 use crate::pals_adaptive_startup::PinnedPalsSystemStartupV6;
@@ -14,6 +15,7 @@ use rz_contracts::pals::{
         PROXY_ENTRY_SMOKE_POLICY_DOMAIN, ProxyEntrySmokePhase, ProxyEntrySmokeScope,
     },
 };
+use rz_experiments::PalsSystemStartupLockV6;
 use serde::Serialize;
 use std::{
     io,
@@ -34,6 +36,14 @@ pub(super) struct OriginalNoGameSmokeGrants {
 pub(super) struct ProxyEntryNoGameSmokeBundleV1 {
     pub inputs: OriginalNoGameSmokeGrants,
     pub window: OriginalProxyWindowV6,
+}
+
+/// The initial proxy-local lock pin and both original grant owners travel
+/// together; this is still not child executable or native execution authority.
+pub(super) struct ProxyEntryNoGameAdmittedBundleV1 {
+    pub inputs: OriginalNoGameSmokeGrants,
+    pub window: OriginalProxyWindowV6,
+    pub lock_admission: OriginalSmokeLockAdmission,
 }
 
 /// Relative process-local observations. This receipt contains no game number,
@@ -70,7 +80,159 @@ fn same_no_game_scope(run: &ProxyEntrySmokeScope, cleanup: &ProxyEntrySmokeScope
         && run.request_id != cleanup.request_id
 }
 
+fn project_no_game_window(
+    entry_owner: &ProxyEntryFunctionalSmokeV1,
+    inputs: &OriginalNoGameSmokeGrants,
+    lock: &PalsSystemStartupLockV6,
+    source_scope: &'static str,
+    observed_source: &'static str,
+    cancelled: &Arc<AtomicBool>,
+    cleanup_cancelled: &Arc<AtomicBool>,
+) -> io::Result<(OriginalProxyWindowV6, ProxyEntryNoGameSmokeReceiptV1)> {
+    let entry = entry_owner.local_entry();
+    let run_scope = inputs.run.scope();
+    let cleanup_scope = inputs.cleanup.scope();
+    if !same_no_game_scope(run_scope, cleanup_scope)
+        || !inputs.run.same_original_peer_and_challenge(&inputs.cleanup)
+        || entry > inputs.run.requested_at()
+        || entry > inputs.cleanup.requested_at()
+    {
+        return Err(invalid("NoGame smoke grant scope, peer or entry differs"));
+    }
+    let lock_sha256: String = run_scope
+        .lock_sha256
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if lock_sha256 != lock.canonical_sha256
+        || run_scope.generation != lock.config.process_generation
+    {
+        return Err(invalid(
+            "NoGame smoke grant differs from original startup lock",
+        ));
+    }
+    inputs.run.verify_original_peer()?;
+    inputs.cleanup.verify_original_peer()?;
+    let run_until = inputs.run.deadline().min(inputs.cleanup.deadline());
+    let cleanup_cap = run_until
+        .checked_add(Duration::from_millis(lock.config.window.cleanup_max_ms))
+        .ok_or_else(|| invalid("NoGame smoke cleanup cap overflow"))?;
+    let cleanup_until = inputs.cleanup.deadline().min(cleanup_cap);
+    let cap_ms = lock.config.native_options.startup_ms;
+    let startup_until = local_startup_cap(entry, cap_ms, run_until, cleanup_until, Instant::now())?;
+    inputs.run.verify_original_peer()?;
+    inputs.cleanup.verify_original_peer()?;
+    let now = Instant::now();
+    if now >= startup_until {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "NoGame smoke startup deadline expired",
+        ));
+    }
+    let elapsed = u64::try_from(now.duration_since(entry).as_nanos())
+        .map_err(|_| invalid("NoGame smoke elapsed overflow"))?;
+    let remaining = u64::try_from(startup_until.duration_since(now).as_nanos())
+        .map_err(|_| invalid("NoGame smoke startup remaining overflow"))?;
+    let role = match run_scope.role {
+        DeadlineRole::Baseline => "baseline",
+        DeadlineRole::Candidate => "candidate",
+    };
+    let receipt = ProxyEntryNoGameSmokeReceiptV1 {
+        policy_domain: PROXY_ENTRY_SMOKE_POLICY_DOMAIN,
+        evidence_scope: "no_game_functional_smoke_only",
+        entry_observation: "caller_supplied_proxy_local_instant",
+        os_spawn_to_entry: "unknown",
+        owner_id: run_scope
+            .owner_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        owner_epoch: run_scope.owner_epoch,
+        run_request_id: run_scope.request_id,
+        cleanup_request_id: cleanup_scope.request_id,
+        role,
+        generation: run_scope.generation,
+        lock_sha256,
+        source_scope,
+        source_observation: observed_source,
+        entry_to_binding_ns: elapsed,
+        local_startup_cap_ms: cap_ms,
+        startup_remaining_at_binding_ns: remaining,
+    };
+    let window = OriginalProxyWindowV6 {
+        bound_reference: inputs.run.requested_at().min(inputs.cleanup.requested_at()),
+        startup_until,
+        run_until,
+        cleanup_until,
+        cancelled: Arc::clone(cancelled),
+        cleanup_cancelled: Arc::clone(cleanup_cancelled),
+    };
+    Ok((window, receipt))
+}
+
 impl ProxyEntryFunctionalSmokeV1 {
+    /// Use the same proxy-local lock admission owner instead of requiring
+    /// this proxy process to claim the mapped identity of the child binary.
+    /// The source is honestly unknown until the child validates its own image.
+    pub(super) fn bind_admitted_no_game_original(
+        self,
+        inputs: OriginalNoGameSmokeGrants,
+        admission: OriginalSmokeLockAdmission,
+        cancelled: &Arc<AtomicBool>,
+        cleanup_cancelled: &Arc<AtomicBool>,
+    ) -> Result<
+        (
+            ProxyEntryNoGameAdmittedBundleV1,
+            ProxyEntryNoGameSmokeReceiptV1,
+        ),
+        (
+            io::Error,
+            Self,
+            OriginalNoGameSmokeGrants,
+            OriginalSmokeLockAdmission,
+        ),
+    > {
+        let result = (|| {
+            if admission.entry() != self.local_entry() || !admission.matches_token(cancelled) {
+                return Err(invalid(
+                    "NoGame smoke lock entry or cancellation owner differs",
+                ));
+            }
+            admission.verify_held()?;
+            let projection = project_no_game_window(
+                &self,
+                &inputs,
+                admission.lock(),
+                "proxy_initial_lock_only",
+                "unknown",
+                cancelled,
+                cleanup_cancelled,
+            )?;
+            if projection.0.startup_until > admission.local_until() {
+                return Err(invalid("NoGame smoke extends original local lock deadline"));
+            }
+            admission.verify_held()?;
+            if Instant::now() >= projection.0.startup_until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "NoGame smoke startup deadline expired",
+                ));
+            }
+            Ok(projection)
+        })();
+        match result {
+            Ok((window, receipt)) => Ok((
+                ProxyEntryNoGameAdmittedBundleV1 {
+                    inputs,
+                    window,
+                    lock_admission: admission,
+                },
+                receipt,
+            )),
+            Err(error) => Err((error, self, inputs, admission)),
+        }
+    }
+
     /// This strictly separate NoGame path holds original direct-parent streams
     /// on success and returns them with this exact entry owner on all failures.
     /// It does not authorize a role listener or create a native session.
@@ -87,90 +249,15 @@ impl ProxyEntryFunctionalSmokeV1 {
         ),
         (io::Error, Self, OriginalNoGameSmokeGrants),
     > {
-        let result = (|| {
-            let entry = self.local_entry();
-            let run_scope = inputs.run.scope();
-            let cleanup_scope = inputs.cleanup.scope();
-            if !same_no_game_scope(run_scope, cleanup_scope)
-                || !inputs.run.same_original_peer_and_challenge(&inputs.cleanup)
-                || entry > inputs.run.requested_at()
-                || entry > inputs.cleanup.requested_at()
-            {
-                return Err(invalid("NoGame smoke grant scope, peer or entry differs"));
-            }
-            let lock_sha256: String = run_scope
-                .lock_sha256
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            if lock_sha256 != source.lock().canonical_sha256
-                || run_scope.generation != source.lock().config.process_generation
-            {
-                return Err(invalid(
-                    "NoGame smoke grant differs from original startup lock",
-                ));
-            }
-            inputs.run.verify_original_peer()?;
-            inputs.cleanup.verify_original_peer()?;
-            let run_until = inputs.run.deadline().min(inputs.cleanup.deadline());
-            let cleanup_cap = run_until
-                .checked_add(Duration::from_millis(
-                    source.lock().config.window.cleanup_max_ms,
-                ))
-                .ok_or_else(|| invalid("NoGame smoke cleanup cap overflow"))?;
-            let cleanup_until = inputs.cleanup.deadline().min(cleanup_cap);
-            let cap_ms = source.lock().config.native_options.startup_ms;
-            let startup_until =
-                local_startup_cap(entry, cap_ms, run_until, cleanup_until, Instant::now())?;
-            inputs.run.verify_original_peer()?;
-            inputs.cleanup.verify_original_peer()?;
-            let now = Instant::now();
-            if now >= startup_until {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "NoGame smoke startup deadline expired",
-                ));
-            }
-            let elapsed = u64::try_from(now.duration_since(entry).as_nanos())
-                .map_err(|_| invalid("NoGame smoke elapsed overflow"))?;
-            let remaining = u64::try_from(startup_until.duration_since(now).as_nanos())
-                .map_err(|_| invalid("NoGame smoke startup remaining overflow"))?;
-            let role = match run_scope.role {
-                DeadlineRole::Baseline => "baseline",
-                DeadlineRole::Candidate => "candidate",
-            };
-            let receipt = ProxyEntryNoGameSmokeReceiptV1 {
-                policy_domain: PROXY_ENTRY_SMOKE_POLICY_DOMAIN,
-                evidence_scope: "no_game_functional_smoke_only",
-                entry_observation: "caller_supplied_proxy_local_instant",
-                os_spawn_to_entry: "unknown",
-                owner_id: run_scope
-                    .owner_id
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-                owner_epoch: run_scope.owner_epoch,
-                run_request_id: run_scope.request_id,
-                cleanup_request_id: cleanup_scope.request_id,
-                role,
-                generation: run_scope.generation,
-                lock_sha256,
-                source_scope: "pinned_system_v6_source_observation_only",
-                source_observation: source_observation(source.system_v6_source()),
-                entry_to_binding_ns: elapsed,
-                local_startup_cap_ms: cap_ms,
-                startup_remaining_at_binding_ns: remaining,
-            };
-            let window = OriginalProxyWindowV6 {
-                bound_reference: inputs.run.requested_at().min(inputs.cleanup.requested_at()),
-                startup_until,
-                run_until,
-                cleanup_until,
-                cancelled: Arc::clone(cancelled),
-                cleanup_cancelled: Arc::clone(cleanup_cancelled),
-            };
-            Ok((window, receipt))
-        })();
+        let result = project_no_game_window(
+            &self,
+            &inputs,
+            source.lock(),
+            "pinned_system_v6_source_observation_only",
+            source_observation(source.system_v6_source()),
+            cancelled,
+            cleanup_cancelled,
+        );
         match result {
             Ok((window, receipt)) => {
                 Ok((ProxyEntryNoGameSmokeBundleV1 { inputs, window }, receipt))
