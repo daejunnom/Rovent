@@ -358,6 +358,55 @@ impl TeacherPumpV3 {
         receiver.try_handoffs_accounted(route)
     }
 
+    /// Non-consuming accounting observation for a same-root abort proof.
+    /// `Some(true)` only means original inputs are retained and the receiver
+    /// handoffs are accounted after target revocation. It grants no terminal,
+    /// sender/callback fence, join, physical completion, or unlink authority.
+    /// Each capsule can enter this private custody only after exact-ticket
+    /// cancellation under the route gate in `try_handoff_closed`.
+    pub(crate) fn try_closed_accounting(
+        &self,
+        route: &SpeculativeRootV3,
+        custody: &TeacherClosedCustodyV3,
+    ) -> Result<Option<bool>, ArenaError> {
+        if !self.closed
+            || self.pending_delivery_ack
+            || self.held.is_some()
+            || !self.closed_capsules.is_empty()
+            || self.completed.is_some()
+            || !self.terminal_backlog.is_empty()
+            || self.rejected.is_some()
+            || self.has_pending()
+            || self.receiver_failure.is_some()
+            || !self.observation_errors.is_empty()
+            || !self.owns_closed_custody(custody)
+            || !route.target_revocation().is_revoked()
+        {
+            return Ok(Some(false));
+        }
+        let retained = match custody.0.try_lock() {
+            Ok(retained) => retained,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(invalid("V3 closed input custody poisoned"));
+            }
+        };
+        if !retained.route.same_original_route(route)
+            || !Arc::ptr_eq(&self.closed_custody_identity, &retained.pump_identity)
+            || retained.originals.iter().any(|capsule| {
+                !route.matches_admission(capsule.admission()) || !capsule.is_ticket_canceled()
+            })
+        {
+            return Ok(Some(false));
+        }
+        let receiver = match self.receiver.try_lock() {
+            Ok(receiver) => receiver,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => return Err(invalid("V3 teacher receiver poisoned")),
+        };
+        receiver.try_handoffs_accounted(route)
+    }
+
     /// The native observer must separately revoke this exact ticket. A match
     /// in the held slot has not been issued; retain it as a rejected input.
     pub(crate) fn cancel_ticket(
