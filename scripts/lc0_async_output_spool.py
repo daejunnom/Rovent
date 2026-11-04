@@ -62,7 +62,7 @@ class AsyncOutputSpool:
         self._retry_requested = False
         self._cancel_observed = False
         self._backpressure_count = 0
-        self._thread = threading.Thread(target=self._run, name="lc0-output-writer", daemon=False)
+        self._thread = threading.Thread(target=self._run_guarded, name="lc0-output-writer", daemon=False)
         self._notification = None
         self._notification_init_error = None
         try:
@@ -207,6 +207,25 @@ class AsyncOutputSpool:
         """
         with self._condition:
             return (self._original_failure, *self._last_errors)
+
+    def _run_guarded(self):
+        # An unexpected failure in bookkeeping or notification must retain
+        # the same output owner just like an exception from the disk call.
+        try:
+            self._run()
+        except BaseException as error:
+            with self._condition:
+                self._failure = self._failure or type(error).__name__
+                if self._original_failure is None:
+                    self._original_failure = error
+                self._state = "close_unknown" if self._state == "closing" else "writer_fault"
+                _QUARANTINED_WRITERS.append(self)
+            try:
+                self._signal()
+            except BaseException:
+                # The original writer exception and all pending bytes remain
+                # retained; notification is not a completion authority.
+                pass
 
     def _run(self):
         try:

@@ -143,6 +143,33 @@ class AsyncOutputSpoolTests(unittest.TestCase):
             spool._fd = None
             self.assertTrue(spool._notification.close_after_writer())
 
+    def test_bookkeeping_failure_after_write_retains_original_owner(self):
+        original_observation = lc0_output_spool.OutputSpool.observation
+
+        def fail_after_write(owner):
+            if owner.bytes_written:
+                raise RuntimeError("fixture observation failure")
+            return original_observation(owner)
+
+        with tempfile.TemporaryFile() as output, mock.patch.object(
+            lc0_output_spool.OutputSpool, "observation", fail_after_write
+        ):
+            spool = async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
+                                                  max_queue_bytes=16, max_queue_items=2)
+            self.assertEqual(spool.offer(b"source"), "accepted")
+            failed = wait_state(spool, "writer_fault")
+            self.assertEqual(failed["inflight_bytes"], 6)
+            self.assertTrue(failed["original_failure_retained"])
+            self.assertEqual(os.pread(output.fileno(), 64, 0), b"source")
+            self.assertIs(async_spool._QUARANTINED_WRITERS.pop(), spool)
+            spool._thread.join(1)
+            self.assertFalse(spool._thread.is_alive())
+            os.close(spool._spool._fd)
+            os.close(spool._fd)
+            spool._spool._fd = None
+            spool._fd = None
+            self.assertTrue(spool._notification.close_after_writer())
+
     def test_read_error_is_not_reported_as_eof(self):
         with tempfile.TemporaryFile() as output:
             spool = async_spool.AsyncOutputSpool(output.fileno(), max_bytes=64,
