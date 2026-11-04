@@ -15,6 +15,7 @@ const PUBLICATION_GRANTED: u8 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhaseV3 {
     Open,
+    AdmissionSealed,
     Closed,
     Preparing,
     Granted,
@@ -44,6 +45,15 @@ pub(super) struct GameAuthorityV3<S> {
 pub(super) struct GameClosureProofV3 {
     owner: Arc<()>,
     _requires_audited_bridge: Infallible,
+}
+
+/// A distinct, earlier proof: only the original native launch/bridge may
+/// attest no further root admission. It does not attest root drains, teacher
+/// joins, output completion, or any physical device release. A real bridge
+/// constructor is intentionally not implemented in this isolated candidate.
+pub(super) struct GameAdmissionSealProofV3 {
+    owner: Arc<()>,
+    _requires_original_native_fence: Infallible,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,7 +102,7 @@ impl<S> GameAuthorityV3<S> {
             Ok(s) => s,
             Err(e) => return e,
         };
-        if state.phase != PhaseV3::Open {
+        if !matches!(state.phase, PhaseV3::Open | PhaseV3::AdmissionSealed) {
             return GameStepV3::Closed;
         }
         let candidate = Arc::downgrade(supervisor);
@@ -112,7 +122,7 @@ impl<S> GameAuthorityV3<S> {
             Ok(s) => s,
             Err(e) => return e,
         };
-        if state.phase != PhaseV3::Open {
+        if !matches!(state.phase, PhaseV3::Open | PhaseV3::AdmissionSealed) {
             return GameStepV3::Closed;
         }
         match &state.pipeline {
@@ -135,7 +145,7 @@ impl<S> GameAuthorityV3<S> {
             Ok(s) => s,
             Err(e) => return e,
         };
-        if state.phase != PhaseV3::Open {
+        if !matches!(state.phase, PhaseV3::Open | PhaseV3::AdmissionSealed) {
             return GameStepV3::Closed;
         }
         let candidate = Arc::downgrade(output);
@@ -257,6 +267,27 @@ impl<S> GameAuthorityV3<S> {
         self.control.fetch_or(ABORT_REQUESTED, Ordering::SeqCst);
     }
 
+    /// Only admission is sealed here. Existing reservations and original
+    /// root work remain held and must be separately settled and observed.
+    pub(super) fn try_seal_admission(&self, proof: &GameAdmissionSealProofV3) -> GameStepV3 {
+        if !Arc::ptr_eq(&self.identity, &proof.owner) {
+            return GameStepV3::Foreign;
+        }
+        let mut state = match self.lock() {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        match state.phase {
+            PhaseV3::Open => {
+                state.phase = PhaseV3::AdmissionSealed;
+                GameStepV3::Ready
+            }
+            PhaseV3::AdmissionSealed => GameStepV3::Existing,
+            PhaseV3::Unknown => GameStepV3::Unknown,
+            _ => GameStepV3::Closed,
+        }
+    }
+
     pub(super) fn try_close(&self, proof: &GameClosureProofV3) -> GameStepV3 {
         if !Arc::ptr_eq(&self.identity, &proof.owner) {
             return GameStepV3::Foreign;
@@ -281,7 +312,7 @@ impl<S> GameAuthorityV3<S> {
             return GameStepV3::Foreign;
         }
         match state.phase {
-            PhaseV3::Open => {
+            PhaseV3::AdmissionSealed => {
                 state.phase = PhaseV3::Closed;
                 GameStepV3::Ready
             }
