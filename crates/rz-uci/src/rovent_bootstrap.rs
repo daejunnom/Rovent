@@ -35,8 +35,10 @@ pub use pinned::{
 };
 
 use crate::pals_adaptive::{NativeQuestionProjection, ProjectedNativeBackend};
+#[cfg(target_os = "linux")]
+use crate::pals_native::ticketed::TicketNativeBackend;
 use crate::pals_native::ticketed::{
-    NativeVirtualReviewTicketBackend, TicketNativeBackend, TicketNativeEvent, TicketServiceLimits,
+    NativeVirtualReviewTicketBackend, TicketNativeEvent, TicketServiceLimits,
     TicketedNativeService, VirtualReviewCollectionObserver,
 };
 use rz_contracts::rovent::ExecutionMode;
@@ -1214,7 +1216,7 @@ where
     let native = TicketedNativeService::spawn_with_capacity(
         move || {
             let loaded =
-                factory_diagnostic.trace(NativeStartupDiagnosticStage::NativeFactory, || factory());
+                factory_diagnostic.trace(NativeStartupDiagnosticStage::NativeFactory, factory);
             let observation = loaded
                 .as_ref()
                 .map(|(_, snapshot)| snapshot.clone())
