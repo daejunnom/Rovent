@@ -701,11 +701,9 @@ impl Lc0SupervisedSession {
         self.supervisor.serve_until(until, serve)
     }
 
-    /// Start the actual UCI engine using this session's original native
-    /// factory, registry and process epoch. Rejection before service returns
-    /// the same inputs; a later setup failure stays with this session.
-    /// The caller must retain this session and the original process across
-    /// pending or unknown outcomes. The CLI guard remains independent.
+    /// Currently refuses async admission and returns the original inputs.
+    /// Actual start is held until the original owner survives every start
+    /// unwind and pending run; the CLI guard is independent.
     pub fn start_async_service(
         &mut self,
         inputs: Lc0AsyncInputs,
@@ -799,7 +797,7 @@ impl Lc0SupervisedSession {
     }
 
     /// Borrow the exact engine setup failure and its retained input owners.
-    pub fn async_start_failure(&self) -> Option<&Lc0StartFailure> {
+    pub(crate) fn async_start_failure(&self) -> Option<&Lc0StartFailure> {
         match self.async_custody.as_ref()? {
             Lc0AsyncCustody::StartFailed(error) => Some(error),
             _ => None,
@@ -816,7 +814,7 @@ impl Lc0SupervisedSession {
 
     /// Joins only confirmed-finished engine CPU workers and their timer. The
     /// original writer, native worker and physical completion remain separate.
-    pub fn try_join_async_timer(&mut self) -> Option<EngineTimerJoinStatus> {
+    pub(crate) fn try_join_async_timer(&mut self) -> Option<EngineTimerJoinStatus> {
         match self.async_custody.as_mut()? {
             Lc0AsyncCustody::Running { run, .. } => Some(run.try_join_timer_after_workers()),
             _ => None,
