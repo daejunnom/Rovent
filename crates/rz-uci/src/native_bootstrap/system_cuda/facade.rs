@@ -179,6 +179,23 @@ impl Lc0ParentListener {
     pub fn accept_parent(&self, until: Instant) -> io::Result<UnixStream> {
         self.endpoint.accept_parent(until)
     }
+
+    /// Retire a bind attempt only while the original pre-authentication
+    /// ticket is still held. A failed cleanup remains in this endpoint owner;
+    /// it is not a native-session or physical-completion observation.
+    pub fn retire_before_auth(
+        &mut self,
+        pending: &Lc0PendingSupervisor,
+        until: Instant,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.ticket_token, &pending.ticket_token) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "LC0 listener belongs to another pending ticket",
+            ));
+        }
+        self.endpoint.cleanup(until)
+    }
 }
 
 impl Lc0ReceiptOwner {
@@ -425,6 +442,13 @@ impl Lc0PendingSupervisor {
 }
 
 impl Lc0SupervisedSession {
+    /// The supervised CLI must check this before opening assets or entering
+    /// CUDA. Enable only when in-place start, normal finish and caller-owned
+    /// pending/drop custody are all implemented and independently verified.
+    pub const fn async_service_available() -> bool {
+        false
+    }
+
     /// A projection of this exact owner and its own publication attempts.
     /// It cannot authorize process exit or establish physical completion.
     pub fn original_session_observation(
@@ -718,10 +742,13 @@ impl Lc0SupervisedSession {
         // `start_async` can unwind after taking its input owners. Until the
         // same-owner in-place start can retain them, do not enter native
         // service through a public library caller either.
-        Err((
-            NativeBootstrapError::Config("LC0 async start custody is not available"),
-            inputs,
-        ))
+        if !Self::async_service_available() {
+            return Err((
+                NativeBootstrapError::Config("LC0 async start custody is not available"),
+                inputs,
+            ));
+        }
+        self.start_async_service_with_pending_custody(inputs)
     }
 
     // Prepared implementation; intentionally not called while start-unwind

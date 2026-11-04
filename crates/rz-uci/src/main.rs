@@ -3243,6 +3243,7 @@ fn run_native(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 #[cfg(feature = "onnx-cpu")]
 fn run_native(mut arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut parent_preflight = None;
+    let mut supervised = None;
     arguments.retain(|argument| {
         if let Some(value) = argument.strip_prefix("--lc0-parent-preflight=") {
             if parent_preflight.is_some() {
@@ -3251,12 +3252,39 @@ fn run_native(mut arguments: Vec<String>) -> Result<(), Box<dyn std::error::Erro
                 parent_preflight = Some(value.to_owned());
             }
             false
+        } else if let Some(value) = argument.strip_prefix("--lc0-supervised=") {
+            if supervised.is_some() {
+                supervised = Some("duplicate".to_owned());
+            } else {
+                supervised = Some(value.to_owned());
+            }
+            false
         } else {
             true
         }
     });
     // NativeConfig owns exact flag/asset/hash validation and bounded public errors.
     let config = NativeConfig::parse(arguments)?;
+    if supervised.is_some() && parent_preflight.is_some() {
+        return Err("LC0 supervised service and parent preflight are distinct".into());
+    }
+    if let Some(specification) = supervised {
+        if config.provider() != NativeProvider::Cuda {
+            return Err("LC0 supervised service requires explicit system CUDA".into());
+        }
+        let (epoch, seconds) = specification
+            .split_once(':')
+            .ok_or("LC0 supervised service requires EPOCH:SECONDS")?;
+        let epoch: u64 = epoch.parse()?;
+        let seconds: u64 = seconds.parse()?;
+        if epoch == 0 || !(1..=3600).contains(&seconds) {
+            return Err("LC0 supervised epoch or duration is invalid".into());
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+        return run_lc0_supervised(config, epoch, Duration::from_secs(seconds));
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux")))]
+        return Err("LC0 supervised service requires Linux, onnx-cuda and pals-adaptive".into());
+    }
     if let Some(specification) = parent_preflight {
         if config.provider() != NativeProvider::Cuda {
             return Err("LC0 parent preflight requires explicit system CUDA".into());
@@ -3422,6 +3450,25 @@ fn run_cuda(config: NativeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let report = finished?;
     eprintln!("{report}");
     Ok(())
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+fn run_lc0_supervised(
+    _config: NativeConfig,
+    _epoch: u64,
+    _window: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // This check is deliberately before endpoint creation, opening assets,
+    // starting a writer or entering a native provider.
+    if !rz_uci::native_bootstrap::Lc0SupervisedSession::async_service_available() {
+        return Err(
+            "LC0 supervised service custody is not available; no runtime was started".into(),
+        );
+    }
+    // The eventual caller must keep the original session, listener and
+    // receipts together across every timeout and unwind; do not bypass this
+    // barrier until native finish and parent-loss custody are wired.
+    Err("LC0 supervised service caller is not yet available; no runtime was started".into())
 }
 
 fn serve_process(
