@@ -20,6 +20,8 @@ pub struct AsyncEngineStartSlot<O: Write + Send + 'static, D: Write + Send + 'st
     events: Option<Receiver<Event>>,
     sender: SyncSender<Event>,
     output: Option<AsyncOutputOwner<O, D>>,
+    output_close_requested: bool,
+    output_recovery: Option<Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>>,
     close: PriorityCloseHandle,
     settings: EngineSettings,
     transferred: bool,
@@ -73,6 +75,8 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
             events: Some(events),
             sender,
             output: Some(output),
+            output_close_requested: false,
+            output_recovery: None,
             close,
             settings,
             transferred: false,
@@ -333,6 +337,76 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         };
         self.transferred = true;
         Ok(run)
+    }
+    /// Refusal-only writer drain. A started timer or accepted output remains
+    /// outside this idle cleanup path, and no native completion is inferred.
+    pub fn request_idle_writer_close(&mut self) -> UnstartedWriterCloseStatus {
+        if self.transferred
+            || self
+                .staged
+                .as_ref()
+                .is_some_and(|stage| stage.timer.is_some())
+        {
+            return UnstartedWriterCloseStatus::NotUnstarted;
+        }
+        if self.output_recovery.is_some() {
+            return UnstartedWriterCloseStatus::AlreadyRecovered;
+        }
+        if self.output_close_requested {
+            return UnstartedWriterCloseStatus::AlreadyRequested;
+        }
+        let Some(original) = self.output.as_ref() else {
+            return UnstartedWriterCloseStatus::OriginalOwnerMissing;
+        };
+        if original.observation().accepted_batches != 0 {
+            return UnstartedWriterCloseStatus::NotIdle;
+        }
+        original.request_close();
+        self.output_close_requested = true;
+        UnstartedWriterCloseStatus::Requested
+    }
+    pub fn try_recover_idle_writer(&mut self) -> UnstartedWriterRecoveryStatus {
+        if self.transferred
+            || self
+                .staged
+                .as_ref()
+                .is_some_and(|stage| stage.timer.is_some())
+        {
+            return UnstartedWriterRecoveryStatus::NotUnstarted;
+        }
+        if let Some(original) = &self.output_recovery {
+            return if original.is_ok() {
+                UnstartedWriterRecoveryStatus::Recovered
+            } else {
+                UnstartedWriterRecoveryStatus::WorkerPanicked
+            };
+        }
+        if !self.output_close_requested {
+            return UnstartedWriterRecoveryStatus::CloseNotRequested;
+        }
+        let Some(original) = self.output.take() else {
+            return UnstartedWriterRecoveryStatus::OriginalOwnerMissing;
+        };
+        match original.try_recover() {
+            Err(original) => {
+                self.output = Some(original);
+                UnstartedWriterRecoveryStatus::Pending
+            }
+            Ok(original) => {
+                let status = if original.is_ok() {
+                    UnstartedWriterRecoveryStatus::Recovered
+                } else {
+                    UnstartedWriterRecoveryStatus::WorkerPanicked
+                };
+                self.output_recovery = Some(original);
+                status
+            }
+        }
+    }
+    pub fn idle_writer_recovery(
+        &self,
+    ) -> Option<&Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>> {
+        self.output_recovery.as_ref()
     }
     pub fn preflight_failure(&self) -> Option<&EngineError> {
         self.preflight_failure.as_ref()
