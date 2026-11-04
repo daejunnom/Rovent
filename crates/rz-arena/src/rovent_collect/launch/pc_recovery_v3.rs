@@ -72,6 +72,7 @@ pub(crate) enum PcOutputClosureV3 {
     Aborted,
     Failed,
     Unknown,
+    Timeout,
 }
 
 struct OriginalPcRunV3 {
@@ -100,6 +101,33 @@ struct OriginalPcRunV3 {
     before_admission_released: bool,
     joined_offered: bool,
     state: PcRunRecoveryStateV3,
+}
+
+/// Close admission only after the caller has established producer shutdown.
+/// Preserve the original terminal separately from uncertain close evidence.
+fn observe_closed_output_v3(
+    original: &mut OriginalPcRunV3,
+    terminal: PcOutputClosureV3,
+) -> PcOutputClosureV3 {
+    if original.output_close.is_none() {
+        original.output_close = original.output.try_close();
+    }
+    let Some(evidence) = original.output_close.as_ref() else {
+        return PcOutputClosureV3::Pending;
+    };
+    if !evidence.matches_original(&original.output) {
+        return PcOutputClosureV3::Unknown;
+    }
+    use super::pc_lock_v3::ManagedOutputCloseStatusV3 as Close;
+    match (terminal, evidence.status()) {
+        (_, Close::Unknown | Close::UnknownAfterAttempt) => PcOutputClosureV3::Unknown,
+        (PcOutputClosureV3::Published, Close::WritesAcknowledged { count }) if count > 0 => {
+            terminal
+        }
+        (PcOutputClosureV3::NoData, Close::NoWrites) => terminal,
+        (PcOutputClosureV3::Published | PcOutputClosureV3::NoData, _) => PcOutputClosureV3::Unknown,
+        _ => terminal,
+    }
 }
 
 struct PcRunRecoverySlotV3 {
@@ -776,29 +804,7 @@ impl PcRunRecoveryKeyV3 {
             .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(terminal) = original.output_terminal {
-                if original.output_close.is_none() {
-                    original.output_close = original.output.try_close();
-                }
-                let Some(evidence) = original.output_close.as_ref() else {
-                    return PcOutputClosureV3::Pending;
-                };
-                if !evidence.matches_original(&original.output) {
-                    return PcOutputClosureV3::Unknown;
-                }
-                use super::pc_lock_v3::ManagedOutputCloseStatusV3 as Close;
-                return match (terminal, evidence.status()) {
-                    (_, Close::Unknown | Close::UnknownAfterAttempt) => PcOutputClosureV3::Unknown,
-                    (PcOutputClosureV3::Published, Close::WritesAcknowledged { count })
-                        if count > 0 =>
-                    {
-                        terminal
-                    }
-                    (PcOutputClosureV3::NoData, Close::NoWrites) => terminal,
-                    (PcOutputClosureV3::Published | PcOutputClosureV3::NoData, _) => {
-                        PcOutputClosureV3::Unknown
-                    }
-                    _ => terminal,
-                };
+                return observe_closed_output_v3(original, terminal);
             }
             if Instant::now() >= until {
                 return PcOutputClosureV3::Pending;
@@ -919,6 +925,60 @@ impl PcRunRecoveryKeyV3 {
                 original.output_panic = Some(payload);
                 original.output_terminal = Some(PcOutputClosureV3::Unknown);
                 Ok(PcOutputClosureV3::Progress)
+            }
+        }
+    }
+
+    /// Seal a nonterminal publication timeout without starting any additional
+    /// publication. The original guard, pipeline, partial data and errors stay
+    /// in this slot. Same-owner settlement and actual driver join are required
+    /// before closing output admission; GPU and parent lease remain independent.
+    pub(crate) fn poll_output_timeout(&self) -> Result<PcOutputClosureV3, PcDriverEvidenceErrorV3> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcOutputClosureV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_mut()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(terminal) = original.output_terminal {
+                return observe_closed_output_v3(original, terminal);
+            }
+            if original.output_panic.is_some() {
+                return PcOutputClosureV3::Unknown;
+            }
+            let Some(settled) = original.settled.as_ref() else {
+                return PcOutputClosureV3::Pending;
+            };
+            if !Arc::ptr_eq(&settled.collection, original.owners.native()) {
+                return PcOutputClosureV3::Unknown;
+            }
+            let Some(joined) = settled.driver_joined.as_ref() else {
+                return PcOutputClosureV3::Pending;
+            };
+            if !joined.matches_original(
+                original.owners.driver_custody(),
+                original.owners.supervisor(),
+                original.owners.native(),
+            ) || settled
+                .hook_custody
+                .downcast_ref::<Arc<PcV3LaunchClosure>>()
+                .is_none()
+            {
+                return PcOutputClosureV3::Unknown;
+            }
+            original.output_terminal = Some(PcOutputClosureV3::Timeout);
+            observe_closed_output_v3(original, PcOutputClosureV3::Timeout)
+        }));
+        match result {
+            Ok(step) => Ok(step),
+            Err(payload) => {
+                original.output_panic = Some(payload);
+                Ok(PcOutputClosureV3::Unknown)
             }
         }
     }
