@@ -310,6 +310,54 @@ pub trait AdaptiveCollectionObserverV3<Q, O>: Send {
     }
     fn abandoned(&mut self, ticket: &RoleTicketEnvelope) -> Result<(), AdaptiveCollectionError>;
     fn settled(&mut self, tickets: &[RoleTicketEnvelope]) -> Result<(), AdaptiveCollectionError>;
+
+    /// `Busy` means the borrowed original evidence was not applied. The
+    /// caller must retain that evidence and retry it in the same root; it is
+    /// neither a physical completion nor a collection failure. Implementors
+    /// may retain independently committed captures before returning Busy,
+    /// but must not apply the supplied event until they return Ready.
+    fn try_native_event(
+        &mut self,
+        event: RoventCollectionNativeEventWitnessV3<'_, O>,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.native_event(event)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
+
+    fn try_accepted(
+        &mut self,
+        accepted: RoventCollectionAcceptedWitnessV3<'_>,
+        input: &FrameInput<ReviewView, Q>,
+        output: &O,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.accepted(accepted, input, output)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
+
+    fn try_consumed(
+        &mut self,
+        accepted: RoventCollectionConsumedWitnessV3<'_>,
+        observation: RoleOnlySearchConsumptionV2,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.consumed(accepted, observation)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
+
+    fn try_abandoned(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.abandoned(ticket)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
+
+    fn try_settled(
+        &mut self,
+        tickets: &[RoleTicketEnvelope],
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        self.settled(tickets)
+            .map(|()| AdaptiveCollectionBoundaryV2::Ready)
+    }
 }
 #[cfg(target_os = "linux")]
 pub type AdaptiveCollectionObserverBoxV3<Q, O> = Box<dyn AdaptiveCollectionObserverV3<Q, O>>;
@@ -430,6 +478,81 @@ pub(crate) enum VersionedCollectionObserver<Q, O> {
 // pairing on Linux but are intentionally unreachable in the V2-only build.
 #[allow(unreachable_patterns)]
 impl<Q, O> VersionedCollectionObserver<Q, O> {
+    pub(crate) fn try_native_event(
+        &mut self,
+        witness: VersionedCollectionNativeEventWitness<'_, O>,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        match (self, witness) {
+            (Self::V2(o), VersionedCollectionNativeEventWitness::V2(w)) => o
+                .native_event(w)
+                .map(|()| AdaptiveCollectionBoundaryV2::Ready),
+            #[cfg(target_os = "linux")]
+            (Self::V3(o), VersionedCollectionNativeEventWitness::V3(w)) => o.try_native_event(w),
+            _ => Err(mismatch(AdaptiveCollectionStage::NativeEvent)),
+        }
+    }
+
+    pub(crate) fn try_accepted(
+        &mut self,
+        witness: VersionedCollectionAcceptedWitness<'_>,
+        input: &FrameInput<ReviewView, Q>,
+        output: &O,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        match (self, witness) {
+            (Self::V2(o), VersionedCollectionAcceptedWitness::V2(w)) => o
+                .accepted(w, input, output)
+                .map(|()| AdaptiveCollectionBoundaryV2::Ready),
+            #[cfg(target_os = "linux")]
+            (Self::V3(o), VersionedCollectionAcceptedWitness::V3(w)) => {
+                o.try_accepted(w, input, output)
+            }
+            _ => Err(mismatch(AdaptiveCollectionStage::Accepted)),
+        }
+    }
+
+    pub(crate) fn try_consumed(
+        &mut self,
+        witness: VersionedCollectionConsumedWitness<'_>,
+        observation: RoleOnlySearchConsumptionV2,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        match (self, witness) {
+            (Self::V2(o), VersionedCollectionConsumedWitness::V2(w)) => o
+                .consumed(w, observation)
+                .map(|()| AdaptiveCollectionBoundaryV2::Ready),
+            #[cfg(target_os = "linux")]
+            (Self::V3(o), VersionedCollectionConsumedWitness::V3(w)) => {
+                o.try_consumed(w, observation)
+            }
+            _ => Err(mismatch(AdaptiveCollectionStage::Accepted)),
+        }
+    }
+
+    pub(crate) fn try_abandoned(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        match self {
+            Self::V2(o) => o
+                .abandoned(ticket)
+                .map(|()| AdaptiveCollectionBoundaryV2::Ready),
+            #[cfg(target_os = "linux")]
+            Self::V3(o) => o.try_abandoned(ticket),
+        }
+    }
+
+    pub(crate) fn try_settled(
+        &mut self,
+        tickets: &[RoleTicketEnvelope],
+    ) -> Result<AdaptiveCollectionBoundaryV2, AdaptiveCollectionError> {
+        match self {
+            Self::V2(o) => o
+                .settled(tickets)
+                .map(|()| AdaptiveCollectionBoundaryV2::Ready),
+            #[cfg(target_os = "linux")]
+            Self::V3(o) => o.try_settled(tickets),
+        }
+    }
+
     pub(crate) fn admitted(
         &mut self,
         admission: &VersionedCollectionAdmission,
