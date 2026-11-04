@@ -78,6 +78,9 @@ pub(crate) struct PcRootRecoveryV3 {
     worker_key: Option<RoventPcCollectionWorkerKeyV3>,
     handoff: Option<RootHandoffV3>,
     aggregate: Option<RoventTeacherScopeAggregateAckV3>,
+    // A game abort is sticky for this original root. This is not a native
+    // cancellation, an aggregate acknowledgement, or permission to reuse it.
+    abort_before_route: bool,
     diagnostics: Vec<(String, TeacherDiagnostics)>,
     prepared: Option<PcPreparedRootV3>,
     custodian: TeacherRecoveryCustodianV3,
@@ -124,6 +127,7 @@ impl PcRootRecoveryV3 {
             worker_key: None,
             handoff: None,
             aggregate: None,
+            abort_before_route: false,
             diagnostics: Vec::new(),
             prepared: None,
             custodian: TeacherRecoveryCustodianV3::new(),
@@ -1654,6 +1658,37 @@ fn prepare_root_step_v3(
     if state.published {
         return Ok(PcPrepareStepV3::Published);
     }
+    if bridge.game_authority().abort_requested() && state.route.is_none()
+        && state.worker.is_none() && state.worker_key.is_none()
+        && state.prepared.is_none()
+    {
+        state.abort_before_route = true;
+    }
+    if state.abort_before_route {
+        // Preserve the exact session and recovery custodian. A claim or spawn
+        // with an unknown outcome is never promoted to a no-worker result.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.try_drain_teacher_before_route(cleanup_deadline)
+        }));
+        if let Err(payload) = result {
+            state.panic = Some(payload);
+            state.failure.get_or_insert_with(|| "P-C V3 pre-route abort drain panicked".into());
+        }
+        return Ok(PcPrepareStepV3::Pending);
+    }
+    if bridge.game_authority().abort_requested() {
+        // A route or worker may have appeared while abort raced preparation.
+        // Do not start another one or invent the missing native handoff.
+        if let Some(route) = &state.route {
+            route.cancel_all();
+        }
+        if let Some(pump) = &state.pump {
+            if let Ok(mut pump) = pump.try_lock() {
+                pump.close_admission();
+            }
+        }
+        return Ok(PcPrepareStepV3::Pending);
+    }
     if state.failure.is_some() {
         let unstarted =
             state.definitely_unstarted() && state.no_scope_recovery == NoScopeRecoveryV3::Pending;
@@ -1750,6 +1785,9 @@ fn prepare_root_step_v3(
         use super::teacher::v3_session::TeacherSessionStageStateV3 as S;
         match staged.state() {
             S::Prepared => {
+                if bridge.game_authority().abort_requested() {
+                    return Ok(PcPrepareStepV3::Pending);
+                }
                 if let Err(error) = staged.claim() {
                     state.stage_claim_failure = Some(error);
                     state.failure = Some("teacher scope claim unresolved or rejected".into());
@@ -1775,6 +1813,9 @@ fn prepare_root_step_v3(
         .ok_or("P-C V3 staged session absent")?;
     let roster = &inputs.plan().teacher_slots;
     if state.next_actor < roster.len() {
+        if bridge.game_authority().abort_requested() {
+            return Ok(PcPrepareStepV3::Pending);
+        }
         let actor_id = roster[state.next_actor].actor_id.clone();
         let mut owner = session.lock().map_err(|_| "P-C V3 session poisoned")?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1805,6 +1846,9 @@ fn prepare_root_step_v3(
         return Ok(PcPrepareStepV3::Pending);
     }
     if state.route.is_none() {
+        if bridge.game_authority().abort_requested() {
+            return Ok(PcPrepareStepV3::Pending);
+        }
         let installed = bridge
             .capture_registration()
             .try_install_speculative_root_v3(
@@ -2180,6 +2224,72 @@ impl PcRootRecoveryV3 {
                 self.panic = Some(payload);
                 self.failure
                     .get_or_insert_with(|| "P-C V3 policy step panicked".into());
+            }
+        }
+    }
+
+    /// Drain the same session when abort arrived before a route or root worker
+    /// existed. The aggregate stays in this recovery; it is not a handoff,
+    /// native fence, semantic success, or permission to release any quota.
+    fn try_drain_teacher_before_route(&mut self, deadline: Instant) -> bool {
+        if self.aggregate.is_some() {
+            return true;
+        }
+        if self.panic.is_some() || self.route.is_some() || self.receiver.is_some()
+            || self.owner.is_some() || self.pump.is_some() || self.worker.is_some()
+            || self.worker_key.is_some() || self.prepared.is_some() || self.published
+        {
+            return false;
+        }
+        let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
+            return false;
+        };
+        let session = match stage.try_lock() {
+            Ok(stage) => stage.session(),
+            Err(_) => None,
+        };
+        let Some(session) = session else {
+            // Prepared/claimed/unknown stages retain their original owner.
+            return false;
+        };
+        let Ok(mut session) = session.try_lock() else {
+            return false;
+        };
+        if !session.original_admission().same_original_admission(&self.admission) {
+            self.failure.get_or_insert_with(|| "P-C V3 abort session admission differs".into());
+            return false;
+        }
+        if let Err(error) = session.request_shutdown(deadline) {
+            self.failure.get_or_insert_with(|| format!("P-C V3 abort shutdown: {error}"));
+            return false;
+        }
+        let actors: Vec<String> = session.registration().teachers.keys().cloned().collect();
+        for actor in actors {
+            if self.diagnostics.try_reserve(1).is_err() {
+                return false;
+            }
+            let has_lifecycle = if let Some(lifecycle) = session.lifecycle_mut(&actor) {
+                let _ = lifecycle.poll();
+                if let Some(diagnostics) = lifecycle.take_diagnostics_after_join() {
+                    self.diagnostics.push((actor.clone(), diagnostics));
+                }
+                true
+            } else {
+                false
+            };
+            if has_lifecycle && !matches!(session.finish_worker(&actor), Ok(true)) {
+                return false;
+            }
+        }
+        match session.try_aggregate() {
+            Ok(Some(aggregate)) => {
+                self.aggregate = Some(aggregate);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.failure.get_or_insert_with(|| format!("P-C V3 abort aggregate: {error}"));
+                false
             }
         }
     }
