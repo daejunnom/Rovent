@@ -37,11 +37,12 @@ pub(super) enum PolicyPipelineFailureV3 {
 
 pub(super) enum PolicyPipelineProgressV3 {
     Appended,
-    /// A complete prior chunk is in the caller's retained output slot.
+    /// A complete prior chunk is in this pipeline's retained output owner.
     ChunkReady,
     Busy,
     NotReady,
     Failed,
+    Unknown,
 }
 
 pub(super) enum PolicyFlushOutcomeV3 {
@@ -49,12 +50,14 @@ pub(super) enum PolicyFlushOutcomeV3 {
     Empty,
     NotReady,
     Failed,
+    Unknown,
 }
 
 pub(super) enum PolicyPrepareOutcomeV3 {
     Prepared,
     NotReady,
     Failed,
+    Unknown,
 }
 
 pub(super) struct PolicyRowPipelineV3 {
@@ -63,12 +66,28 @@ pub(super) struct PolicyRowPipelineV3 {
     pending: Option<PendingPolicyPublicationV3>,
     capability: Option<TargetPublicationV3>,
     writer: Option<RoventCorpusWriterLockV3>,
+    output_chunk: Option<RoventChunkPacket>,
+    output_completed: Option<PendingPolicyPublicationV3>,
+    output_finished: Option<FinishedRoventCorpusLockV3>,
     appended: bool,
     failure: Option<PolicyPipelineFailureV3>,
 }
 
 #[derive(Clone)]
 pub(super) struct PolicyRowPipelineOwnerV3(Arc<Mutex<PolicyRowPipelineV3>>);
+
+/// A view of the very same game-scoped pipeline owner. It cannot be created
+/// from a digest or from another root's arbitrary output slot.
+#[derive(Clone)]
+pub(super) struct PolicyOutputOwnerV3(PolicyRowPipelineOwnerV3);
+
+/// Retention observation only; none of these flags proves durable output,
+/// target validity, worker join, or permission to release an owner.
+pub(super) struct PolicyOutputStatusV3 {
+    pub(super) chunk_held: bool,
+    pub(super) completed_held: bool,
+    pub(super) finished_held: bool,
+}
 
 impl PolicyRowPipelineOwnerV3 {
     pub(super) fn new(writer: RoventCorpusWriterLockV3) -> Self {
@@ -78,6 +97,9 @@ impl PolicyRowPipelineOwnerV3 {
             pending: None,
             capability: None,
             writer: Some(writer),
+            output_chunk: None,
+            output_completed: None,
+            output_finished: None,
             appended: false,
             failure: None,
         })))
@@ -98,6 +120,27 @@ impl PolicyRowPipelineOwnerV3 {
     pub(super) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    pub(super) fn output_owner(&self) -> PolicyOutputOwnerV3 {
+        PolicyOutputOwnerV3(self.clone())
+    }
+}
+
+impl PolicyOutputOwnerV3 {
+    pub(super) fn same_owner(&self, pipeline: &PolicyRowPipelineOwnerV3) -> bool {
+        self.0.same_owner(pipeline)
+    }
+
+    pub(super) fn try_observe(&self) -> Result<Option<PolicyOutputStatusV3>, &'static str> {
+        let Some(owner) = self.0.try_lock()? else {
+            return Ok(None);
+        };
+        Ok(Some(PolicyOutputStatusV3 {
+            chunk_held: owner.output_chunk.is_some(),
+            completed_held: owner.output_completed.is_some(),
+            finished_held: owner.output_finished.is_some(),
+        }))
+    }
 }
 
 impl PolicyRowPipelineV3 {
@@ -107,6 +150,7 @@ impl PolicyRowPipelineV3 {
             && self.prepared.is_none()
             && self.pending.is_none()
             && self.capability.is_none()
+            && self.output_completed.is_none()
             && !self.appended
             && self.failure.is_none()
     }
@@ -142,6 +186,9 @@ impl PolicyRowPipelineV3 {
         &mut self,
         sealed: &mut Option<RoventSealedTeacherPolicyV3>,
     ) -> PolicyPrepareOutcomeV3 {
+        if self.is_uncertain() {
+            return PolicyPrepareOutcomeV3::Unknown;
+        }
         if self.failure.is_some() {
             return PolicyPrepareOutcomeV3::Failed;
         }
@@ -209,6 +256,19 @@ impl PolicyRowPipelineV3 {
         self.failure.as_ref()
     }
 
+    /// Unknown never authorizes retry, dropping the writer, or publication.
+    pub(super) fn is_uncertain(&self) -> bool {
+        matches!(
+            self.failure.as_ref(),
+            Some(PolicyPipelineFailureV3::AppendUncertain | PolicyPipelineFailureV3::FlushPanic(_))
+                | Some(PolicyPipelineFailureV3::GateRejected(
+                    TargetBeginRejectionV3::Uncertain
+                        | TargetBeginRejectionV3::Poisoned
+                        | TargetBeginRejectionV3::AlreadyCommitted
+                ))
+        )
+    }
+
     /// Called outside the native manager. The producer belongs to the same
     /// original observer and is only borrowed while the supervisor retains it.
     pub(super) fn prepare(&mut self, producer: &mut RoventCorpusProducerLockV3) -> bool {
@@ -244,10 +304,10 @@ impl PolicyRowPipelineV3 {
 
     /// Runs only in the retained worker. It never takes an observer or
     /// registration lock while the target gate is held by the writer.
-    pub(super) fn try_append(
-        &mut self,
-        output: &mut Option<RoventChunkPacket>,
-    ) -> PolicyPipelineProgressV3 {
+    pub(super) fn try_append(&mut self) -> PolicyPipelineProgressV3 {
+        if self.is_uncertain() {
+            return PolicyPipelineProgressV3::Unknown;
+        }
         if self.failure.is_some() || self.appended {
             return PolicyPipelineProgressV3::Failed;
         }
@@ -270,9 +330,10 @@ impl PolicyRowPipelineV3 {
             _ => return PolicyPipelineProgressV3::NotReady,
         };
         if needs_flush {
-            return match self.flush_into(output) {
+            return match self.flush_into() {
                 PolicyFlushOutcomeV3::Packet => PolicyPipelineProgressV3::ChunkReady,
                 PolicyFlushOutcomeV3::NotReady => PolicyPipelineProgressV3::NotReady,
+                PolicyFlushOutcomeV3::Unknown => PolicyPipelineProgressV3::Unknown,
                 PolicyFlushOutcomeV3::Empty | PolicyFlushOutcomeV3::Failed => {
                     PolicyPipelineProgressV3::Failed
                 }
@@ -305,7 +366,11 @@ impl PolicyRowPipelineV3 {
             }
             PolicyAppendResultV3::GateRejected(error) => {
                 self.failure = Some(PolicyPipelineFailureV3::GateRejected(error));
-                PolicyPipelineProgressV3::Failed
+                if self.is_uncertain() {
+                    PolicyPipelineProgressV3::Unknown
+                } else {
+                    PolicyPipelineProgressV3::Failed
+                }
             }
             PolicyAppendResultV3::PreparationPanicked(payload) => {
                 self.failure = Some(PolicyPipelineFailureV3::BeforeAppendPanic(payload));
@@ -313,7 +378,7 @@ impl PolicyRowPipelineV3 {
             }
             PolicyAppendResultV3::Uncertain => {
                 self.failure = Some(PolicyPipelineFailureV3::AppendUncertain);
-                PolicyPipelineProgressV3::Failed
+                PolicyPipelineProgressV3::Unknown
             }
         }
     }
@@ -321,27 +386,28 @@ impl PolicyRowPipelineV3 {
     /// The supervisor must retain this completed original evidence until its
     /// own separate game/teacher lifecycle permits release. This does not
     /// claim durable output or physical retirement.
-    pub(super) fn transfer_appended(
-        &mut self,
-        target: &mut Option<PendingPolicyPublicationV3>,
-    ) -> bool {
-        if !self.appended || self.failure.is_some() || target.is_some() || self.pending.is_none() {
+    pub(super) fn transfer_appended(&mut self) -> bool {
+        if !self.appended
+            || self.failure.is_some()
+            || self.output_completed.is_some()
+            || self.pending.is_none()
+        {
             return false;
         }
-        *target = self.pending.take();
+        self.output_completed = self.pending.take();
         self.appended = false;
         true
     }
 
-    /// A successful packet moves only to another caller-owned retained slot.
-    pub(super) fn flush_into(
-        &mut self,
-        output: &mut Option<RoventChunkPacket>,
-    ) -> PolicyFlushOutcomeV3 {
+    /// A successful packet remains in this same original output owner.
+    pub(super) fn flush_into(&mut self) -> PolicyFlushOutcomeV3 {
+        if self.is_uncertain() {
+            return PolicyFlushOutcomeV3::Unknown;
+        }
         if self.failure.is_some() {
             return PolicyFlushOutcomeV3::Failed;
         }
-        if output.is_some() {
+        if self.output_chunk.is_some() {
             return PolicyFlushOutcomeV3::NotReady;
         }
         let Some(writer) = self.writer.as_mut() else {
@@ -349,7 +415,7 @@ impl PolicyRowPipelineV3 {
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.flush())) {
             Ok(Ok(Some(packet))) => {
-                *output = Some(packet);
+                self.output_chunk = Some(packet);
                 PolicyFlushOutcomeV3::Packet
             }
             Ok(Ok(None)) => PolicyFlushOutcomeV3::Empty,
@@ -359,20 +425,20 @@ impl PolicyRowPipelineV3 {
             }
             Err(payload) => {
                 self.failure = Some(PolicyPipelineFailureV3::FlushPanic(payload));
-                PolicyFlushOutcomeV3::Failed
+                PolicyFlushOutcomeV3::Unknown
             }
         }
     }
 
     /// Final assembly moves the original writer only after successful
-    /// validation and into another caller-owned slot. The caller must retain
+    /// validation and into this same output owner. The caller must retain
     /// the actual flushed chunk packets and separate lifecycle evidence.
-    pub(super) fn finish_into(&mut self, output: &mut Option<FinishedRoventCorpusLockV3>) -> bool {
-        if !self.idle() || output.is_some() {
+    pub(super) fn finish_into(&mut self) -> bool {
+        if !self.idle() || self.output_finished.is_some() {
             return false;
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            RoventCorpusWriterLockV3::finish_in_slots(&mut self.writer, output)
+            RoventCorpusWriterLockV3::finish_in_slots(&mut self.writer, &mut self.output_finished)
         })) {
             Ok(Ok(())) => true,
             Ok(Err(error)) => {
