@@ -1491,6 +1491,12 @@ impl PcWorkerSupervisorV3 {
             .map(PolicyRowPipelineOwnerV3::output_owner)
     }
 
+    /// Retain the original game pipeline; this is not a finish or output
+    /// receipt. Callers must still verify same-root observer custody.
+    pub(super) fn game_pipeline(&self) -> Option<PolicyRowPipelineOwnerV3> {
+        self.pipeline.clone()
+    }
+
     /// The caller retains its original managed output capability; path names
     /// or a second copy of input bytes cannot manufacture this ownership.
     fn try_install_output(&self, output: &Arc<ManagedOutputOwnerV3>) -> Result<bool, String> {

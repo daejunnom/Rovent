@@ -1349,12 +1349,109 @@ impl RoventPcCollectionBridgeV3 {
 
 /// Retains all original root proof owners after the native owner seals the
 /// same installed hook. This is not a model/teacher/collection success claim.
-struct PcV3LaunchClosure {
+struct PcV3VerifiedClosureRoot {
+    admission: RoventCollectionRootAdmissionV3,
+    observer: Option<RoventCollectionOwnerLockV3>,
+    requires_observer: bool,
+}
+
+pub(super) struct PcV3LaunchClosure {
     _bridge: Arc<RoventPcCollectionBridgeV3>,
     _native_owner: Arc<RoventPcCollectionLaunchOwnerV3>,
     // Captured while the same bridge state lock still protects the verified
     // roots. This alone is not game closure or publication authority.
-    _verified_admissions: Option<Vec<RoventCollectionRootAdmissionV3>>,
+    verified_roots: Option<Vec<PcV3VerifiedClosureRoot>>,
+}
+
+/// Game-only evidence retained outside the bridge. Physical settlement,
+/// pipeline finish and publication have their own original owners.
+pub(super) struct PcGameClosureProofV3 {
+    closure: Arc<PcV3LaunchClosure>,
+    game: Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>,
+    _custody: Arc<Mutex<SupervisorStartCustodyV3>>,
+    _supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
+    pipeline: super::policy_row_pipeline_v3::PolicyRowPipelineOwnerV3,
+    observers: Vec<(RoventCollectionOwnerLockV3, RoventCollectionRootAdmissionV3, super::observer_lock_v3::ObserverRootDrainedV3)>,
+}
+
+impl PcGameClosureProofV3 {
+    pub(super) fn matches_game(&self, game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>) -> bool {
+        Arc::ptr_eq(&self.game, game)
+    }
+
+    pub(super) fn matches_roots(&self, roots: &[RoventCollectionRootAdmissionV3]) -> bool {
+        let Some(original) = self.closure.verified_roots.as_ref() else { return false; };
+        original.len() == roots.len() && original.iter().all(|entry|
+            roots.iter().any(|root| root.same_original_admission(&entry.admission)))
+    }
+
+    /// The stored observer tokens are observations, not a promise that the
+    /// owners stayed drained. Reobserve the same roots before game closure.
+    pub(super) fn try_revalidate_observers(&self) -> Result<Option<bool>, ArenaError> {
+        for (owner, admission, original) in &self.observers {
+            if !original.matches_original(owner, admission, &self.pipeline) {
+                return Err(invalid("P-C V3 original observer drain differs"));
+            }
+            match owner.try_observe_root_drained(admission, &self.pipeline)? {
+                super::observer_lock_v3::ObserverRootDrainAttemptV3::Ready(current)
+                    if current.matches_original(owner, admission, &self.pipeline) => {},
+                super::observer_lock_v3::ObserverRootDrainAttemptV3::Busy
+                | super::observer_lock_v3::ObserverRootDrainAttemptV3::Pending => return Ok(None),
+                _ => return Ok(Some(false)),
+            }
+        }
+        Ok(Some(true))
+    }
+}
+
+impl PcV3LaunchClosure {
+    /// Build a separate game candidate only after the exact driver's actual
+    /// join. Busy and missing optional game evidence do not undo physical
+    /// settlement. The caller retains the settled outcome and original proof.
+    pub(super) fn try_game_proof(
+        self: &Arc<Self>,
+        joined: &PcSupervisorJoinedProofV3,
+        custody: &Arc<Mutex<SupervisorStartCustodyV3>>,
+    ) -> Result<Option<PcGameClosureProofV3>, ArenaError> {
+        let bridge = &self._bridge;
+        let Some(seal) = bridge.game_joined_seal.get() else { return Ok(None); };
+        let Some(game) = seal.game.upgrade() else { return Ok(None); };
+        let Some(original_custody) = seal.custody.upgrade() else { return Ok(None); };
+        let Some(supervisor) = seal.supervisor.upgrade() else { return Ok(None); };
+        let Some(native) = seal.native.upgrade() else { return Ok(None); };
+        if !Arc::ptr_eq(&game, &bridge.game) || !Arc::ptr_eq(&original_custody, custody)
+            || !Arc::ptr_eq(&native, &self._native_owner)
+            || joined.panicked() || !joined.matches_original(custody, &supervisor, &native) {
+            return Err(invalid("P-C V3 joined game owner differs"));
+        }
+        let pipeline = match supervisor.try_lock() {
+            Ok(supervisor) => supervisor.game_pipeline(),
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(invalid("P-C V3 joined supervisor poisoned")),
+        };
+        let Some(pipeline) = pipeline else { return Ok(None); };
+        let Some(roots) = self.verified_roots.as_ref() else { return Ok(None); };
+        let mut observers = Vec::new();
+        if observers.try_reserve_exact(roots.len()).is_err() { return Ok(None); }
+        for root in roots {
+            if !root.requires_observer { continue; }
+            let Some(owner) = &root.observer else { return Ok(None); };
+            let token = match owner.try_observe_root_drained(&root.admission, &pipeline)? {
+                super::observer_lock_v3::ObserverRootDrainAttemptV3::Ready(token) => token,
+                super::observer_lock_v3::ObserverRootDrainAttemptV3::Busy
+                | super::observer_lock_v3::ObserverRootDrainAttemptV3::Pending => return Ok(None),
+                super::observer_lock_v3::ObserverRootDrainAttemptV3::Failed => return Err(invalid("P-C V3 observer drain failed")),
+            };
+            if !token.matches_original(owner, &root.admission, &pipeline) {
+                return Err(invalid("P-C V3 observer drain owner differs"));
+            }
+            observers.push((owner.clone(), root.admission.clone(), token));
+        }
+        Ok(Some(PcGameClosureProofV3 {
+            closure: Arc::clone(self), game, _custody: original_custody,
+            _supervisor: supervisor, pipeline, observers,
+        }))
+    }
 }
 
 /// Non-cloneable authorization for stopping the exact original supervisor
@@ -1726,20 +1823,24 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                 Err(error) => return Err(AdaptiveManagerError::Semantic(error.to_string())),
             }
         }
-        let mut admissions = Vec::new();
-        let admissions = if admissions.try_reserve_exact(state.roots.len()).is_ok() {
-            admissions.extend(state.roots.iter().map(|slot| slot.admission.clone()));
-            Some(admissions)
+        let mut roots = Vec::new();
+        let roots = if roots.try_reserve_exact(state.roots.len()).is_ok() {
+            roots.extend(state.roots.iter().map(|slot| PcV3VerifiedClosureRoot {
+                admission: slot.admission.clone(),
+                observer: slot.owner.clone(),
+                requires_observer: slot.route.is_some(),
+            }));
+            Some(roots)
         } else {
             // Optional game evidence must not block independently proven
             // physical cleanup. The game closure remains unavailable.
             None
         };
         drop(state);
-        Ok(Some(Box::new(PcV3LaunchClosure {
+        Ok(Some(Box::new(Arc::new(PcV3LaunchClosure {
             _bridge: bridge,
             _native_owner: owner,
-            _verified_admissions: admissions,
-        })))
+            verified_roots: roots,
+        }))))
     }
 }
