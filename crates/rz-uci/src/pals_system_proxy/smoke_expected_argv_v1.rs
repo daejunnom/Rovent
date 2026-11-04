@@ -124,6 +124,13 @@ impl ParsedSmokeExpectedArgvV1 {
             Err(error) => Err((error, arguments)),
         }
     }
+    /// Compare declarations with the same pinned local lock; this does not
+    /// authenticate argv provenance, the plan or the running proxy binary.
+    pub(super) fn matches_local_lock(&self, canonical_sha256: &str, generation: u64) -> bool {
+        hex::<32>(canonical_sha256).is_ok_and(|digest| digest == self.expected.lock_sha256)
+            && generation == self.expected.generation
+    }
+
     pub(super) fn original_arguments(&self) -> &[String] {
         &self.arguments
     }
@@ -177,6 +184,9 @@ mod tests {
         assert_eq!(parsed.expected.lock_sha256, [0x0f; 32]);
         assert_eq!(parsed.declared_plan_sha256(), &[0x12; 32]);
         assert_eq!(parsed.declared_proxy_sha256(), &[0x34; 32]);
+        assert!(parsed.matches_local_lock(&"0f".repeat(32), 3));
+        assert!(!parsed.matches_local_lock(&"10".repeat(32), 3));
+        assert!(!parsed.matches_local_lock(&"0f".repeat(32), 4));
     }
     #[test]
     fn duplicates_and_invalid_fields_return_the_original_argv() {

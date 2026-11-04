@@ -195,6 +195,11 @@ impl OriginalSmokeLockAdmission {
     pub(super) fn matches_token(&self, cancelled: &Arc<AtomicBool>) -> bool {
         Arc::ptr_eq(&self.cancelled, cancelled)
     }
+    /// Lightweight control check for nonblocking owner polling. Full lock
+    /// bytes/name are checked at explicit admission and transfer boundaries.
+    pub(super) fn check_control(&self) -> io::Result<()> {
+        alive(self.local_until, &self.cancelled)
+    }
     pub(super) fn verify_held(&self) -> io::Result<()> {
         alive(self.local_until, &self.cancelled)?;
         self.pin.verify_held(self.local_until, &self.cancelled)?;
