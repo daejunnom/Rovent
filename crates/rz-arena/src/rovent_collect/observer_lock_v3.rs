@@ -69,6 +69,7 @@ struct State {
     metadata: RoventCollectionMetadata,
     registration: RoventNativeCaptureRegistration,
     router: Arc<CaptureRouterV3>,
+    policy_pipeline: Option<PolicyRowPipelineOwnerV3>,
     admission: Option<RoventCollectionRootAdmissionV3>,
     prepared_admission: Option<RoventCollectionRootAdmissionV3>,
     route_admission: Option<RoventCollectionRootAdmissionV3>,
@@ -101,6 +102,28 @@ impl RoventCollectionOwnerLockV3 {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
+    /// Bind this root to the supervisor-retained game pipeline. The same
+    /// game owner may be bound by later roots, but a root cannot switch slots.
+    pub(super) fn try_bind_policy_pipeline(
+        &self,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> Result<Option<()>, ArenaError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        if let Some(original) = &state.policy_pipeline {
+            check(
+                original.same_owner(pipeline),
+                "lock-v3 policy pipeline owner changed",
+            )?;
+        } else {
+            state.policy_pipeline = Some(pipeline.clone());
+        }
+        Ok(Some(()))
+    }
+
     /// Move an exact retired row directly into the caller-retained shared
     /// pipeline slot. Both locks are nonblocking and no fallible operation
     /// occurs between removing the row and transferring or restoring it.
@@ -115,6 +138,13 @@ impl RoventCollectionOwnerLockV3 {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(RetiredTransferV3::Busy),
             Err(_) => return Err(invalid("lock-v3 owner poisoned")),
         };
+        check(
+            state
+                .policy_pipeline
+                .as_ref()
+                .is_some_and(|original| original.same_owner(pipeline)),
+            "lock-v3 policy pipeline differs from original supervisor",
+        )?;
         let mut slot = match pipeline.try_lock().map_err(invalid)? {
             Some(slot) => slot,
             None => return Ok(RetiredTransferV3::Busy),
@@ -153,6 +183,13 @@ impl RoventCollectionOwnerLockV3 {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(PipelinePreparationV3::Busy),
             Err(_) => return Err(invalid("lock-v3 owner poisoned")),
         };
+        check(
+            state
+                .policy_pipeline
+                .as_ref()
+                .is_some_and(|original| original.same_owner(pipeline)),
+            "lock-v3 policy pipeline differs from original supervisor",
+        )?;
         let mut slot = match pipeline.try_lock().map_err(invalid)? {
             Some(slot) => slot,
             None => return Ok(PipelinePreparationV3::Busy),
@@ -188,6 +225,7 @@ impl RoventCollectionOwnerLockV3 {
                 metadata,
                 registration,
                 router,
+                policy_pipeline: None,
                 admission: None,
                 prepared_admission: None,
                 route_admission: None,
