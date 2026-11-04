@@ -109,3 +109,74 @@ impl PalsSystemProxyInputsV1 {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NativeLaunchDeclaration;
+    use crate::pals_adaptive_launch::system_v6::pair::tests::fixture;
+
+    fn sidecar(pair: &LockedPalsSystemArenaPairV6) -> PalsSystemProxyInputsV1 {
+        let mut binary = pair.input().runner.binary.clone();
+        binary.path = "test/proxy".into();
+        PalsSystemProxyInputsV1 {
+            domain: PALS_SYSTEM_PROXY_INPUTS_V1_DOMAIN.into(),
+            pair_sha256: pair.sha256().into(),
+            proxy_binary: binary,
+            proxy_snapshot_path: "inputs/test/proxy".into(),
+        }
+    }
+
+    #[test]
+    fn separate_proxy_is_part_of_original_declaration_without_changing_pair_identity() {
+        let pair = fixture().lock().unwrap();
+        let original_sha = pair.sha256().to_owned();
+        let original_bytes = pair.unique_bytes().unwrap();
+        let original_inputs = pair.declared_inputs().len();
+        let sidecar = sidecar(&pair);
+        assert!(!pair.additional_executable_input(&sidecar.proxy_binary));
+        let bound = pair.with_proxy_inputs(sidecar.clone()).unwrap();
+        assert_eq!(bound.sha256(), original_sha);
+        assert_eq!(bound.proxy_inputs(), Some(&sidecar));
+        assert_eq!(bound.declared_inputs().len(), original_inputs + 1);
+        assert!(bound.declared_inputs().contains(&&sidecar.proxy_binary));
+        assert_eq!(
+            bound.unique_bytes().unwrap(),
+            original_bytes + sidecar.proxy_binary.bytes
+        );
+        assert!(bound.additional_executable_input(&sidecar.proxy_binary));
+        assert_eq!(
+            bound
+                .snapshot_relative_path(&sidecar.proxy_binary)
+                .as_deref(),
+            Some("inputs/test/proxy")
+        );
+        assert_eq!(
+            NativeLaunchDeclaration::snapshot_relative_path(&bound, &sidecar.proxy_binary)
+                .as_deref(),
+            Some("test/proxy")
+        );
+        assert!(bound.proxy_inputs_sha256().is_some());
+        // This preparation declaration is not admission or physical completion.
+        assert!(bound.validate_execution().is_err());
+        assert!(bound.with_proxy_inputs(sidecar).is_err());
+    }
+
+    #[test]
+    fn sidecar_digest_is_separate_and_wrong_pair_is_rejected() {
+        let pair = fixture().lock().unwrap();
+        let first = sidecar(&pair);
+        let mut second = first.clone();
+        second.proxy_snapshot_path = "inputs/test/proxy-other".into();
+        let first_bound = pair.clone().with_proxy_inputs(first.clone()).unwrap();
+        let second_bound = pair.clone().with_proxy_inputs(second).unwrap();
+        assert_eq!(first_bound.sha256(), second_bound.sha256());
+        assert_ne!(
+            first_bound.proxy_inputs_sha256(),
+            second_bound.proxy_inputs_sha256()
+        );
+        let mut wrong_pair = first;
+        wrong_pair.pair_sha256 = "0".repeat(64);
+        assert!(pair.with_proxy_inputs(wrong_pair).is_err());
+    }
+}

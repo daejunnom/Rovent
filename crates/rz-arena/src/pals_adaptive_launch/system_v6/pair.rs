@@ -3,6 +3,7 @@
 //! A validated declaration records only planned inputs. It is not a process
 //! owner, a verified provider, or proof of GPU completion.
 use super::super::{PalsSourceFileV5, opening};
+use super::{PALS_SYSTEM_PROXY_INPUTS_V1_DOMAIN, PalsSystemProxyInputsV1};
 use crate::ArenaError;
 use rz_experiments::{
     ArtifactRef, EngineEnvironmentV2, ExternalSourceV2, ExternalUciEndpointV2, ManifestError,
@@ -89,6 +90,9 @@ pub struct LockedPalsSystemArenaPairV6 {
     sha256: String,
     opening: OpeningSpec,
     endpoint_views: [ExternalUciEndpointV2; 2],
+    // Deliberately outside the historical V6 canonical pair representation.
+    proxy_inputs: Option<PalsSystemProxyInputsV1>,
+    proxy_inputs_sha256: Option<String>,
 }
 
 impl PalsSystemArenaPairV6 {
@@ -348,11 +352,37 @@ impl PalsSystemArenaPairV6 {
             sha256: crate::canonical_sha256(&(PALS_SYSTEM_ARENA_PAIR_V6_DOMAIN, self))?,
             opening: system_opening(&self.pair)?,
             endpoint_views,
+            proxy_inputs: None,
+            proxy_inputs_sha256: None,
         })
     }
 }
 
 impl LockedPalsSystemArenaPairV6 {
+    /// Bind a separate proxy declaration before creating the original owner.
+    /// This does not alter the historical pair hash or admit native execution.
+    pub fn with_proxy_inputs(
+        mut self,
+        sidecar: PalsSystemProxyInputsV1,
+    ) -> Result<Self, ArenaError> {
+        if self.proxy_inputs.is_some() {
+            return Err(ArenaError::Invalid(
+                "PALS V6 proxy inputs already bound".into(),
+            ));
+        }
+        sidecar.validate_for_pair(&self)?;
+        let digest = crate::canonical_sha256(&(PALS_SYSTEM_PROXY_INPUTS_V1_DOMAIN, &sidecar))?;
+        self.proxy_inputs = Some(sidecar);
+        self.proxy_inputs_sha256 = Some(digest);
+        Ok(self)
+    }
+    pub fn proxy_inputs(&self) -> Option<&PalsSystemProxyInputsV1> {
+        self.proxy_inputs.as_ref()
+    }
+    /// Independent identity for the sidecar; the pair SHA does not include it.
+    pub fn proxy_inputs_sha256(&self) -> Option<&str> {
+        self.proxy_inputs_sha256.as_deref()
+    }
     pub fn input(&self) -> &PalsSystemArenaPairV6 {
         &self.input
     }
@@ -377,6 +407,11 @@ impl LockedPalsSystemArenaPairV6 {
         }]
     }
     pub fn snapshot_relative_path(&self, artifact: &ArtifactRef) -> Option<String> {
+        if let Some(sidecar) = &self.proxy_inputs
+            && artifact == &sidecar.proxy_binary
+        {
+            return Some(sidecar.proxy_snapshot_path.clone());
+        }
         for endpoint in &self.input.endpoints {
             if artifact == &endpoint.startup_lock_artifact {
                 return Some(endpoint.startup_snapshot_path.clone());

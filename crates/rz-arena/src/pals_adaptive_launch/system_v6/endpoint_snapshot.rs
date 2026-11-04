@@ -39,10 +39,12 @@ impl<'a> PalsV6EndpointSnapshot<'a> {
     /// V6 execution path, not permission to reopen the source executable.
     pub(crate) fn from_original(
         owner: &'a NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
-        sidecar: &'a PalsSystemProxyInputsV1,
         role: NativeEngineRole,
     ) -> Result<Self, ArenaError> {
         let pair = owner.spec();
+        let sidecar = pair.proxy_inputs().ok_or_else(|| {
+            ArenaError::Invalid("PALS V6 original owner has no proxy sidecar".into())
+        })?;
         sidecar.validate_for_pair(pair)?;
         let endpoint = pair.endpoint(role);
         let lock = linux::pin(&owner.snapshot.pins, &endpoint.startup_lock_artifact)?;

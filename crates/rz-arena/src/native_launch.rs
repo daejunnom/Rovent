@@ -47,6 +47,11 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
     }
     fn view(&self) -> NativePairView<'_>;
     fn declared_inputs(&self) -> Vec<&ArtifactRef>;
+    /// Additional explicitly declared executable inputs, beyond the runner,
+    /// match executor and engine executables. Existing profiles add none.
+    fn additional_executable_input(&self, _artifact: &ArtifactRef) -> bool {
+        false
+    }
     fn unique_bytes(&self) -> Result<u64, rz_experiments::ManifestError>;
     fn engine_view(
         &self,
@@ -1321,6 +1326,7 @@ pub(crate) mod linux {
                 .attempted_snapshot_relative_paths
                 .push(format!("inputs/{name}"));
             let executable = artifact == &input.runner.binary
+                || spec.additional_executable_input(artifact)
                 || spec
                     .match_execution()
                     .is_some_and(|e| &e.executor == artifact)

@@ -61,11 +61,33 @@ impl NativeLaunchDeclaration for LockedPalsSystemArenaPairV6 {
     }
 
     fn declared_inputs(&self) -> Vec<&ArtifactRef> {
-        self.input().declared_artifacts()
+        let mut inputs = self.input().declared_artifacts();
+        if let Some(sidecar) = self.proxy_inputs()
+            && !inputs.contains(&&sidecar.proxy_binary)
+        {
+            inputs.push(&sidecar.proxy_binary);
+        }
+        inputs
+    }
+
+    fn additional_executable_input(&self, artifact: &ArtifactRef) -> bool {
+        self.proxy_inputs()
+            .is_some_and(|sidecar| artifact == &sidecar.proxy_binary)
     }
 
     fn unique_bytes(&self) -> Result<u64, ManifestError> {
-        self.input().unique_input_bytes()
+        let base = self.input().unique_input_bytes()?;
+        let extra = self
+            .proxy_inputs()
+            .filter(|sidecar| {
+                !self
+                    .input()
+                    .declared_artifacts()
+                    .contains(&&sidecar.proxy_binary)
+            })
+            .map_or(0, |sidecar| sidecar.proxy_binary.bytes);
+        base.checked_add(extra)
+            .ok_or_else(|| ManifestError::Integrity("proxy input bytes overflow".into()))
     }
 
     fn engine_view(&self, role: NativeEngineRole) -> Result<NativeEngineView<'_>, ManifestError> {
