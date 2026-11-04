@@ -99,6 +99,7 @@ class OwnedProcessGroup:
         self.cleanup_error = None
         self.stop_error = None
         self.stop_cause = None
+        self.output_handoff_close_error = None
 
     def _assert_available(self):
         if os.getpid() != self._owner_pid or self._child is not None or self._completed:
@@ -210,12 +211,13 @@ def _check_before_spawn(argv, cwd, pass_fds, stdout):
 
 def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=None, on_spawn=None,
               verify_before_spawn=False, absolute_deadline=None, deadline_observation=None,
-              on_tick=None, owned_group=None, graceful_drain_deadline=None, on_stop=None):
+              on_tick=None, owned_group=None, graceful_drain_deadline=None, on_stop=None,
+              output_handoff=None):
     if os.name == "nt":
         if (pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn
                 or absolute_deadline is not None or deadline_observation is not None
                 or on_tick is not None or owned_group is not None or graceful_drain_deadline is not None
-                or on_stop is not None):
+                or on_stop is not None or output_handoff is not None):
             raise RuntimeError("explicit descriptor handoff requires Linux")
         return _run_windows(argv, cwd, env, timeout, admission_check)
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
@@ -228,6 +230,34 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         if type(owned_group) is not OwnedProcessGroup:
             raise ValueError("owned_group must be an OwnedProcessGroup")
         owned_group._assert_available()
+    if output_handoff is not None:
+        # Import lazily: the handoff module itself names OwnedProcessGroup.
+        # Other process users retain their original code and dependencies.
+        from managed_output_child_handoff import ManagedOutputChildHandoff
+        if (type(output_handoff) is not ManagedOutputChildHandoff
+                or owned_group is None or output_handoff._group is not owned_group
+                or output_handoff._owner_pid != os.getpid()):
+            raise ValueError("output handoff requires its original owned process group")
+        pass_fds = tuple(pass_fds)
+        output_fds = output_handoff.child_fds
+        if (len(output_fds) != 2 or any(type(fd) is not int or fd < 0 for fd in output_fds)
+                or output_fds[0] == output_fds[1]
+                or any(pass_fds.count(fd) != 1 for fd in output_fds)):
+            raise ValueError("exact original output child descriptors must be passed once")
+        for fd in output_fds:
+            os.fstat(fd)
+        previous_on_spawn, previous_on_tick = on_spawn, on_tick
+
+        def on_spawn():
+            output_handoff.after_spawn()
+            if previous_on_spawn is not None:
+                previous_on_spawn()
+            output_handoff.confirm_scope_admission()
+
+        def on_tick():
+            output_handoff.service()
+            if previous_on_tick is not None:
+                previous_on_tick()
     if graceful_drain_deadline is not None:
         try:
             valid_grace = (owned_group is not None and absolute_deadline is not None
@@ -257,12 +287,23 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
             raise ValueError("absolute deadline must be finite positive monotonic seconds")
         if time.monotonic() >= absolute_deadline:
             raise ProcessNotSpawned("absolute deadline expired before process spawn") from TimeoutError()
-    if verify_before_spawn:
+    # The selected output owner can be released after a proven pre-dispatch
+    # error. This cheap check does not turn a later Popen exception into proof.
+    if verify_before_spawn or output_handoff is not None:
         _check_before_spawn(argv, cwd, pass_fds, stdout)
     if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
         raise ProcessNotSpawned("absolute deadline expired before process spawn") from TimeoutError()
     requested_exit = None
     failure = None
+    if output_handoff is not None:
+        # A Popen attempt is not evidence that no child exists if it raises.
+        # The same handoff/lease must remain retained until original custody
+        # independently establishes that the process scope is gone.
+        if output_handoff.child_fds != output_fds:
+            raise ProcessNotSpawned("original output child descriptors changed")
+        for fd in output_fds:
+            os.fstat(fd)
+        output_handoff.mark_dispatch_attempted()
     child = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
                              pass_fds=tuple(pass_fds), stdout=stdout)
     try:
@@ -362,6 +403,20 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
         # interrupted; do not infer anything about a Popen that raised itself.
         if owned_group._child is None:
             owned_group._bind(child)
+        if requested_exit is not None and output_handoff is not None:
+            try:
+                # No new output grants after cancellation or timeout. The
+                # original lease and group remain owned through the drain.
+                output_handoff.close_admission()
+            except BaseException as exc:
+                owned_group.output_handoff_close_error = {
+                    "kind": "callback", "error_type": type(exc).__name__, "message": str(exc)
+                }
+                # Even if revocation fails, never dispatch another handoff
+                # tick. Preserve any unrelated caller tick and first failure.
+                on_tick = previous_on_tick
+                if failure is None:
+                    failure = f"{type(exc).__name__}: {exc}"
         stop_result = None
         if requested_exit is not None and on_stop is not None:
             owned_group.stop_cause = {"requested_exit_code": requested_exit,

@@ -308,6 +308,9 @@ class OutputLease:
         self._foreign_estimate_reported = False
         self._last_own_usage = None
         self._live_anchor = None
+        # Only an explicitly installed child handoff participates in this
+        # lease's finish; unrelated producers retain their existing path.
+        self._live_child_handoff = None
         self._live_suspended = False
         self._live_key = None
         self._live_gate = threading.RLock()
@@ -745,6 +748,8 @@ class OutputLease:
                 self._close_live_anchor()
                 receipt["descriptor_close"] = copy.deepcopy(self._live_descriptor_close_receipt)
                 self._live_finish_receipt = copy.deepcopy(receipt)
+                if self._live_child_handoff is not None:
+                    self._live_child_handoff.release_after_lease_finished()
             except BaseException as error:
                 if self._live_finish_close_error is None:
                     self._live_finish_close_error = error
@@ -1190,6 +1195,8 @@ class OutputLease:
     def _finish_locked(self, *, status, tree_gone):
         # No file cleanup is implied by this method. In particular OS exit is
         # never promoted to a provider's physical completion fence.
+        if self._live_child_handoff is not None:
+            self._live_child_handoff.assert_finish_allowed()
         if self._live_suspended:
             raise StorageError("resume the original live lease before finishing")
         if self._live_anchor is not None:
@@ -1296,6 +1303,8 @@ class OutputLease:
                     "descriptor_close": copy.deepcopy(self._live_descriptor_close_receipt),
                     "physical_completion": "not_inferred",
                 }
+                if self._live_child_handoff is not None:
+                    self._live_child_handoff.release_after_lease_finished()
             except BaseException as close_error:
                 if self._live_finish_close_error is None:
                     self._live_finish_close_error = close_error

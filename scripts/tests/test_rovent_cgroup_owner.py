@@ -7,6 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import rovent_cgroup_owner as subject
+from managed_process import OwnedProcessGroup
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux cgroup descriptors")
@@ -34,6 +35,74 @@ class CgroupOwnerTests(unittest.TestCase):
                 os.close(read_fd)
                 for fd in owner._fds.values():
                     os.close(fd)
+
+    def test_close_admission_prevents_new_barrier_before_empty_observation(self):
+        with tempfile.TemporaryDirectory() as root:
+            owner = self.make_owner(root)
+            read_fd, write_fd = os.pipe()
+            try:
+                group = OwnedProcessGroup()
+                owner.reserve_output_group(group)
+                self.assertTrue(owner.close_admission_and_observe_empty(group))
+                with self.assertRaises(subject.CgroupOwnerError):
+                    owner.admit_waiting_child(os.getpid(), write_fd)
+                self.assertEqual(os.read(read_fd, 1), b"")
+            finally:
+                os.close(read_fd)
+                for fd in owner._fds.values():
+                    os.close(fd)
+
+    def test_output_group_reservation_preserves_original_on_competing_request(self):
+        with tempfile.TemporaryDirectory() as root:
+            owner = self.make_owner(root)
+            first, second = OwnedProcessGroup(), OwnedProcessGroup()
+            try:
+                owner.reserve_output_group(first)
+                with self.assertRaises(subject.CgroupOwnerError):
+                    owner.reserve_output_group(second)
+                self.assertIs(owner._output_group, first)
+                owner.release_unstarted_output_group(first)
+                owner.reserve_output_group(second)
+                self.assertIs(owner._output_group, second)
+            finally:
+                for fd in owner._fds.values():
+                    os.close(fd)
+
+    def test_descriptor_retry_never_closes_reused_unknown_fd(self):
+        # Private descriptors only; filesystem cgroup removal is outside this
+        # test. Simulate the explicit post-removal phase of the same owner.
+        with tempfile.TemporaryDirectory() as root:
+            owner = self.make_owner(root)
+            owner._closed = True
+            target_name = next(iter(owner._fds))
+            target_fd = owner._fds[target_name]
+            original_close = os.close
+            replacement = []
+            def close_then_report_unknown(fd):
+                if fd == target_fd and not replacement:
+                    original_close(fd)
+                    replacement.append(os.open("/dev/null", os.O_RDONLY))
+                    if replacement[0] != target_fd:
+                        self.skipTest("kernel did not reuse the closed descriptor number")
+                    raise OSError("close-result-unknown")
+                original_close(fd)
+            try:
+                with mock.patch.object(subject.os, "close", side_effect=close_then_report_unknown):
+                    with self.assertRaises(OSError):
+                        owner.close()
+                    with self.assertRaises(subject.CgroupOwnerError):
+                        owner.retry()
+                    os.fstat(replacement[0])
+                    observation = owner.descriptor_close_observation()
+                    self.assertEqual(observation["descriptors"][target_name], "unknown")
+                    self.assertTrue(all(value in {"closed", "unknown"}
+                                        for value in observation["descriptors"].values()))
+            finally:
+                if replacement:
+                    original_close(replacement[0])
+                for name, fd in tuple(owner._fds.items()):
+                    if owner._fd_close_states[name] == "unattempted":
+                        original_close(fd)
 
     def test_workload_observation_refuses_path_replacement(self):
         with tempfile.TemporaryDirectory() as root:

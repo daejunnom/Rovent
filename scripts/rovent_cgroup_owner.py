@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import threading
 import uuid
 
 
@@ -121,7 +122,19 @@ class CgroupOwner:
         self._controls_disabled = False
         self._manager_moved = False
         self.admission_outcome = "not_attempted"
+        self._last_granted_child = None
+        self._admission_gate = threading.RLock()
+        self._admission_closed = False
+        self._output_group = None
+        self._output_dispatch_attempted = False
         self._closed = False
+        # Filesystem teardown and descriptor-close observations are separate.
+        # A descriptor is never retried once a close attempt might have run:
+        # its numeric value can already have been reused by another owner.
+        self._fd_close_states = {name: "unattempted" for name in self._fds}
+        self._fd_close_errors = {}
+        # Historical numbers are diagnostics only, never authority to close.
+        self._fd_close_attempted = {}
 
     @classmethod
     def prepare(cls) -> "CgroupOwner":
@@ -210,8 +223,23 @@ class CgroupOwner:
                     setattr(self, field, True)
 
     def admit_waiting_child(self, pid: int, release_fd: int) -> None:
+        with self._admission_gate:
+            if self._admission_closed:
+                os.close(release_fd)
+                raise CgroupOwnerError("original workload admission is closed")
+            if (self._output_group is not None and
+                    (self._output_group._child is None or self._output_group._child.pid != pid)):
+                os.close(release_fd)
+                raise CgroupOwnerError("workload is reserved for another original child")
+            if self._output_group is not None and self._last_granted_child is not None:
+                os.close(release_fd)
+                raise CgroupOwnerError("original output child was already granted")
+            self._admit_waiting_child_locked(pid, release_fd)
+
+    def _admit_waiting_child_locked(self, pid: int, release_fd: int) -> None:
         """Move the direct, unreaped barrier child before permitting its exec."""
         self.admission_outcome = "rejected_before_grant"
+        self._last_granted_child = None
         try:
             self._check_owner()
             if type(pid) is not int or pid <= 0:
@@ -231,9 +259,81 @@ class CgroupOwner:
             if os.write(release_fd, b"R") != 1:
                 raise CgroupOwnerError("barrier release was incomplete")
             self.admission_outcome = "granted"
+            self._last_granted_child = pid
         finally:
             # EOF makes a still-waiting shim exit without executing native.
             os.close(release_fd)
+
+    def confirms_granted_child(self, pid: int) -> bool:
+        """Observe this original scope's last completed barrier grant only."""
+        with self._admission_gate:
+            self._check_owner()
+            return (type(pid) is int and pid > 0 and self.admission_outcome == "granted"
+                    and self._last_granted_child == pid)
+
+    def reserve_output_group(self, group) -> None:
+        """Reserve an empty original workload for one explicit output group."""
+        from managed_process import OwnedProcessGroup
+        with self._admission_gate:
+            self._check_owner()
+            if (type(group) is not OwnedProcessGroup or group._owner_pid != self._pid
+                    or group._child is not None or group._completed
+                    or self._admission_closed or self._output_group is not None
+                    or not self.workload_empty()):
+                raise CgroupOwnerError("empty original workload is unavailable for output group")
+            self._last_granted_child = None
+            self.admission_outcome = "not_attempted"
+            self._output_dispatch_attempted = False
+            self._output_group = group
+
+    def mark_output_dispatch_attempted(self, group) -> None:
+        with self._admission_gate:
+            self._check_owner()
+            if self._output_group is not group or self._output_dispatch_attempted:
+                raise CgroupOwnerError("original output dispatch cannot be marked")
+            self._output_dispatch_attempted = True
+
+    def output_dispatch_attempted(self, group) -> bool:
+        with self._admission_gate:
+            self._check_owner()
+            if self._output_group is not group:
+                raise CgroupOwnerError("original output group differs")
+            return self._output_dispatch_attempted
+
+    def release_unstarted_output_group(self, group) -> None:
+        with self._admission_gate:
+            self._check_owner()
+            if (self._output_group is not group or group._child is not None
+                    or self._output_dispatch_attempted):
+                raise CgroupOwnerError("original unstarted output group differs")
+            self._output_group = None
+
+    def owns_output_group(self, group) -> bool:
+        """Observe the original scope's current reservation without reissue."""
+        with self._admission_gate:
+            if self._closed and self._pid == os.getpid():
+                # close() refuses any live output reservation before setting
+                # _closed, so this is an observation of that same owner.
+                return False
+            self._check_owner()
+            return self._output_group is group
+
+    def close_admission_and_observe_empty(self, group) -> bool:
+        """Close this owner's API admission before observing its workload."""
+        with self._admission_gate:
+            self._check_owner()
+            if self._output_group is not group:
+                raise CgroupOwnerError("original output group differs")
+            self._admission_closed = True
+            return self.workload_empty()
+
+    def release_finished_output_group(self, group) -> None:
+        with self._admission_gate:
+            self._check_owner()
+            if (self._output_group is not group or not group._completed
+                    or not self._admission_closed or not self.workload_empty()):
+                raise CgroupOwnerError("original output scope is not settled")
+            self._output_group = None
 
     def workload_empty(self) -> bool:
         """Observe this same cgroup tree, not a device fence or host-wide state."""
@@ -254,7 +354,15 @@ class CgroupOwner:
         return events["populated"] == "0"
 
     def close(self, native_leaf: str | None = None) -> None:
+        with self._admission_gate:
+            if self._output_group is not None:
+                raise CgroupOwnerError("finish the original output lease before closing its scope")
+            self._close_locked(native_leaf)
+
+    def _close_locked(self, native_leaf: str | None = None) -> None:
         """Remove only fresh, empty directories after caller confirms closure."""
+        if self._closed:
+            return self._finish_descriptor_closure()
         self._reconcile_removals()
         self._check_owner()
         if not self._workload_removed:
@@ -298,8 +406,60 @@ class CgroupOwner:
             self.manager.rmdir()
             self._manager_removed = True
         self._closed = True
-        for fd in self._fds.values():
-            os.close(fd)
+        self._finish_descriptor_closure()
+
+    def _finish_descriptor_closure(self) -> None:
+        """Retry only untouched original FDs; never retry a possibly closed FD."""
+        if self._pid != os.getpid():
+            raise CgroupOwnerError("original cgroup owner process differs")
+        for name in tuple(self._fd_close_states):
+            state = self._fd_close_states[name]
+            if state == "unknown":
+                # If interrupted after recording the close intent but before
+                # taking the integer out of the table, discard the stale
+                # integer without issuing another close against its number.
+                self._fds.pop(name, None)
+                continue
+            if state == "closed":
+                self._fds.pop(name, None)
+                continue
+            if state != "unattempted" or name not in self._fds:
+                raise CgroupOwnerError("original cgroup descriptor state differs")
+            # Set unknown before moving or closing the descriptor. An async
+            # exception at any later instruction never makes it retryable.
+            self._fd_close_attempted[name] = self._fds[name]
+            self._fd_close_states[name] = "unknown"
+            fd = self._fds.pop(name)
+            try:
+                os.close(fd)
+            except BaseException as error:
+                try:
+                    self._fd_close_errors.setdefault(name, error)
+                except BaseException as retention_error:
+                    try:
+                        error.add_note("descriptor close error retention also failed: "
+                                       + type(retention_error).__name__)
+                    except BaseException:
+                        pass
+                raise
+            self._fd_close_states[name] = "closed"
+        unknown = [name for name, state in self._fd_close_states.items() if state == "unknown"]
+        if unknown:
+            first = next((self._fd_close_errors.get(name) for name in unknown
+                          if name in self._fd_close_errors), None)
+            error = CgroupOwnerError("original cgroup descriptor close remains unknown: " + ", ".join(unknown))
+            if first is not None:
+                raise error from first
+            raise error
+
+    def descriptor_close_observation(self) -> dict:
+        """Report same-owner cleanup status; never a process or GPU fence."""
+        with self._admission_gate:
+            if self._pid != os.getpid():
+                raise CgroupOwnerError("original cgroup owner process differs")
+            return {"filesystem_cleanup": "complete" if self._closed else "not_complete",
+                    "descriptors": dict(self._fd_close_states),
+                    "physical_completion": "not_inferred"}
 
     def retry(self) -> None:
         """Retry an unstarted setup cleanup returned by CgroupSetupError."""
