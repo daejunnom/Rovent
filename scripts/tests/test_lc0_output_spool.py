@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lc0_output_spool import OutputSpool
+from lc0_output_spool import OutputSpool, OutputSpoolInitError
 
 
 @unittest.skipUnless(hasattr(os, "pwrite"), "positional file writes required")
@@ -78,6 +78,23 @@ class OutputSpoolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             spool.accept(b"late")
         spool.close()
+
+    def test_failed_initialization_preserves_original_and_ambiguous_close(self):
+        original = OSError(errno.EIO, "private initialization detail")
+        cleanup = OSError(errno.EIO, "private cleanup detail")
+        close = os.close
+
+        def close_then_fail(fd):
+            close(fd)
+            raise cleanup
+
+        with mock.patch("lc0_output_spool.os.fstat", side_effect=original), \
+                mock.patch("lc0_output_spool.os.close", side_effect=close_then_fail):
+            with self.assertRaises(OutputSpoolInitError) as caught:
+                OutputSpool(self.file.fileno(), 20)
+        self.assertIs(caught.exception.original_error, original)
+        self.assertIs(caught.exception.close_error, cleanup)
+        self.assertNotIn("private", str(caught.exception))
 
 
 if __name__ == "__main__":

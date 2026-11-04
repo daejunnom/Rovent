@@ -12,6 +12,15 @@ import os
 import stat
 
 
+class OutputSpoolInitError(Exception):
+    """Retain both initialization and uncertain descriptor-close failures."""
+
+    def __init__(self, original_error: BaseException, close_error: BaseException):
+        super().__init__("output spool initialization failed and descriptor close is unknown")
+        self.original_error = original_error
+        self.close_error = close_error
+
+
 class OutputSpool:
     """Keep a bounded prefix, including bytes awaiting a failed write.
 
@@ -33,8 +42,14 @@ class OutputSpool:
             if not stat.S_ISREG(info.st_mode) or info.st_size != 0:
                 raise ValueError("output spool requires a new empty regular file")
             self._identity = (info.st_dev, info.st_ino)
-        except BaseException:
-            os.close(self._fd)
+        except BaseException as original_error:
+            try:
+                os.close(self._fd)
+            except BaseException as close_error:
+                # A close error does not prove whether the OS released this
+                # descriptor. Never retry it by number after that ambiguity.
+                raise OutputSpoolInitError(original_error, close_error) from original_error
+            self._fd = None
             raise
         self.max_bytes = max_bytes
         self.bytes_seen = 0
