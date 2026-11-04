@@ -785,12 +785,21 @@ pub(crate) fn engine(error: &EngineError) -> Result<CauseReceiptV1, CauseProject
                 pending.extend(cleanup);
             }
             EngineError::Transport(transport) => {
-                if let ServeFailure::Handler(original) = &transport.failure {
-                    pending.push(original);
+                match &transport.failure {
+                    ServeFailure::Handler(original) => pending.push(original),
+                    ServeFailure::Io(_) => {}
                 }
                 pending.extend(&transport.cleanup_failures);
             }
-            _ => {}
+            // Exhaustive on purpose: a new EngineError variant must declare
+            // whether it contains further engine errors before V1 can compile.
+            EngineError::Contract(_)
+            | EngineError::SearchDriverClose(_)
+            | EngineError::Session(_)
+            | EngineError::WorkerPanic
+            | EngineError::DrainTimeout
+            | EngineError::UndeliveredDiagnostics(_)
+            | EngineError::UndeliveredWorkerFailure(_) => {}
         }
     }
     Ok(project(|budget| budget.engine(error, 1)))
