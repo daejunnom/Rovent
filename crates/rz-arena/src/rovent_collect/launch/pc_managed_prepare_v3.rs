@@ -5,7 +5,9 @@
 use super::ArenaError;
 use super::managed_output_fd_v2::{ManagedPlanLeaseRejectionV2, ObservedManagedPlanLeaseV2};
 use super::pc_cli_managed_v3::{ManagedCollectionCliV3, ManagedDeadlineErrorV3};
-use super::pc_lock_v3::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
+use super::pc_lock_v3::{
+    ManagedOutputOwnerV3, PcCollectionOwnersV3, PcCollectionRunV3, PreparedPcCollectionInputsV3,
+};
 use rz_platform::ManagedCollectionInheritedFds;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +18,90 @@ pub(crate) struct PreparedManagedPcV3 {
     pub(crate) arguments: Vec<String>,
     pub(crate) work_until: Instant,
     pub(crate) cleanup_until: Instant,
+}
+
+/// Start failures retain the original input/output and, if created, the same
+/// supervisor owner. The optional registry key is custody, not completion.
+pub(crate) enum ManagedPcStartErrorV3 {
+    WorkExpired(PreparedManagedPcV3),
+    Supervisor {
+        error: ArenaError,
+        prepared: PreparedManagedPcV3,
+    },
+    /// Original inputs and payload are retained; any partial internal
+    /// registration remains unknown until its own owner is recovered.
+    SupervisorPanic {
+        payload: Box<dyn std::any::Any + Send>,
+        prepared: PreparedManagedPcV3,
+    },
+    WorkExpiredAfterSupervisor {
+        prepared: PreparedManagedPcV3,
+        owners: Arc<PcCollectionOwnersV3>,
+    },
+    Launch {
+        error: ArenaError,
+        prepared: PreparedManagedPcV3,
+        owners: Arc<PcCollectionOwnersV3>,
+    },
+    Panic {
+        payload: Box<dyn std::any::Any + Send>,
+        prepared: PreparedManagedPcV3,
+        owners: Arc<PcCollectionOwnersV3>,
+    },
+}
+
+impl PreparedManagedPcV3 {
+    /// Enter only after the caller has arranged bounded recovery for the
+    /// original supervisor and output. A return is not final settlement.
+    pub(crate) fn start(self) -> Result<PcCollectionRunV3, ManagedPcStartErrorV3> {
+        if Instant::now() >= self.work_until {
+            return Err(ManagedPcStartErrorV3::WorkExpired(self));
+        }
+        let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PcCollectionOwnersV3::prepare(
+                Arc::clone(&self.inputs),
+                self.work_until,
+                self.cleanup_until,
+            )
+        }));
+        let owners = match preparation {
+            Ok(Ok(owners)) => Arc::new(owners),
+            Ok(Err(error)) => {
+                return Err(ManagedPcStartErrorV3::Supervisor {
+                    error,
+                    prepared: self,
+                });
+            }
+            Err(payload) => {
+                return Err(ManagedPcStartErrorV3::SupervisorPanic {
+                    payload,
+                    prepared: self,
+                });
+            }
+        };
+        if Instant::now() >= self.work_until {
+            return Err(ManagedPcStartErrorV3::WorkExpiredAfterSupervisor {
+                prepared: self,
+                owners,
+            });
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owners.run_with_original_output(&self.output, self.arguments.clone())
+        }));
+        match result {
+            Ok(Ok(run)) => Ok(run),
+            Ok(Err(error)) => Err(ManagedPcStartErrorV3::Launch {
+                error,
+                prepared: self,
+                owners,
+            }),
+            Err(payload) => Err(ManagedPcStartErrorV3::Panic {
+                payload,
+                prepared: self,
+                owners,
+            }),
+        }
+    }
 }
 
 /// Rejection carries the original /2 observation when it was acquired. It is
