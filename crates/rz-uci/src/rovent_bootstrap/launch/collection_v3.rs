@@ -58,7 +58,34 @@ pub struct RoventPcCollectionStartGateV3 {
     pub(super) _parent: Arc<ConnectedParent>,
 }
 
+/// Retains only the original launch's input-lock identity. This is not a
+/// root, worker, teacher, GPU-completion, or collection-settlement witness.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub struct RoventPcCollectionInputLockIdentityV3 {
+    lock: Arc<RoventInputLockV3>,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl RoventPcCollectionInputLockIdentityV3 {
+    /// Match the exact lock owned by the original loaded native origin.
+    pub fn matches_origin(
+        &self,
+        origin: &crate::pals_adaptive::RoventNativeCollectionOriginV3,
+    ) -> bool {
+        std::ptr::eq(self.lock.as_ref(), origin.original_input_lock())
+    }
+}
+
 impl RoventPcCollectionStartGateV3 {
+    /// Issue an identity from this authenticated launch gate, retaining the
+    /// same original lock independently of the gate's borrow.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn input_lock_identity(&self) -> RoventPcCollectionInputLockIdentityV3 {
+        RoventPcCollectionInputLockIdentityV3 {
+            lock: Arc::clone(&self.lock),
+        }
+    }
+
     pub fn matches_original_lock(&self, lock: &Arc<RoventInputLockV3>) -> bool {
         Arc::ptr_eq(&self.lock, lock)
     }

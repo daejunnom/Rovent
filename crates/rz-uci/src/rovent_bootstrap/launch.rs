@@ -121,6 +121,8 @@ pub use collection::{
     run_own_nnuec_collection_v2_with_resource_admission,
     run_pc_collection_v2_with_resource_admission, run_pc_collection_v2_with_sealed_policy,
 };
+#[cfg(all(target_os = "linux", feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use collection_v3::RoventPcCollectionInputLockIdentityV3;
 #[cfg(target_os = "linux")]
 pub use collection_v3::{
     RoventPcCollectionLaunchOwnerV3, RoventPcCollectionNativeFenceV3,
