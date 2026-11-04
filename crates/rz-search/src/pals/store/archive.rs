@@ -2647,12 +2647,34 @@ impl PalsStores {
             return Err(error);
         }
         let manager = self.archive.take().expect("checked archive owner");
-        manager.note(|meter| {
-            meter.admission_closed = true;
-            meter.cleanup_complete = true;
-            meter.lifecycle = ArchiveOwnerLifecycle::Closed;
-        });
-        let snapshot = manager.snapshot();
+        // The original capability must survive an unwind in telemetry.  Do
+        // not manufacture a replacement owner or infer physical completion.
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            manager.note(|meter| {
+                meter.admission_closed = true;
+                meter.cleanup_complete = true;
+                meter.lifecycle = ArchiveOwnerLifecycle::Closed;
+            });
+            manager.snapshot()
+        }));
+        let snapshot = match observed {
+            Ok(snapshot) => snapshot,
+            Err(payload) => {
+                // The capability still exists; a partially written close
+                // observation is not evidence that it was released.
+                let mut meter = manager
+                    .telemetry
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                meter.admission_closed = false;
+                meter.cleanup_complete = false;
+                meter.lifecycle = ArchiveOwnerLifecycle::Failed;
+                meter.complete = false;
+                drop(meter);
+                self.archive = Some(manager);
+                std::panic::resume_unwind(payload);
+            }
+        };
         drop(manager); // Expire the actual Arc; copied telemetry is not authority.
         Ok(Some(snapshot))
     }

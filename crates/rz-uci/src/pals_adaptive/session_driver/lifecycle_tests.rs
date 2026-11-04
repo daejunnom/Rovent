@@ -1423,3 +1423,123 @@ fn physical_finish_unknown_is_retained_and_never_a_process_receipt() {
         1
     );
 }
+
+#[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+#[test]
+fn system_v6_borrowed_idle_finish_keeps_original_owner_and_confirms_physical_finish() {
+    let (driver, facts, _, actual_cpu_owner) = fixture();
+    let original_owner = {
+        let state = driver.state.lock().unwrap();
+        let SessionState::Idle(owners) = &*state else {
+            panic!("fixture must retain its original idle owner");
+        };
+        std::ptr::from_ref(owners.as_ref())
+    };
+
+    let receipt =
+        match driver.finish_pals_system_v6_idle_borrowed(Instant::now() + Duration::from_secs(3)) {
+            PalsV6IdleFinish::Complete(receipt) => receipt,
+            PalsV6IdleFinish::Unavailable(failure) => panic!("finish failed: {failure:?}"),
+            PalsV6IdleFinish::Panicked(_) => panic!("finish unexpectedly panicked"),
+        };
+    assert!(receipt.permits_process_close());
+    assert!(receipt.native_owner_joined());
+    assert!(receipt.native_physical_shutdown_confirmed());
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
+    let state = driver.state.lock().unwrap();
+    let SessionState::Idle(owners) = &*state else {
+        panic!("borrowed finish must preserve the original idle owner");
+    };
+    assert_eq!(std::ptr::from_ref(owners.as_ref()), original_owner);
+    assert_eq!(
+        owners.cpu[0]
+            .engine
+            .paused_stack_snapshot()
+            .unwrap()
+            .owner_id,
+        actual_cpu_owner
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+#[test]
+fn system_v6_borrowed_idle_finish_retains_owner_when_physical_finish_is_unknown() {
+    let (driver, facts, _, actual_cpu_owner) = fixture();
+    let original_owner = {
+        let state = driver.state.lock().unwrap();
+        let SessionState::Idle(owners) = &*state else {
+            panic!("fixture must retain its original idle owner");
+        };
+        std::ptr::from_ref(owners.as_ref())
+    };
+    facts.finish_ok.store(false, Ordering::Release);
+
+    match driver.finish_pals_system_v6_idle_borrowed(Instant::now() + Duration::from_secs(3)) {
+        PalsV6IdleFinish::Unavailable(failure) => assert_eq!(
+            failure.physical_completion,
+            crate::search_driver::DriverPhysicalCompletion::Unknown
+        ),
+        PalsV6IdleFinish::Complete(_) => panic!("unknown completion is not a receipt"),
+        PalsV6IdleFinish::Panicked(_) => panic!("finish unexpectedly panicked"),
+    }
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
+    let state = driver.state.lock().unwrap();
+    let SessionState::Idle(owners) = &*state else {
+        panic!("failed finish must preserve the original idle owner");
+    };
+    assert_eq!(std::ptr::from_ref(owners.as_ref()), original_owner);
+    assert_eq!(owners.native_finished, Some(false));
+    assert_eq!(
+        owners.cpu[0]
+            .engine
+            .paused_stack_snapshot()
+            .unwrap()
+            .owner_id,
+        actual_cpu_owner
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+#[test]
+fn system_v6_borrowed_idle_finish_expired_deadline_does_not_start_shutdown() {
+    let (driver, facts, _, actual_cpu_owner) = fixture();
+    let original_owner = {
+        let state = driver.state.lock().unwrap();
+        let SessionState::Idle(owners) = &*state else {
+            panic!("fixture must retain its original idle owner");
+        };
+        std::ptr::from_ref(owners.as_ref())
+    };
+
+    match driver.finish_pals_system_v6_idle_borrowed(Instant::now()) {
+        PalsV6IdleFinish::Unavailable(failure) => assert_eq!(
+            failure.physical_completion,
+            crate::search_driver::DriverPhysicalCompletion::Unknown
+        ),
+        PalsV6IdleFinish::Complete(_) => panic!("expired deadline is not a receipt"),
+        PalsV6IdleFinish::Panicked(_) => panic!("finish unexpectedly panicked"),
+    }
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 0);
+    assert!(!driver.closed.load(Ordering::Acquire));
+    {
+        let state = driver.state.lock().unwrap();
+        let SessionState::Idle(owners) = &*state else {
+            panic!("deadline refusal must preserve the original idle owner");
+        };
+        assert_eq!(std::ptr::from_ref(owners.as_ref()), original_owner);
+        assert_eq!(
+            owners.cpu[0]
+                .engine
+                .paused_stack_snapshot()
+                .unwrap()
+                .owner_id,
+            actual_cpu_owner
+        );
+    }
+    assert!(
+        driver
+            .finish_process(Instant::now() + Duration::from_secs(3))
+            .unwrap()
+            .permits_process_close()
+    );
+}

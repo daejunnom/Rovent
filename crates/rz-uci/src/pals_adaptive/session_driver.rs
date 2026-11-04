@@ -9,8 +9,16 @@ pub use checker_metadata::*;
 mod collection_v2;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use collection_v2::*;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+mod admission_system_v6;
 mod completion_observation;
 mod idle_physical_close;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+mod idle_system_v6_close;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+pub(crate) use admission_system_v6::PalsV6Admission;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
+pub(crate) use idle_system_v6_close::PalsV6IdleFinish;
 #[cfg(feature = "pals-adaptive")]
 mod initial_stop;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -1639,35 +1647,45 @@ where
             }
             _ => ProcessWorkJournal::new_pals(resolver),
         };
+        // Reserve every heap allocation and construct all fallible journals
+        // before taking either original owner slot. `Box::write` below only
+        // initializes this already-allocated storage; it does not allocate.
+        let prepared_engine = Box::<PalsEngine<AdaptivePortModel>>::new_uninit();
+        let prepared_owners = Box::<IdleOwners<B>>::new_uninit();
+        let completion = Mutex::new(CompletionJournal::new(
+            clock.epoch(),
+            options.implementation,
+        ));
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let profiled_retirement_commits = Mutex::new(VecDeque::with_capacity(64));
+        let archive_receipts = Mutex::new(VecDeque::with_capacity(64));
+        let accepted_outputs = Mutex::new(VecDeque::with_capacity(64));
+        let Some(researcher_source) = researcher_slot.take() else {
+            return Err(failure(
+                "AdaptiveSessionSources",
+                "original researcher source absent",
+            ));
+        };
+        let Some(sources) = sources_slot.take() else {
+            *researcher_slot = Some(researcher_source);
+            return Err(failure(
+                "AdaptiveSessionSources",
+                "original session sources absent",
+            ));
+        };
         let AdaptiveSessionSources {
             native,
             engine,
             cpu,
             external,
             checker_metadata,
-        } = sources_slot
-            .take()
-            .expect("validated original session sources");
-        let researcher_source = researcher_slot
-            .take()
-            .expect("validated original researcher source");
-        Ok(Self {
-            completion: Mutex::new(CompletionJournal::new(
-                clock.epoch(),
-                options.implementation,
-            )),
-            options,
-            limits,
-            explicit_native_limits,
-            researcher_class,
-            clock,
-            issuer,
-            registration,
-            checker_metadata,
-            external_metadata_bound: AtomicBool::new(false),
-            state: Mutex::new(SessionState::Idle(Box::new(IdleOwners {
+        } = sources;
+        let engine = Box::write(prepared_engine, engine);
+        let owners = Box::write(
+            prepared_owners,
+            IdleOwners {
                 native,
-                engine: Some(Box::new(engine)),
+                engine: Some(engine),
                 unexpected_archive_owner: None,
                 cpu,
                 external,
@@ -1683,7 +1701,20 @@ where
                 profiled_retirement: None,
                 #[cfg(feature = "pals-adaptive")]
                 rovent_idle_custody: RoventPcrIdleCustody::StartupReady,
-            }))),
+            },
+        );
+        Ok(Self {
+            completion,
+            options,
+            limits,
+            explicit_native_limits,
+            researcher_class,
+            clock,
+            issuer,
+            registration,
+            checker_metadata,
+            external_metadata_bound: AtomicBool::new(false),
+            state: Mutex::new(SessionState::Idle(owners)),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             storage: Mutex::new(None),
             work,
@@ -1700,7 +1731,7 @@ where
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             profiled_retirement_sink: Mutex::new(None),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-            profiled_retirement_commits: Mutex::new(VecDeque::with_capacity(64)),
+            profiled_retirement_commits,
             rovent: None,
             #[cfg(feature = "pals-adaptive")]
             rovent_root_policy: None,
@@ -1738,9 +1769,9 @@ where
             latest_rovent_initial_v2: Mutex::new(None),
             #[cfg(feature = "pals-adaptive")]
             latest_rovent_initial_v3: Mutex::new(None),
-            archive_receipts: Mutex::new(VecDeque::with_capacity(64)),
+            archive_receipts,
             pending_output: Mutex::new(None),
-            accepted_outputs: Mutex::new(VecDeque::with_capacity(64)),
+            accepted_outputs,
         })
     }
 
