@@ -433,6 +433,7 @@ pub(crate) struct RoventPcCollectionBridgeV3 {
     ledger: Arc<Mutex<PcRootQuotaLedgerV3>>,
     startup: OnceLock<RoventStartupControl>,
     native_owner: OnceLock<Weak<RoventPcCollectionLaunchOwnerV3>>,
+    game_admission_seal: OnceLock<PcGameAdmissionSealV3>,
     supervisor: OnceLock<Weak<Mutex<PcWorkerSupervisorV3>>>,
     state: Mutex<PcBridgeStateV3>,
     requests: mpsc::SyncSender<RoventCollectionRootAdmissionV3>,
@@ -481,7 +482,7 @@ impl RoventPcCollectionBridgeV3 {
         Ok(Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
             ledger: Arc::new(Mutex::new(PcRootQuotaLedgerV3::new(Arc::clone(&inputs)))),
-            inputs, game, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), supervisor: OnceLock::new(),
+            inputs, game, registration, startup: OnceLock::new(), native_owner: OnceLock::new(), game_admission_seal: OnceLock::new(), supervisor: OnceLock::new(),
             state: Mutex::new(PcBridgeStateV3 { roots, deferred }), requests,
             request_receiver: Mutex::new(receiver),
         }))
@@ -961,6 +962,19 @@ impl RoventPcCollectionBridgeV3 {
         let hooks: Arc<dyn RoventPcCollectionHooksV3> = self.clone();
         if !fence.matches_original_owner(&native_owner) || !fence.matches_original_hooks(&hooks) {
             return Err("P-C V3 native fence belongs to another owner");
+        }
+        if self.game_admission_seal.get().is_none() {
+            let Some(original_fence) = native_owner.native_session_fence() else { return Ok(None); };
+            let seal = self.try_game_admission_seal(original_fence)
+                .map_err(|(_, error)| error)?;
+            // Another poll may have installed the equivalent same-owner seal.
+            let _ = self.game_admission_seal.set(seal);
+        }
+        let Some(seal) = self.game_admission_seal.get() else { return Ok(None); };
+        match self.game.try_seal_pc(seal) {
+            super::game_authority_v3::GameStepV3::Ready | super::game_authority_v3::GameStepV3::Existing => {},
+            super::game_authority_v3::GameStepV3::Busy => return Ok(None),
+            _ => return Err("P-C V3 game admission seal rejected"),
         }
         if !self.supervisor.get().and_then(Weak::upgrade)
             .is_some_and(|original| Arc::ptr_eq(&original, supervisor)) {
