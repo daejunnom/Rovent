@@ -2499,6 +2499,10 @@ impl<S: NativeProviderDeclaration> NativeRunBundle<S> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "native_runner_no_game_evidence_tests.rs"]
+mod no_game_evidence_tests;
+
 #[cfg(test)]
 mod physical_guard_tests {
     use super::*;

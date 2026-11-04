@@ -306,6 +306,33 @@ impl PcRootRecoveryV3 {
         Ok(Some(stage.seal_unclaimed_scope_after_source(source, unclaimed_proof)))
     }
 
+    /// Reobserve only a proof already sealed in this original recovery. It
+    /// never issues a new proof, scope, ACK, or physical completion evidence.
+    pub(crate) fn try_observe_sealed_aborted_unclaimed_stage(&self) -> Result<Option<bool>, &'static str> {
+        use super::game_authority_v3::GameStepV3 as G;
+        if !self.abort_before_route || self.panic.is_some() || self.route.is_some()
+            || self.worker.is_some() || self.worker_key.is_some() || self.prepared.is_some()
+            || self.published || self.next_actor != 0 || !self.custodian.keys().is_empty()
+        { return Ok(Some(false)); }
+        let Some(stage_owner) = self.stage.as_ref().map(Arc::clone) else { return Ok(Some(false)); };
+        let stage = match stage_owner.try_lock() {
+            Ok(stage) => stage,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 unclaimed stage poisoned"),
+        };
+        let slots = match self.scope_effects.try_lock() {
+            Ok(slots) => slots,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 unclaimed scope slots poisoned"),
+        };
+        if slots.claim.is_some() || slots.outcome.is_some()
+            || !matches!(slots.claim_step, None | Some(G::Busy | G::Aborted | G::Closed))
+        { return Ok(Some(false)); }
+        let source = slots.teacher_source.as_ref().or_else(|| slots.game_source.as_ref().and_then(|owner| owner.pc_scope_source()));
+        let (Some(source), Some(proof)) = (source, slots.unclaimed_proof.as_ref()) else { return Ok(Some(false)); };
+        Ok(Some(proof.matches_original(&stage, source, &self.admission)))
+    }
+
     /// Seal only a known pre-route root whose own session physically retired.
     /// The ledger must separately validate this same recovery and aggregate.
     pub(crate) fn seal_aborted_pre_route(&mut self) -> bool {
