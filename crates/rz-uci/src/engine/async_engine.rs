@@ -139,6 +139,11 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         if !ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED {
             return InPlaceTimerStatus::NotReady;
         }
+        self.start_timer_inner()
+    }
+    // Shared production implementation. Only the private CPU test module may
+    // exercise it without admitting a product session through the guard.
+    fn start_timer_inner(&mut self) -> InPlaceTimerStatus {
         if self.transferred {
             return InPlaceTimerStatus::AlreadyTransferred;
         }
@@ -310,6 +315,13 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
         if !ORIGINAL_SLOT_DROP_RECOVERY_IMPLEMENTED {
             return Err(InPlaceTransferStatus::NotReady);
         }
+        self.take_run_inner(max_output_bytes, poll_interval)
+    }
+    fn take_run_inner(
+        &mut self,
+        max_output_bytes: usize,
+        poll_interval: Duration,
+    ) -> Result<AsyncEngineRun<O, D>, InPlaceTransferStatus> {
         if self.transferred || self.run.is_some() {
             return Err(InPlaceTransferStatus::AlreadyTransferred);
         }
@@ -1033,6 +1045,121 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_mock_slot_transfers_and_drains_same_session() {
+        struct CpuMock;
+        impl crate::search_driver::SearchSessionDriver for CpuMock {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Cpu
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([7; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "CPU mock".into(),
+                    author: "test".into(),
+                }
+            }
+            fn run(
+                &self,
+                _: &Position,
+                _: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                panic!("no-go test must not start a search")
+            }
+        }
+        let driver: Arc<dyn crate::search_driver::SearchSessionDriver> = Arc::new(CpuMock);
+        let mut process = EngineProcess::with_search_driver(
+            driver,
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(84)),
+        );
+        let close = process.install_priority_close().unwrap();
+        let (sender, events) = event_channel();
+        let output = AsyncOutputOwner::start(Vec::<u8>::new(), Vec::<u8>::new(), 4, 4096)
+            .ok()
+            .unwrap();
+        let mut slot = AsyncEngineStartSlot::new(
+            process,
+            events,
+            sender,
+            output,
+            close,
+            EngineSettings::default(),
+        );
+        assert_eq!(slot.preflight(), InPlacePreflightStatus::Ready);
+        // Both helpers are private; production continues through its own guard.
+        assert_eq!(slot.start_timer_inner(), InPlaceTimerStatus::Started);
+        let run = match slot.take_run_inner(4096, Duration::from_millis(1)) {
+            Ok(run) => run,
+            Err(_) => {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while slot.try_retire_staged_timer() == InPlaceTimerRetirement::Waiting
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                panic!("staged transfer failed")
+            }
+        };
+        slot.run = Some(run);
+        slot.sender.try_send(Event::Line("uci".into())).unwrap();
+        slot.sender.try_send(Event::Line("quit".into())).unwrap();
+        struct TimerGuard<'a>(&'a mut AsyncEngineRun<Vec<u8>, Vec<u8>>);
+        impl Drop for TimerGuard<'_> {
+            fn drop(&mut self) {
+                self.0.timer_stop.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while self
+                    .0
+                    .timer
+                    .as_ref()
+                    .is_some_and(|timer| !timer.is_finished())
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                if self.0.timer.as_ref().is_some_and(JoinHandle::is_finished) {
+                    if let Some(timer) = self.0.timer.take() {
+                        let _ = timer.join();
+                    }
+                    self.0.timer_joined = true;
+                }
+            }
+        }
+        let mut guard = TimerGuard(slot.original_run_mut().unwrap());
+        let run = &mut *guard.0;
+        assert_eq!(
+            run.drive_until(Instant::now() + Duration::from_secs(2)),
+            Some(AsyncServeStatus::OutputQueued)
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match run.try_recover_writer() {
+                EngineWriterRecoveryStatus::Recovered => break,
+                EngineWriterRecoveryStatus::Pending if Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                _ => panic!("original writer did not finish"),
+            }
+        }
+        let output = run.output_recovery().unwrap().as_ref().ok().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.protocol)
+                .lines()
+                .any(|line| line == "uciok")
+        );
+        assert!(output.failure.is_none());
+        assert!(run.final_output_observation().is_some());
+        // TimerGuard retires and joins this fixture's own CPU timer on both
+        // normal return and assertion unwind; no GPU resource was created.
+    }
 
     #[test]
     fn refused_start_recovers_original_unstarted_writer() {
