@@ -67,6 +67,11 @@ pub struct RoventPcCollectionInputLockIdentityV3 {
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 impl RoventPcCollectionInputLockIdentityV3 {
+    /// Compare only the retained original input-lock owner.
+    pub fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lock, &other.lock)
+    }
+
     /// Match the exact lock owned by the original loaded native origin.
     pub fn matches_origin(
         &self,
