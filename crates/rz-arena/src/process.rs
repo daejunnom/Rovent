@@ -20,6 +20,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 pub(crate) mod smoke_reobserve;
+#[cfg(all(test, target_os = "linux"))]
+mod smoke_reobserve_tests;
 type StdoutObserver<'a> = &'a mut dyn FnMut(&[u8]);
 type LoadedImageVerifier<'a> = &'a mut dyn FnMut(&File) -> Result<(), ()>;
 /// A nonblocking owner operation, polled only while the original child is
