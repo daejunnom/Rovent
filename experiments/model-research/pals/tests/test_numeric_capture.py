@@ -63,6 +63,38 @@ class NumericCaptureTests(unittest.TestCase):
     def tearDown(self):
         self.blocker.stop()
 
+    def test_system_cuda_uses_distinct_plan_and_exact_library_identity(self):
+        system = bindings()
+        system.pop("cuda_libraries")
+        system.pop("cuda_manifest_sha256")
+        system.update(backend="ort_cuda_system", system_cuda_config_sha256="08" * 32,
+                      system_cuda_libraries=[
+                          {"role": "ort-core", "sha256": system["runtime_library_sha256"],
+                           "bytes": 1024, "required_mapping": True},
+                          {"role": "ort-provider-cuda", "sha256": "07" * 32,
+                           "bytes": 2048, "required_mapping": True},
+                      ])
+        plan = capture.make_system_case_plan(system)
+        self.assertEqual(capture.validate_system_case_plan(plan), 100)
+        self.assertEqual(plan["domain"], capture.SYSTEM_PLAN_DOMAIN)
+        with self.assertRaises(ValueError):
+            capture.validate_case_plan(plan)
+        with self.assertRaises(ValueError):
+            capture.validate_system_case_plan(capture.make_case_plan(bindings()))
+        for mutate in (
+            lambda b: b["system_cuda_libraries"].reverse(),
+            lambda b: b["system_cuda_libraries"].append(copy.deepcopy(b["system_cuda_libraries"][0])),
+            lambda b: b["system_cuda_libraries"][0].update(sha256="ff" * 32),
+            lambda b: b["system_cuda_libraries"][1].update(required_mapping=False),
+            lambda b: b["system_cuda_libraries"][1].update(bytes=True),
+            lambda b: b.update(cuda_manifest_sha256="08" * 32),
+            lambda b: b.update(system_cuda_config_sha256="not-a-digest"),
+        ):
+            invalid = copy.deepcopy(system)
+            mutate(invalid)
+            with self.assertRaises(ValueError):
+                capture.validate_system_bindings(invalid)
+
     def test_binding_rosters_domains_and_dtype_are_exact_and_copied(self):
         for collection, cuda in ((False,False),(True,False),(False,True)):
             original = bindings(collection,cuda)

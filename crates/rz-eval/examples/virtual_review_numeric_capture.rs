@@ -6,19 +6,21 @@
 use rz_eval::asset;
 use rz_eval::error::BackendError;
 use rz_eval::onnx::{NativeLoadingProfile, OrtRuntime, Provider};
+#[cfg(target_os = "linux")]
+use rz_eval::onnx::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
 use rz_eval::pals_model::virtual_review::{
     self as model, PalsVirtualReviewInput, ReviewExecutionIdentity,
 };
 use rz_eval::pals_model::{PalsCandidateToken, PalsModelProfile, PalsRawOutput, PalsRole};
 use rz_eval::pals_onnx::virtual_review::{
-    validate_virtual_review_export_manifest, PalsVirtualReviewOnnxBackend,
-    VirtualReviewExecutionMode, VirtualReviewInvocation, VirtualReviewNativeCommand as Command,
-    VirtualReviewNativeResult as Outcome,
+    PalsVirtualReviewOnnxBackend, VirtualReviewExecutionMode, VirtualReviewInvocation,
+    VirtualReviewNativeCommand as Command, VirtualReviewNativeResult as Outcome,
+    validate_virtual_review_export_manifest,
 };
 use rz_eval::pals_onnx::{
     PalsBackendStats, PalsCuDnnConvSearch, PalsCudaControlPolicy, PalsOnnxConfig,
 };
-use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
+use rz_eval::runtime_pin::RuntimeCache;
 use rz_eval::worker::{PhysicalPoll, SingleWorker};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -120,7 +122,7 @@ fn decode_unique<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(serde_json::from_value(unique.0)?)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Bindings {
     model_profile: String,
@@ -134,12 +136,57 @@ struct Bindings {
     export_manifest_sha256: String,
     graphs: BTreeMap<String, String>,
     runtime_library_sha256: String,
+    #[serde(default)]
     cuda_libraries: BTreeSet<String>,
     cuda_manifest_sha256: Option<String>,
+    #[serde(default)]
+    system_cuda_config_sha256: Option<String>,
+    #[serde(default)]
+    system_cuda_libraries: Option<Vec<SystemLibraryBinding>>,
     backend: String,
     precision: String,
     tf32: bool,
     source_components: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SystemLibraryBinding {
+    role: String,
+    sha256: String,
+    bytes: u64,
+    required_mapping: bool,
+}
+impl Serialize for Bindings {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("model_profile", &self.model_profile)?;
+        map.serialize_entry("model_schema", &self.model_schema)?;
+        map.serialize_entry("model_semantics", &self.model_semantics)?;
+        map.serialize_entry("encoding_schema", &self.encoding_schema)?;
+        map.serialize_entry("model_semantic_sha256", &self.model_semantic_sha256)?;
+        map.serialize_entry("encoding_sha256", &self.encoding_sha256)?;
+        map.serialize_entry("model_epoch", &self.model_epoch)?;
+        map.serialize_entry("weights_sha256", &self.weights_sha256)?;
+        map.serialize_entry("export_manifest_sha256", &self.export_manifest_sha256)?;
+        map.serialize_entry("graphs", &self.graphs)?;
+        map.serialize_entry("runtime_library_sha256", &self.runtime_library_sha256)?;
+        if self.backend == "ort_cuda_system" {
+            map.serialize_entry("system_cuda_config_sha256", &self.system_cuda_config_sha256)?;
+            map.serialize_entry("system_cuda_libraries", &self.system_cuda_libraries)?;
+        } else {
+            map.serialize_entry("cuda_libraries", &self.cuda_libraries)?;
+            map.serialize_entry("cuda_manifest_sha256", &self.cuda_manifest_sha256)?;
+        }
+        map.serialize_entry("backend", &self.backend)?;
+        map.serialize_entry("precision", &self.precision)?;
+        map.serialize_entry("tf32", &self.tf32)?;
+        map.serialize_entry("source_components", &self.source_components)?;
+        map.end()
+    }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(
@@ -306,6 +353,10 @@ struct Config {
     cuda_bundle: Option<PathBuf>,
     cuda_inventory: Option<PathBuf>,
     cuda_inventory_sha256: Option<String>,
+    #[serde(default)]
+    system_cuda_config: Option<PathBuf>,
+    #[serde(default)]
+    system_cuda_config_sha256: Option<String>,
     gpu_device_id: i32,
     gpu_arena_bytes: usize,
     deadline_seconds: u64,
@@ -320,13 +371,14 @@ impl Config {
         selected.cache_public_memory = false;
         let profile = match self.provider.as_str() {
             "cpu" => None,
+            "cuda-system" => None,
             "cuda-control" => Some(NativeLoadingProfile::EagerCuda12Cudnn9V1),
             "cuda-control-shim" => Some(NativeLoadingProfile::CuDnnShimLazyV1),
             _ => {
                 return Err("explicit cpu/cuda-control/cuda-control-shim provider required".into());
             }
         };
-        if profile.is_some() {
+        if profile.is_some() || self.provider == "cuda-system" {
             selected.provider = Provider::Cuda {
                 device_id: self.gpu_device_id,
                 arena_bytes: self.gpu_arena_bytes,
@@ -350,9 +402,45 @@ impl Config {
                 .as_deref()
                 .ok_or("experimental DEFAULT requires explicit V3 inventory SHA")?)?;
         }
-        selected.validate_execution_selection(profile, profile.is_some())?;
+        if self.provider == "cuda-system" {
+            if self.cuda_bundle.is_some()
+                || self.cuda_inventory.is_some()
+                || self.cuda_inventory_sha256.is_some()
+                || self.system_cuda_config.is_none()
+                || self.system_cuda_config_sha256.is_none()
+            {
+                return Err(
+                    "system CUDA requires its own config and no legacy bundle/control".into(),
+                );
+            }
+            selected.validate_system_execution_selection()?;
+        } else {
+            if self.system_cuda_config.is_some() || self.system_cuda_config_sha256.is_some() {
+                return Err("system config is only supported by cuda-system".into());
+            }
+            selected.validate_execution_selection(profile, profile.is_some())?;
+        }
         Ok(selected)
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemCudaConfig {
+    max_libraries: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_capture_ms: u64,
+    libraries: Vec<SystemCudaLibrary>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemCudaLibrary {
+    role: String,
+    path: PathBuf,
+    required_mapping: bool,
 }
 
 #[derive(Serialize)]
@@ -422,7 +510,11 @@ fn loaded_policy_observation(
     explicit_control: bool,
 ) -> Result<LoadedPolicyObservation> {
     let config = backend.config();
-    config.validate_execution_selection(backend.native_loading_profile(), explicit_control)?;
+    if backend.system_cuda_runtime_selected() {
+        config.validate_system_execution_selection()?;
+    } else {
+        config.validate_execution_selection(backend.native_loading_profile(), explicit_control)?;
+    }
     if config.device_public_memory {
         return Err("raw capture requires the original host-public execution path".into());
     }
@@ -958,6 +1050,7 @@ fn identity(
 fn execute(config: Config) -> Result<()> {
     let selected = config.execution_config()?;
     let is_cuda = matches!(selected.provider, Provider::Cuda { .. });
+    let system_cuda = config.provider == "cuda-system";
     for path in [
         &config.case_plan,
         &config.export_manifest,
@@ -968,6 +1061,7 @@ fn execute(config: Config) -> Result<()> {
     .into_iter()
     .chain(config.cuda_bundle.as_ref())
     .chain(config.cuda_inventory.as_ref())
+    .chain(config.system_cuda_config.as_ref())
     {
         if !path.is_absolute() {
             return Err("all configured capture asset/output paths must be absolute".into());
@@ -982,9 +1076,34 @@ fn execute(config: Config) -> Result<()> {
     if asset::sha256(&plan_bytes) != pin(&config.case_plan_sha256)? {
         return Err("actual case plan SHA differs".into());
     }
-    let plan: Plan = decode_unique(&plan_bytes)?;
-    if plan.domain != "rz-pals-numerical-case-plan-v5/1"
-        || plan.schema_version != 5
+    let raw_plan: serde_json::Value = decode_unique(&plan_bytes)?;
+    let binding_keys = raw_plan
+        .get("bindings")
+        .and_then(|v| v.as_object())
+        .ok_or("plan bindings missing")?;
+    if system_cuda {
+        if binding_keys.contains_key("cuda_manifest_sha256")
+            || binding_keys.contains_key("cuda_libraries")
+            || !binding_keys.contains_key("system_cuda_config_sha256")
+            || !binding_keys.contains_key("system_cuda_libraries")
+        {
+            return Err("system plan must use only system CUDA bindings".into());
+        }
+    } else if !binding_keys.contains_key("cuda_manifest_sha256")
+        || !binding_keys.contains_key("cuda_libraries")
+        || binding_keys.contains_key("system_cuda_config_sha256")
+        || binding_keys.contains_key("system_cuda_libraries")
+    {
+        return Err("V5 plan must retain legacy binding shape".into());
+    }
+    let plan: Plan = serde_json::from_value(raw_plan)?;
+    if plan.domain
+        != if system_cuda {
+            "rz-pals-numerical-case-plan-v6/1"
+        } else {
+            "rz-pals-numerical-case-plan-v5/1"
+        }
+        || plan.schema_version != if system_cuda { 6 } else { 5 }
         || plan.invocation != "fresh"
         || plan.batch != 1
         || plan.groups.is_empty()
@@ -1036,7 +1155,14 @@ fn execute(config: Config) -> Result<()> {
         || b.encoding_schema != model::ENCODING
         || b.precision != "fp32"
         || b.tf32
-        || b.backend != if is_cuda { "ort_cuda" } else { "ort_cpu" }
+        || b.backend
+            != if system_cuda {
+                "ort_cuda_system"
+            } else if is_cuda {
+                "ort_cuda"
+            } else {
+                "ort_cpu"
+            }
         || b.model_semantic_sha256
             != hex(PalsModelProfile::VirtualReviewV1.registered_semantics_sha256())
         || b.encoding_sha256 != hex(model::registered_encoding_sha256())
@@ -1073,10 +1199,10 @@ fn execute(config: Config) -> Result<()> {
     }
     let order = capture_order(
         &plan.groups,
-        is_cuda,
+        is_cuda && !system_cuda,
         mode == VirtualReviewExecutionMode::Collection,
     )?;
-    let mut profiling_window = is_cuda.then(|| CudaProfilingWindow {
+    let mut profiling_window = (is_cuda && !system_cuda).then(|| CudaProfilingWindow {
         scope: "original planned cases only; profiles close at first registered role coverage, not full-run kernel coverage",
         actual_cases: order.slots[..order.profile_cases].iter().map(|slot| {
             let group = &plan.groups[slot.group];
@@ -1107,22 +1233,13 @@ fn execute(config: Config) -> Result<()> {
     {
         return Err("actual strict export/checkpoint/graph/encoding pins differ".into());
     }
-    let cache = RuntimeCache::open(&config.runtime_cache)?;
-    let control = if is_cuda {
-        if std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref() != Some("0") {
-            return Err("CUDA capture requires NVIDIA_TF32_OVERRIDE=0".into());
-        }
-        Some(PalsCudaControlPolicy::from_virtual_review_inventory(
-            config
-                .cuda_inventory
-                .as_ref()
-                .ok_or("V3 inventory missing")?,
-            config
-                .cuda_inventory_sha256
-                .as_deref()
-                .ok_or("V3 inventory SHA missing")?,
-        )?)
-    } else {
+    if is_cuda && !system_cuda {
+        return Err("legacy CUDA bundle execution disabled; use a V6 system CUDA plan".into());
+    }
+    if is_cuda && std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref() != Some("0") {
+        return Err("CUDA capture requires NVIDIA_TF32_OVERRIDE=0".into());
+    }
+    if !system_cuda {
         if config.cuda_bundle.is_some()
             || config.cuda_inventory.is_some()
             || config.cuda_inventory_sha256.is_some()
@@ -1131,59 +1248,104 @@ fn execute(config: Config) -> Result<()> {
         {
             return Err("CPU cannot carry CUDA assets".into());
         }
-        None
-    };
-    let runtime_pin = if is_cuda {
-        let bytes = asset::read_bounded(
-            config.cuda_bundle.as_ref().ok_or("CUDA bundle missing")?,
-            64 * 1024,
-        )?;
-        if Some(hex(asset::sha256(&bytes))) != b.cuda_manifest_sha256 {
-            return Err("actual CUDA bundle manifest SHA differs".into());
-        }
-        let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&bytes)?)?;
-        let expected = spec
-            .files
-            .iter()
-            .filter(|f| f.role != RuntimeBundleFileRole::Core)
-            .map(|f| f.sha256.clone())
-            .collect::<BTreeSet<_>>();
-        let core = spec
-            .files
-            .iter()
-            .find(|f| f.role == RuntimeBundleFileRole::Core)
-            .ok_or("core absent")?;
-        if expected != b.cuda_libraries
-            || core.sha256 != b.runtime_library_sha256
-            || config.runtime_library.file_name().and_then(|n| n.to_str()) != Some(&core.filename)
-        {
-            return Err("actual native library roster differs".into());
-        }
-        cache.cuda_bundle(
-            config
-                .runtime_library
-                .parent()
-                .ok_or("core parent absent")?,
-            &spec,
-        )?
-    } else {
-        cache.library(&config.runtime_library, &b.runtime_library_sha256)?
-    };
-    if Instant::now() >= until {
-        return Err("capture window expired before runtime load".into());
     }
-    let runtime = if config.provider == "cuda-control-shim" {
-        OrtRuntime::load_with_cuda_loading_profile(
-            &runtime_pin,
-            NativeLoadingProfile::CuDnnShimLazyV1,
-        )?
+    let control: Option<PalsCudaControlPolicy> = None;
+    let runtime = if system_cuda {
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = asset::read_bounded(
+                config
+                    .system_cuda_config
+                    .as_ref()
+                    .ok_or("system config missing")?,
+                64 * 1024,
+            )?;
+            let config_sha = hex(asset::sha256(&bytes));
+            if Some(&config_sha) != config.system_cuda_config_sha256.as_ref()
+                || Some(&config_sha) != b.system_cuda_config_sha256.as_ref()
+            {
+                return Err("system config differs from pinned plan".into());
+            }
+            let system: SystemCudaConfig = decode_unique(&bytes)?;
+            if system.max_capture_ms == 0
+                || system
+                    .libraries
+                    .iter()
+                    .any(|entry| !entry.path.is_absolute())
+            {
+                return Err("system library paths and finite capture limit required".into());
+            }
+            let owner = SystemRuntime::capture(
+                system
+                    .libraries
+                    .into_iter()
+                    .map(|entry| SystemLibraryRequest {
+                        role: entry.role,
+                        path: entry.path,
+                        required_mapping: entry.required_mapping,
+                    })
+                    .collect(),
+                SystemCaptureLimits {
+                    max_libraries: system.max_libraries,
+                    max_file_bytes: system.max_file_bytes,
+                    max_total_bytes: system.max_total_bytes,
+                    max_elapsed: Duration::from_millis(system.max_capture_ms),
+                },
+            )?;
+            let mut observed = owner
+                .libraries()
+                .iter()
+                .map(|entry| SystemLibraryBinding {
+                    role: entry.role.clone(),
+                    sha256: hex(entry.sha256),
+                    bytes: entry.bytes,
+                    required_mapping: entry.required_mapping,
+                })
+                .collect::<Vec<_>>();
+            observed.sort_by(|a, b| a.role.cmp(&b.role));
+            let expected = b
+                .system_cuda_libraries
+                .as_ref()
+                .ok_or("system roster missing")?;
+            if expected != &observed || observed.windows(2).any(|w| w[0].role >= w[1].role) {
+                return Err("captured system library roster differs from plan".into());
+            }
+            let core = owner
+                .libraries()
+                .into_iter()
+                .find(|entry| entry.role == "ort-core" && entry.required_mapping)
+                .ok_or("required ort-core missing")?;
+            if hex(core.sha256) != b.runtime_library_sha256
+                || fs::canonicalize(&config.runtime_library)? != core.canonical_path
+            {
+                return Err("system ORT core differs from plan".into());
+            }
+            if Instant::now() >= until {
+                return Err("capture window expired before system runtime load".into());
+            }
+            OrtRuntime::load_system_cuda(&owner)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err("system CUDA capture requires Linux".into());
+        }
     } else {
+        let cache = RuntimeCache::open(&config.runtime_cache)?;
+        let runtime_pin = cache.library(&config.runtime_library, &b.runtime_library_sha256)?;
+        if Instant::now() >= until {
+            return Err("capture window expired before runtime load".into());
+        }
         OrtRuntime::load(&runtime_pin)?
     };
     if hex(runtime.binary_digest()) != b.runtime_library_sha256 {
         return Err("actual loaded ORT pin differs".into());
     }
-    selected.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
+    if system_cuda {
+        selected.validate_system_execution_selection()?;
+    } else {
+        selected
+            .validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
+    }
     let output_owner =
         capture_output_root(&config.output_root, config.output_root_admission.as_ref())?;
     let root = &output_owner.path;
@@ -1226,9 +1388,13 @@ fn execute(config: Config) -> Result<()> {
     };
     let epoch = backend.model_epoch();
     let backend_digest = backend.backend_digest();
-    let policy_observation =
-        loaded_policy_observation(&backend, config.cudnn_conv_search.as_deref(), is_cuda)?;
+    let policy_observation = loaded_policy_observation(
+        &backend,
+        config.cudnn_conv_search.as_deref(),
+        is_cuda && !system_cuda,
+    )?;
     let mut worker = backend.into_worker()?;
+    let mut system_mapping = None;
     let work = (|| -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut outputs = (0..plan.groups.len()).map(|_| None).collect::<Vec<_>>();
         let mut bytes = 0u64;
@@ -1259,7 +1425,7 @@ fn execute(config: Config) -> Result<()> {
                     .checked_add(actual_nn_inputs)
                     .ok_or("profile window NN input overflow")?;
             }
-            if is_cuda && index + 1 == order.profile_cases {
+            if is_cuda && !system_cuda && index + 1 == order.profile_cases {
                 first_placement = Some(
                     match command(&mut worker, Command::VerifyVirtualCudaPlacement, until)? {
                         Outcome::VirtualCudaPlacementVerified(witness) => witness,
@@ -1286,8 +1452,12 @@ fn execute(config: Config) -> Result<()> {
             let public_cache_hits = stage.public_cache_hits;
             stages.insert(group.id.clone(), stage);
             let raw = RawRun {
-                schema_version: 5,
-                domain: "rz-pals-numerical-raw-run-v5/1",
+                schema_version: if system_cuda { 6 } else { 5 },
+                domain: if system_cuda {
+                    "rz-pals-numerical-raw-run-v6/1"
+                } else {
+                    "rz-pals-numerical-raw-run-v5/1"
+                },
                 run_id: format!("native-{}", group.id),
                 producer: "rust_ort_native",
                 producer_source_component: b.source_components["model_native"].clone(),
@@ -1325,11 +1495,27 @@ fn execute(config: Config) -> Result<()> {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or("original capture plan has an unpublished group")?;
-        match command(&mut worker, Command::VerifyRuntime, until)? {
-            Outcome::RuntimeVerified => {}
-            _ => return Err("runtime audit incomplete".into()),
+        if system_cuda {
+            match command(&mut worker, Command::ObserveRuntimeMapping, until)? {
+                Outcome::RuntimeMappingObserved {
+                    mapping,
+                    system_placement,
+                } => {
+                    system_mapping = Some(serde_json::json!({
+                        "schema":"rovezero.virtual-system-mapping-observation.v1",
+                        "mapping":format!("{mapping:?}"), "placement_prerequisites":format!("{system_placement:?}"),
+                        "gpu_kernel_placement":"unknown", "process_exit":"requires_external_supervisor"
+                    }));
+                }
+                _ => return Err("system runtime mapping observation unavailable".into()),
+            }
+        } else {
+            match command(&mut worker, Command::VerifyRuntime, until)? {
+                Outcome::RuntimeVerified => {}
+                _ => return Err("runtime audit incomplete".into()),
+            }
         }
-        if is_cuda {
+        if is_cuda && !system_cuda {
             match command(&mut worker, Command::VerifyVirtualCudaPlacement, until)? {
                 Outcome::VirtualCudaPlacementVerified(witness) => {
                     if first_placement.as_ref() != Some(&witness) {
@@ -1385,6 +1571,13 @@ fn execute(config: Config) -> Result<()> {
             // V5 payload. Required runtime/placement checks and worker join have
             // already succeeded; consumers requiring this sidecar must still
             // reject its absence or a partial write under their own contract.
+            if let Some(observation) = &system_mapping {
+                write_exclusive_bounded(
+                    &root.join("system-runtime-mapping.json"),
+                    observation,
+                    POLICY_LIMIT,
+                )?;
+            }
             write_exclusive_bounded(
                 &root.join("actual-cudnn-execution-policy.json"),
                 &JoinedPolicyObservation {
@@ -1980,11 +2173,27 @@ mod tests {
             cuda_bundle: Some(PathBuf::new()),
             cuda_inventory: Some(PathBuf::new()),
             cuda_inventory_sha256: Some("a".repeat(64)),
+            system_cuda_config: None,
+            system_cuda_config_sha256: None,
             gpu_device_id: 0,
             gpu_arena_bytes: 1024 * 1024,
             deadline_seconds: 1,
             cleanup_seconds: 1,
         }
+    }
+
+    #[test]
+    fn system_cuda_requires_own_config_and_refuses_legacy_inputs() {
+        let mut config = selection_config("cuda-system");
+        config.system_cuda_config = Some(PathBuf::from("/tmp/system.json"));
+        config.system_cuda_config_sha256 = Some("a".repeat(64));
+        assert!(config.execution_config().is_err());
+        config.cuda_bundle = None;
+        config.cuda_inventory = None;
+        config.cuda_inventory_sha256 = None;
+        assert!(config.execution_config().is_ok());
+        config.cudnn_conv_search = Some("experimental_default".into());
+        assert!(config.execution_config().is_err());
     }
 
     #[test]
@@ -2093,9 +2302,11 @@ mod tests {
         let actual = source_pins().unwrap();
         let common = rz_experiments::compiled_source_components_v5().unwrap();
         assert_eq!(actual.len(), 5);
-        assert!(actual
-            .iter()
-            .all(|(name, digest)| common.get(name) == Some(digest)));
+        assert!(
+            actual
+                .iter()
+                .all(|(name, digest)| common.get(name) == Some(digest))
+        );
         assert!(!id("unsafe:ads"));
     }
 }
