@@ -371,6 +371,8 @@ impl PcCollectionOwnersV3 {
             joined_offered: false,
             unstarted_proof: None,
             unstarted_released: false,
+            before_admission_join: None,
+            before_admission_released: false,
         })
     }
 }
@@ -388,9 +390,52 @@ pub(crate) struct PcCollectionRunV3 {
     joined_offered: bool,
     unstarted_proof: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3>,
     unstarted_released: bool,
+    before_admission_join:
+        Option<crate::rovent_collect::pc_worker_v3::PcSupervisorBeforeAdmissionJoinProofV3>,
+    before_admission_released: bool,
 }
 
 impl PcCollectionRunV3 {
+    /// A created driver may be retired independently only if its original
+    /// join proves it never crossed the root-admission barrier. A panic is
+    /// kept in the original custody and remains observable in the proof.
+    pub(crate) fn try_release_before_admission_driver(&mut self) -> Result<bool, &'static str> {
+        if self.before_admission_released {
+            return Ok(true);
+        }
+        if self.before_admission_join.is_none() {
+            {
+                let mut custody = match self.owners.driver_custody.try_lock() {
+                    Ok(custody) => custody,
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err("P-C supervisor custody poisoned");
+                    }
+                };
+                custody.try_join();
+            }
+            self.before_admission_join =
+                SupervisorStartCustodyV3::before_admission_join_proof(&self.owners.driver_custody)?;
+        }
+        let Some(proof) = self.before_admission_join.as_ref() else {
+            return Ok(false);
+        };
+        if !proof.matches_original(
+            &self.owners.driver_custody,
+            &self.owners.supervisor,
+            &self.owners.native,
+        ) {
+            return Err("P-C before-admission proof belongs to another owner");
+        }
+        if !SupervisorStartCustodyV3::release_before_admission_join(
+            &self.owners.driver_custody,
+            proof,
+        )? {
+            return Ok(false);
+        }
+        self.before_admission_released = true;
+        Ok(true)
+    }
     /// Retire the original driver if it is provably unstarted. The resource
     /// outcome stays owned and pending until its own recovery is complete.
     pub(crate) fn try_release_unstarted_driver(&mut self) -> Result<bool, &'static str> {
