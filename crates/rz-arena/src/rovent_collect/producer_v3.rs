@@ -392,8 +392,7 @@ impl RoventCorpusProducerLockV3 {
         )?;
         let source = accepted.ranking().source();
         accepted
-            .admission()
-            .validate_output(&source.ticket, output)
+            .validate_observed_output(output)
             .map_err(|error| invalid(error.to_string()))?;
         check(
             native_acceptance_output_digest(output).map_err(|error| invalid(error.to_string()))?

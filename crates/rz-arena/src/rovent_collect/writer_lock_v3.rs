@@ -271,34 +271,29 @@ impl RoventCorpusWriterLockV3 {
             .checked_add(512)
             .ok_or_else(|| invalid("writer /3 byte count overflow"))?;
         check(total <= self.output_bytes_max, "writer /3 chunk/index cap")?;
-        let bytes = std::mem::take(&mut self.buffer);
+        self.index
+            .chunks
+            .try_reserve(1)
+            .map_err(|_| invalid("writer /3 chunk index allocation"))?;
         let declaration = RoventCorpusChunk {
             path: format!("chunks/{:06}.jsonl", self.index.chunks.len()),
-            bytes: bytes.len() as u64,
-            sha256: hex(Digest(Sha256::digest(&bytes).into())),
+            bytes: self.buffer.len() as u64,
+            sha256: hex(Digest(Sha256::digest(&self.buffer).into())),
             records: self.buffer_rows,
         };
+        // Complete allocation and hashing before moving the sole buffer out.
+        let indexed = declaration.clone();
+        let bytes = std::mem::take(&mut self.buffer);
         self.total_bytes = total;
         self.buffer_rows = 0;
-        self.index.chunks.push(declaration.clone());
+        self.index.chunks.push(indexed);
         Ok(Some(RoventChunkPacket { declaration, bytes }))
     }
 
     /// Only assembles the already-flushed corpus. On failure the caller gets
     /// the original writer back; success does not prove physical completion.
     pub fn finish(self) -> Result<FinishedRoventCorpusLockV3, Box<(ArenaError, Self)>> {
-        let result = (|| {
-            check(
-                self.uncertain_append.is_none()
-                    && self.buffer.is_empty()
-                    && self.index.record_count > 0
-                    && !self.admissions.is_empty()
-                    && self.index.record_count as usize == self.record_seals.len(),
-                "writer /3 finish requires flushed original rows",
-            )?;
-            self.index.validate(&self.manifest, &self.lock)?;
-            Ok::<(), ArenaError>(())
-        })();
+        let result = self.validate_finish();
         if let Err(error) = result {
             return Err(Box::new((error, self)));
         }
@@ -307,6 +302,40 @@ impl RoventCorpusWriterLockV3 {
             index: self.index,
             admissions: self.admissions,
         })
+    }
+
+    fn validate_finish(&self) -> Result<(), ArenaError> {
+        check(
+            self.uncertain_append.is_none()
+                && self.buffer.is_empty()
+                && self.index.record_count > 0
+                && !self.admissions.is_empty()
+                && self.index.record_count as usize == self.record_seals.len(),
+            "writer /3 finish requires flushed original rows",
+        )?;
+        self.index.validate(&self.manifest, &self.lock)?;
+        Ok(())
+    }
+
+    /// Validate before moving the original writer; an error or unwind leaves
+    /// it in the caller-owned slot. A finished value is assembled evidence,
+    /// not a physical worker or durable publication receipt.
+    pub(super) fn finish_in_slots(
+        owner: &mut Option<Self>,
+        finished: &mut Option<FinishedRoventCorpusLockV3>,
+    ) -> Result<(), ArenaError> {
+        check(finished.is_none(), "writer /3 finished slot occupied")?;
+        let current = owner
+            .as_ref()
+            .ok_or_else(|| invalid("writer /3 owner slot empty"))?;
+        current.validate_finish()?;
+        let current = owner.take().expect("validated original writer slot");
+        *finished = Some(FinishedRoventCorpusLockV3 {
+            manifest: current.manifest,
+            index: current.index,
+            admissions: current.admissions,
+        });
+        Ok(())
     }
 }
 
