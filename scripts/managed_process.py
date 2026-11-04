@@ -14,18 +14,19 @@ class ProcessNotSpawned(RuntimeError):
 
 
 def _group_has_live_members(pgid):
-    for entry in os.scandir("/proc"):
-        if not entry.name.isdecimal():
-            continue
-        try:
-            with open(f"{entry.path}/stat", encoding="utf-8") as stream:
-                fields = stream.read().rsplit(")", 1)[1].split()
-            if int(fields[2]) == pgid and fields[0] not in {"Z", "X"}:
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            try:
+                with open(f"{entry.path}/stat", encoding="utf-8") as stream:
+                    fields = stream.read().rsplit(")", 1)[1].split()
+                if int(fields[2]) == pgid and fields[0] not in {"Z", "X"}:
+                    return True
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (OSError, ValueError, IndexError):
                 return True
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        except (OSError, ValueError, IndexError):
-            return True
     return False
 
 
