@@ -24,6 +24,9 @@ pub(super) mod v2_session;
 #[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
 #[allow(dead_code)]
 pub(super) mod v3_session;
+#[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
+#[allow(dead_code)]
+pub(super) mod v3_dispatch;
 pub use session::*;
 mod pump;
 pub use pump::*;

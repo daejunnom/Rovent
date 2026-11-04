@@ -30,6 +30,62 @@ impl RoventCollectionTeacherPhysicalOwnerV3 {
     pub fn member_witness(&self) -> &CollectionProcessMemberWitness {
         &self.member_witness
     }
+    /// These describe the originally bound source, not process startup.
+    pub fn source_index(&self) -> usize {
+        self.actor().source_index()
+    }
+    pub fn launch(&self) -> &PreparedRoventExternalLaunch {
+        &self.actor().source().prepared
+    }
+    /// Historical observation from this actual worker. The returned common
+    /// startup record is neither a /2 receipt nor proof of current liveness,
+    /// teacher result, option readback, or eventual physical retirement.
+    pub fn verified_startup(&self) -> Result<Option<VerifiedRoventExternalStartup>, CheckerError> {
+        let Some(startup) = self.worker.startup_report() else {
+            return Ok(None);
+        };
+        let actor = self.actor();
+        let root = self.admission().root_admission();
+        let launch = self.launch();
+        let original = root.owner().v3().ok_or(invalid("teacher /3 original lock absent"))?;
+        let registration = self.worker.registration();
+        let original_digest = Digest(rz_eval::asset::parse_sha256(&original.canonical_sha256)
+            .map_err(|_| invalid("teacher /3 lock digest syntax"))?);
+        if !launch.original_lock_owner_v3().is_some_and(|lock| Arc::ptr_eq(lock, original))
+            || launch.input_lock_sha256.as_deref() != Some(original.canonical_sha256.as_str())
+            || root.startup_lock_digest() != original_digest
+            || actor.source().index != actor.source_index()
+            || registration.collection_owner != actor.collection_owner()
+            || registration.authority != root.authority()
+            || registration.original_deadline != root.hard_deadline()
+            || registration.input_lock != root.startup_lock_digest()
+            || registration.root_admission != root.descriptor().digest()
+                .map_err(|_| invalid("teacher /3 root digest"))?
+            || registration.root_budget != self.admission().root_budget()
+            || registration.frozen_actor != actor.actor_digest()
+            || self.worker.profile() != launch.profile().engine
+        {
+            return Err(invalid("teacher /3 startup original source or worker mismatch"));
+        }
+        let observed_uci = startup.result?;
+        if observed_uci.name != launch.profile().expected_uci_name {
+            return Err(invalid("teacher /3 actual UCI name"));
+        }
+        let external = startup.attempt
+            .ok_or(invalid("teacher /3 startup attempt absent"))?
+            .external.ok_or(invalid("teacher /3 startup process absent"))?;
+        if external.request_id != 0 || external.partial_report.is_some() || !reusable(external.process) {
+            return Err(invalid("teacher /3 startup physical evidence"));
+        }
+        Ok(Some(VerifiedRoventExternalStartup {
+            canonical_sha256: launch.canonical_sha256().to_owned(),
+            capability_sha256: launch.capability_sha256().to_owned(),
+            input_lock_sha256: original.canonical_sha256.clone(),
+            observed_uci,
+            process: external.process.process_identity
+                .ok_or(invalid("teacher /3 startup process identity"))?,
+        }))
+    }
     fn actor(&self) -> &BoundCollectionTeacherActorV3 {
         self.actor.as_ref().expect("retained /3 teacher actor")
     }

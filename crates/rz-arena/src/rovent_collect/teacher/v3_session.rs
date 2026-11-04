@@ -40,6 +40,7 @@ struct ActorV3 {
     recovery_key: Option<TeacherRecoveryKeyV3>,
     terminal: Option<RoventTeacherWorkerTerminalTokenV3>,
     spawn_attempted: bool,
+    dispatch_claimed: bool,
 }
 
 /// A failed one-shot claim returns the original scope or capability.
@@ -83,6 +84,39 @@ pub(crate) struct RoventCollectionTeacherSessionV3 {
 }
 
 impl RoventCollectionTeacherSessionV3 {
+    pub(crate) fn original_admission(&self) -> &RoventCollectionRootAdmissionV3 {
+        &self.admission
+    }
+
+    pub(crate) fn manifest_lock(&self) -> &Arc<RoventCorpusManifestLockV3> {
+        &self.manifest
+    }
+
+    pub(crate) fn registration(&self) -> &Arc<RoventCorpusManifestV2> {
+        &self.registration
+    }
+
+    pub(crate) fn actor_registration(&self, actor_id: &str) -> Option<TeacherWorkerRegistration> {
+        self.actors.get(actor_id).map(|actor| actor.registration)
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing
+    }
+
+    /// A physical actor has one dispatcher and one sequence namespace for the
+    /// whole original root. Dropping a dispatcher does not permit re-issuance.
+    pub(crate) fn claim_dispatch_owner(&mut self, actor_id: &str) -> bool {
+        let Some(actor) = self.actors.get_mut(actor_id) else {
+            return false;
+        };
+        if self.closing || actor.dispatch_claimed {
+            return false;
+        }
+        actor.dispatch_claimed = true;
+        true
+    }
+
     pub(crate) fn prepare(
         admission: &RoventCollectionRootAdmissionV3,
         startup: &RoventStartupControl,
@@ -129,7 +163,7 @@ impl RoventCollectionTeacherSessionV3 {
             actors.insert(entry.actor_id, ActorV3 {
                 bound: Some(bound), registration: worker, permit: None,
                 lifecycle: None, recovery_key: None, terminal: None,
-                spawn_attempted: false,
+                spawn_attempted: false, dispatch_claimed: false,
             });
         }
         let scope = CollectionProcessScope::new(manifest_digest, actors.values().map(|a| a.registration).collect())
