@@ -1214,6 +1214,51 @@ fn system_supervisor_socket() -> Result<std::os::unix::net::UnixDatagram> {
     Ok(socket)
 }
 
+/// Check the parent's actual absolute deadline immediately before worker
+/// creation. Rust's Instant on Linux and CLOCK_MONOTONIC share the monotonic
+/// clock; computing remaining duration before reading the clock is deliberately
+/// conservative by the time spent reading it.
+#[cfg(target_os = "linux")]
+fn check_supervisor_deadline(work_until: Instant, cleanup: Duration) -> Result<()> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: std::os::raw::c_long,
+        tv_nsec: std::os::raw::c_long,
+    }
+    extern "C" {
+        fn clock_gettime(clock_id: std::os::raw::c_int, out: *mut Timespec) -> std::os::raw::c_int;
+    }
+    let supervisor_ns =
+        std::env::var("ROVEZERO_SUPERVISOR_DEADLINE_MONOTONIC_NS")?.parse::<u128>()?;
+    let remaining = work_until
+        .checked_duration_since(Instant::now())
+        .ok_or("work deadline expired before supervisor admission")?;
+    let mut now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: now points to a valid writable Linux timespec; clock id 1 is
+    // CLOCK_MONOTONIC. No resources or native model runtimes are entered.
+    if unsafe { clock_gettime(1, &mut now) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if now.tv_sec < 0 || !(0..1_000_000_000).contains(&now.tv_nsec) {
+        return Err("invalid monotonic clock reading".into());
+    }
+    let required_ns = (now.tv_sec as u128)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(now.tv_nsec as u128))
+        .and_then(|value| value.checked_add(remaining.as_nanos()))
+        .and_then(|value| value.checked_add(cleanup.as_nanos()))
+        .ok_or("supervisor deadline conversion overflow")?;
+    if required_ns > supervisor_ns {
+        return Err(
+            "supervisor deadline cannot contain the original work and cleanup windows".into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct SystemPhysicalUnknown {
@@ -1301,6 +1346,36 @@ impl Error for CaptureAndCleanupFailure {
         Some(self.primary.as_ref())
     }
 }
+
+#[cfg(target_os = "linux")]
+struct CapturePanicFailure {
+    stage: &'static str,
+    _original_payload: Box<dyn std::any::Any + Send>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for CapturePanicFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturePanicFailure")
+            .field("stage", &self.stage)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for CapturePanicFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "system capture {} panicked; original panic payload retained",
+            self.stage
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for CapturePanicFailure {}
 
 #[cfg(target_os = "linux")]
 impl SystemCaptureWorker {
@@ -2074,6 +2149,7 @@ fn execute(config: Config) -> Result<()> {
             // Admission must establish the supervisor channel before any
             // reservation, worker creation, or ORT entry.
             let supervisor = system_supervisor_socket()?;
+            check_supervisor_deadline(until, Duration::from_secs(config.cleanup_seconds))?;
             let custody = system_startup_custody(
                 &config.export_manifest,
                 &summary,
@@ -2131,7 +2207,15 @@ fn execute(config: Config) -> Result<()> {
                 quarantined: false,
             };
             owner.send_supervisor(b"PENDING");
-            let started = match owner.start(until) {
+            let start_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.start(until)))
+                    .unwrap_or_else(|payload| {
+                        Err(Box::new(CapturePanicFailure {
+                            stage: "startup",
+                            _original_payload: payload,
+                        }))
+                    });
+            let started = match start_result {
                 Ok(started) => started,
                 Err(startup) => {
                     let registered = system_cleanup_limit.ok_or("system cleanup limit absent")?;
@@ -2166,7 +2250,7 @@ fn execute(config: Config) -> Result<()> {
     let mut initial_partial_failure: Option<String> = None;
     #[cfg(not(target_os = "linux"))]
     let initial_partial_failure: Option<String> = None;
-    let work = (|| -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut work_fn = || -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut outputs = (0..plan.groups.len()).map(|_| None).collect::<Vec<_>>();
         let mut bytes = 0u64;
         let mut completion = 0u64;
@@ -2358,7 +2442,20 @@ fn execute(config: Config) -> Result<()> {
         write_pending(&stage_pending, &stages, LIMIT as u64)?;
         outputs.push((stage_pending, root.join("actual-stage-counters.json")));
         Ok(outputs)
-    })();
+    };
+    #[cfg(target_os = "linux")]
+    let work = if system_cuda {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(work_fn)).unwrap_or_else(|payload| {
+            Err(Box::new(CapturePanicFailure {
+                stage: "capture",
+                _original_payload: payload,
+            }))
+        })
+    } else {
+        work_fn()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let work = work_fn();
     let cleanup_until = if let Some(registered) = system_cleanup_limit {
         Instant::now()
             .checked_add(Duration::from_secs(config.cleanup_seconds))
