@@ -342,6 +342,12 @@ pub struct RoventPcCollectionWorkerV3 {
 /// process-local quarantine. It does not imply completion or authorization.
 #[derive(Clone)]
 pub struct RoventPcCollectionWorkerKeyV3(Arc<()>);
+impl RoventPcCollectionWorkerKeyV3 {
+    /// Identity comparison only; this grants neither completion nor recovery.
+    pub fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 struct QuarantinedPcWorkerV3 {
     key: RoventPcCollectionWorkerKeyV3,
     admission: RoventCollectionRootAdmissionV3,
