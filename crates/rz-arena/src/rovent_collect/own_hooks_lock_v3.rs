@@ -6,7 +6,10 @@
 
 use super::native_capture::RoventNativeCaptureRegistration;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
+use super::own_worker_v3::OwnRootRecoveryV3;
 use super::speculative_route_v3::SpeculativeRootV3;
+use super::teacher::v3_pump::TeacherPumpV3;
+use super::teacher::v3_session::TeacherSessionStagingV3;
 use rz_search::pals::engine::adaptive_port::AdaptivePortQuestion;
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionBoundaryV2, AdaptiveCollectionObserverBoxV3,
@@ -33,12 +36,15 @@ struct RootSlot {
     admission: RoventCollectionRootAdmissionV3,
     requested: bool,
     revoked: Arc<AtomicBool>,
+    worker_reserved: bool,
+    teacher_reserved: bool,
     installed: bool,
     owner: Option<RoventCollectionOwnerLockV3>,
     observer: Option<Observer>,
     route: Option<SpeculativeRootV3>,
     worker: Option<RoventBoardCollectionWorkerV3>,
     worker_key: Option<RoventBoardCollectionWorkerKeyV3>,
+    recovery: Option<Arc<Mutex<OwnRootRecoveryV3>>>,
     handoff: Option<Handoff>,
     joined: Option<Custody>,
     returned: Option<Arc<Mutex<Custody>>>,
@@ -51,6 +57,8 @@ struct State {
     slots: Vec<RootSlot>,
     deferred: Vec<Arc<Mutex<RoventBoardDeferredCleanupV3>>>,
     maximum_roots: usize,
+    maximum_workers: usize,
+    maximum_teacher_roots: usize,
 }
 
 /// Both this hook and its external supervisor retain this same Arc. The
@@ -81,6 +89,9 @@ pub(crate) struct OwnPreparedRootV3 {
     pub owner: RoventCollectionOwnerLockV3,
     pub route: SpeculativeRootV3,
     pub worker: RoventBoardCollectionWorkerV3,
+    pub stage: Arc<Mutex<TeacherSessionStagingV3>>,
+    pub pump: Arc<Mutex<TeacherPumpV3>>,
+    pub recovery: Arc<Mutex<OwnRootRecoveryV3>>,
 }
 pub(crate) enum OwnPrepareOutcomeV3 {
     Prepared,
@@ -95,13 +106,26 @@ pub(crate) enum OwnPrepareOutcomeV3 {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnReserveOutcomeV3 {
+    Reserved,
+    AlreadyReserved,
+    Busy,
+    Exhausted,
+}
+
 impl RoventOwnCollectionBridgeV3 {
     /// Called before native startup. No worker or teacher is started here.
     pub(crate) fn new(
         registration: RoventNativeCaptureRegistration,
         maximum_roots: usize,
+        maximum_workers: usize,
+        maximum_teacher_roots: usize,
     ) -> Result<Arc<Self>, &'static str> {
-        if !(1..=64).contains(&maximum_roots) {
+        if !(1..=64).contains(&maximum_roots)
+            || !(1..=maximum_roots).contains(&maximum_workers)
+            || !(1..=maximum_workers).contains(&maximum_teacher_roots)
+        {
             return Err("Own /3 root capacity");
         }
         let mut slots = Vec::new();
@@ -120,6 +144,8 @@ impl RoventOwnCollectionBridgeV3 {
                 slots,
                 deferred,
                 maximum_roots,
+                maximum_workers,
+                maximum_teacher_roots,
             }),
             request_sender,
             request_receiver: Mutex::new(request_receiver),
@@ -142,6 +168,109 @@ impl RoventOwnCollectionBridgeV3 {
 
     pub(crate) fn startup(&self) -> Option<&RoventStartupControl> {
         self.startup.get()
+    }
+
+    /// Reserve independent root-worker and teacher-process capacity before
+    /// starting either. Unresolved originals continue consuming their slots.
+    pub(crate) fn try_reserve_root(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<OwnRootRecoveryV3>>,
+        teacher: bool,
+    ) -> Result<OwnReserveOutcomeV3, &'static str> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(OwnReserveOutcomeV3::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned"),
+        };
+        let Some(index) = state
+            .slots
+            .iter()
+            .position(|slot| slot.admission.same_original_admission(admission))
+        else {
+            return Err("Own /3 original request absent");
+        };
+        let slot = &state.slots[index];
+        if slot.revoked.load(Ordering::Acquire)
+            || !slot
+                .recovery
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, recovery))
+        {
+            return Err("Own /3 recovery owner is revoked or changed");
+        }
+        if if teacher {
+            slot.teacher_reserved
+        } else {
+            slot.worker_reserved
+        } {
+            return Ok(OwnReserveOutcomeV3::AlreadyReserved);
+        }
+        if teacher && !slot.worker_reserved {
+            return Err("Own /3 worker quota must be reserved first");
+        }
+        let in_use = state
+            .slots
+            .iter()
+            .filter(|slot| {
+                if teacher {
+                    slot.teacher_reserved
+                } else {
+                    slot.worker_reserved
+                }
+            })
+            .count();
+        let limit = if teacher {
+            state.maximum_teacher_roots
+        } else {
+            state.maximum_workers
+        };
+        if in_use >= limit {
+            return Ok(OwnReserveOutcomeV3::Exhausted);
+        }
+        if teacher {
+            state.slots[index].teacher_reserved = true;
+        } else {
+            state.slots[index].worker_reserved = true;
+        }
+        Ok(OwnReserveOutcomeV3::Reserved)
+    }
+
+    /// Install the original recovery owner before it starts any acquisition.
+    /// Busy or mismatch never transfers or destroys the caller's Arc.
+    pub(crate) fn try_publish_recovery(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<OwnRootRecoveryV3>>,
+    ) -> Result<bool, &'static str> {
+        let original = match recovery.try_lock() {
+            Ok(value) => value,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 recovery poisoned"),
+        };
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned"),
+        };
+        let Some(slot) = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.admission.same_original_admission(admission))
+        else {
+            return Err("Own /3 original request absent");
+        };
+        if !original.matches_admission(admission)
+            || !Arc::ptr_eq(&original.request.revoked, &slot.revoked)
+            || slot.revoked.load(Ordering::Acquire)
+        {
+            return Err("Own /3 request or revocation owner differs");
+        }
+        if let Some(existing) = &slot.recovery {
+            return Ok(Arc::ptr_eq(existing, recovery));
+        }
+        slot.recovery = Some(Arc::clone(recovery));
+        Ok(true)
     }
 
     /// The caller creates the actual worker and teacher owner outside the
@@ -233,6 +362,8 @@ impl RoventOwnCollectionBridgeV3 {
             };
         };
         if !slot.requested
+            || !slot.worker_reserved
+            || !slot.teacher_reserved
             || slot.revoked.load(Ordering::Acquire)
             || slot.installed
             || slot.worker.is_some()
@@ -240,6 +371,39 @@ impl RoventOwnCollectionBridgeV3 {
         {
             return OwnPrepareOutcomeV3::Rejected {
                 reason: "Own /3 root already prepared".into(),
+                original,
+            };
+        }
+        if !slot
+            .recovery
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &original.recovery))
+        {
+            return OwnPrepareOutcomeV3::Rejected {
+                reason: "Own /3 original recovery not registered".into(),
+                original,
+            };
+        }
+        let matches_original = match original.recovery.try_lock() {
+            Ok(recovery) => recovery.matches_prepared(
+                &original.admission,
+                &original.route,
+                &original.owner,
+                &original.stage,
+                &original.pump,
+                &original.worker.recovery_key(),
+            ),
+            Err(TryLockError::WouldBlock) => return OwnPrepareOutcomeV3::Busy(original),
+            Err(TryLockError::Poisoned(_)) => {
+                return OwnPrepareOutcomeV3::Rejected {
+                    reason: "Own /3 recovery poisoned".into(),
+                    original,
+                };
+            }
+        };
+        if !matches_original {
+            return OwnPrepareOutcomeV3::Rejected {
+                reason: "Own /3 staged teacher owner differs".into(),
                 original,
             };
         }
@@ -254,6 +418,9 @@ impl RoventOwnCollectionBridgeV3 {
             owner,
             route,
             worker,
+            stage: _,
+            pump: _,
+            recovery: _,
         } = original;
         slot.observer = Some(observer);
         slot.owner = Some(owner);
@@ -439,12 +606,15 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                     admission: admission.clone(),
                     requested: false,
                     revoked: Arc::new(AtomicBool::new(false)),
+                    worker_reserved: false,
+                    teacher_reserved: false,
                     installed: false,
                     owner: None,
                     observer: None,
                     route: None,
                     worker: None,
                     worker_key: None,
+                    recovery: None,
                     handoff: None,
                     joined: None,
                     returned: None,
