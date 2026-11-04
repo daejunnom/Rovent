@@ -110,6 +110,12 @@ impl RoventNoCaptureRootCapabilityV3 {
         fence.matches_original_capability(self)
     }
 
+    /// The Own fence also belongs to one original manager and native owner;
+    /// its public receipt is not by itself authority for marker cleanup.
+    pub fn matches_own_fence(&self, fence: &super::super::RoventOwnNoCaptureFenceV3) -> bool {
+        fence.matches_original_capability(self)
+    }
+
     /// Late discard checks immutable owner and ticket identity even after
     /// root revocation. It grants no new admission or completion authority.
     pub fn validate_native_discard_owner<V, Q, P>(

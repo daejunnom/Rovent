@@ -86,6 +86,10 @@ where
             collection_admission_v2: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             collection_v2_settlement: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+            no_capture_original_v3: OnceLock::new(),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+            no_capture_cleanup_confirmed_v3: false,
             roles: Vec::with_capacity(limits.role_tickets_max),
             acknowledgements: VecDeque::with_capacity(limits.role_tickets_max),
             own: own_workers

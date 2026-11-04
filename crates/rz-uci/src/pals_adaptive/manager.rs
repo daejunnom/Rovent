@@ -1981,6 +1981,30 @@ pub struct AdaptiveShutdownReceipt {
     external_root_fence: Option<ExternalRootFence>,
     external_owner: Option<CpuWorkerId>,
 }
+
+/// Root closure issued by this manager for its original V3 no-capture scope.
+/// A public shutdown receipt alone cannot manufacture this authority.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+#[derive(Clone)]
+pub struct RoventOwnNoCaptureFenceV3 {
+    capability: collection::RoventNoCaptureRootCapabilityV3,
+    receipt: AdaptiveShutdownReceipt,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+impl RoventOwnNoCaptureFenceV3 {
+    pub fn receipt(&self) -> &AdaptiveShutdownReceipt {
+        &self.receipt
+    }
+
+    pub(in crate::pals_adaptive::manager) fn matches_original_capability(
+        &self,
+        capability: &collection::RoventNoCaptureRootCapabilityV3,
+    ) -> bool {
+        capability.same_original_capability(&self.capability)
+            && capability.matches_shutdown_receipt(&self.receipt)
+    }
+}
 impl AdaptiveShutdownReceipt {
     fn external_closed(&self) -> bool {
         match self.external_owner {
@@ -2408,6 +2432,10 @@ where
     collection_admission_v2: Option<collection::VersionedCollectionAdmission>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     collection_v2_settlement: Option<Result<(), AdaptiveCollectionError>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    no_capture_original_v3: OnceLock<collection::RoventNoCaptureRootCapabilityV3>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    no_capture_cleanup_confirmed_v3: bool,
     cpu_semantic: Option<cpu_semantic::CpuSemanticState<Q>>,
     utility_route: Option<utility_route::UtilityRouteState<Q>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -3036,6 +3064,12 @@ where
                 "V2 collection observer must be returned",
             ));
         }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        if self.no_capture_original_v3.get().is_some() && !self.no_capture_cleanup_confirmed_v3 {
+            return Err(AdaptiveManagerError::Invalid(
+                "Own V3 no-capture cleanup not confirmed",
+            ));
+        }
         if self.nnuec.is_some() || self.own.iter().any(|slot| slot.nnuec_retirement.is_some()) {
             return Err(AdaptiveManagerError::Invalid(
                 "NNUEC requires actual actor retirement transfer",
@@ -3135,6 +3169,7 @@ where
         if self.root_started
             || !self.roles.is_empty()
             || self.phase != ManagerPhase::Running
+            || self.has_original_no_capture_v3()
             || self.collection_observer_v2.is_some()
             || self.collection_admission_v2.is_some()
             || self.collection_observer.is_some()
@@ -3199,14 +3234,107 @@ where
                 .ok_or(AdaptiveManagerError::Invalid(
                     "V3 no-capture native verifier unavailable",
                 ))?;
-        collection::RoventNoCaptureRootCapabilityV3::new(admission.clone(), verifier).map_err(
-            |error| match error {
+        if let Some(original) = self.no_capture_original_v3.get() {
+            if !original.same_original_admission(admission)
+                || !original.same_native_owner(&verifier)
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "Own V3 no-capture capability differs from original owner",
+                ));
+            }
+            return Ok(original.clone());
+        }
+        let capability =
+            collection::RoventNoCaptureRootCapabilityV3::new(admission.clone(), verifier.clone())
+                .map_err(|error| match error {
                 collection::RoventNoCaptureIssueErrorV3::Busy(_) => {
                     AdaptiveManagerError::AuxiliaryPending
                 }
                 collection::RoventNoCaptureIssueErrorV3::Rejected(error) => error.into(),
-            },
-        )
+            })?;
+        let _ = self.no_capture_original_v3.set(capability);
+        let original = self
+            .no_capture_original_v3
+            .get()
+            .expect("original capability set");
+        if !original.same_original_admission(admission) || !original.same_native_owner(&verifier) {
+            return Err(AdaptiveManagerError::Invalid(
+                "Own V3 no-capture capability differs from original owner",
+            ));
+        }
+        Ok(original.clone())
+    }
+
+    /// Retain the same original capability during a pending marker install.
+    /// This observation does not establish installation or physical closure.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    pub(crate) fn original_no_capture_v3(
+        &self,
+    ) -> Option<&collection::RoventNoCaptureRootCapabilityV3> {
+        self.no_capture_original_v3.get()
+    }
+
+    /// Seal only this manager's finished root and actual native worker.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    pub(crate) fn own_no_capture_fence_v3(
+        &self,
+        capability: &collection::RoventNoCaptureRootCapabilityV3,
+    ) -> Result<RoventOwnNoCaptureFenceV3, AdaptiveManagerError> {
+        let original = self
+            .no_capture_original_v3
+            .get()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "Own V3 original no-capture capability absent",
+            ))?;
+        if !original.same_original_capability(capability) {
+            return Err(AdaptiveManagerError::Invalid(
+                "Own V3 no-capture original differs",
+            ));
+        }
+        let verifier =
+            self.native
+                .native_acceptance_verifier()
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "Own V3 original native verifier absent",
+                ))?;
+        if !original.same_native_owner(&verifier) {
+            return Err(AdaptiveManagerError::Invalid("Own V3 native owner differs"));
+        }
+        let receipt = self.shutdown_receipt()?;
+        if self.phase != ManagerPhase::Finished || !original.matches_shutdown_receipt(&receipt) {
+            return Err(AdaptiveManagerError::PhysicalUnknown);
+        }
+        original.close_install();
+        Ok(RoventOwnNoCaptureFenceV3 {
+            capability: original.clone(),
+            receipt,
+        })
+    }
+
+    /// Confirm only after the original marker owner reports removal or that
+    /// this exact capability was never installed.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    pub(crate) fn confirm_no_capture_v3_cleanup(
+        &mut self,
+        capability: &collection::RoventNoCaptureRootCapabilityV3,
+        fence: &RoventOwnNoCaptureFenceV3,
+    ) -> Result<(), AdaptiveManagerError> {
+        let original = self
+            .no_capture_original_v3
+            .get()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "Own V3 original no-capture capability absent",
+            ))?;
+        if self.phase != ManagerPhase::Finished
+            || !original.same_original_capability(capability)
+            || !original.matches_own_fence(fence)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "Own V3 no-capture cleanup owner differs",
+            ));
+        }
+        self.no_capture_cleanup_confirmed_v3 = true;
+        Ok(())
     }
 
     /// Install only an actual /3 observer whose driver supports all native
@@ -3224,6 +3352,7 @@ where
                 if self.root_started
                     || !self.roles.is_empty()
                     || self.phase != ManagerPhase::Running
+                    || self.has_original_no_capture_v3()
                     || self.collection_observer.is_some()
                     || self.collection_admission.is_some()
                     || self.collection_observer_v2.is_some()
@@ -3317,6 +3446,7 @@ where
                 if self.root_started
                     || !self.roles.is_empty()
                     || self.phase != ManagerPhase::Running
+                    || self.has_original_no_capture_v3()
                     || self.collection_observer.is_some()
                     || self.collection_admission.is_some()
                     || self.collection_observer_v2.is_some()
@@ -3535,6 +3665,7 @@ where
         if self.root_started
             || !self.roles.is_empty()
             || self.phase != ManagerPhase::Running
+            || self.has_original_no_capture_v3()
             || self.collection_observer.is_some()
             || self.has_collection_v2()
         {
@@ -3559,6 +3690,7 @@ where
         self.driver.validate_collection_admission(&admission)?;
         if self.root_started
             || !self.roles.is_empty()
+            || self.has_original_no_capture_v3()
             || self.collection_admission.is_some()
             || self.has_collection_v2()
             || self.phase != ManagerPhase::Running
@@ -3571,6 +3703,16 @@ where
         }
         self.collection_admission = Some(admission);
         Ok(())
+    }
+    fn has_original_no_capture_v3(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        {
+            self.no_capture_original_v3.get().is_some()
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux")))]
+        {
+            false
+        }
     }
     fn has_collection_v2(&self) -> bool {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
