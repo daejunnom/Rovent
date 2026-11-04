@@ -22,6 +22,10 @@ fn sources() -> &'static [(&'static str, &'static [u8])] {
         ),
         ("arena_deadline_grant", include_bytes!("deadline_grant.rs")),
         (
+            "arena_deadline_control",
+            include_bytes!("deadline_control.rs"),
+        ),
+        (
             "arena_execution_start",
             include_bytes!("execution_start.rs"),
         ),

@@ -7,6 +7,8 @@
 use crate::ArenaError;
 use rz_experiments::{PalsSystemStartupLockV6, SystemRuntimeReceiptV6};
 
+#[cfg(target_os = "linux")]
+mod deadline_control;
 mod deadline_grant;
 mod deadline_sources;
 mod execution_start;

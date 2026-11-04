@@ -85,7 +85,8 @@ fn validate_descriptor(fd: &OwnedFd, needs_read: bool, needs_write: bool) -> io:
 /// this value alone does not establish their origin or arena identity.
 #[derive(Clone)]
 pub(super) struct OriginalProxyWindowV6 {
-    pub started: Instant,
+    /// Local request reference for conservative bounds, not the arena start.
+    pub bound_reference: Instant,
     pub startup_until: Instant,
     pub run_until: Instant,
     pub cleanup_until: Instant,
@@ -278,15 +279,15 @@ impl ProxyCliInputsV6 {
         }
         let now = Instant::now();
         let max_startup = window
-            .started
+            .bound_reference
             .checked_add(Duration::from_millis(lock.config.native_options.startup_ms));
         let max_run = window
-            .started
+            .bound_reference
             .checked_add(Duration::from_millis(lock.config.window.wall_time_max_ms));
         let max_cleanup = window
             .run_until
             .checked_add(Duration::from_millis(lock.config.window.cleanup_max_ms));
-        if window.started > now
+        if window.bound_reference > now
             || window.startup_until <= now
             || max_startup.is_none_or(|bound| window.startup_until > bound)
             || max_run.is_none_or(|bound| window.run_until > bound)
@@ -357,7 +358,7 @@ impl ProxyCliInputsV6 {
             self.outgoing.take().expect("checked output"),
             self.diagnostics.take().expect("checked diagnostics"),
             self.max_line,
-            window.started,
+            window.bound_reference,
             window.run_until,
             window.cleanup_until,
             Arc::clone(&window.cancelled),

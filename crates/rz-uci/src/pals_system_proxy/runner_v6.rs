@@ -75,7 +75,7 @@ pub(super) struct PalsProxySupervisorV6 {
     unattached_input: Option<PalsDirectChildInputPipeV6>,
     run_until: Instant,
     finish_until: Instant,
-    window_started: Instant,
+    bound_reference: Instant,
     wall_time_max_ms: u64,
     cleanup_max_ms: u64,
     cancelled: Arc<AtomicBool>,
@@ -111,7 +111,7 @@ impl PalsProxySupervisorV6 {
         outgoing: OwnedFd,
         diagnostics: OwnedFd,
         max_line: usize,
-        window_started: Instant,
+        bound_reference: Instant,
         run_until: Instant,
         finish_until: Instant,
         cancelled: Arc<AtomicBool>,
@@ -130,7 +130,7 @@ impl PalsProxySupervisorV6 {
             unattached_input: None,
             run_until,
             finish_until,
-            window_started,
+            bound_reference,
             cancelled,
             finish_cancelled,
             max_line,
@@ -157,7 +157,7 @@ impl PalsProxySupervisorV6 {
 
     fn check_run(&self) -> io::Result<()> {
         let registered_run_end = self
-            .window_started
+            .bound_reference
             .checked_add(Duration::from_millis(self.wall_time_max_ms));
         let registered_cleanup_end = self
             .run_until
@@ -167,7 +167,7 @@ impl PalsProxySupervisorV6 {
                 io::ErrorKind::Interrupted,
                 "PALS proxy cancelled",
             ))
-        } else if self.window_started > Instant::now()
+        } else if self.bound_reference > Instant::now()
             || registered_run_end.is_none_or(|end| self.run_until > end)
             || registered_cleanup_end.is_none_or(|end| self.finish_until > end)
             || Instant::now() >= self.run_until
