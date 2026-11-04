@@ -332,29 +332,6 @@ impl PcCollectionOwnersV3 {
         &self.driver_custody
     }
 
-    /// Retain the typed proof for this exact original driver before any
-    /// no-worker release. Running or ambiguous states remain in custody.
-    pub(crate) fn seal_unstarted_driver(
-        &self,
-    ) -> Result<
-        Option<crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3>,
-        &'static str,
-    > {
-        SupervisorStartCustodyV3::seal_no_worker(&self.driver_custody, &self.native)
-    }
-
-    /// Release only the same original, sealed no-worker driver registration.
-    /// This does not release native, GPU, output, or resource custody.
-    pub(crate) fn release_sealed_unstarted_driver(
-        &self,
-        proof: &crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3,
-    ) -> Result<bool, &'static str> {
-        if !proof.matches_original(&self.driver_custody, &self.supervisor, &self.native) {
-            return Err("P-C no-worker proof belongs to another owner");
-        }
-        SupervisorStartCustodyV3::release_no_worker(&self.driver_custody)
-    }
-
     /// Resource validation is separate and precedes any worker start.
     pub(crate) fn validate_original_boundary(
         &self,
@@ -520,12 +497,7 @@ impl PcCollectionOwnersV3 {
             recovery,
             recovery_recorded,
             recovery_error,
-            pending_joined: None,
-            joined_offered: false,
-            unstarted_proof: None,
-            unstarted_released: false,
-            before_admission_join: None,
-            before_admission_released: false,
+            settled: false,
         })
     }
 }
@@ -540,168 +512,29 @@ pub(crate) struct PcCollectionRunV3 {
     recovery: super::pc_recovery_v3::PcRunRecoveryKeyV3,
     recovery_recorded: bool,
     recovery_error: Option<&'static str>,
-    pending_joined: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>,
-    joined_offered: bool,
-    unstarted_proof: Option<crate::rovent_collect::pc_worker_v3::PcSupervisorNoWorkerProofV3>,
-    unstarted_released: bool,
-    before_admission_join:
-        Option<crate::rovent_collect::pc_worker_v3::PcSupervisorBeforeAdmissionJoinProofV3>,
-    before_admission_released: bool,
+    settled: bool,
 }
 
 impl PcCollectionRunV3 {
-    /// Bounded recovery step for a driver that never admitted a root. A busy
-    /// owner is Pending, not failure; no native or resource result is inferred.
-    pub(crate) fn poll_pre_native_driver(
-        &mut self,
-    ) -> Result<PcDriverPollV3<bool>, PcDriverEvidenceErrorV3> {
-        if self.unstarted_released || self.before_admission_released {
-            return Ok(PcDriverPollV3::Ready(true));
-        }
-        if self.unstarted_proof.is_none() && self.before_admission_join.is_none() {
-            match SupervisorStartCustodyV3::try_seal_no_worker(
-                &self.owners.driver_custody,
-                &self.owners.native,
-            )? {
-                PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
-                PcDriverPollV3::Ready(proof) => self.unstarted_proof = proof,
-            }
-        }
-        if let Some(proof) = self.unstarted_proof.as_ref() {
-            if !proof.matches_original(
-                &self.owners.driver_custody,
-                &self.owners.supervisor,
-                &self.owners.native,
-            ) {
-                return Err(PcDriverEvidenceErrorV3::Invalid(
-                    "original no-worker proof differs",
-                ));
-            }
-            return match SupervisorStartCustodyV3::try_release_no_worker(
-                &self.owners.driver_custody,
-            )? {
-                PcDriverPollV3::Pending => Ok(PcDriverPollV3::Pending),
-                PcDriverPollV3::Ready(released) => {
-                    self.unstarted_released = released;
-                    Ok(PcDriverPollV3::Ready(released))
-                }
-            };
-        }
-        if self.before_admission_join.is_none() {
-            {
-                let mut custody = match self.owners.driver_custody.try_lock() {
-                    Ok(custody) => custody,
-                    Err(std::sync::TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
-                    Err(std::sync::TryLockError::Poisoned(_)) => {
-                        return Err(PcDriverEvidenceErrorV3::Poisoned("custody"));
-                    }
-                };
-                custody.try_join();
-            }
-            match SupervisorStartCustodyV3::try_before_admission_join_proof(
-                &self.owners.driver_custody,
-            )? {
-                PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
-                PcDriverPollV3::Ready(proof) => self.before_admission_join = proof,
-            }
-        }
-        let Some(proof) = self.before_admission_join.as_ref() else {
-            return Ok(PcDriverPollV3::Ready(false));
-        };
-        if !proof.matches_original(
-            &self.owners.driver_custody,
-            &self.owners.supervisor,
-            &self.owners.native,
-        ) {
-            return Err(PcDriverEvidenceErrorV3::Invalid(
-                "original before-admission proof differs",
-            ));
-        }
-        match SupervisorStartCustodyV3::try_release_before_admission_join(
-            &self.owners.driver_custody,
-            proof,
-        )? {
-            PcDriverPollV3::Pending => Ok(PcDriverPollV3::Pending),
-            PcDriverPollV3::Ready(released) => {
-                self.before_admission_released = released;
-                Ok(PcDriverPollV3::Ready(released))
-            }
-        }
+    /// This key names the retained original owner; it is not completion.
+    pub(crate) fn recovery_key(&self) -> super::pc_recovery_v3::PcRunRecoveryKeyV3 {
+        self.recovery.clone()
     }
-    /// A created driver may be retired independently only if its original
-    /// join proves it never crossed the root-admission barrier. A panic is
-    /// kept in the original custody and remains observable in the proof.
-    pub(crate) fn try_release_before_admission_driver(&mut self) -> Result<bool, &'static str> {
-        if self.before_admission_released {
+
+    /// Nonblocking progress for this original run. Pre-admission driver
+    /// retirement is independent of native/resource/output settlement. A
+    /// true result means settled owners are retained in the original slot.
+    pub(crate) fn try_settle(&mut self) -> Result<bool, &'static str> {
+        if self.settled {
             return Ok(true);
         }
-        if self.before_admission_join.is_none() {
-            {
-                let mut custody = match self.owners.driver_custody.try_lock() {
-                    Ok(custody) => custody,
-                    Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-                    Err(std::sync::TryLockError::Poisoned(_)) => {
-                        return Err("P-C supervisor custody poisoned");
-                    }
-                };
-                custody.try_join();
-            }
-            self.before_admission_join =
-                SupervisorStartCustodyV3::before_admission_join_proof(&self.owners.driver_custody)?;
-        }
-        let Some(proof) = self.before_admission_join.as_ref() else {
-            return Ok(false);
-        };
-        if !proof.matches_original(
-            &self.owners.driver_custody,
-            &self.owners.supervisor,
-            &self.owners.native,
-        ) {
-            return Err("P-C before-admission proof belongs to another owner");
-        }
-        if !SupervisorStartCustodyV3::release_before_admission_join(
-            &self.owners.driver_custody,
-            proof,
-        )? {
-            return Ok(false);
-        }
-        self.before_admission_released = true;
-        Ok(true)
-    }
-    /// Retire the original driver if it is provably unstarted. The resource
-    /// outcome stays owned and pending until its own recovery is complete.
-    pub(crate) fn try_release_unstarted_driver(&mut self) -> Result<bool, &'static str> {
-        if self.unstarted_released {
-            return Ok(true);
-        }
-        if self.unstarted_proof.is_none() {
-            self.unstarted_proof = self.owners.seal_unstarted_driver()?;
-        }
-        let Some(proof) = self.unstarted_proof.as_ref() else {
-            return Ok(false);
-        };
-        if !self.owners.release_sealed_unstarted_driver(proof)? {
-            return Ok(false);
-        }
-        self.unstarted_released = true;
-        Ok(true)
-    }
-    /// Progress exact driver settlement and then the original resource
-    /// outcome. A returned outcome still contains the native result and does
-    /// not claim durable publication or an independent GPU observation.
-    pub(crate) fn try_settle(
-        &mut self,
-    ) -> Result<
-        Option<crate::rovent_resource_scope::launch::RoventPcCollectionSettledOutcomeV3>,
-        &'static str,
-    > {
         if let Some(error) = self.recovery_error {
             return Err(error);
         }
         if !self.recovery_recorded {
             match self.recovery.try_record_outcome_key(&self.outcome) {
                 Ok(()) => self.recovery_recorded = true,
-                Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Busy) => return Ok(None),
+                Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Busy) => return Ok(false),
                 Err(super::pc_recovery_v3::PcRunRecoveryRecordErrorV3::Poisoned) => {
                     self.recovery_error = Some("Collection recovery slot poisoned");
                     return Err("Collection recovery slot poisoned");
@@ -712,65 +545,47 @@ impl PcCollectionRunV3 {
                 }
             }
         }
-        if !self.joined_offered {
-            match self.poll_pre_native_driver().map_err(|error| match error {
+        match self
+            .recovery
+            .poll_pre_admission_driver()
+            .map_err(|error| match error {
                 PcDriverEvidenceErrorV3::Poisoned(reason)
                 | PcDriverEvidenceErrorV3::Invalid(reason) => reason,
             })? {
-                PcDriverPollV3::Pending | PcDriverPollV3::Ready(true) => return Ok(None),
-                PcDriverPollV3::Ready(false) => {}
-            }
+            PcDriverPollV3::Pending | PcDriverPollV3::Ready(true) => return Ok(false),
+            PcDriverPollV3::Ready(false) => {}
         }
-        if !self.joined_offered && self.pending_joined.is_none() {
-            self.pending_joined = self.try_join_driver()?;
-        }
-        if !self.joined_offered && self.pending_joined.is_none() {
-            // Even a pre-auth native failure can leave this separately
-            // registered driver in Prepared/NoWorker custody. Its explicit
-            // proof-and-release path is distinct from a native result.
-            return Ok(None);
-        }
-        if let Some(proof) = self.pending_joined.take() {
-            if let Err(proof) = self.outcome.offer_joined_driver(&self.owners, proof) {
-                self.pending_joined = Some(proof);
-                return Err("P-C joined proof differs from resource owner");
-            }
-            self.joined_offered = true;
-        }
-        self.outcome.try_settle()
-    }
-
-    /// Advance the same driver's physical shutdown without waiting. A native
-    /// fence alone is insufficient: the bridge must first seal every original
-    /// root and teacher before it issues the exact supervisor authorization.
-    pub(crate) fn try_join_driver(
-        &mut self,
-    ) -> Result<Option<crate::rovent_collect::pc_worker_v3::PcSupervisorJoinedProofV3>, &'static str>
-    {
         let Some(fence) = self.owners.native.native_session_fence() else {
-            return Ok(None);
+            return Ok(false);
         };
         if self
             .recovery
             .try_prepare_stop(&self.owners.bridge, &fence)?
             == super::pc_recovery_v3::PcStopStepV3::Pending
         {
-            return Ok(None);
+            return Ok(false);
         }
         if self.recovery.try_handoff_stop()? == super::pc_recovery_v3::PcStopStepV3::Pending {
-            return Ok(None);
+            return Ok(false);
         }
-        {
-            let mut custody = match self.owners.driver_custody.try_lock() {
-                Ok(custody) => custody,
-                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err("P-C supervisor custody poisoned");
+        match self
+            .recovery
+            .poll_joined_driver(&mut self.outcome)
+            .map_err(|error| match error {
+                PcDriverEvidenceErrorV3::Poisoned(reason)
+                | PcDriverEvidenceErrorV3::Invalid(reason) => reason,
+            })? {
+            PcDriverPollV3::Pending | PcDriverPollV3::Ready(false) => Ok(false),
+            PcDriverPollV3::Ready(true) => {
+                match self.recovery.try_settle_outcome(&mut self.outcome)? {
+                    PcDriverPollV3::Pending => Ok(false),
+                    PcDriverPollV3::Ready(settled) => {
+                        self.settled = settled;
+                        Ok(settled)
+                    }
                 }
-            };
-            custody.try_join();
+            }
         }
-        SupervisorStartCustodyV3::joined_proof(&self.owners.driver_custody)
     }
 }
 
