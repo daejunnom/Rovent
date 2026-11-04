@@ -9,6 +9,10 @@ pub use checker_metadata::*;
 mod collection_v2;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use collection_v2::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+mod collection_v3;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+pub use collection_v3::*;
 #[cfg(all(target_os = "linux", feature = "onnx-cuda", feature = "pals-adaptive"))]
 mod admission_system_v6;
 mod completion_observation;
@@ -756,6 +760,8 @@ where
     #[cfg(feature = "pals-adaptive")]
     rovent_root_policy_v3: Option<RoventPcrRootPolicyV3>,
     rovent_collection_origin: Option<super::RoventNativeCollectionOrigin>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+    rovent_collection_v3: Option<collection_v3::RoventBoardCollectionStateV3<B>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     rovent_collection_origin_v2: Option<super::RoventNativeCollectionOriginV2>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -1777,6 +1783,8 @@ where
             #[cfg(feature = "pals-adaptive")]
             rovent_root_policy_v3: None,
             rovent_collection_origin: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+            rovent_collection_v3: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             rovent_collection_origin_v2: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -2454,6 +2462,16 @@ where
         observation: &mut AttemptObservation,
         semantic_completion: &mut Option<PalsCompletion>,
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        if self.rovent_collection_v3.is_some() {
+            // Do not run a collection root without its original V3 observer,
+            // Busy retry and teacher custody paths fully connected.
+            return Err(failure(
+                "RoventBoardCollectionV3Unavailable",
+                "V3 board collection root lifecycle is not yet connected",
+            )
+            .unknown_if_unclosed());
+        }
         if self.rovent.is_none()
             && (context.control.max_simulations == 0
                 || context.control.max_simulations > self.options.max_cpu_nodes)
@@ -3845,6 +3863,16 @@ where
         until: Instant,
     ) -> Result<AdaptiveSessionProcessReceipt, SearchSessionFailure> {
         self.closed.store(true, Ordering::Release);
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        if self
+            .rovent_collection_v3
+            .as_ref()
+            .is_some_and(|owner| owner.outstanding.load(Ordering::Acquire))
+        {
+            // Native finish cannot retire a separate V3 observer, marker or
+            // teacher. Preserve the exact session for later same-owner drain.
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if let Some(hooks) = &self.rovent_collection_hooks_v2 {
             // A native process fence cannot attest the separately owned V2
@@ -4379,6 +4407,14 @@ where
             .unwrap_or_else(|poison| poison.into_inner());
         let retained = std::mem::replace(state, SessionState::Moving);
         let physically_closed = matches!(retained, SessionState::Closed(_));
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu", target_os = "linux"))]
+        if let Some(owner) = self.rovent_collection_v3.take() {
+            if !physically_closed || owner.outstanding.load(Ordering::Acquire) {
+                // Retain the original observer/teacher owners whenever their
+                // complete scope has not been confirmed by this session.
+                std::mem::forget(owner);
+            }
+        }
         if physically_closed {
             drop(retained);
         } else {
