@@ -545,6 +545,53 @@ pub(crate) struct PcCollectionRunV3 {
 }
 
 impl PcCollectionRunV3 {
+    /// Poll this supervisor's original recovery without conflating contention,
+    /// a missing outcome, and poisoned custody. None is not a no-worker proof.
+    pub(crate) fn recover_original_poll(
+        owners: &Arc<PcCollectionOwnersV3>,
+        output: &Arc<ManagedOutputOwnerV3>,
+    ) -> Result<PcDriverPollV3<Option<Self>>, PcDriverEvidenceErrorV3> {
+        use super::pc_recovery_v3::{PcRunRecoveryKeyV3, PcRunRecoveryStateV3};
+        use crate::rovent_resource_scope::launch::RoventPcCollectionRecoveryErrorV3;
+        let snapshot = match PcRunRecoveryKeyV3::try_recovery_snapshot_for_supervisor(
+            owners.supervisor(),
+        )? {
+            PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+            PcDriverPollV3::Ready(None) => return Ok(PcDriverPollV3::Ready(None)),
+            PcDriverPollV3::Ready(Some(snapshot)) => snapshot,
+        };
+        if !Arc::ptr_eq(&snapshot.owners, owners) || !Arc::ptr_eq(&snapshot.output, output) {
+            return Err(PcDriverEvidenceErrorV3::Invalid("original recovery owners differ"));
+        }
+        let outcome = match snapshot.outcome_key.try_recover_typed() {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return Ok(PcDriverPollV3::Ready(None)),
+            Err(RoventPcCollectionRecoveryErrorV3::Busy) => return Ok(PcDriverPollV3::Pending),
+            Err(RoventPcCollectionRecoveryErrorV3::Poisoned) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("original outcome"));
+            }
+        };
+        if !outcome.matches_original_collection(owners.native()) {
+            return Err(PcDriverEvidenceErrorV3::Invalid("original outcome differs"));
+        }
+        let recovery_recorded = match snapshot.state {
+            PcRunRecoveryStateV3::Returned | PcRunRecoveryStateV3::Panicked => true,
+            PcRunRecoveryStateV3::Executing => false,
+            PcRunRecoveryStateV3::Prepared => {
+                return Err(PcDriverEvidenceErrorV3::Invalid("outcome was not executing"));
+            }
+        };
+        Ok(PcDriverPollV3::Ready(Some(Self {
+            owners: Arc::clone(owners),
+            output: Arc::clone(output),
+            outcome,
+            recovery: snapshot.recovery,
+            recovery_recorded,
+            recovery_error: None,
+            settled: false,
+        })))
+    }
+
     /// Reclaim only the outcome held by this supervisor's original recovery
     /// key. None does not prove that no worker or resource exists.
     pub(crate) fn recover_original(
