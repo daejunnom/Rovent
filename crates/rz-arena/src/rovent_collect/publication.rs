@@ -512,10 +512,107 @@ pub(super) fn publish_original_payloads_authorized<
     ) -> Result<P, ArenaError>,
     authorize: impl FnOnce() -> Result<(), ArenaError>,
 ) -> Result<P, ArenaError> {
+    publish_original_payloads_authorized_with_hook(
+        directory,
+        until,
+        cancel,
+        material,
+        build,
+        authorize,
+        |_, _| Ok(()),
+    )
+}
+
+/// Identifies an operation at the original managed publication boundary.
+/// `Authorize` may mutate the game gate; other events may mutate storage.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RoventPublicationHookEventV3 {
+    CreateDirectory,
+    CreatePayload,
+    WritePayload,
+    SyncPayload,
+    SyncChunk,
+    SyncDirectory,
+    LinkCommit,
+    RemovePending,
+    Authorize,
+}
+
+#[cfg(target_os = "linux")]
+impl RoventPublicationHookEventV3 {
+    /// A before hook should conservatively mark every listed operation as
+    /// attempted, including the game-gate authorization.
+    pub(super) const fn is_mutation(self) -> bool {
+        match self {
+            Self::CreateDirectory
+            | Self::CreatePayload
+            | Self::WritePayload
+            | Self::SyncPayload
+            | Self::SyncChunk
+            | Self::SyncDirectory
+            | Self::LinkCommit
+            | Self::RemovePending
+            | Self::Authorize => true,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RoventPublicationHookPhaseV3 {
+    Before,
+    After,
+}
+
+/// Calls `hook` immediately before and after each operation, including failed
+/// attempts. The caller records sticky uncertainty in `Before` before checking
+/// liveness. A failed operation retains precedence over a failed after-check.
+#[cfg(target_os = "linux")]
+pub(super) fn publish_original_payloads_authorized_with_hook<
+    P: serde::Serialize,
+    S: PublicationSourceBytes,
+>(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    material: RoventPublicationMaterial<'_, S>,
+    build: impl FnOnce(
+        RoventPublicationFile,
+        RoventPublicationFile,
+        Vec<RoventPublicationFile>,
+        Vec<RoventPublicationAdmission>,
+        u64,
+    ) -> Result<P, ArenaError>,
+    authorize: impl FnOnce() -> Result<(), ArenaError>,
+    mut hook: impl FnMut(
+        RoventPublicationHookEventV3,
+        RoventPublicationHookPhaseV3,
+    ) -> Result<(), ArenaError>,
+) -> Result<P, ArenaError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use std::io::Read;
     fn io(error: std::io::Error) -> ArenaError {
         ArenaError::Io(error.to_string())
+    }
+    fn guarded<T>(
+        hook: &mut impl FnMut(
+            RoventPublicationHookEventV3,
+            RoventPublicationHookPhaseV3,
+        ) -> Result<(), ArenaError>,
+        event: RoventPublicationHookEventV3,
+        operation: impl FnOnce() -> Result<T, ArenaError>,
+    ) -> Result<T, ArenaError> {
+        hook(event, RoventPublicationHookPhaseV3::Before)?;
+        let result = operation();
+        let after = hook(event, RoventPublicationHookPhaseV3::After);
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => {
+                after?;
+                Ok(value)
+            }
+        }
     }
     let active = || -> Result<(), ArenaError> {
         check(
@@ -528,6 +625,10 @@ pub(super) fn publish_original_payloads_authorized<
         directory: &cap_std::fs::Dir,
         path: &str,
         bytes: &[u8],
+        hook: &mut impl FnMut(
+            RoventPublicationHookEventV3,
+            RoventPublicationHookPhaseV3,
+        ) -> Result<(), ArenaError>,
     ) -> Result<RoventPublicationFile, ArenaError> {
         use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
         use std::io::Write;
@@ -540,10 +641,15 @@ pub(super) fn publish_original_payloads_authorized<
             .write(true)
             .create_new(true)
             .follow(FollowSymlinks::No);
-        let mut file = directory.open_with(path, &options).map_err(io)?;
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(io)?;
+        let mut file = guarded(hook, RoventPublicationHookEventV3::CreatePayload, || {
+            directory.open_with(path, &options).map_err(io)
+        })?;
+        guarded(hook, RoventPublicationHookEventV3::WritePayload, || {
+            file.write_all(bytes).map_err(io)
+        })?;
+        guarded(hook, RoventPublicationHookEventV3::SyncPayload, || {
+            file.sync_all().map_err(io)
+        })?;
         check(
             file.metadata().map_err(io)?.is_file(),
             "publication payload is not regular",
@@ -594,19 +700,29 @@ pub(super) fn publish_original_payloads_authorized<
             copied == pin.bytes && hex(Digest(hash.finalize().into())) == pin.sha256,
             "original publication chunk bytes changed",
         )?;
-        file.sync_all().map_err(io)?;
+        guarded(&mut hook, RoventPublicationHookEventV3::SyncChunk, || {
+            file.sync_all().map_err(io)
+        })?;
         payload_bytes = payload_bytes
             .checked_add(pin.bytes)
             .ok_or_else(|| invalid("publication payload overflow"))?;
         chunks.push(pin);
     }
-    directory.create_dir("input-locks").map_err(io)?;
+    guarded(
+        &mut hook,
+        RoventPublicationHookEventV3::CreateDirectory,
+        || directory.create_dir("input-locks").map_err(io),
+    )?;
     if material
         .admissions
         .values()
         .any(|source| source.runtime_bundle().is_some())
     {
-        directory.create_dir("runtime-bundles").map_err(io)?;
+        guarded(
+            &mut hook,
+            RoventPublicationHookEventV3::CreateDirectory,
+            || directory.create_dir("runtime-bundles").map_err(io),
+        )?;
     }
     let mut locks: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
     let mut bundles: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
@@ -621,6 +737,7 @@ pub(super) fn publish_original_payloads_authorized<
                     directory,
                     &format!("input-locks/{canonical}.json"),
                     source.lock_bytes(),
+                    &mut hook,
                 )?;
                 payload_bytes = payload_bytes
                     .checked_add(pin.bytes)
@@ -637,6 +754,7 @@ pub(super) fn publish_original_payloads_authorized<
                         directory,
                         &format!("runtime-bundles/{}.json", original.sha256),
                         bytes,
+                        &mut hook,
                     )?;
                     check(
                         pin.sha256 == original.sha256 && pin.bytes == original.bytes,
@@ -664,9 +782,15 @@ pub(super) fn publish_original_payloads_authorized<
         directory,
         ROVENT_PUBLICATION_MANIFEST,
         material.manifest_bytes,
+        &mut hook,
     )?;
     active()?;
-    let index = put(directory, ROVENT_PUBLICATION_INDEX, material.index_bytes)?;
+    let index = put(
+        directory,
+        ROVENT_PUBLICATION_INDEX,
+        material.index_bytes,
+        &mut hook,
+    )?;
     let publication = build(manifest, index, chunks, admissions, payload_bytes)?;
     let raw = serde_json::to_vec(&publication).map_err(|error| invalid(error.to_string()))?;
     check(
@@ -675,24 +799,45 @@ pub(super) fn publish_original_payloads_authorized<
     )?;
     let pending = "publication.pending.json";
     active()?;
-    put(directory, pending, &raw)?;
+    put(directory, pending, &raw, &mut hook)?;
     let original_directory = crate::pals_collect_v3::training_process::directory_file(directory)?;
     for name in ["chunks", "input-locks", "runtime-bundles"] {
         if name == "runtime-bundles" && bundles.is_empty() {
             continue;
         }
         let subdirectory = directory.open_dir(name).map_err(io)?;
-        crate::pals_collect_v3::training_process::directory_file(&subdirectory)?
-            .sync_all()
-            .map_err(io)?;
+        let subdirectory = crate::pals_collect_v3::training_process::directory_file(&subdirectory)?;
+        guarded(
+            &mut hook,
+            RoventPublicationHookEventV3::SyncDirectory,
+            || subdirectory.sync_all().map_err(io),
+        )?;
     }
-    original_directory.sync_all().map_err(io)?;
+    guarded(
+        &mut hook,
+        RoventPublicationHookEventV3::SyncDirectory,
+        || original_directory.sync_all().map_err(io),
+    )?;
     active()?;
-    authorize()?;
-    directory
-        .hard_link(pending, directory, ROVENT_PUBLICATION_FILE)
-        .map_err(io)?;
-    directory.remove_file(pending).map_err(io)?;
-    original_directory.sync_all().map_err(io)?;
+    guarded(
+        &mut hook,
+        RoventPublicationHookEventV3::Authorize,
+        authorize,
+    )?;
+    guarded(&mut hook, RoventPublicationHookEventV3::LinkCommit, || {
+        directory
+            .hard_link(pending, directory, ROVENT_PUBLICATION_FILE)
+            .map_err(io)
+    })?;
+    guarded(
+        &mut hook,
+        RoventPublicationHookEventV3::RemovePending,
+        || directory.remove_file(pending).map_err(io),
+    )?;
+    guarded(
+        &mut hook,
+        RoventPublicationHookEventV3::SyncDirectory,
+        || original_directory.sync_all().map_err(io),
+    )?;
     Ok(publication)
 }
