@@ -14,8 +14,9 @@ use crate::rovent_collect::pc_hooks_lock_v3::{
     PcSupervisorStopAuthorizationV3, RoventPcCollectionBridgeV3,
 };
 use crate::rovent_collect::pc_worker_v3::{
-    PcSupervisorBeforeAdmissionJoinProofV3, PcSupervisorJoinedProofV3, PcSupervisorNoWorkerProofV3,
-    PcWorkerSupervisorV3,
+    PcDriverEvidenceErrorV3, PcDriverPollV3, PcSupervisorBeforeAdmissionJoinProofV3,
+    PcSupervisorJoinedProofV3, PcSupervisorNoWorkerProofV3, PcWorkerSupervisorV3,
+    SupervisorStartCustodyV3,
 };
 use crate::rovent_resource_scope::launch::{
     NativeResourceCustody, RoventPcCollectionRecoveryKeyV3, RoventPcCollectionResourceOutcomeV3,
@@ -23,90 +24,11 @@ use crate::rovent_resource_scope::launch::{
 use std::any::Any;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
-/// A custody operation does not consume an incoming original on failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PcEvidenceCustodyErrorV3 {
-    Busy,
-    Poisoned,
-    Missing,
-    AlreadyOccupied,
-    DifferentOwner,
-}
-
 /// A busy original owner is pending, never a completed stop or join.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PcStopStepV3 {
     Pending,
     Ready,
-}
-
-trait SamePcRunV3 {
-    fn matches_run(&self, owners: &PcCollectionOwnersV3) -> bool;
-}
-
-impl SamePcRunV3 for PcSupervisorStopAuthorizationV3 {
-    fn matches_run(&self, owners: &PcCollectionOwnersV3) -> bool {
-        self.matches_original(owners.supervisor(), owners.native())
-    }
-}
-
-macro_rules! same_driver_evidence {
-    ($($evidence:ty),+ $(,)?) => {$(
-        impl SamePcRunV3 for $evidence {
-            fn matches_run(&self, owners: &PcCollectionOwnersV3) -> bool {
-                self.matches_original(owners.driver_custody(), owners.supervisor(), owners.native())
-            }
-        }
-    )+};
-}
-
-same_driver_evidence!(
-    PcSupervisorJoinedProofV3,
-    PcSupervisorNoWorkerProofV3,
-    PcSupervisorBeforeAdmissionJoinProofV3,
-);
-
-macro_rules! evidence_custody {
-    ($put:ident, $take:ident, $field:ident, $evidence:ty) => {
-        /// Retain this exact token; rejection returns it unchanged.
-        pub(crate) fn $put(
-            &self,
-            evidence: $evidence,
-        ) -> Result<(), ($evidence, PcEvidenceCustodyErrorV3)> {
-            let mut guard = match self.0.original.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => {
-                    return Err((evidence, PcEvidenceCustodyErrorV3::Busy))
-                }
-                Err(TryLockError::Poisoned(_)) => {
-                    return Err((evidence, PcEvidenceCustodyErrorV3::Poisoned))
-                }
-            };
-            let Some(original) = guard.as_mut() else {
-                return Err((evidence, PcEvidenceCustodyErrorV3::Missing));
-            };
-            if !evidence.matches_run(&original.owners) {
-                return Err((evidence, PcEvidenceCustodyErrorV3::DifferentOwner));
-            }
-            if original.$field.is_some() {
-                return Err((evidence, PcEvidenceCustodyErrorV3::AlreadyOccupied));
-            }
-            original.$field = Some(evidence);
-            Ok(())
-        }
-
-        /// Transfer the same token to the caller; this does not consume its
-        /// meaning or authorize settlement or resource release.
-        pub(crate) fn $take(&self) -> Result<Option<$evidence>, PcEvidenceCustodyErrorV3> {
-            let mut guard = match self.0.original.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => return Err(PcEvidenceCustodyErrorV3::Busy),
-                Err(TryLockError::Poisoned(_)) => return Err(PcEvidenceCustodyErrorV3::Poisoned),
-            };
-            let original = guard.as_mut().ok_or(PcEvidenceCustodyErrorV3::Missing)?;
-            Ok(original.$field.take())
-        }
-    };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +58,9 @@ struct OriginalPcRunV3 {
     joined_proof: Option<PcSupervisorJoinedProofV3>,
     no_worker_proof: Option<PcSupervisorNoWorkerProofV3>,
     before_admission_join_proof: Option<PcSupervisorBeforeAdmissionJoinProofV3>,
+    unstarted_released: bool,
+    before_admission_released: bool,
+    joined_offered: bool,
     state: PcRunRecoveryStateV3,
 }
 
@@ -200,6 +125,9 @@ impl PcRunRecoveryKeyV3 {
                 joined_proof: None,
                 no_worker_proof: None,
                 before_admission_join_proof: None,
+                unstarted_released: false,
+                before_admission_released: false,
+                joined_offered: false,
                 state: PcRunRecoveryStateV3::Prepared,
             })),
         });
@@ -364,25 +292,6 @@ impl PcRunRecoveryKeyV3 {
         Ok(original.outcome_key.clone())
     }
 
-    evidence_custody!(
-        put_joined_proof,
-        take_joined_proof,
-        joined_proof,
-        PcSupervisorJoinedProofV3
-    );
-    evidence_custody!(
-        put_no_worker_proof,
-        take_no_worker_proof,
-        no_worker_proof,
-        PcSupervisorNoWorkerProofV3
-    );
-    evidence_custody!(
-        put_before_admission_join_proof,
-        take_before_admission_join_proof,
-        before_admission_join_proof,
-        PcSupervisorBeforeAdmissionJoinProofV3
-    );
-
     /// Produce the exact bridge authorization directly into this slot. The
     /// bridge's native fence and original supervisor checks remain mandatory.
     /// Its current issuance path has no irreversible token-consumption step;
@@ -462,6 +371,179 @@ impl PcRunRecoveryKeyV3 {
                 drop(guard);
                 std::panic::resume_unwind(payload)
             }
+        }
+    }
+
+    /// Retire only the same proven unstarted or pre-admission driver. Native,
+    /// physical device, teacher, output and resource custody remain separate.
+    /// The proofs stay in this registered slot after the driver retirement.
+    pub(crate) fn poll_pre_admission_driver(
+        &self,
+    ) -> Result<PcDriverPollV3<bool>, PcDriverEvidenceErrorV3> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_mut()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if original.unstarted_released || original.before_admission_released {
+                return Ok(PcDriverPollV3::Ready(true));
+            }
+            if original.no_worker_proof.is_none() && original.before_admission_join_proof.is_none()
+            {
+                match SupervisorStartCustodyV3::try_seal_no_worker(
+                    original.owners.driver_custody(),
+                    original.owners.native(),
+                )? {
+                    PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+                    PcDriverPollV3::Ready(proof) => original.no_worker_proof = proof,
+                }
+            }
+            if let Some(proof) = original.no_worker_proof.as_ref() {
+                if !proof.matches_original(
+                    original.owners.driver_custody(),
+                    original.owners.supervisor(),
+                    original.owners.native(),
+                ) {
+                    return Err(PcDriverEvidenceErrorV3::Invalid(
+                        "original no-worker proof differs",
+                    ));
+                }
+                return match SupervisorStartCustodyV3::try_release_no_worker(
+                    original.owners.driver_custody(),
+                )? {
+                    PcDriverPollV3::Pending => Ok(PcDriverPollV3::Pending),
+                    PcDriverPollV3::Ready(released) => {
+                        original.unstarted_released = released;
+                        Ok(PcDriverPollV3::Ready(released))
+                    }
+                };
+            }
+            if original.before_admission_join_proof.is_none() {
+                {
+                    let mut driver = match original.owners.driver_custody().try_lock() {
+                        Ok(driver) => driver,
+                        Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+                        Err(TryLockError::Poisoned(_)) => {
+                            return Err(PcDriverEvidenceErrorV3::Poisoned("driver"));
+                        }
+                    };
+                    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        driver.try_join()
+                    }));
+                    drop(driver);
+                    if let Err(payload) = attempt {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+                match SupervisorStartCustodyV3::try_before_admission_join_proof(
+                    original.owners.driver_custody(),
+                )? {
+                    PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+                    PcDriverPollV3::Ready(proof) => original.before_admission_join_proof = proof,
+                }
+            }
+            let Some(proof) = original.before_admission_join_proof.as_ref() else {
+                return Ok(PcDriverPollV3::Ready(false));
+            };
+            if !proof.matches_original(
+                original.owners.driver_custody(),
+                original.owners.supervisor(),
+                original.owners.native(),
+            ) {
+                return Err(PcDriverEvidenceErrorV3::Invalid(
+                    "original before-admission proof differs",
+                ));
+            }
+            match SupervisorStartCustodyV3::try_release_before_admission_join(
+                original.owners.driver_custody(),
+                proof,
+            )? {
+                PcDriverPollV3::Pending => Ok(PcDriverPollV3::Pending),
+                PcDriverPollV3::Ready(released) => {
+                    original.before_admission_released = released;
+                    Ok(PcDriverPollV3::Ready(released))
+                }
+            }
+        }));
+        drop(guard);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Directly retain joined evidence in the same original outcome. The
+    /// proof remains in its slot if the outcome rejects it or is busy.
+    pub(crate) fn poll_joined_driver(
+        &self,
+        outcome: &mut RoventPcCollectionResourceOutcomeV3,
+    ) -> Result<PcDriverPollV3<bool>, PcDriverEvidenceErrorV3> {
+        let mut guard = match self.0.original.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(PcDriverEvidenceErrorV3::Poisoned("recovery"));
+            }
+        };
+        let original = guard
+            .as_mut()
+            .ok_or(PcDriverEvidenceErrorV3::Invalid("original custody missing"))?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !outcome.matches_original_collection(original.owners.native())
+                || !original
+                    .outcome_key
+                    .as_ref()
+                    .is_some_and(|key| key.same_original(&outcome.recovery_key()))
+            {
+                return Err(PcDriverEvidenceErrorV3::Invalid("original outcome differs"));
+            }
+            if original.joined_offered {
+                return Ok(PcDriverPollV3::Ready(true));
+            }
+            if original.joined_proof.is_none() {
+                {
+                    let mut driver = match original.owners.driver_custody().try_lock() {
+                        Ok(driver) => driver,
+                        Err(TryLockError::WouldBlock) => return Ok(PcDriverPollV3::Pending),
+                        Err(TryLockError::Poisoned(_)) => {
+                            return Err(PcDriverEvidenceErrorV3::Poisoned("driver"));
+                        }
+                    };
+                    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        driver.try_join()
+                    }));
+                    drop(driver);
+                    if let Err(payload) = attempt {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+                match SupervisorStartCustodyV3::try_joined_proof(original.owners.driver_custody())?
+                {
+                    PcDriverPollV3::Pending => return Ok(PcDriverPollV3::Pending),
+                    PcDriverPollV3::Ready(proof) => original.joined_proof = proof,
+                }
+            }
+            if original.joined_proof.is_none() {
+                return Ok(PcDriverPollV3::Ready(false));
+            }
+            let moved = outcome
+                .offer_joined_driver_from_slot(&original.owners, &mut original.joined_proof)
+                .map_err(PcDriverEvidenceErrorV3::Invalid)?;
+            if moved {
+                original.joined_offered = true;
+            }
+            Ok(PcDriverPollV3::Ready(moved))
+        }));
+        drop(guard);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 
