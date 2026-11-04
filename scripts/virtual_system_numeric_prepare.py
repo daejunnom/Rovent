@@ -156,10 +156,30 @@ def _pinned_metadata(image_fd, output, switch, source, deadline, check_budget, c
         os.close(out_fd)
 
 
+def source_head(source, git_executable, path_format):
+    """Read HEAD from the explicitly selected Git without changing its config."""
+    git_source = str(source)
+    if path_format == "windows":
+        git_source = subprocess.run(["wslpath", "-w", str(source)], check=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=10).stdout.decode("utf-8").strip()
+        if not git_source:
+            raise ValueError("Windows Git source path conversion returned empty output")
+    elif path_format != "native":
+        raise ValueError("explicit native/windows Git path format required")
+    return subprocess.run([git_executable, "-C", git_source, "rev-parse", "HEAD"],
+                          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          timeout=10).stdout.decode("ascii").strip()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source-root", type=Path, required=True)
     p.add_argument("--source-head", required=True)
+    p.add_argument("--git-executable", default="git",
+                   help="Git executable for this checkout; defaults to native Linux git")
+    p.add_argument("--git-path-format", choices=("native", "windows"), default="native",
+                   help="explicit checkout path format expected by the selected Git")
     p.add_argument("--binary", type=Path, required=True)
     p.add_argument("--binary-sha256", required=True)
     p.add_argument("--binary-bytes", type=int, required=True)
@@ -184,8 +204,7 @@ def main():
         raise ValueError("fresh output leaf and existing parent required")
     if len(args.source_head) != 40 or any(c not in "0123456789abcdef" for c in args.source_head):
         raise ValueError("full source commit required")
-    head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
-                          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10).stdout.decode().strip()
+    head = source_head(source, args.git_executable, args.git_path_format)
     if head != args.source_head:
         raise ValueError("source commit differs")
     sys.path.insert(0, str(source / "experiments/model-research/pals/src"))
