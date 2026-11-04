@@ -620,6 +620,9 @@ pub(super) mod linux {
         )?;
         let template: G0NumericalStartupTemplateV5 = common::decode(&template_raw)?;
         validate_template(&template, &registration)?;
+        if template.config.endpoint.model.backend == PalsModelBackendV3::OrtCuda {
+            return Err(super::super::g0_cuda_artifact_tree::legacy_cuda_execution_disabled());
+        }
         common::retain_directory(template.private_cwd.clone(), held)?;
         for input in &template.input_pins {
             common::hold_input(input.source.clone(), false, held, &mut credit)?;
