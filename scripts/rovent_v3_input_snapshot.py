@@ -106,6 +106,10 @@ class OriginalControlInput:
     def __init__(self, base, rel):
         self._directory = self._file = None
         try:
+            # Keep the selector used by the first open, not a later path to
+            # the same inode. It is an input identity, not write authority.
+            self._selector = rel.as_posix()
+            rel = relative(self._selector)
             self._directory = os.dup(base)
             directory = os.fstat(self._directory)
             require(stat.S_ISDIR(directory.st_mode), "control source is not a directory")
@@ -148,6 +152,11 @@ class OriginalControlInput:
     def bytes(self):
         self.recheck()
         return self._bytes
+
+    @property
+    def selector(self):
+        self.recheck()
+        return self._selector
 
     def borrowed_fds(self):
         """Borrow original descriptors; the caller must retain this owner."""

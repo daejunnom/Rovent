@@ -167,6 +167,7 @@ for seq in (1, 2):
         info = os.fstat(fd)
         assert (reply[field]["device"], reply[field]["inode"]) == (info.st_dev, info.st_ino)
     actual = os.pread(plan, os.fstat(plan).st_size, 0)
+    assert reply["plan"]["path"] == "plan"
     assert reply["plan"]["size"] == len(actual)
     assert reply["plan"]["sha256"] == hashlib.sha256(actual).hexdigest()
 print("ok")

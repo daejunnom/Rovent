@@ -452,6 +452,7 @@ class ManagedCollectionOutputHandoffV2(ManagedOutputChildHandoff):
                 "output": {"device": info.st_dev, "inode": info.st_ino},
                 "input_directory": {"device": directory.st_dev, "inode": directory.st_ino},
                 "plan": {"device": plan.st_dev, "inode": plan.st_ino,
+                         "path": self._input.selector,
                          "size": plan.st_size, "sha256": hashlib.sha256(data).hexdigest()}}
 
     def _close_input_duplicates(self):

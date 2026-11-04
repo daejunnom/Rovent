@@ -85,6 +85,20 @@ class SnapshotOwnershipTests(unittest.TestCase):
         with self.assertRaises(OSError):
             snapshot.OriginalControlInput(self.source_fd, Path("link.json"))
 
+    @unittest.skipUnless(hasattr(os, "pread"), "position-independent read required")
+    def test_original_control_retains_the_actual_relative_selector(self):
+        (self.source / "inputs").mkdir()
+        plan = self.source / "inputs" / "plan.json"
+        plan.write_bytes(b"plan")
+        os.link(plan, self.source / "alias.json")
+        with snapshot.OriginalControlInput(self.source_fd, Path("inputs/plan.json")) as owner:
+            self.assertEqual(owner.selector, "inputs/plan.json")
+            self.assertNotEqual(owner.selector, "alias.json")
+        with self.assertRaises(RuntimeError):
+            snapshot.OriginalControlInput(self.source_fd, Path("../plan.json"))
+        with self.assertRaises(RuntimeError):
+            snapshot.OriginalControlInput(self.source_fd, Path("."))
+
     def test_copy_uses_actual_bytes_and_never_overwrites(self):
         data = os.urandom(127)
         (self.source / "asset").write_bytes(data)
