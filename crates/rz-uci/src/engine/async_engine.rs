@@ -356,6 +356,11 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
             }
             original.dispatch(effect, &sender)
         });
+        // From the first take through installation, no user callback, lock,
+        // I/O, or thread spawn runs. The driver constructor performs only
+        // field moves and an empty VecDeque::new; closures were boxed above.
+        // Allocation failure/refcount overflow abort is not an unwind or a
+        // claim that the containing slot is safe to drop while unsettled.
         let Some(events) = self.events.take() else {
             return Err(InPlaceTransferStatus::MissingResource);
         };
