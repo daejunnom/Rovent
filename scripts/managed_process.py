@@ -3,21 +3,53 @@ from __future__ import annotations
 import ctypes
 import os
 import signal
+import stat
 import subprocess
 import time
 
 
-def run_group(argv, cwd, env, timeout, admission_check):
+class ProcessNotSpawned(RuntimeError):
+    """Opt-in preflight failed before Popen was invoked; retains original cause."""
+
+
+def _check_before_spawn(argv, cwd, pass_fds, stdout):
+    try:
+        if not argv or not os.path.isabs(os.fspath(argv[0])):
+            raise ValueError("preflight requires an absolute executable path")
+        executable = os.stat(argv[0])
+        if not stat.S_ISREG(executable.st_mode) or not os.access(argv[0], os.X_OK):
+            raise ValueError("preflight requires an executable regular file")
+        if not stat.S_ISDIR(os.stat(cwd).st_mode):
+            raise ValueError("preflight requires an existing directory")
+        for fd in pass_fds:
+            os.fstat(fd)
+        if stdout is not None:
+            if stdout == subprocess.PIPE:
+                raise ValueError("bounded stdout must be an opened file descriptor")
+            os.fstat(stdout if isinstance(stdout, int) else stdout.fileno())
+    except (OSError, ValueError, TypeError) as error:
+        raise ProcessNotSpawned("original pre-dispatch preflight failed") from error
+
+
+def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=None, on_spawn=None,
+              verify_before_spawn=False):
     if os.name == "nt":
+        if pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn:
+            raise RuntimeError("explicit descriptor handoff requires Linux")
         return _run_windows(argv, cwd, env, timeout, admission_check)
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
         raise RuntimeError("non-reaping process supervision requires Linux waitid")
-    child = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+    if verify_before_spawn:
+        _check_before_spawn(argv, cwd, pass_fds, stdout)
+    child = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
+                             pass_fds=tuple(pass_fds), stdout=stdout)
     started = time.monotonic()
     next_check = started
     requested_exit = None
     failure = None
     try:
+        if on_spawn is not None:
+            on_spawn()
         while True:
             status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             if status is not None:
@@ -38,6 +70,12 @@ def run_group(argv, cwd, env, timeout, admission_check):
         requested_exit = 130
     except Exception as exc:
         requested_exit, failure = 125, str(exc)
+    except BaseException as exc:
+        # Child ownership already exists: even an uncommon control-flow
+        # exception must pass through the original group drain below.
+        if on_spawn is None:
+            raise
+        requested_exit, failure = 125, f"{type(exc).__name__}: {exc}"
     # The unreaped leader reserves this exact process/group ID while signaling.
     # Normal exits must also drain descendants before scratch is reclaimed.
     for sig in (signal.SIGTERM, signal.SIGKILL):
