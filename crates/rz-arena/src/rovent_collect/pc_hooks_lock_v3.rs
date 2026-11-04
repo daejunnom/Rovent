@@ -370,6 +370,21 @@ struct RootNotAcceptingNoDispatchV3 {
     quota: RootNotAcceptingQuotaV3,
 }
 
+// This owner stays in the same root slot while a supervisor joins. The join
+// can wait on thread teardown, so the bridge's shared roots lock must not be
+// held while the original worker is polled.
+struct PcRootWorkerOwnerV3 {
+    worker: Option<RoventPcCollectionWorkerV3>,
+    result: Option<PcRootJoinResultV3>,
+    terminal: bool,
+}
+
+enum PcRootJoinResultV3 {
+    Joined(RoventPcCollectionRootCustodyV3),
+    Failed(RoventPcCollectionWorkerJoinFailureV3),
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
 struct PcRootSlotV3 {
     admission: RoventCollectionRootAdmissionV3,
     game_reservation: Option<super::game_authority_v3::GameRootReservationV3<PcWorkerSupervisorV3>>,
@@ -396,7 +411,7 @@ struct PcRootSlotV3 {
     stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
     pump: Option<Arc<Mutex<TeacherPumpV3>>>,
     observer: Option<PcObserverV3>,
-    worker: Option<RoventPcCollectionWorkerV3>,
+    worker: Option<Arc<Mutex<PcRootWorkerOwnerV3>>>,
     handoff: Option<PcHandoffV3>,
     joined: Option<RoventPcCollectionRootCustodyV3>,
     custody_taken: bool,
@@ -1461,28 +1476,77 @@ impl RoventPcCollectionBridgeV3 {
         if slot.owner.is_some() || slot.worker.is_some() || slot.installed {
             return PcPreparedOutcomeV3::Rejected("P-C V3 root already prepared", original);
         }
+        // Allocate the holder before moving the original worker out of the
+        // prepared root. It is uniquely owned here and cannot be poisoned.
+        let mut worker_owner = Arc::new(Mutex::new(PcRootWorkerOwnerV3 { worker: None, result: None, terminal: false }));
         let PcPreparedRootV3 { owner, route, stage, pump, worker, .. } = original;
+        if let Some(holder) = Arc::get_mut(&mut worker_owner) {
+            holder.get_mut().unwrap_or_else(|poison| poison.into_inner()).worker = Some(worker);
+        } else {
+            unreachable!("new P-C worker owner must be unique");
+        }
         slot.observer = Some(owner.observer::<PcPortQuestion, VirtualReviewTicketOutput>());
         slot.owner = Some(owner); slot.route = Some(route); slot.stage = Some(stage);
-        slot.pump = Some(pump); slot.worker = Some(worker);
+        slot.pump = Some(pump); slot.worker = Some(worker_owner);
         PcPreparedOutcomeV3::Accepted
     }
 
     /// The supervisor, never the manager callback, joins the exact worker.
     pub(crate) fn try_join_root(&self, admission: &RoventCollectionRootAdmissionV3) -> Result<bool, &'static str> {
-        let mut state = self.state.try_lock().map_err(|_| "P-C V3 roots unavailable")?;
+        let (worker, handoff) = {
+            let state = self.state.try_lock().map_err(|_| "P-C V3 roots unavailable")?;
+            let slot = state.roots.iter().find(|slot| slot.admission.same_original_admission(admission))
+                .ok_or("P-C V3 root absent")?;
+            if slot.returned.is_some() || slot.joined.is_some() { return Ok(true); }
+            if slot.custody_taken { return Ok(false); }
+            if slot.join_failure.is_some() || slot.join_panic.is_some() { return Err("P-C V3 worker join unresolved"); }
+            let Some(handoff) = &slot.handoff else { return Ok(false); };
+            (Arc::clone(slot.worker.as_ref().ok_or("P-C V3 worker absent")?), Arc::clone(handoff))
+        };
+        {
+            let mut original = match worker.try_lock() {
+                Ok(original) => original,
+                Err(TryLockError::WouldBlock) => return Ok(false),
+                Err(_) => return Err("P-C V3 original worker owner poisoned"),
+            };
+            if !original.terminal {
+                let worker = original.worker.as_mut().ok_or("P-C V3 original worker missing")?;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.try_join(&handoff)));
+                original.result = match result {
+                    Ok(Ok(Some(custody))) => Some(PcRootJoinResultV3::Joined(custody)),
+                    Ok(Ok(None)) => None,
+                    Ok(Err(error)) => Some(PcRootJoinResultV3::Failed(error)),
+                    Err(payload) => Some(PcRootJoinResultV3::Panicked(payload)),
+                };
+                original.terminal = original.result.is_some();
+            }
+        }
+        // If either lock is busy the original worker and result remain in the
+        // root owner; another tick transfers the same result exactly once.
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(_) => return Err("P-C V3 roots poisoned"),
+        };
         let slot = state.roots.iter_mut().find(|slot| slot.admission.same_original_admission(admission))
             .ok_or("P-C V3 root absent")?;
+        if !slot.worker.as_ref().is_some_and(|old| Arc::ptr_eq(old, &worker))
+            || !slot.handoff.as_ref().is_some_and(|old| Arc::ptr_eq(old, &handoff)) {
+            return Err("P-C V3 original join owner changed");
+        }
         if slot.returned.is_some() || slot.joined.is_some() { return Ok(true); }
         if slot.custody_taken { return Ok(false); }
         if slot.join_failure.is_some() || slot.join_panic.is_some() { return Err("P-C V3 worker join unresolved"); }
-        let Some(handoff) = &slot.handoff else { return Ok(false); };
-        let worker = slot.worker.as_mut().ok_or("P-C V3 worker absent")?;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.try_join(handoff))) {
-            Ok(Ok(Some(custody))) => { slot.joined = Some(custody); Ok(true) }
-            Ok(Ok(None)) => Ok(false),
-            Ok(Err(error)) => { slot.join_failure = Some(error); Err("P-C V3 original join failed") }
-            Err(payload) => { slot.join_panic = Some(payload); Err("P-C V3 original join panicked") }
+        let mut original = match worker.try_lock() {
+            Ok(original) => original,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(_) => return Err("P-C V3 original worker owner poisoned"),
+        };
+        match original.result.take() {
+            Some(PcRootJoinResultV3::Joined(custody)) => { slot.joined = Some(custody); Ok(true) }
+            Some(PcRootJoinResultV3::Failed(error)) => { slot.join_failure = Some(error); Err("P-C V3 original join failed") }
+            Some(PcRootJoinResultV3::Panicked(payload)) => { slot.join_panic = Some(payload); Err("P-C V3 original join panicked") }
+            None => Ok(false),
         }
     }
 
@@ -2083,7 +2147,13 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
         let state = pc_state(&self.state)?;
         let slot = state.roots.iter().find(|slot| slot.admission.same_original_admission(admission))
             .ok_or(AdaptiveManagerError::Invalid("P-C V3 handoff root absent"))?;
-        Ok(slot.worker.as_ref().ok_or(AdaptiveManagerError::AuxiliaryPending)?.sender())
+        let worker = slot.worker.as_ref().ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let worker = match worker.try_lock() {
+            Ok(worker) => worker,
+            Err(TryLockError::WouldBlock) => return Err(AdaptiveManagerError::AuxiliaryPending),
+            Err(_) => return Err(AdaptiveManagerError::Invalid("P-C V3 original worker owner poisoned")),
+        };
+        Ok(worker.worker.as_ref().ok_or(AdaptiveManagerError::Invalid("P-C V3 original worker missing"))?.sender())
     }
 
     fn try_take_root_custody(&self, handoff: &PcHandoffV3) -> Result<Option<RoventPcCollectionRootCustodyV3>, AdaptiveManagerError> {
