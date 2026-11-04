@@ -4,18 +4,30 @@
 //! proof. The bridge must retain the same recovery Arc before any claim,
 //! source handoff or physical worker spawn.
 use super::capture_router_v3::CaptureRouterV3;
+use super::launch::ManagedOutputOwnerV3;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
 use super::pc_hooks_lock_v3::{
     PcPreparedOutcomeV3, PcPreparedRootV3, PcQuotaOutcomeV3, PcRootAccountingV3,
     RoventPcCollectionBridgeV3,
 };
+use super::policy_row_pipeline_v3::{
+    PolicyChunkPersistenceV3, PolicyOutputOwnerV3, PolicyRootRetainedOwnerV3,
+    PolicyRowPipelineOwnerV3,
+};
 use super::speculative_route_v3::{SpeculativeReceiverV3, SpeculativeRootV3};
-use super::teacher::v3_pump::{TeacherPumpSetupErrorV3, TeacherPumpStepV3, TeacherPumpV3};
+use super::teacher::v3_policy_consumer::{
+    TeacherPolicyConsumerOwnerV3, TeacherPolicyConsumerProgressV3, TeacherPolicyConsumerStartV3,
+    TeacherProcessedOwnerV3,
+};
+use super::teacher::v3_pump::{
+    TeacherPendingDrainV3, TeacherPumpSetupErrorV3, TeacherPumpStepV3, TeacherPumpV3,
+};
 use super::teacher::v3_session::{
     RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherPrepareOwnerV3,
     TeacherSessionClaimErrorV3, TeacherSessionStageStateV3, TeacherSessionStagingV3,
     TeacherStartErrorV3,
 };
+use super::writer_lock_v3::RoventCorpusWriterLockV3;
 use rz_search::external_cpu::collection_teacher::TeacherDiagnostics;
 use rz_uci::pals_adaptive::{
     AdaptiveCollectionError, RoventCollectionRootAdmissionV3, RoventTeacherScopeCapabilityV3,
@@ -47,6 +59,13 @@ pub(crate) struct PcRootRecoveryV3 {
     receiver: Option<Arc<Mutex<SpeculativeReceiverV3>>>,
     owner: Option<RoventCollectionOwnerLockV3>,
     pump: Option<Arc<Mutex<TeacherPumpV3>>>,
+    pipeline: PolicyRowPipelineOwnerV3,
+    output: PolicyOutputOwnerV3,
+    processed: Option<TeacherProcessedOwnerV3>,
+    retained: Option<PolicyRootRetainedOwnerV3>,
+    consumer: Option<TeacherPolicyConsumerOwnerV3>,
+    consumer_setup_unknown: bool,
+    consumer_phase: ConsumerPhaseV3,
     pump_setup_failure: Option<TeacherPumpSetupErrorV3>,
     pump_setup_unknown: bool,
     actor_start_failure: Option<TeacherStartErrorV3>,
@@ -68,7 +87,11 @@ pub(crate) struct PcRootRecoveryV3 {
 }
 
 impl PcRootRecoveryV3 {
-    pub(crate) fn new(admission: RoventCollectionRootAdmissionV3) -> Arc<Mutex<Self>> {
+    pub(crate) fn new(
+        admission: RoventCollectionRootAdmissionV3,
+        pipeline: PolicyRowPipelineOwnerV3,
+    ) -> Arc<Mutex<Self>> {
+        let output = pipeline.output_owner();
         Arc::new(Mutex::new(Self {
             admission,
             stage: None,
@@ -82,6 +105,13 @@ impl PcRootRecoveryV3 {
             receiver: None,
             owner: None,
             pump: None,
+            pipeline,
+            output,
+            processed: None,
+            retained: None,
+            consumer: None,
+            consumer_setup_unknown: false,
+            consumer_phase: ConsumerPhaseV3::Receive,
             pump_setup_failure: None,
             pump_setup_unknown: false,
             actor_start_failure: None,
@@ -104,6 +134,32 @@ impl PcRootRecoveryV3 {
     }
     pub(crate) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
         self.admission.same_original_admission(admission)
+    }
+    pub(crate) fn matches_route_pump(
+        &self,
+        route: &SpeculativeRootV3,
+        pump: &Arc<Mutex<TeacherPumpV3>>,
+    ) -> bool {
+        self.route
+            .as_ref()
+            .is_some_and(|original| original.same_original_route(route))
+            && self
+                .pump
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, pump))
+    }
+    /// This root has no in-flight policy stage. Shared output may still be
+    /// held by the game pipeline and is not evidence of durable storage.
+    pub(crate) fn consumer_route_retirement(&self) -> PcConsumerRetirementV3 {
+        if self.consumer_setup_unknown || self.consumer.is_none() {
+            return PcConsumerRetirementV3::Unknown;
+        }
+        match self.consumer_phase {
+            ConsumerPhaseV3::Receive => PcConsumerRetirementV3::Ready,
+            ConsumerPhaseV3::Rejected => PcConsumerRetirementV3::Rejected,
+            ConsumerPhaseV3::Unknown => PcConsumerRetirementV3::Unknown,
+            _ => PcConsumerRetirementV3::Pending,
+        }
     }
     pub(crate) fn matches_prepared(
         &self,
@@ -152,6 +208,10 @@ impl PcRootRecoveryV3 {
             && self.owner.is_none()
             && self.pump_setup_failure.is_none()
             && !self.pump_setup_unknown
+            && self.processed.is_none()
+            && self.retained.is_none()
+            && self.consumer.is_none()
+            && !self.consumer_setup_unknown
             && self.actor_start_failure.is_none()
             && self.custodian.keys().is_empty()
     }
@@ -179,6 +239,28 @@ pub(crate) enum PcPrepareStepV3 {
     Pending,
     Published,
     Failed,
+}
+
+#[derive(Clone, Copy)]
+enum ConsumerPhaseV3 {
+    Receive,
+    Seal,
+    TransferRow,
+    Prepare,
+    Candidate,
+    Capability,
+    Append,
+    RetainAppend,
+    RetainCompletion,
+    Rejected,
+    Unknown,
+}
+
+pub(crate) enum PcConsumerRetirementV3 {
+    Ready,
+    Pending,
+    Rejected,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +330,10 @@ impl PcRootRecoveryV3 {
             || self.pump.is_some()
             || self.pump_setup_failure.is_some()
             || self.pump_setup_unknown
+            || self.processed.is_some()
+            || self.retained.is_some()
+            || self.consumer.is_some()
+            || self.consumer_setup_unknown
             || self.worker.is_some()
             || self.worker_spawn_failure.is_some()
             || self.worker_key.is_some()
@@ -421,11 +507,37 @@ pub(crate) struct PcWorkerSupervisorV3 {
     bridge: Arc<RoventPcCollectionBridgeV3>,
     router: Arc<CaptureRouterV3>,
     roots: Vec<Arc<Mutex<PcRootRecoveryV3>>>,
+    pending_root: Option<RoventCollectionRootAdmissionV3>,
+    pipeline: Option<PolicyRowPipelineOwnerV3>,
     startup_deadline: Instant,
     cleanup_deadline: Instant,
 }
 
 impl PcWorkerSupervisorV3 {
+    /// Same in-memory game output owner; no durable sink is implied.
+    pub(crate) fn output_owner(&self) -> Option<PolicyOutputOwnerV3> {
+        self.pipeline
+            .as_ref()
+            .map(PolicyRowPipelineOwnerV3::output_owner)
+    }
+
+    /// The caller retains its original managed output capability; path names
+    /// or a second copy of input bytes cannot manufacture this ownership.
+    pub(crate) fn try_install_output(
+        &self,
+        output: &Arc<ManagedOutputOwnerV3>,
+    ) -> Result<bool, String> {
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return Ok(false);
+        };
+        let Some(mut pipeline) = pipeline.try_lock().map_err(str::to_owned)? else {
+            return Ok(false);
+        };
+        pipeline
+            .install_output_directory(self.bridge.inputs(), output)
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
     pub(crate) fn new(
         bridge: Arc<RoventPcCollectionBridgeV3>,
         router: Arc<CaptureRouterV3>,
@@ -443,6 +555,8 @@ impl PcWorkerSupervisorV3 {
             bridge,
             router,
             roots,
+            pending_root: None,
+            pipeline: None,
             startup_deadline,
             cleanup_deadline,
         })
@@ -450,17 +564,32 @@ impl PcWorkerSupervisorV3 {
 
     /// One finite poll; unresolved evidence stays in its original root owner.
     pub(crate) fn step(&mut self) -> Result<(), String> {
-        if self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots) {
-            if let Some(admission) = self.bridge.try_next_root().map_err(str::to_owned)? {
-                if self.roots.iter().any(|root| {
-                    root.lock()
-                        .ok()
-                        .is_some_and(|root| root.matches_admission(&admission))
-                }) {
-                    return Err("P-C V3 duplicate original root".into());
-                }
-                self.roots.push(PcRootRecoveryV3::new(admission));
+        if self.pending_root.is_none()
+            && self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots)
+        {
+            self.pending_root = self.bridge.try_next_root().map_err(str::to_owned)?;
+        }
+        if let Some(admission) = self.pending_root.as_ref() {
+            if self.pipeline.is_none() {
+                let writer = RoventCorpusWriterLockV3::new_shared(
+                    self.bridge.inputs().manifest(),
+                    admission,
+                )
+                .map_err(|error| error.to_string())?;
+                self.pipeline = Some(PolicyRowPipelineOwnerV3::new(writer));
             }
+            if self.roots.iter().any(|root| {
+                root.lock()
+                    .ok()
+                    .is_some_and(|root| root.matches_admission(admission))
+            }) {
+                return Err("P-C V3 duplicate original root".into());
+            }
+            self.roots.push(PcRootRecoveryV3::new(
+                admission.clone(),
+                self.pipeline.as_ref().expect("pipeline retained").clone(),
+            ));
+            self.pending_root.take();
         }
         for original in &self.roots {
             let outcome = prepare_root_step_v3(
@@ -513,6 +642,21 @@ pub(crate) fn prepare_root_step_v3(
         .map_err(|_| "P-C V3 recovery poisoned")?
         .admission
         .clone();
+    // Startup windows are relative to each original root clock, not to the
+    // first root or a previously observed global duration.
+    let root = admission.root_admission();
+    let origin = root.runtime_clock().origin();
+    let root_startup = origin
+        .checked_add(Duration::from_nanos(root.admission_deadline().at.0))
+        .ok_or("P-C V3 root startup deadline overflow")?;
+    let root_cleanup = origin
+        .checked_add(Duration::from_nanos(root.cleanup_deadline().at.0))
+        .ok_or("P-C V3 root cleanup deadline overflow")?;
+    let startup_deadline = startup_deadline.min(root_startup);
+    let cleanup_deadline = cleanup_deadline.min(root_cleanup);
+    if startup_deadline > cleanup_deadline {
+        return Err("P-C V3 root deadline ordering invalid".into());
+    }
     if !bridge
         .try_publish_recovery(&admission, recovery)
         .map_err(str::to_owned)?
@@ -728,6 +872,99 @@ pub(crate) fn prepare_root_step_v3(
             }
         }
     }
+    if state.processed.is_none() {
+        state.processed = Some(
+            TeacherProcessedOwnerV3::new(
+                admission.clone(),
+                inputs.plan().teacher_tickets_per_root as usize,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+    }
+    if state.retained.is_none() {
+        state.retained = match PolicyRootRetainedOwnerV3::try_new(
+            &state.pipeline,
+            admission.clone(),
+            inputs.plan().teacher_tickets_per_root as usize,
+        )
+        .map_err(str::to_owned)?
+        {
+            Some(owner) => Some(owner),
+            None => return Ok(PcPrepareStepV3::Pending),
+        };
+    }
+    if state.consumer.is_none() {
+        let owner = state.owner.as_ref().expect("owner retained").clone();
+        let route = state.route.as_ref().expect("route retained").clone();
+        match owner
+            .try_attach_speculative_root(&admission, &route)
+            .map_err(|e| e.to_string())?
+        {
+            Some(()) => {}
+            None => return Ok(PcPrepareStepV3::Pending),
+        }
+        let pump = Arc::clone(state.pump.as_ref().expect("pump retained"));
+        let pipeline = state.pipeline.clone();
+        let processed = state
+            .processed
+            .as_ref()
+            .expect("processed owner retained")
+            .clone();
+        let retained = state
+            .retained
+            .as_ref()
+            .expect("root policy owner retained")
+            .clone();
+        if !state.output.same_owner(&pipeline) {
+            state.failure = Some("P-C V3 output/pipeline owner differs".into());
+            return Ok(PcPrepareStepV3::Failed);
+        }
+        state.consumer_setup_unknown = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TeacherPolicyConsumerOwnerV3::try_new(
+                &session, &pump, &route, &owner, &pipeline, &processed, &retained,
+            )
+        }));
+        match result {
+            Ok(Ok(TeacherPolicyConsumerStartV3::Ready(consumer))) => {
+                state.consumer = Some(consumer);
+                state.consumer_setup_unknown = false;
+            }
+            Ok(Ok(TeacherPolicyConsumerStartV3::Busy | TeacherPolicyConsumerStartV3::NotReady)) => {
+                state.consumer_setup_unknown = false;
+                return Ok(PcPrepareStepV3::Pending);
+            }
+            Ok(Err(error)) => {
+                state.consumer_setup_unknown = false;
+                state.failure = Some(format!("P-C V3 consumer setup: {error}"));
+                return Ok(PcPrepareStepV3::Failed);
+            }
+            Err(payload) => {
+                state.panic = Some(payload);
+                state.failure = Some("P-C V3 consumer setup unknown".into());
+                return Ok(PcPrepareStepV3::Failed);
+            }
+        }
+    }
+    {
+        let consumer = state.consumer.as_ref().expect("consumer retained");
+        match consumer.try_matches_registered_owners(
+            &session,
+            state.pump.as_ref().expect("pump retained"),
+            state.route.as_ref().expect("route retained"),
+            state.owner.as_ref().expect("owner retained"),
+            &state.pipeline,
+            state.processed.as_ref().expect("processed owner retained"),
+            state.retained.as_ref().expect("root policy owner retained"),
+        ) {
+            Ok(Some(true)) => {}
+            Ok(None) => return Ok(PcPrepareStepV3::Pending),
+            _ => {
+                state.failure = Some("P-C V3 consumer original owners differ".into());
+                return Ok(PcPrepareStepV3::Failed);
+            }
+        }
+    }
     // Root worker construction and publication are deliberately separate from
     // claiming the teacher scope; failure must keep the original owner.
     if state.worker.is_none() {
@@ -735,12 +972,13 @@ pub(crate) fn prepare_root_step_v3(
         let task = Box::new(move |receiver: rz_uci::rovent_bootstrap::pc_collection_v3::RoventPcRootHandoffReceiverV3| {
             let mut handoff = None;
             while Instant::now() < cleanup_deadline {
-                if let Ok(owner) = original.try_lock() {
+                if let Ok(mut owner) = original.try_lock() {
                     if let Some(pump) = &owner.pump {
                         if let Ok(mut pump) = pump.try_lock() {
                             if matches!(pump.try_pump(), Ok(TeacherPumpStepV3::OutputBackpressure)) { /* retained by pump */ }
                         }
                     }
+                    owner.drive_consumer_step();
                 }
                 match receiver.recv_timeout(Duration::from_millis(10)) {
                     Ok(Some(value)) => { handoff = Some(value); break; }
@@ -817,10 +1055,153 @@ pub(crate) fn prepare_root_step_v3(
 }
 
 impl PcRootRecoveryV3 {
+    /// One stage per worker tick; Busy/NotReady and an unacknowledged output
+    /// remain pending in the original consumer/pipeline. No durable sink is
+    /// assumed merely because an in-memory append or chunk succeeded.
+    fn drive_consumer_step(&mut self) {
+        use TeacherPolicyConsumerProgressV3 as P;
+        let Some(consumer) = self.consumer.as_ref().cloned() else {
+            return;
+        };
+        let mut guard = match consumer.try_lock() {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return,
+            Err(error) => {
+                self.failure = Some(error.into());
+                self.consumer_phase = ConsumerPhaseV3::Unknown;
+                return;
+            }
+        };
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self.consumer_phase {
+                ConsumerPhaseV3::Receive => guard.try_transfer_completion(),
+                ConsumerPhaseV3::Seal => guard.try_seal(),
+                ConsumerPhaseV3::TransferRow => guard.try_transfer_retired(),
+                ConsumerPhaseV3::Prepare => guard.try_prepare_sealed(),
+                ConsumerPhaseV3::Candidate => guard.try_prepare_candidate(),
+                ConsumerPhaseV3::Capability => guard.try_transfer_capability(),
+                ConsumerPhaseV3::Append => guard.try_append_policy(),
+                ConsumerPhaseV3::RetainAppend => guard.try_retain_appended(),
+                ConsumerPhaseV3::RetainCompletion => guard.try_retain_processed_completion(),
+                ConsumerPhaseV3::Rejected => return Ok(P::Rejected),
+                ConsumerPhaseV3::Unknown => return Ok(P::Unknown),
+            }));
+        match result {
+            Ok(Ok(P::CompletionStored))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::Receive) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::Seal
+            }
+            Ok(Ok(P::Sealed)) if matches!(self.consumer_phase, ConsumerPhaseV3::Seal) => {
+                self.consumer_phase = ConsumerPhaseV3::TransferRow
+            }
+            Ok(Ok(P::RowTransferred))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::TransferRow) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::Prepare
+            }
+            Ok(Ok(P::Prepared)) if matches!(self.consumer_phase, ConsumerPhaseV3::Prepare) => {
+                self.consumer_phase = ConsumerPhaseV3::Candidate
+            }
+            Ok(Ok(P::CandidateReady))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::Candidate) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::Capability
+            }
+            Ok(Ok(P::CapabilityStored))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::Capability) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::Append
+            }
+            Ok(Ok(P::Appended)) if matches!(self.consumer_phase, ConsumerPhaseV3::Append) => {
+                self.consumer_phase = ConsumerPhaseV3::RetainAppend
+            }
+            Ok(Ok(P::AppendedEvidenceStored))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::RetainAppend) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::RetainCompletion
+            }
+            Ok(Ok(P::CompletionStored))
+                if matches!(self.consumer_phase, ConsumerPhaseV3::RetainCompletion) =>
+            {
+                self.consumer_phase = ConsumerPhaseV3::Receive
+            }
+            Ok(Ok(P::Busy | P::NotReady | P::OutputHeld)) => {}
+            Ok(Ok(P::ChunkReady)) => {
+                let persistence = match self.pipeline.try_lock() {
+                    Ok(Some(mut pipeline)) => {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            pipeline.persist_chunk()
+                        })) {
+                            Ok(result) => Some(result),
+                            Err(payload) => {
+                                self.panic = Some(payload);
+                                self.consumer_phase = ConsumerPhaseV3::Unknown;
+                                self.failure.get_or_insert_with(|| {
+                                    "P-C V3 chunk persistence panicked".into()
+                                });
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        self.consumer_phase = ConsumerPhaseV3::Unknown;
+                        self.failure.get_or_insert_with(|| error.into());
+                        None
+                    }
+                };
+                match persistence {
+                    Some(PolicyChunkPersistenceV3::Failed) => {
+                        self.consumer_phase = ConsumerPhaseV3::Rejected;
+                        self.failure
+                            .get_or_insert_with(|| "P-C V3 output chunk persistence failed".into());
+                    }
+                    Some(PolicyChunkPersistenceV3::Unknown) => {
+                        self.consumer_phase = ConsumerPhaseV3::Unknown;
+                        self.failure.get_or_insert_with(|| {
+                            "P-C V3 output chunk persistence unknown".into()
+                        });
+                    }
+                    Some(
+                        PolicyChunkPersistenceV3::Persisted | PolicyChunkPersistenceV3::NotReady,
+                    )
+                    | None => {}
+                }
+            }
+            Ok(Ok(P::Rejected)) => {
+                self.consumer_phase = ConsumerPhaseV3::Rejected;
+                self.failure
+                    .get_or_insert_with(|| "P-C V3 policy consumer rejected".into());
+            }
+            Ok(Ok(P::Unknown)) => {
+                self.consumer_phase = ConsumerPhaseV3::Unknown;
+                self.failure
+                    .get_or_insert_with(|| "P-C V3 policy consumer outcome unknown".into());
+            }
+            Ok(Ok(_)) => {
+                self.consumer_phase = ConsumerPhaseV3::Unknown;
+                self.failure
+                    .get_or_insert_with(|| "P-C V3 policy phase mismatch".into());
+            }
+            Ok(Err(error)) => {
+                self.consumer_phase = ConsumerPhaseV3::Unknown;
+                self.failure.get_or_insert_with(|| error.to_string());
+            }
+            Err(payload) => {
+                self.consumer_phase = ConsumerPhaseV3::Unknown;
+                self.panic = Some(payload);
+                self.failure
+                    .get_or_insert_with(|| "P-C V3 policy step panicked".into());
+            }
+        }
+    }
+
     /// Only actual drained terminals, joined teacher workers and the original
     /// scope aggregate can reach the handoff. Output backpressure remains in
     /// the pump until the target consumer takes it; it is never discarded.
     fn try_drain_teacher(&mut self, handoff: &RootHandoffV3, deadline: Instant) -> bool {
+        self.drive_consumer_step();
         let Some(stage) = self.stage.as_ref().map(Arc::clone) else {
             return false;
         };
@@ -846,17 +1227,21 @@ impl PcRootRecoveryV3 {
             let Ok(mut pump) = pump_owner.try_lock() else {
                 return false;
             };
-            if matches!(
-                pump.try_pump(),
-                Err(_)
-                    | Ok(TeacherPumpStepV3::OutputBackpressure)
-                    | Ok(TeacherPumpStepV3::Completed)
-                    | Ok(TeacherPumpStepV3::Rejected)
-            ) {
-                return false;
-            }
+            // Output and semantic failure remain in the retained pump or
+            // consumer; neither alone prevents physical worker retirement.
+            // An actual pending dispatch is still a separate drain barrier.
+            let _ = pump.try_pump();
             if pump.has_pending() {
-                return false;
+                match pump.try_drain_pending() {
+                    Ok(TeacherPendingDrainV3::Drained) if !pump.has_pending() => {}
+                    Ok(
+                        TeacherPendingDrainV3::Drained
+                        | TeacherPendingDrainV3::Pending
+                        | TeacherPendingDrainV3::Full
+                        | TeacherPendingDrainV3::Unknown,
+                    )
+                    | Err(_) => return false,
+                }
             }
         }
         let Ok(mut session) = session.try_lock() else {
