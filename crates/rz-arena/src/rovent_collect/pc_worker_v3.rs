@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 /// The original scope, route, session and any uncertain worker remain rooted
 /// here even if preparation or a worker task is interrupted.
 pub(crate) struct PcRootRecoveryV3 {
+    original_self: Weak<Mutex<PcRootRecoveryV3>>,
     admission: RoventCollectionRootAdmissionV3,
     received_root: Option<PcReceivedRootV3>,
     stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
@@ -111,7 +112,8 @@ impl PcRootRecoveryV3 {
         pipeline: PolicyRowPipelineOwnerV3,
     ) -> Arc<Mutex<Self>> {
         let output = pipeline.output_owner();
-        Arc::new(Mutex::new(Self {
+        Arc::new_cyclic(|original_self| Mutex::new(Self {
+            original_self: original_self.clone(),
             admission,
             received_root: None,
             stage: None,
@@ -614,6 +616,7 @@ impl PcRootRecoveryV3 {
 /// Bounded supervisor; each original root remains owned even if a different
 /// root fails or needs additional recovery. Caller sets finite deadlines.
 pub(crate) struct PcWorkerSupervisorV3 {
+    original_self: OnceLock<Weak<Mutex<PcWorkerSupervisorV3>>>,
     bridge: Arc<RoventPcCollectionBridgeV3>,
     router: Arc<CaptureRouterV3>,
     roots: Vec<Arc<Mutex<PcRootRecoveryV3>>>,
@@ -648,6 +651,34 @@ impl PcReceivedStageProofV3 {
         self.recovery.upgrade().map(|original| Arc::ptr_eq(&original, recovery))
     }
     pub(super) fn stage(&self) -> Option<Arc<Mutex<TeacherSessionStagingV3>>> { self.stage.upgrade() }
+
+    /// Revalidate while the caller already holds both original guards. The
+    /// two Weak identities were sealed at construction/binding; no guard is
+    /// reacquired and no raw address or copied identifier is authority.
+    pub(super) fn try_revalidate_with_guards(
+        &self,
+        supervisor: &PcWorkerSupervisorV3,
+        recovery: &PcRootRecoveryV3,
+    ) -> Result<Option<bool>, &'static str> {
+        let Some(supervisor_identity) = supervisor.original_self.get() else {
+            return Err("P-C V3 supervisor identity is not bound");
+        };
+        if !Weak::ptr_eq(supervisor_identity, &self.supervisor)
+            || !Weak::ptr_eq(&recovery.original_self, &self.recovery)
+        {
+            return Ok(Some(false));
+        }
+        let bridge = self.bridge.upgrade().ok_or("P-C V3 bridge owner unavailable")?;
+        let recovery_owner = self.recovery.upgrade().ok_or("P-C V3 recovery owner unavailable")?;
+        let stage = self.stage.upgrade().ok_or("P-C V3 stage owner unavailable")?;
+        if !supervisor.matches_original_bridge(&bridge) || !supervisor.owns_recovery(&recovery_owner)
+            || !recovery.matches_admission(&self.admission) || !recovery.matches_received_root(&bridge)
+            || !recovery.stage.as_ref().is_some_and(|original| Arc::ptr_eq(original, &stage))
+        {
+            return Ok(Some(false));
+        }
+        bridge.try_matches_registered_recovery(&self.admission, &recovery_owner)
+    }
 
     /// Reobserve the original owners before issuing an effect. This never
     /// locks the supervisor across a blocking call or fabricates a receipt.
@@ -1669,6 +1700,20 @@ impl SupervisorStartCustodyV3 {
 }
 
 impl PcWorkerSupervisorV3 {
+    /// Call only while holding the guard obtained from `original` itself.
+    /// The bridge performs this binding before any worker or admission.
+    pub(super) fn bind_original_identity(
+        &mut self,
+        original: &Arc<Mutex<Self>>,
+    ) -> Result<(), &'static str> {
+        let candidate = Arc::downgrade(original);
+        if let Some(bound) = self.original_self.get() {
+            return if Weak::ptr_eq(bound, &candidate) { Ok(()) }
+                else { Err("P-C V3 supervisor identity changed") };
+        }
+        self.original_self.set(candidate).map_err(|_| "P-C V3 supervisor identity raced")
+    }
+
     /// Construct only from the same original supervisor and a recovery already
     /// registered in its root list and in the bridge's exact slot.
     pub(super) fn try_received_stage_proof(
@@ -1778,6 +1823,7 @@ impl PcWorkerSupervisorV3 {
             .try_reserve_exact(usize::from(bridge.inputs().plan().maximum_roots))
             .map_err(|_| "P-C V3 supervisor allocation failed")?;
         Ok(Self {
+            original_self: OnceLock::new(),
             bridge,
             router,
             roots,
