@@ -216,7 +216,7 @@ pub(super) fn prepare_supervisor(
             return Err(invalid("NoGame child pin root differs"));
         }
         admission.verify_held()?;
-        PalsProxyLaunchV6::new(
+        let mut launch = PalsProxyLaunchV6::new(
             binary,
             lock_path,
             args.startup
@@ -225,7 +225,9 @@ pub(super) fn prepare_supervisor(
             admission.lock().clone(),
             window.startup_until,
             Arc::clone(&window.cancelled),
-        )
+        )?;
+        launch.select_no_game_session_report();
+        Ok(launch)
     })();
     let launch = match result {
         Ok(launch) => launch,

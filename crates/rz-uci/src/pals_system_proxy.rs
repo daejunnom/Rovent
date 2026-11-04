@@ -91,6 +91,7 @@ pub struct PalsProxyLaunchV6 {
     lock: PalsSystemStartupLockV6,
     startup_until: Instant,
     startup_cancelled: Arc<AtomicBool>,
+    no_game_session_report: bool,
 }
 
 /// The verified input inode is opened once and kept for all child executions
@@ -208,7 +209,14 @@ impl PalsProxyLaunchV6 {
             lock,
             startup_until,
             startup_cancelled,
+            no_game_session_report: false,
         })
+    }
+
+    /// Explicit NoGame profile only; the child and this original supervisor
+    /// must use the corresponding parent-deadline and session-report protocol.
+    fn select_no_game_session_report(&mut self) {
+        self.no_game_session_report = true;
     }
 
     fn check_startup_control(&self) -> io::Result<()> {
@@ -353,6 +361,8 @@ pub struct DirectPalsChildV6 {
     startup_until: Instant,
     startup_cancelled: Arc<AtomicBool>,
     image_grant: ImageGrantState,
+    no_game_session_report: bool,
+    cleanup_deadline_acknowledged: bool,
     finish_channel_attempted: bool,
     finish_channel_rejected: Option<parent::AuthenticatedChildChannel>,
 }
@@ -546,6 +556,9 @@ impl DirectPalsChildV6 {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if launch.no_game_session_report {
+            command.arg("--pals-system-no-game-session-report=true");
+        }
         if let Err(error) = launch.check_startup_control() {
             let cleanup = if socket_abstract {
                 Ok(())
@@ -600,6 +613,8 @@ impl DirectPalsChildV6 {
             startup_until: launch.startup_until,
             startup_cancelled: launch.startup_cancelled,
             image_grant: ImageGrantState::NotAttempted,
+            no_game_session_report: launch.no_game_session_report,
+            cleanup_deadline_acknowledged: false,
             finish_channel_attempted: false,
             finish_channel_rejected: None,
         })
@@ -701,6 +716,11 @@ impl DirectPalsChildV6 {
     /// the matching child acknowledgement. On failure, the original child,
     /// control stream and image FD (if any) remain owned by `self`.
     pub fn grant_original_image(&mut self) -> io::Result<()> {
+        if self.no_game_session_report {
+            return Err(invalid(
+                "NoGame child requires its original cleanup deadline",
+            ));
+        }
         if !matches!(self.image_grant, ImageGrantState::NotAttempted) {
             return Err(invalid("PALS image grant already attempted"));
         }
@@ -724,6 +744,55 @@ impl DirectPalsChildV6 {
                 Err(error)
             }
         }
+    }
+
+    /// The selected NoGame child receives the same supervisor's cleanup
+    /// deadline after image authentication. A partial exchange remains in
+    /// this owner and never authorizes input transfer or retry.
+    fn grant_original_image_with_cleanup(&mut self, cleanup_until: Instant) -> io::Result<()> {
+        if !self.no_game_session_report
+            || !matches!(self.image_grant, ImageGrantState::NotAttempted)
+        {
+            return Err(invalid(
+                "NoGame image grant unavailable or already attempted",
+            ));
+        }
+        let listener = self
+            .listener
+            .as_ref()
+            .ok_or_else(|| invalid("PALS listener retired"))?
+            .try_clone()?;
+        let until = self.startup_until;
+        let cancelled = Arc::clone(&self.startup_cancelled);
+        match parent::grant_after_original_image_with_cleanup(
+            &listener,
+            self,
+            until,
+            cancelled.as_ref(),
+        ) {
+            Ok(grant) => self.image_grant = ImageGrantState::Acknowledged(grant),
+            Err(failure) => {
+                let error = io::Error::new(failure.error.kind(), failure.error.to_string());
+                self.image_grant = ImageGrantState::Failed(failure);
+                return Err(error);
+            }
+        }
+        let initial = self
+            .channel
+            .as_ref()
+            .ok_or_else(|| invalid("PALS original parent channel unavailable"))?;
+        let ImageGrantState::Acknowledged(grant) = &mut self.image_grant else {
+            unreachable!("original image grant retained above");
+        };
+        grant.grant_cleanup_deadline_once(
+            initial,
+            &mut self.child,
+            until,
+            cleanup_until,
+            cancelled.as_ref(),
+        )?;
+        self.cleanup_deadline_acknowledged = true;
+        Ok(())
     }
 
     /// Accept one dedicated finish channel for this same direct child.
@@ -778,6 +847,9 @@ impl DirectPalsChildV6 {
     }
 
     fn require_authenticated_parent(&mut self) -> io::Result<()> {
+        if self.no_game_session_report && !self.cleanup_deadline_acknowledged {
+            return Err(invalid("NoGame cleanup deadline was not acknowledged"));
+        }
         if self.startup_cancelled.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
