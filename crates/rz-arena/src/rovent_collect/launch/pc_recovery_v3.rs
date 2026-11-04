@@ -10,13 +10,92 @@
 //! None of these operations establishes a fence, validates an output handoff,
 //! or authorizes settlement or resource release.
 use super::pc_lock_v3::{ManagedOutputOwnerV3, PcCollectionOwnersV3};
-use crate::rovent_collect::pc_worker_v3::PcWorkerSupervisorV3;
+use crate::rovent_collect::pc_hooks_lock_v3::PcSupervisorStopAuthorizationV3;
+use crate::rovent_collect::pc_worker_v3::{
+    PcSupervisorBeforeAdmissionJoinProofV3, PcSupervisorJoinedProofV3,
+    PcSupervisorNoWorkerProofV3, PcWorkerSupervisorV3,
+};
 use crate::rovent_resource_scope::launch::{
     NativeResourceCustody, RoventPcCollectionRecoveryKeyV3,
     RoventPcCollectionResourceOutcomeV3,
 };
 use std::any::Any;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+
+/// A custody operation does not consume an incoming original on failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PcEvidenceCustodyErrorV3 {
+    Busy,
+    Poisoned,
+    Missing,
+    AlreadyOccupied,
+    DifferentOwner,
+}
+
+trait SamePcRunV3 {
+    fn matches_run(&self, owners: &PcCollectionOwnersV3) -> bool;
+}
+
+impl SamePcRunV3 for PcSupervisorStopAuthorizationV3 {
+    fn matches_run(&self, owners: &PcCollectionOwnersV3) -> bool {
+        self.matches_original(owners.supervisor(), owners.native())
+    }
+}
+
+macro_rules! same_driver_evidence {
+    ($($evidence:ty),+ $(,)?) => {$(
+        impl SamePcRunV3 for $evidence {
+            fn matches_run(&self, owners: &PcCollectionOwnersV3) -> bool {
+                self.matches_original(owners.driver_custody(), owners.supervisor(), owners.native())
+            }
+        }
+    )+};
+}
+
+same_driver_evidence!(
+    PcSupervisorJoinedProofV3,
+    PcSupervisorNoWorkerProofV3,
+    PcSupervisorBeforeAdmissionJoinProofV3,
+);
+
+macro_rules! evidence_custody {
+    ($put:ident, $take:ident, $field:ident, $evidence:ty) => {
+        /// Retain this exact token; rejection returns it unchanged.
+        pub(crate) fn $put(
+            &self,
+            evidence: $evidence,
+        ) -> Result<(), ($evidence, PcEvidenceCustodyErrorV3)> {
+            let mut guard = match self.0.original.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => return Err((evidence, PcEvidenceCustodyErrorV3::Busy)),
+                Err(TryLockError::Poisoned(_)) => return Err((evidence, PcEvidenceCustodyErrorV3::Poisoned)),
+            };
+            let Some(original) = guard.as_mut() else {
+                return Err((evidence, PcEvidenceCustodyErrorV3::Missing));
+            };
+            if !evidence.matches_run(&original.owners) {
+                return Err((evidence, PcEvidenceCustodyErrorV3::DifferentOwner));
+            }
+            if original.$field.is_some() {
+                return Err((evidence, PcEvidenceCustodyErrorV3::AlreadyOccupied));
+            }
+            original.$field = Some(evidence);
+            Ok(())
+        }
+
+        /// Transfer the same token to the caller; this does not consume its
+        /// meaning or authorize settlement or resource release.
+        pub(crate) fn $take(&self) -> Result<Option<$evidence>, PcEvidenceCustodyErrorV3> {
+            let mut guard = match self.0.original.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => return Err(PcEvidenceCustodyErrorV3::Busy),
+                Err(TryLockError::Poisoned(_)) => return Err(PcEvidenceCustodyErrorV3::Poisoned),
+            };
+            let original = guard.as_mut().ok_or(PcEvidenceCustodyErrorV3::Missing)?;
+            Ok(original.$field.take())
+        }
+    };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PcRunRecoveryStateV3 {
@@ -33,6 +112,10 @@ struct OriginalPcRunV3 {
     outcome: Option<RoventPcCollectionResourceOutcomeV3>,
     outcome_key: Option<RoventPcCollectionRecoveryKeyV3>,
     panic: Option<Box<dyn Any + Send>>,
+    stop_authorization: Option<PcSupervisorStopAuthorizationV3>,
+    joined_proof: Option<PcSupervisorJoinedProofV3>,
+    no_worker_proof: Option<PcSupervisorNoWorkerProofV3>,
+    before_admission_join_proof: Option<PcSupervisorBeforeAdmissionJoinProofV3>,
     state: PcRunRecoveryStateV3,
 }
 
@@ -82,6 +165,10 @@ impl PcRunRecoveryKeyV3 {
                 outcome: None,
                 outcome_key: None,
                 panic: None,
+                stop_authorization: None,
+                joined_proof: None,
+                no_worker_proof: None,
+                before_admission_join_proof: None,
                 state: PcRunRecoveryStateV3::Prepared,
             })),
         });
@@ -191,6 +278,15 @@ impl PcRunRecoveryKeyV3 {
         let original = guard.as_ref().ok_or("P-C original custody missing")?;
         Ok(original.outcome_key.clone())
     }
+
+    evidence_custody!(put_stop_authorization, take_stop_authorization,
+        stop_authorization, PcSupervisorStopAuthorizationV3);
+    evidence_custody!(put_joined_proof, take_joined_proof,
+        joined_proof, PcSupervisorJoinedProofV3);
+    evidence_custody!(put_no_worker_proof, take_no_worker_proof,
+        no_worker_proof, PcSupervisorNoWorkerProofV3);
+    evidence_custody!(put_before_admission_join_proof, take_before_admission_join_proof,
+        before_admission_join_proof, PcSupervisorBeforeAdmissionJoinProofV3);
 
     /// The caller catches the launch panic and transfers the original payload.
     /// A panic does not imply that no worker, native work, or GPU work started.
