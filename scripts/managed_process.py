@@ -33,14 +33,18 @@ def _check_before_spawn(argv, cwd, pass_fds, stdout):
 
 
 def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=None, on_spawn=None,
-              verify_before_spawn=False, absolute_deadline=None, deadline_observation=None):
+              verify_before_spawn=False, absolute_deadline=None, deadline_observation=None,
+              on_tick=None):
     if os.name == "nt":
         if (pass_fds or stdout is not None or on_spawn is not None or verify_before_spawn
-                or absolute_deadline is not None or deadline_observation is not None):
+                or absolute_deadline is not None or deadline_observation is not None
+                or on_tick is not None):
             raise RuntimeError("explicit descriptor handoff requires Linux")
         return _run_windows(argv, cwd, env, timeout, admission_check)
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
         raise RuntimeError("non-reaping process supervision requires Linux waitid")
+    if on_tick is not None and not callable(on_tick):
+        raise ValueError("on_tick must be callable")
     if deadline_observation is not None:
         if type(deadline_observation) is not dict or absolute_deadline is None:
             raise ValueError("deadline observation requires a dict and an absolute deadline")
@@ -98,6 +102,27 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
                     deadline_observation["deadline_elapsed_while_running_observed"] = True
                 requested_exit = 124
                 break
+            # Fast nonblocking control I/O must not wait for the heavier
+            # admission/budget scan, which remains on its existing schedule.
+            if on_tick is not None:
+                on_tick()
+                now = time.monotonic()
+                if now - started > timeout or (absolute_deadline is not None and now >= absolute_deadline):
+                    check_started = now
+                    status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    if status is not None:
+                        if deadline_observation is not None:
+                            observed = time.monotonic()
+                            deadline_observation.update(
+                                exit_observed_monotonic=observed,
+                                exit_observation_timing=("before_deadline" if observed < absolute_deadline
+                                                         else "at_or_after_deadline"),
+                            )
+                    else:
+                        if deadline_observation is not None and check_started >= absolute_deadline:
+                            deadline_observation["deadline_elapsed_while_running_observed"] = True
+                        requested_exit = 124
+                    break
             if now >= next_check:
                 admission_check()
                 # A full custody observation may itself exceed the sampling
@@ -132,7 +157,7 @@ def run_group(argv, cwd, env, timeout, admission_check, *, pass_fds=(), stdout=N
     except BaseException as exc:
         # Child ownership already exists: even an uncommon control-flow
         # exception must pass through the original group drain below.
-        if on_spawn is None:
+        if on_spawn is None and on_tick is None:
             raise
         requested_exit, failure = 125, f"{type(exc).__name__}: {exc}"
     # Popen and individual observations cannot be preempted. The finite

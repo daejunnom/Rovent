@@ -205,6 +205,77 @@ class ManagedProcessSpawnTests(unittest.TestCase):
         )
         self.assertEqual((code, gone, failure), (124, True, None))
 
+    def test_fast_tick_runs_each_loop_without_extra_budget_scans(self):
+        clock = {"now": 10.0}
+        ticks, scans = [], []
+        child = mock.Mock(pid=123456)
+        child.wait.return_value = 0
+
+        def advance(seconds):
+            clock["now"] += seconds
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch("managed_process.time.sleep", side_effect=advance), \
+             mock.patch("managed_process.os.waitid", side_effect=[None, None, None, object()]), \
+             mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("managed_process.os.scandir", return_value=[]):
+            result = run_group([self.python], self.root, os.environ.copy(), 20,
+                               lambda: scans.append(1), absolute_deadline=15.0,
+                               on_tick=lambda: ticks.append(1))
+        self.assertEqual(result, (0, True, None))
+        self.assertEqual(len(ticks), 3)
+        self.assertEqual(len(scans), 1)
+
+    def test_tick_failures_drain_original_child(self):
+        for exception, expected in ((ValueError("tick-failed"), "tick-failed"),
+                                    (SystemExit("tick-stop"), "SystemExit: tick-stop")):
+            child = mock.Mock(pid=123456)
+            child.wait.return_value = -15
+
+            def fail():
+                raise exception
+
+            with self.subTest(exception=type(exception).__name__), \
+                 mock.patch("managed_process.subprocess.Popen", return_value=child), \
+                 mock.patch("managed_process.os.waitid", return_value=None), \
+                 mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+                 mock.patch("managed_process.os.scandir", return_value=[]):
+                result = run_group([self.python], self.root, os.environ.copy(), 10,
+                                   lambda: None, on_tick=fail)
+            self.assertEqual(result, (125, True, expected))
+            child.wait.assert_called_once_with()
+
+    def test_slow_tick_preserves_exit_and_unknown_completion_time(self):
+        clock, observation = {"now": 10.0}, {}
+        child = mock.Mock(pid=123456)
+        child.wait.return_value = 7
+        scans = []
+
+        def slow_tick():
+            clock["now"] = 20.0
+
+        with mock.patch("managed_process.subprocess.Popen", return_value=child), \
+             mock.patch("managed_process.time.monotonic", side_effect=lambda: clock["now"]), \
+             mock.patch("managed_process.os.waitid", side_effect=[None, object()]), \
+             mock.patch("managed_process.os.killpg", side_effect=ProcessLookupError), \
+             mock.patch("managed_process.os.scandir", return_value=[]):
+            result = run_group([self.python], self.root, os.environ.copy(), 10,
+                               lambda: scans.append(1), absolute_deadline=15.0,
+                               deadline_observation=observation, on_tick=slow_tick)
+        self.assertEqual(result, (7, True, None))
+        self.assertEqual(scans, [])
+        self.assertEqual(observation["exit_observation_timing"], "at_or_after_deadline")
+        self.assertEqual(observation["actual_exit_time"], "unknown")
+        self.assertFalse(observation["deadline_elapsed_while_running_observed"])
+
+    def test_invalid_tick_is_rejected_before_spawn(self):
+        with mock.patch("managed_process.subprocess.Popen") as popen:
+            with self.assertRaises(ValueError):
+                run_group([self.python], self.root, os.environ.copy(), 10,
+                          lambda: None, on_tick=1)
+            popen.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
