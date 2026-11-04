@@ -222,7 +222,12 @@ impl Lc0ControlSupervisor {
             Lc0ObservedService::Serving
         } else if self.service_panic.is_some() || self.service_failure_projection.is_some() {
             Lc0ObservedService::Failed
-        } else if self.finish.as_ref().is_some_and(|f| f.run.is_ok()) {
+        } else if matches!(
+            self.state,
+            ServiceState::DrainRequested | ServiceState::SessionReleased
+        ) {
+            // This state is reached only after the UCI service returned.
+            // Session/receipt failures are separate observations below.
             Lc0ObservedService::Succeeded
         } else {
             Lc0ObservedService::Unknown
