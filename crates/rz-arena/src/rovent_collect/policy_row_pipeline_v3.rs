@@ -4,7 +4,10 @@
 //! worker and through that worker's actual join. This is not a worker-join,
 //! GPU fence, durable publication, or training-eligibility proof.
 
-use super::launch::{ManagedOutputOwnerV3, PreparedPcCollectionInputsV3};
+use super::game_authority_v3::{GamePublicationOriginV3, GamePublishGuardV3, GameStepV3};
+use super::launch::{
+    ManagedOutputOwnerV3, ManagedOutputWriteErrorV3, PreparedPcCollectionInputsV3,
+};
 use super::producer_v3::{
     PendingPolicyPublicationV3, RoventCorpusProducerLockV3, RoventRetiredLockV3Record,
 };
@@ -42,6 +45,21 @@ pub(super) enum PolicyPipelineFailureV3 {
     ChunkPreparePanic(Box<dyn std::any::Any + Send>),
     ChunkIo(ArenaError),
     ChunkPanic(Box<dyn std::any::Any + Send>),
+    PublicationBeforeWrite(String),
+    PublicationUnknown(String),
+    PublicationPanic(Box<dyn std::any::Any + Send>),
+}
+
+/// Pipeline-local result only; worker, native and parent lease termination
+/// remain independently owned and independently evidenced.
+pub(super) enum PolicyFinalizationV3 {
+    Pending,
+    Progress,
+    NoData,
+    Published,
+    Aborted,
+    Failed,
+    Unknown,
 }
 
 pub(super) enum PolicyPipelineProgressV3 {
@@ -86,6 +104,11 @@ pub(super) struct PolicyRowPipelineV3 {
     output_chunk: Option<RoventChunkPacket>,
     output_completed: Option<PendingPolicyPublicationV3>,
     output_finished: Option<FinishedRoventCorpusLockV3>,
+    output_publication:
+        Option<rz_experiments::rovent_corpus_lock_v3::publication::RoventLockV3Publication>,
+    output_origin: Option<GamePublicationOriginV3>,
+    output_no_data: bool,
+    output_aborted: bool,
     output_directory: Option<Arc<ManagedOutputOwnerV3>>,
     chunk_attempted: bool,
     chunk_receipts: Vec<rz_experiments::rovent_corpus::RoventCorpusChunk>,
@@ -155,6 +178,10 @@ impl PolicyRowPipelineOwnerV3 {
             output_chunk: None,
             output_completed: None,
             output_finished: None,
+            output_publication: None,
+            output_origin: None,
+            output_no_data: false,
+            output_aborted: false,
             output_directory: None,
             chunk_attempted: false,
             chunk_receipts: Vec::new(),
@@ -181,6 +208,146 @@ impl PolicyRowPipelineOwnerV3 {
 
     pub(super) fn output_owner(&self) -> PolicyOutputOwnerV3 {
         PolicyOutputOwnerV3(self.clone())
+    }
+
+    /// Advance only this original pipeline after the real game owner has
+    /// issued its publication guard. The caller retains both owners and the
+    /// guard across Busy; no result here proves worker or lease termination.
+    pub(super) fn try_finalize<S>(
+        &self,
+        guard: &mut GamePublishGuardV3<S>,
+        until: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> PolicyFinalizationV3 {
+        let mut state = match self.try_lock() {
+            Ok(Some(state)) => state,
+            Ok(None) => return PolicyFinalizationV3::Pending,
+            Err(_) => return PolicyFinalizationV3::Unknown,
+        };
+        if state
+            .output_origin
+            .as_ref()
+            .is_some_and(|origin| !guard.matches_original_game(origin))
+        {
+            return PolicyFinalizationV3::Failed;
+        }
+        if state.output_publication.is_some() {
+            return PolicyFinalizationV3::Published;
+        }
+        if state.output_no_data {
+            return PolicyFinalizationV3::NoData;
+        }
+        if state.output_aborted {
+            return PolicyFinalizationV3::Aborted;
+        }
+        if state.is_uncertain() {
+            return PolicyFinalizationV3::Unknown;
+        }
+        if state.failure.is_some() {
+            return PolicyFinalizationV3::Failed;
+        }
+        let Some(output) = state.output_directory.as_ref().cloned() else {
+            return PolicyFinalizationV3::Pending;
+        };
+        match guard.try_matches_output_pipeline(&output, self) {
+            Ok(Some(true)) => {}
+            Ok(None) => return PolicyFinalizationV3::Pending,
+            Ok(Some(false)) => return PolicyFinalizationV3::Failed,
+            Err(error) => {
+                state.failure = Some(PolicyPipelineFailureV3::PublicationUnknown(error.into()));
+                return PolicyFinalizationV3::Unknown;
+            }
+        }
+        if state.output_origin.is_none() {
+            state.output_origin = Some(guard.original_game_identity());
+        }
+        if state.output_finished.is_some() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                output.checked_publish_corpus(
+                    state
+                        .output_finished
+                        .as_ref()
+                        .expect("checked finished owner"),
+                    self,
+                    guard,
+                    until,
+                    cancel,
+                )
+            }));
+            return match result {
+                Ok(Ok(receipt)) => {
+                    state.output_publication = Some(receipt);
+                    PolicyFinalizationV3::Published
+                }
+                Ok(Err(ManagedOutputWriteErrorV3::Busy)) => PolicyFinalizationV3::Pending,
+                Ok(Err(ManagedOutputWriteErrorV3::BeforeWrite(error))) => {
+                    state.failure = Some(PolicyPipelineFailureV3::PublicationBeforeWrite(error));
+                    PolicyFinalizationV3::Failed
+                }
+                Ok(Err(ManagedOutputWriteErrorV3::AuthorityUnknown(error))) => {
+                    state.failure = Some(PolicyPipelineFailureV3::PublicationUnknown(error));
+                    PolicyFinalizationV3::Unknown
+                }
+                Ok(Err(ManagedOutputWriteErrorV3::AfterAttempt(error))) => {
+                    state.failure = Some(PolicyPipelineFailureV3::PublicationUnknown(error));
+                    PolicyFinalizationV3::Unknown
+                }
+                Err(payload) => {
+                    state.failure = Some(PolicyPipelineFailureV3::PublicationPanic(payload));
+                    PolicyFinalizationV3::Unknown
+                }
+            };
+        }
+        if !state.idle() {
+            return PolicyFinalizationV3::Pending;
+        }
+        if state.output_chunk.is_some() {
+            return match state.persist_chunk() {
+                PolicyChunkPersistenceV3::Persisted => PolicyFinalizationV3::Progress,
+                PolicyChunkPersistenceV3::NotReady => PolicyFinalizationV3::Pending,
+                PolicyChunkPersistenceV3::Failed => PolicyFinalizationV3::Failed,
+                PolicyChunkPersistenceV3::Unknown => PolicyFinalizationV3::Unknown,
+            };
+        }
+        match state.flush_into() {
+            PolicyFlushOutcomeV3::Packet => PolicyFinalizationV3::Progress,
+            PolicyFlushOutcomeV3::NotReady => PolicyFinalizationV3::Pending,
+            PolicyFlushOutcomeV3::Failed => PolicyFinalizationV3::Failed,
+            PolicyFlushOutcomeV3::Unknown => PolicyFinalizationV3::Unknown,
+            PolicyFlushOutcomeV3::Empty => {
+                if state
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.is_pristine())
+                {
+                    match guard.try_finish_no_data() {
+                        GameStepV3::Ready => {
+                            state.output_no_data = true;
+                            PolicyFinalizationV3::NoData
+                        }
+                        GameStepV3::Busy => PolicyFinalizationV3::Pending,
+                        GameStepV3::Aborted => {
+                            state.output_aborted = true;
+                            PolicyFinalizationV3::Aborted
+                        }
+                        _ => {
+                            state.failure = Some(PolicyPipelineFailureV3::PublicationUnknown(
+                                "game no-data termination unknown".into(),
+                            ));
+                            PolicyFinalizationV3::Unknown
+                        }
+                    }
+                } else if state.finish_into() {
+                    PolicyFinalizationV3::Progress
+                } else if state.is_uncertain() {
+                    PolicyFinalizationV3::Unknown
+                } else if state.failure.is_some() {
+                    PolicyFinalizationV3::Failed
+                } else {
+                    PolicyFinalizationV3::Pending
+                }
+            }
+        }
     }
 }
 
@@ -408,6 +575,8 @@ impl PolicyRowPipelineV3 {
                     | PolicyPipelineFailureV3::FlushPanic(_)
                     | PolicyPipelineFailureV3::ChunkIo(_)
                     | PolicyPipelineFailureV3::ChunkPanic(_)
+                    | PolicyPipelineFailureV3::PublicationUnknown(_)
+                    | PolicyPipelineFailureV3::PublicationPanic(_)
             ) | Some(PolicyPipelineFailureV3::GateRejected(
                 TargetBeginRejectionV3::Uncertain
                     | TargetBeginRejectionV3::Poisoned
@@ -522,6 +691,11 @@ impl PolicyRowPipelineV3 {
                 self.chunk_attempted = false;
                 self.failure = Some(PolicyPipelineFailureV3::ChunkPrepare(super::invalid(error)));
                 PolicyChunkPersistenceV3::Failed
+            }
+            Ok(Err(super::launch::ManagedOutputWriteErrorV3::AuthorityUnknown(error))) => {
+                self.chunk_attempted = false;
+                self.failure = Some(PolicyPipelineFailureV3::PublicationUnknown(error));
+                PolicyChunkPersistenceV3::Unknown
             }
             Ok(Err(super::launch::ManagedOutputWriteErrorV3::AfterAttempt(error))) => {
                 self.failure = Some(PolicyPipelineFailureV3::ChunkIo(super::invalid(error)));
