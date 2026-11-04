@@ -3,6 +3,8 @@
 use rz_eval::asset;
 use rz_eval::error::{BackendError, FailureKind, FailureStage};
 use rz_eval::onnx::{OrtRuntime, Provider};
+#[cfg(target_os = "linux")]
+use rz_eval::onnx::{SystemCaptureLimits, SystemLibraryRequest, SystemRuntime};
 use rz_eval::pals_model::{
     PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRecordLine, PalsRole,
 };
@@ -11,7 +13,7 @@ use rz_eval::pals_onnx::{
     PalsCudaControlPolicy, PalsNativeCommand, PalsNativeResult, PalsOnnxBackend, PalsOnnxConfig,
     PalsPublicMemoryWitness,
 };
-use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
+use rz_eval::runtime_pin::RuntimeCache;
 use rz_eval::worker::PhysicalPoll;
 use rz_native_loader::{NativeLoadingProfile, NativeMappingObservation};
 use serde::Deserialize;
@@ -19,6 +21,8 @@ use serde_json::json;
 use std::error::Error;
 use std::io::Write;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -892,6 +896,130 @@ fn mapping_json(phase: &str, observed: &NativeMappingObservation) -> serde_json:
         "vram_residency":"unknown","normal_process_exit":"requires_external_supervisor"})
 }
 
+/// A caller-pinned description of already installed system libraries. No runtime
+/// file is copied; the retained SystemRuntime owns the exact opened identities.
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemCudaLibrary {
+    role: String,
+    path: PathBuf,
+    required_mapping: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemCudaConfig {
+    max_libraries: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_capture_ms: u64,
+    libraries: Vec<SystemCudaLibrary>,
+}
+
+#[cfg(target_os = "linux")]
+fn system_cuda_runtime(
+    args: &[String],
+    trace: &NativeStartupTrace,
+) -> Result<OrtRuntime, Box<dyn Error>> {
+    let path = Path::new(&args[8]);
+    if !path.is_absolute() || !Path::new(&args[2]).is_absolute() {
+        return Err("system CUDA config and ORT paths must be absolute".into());
+    }
+    let bytes = asset::read_bounded(path, 64 * 1024)?;
+    if asset::sha256(&bytes) != asset::parse_sha256(&args[9])? {
+        return Err("system CUDA config digest differs".into());
+    }
+    let config: SystemCudaConfig = serde_json::from_slice(&bytes)?;
+    if config.max_capture_ms == 0 || config.libraries.iter().any(|item| !item.path.is_absolute()) {
+        return Err(
+            "system CUDA requires absolute library paths and a finite capture limit".into(),
+        );
+    }
+    let requests = config
+        .libraries
+        .into_iter()
+        .map(|item| SystemLibraryRequest {
+            role: item.role,
+            path: item.path,
+            required_mapping: item.required_mapping,
+        })
+        .collect();
+    let owner = SystemRuntime::capture(
+        requests,
+        SystemCaptureLimits {
+            max_libraries: config.max_libraries,
+            max_file_bytes: config.max_file_bytes,
+            max_total_bytes: config.max_total_bytes,
+            max_elapsed: Duration::from_millis(config.max_capture_ms),
+        },
+    )?;
+    let core = owner
+        .libraries()
+        .into_iter()
+        .find(|item| item.role == "ort-core" && item.required_mapping)
+        .ok_or("system CUDA requires a required ort-core")?;
+    if std::fs::canonicalize(&args[2])? != core.canonical_path
+        || asset::parse_sha256(&args[3])? != core.sha256
+    {
+        return Err("system CUDA core differs from requested ORT path or digest".into());
+    }
+    trace.stage("runtime_pin_returned");
+    trace.stage("runtime_load_entered");
+    Ok(OrtRuntime::load_system_cuda(&owner)?)
+}
+
+fn cuda_mapping_json(
+    phase: &str,
+    runtime: &OrtRuntime,
+    include_runtime: bool,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = runtime.system_runtime() {
+        let observed = owner.observe_mappings()?;
+        return Ok(
+            json!({"phase":phase,"scope":"proc_self_maps_at_audit_boundary",
+            "schema":"rovezero.system-native-mapping-observation.v1",
+            "system_runtime_identity_sha256":hex_digest(&observed.identity_sha256),
+            "availability":format!("{:?}", observed.availability),
+            "preexisting_mapping_observed":observed.preexisting_mapping_observed,
+            "preexisting_native_mappings":observed.preexisting_native_mappings,
+            "mapped_roles":observed.mapped_roles,"missing_required_roles":observed.missing_required_roles,
+            "missing_optional_roles":observed.missing_optional_roles,
+            "unregistered_native_mappings":observed.unregistered_native_mappings,
+            "gpu_provider_verified":false,"gpu_completion_verified":false,
+            "normal_process_exit":"requires_external_supervisor"}),
+        );
+    }
+    Ok(mapping_json(
+        phase,
+        &runtime.cuda_mapping_observation(include_runtime)?,
+    ))
+}
+
+fn system_runtime_libraries_json(runtime: &OrtRuntime) -> Option<Vec<serde_json::Value>> {
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = runtime.system_runtime() {
+        return Some(
+            owner
+                .libraries()
+                .iter()
+                .map(|item| {
+                    json!({
+                        "role": item.role, "canonical_path": item.canonical_path,
+                        "sha256": hex_digest(&item.sha256), "bytes": item.bytes,
+                        "required_mapping": item.required_mapping
+                    })
+                })
+                .collect(),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = runtime;
+    None
+}
+
 const COST_COMMON_SIX_FLAG: &str = "--cost-common-six";
 const COST_COMMON_SIX_CONV_DEFAULT_FLAG: &str = "--cost-common-six-conv-default";
 const COST_SECONDS: u64 = 45;
@@ -923,7 +1051,9 @@ impl CostProfile {
         if selected.is_some() {
             args.remove(0);
             if args.iter().any(|arg| arg.starts_with("--")) {
-                return Err("common-six cost is independent;record-page and other optional modes cannot be combined");
+                return Err(
+                    "common-six cost is independent;record-page and other optional modes cannot be combined",
+                );
             }
         }
         Ok(selected)
@@ -1082,7 +1212,9 @@ fn cost_common_six(
         receipt["tf32"] = json!("unknown");
         receipt["tf32_requested"] = json!(false);
         receipt["nvidia_tf32_override_environment_request"] = json!("0");
-        receipt["experiment_scope"] = json!("explicit_DEFAULT_common_six_API_cost;colab_observed_resource_evidence_is_external;not_a_production_default_or_speedup_claim");
+        receipt["experiment_scope"] = json!(
+            "explicit_DEFAULT_common_six_API_cost;colab_observed_resource_evidence_is_external;not_a_production_default_or_speedup_claim"
+        );
     }
     let serde_json::Value::Object(timing_fields) = json!({
         "warmup_calls_per_case_lane":COST_WARMUP,"measured_calls_per_case_lane":COST_SAMPLES,
@@ -1174,7 +1306,9 @@ fn cost_common_six(
         }
         if backend.cuda_control_inventory_digest().is_some() {
             receipt["startup_only_cuda_placement"] = json!(backend.verify_cuda_placement()?);
-            receipt["profile_scope"] = json!("explicit_control_ready_P_C_only;profiling_stopped_before_cost_lanes;not_common_six_cost_profile");
+            receipt["profile_scope"] = json!(
+                "explicit_control_ready_P_C_only;profiling_stopped_before_cost_lanes;not_common_six_cost_profile"
+            );
         } else {
             receipt["profile_scope"] = json!("no_cost_profile_collected");
         }
@@ -1209,9 +1343,11 @@ fn cost_common_six(
                         match &after {
                             Ok(after) => {
                                 sample["backend_after"] = stats_json(after);
-                                sample["returned_physical_nn_inputs_delta"] = json!(after
-                                    .completed_nn_inputs
-                                    .checked_sub(before.completed_nn_inputs));
+                                sample["returned_physical_nn_inputs_delta"] = json!(
+                                    after
+                                        .completed_nn_inputs
+                                        .checked_sub(before.completed_nn_inputs)
+                                );
                                 sample["owner_idle_after_call"] = json!(true);
                             }
                             Err(error) => sample["after_stats_failure"] = cost_failure(error),
@@ -1266,7 +1402,9 @@ fn cost_common_six(
         }
         backend.verify_runtime()?;
         receipt["backend_stats_final"] = stats_json(&backend.snapshot_stats()?);
-        receipt["drain_scope"] = json!("direct_Run_owner_idle_at_final_snapshot;no_async_worker;external_process_cleanup_not_observed");
+        receipt["drain_scope"] = json!(
+            "direct_Run_owner_idle_at_final_snapshot;no_async_worker;external_process_cleanup_not_observed"
+        );
         deadline()?;
         Ok(())
     })();
@@ -1302,6 +1440,7 @@ fn cost_common_six(
 enum CheckerProvider {
     Cpu,
     Cuda,
+    CudaSystem,
     CudaDevice,
     CudaControl,
     CudaControlShim,
@@ -1312,11 +1451,12 @@ impl CheckerProvider {
         match (provider, argument_count) {
             ("cpu", 8) => Ok(Self::Cpu),
             ("cuda", 9) => Ok(Self::Cuda),
+            ("cuda-system", 10) => Ok(Self::CudaSystem),
             ("cuda-device", 9) => Ok(Self::CudaDevice),
             ("cuda-control", 11) => Ok(Self::CudaControl),
             ("cuda-control-shim", 11) => Ok(Self::CudaControlShim),
             ("cuda-control-conv-default", 11) => Ok(Self::CudaControlConvDefault),
-            _ => Err("CUDA requires its explicit pinned bundle; CPU excludes it"),
+            _ => Err("select CPU or explicitly configured system CUDA with the required arguments"),
         }
     }
     fn is_cuda(self) -> bool {
@@ -1330,7 +1470,7 @@ impl CheckerProvider {
     }
     fn loading_profile(self) -> Option<NativeLoadingProfile> {
         match self {
-            Self::Cpu => None,
+            Self::Cpu | Self::CudaSystem => None,
             Self::CudaControlShim => Some(NativeLoadingProfile::CuDnnShimLazyV1),
             _ => Some(NativeLoadingProfile::EagerCuda12Cudnn9V1),
         }
@@ -1353,7 +1493,11 @@ impl CheckerProvider {
         if self == Self::CudaControlConvDefault {
             config.cudnn_conv_search = PalsCuDnnConvSearch::ExperimentalDefault;
         }
-        config.validate_execution_selection(self.loading_profile(), self.explicit_control())?;
+        if self == Self::CudaSystem {
+            config.validate_system_execution_selection()?;
+        } else {
+            config.validate_execution_selection(self.loading_profile(), self.explicit_control())?;
+        }
         Ok(config)
     }
 }
@@ -1443,14 +1587,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Pure bounded source-policy parsing: no runtime load, session, Run or
         // provider claim. The external owner preserves stdout as evidence.
         PalsCudaControlPolicy::from_inventory(Path::new(&args[1]), &args[2])?;
-        println!("Pinned static PALS CUDA control v2 accepted; explicit graph optimization=disable; native placement and GPU execution not observed");
+        println!(
+            "Pinned static PALS CUDA control v2 accepted; explicit graph optimization=disable; native placement and GPU execution not observed"
+        );
         return Ok(());
     }
-    if !matches!(args.len(), 8 | 9 | 11) {
-        return Err("usage: pals_model_check [--cost-common-six|--cost-common-six-conv-default] EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda|cuda-device|cuda-control|cuda-control-shim|cuda-control-conv-default CACHE_ROOT [CUDA_BUNDLE.json] [INVENTORY_V2.json INVENTORY_SHA256]; DEFAULT cost requires its separate leading flag, exact cuda-control-conv-default and NVIDIA_TF32_OVERRIDE=0; CPU-only optional trailing --check-host-record-pages; Linux cuda-control-shim optional trailing --check-cuda-record-pages MANIFEST SHA256 GRAPH SHA256 RESOURCES.json".into());
+    if !matches!(args.len(), 8 | 9 | 10 | 11) {
+        return Err("usage: pals_model_check [--cost-common-six|--cost-common-six-conv-default] EXPORT.json EXPORT_SHA256 ORT_LIBRARY ORT_SHA256 FIXTURES.json REPORT.json cpu|cuda-system CACHE_ROOT [SYSTEM_CONFIG.json SYSTEM_CONFIG_SHA256]; legacy CUDA bundle modes and system-CUDA cost/resident modes are disabled; CPU-only optional trailing --check-host-record-pages".into());
     }
     let selected_provider = CheckerProvider::parse(&args[6], args.len())?;
     let is_cuda = selected_provider.is_cuda();
+    if is_cuda && selected_provider != CheckerProvider::CudaSystem {
+        return Err("legacy copied CUDA bundle execution is disabled; choose cuda-system with an explicit pinned system config".into());
+    }
+    if selected_provider == CheckerProvider::CudaSystem && cost_mode {
+        return Err("system CUDA cost measurement requires a separate system-identity receipt and is not supported by this checker".into());
+    }
+    #[cfg(feature = "experimental-io-binding")]
+    if selected_provider == CheckerProvider::CudaSystem && resident_check.is_some() {
+        return Err(
+            "system CUDA resident-record correctness requires a separate system-control contract"
+                .into(),
+        );
+    }
     // Candidate combinations are refused before fixture/model reads, cache
     // mutation, or native loading. Only the candidate's inventory moves earlier.
     let mut config = selected_provider.config(cost_profile)?;
@@ -1481,40 +1640,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     validate_fixture_coverage(&fixtures)?;
     startup_trace.stage("fixtures_returned");
     startup_trace.stage("runtime_pin_entered");
-    let cache = RuntimeCache::open(Path::new(&args[7]))?;
-    let pin = if is_cuda {
-        let spec_bytes = asset::read_bounded(Path::new(&args[8]), 64 * 1024)?;
-        let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&spec_bytes)?)?;
-        let core = spec
-            .files
-            .iter()
-            .find(|f| f.role == RuntimeBundleFileRole::Core)
-            .ok_or("bundle core absent")?;
-        let path = Path::new(&args[2]);
-        if path.file_name().and_then(|n| n.to_str()) != Some(core.filename.as_str())
-            || args[3] != core.sha256
+    // System CUDA loads the retained system installation directly. CPU keeps
+    // the existing pin/cache route, and no CUDA bundle is ever prepared here.
+    let runtime = if selected_provider == CheckerProvider::CudaSystem {
+        #[cfg(target_os = "linux")]
         {
-            return Err("ORT declaration differs from explicit CUDA bundle".into());
+            system_cuda_runtime(&args, &startup_trace)?
         }
-        cache.cuda_bundle(path.parent().ok_or("runtime core has no parent")?, &spec)?
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err("system CUDA numerical checker requires Linux".into());
+        }
     } else {
-        cache.library(Path::new(&args[2]), &args[3])?
+        let cache = RuntimeCache::open(Path::new(&args[7]))?;
+        let pin = cache.library(Path::new(&args[2]), &args[3])?;
+        startup_trace.stage("runtime_pin_returned");
+        startup_trace.stage("runtime_load_entered");
+        OrtRuntime::load(&pin)?
     };
-    startup_trace.stage("runtime_pin_returned");
-    // Shim lazy is an explicitly registered diagnostic variable. Other modes,
-    // including the existing cuda-control mode, retain eager16 bootstrap.
-    startup_trace.stage("runtime_load_entered");
-    let runtime = (if args[6] == "cuda-control-shim" {
-        OrtRuntime::load_with_cuda_loading_profile(&pin, NativeLoadingProfile::CuDnnShimLazyV1)
-    } else {
-        OrtRuntime::load(&pin)
-    })
-    .map_err(|mut failure| {
-        if is_cuda {
-            failure.detail = "PALS CUDA runtime bootstrap failed before session creation";
-        }
-        failure
-    })?;
     startup_trace.stage("runtime_load_returned");
     let runtime_digest = runtime.binary_digest();
     let runtime_bundle_digest = runtime.bundle_digest();
@@ -1523,10 +1666,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut loading_observations = Vec::new();
     if is_cuda {
         startup_trace.stage("runtime_origin_audit_entered");
-        loading_observations.push(mapping_json(
+        loading_observations.push(cuda_mapping_json(
             "dependencies_before_sessions",
-            &runtime.cuda_mapping_observation(false)?,
-        ));
+            &runtime,
+            false,
+        )?);
         startup_trace.stage("runtime_origin_audit_returned");
     }
     let control_policy = if preflight_control.is_some() {
@@ -1647,10 +1791,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let public_cache_hits = backend.public_cache_hits;
     backend.verify_runtime()?;
     if is_cuda {
-        loading_observations.push(mapping_json(
+        loading_observations.push(cuda_mapping_json(
             "primary_numeric_physical_completion",
-            &runtime.cuda_mapping_observation(true)?,
-        ));
+            &runtime,
+            true,
+        )?);
     }
     let trained = backend.is_trained();
     let residency = backend.residency().clone();
@@ -1709,7 +1854,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         match reset.poll() {
             PhysicalPoll::Ready(Ok(PalsNativeResult::NewGame)) => break,
             PhysicalPoll::Ready(Ok(PalsNativeResult::ResetTo { .. })) => {
-                return Err("legacy new game reset unexpectedly returned a target reset ACK".into())
+                return Err(
+                    "legacy new game reset unexpectedly returned a target reset ACK".into(),
+                );
             }
             PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
             PhysicalPoll::Ready(Ok(PalsNativeResult::Evaluation(_))) => {
@@ -1724,30 +1871,30 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .into());
             }
             PhysicalPoll::Ready(Ok(PalsNativeResult::Stats(_))) => {
-                return Err("cache reset unexpectedly returned native statistics".into())
+                return Err("cache reset unexpectedly returned native statistics".into());
             }
             #[cfg(feature = "experimental-io-binding")]
             PhysicalPoll::Ready(Ok(PalsNativeResult::CudaRecordPagesObserved(_))) => {
-                return Err("cache reset unexpectedly returned resident CUDA metadata".into())
+                return Err("cache reset unexpectedly returned resident CUDA metadata".into());
             }
             PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeVerified)) => {
-                return Err("cache reset unexpectedly returned runtime verification".into())
+                return Err("cache reset unexpectedly returned runtime verification".into());
             }
             PhysicalPoll::Ready(Ok(PalsNativeResult::CudaPlacementVerified(_))) => {
-                return Err("cache reset unexpectedly returned CUDA placement verification".into())
+                return Err("cache reset unexpectedly returned CUDA placement verification".into());
             }
             PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeMappingsObserved(_))) => {
-                return Err("cache reset unexpectedly returned runtime mapping observation".into())
+                return Err("cache reset unexpectedly returned runtime mapping observation".into());
             }
             PhysicalPoll::Quarantined => {
-                return Err("new game cache reset remains quarantined".into())
+                return Err("new game cache reset remains quarantined".into());
             }
             PhysicalPoll::Consumed => return Err("new game cache reset completed twice".into()),
             PhysicalPoll::Pending if Instant::now() < reset_deadline => {
                 std::thread::sleep(Duration::from_millis(1));
             }
             PhysicalPoll::Pending => {
-                return Err("new game cache reset has not physically completed".into())
+                return Err("new game cache reset has not physically completed".into());
             }
         }
     }
@@ -1769,36 +1916,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .into());
                     }
                     PalsNativeResult::NewGame => {
-                        return Err("evaluation unexpectedly returned a cache reset".into())
+                        return Err("evaluation unexpectedly returned a cache reset".into());
                     }
                     PalsNativeResult::ResetTo { .. } => {
-                        return Err("evaluation unexpectedly returned a target reset ACK".into())
+                        return Err("evaluation unexpectedly returned a target reset ACK".into());
                     }
                     PalsNativeResult::Stats(_) => {
-                        return Err("evaluation unexpectedly returned native statistics".into())
+                        return Err("evaluation unexpectedly returned native statistics".into());
                     }
                     #[cfg(feature = "experimental-io-binding")]
                     PalsNativeResult::CudaRecordPagesObserved(_) => {
-                        return Err("evaluation unexpectedly returned resident CUDA metadata".into())
+                        return Err(
+                            "evaluation unexpectedly returned resident CUDA metadata".into()
+                        );
                     }
                     PalsNativeResult::RuntimeVerified => {
-                        return Err("evaluation unexpectedly returned runtime verification".into())
+                        return Err("evaluation unexpectedly returned runtime verification".into());
                     }
                     PalsNativeResult::CudaPlacementVerified(_) => {
                         return Err(
                             "evaluation unexpectedly returned CUDA placement verification".into(),
-                        )
+                        );
                     }
                     PalsNativeResult::RuntimeMappingsObserved(_) => {
                         return Err(
                             "evaluation unexpectedly returned runtime mapping observation".into(),
-                        )
+                        );
                     }
                 }
                 break;
             }
             PhysicalPoll::Quarantined => {
-                return Err("physical completion is unknown; quarantined job retained".into())
+                return Err("physical completion is unknown; quarantined job retained".into());
             }
             PhysicalPoll::Consumed => return Err("physical lease completed twice".into()),
             PhysicalPoll::Pending => {}
@@ -1815,19 +1964,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(Ok(PalsNativeResult::RuntimeVerified)) => break,
             PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
             PhysicalPoll::Ready(Ok(_)) => {
-                return Err("runtime verification returned another command response".into())
+                return Err("runtime verification returned another command response".into());
             }
             PhysicalPoll::Quarantined => {
                 return Err(
                     "runtime verification cannot confirm unknown physical completion".into(),
-                )
+                );
             }
             PhysicalPoll::Consumed => return Err("runtime verification completed twice".into()),
             PhysicalPoll::Pending if Instant::now() < verification_deadline => {
                 std::thread::sleep(Duration::from_millis(1))
             }
             PhysicalPoll::Pending => {
-                return Err("runtime verification has no physical ACK before deadline".into())
+                return Err("runtime verification has no physical ACK before deadline".into());
             }
         }
     }
@@ -1839,26 +1988,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 PhysicalPoll::Ready(Ok(PalsNativeResult::CudaPlacementVerified(witness)))
                     if *witness == *expected =>
                 {
-                    break
+                    break;
                 }
                 PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
                 PhysicalPoll::Ready(Ok(_)) => {
                     return Err(
                         "CUDA placement control returned a different immutable witness or response"
                             .into(),
-                    )
+                    );
                 }
                 PhysicalPoll::Quarantined => {
-                    return Err("CUDA placement control has unknown physical completion".into())
+                    return Err("CUDA placement control has unknown physical completion".into());
                 }
                 PhysicalPoll::Consumed => {
-                    return Err("CUDA placement control completed twice".into())
+                    return Err("CUDA placement control completed twice".into());
                 }
                 PhysicalPoll::Pending if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(1))
                 }
                 PhysicalPoll::Pending => {
-                    return Err("CUDA placement control has no finite physical ACK".into())
+                    return Err("CUDA placement control has no finite physical ACK".into());
                 }
             }
         }
@@ -1870,17 +2019,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             PhysicalPoll::Ready(Ok(PalsNativeResult::Stats(stats))) => break stats,
             PhysicalPoll::Ready(Err(error)) => return Err(error.into()),
             PhysicalPoll::Ready(Ok(_)) => {
-                return Err("native statistics returned another command response".into())
+                return Err("native statistics returned another command response".into());
             }
             PhysicalPoll::Quarantined => {
-                return Err("native statistics cannot confirm unknown physical completion".into())
+                return Err("native statistics cannot confirm unknown physical completion".into());
             }
             PhysicalPoll::Consumed => return Err("native statistics completed twice".into()),
             PhysicalPoll::Pending if Instant::now() < stats_deadline => {
                 std::thread::sleep(Duration::from_millis(1))
             }
             PhysicalPoll::Pending => {
-                return Err("native statistics have no physical ACK before deadline".into())
+                return Err("native statistics have no physical ACK before deadline".into());
             }
         }
     };
@@ -1910,10 +2059,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     if is_cuda {
-        loading_observations.push(mapping_json(
-            "final_worker_joined",
-            &runtime.cuda_mapping_observation(true)?,
-        ));
+        loading_observations.push(cuda_mapping_json("final_worker_joined", &runtime, true)?);
     }
     let host_page_evidence = json!({"scope":"direct_owner_after_numeric_cases_before_worker",
         "page_kind":"whole_input","frozen_numeric_epoch":0,
@@ -1926,10 +2072,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "cache_off_completed_page_retirement":"passed","runtime_allocator_peak":"unknown","vram_peak":"unknown"});
     let cuda_evidence = json!({"cuda_mode":args[6],"graph_optimization":graph_optimization,
         "cuda_control_inventory_sha256":control_policy.as_ref().map(|_| args[10].as_str()),
-        "cuda_placement_witness":placement_witness,"fresh_cuda_placement_witness":fresh_placement_witness});
+        "cuda_placement_witness":placement_witness,"fresh_cuda_placement_witness":fresh_placement_witness,
+        "cuda_kernel_placement":if selected_provider == CheckerProvider::CudaSystem {"unknown"} else {"separate_witness"}});
     let mut receipt = json!({"schema": fixtures.config.profile.model_semantics(),"status":"passed","trained":trained,"rules_certified":false,
         "model_epoch":hex_digest(&epoch),"manifest_sha256":args[1],"fixture_sha256":hex_digest(&fixture_digest),
-        "runtime_sha256":hex_digest(&runtime_digest),"runtime":"1.22.0","rust_ort":"2.0.0-rc.10",
+        "runtime_sha256":hex_digest(&runtime_digest),"runtime":if selected_provider == CheckerProvider::CudaSystem {"unknown"} else {"1.22.0"},"runtime_build_info":runtime.build_info(),"rust_ort":"2.0.0-rc.10",
         "provider":if is_cuda {"CUDAExecutionProvider"} else {"CPUExecutionProvider"},"precision":"fp32","tf32":false,
         "physical_completion":"confirmed","physical_shutdown":"confirmed","public_encodes":public_encodes,
         "public_cache_hits":public_cache_hits,"fresh_cache_equivalence":"passed","private_role_repeat":"passed",
@@ -1942,6 +2089,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     let fields = receipt
         .as_object_mut()
         .ok_or("acceptance receipt is not an object")?;
+    if selected_provider == CheckerProvider::CudaSystem {
+        fields.insert(
+            "runtime_sha256_scope".into(),
+            json!("captured_system_core_source_not_an_unconditional_loaded_image_proof"),
+        );
+        fields.insert(
+            "runtime_origin_acceptance".into(),
+            json!("separate_mapping_observation_required"),
+        );
+        fields.insert("tf32".into(), json!("unknown"));
+        fields.insert("tf32_requested".into(), json!(false));
+        fields.insert(
+            "physical_shutdown_scope".into(),
+            json!("native_worker_only_external_process_exit_required"),
+        );
+        fields.insert("actual_gpu_kernel_placement".into(), json!("unknown"));
+    }
     if let Some(primary) = conv_default_execution {
         // The old baseline wire retains its historical field. This candidate
         // has no observation of actual TF32 use, even after numerical success.
@@ -1971,12 +2135,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     fields.insert(
         "native_loading".into(),
         json!({
-        "schema":"rovezero.native-loading-observation.v1",
+        "schema":if selected_provider == CheckerProvider::CudaSystem {"rovezero.system-native-loading-observation.v1"} else {"rovezero.native-loading-observation.v1"},
         "profile":loading_profile.map(NativeLoadingProfile::identifier),
         "profile_sha256":loading_profile_digest.as_ref().map(hex_digest),
         "experimental_candidate":loading_profile == Some(NativeLoadingProfile::CuDnnShimLazyV1),
         "runtime_bundle_sha256":runtime_bundle_digest.as_ref().map(hex_digest),
-        "declared_bundle_file_count":if is_cuda {19} else {1},
+        "declared_bundle_file_count":if selected_provider == CheckerProvider::CudaSystem {None} else {Some(1)},
+        "system_runtime_identity_sha256":if selected_provider == CheckerProvider::CudaSystem {runtime.cuda_runtime_identity().as_ref().map(hex_digest)} else {None},
+        "system_config_sha256":if selected_provider == CheckerProvider::CudaSystem {Some(args[9].as_str())} else {None},
+        "system_libraries":system_runtime_libraries_json(&runtime),
         "mapping_observations":loading_observations,
         "native_termination_acceptance":"requires_external_process_exit_zero_and_cleanup",
         "preload_cause":"not_proven"}),
@@ -2106,18 +2273,22 @@ mod conv_selection_tests {
             CheckerProvider::CudaControl,
             CheckerProvider::CudaControlShim,
         ] {
-            assert!(provider
-                .config(Some(CostProfile::CommonSixConvDefault))
-                .is_err());
+            assert!(
+                provider
+                    .config(Some(CostProfile::CommonSixConvDefault))
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn default_cost_tf32_request_is_required_without_mutating_process_environment() {
         let profile = CostProfile::CommonSixConvDefault;
-        assert!(profile
-            .validate_tf32_override(Some(std::ffi::OsStr::new("0")))
-            .is_ok());
+        assert!(
+            profile
+                .validate_tf32_override(Some(std::ffi::OsStr::new("0")))
+                .is_ok()
+        );
         for value in [
             None,
             Some(std::ffi::OsStr::new("1")),
