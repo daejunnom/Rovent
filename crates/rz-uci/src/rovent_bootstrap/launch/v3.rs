@@ -1633,13 +1633,52 @@ fn runtime_receipt(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(super) enum OriginalCollectionOwnerV3 {
+    Pc(Arc<super::RoventPcCollectionLaunchOwnerV3>),
+    Own(Arc<super::RoventOwnCollectionLaunchOwnerV3>),
+}
+
+#[cfg(target_os = "linux")]
+impl OriginalCollectionOwnerV3 {
+    fn register_startup_control(
+        &self,
+        control: &RoventStartupControl,
+    ) -> Result<(), RoventLaunchError> {
+        match self {
+            Self::Pc(owner) => owner.hooks().register_startup_control(control),
+            Self::Own(owner) => owner.hooks().register_startup_control(control),
+        }
+        .map_err(|failure| error("CollectionAdmission", failure))
+    }
+    fn teachers(&self) -> &[super::super::RoventTeacherSourceSelection] {
+        match self {
+            Self::Pc(owner) => owner.teachers(),
+            Self::Own(owner) => owner.teachers(),
+        }
+    }
+    fn sealed_teacher_indices(&self) -> &[usize] {
+        match self {
+            Self::Pc(owner) => owner.sealed_teacher_indices(),
+            Self::Own(owner) => owner.sealed_teacher_indices(),
+        }
+    }
+    fn mark_native_session_finished(&self) {
+        match self {
+            Self::Pc(owner) => owner.mark_native_session_finished(),
+            Self::Own(owner) => owner.mark_native_session_finished(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(super) struct OriginalV3Inputs<'a> {
     lock: Arc<RoventInputLockV3>,
     boundary: Arc<VerifiedOwnedRoventProcessBoundaryV3>,
     sources: Arc<RoventPinnedNativeSources<RoventInputLockV3>>,
     control: RoventStartupControl,
     clock: ProcessClock,
-    collection: Option<Arc<super::RoventPcCollectionLaunchOwnerV3>>,
+    collection: Option<OriginalCollectionOwnerV3>,
     // Original open descriptors only; no archive worker is started here.
     storage: Option<storage::RoventStorageByteCustody<RoventInputLockV3>>,
     // A legacy selection index is retained through physical completion;
@@ -1676,7 +1715,7 @@ pub(super) fn admit_original_collection<'a>(
     cwd: PathBuf,
     lock_file: File,
     resource: Option<ResourceAdmissionV3<'a>>,
-    collection: Arc<super::RoventPcCollectionLaunchOwnerV3>,
+    collection: OriginalCollectionOwnerV3,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
     admit_original_inner(
         arguments,
@@ -1697,7 +1736,7 @@ fn admit_original_inner<'a>(
     cwd: PathBuf,
     lock_file: File,
     resource: Option<ResourceAdmissionV3<'a>>,
-    collection: Option<Arc<super::RoventPcCollectionLaunchOwnerV3>>,
+    collection: Option<OriginalCollectionOwnerV3>,
 ) -> Result<OriginalV3Inputs<'a>, RoventLaunchError> {
     if arguments.storage.is_some()
         || arguments.startup_diagnostics
@@ -1720,6 +1759,12 @@ fn admit_original_inner<'a>(
         return Err(error(
             "InputLockUnsupportedV3",
             "Collection requires its original /3 owner and is not a Validation or Deployment observer",
+        ));
+    }
+    if matches!(&collection, Some(OriginalCollectionOwnerV3::Own(_))) {
+        return Err(error(
+            "InputLockUnsupportedV3",
+            "Own V3 Collection launch remains guarded until its product and physical lifetime are connected",
         ));
     }
     if collection.is_some()
@@ -1757,10 +1802,7 @@ fn admit_original_inner<'a>(
         cancellation: Arc::new(AtomicBool::new(false)),
     };
     if let Some(owner) = collection.as_ref() {
-        owner
-            .hooks()
-            .register_startup_control(&control)
-            .map_err(|failure| error("CollectionAdmission", failure))?;
+        owner.register_startup_control(&control)?;
     }
     let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
     control
@@ -2525,7 +2567,10 @@ pub(super) fn run_native_admitted(
         scope.attach_pin(Box::new(Arc::clone(parent)));
     }
     if let Some(owner) = collection.as_ref() {
-        scope.attach_pin(Box::new(Arc::clone(owner)));
+        match owner {
+            OriginalCollectionOwnerV3::Pc(owner) => scope.attach_pin(Box::new(Arc::clone(owner))),
+            OriginalCollectionOwnerV3::Own(owner) => scope.attach_pin(Box::new(Arc::clone(owner))),
+        }
     }
     // Before native entry, reserve both ends in the original scope. The only
     // owner transfer is a no-allocation move between these retained slots.
@@ -3150,11 +3195,22 @@ pub(super) fn run_native_admitted(
             // The optional shared NNUEC and later native service remain in
             // one registered assembly slot from before native startup.
             let assembly = match collection.as_ref() {
-                Some(owner) => super::super::product::RoventPcAssemblyV3::new_collection(
-                    shared_loaded,
-                    Arc::clone(&boundary),
-                    Arc::clone(owner.hooks()),
-                ),
+                Some(OriginalCollectionOwnerV3::Pc(owner)) => {
+                    super::super::product::RoventPcAssemblyV3::new_collection(
+                        shared_loaded,
+                        Arc::clone(&boundary),
+                        Arc::clone(owner.hooks()),
+                    )
+                }
+                Some(OriginalCollectionOwnerV3::Own(_)) => {
+                    scope.mark_before_native();
+                    scope.settled_without_quarantine();
+                    return Err(error(
+                        "InputLockUnsupportedV3",
+                        "Own Collection cannot enter the PC assembly",
+                    )
+                    .into());
+                }
                 None => super::super::product::RoventPcAssemblyV3::new(
                     shared_loaded,
                     Arc::clone(&boundary),
@@ -3162,33 +3218,34 @@ pub(super) fn run_native_admitted(
             };
             let custody = Arc::new(std::sync::Mutex::new(assembly));
             scope.attach_pin(Box::new(Arc::clone(&custody)));
-            let prepared_result = if let Some(owner) = collection.as_ref() {
-                let observer = match owner.observer_proxy() {
-                    Ok(observer) => observer,
-                    Err(failure) => {
-                        scope.mark_before_native();
-                        scope.settled_without_quarantine();
-                        return Err(failure.into());
-                    }
+            let prepared_result =
+                if let Some(OriginalCollectionOwnerV3::Pc(owner)) = collection.as_ref() {
+                    let observer = match owner.observer_proxy() {
+                        Ok(observer) => observer,
+                        Err(failure) => {
+                            scope.mark_before_native();
+                            scope.settled_without_quarantine();
+                            return Err(failure.into());
+                        }
+                    };
+                    super::collection_v3::prepare_collection_with_parent::<PcPortQuestion>(
+                        Arc::clone(&sources),
+                        resources,
+                        clock.runtime_clock(),
+                        control.clone(),
+                        observer,
+                        connected_parent.clone(),
+                    )
+                } else {
+                    super::super::prepare_native_v3_retaining_with_parent::<PcPortQuestion>(
+                        Arc::clone(&sources),
+                        resources,
+                        clock.runtime_clock(),
+                        control.clone(),
+                        connected_parent.clone(),
+                        numeric_observer.take(),
+                    )
                 };
-                super::collection_v3::prepare_collection_with_parent::<PcPortQuestion>(
-                    Arc::clone(&sources),
-                    resources,
-                    clock.runtime_clock(),
-                    control.clone(),
-                    observer,
-                    connected_parent.clone(),
-                )
-            } else {
-                super::super::prepare_native_v3_retaining_with_parent::<PcPortQuestion>(
-                    Arc::clone(&sources),
-                    resources,
-                    clock.runtime_clock(),
-                    control.clone(),
-                    connected_parent.clone(),
-                    numeric_observer.take(),
-                )
-            };
             let prepared = match prepared_result {
                 Ok(prepared) => prepared,
                 Err(failure) => {

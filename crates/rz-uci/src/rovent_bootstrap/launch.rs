@@ -1371,7 +1371,40 @@ pub fn run_pc_collection_v3_with_resource_admission_retaining_connected_control_
         arguments,
         control,
         Some(parent_stream),
-        Some(Arc::clone(collection)),
+        Some(v3::OriginalCollectionOwnerV3::Pc(Arc::clone(collection))),
+        admit_resource,
+    )
+}
+
+/// Prepare an explicit Own-R Collection owner through the original /3
+/// control path. The Own Collection admission guard remains in force until
+/// the product, teacher and physical lifetime are integrated and verified.
+#[cfg(target_os = "linux")]
+pub fn run_own_collection_v3_with_resource_admission_retaining_connected_control_slot<
+    'a,
+    C: Send + 'static,
+>(
+    arguments: Vec<String>,
+    control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    parent_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+    collection: &Arc<RoventOwnCollectionLaunchOwnerV3>,
+    admit_resource: impl FnOnce(
+        &Arc<RoventInputLockV3>,
+        &Dir,
+        &std::fs::File,
+        std::time::Instant,
+        std::time::Instant,
+        Option<&Dir>,
+        Option<&std::path::Path>,
+        &Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
+) -> ControlledV3Result<C> {
+    run_with_v3_control_slot_inner(
+        arguments,
+        control,
+        Some(parent_stream),
+        Some(v3::OriginalCollectionOwnerV3::Own(Arc::clone(collection))),
         admit_resource,
     )
 }
@@ -1381,7 +1414,7 @@ fn run_with_v3_control_slot_inner<'a, C: Send + 'static>(
     arguments: Vec<String>,
     control: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<C>>>>,
     parent_stream: Option<Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>>,
-    collection: Option<Arc<RoventPcCollectionLaunchOwnerV3>>,
+    collection: Option<v3::OriginalCollectionOwnerV3>,
     admit_resource: impl FnOnce(
         &Arc<RoventInputLockV3>,
         &Dir,
