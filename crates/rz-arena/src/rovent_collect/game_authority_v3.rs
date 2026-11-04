@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 const ABORT_REQUESTED: u8 = 1;
 const PUBLICATION_GRANTED: u8 = 2;
+const NO_DATA_FINISHED: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhaseV3 {
@@ -19,6 +20,7 @@ enum PhaseV3 {
     Closed,
     Preparing,
     Granted,
+    NoData,
     Unknown,
 }
 
@@ -476,7 +478,23 @@ pub(crate) struct GamePublishGuardV3<S> {
     owner: Arc<GameAuthorityV3<S>>,
     resolved: bool,
 }
+
+/// Same in-memory game authority identity only. This is not a publication,
+/// output, worker, or physical completion receipt.
+pub(super) struct GamePublicationOriginV3 {
+    identity: Arc<()>,
+}
+
 impl<S> GamePublishGuardV3<S> {
+    pub(super) fn original_game_identity(&self) -> GamePublicationOriginV3 {
+        GamePublicationOriginV3 {
+            identity: Arc::clone(&self.owner.identity),
+        }
+    }
+
+    pub(super) fn matches_original_game(&self, origin: &GamePublicationOriginV3) -> bool {
+        Arc::ptr_eq(&self.owner.identity, &origin.identity)
+    }
     /// Match the bound owners without taking the pipeline mutex: callers may
     /// already hold that mutex while passing its original finished writer.
     /// The pipeline must itself verify its retained output and writer slots.
@@ -491,8 +509,10 @@ impl<S> GamePublishGuardV3<S> {
             Err(_) => return Err("V3 game authority state unknown"),
         };
         Ok(Some(
-            state.phase == PhaseV3::Preparing
-                && output.matches_inputs(&self.owner.inputs)
+            matches!(
+                state.phase,
+                PhaseV3::Preparing | PhaseV3::Granted | PhaseV3::NoData
+            ) && output.matches_inputs(&self.owner.inputs)
                 && state
                     .output
                     .as_ref()
@@ -502,6 +522,37 @@ impl<S> GamePublishGuardV3<S> {
                     .as_ref()
                     .is_some_and(|original| original.same_owner(pipeline)),
         ))
+    }
+
+    /// The caller must hold the original pipeline lock and have observed its
+    /// original writer pristine with no pending, output or uncertain work.
+    /// NoData is terminal for this game; it is not a publication receipt.
+    pub(super) fn try_finish_no_data(&mut self) -> GameStepV3 {
+        let mut state = match self.owner.lock() {
+            Ok(state) => state,
+            Err(error) => return error,
+        };
+        if state.phase != PhaseV3::Preparing {
+            return GameStepV3::Unknown;
+        }
+        match self.owner.control.compare_exchange(
+            0,
+            NO_DATA_FINISHED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                state.phase = PhaseV3::NoData;
+                self.resolved = true;
+                GameStepV3::Ready
+            }
+            Err(actual) if actual & ABORT_REQUESTED != 0 => {
+                state.phase = PhaseV3::Closed;
+                self.resolved = true;
+                GameStepV3::Aborted
+            }
+            Err(_) => GameStepV3::Unknown,
+        }
     }
 
     /// The future writer must call this as its authorization immediately
