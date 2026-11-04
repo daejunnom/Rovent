@@ -28,6 +28,12 @@ use rz_search::external_cpu::process_scope::{CollectionMemberPhysicalState, Coll
 use rz_search::pals::engine::pc_port::PcPortQuestion;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak, mpsc};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AbortedNoScopeKindV3 {
+    BeforeStage,
+    UnclaimedStage,
+}
+
 /// Quota is per original root. Unresolved roots retain their reservation.
 struct RootQuotaV3 {
     admission: RoventCollectionRootAdmissionV3,
@@ -45,6 +51,7 @@ struct RootQuotaV3 {
     claimed_unstarted_recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
     aborted_pre_route_recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
     aborted_no_scope_recovery: Option<Arc<Mutex<PcRootRecoveryV3>>>,
+    aborted_no_scope_kind: Option<AbortedNoScopeKindV3>,
 }
 
 pub(crate) enum PcQuotaOutcomeV3 {
@@ -212,6 +219,7 @@ impl PcRootQuotaLedgerV3 {
             teacher_seal_unknown: false, teacher_seal_panic: None, teacher_seal_error: None,
             unstarted_recovery: None, claimed_unstarted_recovery: None, aborted_pre_route_recovery: None,
             aborted_no_scope_recovery: None,
+            aborted_no_scope_kind: None,
         });
         PcQuotaOutcomeV3::Reserved
     }
@@ -442,8 +450,14 @@ impl PcRootSlotV3 {
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(_) => return Err("P-C V3 no-scope recovery poisoned"),
         };
-        Ok(Some(recovery.matches_admission(&self.admission)
-            && recovery.matches_received_root(bridge) && recovery.is_sealed_abort_no_scope()))
+        if !recovery.matches_admission(&self.admission) || !recovery.matches_received_root(bridge) {
+            return Ok(Some(false));
+        }
+        match root.aborted_no_scope_kind {
+            Some(AbortedNoScopeKindV3::BeforeStage) => Ok(Some(recovery.is_sealed_abort_no_scope())),
+            Some(AbortedNoScopeKindV3::UnclaimedStage) => recovery.try_observe_sealed_aborted_unclaimed_stage(),
+            None => Ok(Some(false)),
+        }
     }
     /// Revalidate only the same game's actual pre-route teacher aggregate.
     /// This authorizes CPU quota retirement, not native or game success.
@@ -1116,6 +1130,24 @@ impl RoventPcCollectionBridgeV3 {
         admission: &RoventCollectionRootAdmissionV3,
         recovery: &Arc<Mutex<PcRootRecoveryV3>>,
     ) -> Result<Option<bool>, &'static str> {
+        self.try_release_aborted_no_scope_kind(admission, recovery, AbortedNoScopeKindV3::BeforeStage)
+    }
+
+    /// Retire a received root whose original scope stage was created but never claimed.
+    pub(crate) fn try_release_aborted_unclaimed_stage(
+        self: &Arc<Self>,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<PcRootRecoveryV3>>,
+    ) -> Result<Option<bool>, &'static str> {
+        self.try_release_aborted_no_scope_kind(admission, recovery, AbortedNoScopeKindV3::UnclaimedStage)
+    }
+
+    fn try_release_aborted_no_scope_kind(
+        self: &Arc<Self>,
+        admission: &RoventCollectionRootAdmissionV3,
+        recovery: &Arc<Mutex<PcRootRecoveryV3>>,
+        kind: AbortedNoScopeKindV3,
+    ) -> Result<Option<bool>, &'static str> {
         if !self.game.abort_requested() { return Err("P-C V3 game abort not requested"); }
         let mut original = match recovery.try_lock() {
             Ok(owner) => owner,
@@ -1156,14 +1188,19 @@ impl RoventPcCollectionBridgeV3 {
         let root = ledger.roots.iter_mut().find(|root| root.admission.same_original_admission(admission))
             .ok_or("P-C V3 no-scope quota root absent")?;
         if let Some(old) = &root.aborted_no_scope_recovery {
+            let proof = match kind {
+                AbortedNoScopeKindV3::BeforeStage => Some(original.is_sealed_abort_no_scope()),
+                AbortedNoScopeKindV3::UnclaimedStage => original.try_observe_sealed_aborted_unclaimed_stage()?,
+            };
+            let Some(proof) = proof else { return Ok(None); };
             return if slot.aborted_no_scope_terminal && Arc::ptr_eq(old, recovery)
-                && original.is_sealed_abort_no_scope() && !root.teacher_reserved && !root.worker_reserved
+                && root.aborted_no_scope_kind == Some(kind) && proof && !root.teacher_reserved && !root.worker_reserved
                 && !root.teacher_seal_unknown && root.unclaimed_teacher_ack.as_ref().is_some_and(|ack|
                     ack.matches_admission(admission) && ack.is_sealed_no_scope()) {
                 Ok(Some(true))
             } else { Err("P-C V3 retained no-scope issuance unresolved") };
         }
-        if slot.aborted_no_scope_terminal || !root.worker_reserved
+        if slot.aborted_no_scope_terminal || root.aborted_no_scope_kind.is_some() || !root.worker_reserved
             || root.teacher_reserved != original.has_teacher_reservation()
             || root.teacher_seal_unknown || root.teacher_seal_panic.is_some() || root.teacher_seal_error.is_some()
             || root.unclaimed_teacher_ack.is_some() || root.retired_teacher_handoff.is_some()
@@ -1171,9 +1208,14 @@ impl RoventPcCollectionBridgeV3 {
             || root.aborted_pre_route_recovery.is_some() || root.joined.is_some() {
             return Err("P-C V3 no-scope quota ownership differs");
         }
-        if !original.seal_aborted_no_scope() { return Ok(None); }
+        let proof = match kind {
+            AbortedNoScopeKindV3::BeforeStage => Some(original.seal_aborted_no_scope()),
+            AbortedNoScopeKindV3::UnclaimedStage => original.try_seal_aborted_unclaimed_stage()?,
+        };
+        if proof != Some(true) { return Ok(None); }
         slot.aborted_no_scope_terminal = true;
         root.aborted_no_scope_recovery = Some(Arc::clone(recovery));
+        root.aborted_no_scope_kind = Some(kind);
         root.teacher_seal_unknown = true;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| admission.seal_unclaimed_teacher_scope())) {
             Ok(Ok(ack)) if ack.matches_admission(admission) && ack.is_sealed_no_scope() => {
