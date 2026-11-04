@@ -183,8 +183,15 @@ impl<'a> DeadlineControl<'a> {
         let Some(peer) = self.peer.as_ref() else {
             return Ok(None);
         };
-        let (leader, _) = self.fastchess.ok_or_else(|| failure("fastchess_custody"))?;
+        let (leader, original_leader) =
+            self.fastchess.ok_or_else(|| failure("fastchess_custody"))?;
+        if process_identity(leader)? != original_leader {
+            return Err(failure("fastchess_identity_changed"));
+        }
         self.verify_peer(leader, peer.pid, peer.identity)?;
+        if process_identity(leader)? != original_leader {
+            return Err(failure("fastchess_identity_changed"));
+        }
         Ok(Some(DeadlinePeerObservation {
             pid: peer.pid,
             start_ticks: peer.identity.start_ticks,
