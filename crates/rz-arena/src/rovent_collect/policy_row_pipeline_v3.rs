@@ -31,6 +31,7 @@ pub(super) enum PolicyPipelineFailureV3 {
 pub(super) enum PolicyPipelineProgressV3 {
     Appended,
     Busy,
+    NotReady,
     Failed,
 }
 
@@ -142,6 +143,11 @@ impl PolicyRowPipelineV3 {
         if self.pending.is_some() {
             return true;
         }
+        // A teacher completion and retired row may arrive in either order.
+        // Missing prepared evidence is ordinary asynchronous NotReady.
+        if self.prepared.is_none() {
+            return false;
+        }
         let Some(row) = self.row.as_mut() else {
             return false;
         };
@@ -168,9 +174,12 @@ impl PolicyRowPipelineV3 {
             return PolicyPipelineProgressV3::Failed;
         }
         let Some(pending) = self.pending.as_mut() else {
-            return PolicyPipelineProgressV3::Failed;
+            return PolicyPipelineProgressV3::NotReady;
         };
         if pending.target_capability().is_none() {
+            if self.capability.is_none() {
+                return PolicyPipelineProgressV3::NotReady;
+            }
             if let Err(error) = pending.bind_target_capability(&mut self.capability) {
                 self.failure = Some(PolicyPipelineFailureV3::Bind(error));
                 return PolicyPipelineProgressV3::Failed;
