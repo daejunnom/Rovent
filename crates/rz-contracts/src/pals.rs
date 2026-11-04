@@ -2,9 +2,11 @@
 //! IDs and digests are issued by owners; estimates never certify Rules facts.
 
 pub mod cancel_control_v1;
+pub mod child_reobserve_v1;
 pub mod deadline_grant_v1;
 pub mod proxy_entry_smoke_cancel_v1;
 pub mod proxy_entry_smoke_grant_v1;
+pub mod proxy_reobserve_v1;
 
 use crate::{
     ByteBudget, CancelToken, ClockDomain, Color, ContractError, Deadline, Digest, ErrorCode,
