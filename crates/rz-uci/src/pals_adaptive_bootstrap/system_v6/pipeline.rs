@@ -362,12 +362,11 @@ impl V6Pipeline {
         // generic engine's unrelated default simulation count.
         self.settings.search.max_simulations = cpu.search.settings.limits.max_cpu_nodes;
         self.cpu = Some(cpu);
-        // Existing factory startup takes the CPU owner by value. If it
-        // unwinds inside that function this stage remains explicitly unknown;
-        // external supervision must not treat the process as safely closed.
+        // CPU ownership remains in this slot until factory startup returns.
+        // An unwind may nevertheless leave native worker custody unknown.
         self.state = V6PipelineObservation::NativeStartInProgress;
         let result = start_owned_system_native_v6(
-            self.cpu.take().expect("original CPU owner"),
+            &mut self.cpu,
             Arc::clone(self.parent.as_ref().expect("original parent")),
             Arc::clone(self.admission.as_ref().expect("original admission")),
             None,

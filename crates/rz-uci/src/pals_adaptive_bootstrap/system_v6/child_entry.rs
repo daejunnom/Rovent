@@ -17,9 +17,9 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ChildStepV6 {
     Pipeline(V6PipelineObservation),
-    /// The pipeline and panic payload remain, but an in-flight ownership
-    /// transfer may have unwound and dropped its local CPU owner. Native
-    /// worker ownership and physical completion are therefore unknown.
+    /// The pipeline and panic payload remain. The factory keeps its CPU
+    /// owner in the pipeline during spawn, but another transition may have
+    /// unwound after moving an owner. Physical completion remains unknown.
     TransitionPanickedCustodyUnknown,
 }
 

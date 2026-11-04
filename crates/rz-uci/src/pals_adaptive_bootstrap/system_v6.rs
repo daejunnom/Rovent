@@ -95,17 +95,21 @@ enum PalsSystemStartupRejectionV6 {
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 #[allow(dead_code)]
 fn start_owned_system_native_v6(
-    cpu: cpu_prepare::PalsSystemCpuPreparationV6,
+    cpu_slot: &mut Option<cpu_prepare::PalsSystemCpuPreparationV6>,
     parent: Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
     admission: Arc<crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6>,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
 ) -> Result<PalsSystemStartupCustodyV6, PalsSystemStartupRejectionV6> {
+    // Keep the original CPU owner in the caller's slot across both admission
+    // and native spawn. An unwind can leave a native worker's status unknown,
+    // but it must not also discard the CPU owner as a local argument.
+    let cpu = cpu_slot.as_ref().expect("original CPU owner");
     if let Err(error) = cpu
         .original_source
         .check_native_admission(&parent, &admission)
     {
         return Err(PalsSystemStartupRejectionV6::BeforeNative {
-            cpu,
+            cpu: cpu_slot.take().expect("original CPU owner"),
             parent,
             admission,
             observer,
@@ -121,13 +125,13 @@ fn start_owned_system_native_v6(
         observer,
     ) {
         Ok(native) => Ok(PalsSystemStartupCustodyV6 {
-            cpu,
+            cpu: cpu_slot.take().expect("original CPU owner"),
             parent,
             admission,
             native,
         }),
         Err(failure) => Err(PalsSystemStartupRejectionV6::NativeSpawn {
-            cpu,
+            cpu: cpu_slot.take().expect("original CPU owner"),
             parent,
             admission,
             failure,
