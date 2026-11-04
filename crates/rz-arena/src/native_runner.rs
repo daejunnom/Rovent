@@ -836,6 +836,87 @@ pub(crate) struct PreparedIndependentNoGameOwner {
     failures: Vec<String>,
 }
 
+/// Each failed stage returns the original owner already acquired at that
+/// stage; none of these variants imply a process or GPU was started.
+#[cfg(target_os = "linux")]
+#[must_use = "retain or explicitly handle the original NoGame setup failure"]
+pub(crate) enum IndependentNoGameSetupFailure {
+    Preflight(ArenaError),
+    Snapshot(Box<crate::pals_adaptive_launch::NoGamePreparationFailure>),
+    Sockets {
+        error: ArenaError,
+        snapshot: Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
+    },
+    Binding {
+        error: ArenaError,
+        snapshot: Arc<crate::pals_adaptive_launch::ProxyEntrySmokeSnapshotOwnerV1>,
+        sockets: Arc<crate::pals_adaptive_launch::NoGameRoleSocketsV1>,
+    },
+    Supervisor {
+        error: ArenaError,
+        binding: crate::pals_adaptive_launch::DirectNoGameBinding,
+    },
+}
+
+/// Assemble the actual original owners up to the still-guarded dispatch
+/// boundary. The caller supplies the locked plan and its original clock; no
+/// new time window, process, GPU or independent result is manufactured.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_independent_no_game_original(
+    plan: &crate::pals_adaptive_launch::LockedNoGameSmokePlanV1,
+    execution: &Arc<crate::pals_adaptive_launch::NoGameExecutionStartV1>,
+    owner_id: [u8; 16],
+    owner_epoch: u64,
+    request_ids: [u64; 2],
+    source_root: &std::path::Path,
+    output_root: &std::path::Path,
+    output_directory: &str,
+) -> Result<PreparedIndependentNoGameOwner, Box<IndependentNoGameSetupFailure>> {
+    use crate::pals_adaptive_launch::{
+        DirectNoGameBinding, NoGameRoleSocketsV1, prepare_proxy_entry_smoke_snapshot_v1,
+        validate_smoke_request_ids,
+    };
+    validate_smoke_request_ids(request_ids)
+        .map_err(|error| Box::new(IndependentNoGameSetupFailure::Preflight(error)))?;
+    let snapshot = Arc::new(
+        prepare_proxy_entry_smoke_snapshot_v1(
+            plan,
+            execution,
+            owner_id,
+            owner_epoch,
+            source_root,
+            output_root,
+            output_directory,
+        )
+        .map_err(|failure| Box::new(IndependentNoGameSetupFailure::Snapshot(failure)))?,
+    );
+    let sockets = NoGameRoleSocketsV1::bind_original(&snapshot, execution).map_err(|error| {
+        Box::new(IndependentNoGameSetupFailure::Sockets {
+            error,
+            snapshot: Arc::clone(&snapshot),
+        })
+    })?;
+    let binding = DirectNoGameBinding::prepare(
+        &snapshot,
+        execution,
+        &sockets,
+        owner_id,
+        owner_epoch,
+        request_ids,
+    )
+    .map_err(|error| {
+        Box::new(IndependentNoGameSetupFailure::Binding {
+            error,
+            snapshot: Arc::clone(&snapshot),
+            sockets: Arc::clone(&sockets),
+        })
+    })?;
+    PreparedIndependentNoGameOwner::prepare(binding).map_err(|(error, binding)| {
+        Box::new(IndependentNoGameSetupFailure::Supervisor { error, binding })
+    })
+}
+
 /// Returned bytes and observations; neither is a physical-completion proof.
 #[cfg(target_os = "linux")]
 pub(crate) struct IndependentNoGameRawEvidence {
