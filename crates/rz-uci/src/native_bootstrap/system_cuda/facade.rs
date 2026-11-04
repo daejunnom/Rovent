@@ -682,6 +682,12 @@ impl Lc0SupervisedSession {
         self.supervisor.original_scope_settled()
     }
 
+    /// Reobserve only this original worker's pending release. The operation
+    /// never changes a failure into success or asserts device-wide fencing.
+    pub fn reobserve_original_release(&mut self) {
+        self.supervisor.reobserve();
+    }
+
     /// Service outcome remains independent of same-session cleanup.
     pub fn original_service_succeeded(&self) -> bool {
         self.supervisor.original_service_succeeded()
@@ -1277,6 +1283,38 @@ impl Lc0SupervisedSession {
         listener: &mut Lc0ParentListener,
         until: Instant,
     ) -> io::Result<()> {
+        if !self.original_scope_settled() {
+            return Err(io::Error::other(
+                "LC0 original session is not settled; listener retained",
+            ));
+        }
+        self.retire_original_listener(listener, until)
+    }
+
+    /// Async collection has already checked the same run's CPU and writer
+    /// owners. Allow endpoint retirement after this original worker's release
+    /// even if its retained report records a service or collection failure.
+    /// Neither that failure nor device-wide physical status is changed.
+    pub fn retire_listener_after_async_release(
+        &mut self,
+        listener: &mut Lc0ParentListener,
+        until: Instant,
+    ) -> io::Result<()> {
+        if !self.async_finish_attempted
+            || self.supervisor.project_original().latest_release != Lc0ObservedRelease::Released
+        {
+            return Err(io::Error::other(
+                "LC0 async original worker release is not confirmed",
+            ));
+        }
+        self.retire_original_listener(listener, until)
+    }
+
+    fn retire_original_listener(
+        &mut self,
+        listener: &mut Lc0ParentListener,
+        until: Instant,
+    ) -> io::Result<()> {
         if !Arc::ptr_eq(&self.ticket_token, &listener.ticket_token)
             || !self
                 .receipt_token
@@ -1286,11 +1324,6 @@ impl Lc0SupervisedSession {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "LC0 listener belongs to another session",
-            ));
-        }
-        if !self.original_scope_settled() {
-            return Err(io::Error::other(
-                "LC0 original session is not settled; listener retained",
             ));
         }
         if self.endpoint_retirement_started {

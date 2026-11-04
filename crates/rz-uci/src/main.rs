@@ -3547,15 +3547,28 @@ fn run_lc0_supervised(
     }));
     match prepared {
         Ok(Ok(())) => {}
-        evidence => hold_lc0_session(
-            session,
-            listener,
-            receipts,
-            evidence,
-            run_until,
-            cleanup_until,
-            false,
-        ),
+        evidence => {
+            if session.original_scope_settled() {
+                session.close_without_service();
+                let cleanup = session
+                    .retire_parent_listener(&mut listener, cleanup_until)
+                    .err();
+                return Err(Box::new(Lc0PreNativePreparationFailure {
+                    _original_evidence: evidence,
+                    cleanup,
+                    _owners: (session, listener, receipts),
+                }));
+            }
+            return hold_lc0_session(
+                session,
+                listener,
+                receipts,
+                evidence,
+                run_until,
+                cleanup_until,
+                false,
+            );
+        }
     }
     let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         AsyncOutputOwner::start(
@@ -3567,7 +3580,7 @@ fn run_lc0_supervised(
     })) {
         Ok(Ok(output)) => output,
         Ok(Err(error @ StartError::Invalid { .. })) | Ok(Err(error @ StartError::Spawn { .. })) => {
-            hold_lc0_session(
+            return hold_lc0_session(
                 session,
                 listener,
                 receipts,
@@ -3575,17 +3588,19 @@ fn run_lc0_supervised(
                 run_until,
                 cleanup_until,
                 false,
-            )
+            );
         }
-        Err(payload) => hold_lc0_session(
-            session,
-            listener,
-            receipts,
-            payload,
-            run_until,
-            cleanup_until,
-            false,
-        ),
+        Err(payload) => {
+            return hold_lc0_session(
+                session,
+                listener,
+                receipts,
+                payload,
+                run_until,
+                cleanup_until,
+                false,
+            );
+        }
     };
     let (sender, events) = engine::event_channel();
     let input = sender.clone();
@@ -3596,24 +3611,28 @@ fn run_lc0_supervised(
             .spawn(move || forward_lines(&mut io::stdin().lock(), &input, input_limit))
     })) {
         Ok(Ok(worker)) => worker,
-        Ok(Err(error)) => hold_lc0_session(
-            session,
-            listener,
-            receipts,
-            (error, output, events, sender),
-            run_until,
-            cleanup_until,
-            false,
-        ),
-        Err(payload) => hold_lc0_session(
-            session,
-            listener,
-            receipts,
-            (payload, output, events, sender),
-            run_until,
-            cleanup_until,
-            false,
-        ),
+        Ok(Err(error)) => {
+            return hold_lc0_session(
+                session,
+                listener,
+                receipts,
+                (error, output, events, sender),
+                run_until,
+                cleanup_until,
+                false,
+            );
+        }
+        Err(payload) => {
+            return hold_lc0_session(
+                session,
+                listener,
+                receipts,
+                (payload, output, events, sender),
+                run_until,
+                cleanup_until,
+                false,
+            );
+        }
     };
     let inputs = Lc0AsyncInputs {
         events,
@@ -3674,15 +3693,84 @@ impl<E: std::error::Error + 'static, O> std::error::Error for Lc0PreNativeCleanu
 }
 
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
-fn hold_lc0_session<T>(
+struct Lc0PreNativePreparationFailure<E, O> {
+    _original_evidence: E,
+    cleanup: Option<io::Error>,
+    _owners: O,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<E, O> std::fmt::Debug for Lc0PreNativePreparationFailure<E, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Lc0PreNativePreparationFailure")
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<E, O> std::fmt::Display for Lc0PreNativePreparationFailure<E, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "LC0 preparation failed before native entry; listener cleanup: {}",
+            self.cleanup
+                .as_ref()
+                .map_or("completed", |_| "failed or unknown")
+        )
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<E, O> std::error::Error for Lc0PreNativePreparationFailure<E, O> {}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+struct Lc0SettledAuxiliaryFailure<O> {
+    service_failed: bool,
+    native_collection_failed: bool,
+    cleanup: Option<io::Error>,
+    receipt: Option<String>,
+    control: Option<io::Error>,
+    parent: Option<io::Error>,
+    renewal: Option<io::Error>,
+    _owners: O,
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<O> std::fmt::Debug for Lc0SettledAuxiliaryFailure<O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Lc0SettledAuxiliaryFailure")
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<O> std::fmt::Display for Lc0SettledAuxiliaryFailure<O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "LC0 same-session release observed; failures: service={}, native_collection={}, cleanup={}, receipt={}, control={}, parent={}, renewal={}; device-wide completion remains unknown",
+            self.service_failed,
+            self.native_collection_failed,
+            self.cleanup.is_some(),
+            self.receipt.is_some(),
+            self.control.is_some(),
+            self.parent.is_some(),
+            self.renewal.is_some()
+        )
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+impl<O> std::error::Error for Lc0SettledAuxiliaryFailure<O> {}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cuda", target_os = "linux"))]
+fn hold_lc0_session<T: 'static>(
     mut session: rz_uci::native_bootstrap::Lc0SupervisedSession,
-    listener: rz_uci::native_bootstrap::Lc0ParentListener,
+    mut listener: rz_uci::native_bootstrap::Lc0ParentListener,
     receipts: rz_uci::native_bootstrap::Lc0ReceiptOwner,
     _original_evidence: T,
     run_until: std::time::Instant,
     cleanup_until: std::time::Instant,
     mut running: bool,
-) -> ! {
+) -> Result<(), Box<dyn std::error::Error>> {
     use rz_uci::native_bootstrap::Lc0AsyncFinishStatus;
     use rz_uci::runner::async_events::AsyncServeStatus;
     let mut original_panic: Option<Box<dyn std::any::Any + Send>> = None;
@@ -3694,6 +3782,10 @@ fn hold_lc0_session<T>(
     let mut finish_terminal = false;
     let mut finish_status: Option<Lc0AsyncFinishStatus> = None;
     let mut receipt_error: Option<String> = None;
+    let mut next_release_poll = std::time::Instant::now();
+    let mut reobservation_published = false;
+    let mut normal_ready = false;
+    let mut service_failed = false;
     loop {
         if original_panic.is_some() {
             thread::park_timeout(Duration::from_secs(1));
@@ -3782,15 +3874,89 @@ fn hold_lc0_session<T>(
                     }
                 }
             }
-            let _ = &receipts;
-            let _ = &finish_status;
-            let _ = &receipt_error;
+            if matches!(
+                finish_status,
+                Some(
+                    Lc0AsyncFinishStatus::NativeCollected
+                        | Lc0AsyncFinishStatus::NativeCollectionFailed
+                )
+            ) {
+                let now = std::time::Instant::now();
+                if !session.original_scope_settled() && now >= next_release_poll {
+                    session.reobserve_original_release();
+                    next_release_poll = now.checked_add(Duration::from_millis(250)).unwrap_or(now);
+                }
+                let released = session
+                    .original_session_observation()
+                    .is_ok_and(|observation| {
+                        observation.latest_release()
+                            == rz_uci::native_bootstrap::Lc0ObservedRelease::Released
+                    });
+                if released {
+                    service_failed = !session.original_service_succeeded();
+                    if !reobservation_published
+                        && session
+                            .original_session_observation()
+                            .is_ok_and(|observation| {
+                                observation.original_release()
+                                    == rz_uci::native_bootstrap::Lc0ObservedRelease::Pending
+                            })
+                    {
+                        reobservation_published = true;
+                        if let Err(error) = session.publish_reobservation(&receipts)
+                            && receipt_error.is_none()
+                        {
+                            receipt_error = Some(error);
+                        }
+                    }
+                    normal_ready = true;
+                }
+            }
         }));
         if let Err(payload) = tick {
             if original_panic.is_none() {
                 original_panic = Some(payload);
             }
             running = false;
+            continue;
+        }
+        if normal_ready {
+            let now = std::time::Instant::now();
+            let until = now
+                .checked_add(cleanup_until.duration_since(run_until))
+                .unwrap_or(now);
+            let retired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.retire_listener_after_async_release(&mut listener, until)
+            }));
+            let cleanup = match retired {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(payload) => {
+                    original_panic = Some(payload);
+                    continue;
+                }
+            };
+            if service_failed
+                || finish_status == Some(Lc0AsyncFinishStatus::NativeCollectionFailed)
+                || cleanup.is_some()
+                || receipt_error.is_some()
+                || first_control_error.is_some()
+                || parent_error.is_some()
+                || renewal_error.is_some()
+            {
+                return Err(Box::new(Lc0SettledAuxiliaryFailure {
+                    service_failed,
+                    native_collection_failed: finish_status
+                        == Some(Lc0AsyncFinishStatus::NativeCollectionFailed),
+                    cleanup,
+                    receipt: receipt_error,
+                    control: first_control_error,
+                    parent: parent_error,
+                    renewal: renewal_error,
+                    _owners: (session, listener, receipts, _original_evidence),
+                }));
+            }
+            return Ok(());
         }
         // The native finish and writer evidence are not yet sufficient to
         // authorize a return. Keep the original objects through timeouts,

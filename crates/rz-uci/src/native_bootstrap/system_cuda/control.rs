@@ -666,7 +666,7 @@ impl Lc0ControlSupervisor {
         }
     }
 
-    fn reobserve(&mut self) {
+    pub(super) fn reobserve(&mut self) {
         if self.state != ServiceState::DrainRequested || self.finish_panic.is_some() {
             return;
         }
