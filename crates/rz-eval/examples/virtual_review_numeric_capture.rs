@@ -15,9 +15,9 @@ use rz_eval::pals_model::{PalsCandidateToken, PalsModelProfile, PalsRawOutput, P
 #[cfg(target_os = "linux")]
 use rz_eval::pals_onnx::virtual_review::SystemPlacementObservation;
 use rz_eval::pals_onnx::virtual_review::{
-    PalsVirtualReviewOnnxBackend, VirtualReviewExecutionMode, VirtualReviewInvocation,
-    VirtualReviewNativeCommand as Command, VirtualReviewNativeResult as Outcome,
-    validate_virtual_review_export_manifest,
+    validate_virtual_review_export_manifest, PalsVirtualReviewOnnxBackend,
+    VirtualReviewExecutionMode, VirtualReviewInvocation, VirtualReviewNativeCommand as Command,
+    VirtualReviewNativeResult as Outcome,
 };
 #[cfg(target_os = "linux")]
 use rz_eval::pals_onnx::virtual_review::{
@@ -1212,6 +1212,41 @@ impl Error for SystemPhysicalUnknown {
     }
 }
 
+// WIP: retained until an outer supervisor can take ownership of this error.
+// Returning it through the CLI main alone is not a physical recovery protocol.
+#[cfg(target_os = "linux")]
+struct UnpublishedReservationFailure {
+    primary: BackendError,
+    _reservation: PhysicalRecoveryReservation,
+    _recovery_key: PhysicalRecoveryKey,
+    detail: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for UnpublishedReservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnpublishedReservationFailure")
+            .field("primary", &self.primary)
+            .field("detail", &self.detail)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for UnpublishedReservationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.detail, self.primary)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for UnpublishedReservationFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct CaptureAndCleanupFailure {
@@ -1255,7 +1290,8 @@ impl SystemCaptureWorker {
                     };
                     self.pending = Some(lease);
                     return Err(Box::new(SystemPhysicalUnknown {
-                        detail: "system capture physical completion unknown; original lease retained",
+                        detail:
+                            "system capture physical completion unknown; original lease retained",
                         cause,
                     }));
                 }
@@ -1329,7 +1365,8 @@ impl SystemCaptureWorker {
                             Err(cause) => Some(cause),
                         };
                         return Err(Box::new(SystemPhysicalUnknown {
-                            detail: "system capture is quarantined; original lease and owner retained",
+                            detail:
+                                "system capture is quarantined; original lease and owner retained",
                             cause,
                         }));
                     }
@@ -1344,16 +1381,27 @@ impl SystemCaptureWorker {
             }
             let worker = self.worker.as_mut().ok_or("system worker absent")?;
             match worker.try_shutdown() {
-                Poll::Ready(Ok(())) if self.pending.is_none() => {
+                Poll::Ready(Ok(())) => {
+                    // Completion can race the poll above and become ready as
+                    // the original worker joins. Inspect the same lease again.
+                    if let Some(lease) = self.pending.as_mut() {
+                        match lease.poll() {
+                            PhysicalPoll::Ready(result) => {
+                                self.late_completion = Some(result);
+                                self.pending.take();
+                            }
+                            _ => {
+                                return Err(
+                                    "system worker joined while original lease remained unresolved"
+                                        .into(),
+                                )
+                            }
+                        }
+                    }
                     self.release = Some(worker.session_release().ok_or(
                         "system worker joined without original owner session-release proof",
                     )?);
                     return Ok(());
-                }
-                Poll::Ready(Ok(())) => {
-                    return Err(
-                        "system worker joined while original lease remained unresolved".into(),
-                    );
                 }
                 Poll::Ready(Err(error)) => return Err(Box::new(error)),
                 Poll::Pending if Instant::now() < until => {
@@ -1362,33 +1410,6 @@ impl SystemCaptureWorker {
                 Poll::Pending => {
                     return Err("system worker did not join within cleanup deadline; original owner retained".into());
                 }
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for SystemCaptureWorker {
-    fn drop(&mut self) {
-        if self.release.is_none() {
-            // Keep the exact worker, request lease, reservation and key alive
-            // for the remaining process lifetime when no same-owner session
-            // release was proven. This does not establish external persistence
-            // after process exit or a device-wide GPU fence.
-            if let Some(lease) = self.pending.take() {
-                std::mem::forget(lease);
-            }
-            if let Some(worker) = self.worker.take() {
-                std::mem::forget(worker);
-            }
-            if let Some(reservation) = self.reservation.take() {
-                std::mem::forget(reservation);
-            }
-            if let Some(key) = self.recovery_key.take() {
-                std::mem::forget(key);
-            }
-            if let Some(late) = self.late_completion.take() {
-                std::mem::forget(late);
             }
         }
     }
@@ -1481,6 +1502,15 @@ fn execute(config: Config) -> Result<()> {
     let selected = config.execution_config()?;
     let is_cuda = matches!(selected.provider, Provider::Cuda { .. });
     let system_cuda = config.provider == "cuda-system";
+    // The supervisor handoff of the original physical owner is still WIP.
+    // Refuse before loading a runtime, reserving a slot, or entering native
+    // code: dropping an unresolved owner on CLI exit is not recovery.
+    if system_cuda {
+        return Err(
+            "system CUDA capture disabled: physical-owner supervisor handoff is not implemented"
+                .into(),
+        );
+    }
     let system_control = system_cuda && config.system_cuda_inventory.is_some();
     for path in [
         &config.case_plan,
@@ -1504,6 +1534,15 @@ fn execute(config: Config) -> Result<()> {
         return Err("capture requires registered finite execution/cleanup windows".into());
     }
     let until = Instant::now() + Duration::from_secs(config.deadline_seconds);
+    let system_cleanup_limit = if system_cuda {
+        Some(
+            until
+                .checked_add(Duration::from_secs(config.cleanup_seconds))
+                .ok_or("registered system cleanup deadline overflows")?,
+        )
+    } else {
+        None
+    };
     let plan_bytes = asset::read_bounded(&config.case_plan, LIMIT)?;
     if asset::sha256(&plan_bytes) != pin(&config.case_plan_sha256)? {
         return Err("actual case plan SHA differs".into());
@@ -1874,19 +1913,21 @@ fn execute(config: Config) -> Result<()> {
                     // unpublished original reservation may be canceled after
                     // the exact custody was returned to its original slot.
                     if original.is_some() {
-                        if let Err((owner, cancel_error)) = reservation.try_cancel_unpublished() {
-                            let _ = writeln!(
-                                std::io::stderr().lock(),
-                                "RZ_NUMERIC_UNPUBLISHED_RESERVATION_RETAINED={cancel_error:?}"
-                            );
-                            std::mem::forget(owner);
+                        if let Err((owner, _cancel_error)) = reservation.try_cancel_unpublished() {
+                            return Err(Box::new(UnpublishedReservationFailure {
+                                primary: error,
+                                _reservation: owner,
+                                _recovery_key: key,
+                                detail: "unpublished original reservation could not be canceled",
+                            }));
                         }
                     } else {
-                        let _ = writeln!(
-                            std::io::stderr().lock(),
-                            "RZ_NUMERIC_RESERVATION_RETAINED={{\"reason\":\"original_custody_unavailable\"}}"
-                        );
-                        std::mem::forget(reservation);
+                        return Err(Box::new(UnpublishedReservationFailure {
+                            primary: error,
+                            _reservation: reservation,
+                            _recovery_key: key,
+                            detail: "original custody unavailable after spawn failure",
+                        }));
                     }
                     return Err(Box::new(error));
                 }
@@ -1902,8 +1943,11 @@ fn execute(config: Config) -> Result<()> {
             let started = match owner.start(until) {
                 Ok(started) => started,
                 Err(startup) => {
-                    let cleanup_until =
-                        Instant::now() + Duration::from_secs(config.cleanup_seconds);
+                    let registered = system_cleanup_limit.ok_or("system cleanup limit absent")?;
+                    let cleanup_until = Instant::now()
+                        .checked_add(Duration::from_secs(config.cleanup_seconds))
+                        .unwrap_or(registered)
+                        .min(registered);
                     return match owner.finish(cleanup_until) {
                         Ok(()) => Err(startup),
                         Err(cleanup) => Err(Box::new(CaptureAndCleanupFailure {
@@ -2124,10 +2168,15 @@ fn execute(config: Config) -> Result<()> {
         outputs.push((stage_pending, root.join("actual-stage-counters.json")));
         Ok(outputs)
     })();
-    let joined = finish(
-        &mut worker,
-        Instant::now() + Duration::from_secs(config.cleanup_seconds),
-    );
+    let cleanup_until = if let Some(registered) = system_cleanup_limit {
+        Instant::now()
+            .checked_add(Duration::from_secs(config.cleanup_seconds))
+            .unwrap_or(registered)
+            .min(registered)
+    } else {
+        Instant::now() + Duration::from_secs(config.cleanup_seconds)
+    };
+    let joined = finish(&mut worker, cleanup_until);
     let outputs = match (work, joined) {
         (Ok(outputs), Ok(())) => outputs,
         (Err(work), Err(join)) => {
@@ -3062,11 +3111,9 @@ mod tests {
         let actual = source_pins().unwrap();
         let common = rz_experiments::compiled_source_components_v5().unwrap();
         assert_eq!(actual.len(), 5);
-        assert!(
-            actual
-                .iter()
-                .all(|(name, digest)| common.get(name) == Some(digest))
-        );
+        assert!(actual
+            .iter()
+            .all(|(name, digest)| common.get(name) == Some(digest)));
         assert!(!id("unsafe:ads"));
     }
 }
