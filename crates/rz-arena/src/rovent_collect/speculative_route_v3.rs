@@ -10,6 +10,10 @@ use std::sync::{
     mpsc,
 };
 
+mod target_gate;
+pub(crate) use target_gate::TargetAppendGuardV3;
+use target_gate::{TargetGateV3, try_cancel_ticket, try_revoke_root};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SpeculativeHandoffV3 {
     Reserved,
@@ -58,18 +62,11 @@ impl SpeculativeTicketV3 {
         self.state.store(5, Ordering::Release);
     }
     pub(super) fn try_cancel(&self) -> Result<Option<()>, ArenaError> {
-        let _gate = match self.target_gate.try_lock() {
-            Ok(gate) => gate,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(invalid("lock-v3 target gate poisoned"));
-            }
-        };
-        self.authority.cancel();
-        let _ = self
-            .state
-            .compare_exchange(0, 6, Ordering::AcqRel, Ordering::Acquire);
-        Ok(Some(()))
+        try_cancel_ticket(&self.target_gate, &self.authority, || {
+            let _ = self
+                .state
+                .compare_exchange(0, 6, Ordering::AcqRel, Ordering::Acquire);
+        })
     }
     fn try_take_target_capability_in_slot(
         &self,
@@ -130,6 +127,15 @@ pub(crate) enum TargetBeginRejectionV3 {
 #[derive(Clone)]
 pub(crate) struct TargetRevocationV3(Arc<AtomicBool>);
 impl TargetRevocationV3 {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+    fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    fn revoke(&self) {
+        self.0.store(true, Ordering::Release);
+    }
     pub(crate) fn is_revoked(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
@@ -144,14 +150,11 @@ impl TargetRevocationV3 {
 pub(crate) struct TargetPublicationV3 {
     admission: RoventCollectionRootAdmissionV3,
     ticket: RoleTicketEnvelope,
-    gate: Arc<Mutex<()>>,
-    revoked: TargetRevocationV3,
-    authority: SpeculativeTicketAuthorityV3,
-    state: AtomicU8,
+    target: TargetGateV3,
 }
 impl TargetPublicationV3 {
     pub(crate) fn matches_revocation(&self, revocation: &TargetRevocationV3) -> bool {
-        Arc::ptr_eq(&self.revoked.0, &revocation.0)
+        self.target.matches_revocation(revocation)
     }
     pub(crate) fn matches(
         &self,
@@ -165,52 +168,7 @@ impl TargetPublicationV3 {
     pub(crate) fn try_begin_append(
         &self,
     ) -> Result<Option<TargetAppendGuardV3<'_>>, TargetBeginRejectionV3> {
-        let gate = match self.gate.try_lock() {
-            Ok(gate) => gate,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(TargetBeginRejectionV3::Poisoned);
-            }
-        };
-        match self.state.load(Ordering::Acquire) {
-            0 => {}
-            2 => return Err(TargetBeginRejectionV3::AlreadyCommitted),
-            _ => return Err(TargetBeginRejectionV3::Uncertain),
-        }
-        if self.revoked.is_revoked() || self.authority.canceled() {
-            return Err(TargetBeginRejectionV3::Revoked);
-        }
-        self.state.store(1, Ordering::Release);
-        Ok(Some(TargetAppendGuardV3 {
-            capability: self,
-            _gate: gate,
-            resolved: false,
-        }))
-    }
-}
-
-/// The gate remains held across the real in-memory append. Dropping after a
-/// panic/unknown result makes subsequent attempts fail rather than guessing.
-pub(crate) struct TargetAppendGuardV3<'a> {
-    capability: &'a TargetPublicationV3,
-    _gate: std::sync::MutexGuard<'a, ()>,
-    resolved: bool,
-}
-impl TargetAppendGuardV3<'_> {
-    pub(crate) fn committed(mut self) {
-        self.capability.state.store(2, Ordering::Release);
-        self.resolved = true;
-    }
-    pub(crate) fn known_not_written(mut self) {
-        self.capability.state.store(0, Ordering::Release);
-        self.resolved = true;
-    }
-}
-impl Drop for TargetAppendGuardV3<'_> {
-    fn drop(&mut self) {
-        if !self.resolved {
-            self.capability.state.store(3, Ordering::Release);
-        }
+        self.target.try_begin()
     }
 }
 
@@ -370,7 +328,7 @@ impl SpeculativeRootV3 {
             unattributed: AtomicU64::new(0),
             cancel_all: Arc::new(AtomicBool::new(false)),
             root_revoked,
-            targets_revoked: TargetRevocationV3(Arc::new(AtomicBool::new(false))),
+            targets_revoked: TargetRevocationV3::new(),
             target_gate: Arc::new(Mutex::new(())),
         });
         Ok((
@@ -458,10 +416,11 @@ impl SpeculativeRootV3 {
         let capability = TargetPublicationV3 {
             admission: self.route.admission.clone(),
             ticket: *ticket,
-            gate: Arc::clone(&self.route.target_gate),
-            revoked: self.route.targets_revoked.clone(),
-            authority: authority.clone(),
-            state: AtomicU8::new(0),
+            target: TargetGateV3::new(
+                Arc::clone(&self.route.target_gate),
+                self.route.targets_revoked.clone(),
+                authority.clone(),
+            ),
         };
         let item = Arc::new(SpeculativeTicketV3 {
             ticket: *ticket,
@@ -558,16 +517,11 @@ impl SpeculativeRootV3 {
         self.route.cancel_all.store(true, Ordering::Release);
     }
     pub(crate) fn try_revoke_all_targets(&self) -> Result<Option<()>, ArenaError> {
-        let _gate = match self.route.target_gate.try_lock() {
-            Ok(gate) => gate,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(invalid("lock-v3 target revocation gate poisoned"));
-            }
-        };
-        self.route.targets_revoked.0.store(true, Ordering::Release);
-        self.route.cancel_all.store(true, Ordering::Release);
-        Ok(Some(()))
+        try_revoke_root(
+            &self.route.target_gate,
+            &self.route.targets_revoked,
+            &self.route.cancel_all,
+        )
     }
     /// Used only with the original registration owner lock for rollback.
     pub(super) fn try_has_registered_tickets(&self) -> Result<Option<bool>, ArenaError> {
