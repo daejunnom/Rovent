@@ -69,6 +69,35 @@ pub(super) enum PipelineCapabilityV3 {
     Outcome(TargetCapabilityTakeV3),
 }
 
+/// Only this original observer's local custody was drained. The issuing
+/// manager's fence, pipeline/output retention, teacher and game closure are
+/// independent evidence and are not implied by this token.
+pub(super) struct ObserverRootDrainedV3 {
+    owner: RoventCollectionOwnerLockV3,
+    admission: RoventCollectionRootAdmissionV3,
+    pipeline: PolicyRowPipelineOwnerV3,
+}
+
+impl ObserverRootDrainedV3 {
+    pub(super) fn matches_original(
+        &self,
+        owner: &RoventCollectionOwnerLockV3,
+        admission: &RoventCollectionRootAdmissionV3,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> bool {
+        self.owner.same_original_owner(owner)
+            && self.admission.same_original_admission(admission)
+            && self.pipeline.same_owner(pipeline)
+    }
+}
+
+pub(super) enum ObserverRootDrainAttemptV3 {
+    Ready(ObserverRootDrainedV3),
+    Pending,
+    Failed,
+    Busy,
+}
+
 struct Staged {
     ticket: RoleTicketEnvelope,
     reservation: RoventInputCaptureReservationV3,
@@ -114,6 +143,55 @@ impl RoventCollectionOwnerLockV3 {
     /// Identity only: this grants no execution, publication or completion.
     pub(crate) fn same_original_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Observe only this original root's local observer custody. A failed or
+    /// busy owner retains all of its original inputs and is not a game fence.
+    pub(super) fn try_observe_root_drained(
+        &self,
+        admission: &RoventCollectionRootAdmissionV3,
+        pipeline: &PolicyRowPipelineOwnerV3,
+    ) -> Result<ObserverRootDrainAttemptV3, ArenaError> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(ObserverRootDrainAttemptV3::Busy);
+            }
+            Err(_) => return Err(invalid("lock-v3 owner poisoned")),
+        };
+        check(
+            state
+                .admission
+                .as_ref()
+                .is_some_and(|original| original.same_original_admission(admission))
+                && state
+                    .policy_pipeline
+                    .as_ref()
+                    .is_some_and(|original| original.same_owner(pipeline)),
+            "lock-v3 root drain owner differs from original admission or pipeline",
+        )?;
+        if !state.failed_reservations.is_empty()
+            || !state.failed_captures.is_empty()
+            || !state.rejected_captures.is_empty()
+        {
+            return Ok(ObserverRootDrainAttemptV3::Failed);
+        }
+        if !state.settled
+            || !state.staged.is_empty()
+            || !state.pending.is_empty()
+            || !state.retired.is_empty()
+            || state
+                .producer
+                .as_ref()
+                .is_none_or(|producer| producer.incomplete_capture_count() != 0)
+        {
+            return Ok(ObserverRootDrainAttemptV3::Pending);
+        }
+        Ok(ObserverRootDrainAttemptV3::Ready(ObserverRootDrainedV3 {
+            owner: self.clone(),
+            admission: admission.clone(),
+            pipeline: pipeline.clone(),
+        }))
     }
 
     /// Identity observation only. Busy does not imply a different route,
@@ -474,32 +552,6 @@ impl RoventCollectionOwnerLockV3 {
             owner: self.clone(),
             marker: PhantomData,
         })
-    }
-    /// Seal a row using its original producer. On error the row stays owned.
-    pub(crate) fn try_publish_next(
-        &self,
-    ) -> Result<Option<PublishedRoventLockV3Record>, ArenaError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| invalid("lock-v3 owner poisoned"))?;
-        check(state.producer.is_some(), "lock-v3 producer missing")?;
-        let Some(row) = state.retired.pop_front() else {
-            return Ok(None);
-        };
-        let result = state
-            .producer
-            .as_ref()
-            .expect("checked producer")
-            .publish(row);
-        match result {
-            Ok(row) => Ok(Some(row)),
-            Err(failure) => {
-                let (error, row) = *failure;
-                state.retired.push_front(row);
-                Err(error)
-            }
-        }
     }
 }
 
