@@ -22,6 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+#[path = "smoke_entry_tests.rs"]
+mod tests;
+
 #[must_use = "retain or explicitly settle the original NoGame entry owners"]
 pub(super) enum NoGameEntryFailureV1 {
     Inputs {

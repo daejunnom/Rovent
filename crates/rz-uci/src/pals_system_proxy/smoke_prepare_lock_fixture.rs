@@ -42,6 +42,10 @@ fn component(name: &str) -> PalsComponentV3 {
 }
 
 pub(super) fn fixture_lock() -> PalsSystemStartupLockV6 {
+    fixture_lock_with_engine(b"synthetic test artifact: test/engine")
+}
+
+pub(super) fn fixture_lock_with_engine(engine: &[u8]) -> PalsSystemStartupLockV6 {
     let runtime = SystemRuntimeSpecV6 {
         platform: SystemPlatformV6::Linux,
         libraries: ["ort-core", "ort-provider-cuda"]
@@ -120,7 +124,11 @@ pub(super) fn fixture_lock() -> PalsSystemStartupLockV6 {
     };
     let endpoint = PalsSystemEndpointV6 {
         id: "test-engine".into(),
-        binary: artifact("test/engine"),
+        binary: ArtifactRef {
+            sha256: digest(engine),
+            bytes: engine.len() as u64,
+            ..artifact("test/engine")
+        },
         source_commit: None,
         mode: PalsEngineModeV5::Deployment,
         model,
