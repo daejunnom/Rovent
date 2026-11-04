@@ -156,7 +156,9 @@ fn component_observations(
     let mut count = 0;
     let mut matches = true;
     for (name, digest) in declared {
-        if name == PALS_SYSTEM_V6_SOURCE_COMPONENT {
+        if name == PALS_SYSTEM_V6_SOURCE_COMPONENT
+            || name == super::PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT
+        {
             continue;
         }
         count += 1;
@@ -202,6 +204,7 @@ pub struct PinnedPalsSystemStartupV6 {
     source_components: PalsSystemSourceObservationV6,
     compiled_components: BTreeMap<String, String>,
     system_v6_source: PalsSystemSourceObservationV6,
+    system_v6_execution_source: PalsSystemSourceObservationV6,
     mapped_executable: crate::process_receipts::ExecutableIdentityV1,
     original_until: Instant,
     original_cancelled: Arc<AtomicBool>,
@@ -297,6 +300,10 @@ impl PinnedPalsSystemStartupV6 {
             &compiled,
             &compiled_pals_system_v6_source_digest(),
         );
+        let system_v6_execution_source = super::system_v6_execution::execution_source_observation(
+            &lock.config.source_components,
+            &super::compiled_pals_system_v6_execution_source_digest(),
+        );
         if lock.config.source_policy == PalsSystemSourcePolicyV6::Strict
             && (source_commit != PalsSystemSourceObservationV6::Verified
                 || source_components != PalsSystemSourceObservationV6::Verified
@@ -328,6 +335,7 @@ impl PinnedPalsSystemStartupV6 {
             source_components,
             compiled_components: compiled,
             system_v6_source,
+            system_v6_execution_source,
             mapped_executable,
             original_until: until,
             original_cancelled: cancelled,
@@ -356,6 +364,11 @@ impl PinnedPalsSystemStartupV6 {
     }
     pub fn system_v6_source(&self) -> PalsSystemSourceObservationV6 {
         self.system_v6_source
+    }
+    /// Separate execution-boundary observation; old V6 preflight receipts
+    /// and their historical source scope are unchanged.
+    pub fn system_v6_execution_source(&self) -> PalsSystemSourceObservationV6 {
+        self.system_v6_execution_source
     }
     pub fn mapped_executable(&self) -> &crate::process_receipts::ExecutableIdentityV1 {
         &self.mapped_executable
@@ -516,6 +529,7 @@ impl PinnedPalsSystemStartupV6 {
         parent: &Arc<crate::rovent_bootstrap::launch::ConnectedParent>,
         admission: &crate::rovent_bootstrap::launch::PalsPostImageAdmissionV6,
     ) -> std::io::Result<()> {
+        super::system_v6_execution::require_execution_source(self.system_v6_execution_source)?;
         self.source_window()
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         admission.ensure_permitted(parent, self.original_until, &self.original_cancelled)
@@ -1021,6 +1035,20 @@ mod tests {
         declared.insert(
             PALS_SYSTEM_V6_SOURCE_COMPONENT.to_owned(),
             v6_digest.clone(),
+        );
+        assert_eq!(
+            component_observations(&declared, &compiled, &v6_digest),
+            (
+                PalsSystemSourceObservationV6::Verified,
+                PalsSystemSourceObservationV6::Verified
+            )
+        );
+        // The separate V6 execution component is not a V5 registry entry.
+        // Its independently checked presence or mismatch must not rewrite
+        // either legacy observation.
+        declared.insert(
+            super::super::PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT.to_owned(),
+            super::super::compiled_pals_system_v6_execution_source_digest(),
         );
         assert_eq!(
             component_observations(&declared, &compiled, &v6_digest),

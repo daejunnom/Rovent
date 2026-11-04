@@ -281,13 +281,18 @@ fn spawn_system_native_v6(
 /// The response is an observation of this binary, not external provenance.
 pub(super) fn source_inventory() -> Result<(), AdaptiveBootstrapError> {
     use crate::pals_adaptive_startup::{
-        PALS_SYSTEM_V6_SOURCE_COMPONENT, compiled_pals_system_v6_source_digest,
+        PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT, PALS_SYSTEM_V6_SOURCE_COMPONENT,
+        compiled_pals_system_v6_execution_source_digest, compiled_pals_system_v6_source_digest,
     };
     let mut components = compiled_source_components_v5()
         .map_err(|error| failure("SystemV6SourceInventory", &error))?;
     components.insert(
         PALS_SYSTEM_V6_SOURCE_COMPONENT.to_owned(),
         compiled_pals_system_v6_source_digest(),
+    );
+    components.insert(
+        PALS_SYSTEM_V6_EXECUTION_SOURCE_COMPONENT.to_owned(),
+        compiled_pals_system_v6_execution_source_digest(),
     );
     let raw_commit = env!("RZ_PALS_COMPILED_SOURCE_COMMIT");
     let commit = (raw_commit.len() == 40
@@ -301,7 +306,7 @@ pub(super) fn source_inventory() -> Result<(), AdaptiveBootstrapError> {
         "source_commit": commit,
         "source_commit_observation": if commit.is_some() { "declared_by_build" } else { "unknown" },
         "source_components": components,
-        "source_component_scope": "v5-registry-plus-pals-system-v6-boundary",
+        "source_component_scope": "v5-registry-plus-pals-system-v6-boundary-and-execution",
         "mapped_binary_verified": false,
         "provider_initialized": false,
         "neural_execution": false,
