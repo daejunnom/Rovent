@@ -39,6 +39,7 @@ pub(super) struct ChildEntryV6 {
     pipeline: V6Pipeline,
     original_cleanup_until: Instant,
     cleanup_cancelled: AtomicBool,
+    report_original_session: bool,
     panic: Option<Box<dyn Any + Send>>,
 }
 
@@ -107,8 +108,19 @@ impl ChildEntryV6 {
             pipeline,
             original_cleanup_until,
             cleanup_cancelled: AtomicBool::new(false),
+            report_original_session: false,
             panic: None,
         })
+    }
+
+    /// Explicitly select the NoGame protocol before connecting the parent or
+    /// starting native work. Existing v1 callers retain their original path.
+    pub(super) fn select_no_game_session_report(&mut self) -> bool {
+        if !self.pipeline.require_parent_cleanup_deadline() {
+            return false;
+        }
+        self.report_original_session = true;
+        true
     }
 
     /// Advance one real stage. Waiting for native readiness is a separate
@@ -150,10 +162,17 @@ impl ChildEntryV6 {
 
     fn observe_cleanup_once(&mut self) -> ChildCleanupV6 {
         if self.pipeline.lifecycle().is_some() {
-            return ChildCleanupV6::Lifecycle(
+            let until = self
+                .original_cleanup_until
+                .min(self.pipeline.original_cleanup_until());
+            let observation = if self.report_original_session {
                 self.pipeline
-                    .finish_observation(self.original_cleanup_until, &self.cleanup_cancelled),
-            );
+                    .finish_observation_with_session_report(until, &self.cleanup_cancelled)
+            } else {
+                self.pipeline
+                    .finish_observation(until, &self.cleanup_cancelled)
+            };
+            return ChildCleanupV6::Lifecycle(observation);
         }
         if self.pipeline.observation() != V6PipelineObservation::Failed {
             return ChildCleanupV6::OwnerUnresolved;

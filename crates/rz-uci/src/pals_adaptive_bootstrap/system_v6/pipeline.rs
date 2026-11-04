@@ -61,6 +61,7 @@ pub(super) struct V6Pipeline {
     rules_owners: Arc<OwnerRegistry>,
     settings: EngineSettings,
     original_cleanup_until: Instant,
+    require_parent_cleanup_deadline: bool,
     parent: Option<Arc<ConnectedParent>>,
     admission: Option<Arc<PalsPostImageAdmissionV6>>,
     cpu: Option<PalsSystemCpuPreparationV6>,
@@ -124,6 +125,7 @@ impl V6Pipeline {
             rules_owners,
             settings,
             original_cleanup_until: original_cleanup_until.min(registered_cleanup_until),
+            require_parent_cleanup_deadline: false,
             parent: None,
             admission: None,
             cpu: None,
@@ -150,6 +152,16 @@ impl V6Pipeline {
     }
     pub(super) fn original_cleanup_until(&self) -> Instant {
         self.original_cleanup_until
+    }
+
+    /// The explicit smoke path must obtain its original cleanup authority on
+    /// the already authenticated parent channel before starting native work.
+    pub(super) fn require_parent_cleanup_deadline(&mut self) -> bool {
+        if self.state != V6PipelineObservation::Initial {
+            return false;
+        }
+        self.require_parent_cleanup_deadline = true;
+        true
     }
     pub(super) fn failure(&self) -> Option<&V6PipelineFailure> {
         self.failure.as_ref()
@@ -427,7 +439,7 @@ impl V6Pipeline {
             Err(error) => return self.fail(V6PipelineFailure::Parent(error)),
         };
         self.parent = Some(parent);
-        let admission = match self.source.await_parent_image_grant(
+        let mut admission = match self.source.await_parent_image_grant(
             &self.parent_socket,
             self.parent_pid,
             self.parent.as_ref().expect("original parent"),
@@ -435,6 +447,28 @@ impl V6Pipeline {
             Ok(admission) => admission,
             Err(error) => return self.fail(V6PipelineFailure::ParentGrant(error)),
         };
+        if self.require_parent_cleanup_deadline {
+            let (until, cancelled) = self.source.original_startup_control();
+            let received = match Arc::get_mut(&mut admission) {
+                Some(original) => original.receive_cleanup_deadline_once(
+                    until,
+                    self.original_cleanup_until,
+                    &cancelled,
+                ),
+                None => Err(std::io::Error::other(
+                    "original post-image admission is unexpectedly shared",
+                )),
+            };
+            match received {
+                Ok(cleanup_until) => self.original_cleanup_until = cleanup_until,
+                Err(error) => {
+                    // Preserve the original admission and any partial frame;
+                    // no native factory has been started at this point.
+                    self.admission = Some(admission);
+                    return self.fail(V6PipelineFailure::ParentGrant(error));
+                }
+            }
+        }
         self.admission = Some(admission);
         let cpu = match prepare_cpu_v6(Arc::clone(&self.source), &self.clock) {
             Ok(cpu) => cpu,
