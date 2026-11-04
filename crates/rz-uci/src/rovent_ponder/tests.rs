@@ -140,10 +140,10 @@ fn nonblocking_observation_reports_poison_separately_from_busy() {
     let (_owner, handle) =
         RoventPonderClockOwner::new(ticket(), authority(&clock), budget, cleanup, &clock).unwrap();
     let poisoned = handle.clone();
-    let _ = std::panic::catch_unwind(move || {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _guard = poisoned.shared.state.lock().unwrap();
         panic!("exercise clock-owner poisoning");
-    });
+    }));
     assert!(
         matches!(handle.try_snapshot(start), Err(error) if error.code == ErrorCode::BackendFailure)
     );
