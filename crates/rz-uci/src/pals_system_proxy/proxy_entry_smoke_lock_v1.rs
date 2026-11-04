@@ -12,7 +12,7 @@ use rz_experiments::PalsSystemStartupLockV6;
 use std::{
     fs::{File, Metadata},
     io,
-    os::unix::fs::{FileExt, MetadataExt},
+    os::unix::fs::{FileExt, MetadataExt as StdMetadataExt},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -41,21 +41,21 @@ fn alive(until: Instant, cancelled: &AtomicBool) -> io::Result<()> {
 }
 fn unchanged(a: &Metadata, b: &Metadata) -> bool {
     (
-        a.dev(),
-        a.ino(),
+        StdMetadataExt::dev(a),
+        StdMetadataExt::ino(a),
         a.len(),
-        a.mtime(),
-        a.mtime_nsec(),
-        a.ctime(),
-        a.ctime_nsec(),
+        StdMetadataExt::mtime(a),
+        StdMetadataExt::mtime_nsec(a),
+        StdMetadataExt::ctime(a),
+        StdMetadataExt::ctime_nsec(a),
     ) == (
-        b.dev(),
-        b.ino(),
+        StdMetadataExt::dev(b),
+        StdMetadataExt::ino(b),
         b.len(),
-        b.mtime(),
-        b.mtime_nsec(),
-        b.ctime(),
-        b.ctime_nsec(),
+        StdMetadataExt::mtime(b),
+        StdMetadataExt::mtime_nsec(b),
+        StdMetadataExt::ctime(b),
+        StdMetadataExt::ctime_nsec(b),
     )
 }
 
@@ -253,8 +253,8 @@ impl OriginalSmokeLockPin {
         }
         let named = directory.symlink_metadata(name)?;
         if !named.is_file()
-            || CapMetadataExt::dev(&named) != self.metadata.dev()
-            || CapMetadataExt::ino(&named) != self.metadata.ino()
+            || CapMetadataExt::dev(&named) != StdMetadataExt::dev(&self.metadata)
+            || CapMetadataExt::ino(&named) != StdMetadataExt::ino(&self.metadata)
             || named.len() != self.metadata.len()
         {
             return Err(invalid("proxy original lock name changed"));
