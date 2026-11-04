@@ -299,6 +299,12 @@ pub struct TicketNativeRecoveryKey {
 }
 
 impl TicketNativeRecoveryKey {
+    /// Compare the original process-local owner capability, not its copied
+    /// observations or a reusable numeric slot alone.
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        self.index == other.index && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+
     /// Transfer the original worker's report after its service receiver has
     /// been released. This is the same single-take slot used by the service.
     pub fn take_finish_report(

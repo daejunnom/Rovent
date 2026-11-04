@@ -10,6 +10,7 @@ use super::driver_assemble::{
 };
 use super::driver_lifecycle::{FinishObservationV6, PalsSystemDriverLifecycleV6};
 use super::driver_prepare::{OriginalSnapshotState, V6SearchPreparationOwner};
+use super::failed_startup_drain::{FailedNativeDrainObservation, V6FailedStartupDrain};
 use super::{PalsSystemStartupRejectionV6, start_owned_system_native_v6};
 use crate::pals_adaptive_startup::PinnedPalsSystemStartupV6;
 use crate::pals_native::ticketed::NativeFactoryStartupStatus;
@@ -56,6 +57,7 @@ pub(super) struct V6Pipeline {
     identity: EngineIdentity,
     rules_owners: Arc<OwnerRegistry>,
     settings: EngineSettings,
+    original_cleanup_until: Instant,
     parent: Option<Arc<ConnectedParent>>,
     admission: Option<Arc<PalsPostImageAdmissionV6>>,
     cpu: Option<PalsSystemCpuPreparationV6>,
@@ -65,6 +67,7 @@ pub(super) struct V6Pipeline {
     lifecycle: Option<PalsSystemDriverLifecycleV6>,
     service_panic: Option<Box<dyn Any + Send>>,
     failure: Option<V6PipelineFailure>,
+    failed_native_drain: Option<V6FailedStartupDrain>,
     state: V6PipelineObservation,
 }
 
@@ -77,6 +80,7 @@ impl V6Pipeline {
         identity: EngineIdentity,
         rules_owners: Arc<OwnerRegistry>,
         settings: EngineSettings,
+        original_cleanup_until: Instant,
     ) -> Self {
         Self {
             source,
@@ -86,6 +90,7 @@ impl V6Pipeline {
             identity,
             rules_owners,
             settings,
+            original_cleanup_until,
             parent: None,
             admission: None,
             cpu: None,
@@ -95,6 +100,7 @@ impl V6Pipeline {
             lifecycle: None,
             service_panic: None,
             failure: None,
+            failed_native_drain: None,
             state: V6PipelineObservation::Initial,
         }
     }
@@ -123,9 +129,59 @@ impl V6Pipeline {
     pub(super) fn service_panic(&self) -> Option<&(dyn Any + Send)> {
         self.service_panic.as_deref()
     }
+    /// Request shutdown of the same retained native worker after a failed
+    /// startup. The caller supplies the original registered cleanup deadline.
+    /// This neither clears the failure nor closes external/archive owners.
+    pub(super) fn begin_failed_native_drain(
+        &mut self,
+        until: Instant,
+    ) -> FailedNativeDrainObservation {
+        if self.state != V6PipelineObservation::Failed {
+            return FailedNativeDrainObservation::OwnerUnavailable;
+        }
+        let service = if let Some(owner) = self.search_owner.as_mut() {
+            Some(&mut owner.custody.native.service)
+        } else {
+            self.pre_admission
+                .as_mut()
+                .and_then(V6PreAdmissionOwner::failed_native_service)
+        };
+        let Some(service) = service else {
+            return FailedNativeDrainObservation::OwnerUnavailable;
+        };
+        if self.failed_native_drain.is_none() {
+            match V6FailedStartupDrain::new(service, until) {
+                Ok(drain) => self.failed_native_drain = Some(drain),
+                Err(observation) => return observation,
+            }
+        }
+        self.failed_native_drain
+            .as_mut()
+            .expect("drain inserted")
+            .begin(service)
+    }
+
+    /// One nonblocking event/join observation on the same retained service.
+    pub(super) fn poll_failed_native_drain(&mut self) -> FailedNativeDrainObservation {
+        let service = if let Some(owner) = self.search_owner.as_mut() {
+            Some(&mut owner.custody.native.service)
+        } else {
+            self.pre_admission
+                .as_mut()
+                .and_then(V6PreAdmissionOwner::failed_native_service)
+        };
+        match (self.failed_native_drain.as_mut(), service) {
+            (Some(drain), Some(service)) => drain.poll_once(service),
+            _ => FailedNativeDrainObservation::OwnerUnavailable,
+        }
+    }
     fn fail(&mut self, failure: V6PipelineFailure) -> V6PipelineObservation {
         self.failure = Some(failure);
         self.state = V6PipelineObservation::Failed;
+        // This only starts the same native worker's bounded drain when one
+        // was actually retained. A caller must continue polling; no failure
+        // or missing physical completion is converted to success here.
+        let _ = self.begin_failed_native_drain(self.original_cleanup_until);
         self.state
     }
 

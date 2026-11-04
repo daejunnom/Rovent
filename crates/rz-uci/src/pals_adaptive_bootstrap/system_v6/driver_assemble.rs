@@ -120,6 +120,17 @@ pub(super) struct V6PreAdmissionOwner {
 }
 
 impl V6PreAdmissionOwner {
+    /// The exact service remains in one of these original slots on rejected
+    /// admission. An admitted driver owns its own shutdown path instead.
+    pub(super) fn failed_native_service(&mut self) -> Option<&mut ActualService> {
+        if let Some(owner) = self.owner.as_mut() {
+            return Some(&mut owner.custody.native.service);
+        }
+        self.admission_sources
+            .as_mut()
+            .map(|source| &mut source.native)
+    }
+
     /// No process, archive or driver is created by construction itself.
     pub(super) fn new(
         owner: V6SearchPreparationOwner,
