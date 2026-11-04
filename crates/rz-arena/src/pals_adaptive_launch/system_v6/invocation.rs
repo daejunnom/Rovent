@@ -196,6 +196,73 @@ impl PalsV6RoleSockets {
         Ok(())
     }
 
+    /// Verify only the selected role without changing paired validation.
+    /// A valid listener remains a transport observation, not peer authority.
+    pub(crate) fn verify_role_listeners(&self, role: NativeEngineRole) -> Result<(), ArenaError> {
+        let selected = &self.roles[match role {
+            NativeEngineRole::Baseline => 0,
+            NativeEngineRole::Candidate => 1,
+        }];
+        selected.grant.verify()?;
+        selected.cancel.verify()?;
+        Ok(())
+    }
+
+    /// Grant polling must not depend on the separate cancel listener.
+    pub(crate) fn verify_role_grant_listener(
+        &self,
+        role: NativeEngineRole,
+    ) -> Result<(), ArenaError> {
+        self.roles[match role {
+            NativeEngineRole::Baseline => 0,
+            NativeEngineRole::Candidate => 1,
+        }]
+        .grant
+        .verify()
+    }
+
+    /// Direct smoke needs this role's original snapshot and channels only.
+    /// The pair's historical full-scope verification remains unchanged.
+    pub(crate) fn verify_role_original(
+        &self,
+        owner: &NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
+        execution: &Arc<PalsV6ExecutionStart>,
+        role: NativeEngineRole,
+    ) -> Result<(), ArenaError> {
+        self.verify_role_socket_owner(owner, execution, role)?;
+        PalsV6EndpointSnapshot::from_original(owner, role)?;
+        Ok(())
+    }
+
+    /// Check only owner identity and the selected listeners. The caller must
+    /// independently verify the selected endpoint's original pin and bytes.
+    pub(crate) fn verify_role_socket_owner(
+        &self,
+        owner: &NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
+        execution: &Arc<PalsV6ExecutionStart>,
+        role: NativeEngineRole,
+    ) -> Result<(), ArenaError> {
+        if !Arc::ptr_eq(&self.execution, execution)
+            || self.pair_sha256 != owner.spec().sha256()
+            || owner.spec().proxy_inputs() != Some(&self.sidecar)
+        {
+            return Err(ArenaError::Integrity(
+                "V6 original socket owner differs".into(),
+            ));
+        }
+        let cwd = owner
+            .snapshot
+            .cwd
+            .metadata()
+            .map_err(|_| ArenaError::Io("V6 original cwd metadata unavailable".into()))?;
+        if (cwd.dev(), cwd.ino()) != (self.cwd_device, self.cwd_inode) {
+            return Err(ArenaError::Integrity(
+                "V6 original socket cwd differs".into(),
+            ));
+        }
+        self.verify_role_listeners(role)
+    }
+
     pub(crate) fn build_invocation(
         &self,
         owner: &NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
