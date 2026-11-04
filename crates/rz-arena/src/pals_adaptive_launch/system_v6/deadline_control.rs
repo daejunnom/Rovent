@@ -9,6 +9,9 @@
 use super::{LockedPalsSystemArenaPairV6, PalsV6ExecutionStart, deadline_grant::OwnerWindow};
 use crate::{ArenaError, process::SpawnCustody};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use rz_contracts::pals::cancel_control_v1::{
+    CANCEL_ACK_BYTES, CANCEL_REQUEST_BYTES, CancelAck, CancelAckDisposition, CancelRequest,
+};
 use rz_contracts::pals::deadline_grant_v1::{
     DeadlineGrant, DeadlinePhase, DeadlineRequest, DeadlineRole, DeadlineScope, REQUEST_BYTES,
 };
@@ -88,6 +91,181 @@ struct Peer {
     response: Option<Vec<u8>>,
     response_until: Option<Instant>,
     written: usize,
+    original_endpoint: bool,
+}
+
+struct IssuedOriginalRun {
+    scope: DeadlineScope,
+    pid: u32,
+    identity: ProcessIdentity,
+    cancel_claimed: bool,
+}
+
+/// Evidence for the same peer which received a complete original run grant.
+/// The caller must keep the creating control owner alive and recheck it before
+/// each I/O operation; this is not cancellation or physical completion.
+pub(crate) struct OriginalCancelPeer {
+    scope: DeadlineScope,
+    pid: u32,
+    identity: ProcessIdentity,
+}
+
+impl OriginalCancelPeer {
+    pub(crate) fn scope(&self) -> &DeadlineScope {
+        &self.scope
+    }
+}
+
+/// Progress is transport observation only. In particular, an ACK means the
+/// run-cancel token was accepted, not that the child or GPU has finished.
+pub(crate) enum OriginalCancelProgress {
+    Pending { written: usize, received: usize },
+    Acknowledged,
+}
+
+/// The original control owner must retain this same object on all outcomes.
+/// A partially sent frame is never reissued on a replacement connection.
+#[must_use = "retain the original cancel stream until its owner is settled"]
+pub(crate) struct OriginalCancelSender {
+    stream: UnixStream,
+    peer: OriginalCancelPeer,
+    sequence: u64,
+    request: [u8; CANCEL_REQUEST_BYTES],
+    written: usize,
+    ack: [u8; CANCEL_ACK_BYTES],
+    received: usize,
+    acknowledged: bool,
+    failed: Option<String>,
+}
+
+impl OriginalCancelSender {
+    /// The stream was accepted on an original role-specific channel and must
+    /// still match the very same issued run grant and actual connected peer.
+    /// A rejected construction returns the same stream to its owner. The
+    /// stream may already have been switched to nonblocking mode.
+    pub(crate) fn new(
+        control: &mut DeadlineControl<'_>,
+        custody: &SpawnCustody,
+        stream: UnixStream,
+        scope: &DeadlineScope,
+        sequence: u64,
+    ) -> Result<Self, (UnixStream, ArenaError)> {
+        // This is a fresh dedicated channel with one run-cancel request;
+        // its receiver starts at sequence zero and permits sequence one.
+        if sequence != 1 {
+            return Err((stream, failure("cancel_initial_sequence")));
+        }
+        let request = match (CancelRequest {
+            scope: scope.clone(),
+            sequence,
+        })
+        .encode()
+        {
+            Ok(request) => request,
+            Err(_) => return Err((stream, failure("cancel_request_invalid"))),
+        };
+        if stream.set_nonblocking(true).is_err() {
+            return Err((stream, failure("cancel_nonblocking")));
+        }
+        let peer = match control.claim_cancel_peer(custody, &stream, scope) {
+            Ok(peer) => peer,
+            Err(error) => return Err((stream, error)),
+        };
+        Ok(Self {
+            stream,
+            peer,
+            sequence,
+            request,
+            written: 0,
+            ack: [0; CANCEL_ACK_BYTES],
+            received: 0,
+            acknowledged: false,
+            failed: None,
+        })
+    }
+
+    /// One bounded nonblocking turn. The caller supplies its original
+    /// pre-signal deadline and never treats an ACK as a process-tree fence.
+    pub(crate) fn poll(
+        &mut self,
+        control: &DeadlineControl<'_>,
+        custody: &SpawnCustody,
+        until: Instant,
+    ) -> Result<OriginalCancelProgress, ArenaError> {
+        if self.acknowledged {
+            return Ok(OriginalCancelProgress::Acknowledged);
+        }
+        if let Some(original) = &self.failed {
+            return Err(ArenaError::Io(format!("cancel_sender_sticky:{original}")));
+        }
+        let result = self.poll_inner(control, custody, until);
+        if let Err(error) = &result {
+            // No new request is sent after a failed or partial transfer. The
+            // original stream, offsets, and first cause remain in this owner.
+            self.failed = Some(error.to_string());
+        }
+        result
+    }
+
+    fn poll_inner(
+        &mut self,
+        control: &DeadlineControl<'_>,
+        custody: &SpawnCustody,
+        until: Instant,
+    ) -> Result<OriginalCancelProgress, ArenaError> {
+        let until = until.min(control.process_cleanup_until);
+        if Instant::now() >= until {
+            return Err(failure("cancel_deadline"));
+        }
+        control.verify_cancel_peer(custody, &self.stream, &self.peer)?;
+        if Instant::now() >= until {
+            return Err(failure("cancel_deadline"));
+        }
+        if self.written < self.request.len() {
+            match self.stream.write(&self.request[self.written..]) {
+                Ok(0) => return Err(failure("cancel_write_zero")),
+                Ok(count) => self.written += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err(failure("cancel_write")),
+            }
+            if self.written < self.request.len() {
+                return Ok(OriginalCancelProgress::Pending {
+                    written: self.written,
+                    received: self.received,
+                });
+            }
+        }
+        if Instant::now() >= until {
+            return Err(failure("cancel_deadline"));
+        }
+        match self.stream.read(&mut self.ack[self.received..]) {
+            Ok(0) => return Err(failure("cancel_peer_eof")),
+            Ok(count) => self.received += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => return Err(failure("cancel_read")),
+        }
+        if self.received < self.ack.len() {
+            return Ok(OriginalCancelProgress::Pending {
+                written: self.written,
+                received: self.received,
+            });
+        }
+        let ack = CancelAck::decode(&self.ack).map_err(failure)?;
+        // This sender transmits one request exactly once. A Duplicate response
+        // cannot be justified by it and is retained as a protocol failure.
+        if ack.scope != *self.peer.scope()
+            || ack.sequence != self.sequence
+            || ack.disposition != CancelAckDisposition::Accepted
+        {
+            return Err(failure("cancel_ack_mismatch"));
+        }
+        control.verify_cancel_peer(custody, &self.stream, &self.peer)?;
+        if Instant::now() >= until {
+            return Err(failure("cancel_deadline"));
+        }
+        self.acknowledged = true;
+        Ok(OriginalCancelProgress::Acknowledged)
+    }
 }
 
 /// A completed grant is a transport event, not a physical completion proof.
@@ -119,8 +297,9 @@ pub(crate) struct DeadlineControl<'a> {
     owner_epoch: u64,
     process_cleanup_until: Instant,
     fastchess: Option<(u32, ProcessIdentity)>,
-    admitted: Vec<(DeadlineScope, u32, ProcessIdentity)>,
+    admitted: Vec<(DeadlineScope, u32, ProcessIdentity, bool)>,
     used: Vec<DeadlineScope>,
+    issued_original_runs: Vec<IssuedOriginalRun>,
     peer: Option<Peer>,
 }
 
@@ -165,6 +344,7 @@ impl<'a> DeadlineControl<'a> {
             fastchess: None,
             admitted: Vec::new(),
             used: Vec::new(),
+            issued_original_runs: Vec::new(),
             peer: None,
         })
     }
@@ -184,13 +364,14 @@ impl<'a> DeadlineControl<'a> {
             || self
                 .admitted
                 .iter()
-                .any(|(existing, _, _)| existing == &scope)
+                .any(|(existing, _, _, _)| existing == &scope)
             || self.used.contains(&scope)
         {
             return Err(failure("scope_admission"));
         }
         let identity = process_identity(expected_peer_pid)?;
-        self.admitted.push((scope, expected_peer_pid, identity));
+        self.admitted
+            .push((scope, expected_peer_pid, identity, false));
         Ok(())
     }
 
@@ -291,7 +472,7 @@ impl<'a> DeadlineControl<'a> {
                     || self
                         .admitted
                         .iter()
-                        .any(|(existing, _, _)| existing == scope)
+                        .any(|(existing, _, _, _)| existing == scope)
                     || self.used.contains(scope)
             })
         {
@@ -306,7 +487,7 @@ impl<'a> DeadlineControl<'a> {
             scopes
                 .iter()
                 .cloned()
-                .map(|scope| (scope, peer.pid, identity)),
+                .map(|scope| (scope, peer.pid, identity, true)),
         );
         Ok(scopes)
     }
@@ -380,6 +561,7 @@ impl<'a> DeadlineControl<'a> {
                 response: None,
                 response_until: None,
                 written: 0,
+                original_endpoint: false,
             });
             // The original owner must first observe and bind this actual
             // child; never derive its authority from the following wire data.
@@ -431,13 +613,14 @@ impl<'a> DeadlineControl<'a> {
             let index = self
                 .admitted
                 .iter()
-                .position(|(scope, admitted_pid, identity)| {
+                .position(|(scope, admitted_pid, identity, _)| {
                     scope == &request.scope
                         && *admitted_pid == peer.pid
                         && *identity == peer.identity
                 })
                 .ok_or_else(|| failure("scope_not_admitted"))?;
-            let (scope, _, _) = self.admitted.remove(index);
+            let (scope, _, _, original_endpoint) = self.admitted.remove(index);
+            peer.original_endpoint = original_endpoint;
             // Reserve before writing: a partial or failed reply is not retried.
             self.used.push(scope.clone());
             let encoded = self.window.grant(&scope, &peer.request).map_err(failure)?;
@@ -478,6 +661,14 @@ impl<'a> DeadlineControl<'a> {
         let scope = DeadlineRequest::decode(&peer.request)
             .map_err(failure)?
             .scope;
+        if peer.original_endpoint && scope.phase == DeadlinePhase::Run {
+            self.issued_original_runs.push(IssuedOriginalRun {
+                scope: scope.clone(),
+                pid: peer.pid,
+                identity: peer.identity,
+                cancel_claimed: false,
+            });
+        }
         Ok(Some(DeadlineGrantObservation {
             peer_pid: peer.pid,
             peer_start_ticks: peer.identity.start_ticks,
@@ -515,6 +706,74 @@ impl<'a> DeadlineControl<'a> {
         }
         Ok(())
     }
+
+    /// Claim one cancel channel only after a complete run grant to the same
+    /// original endpoint. This verifies the actual connected peer, not role
+    /// values asserted by its wire messages. On error the caller retains the
+    /// stream and the original owner; no socket or process is closed here.
+    pub(crate) fn claim_cancel_peer(
+        &mut self,
+        custody: &SpawnCustody,
+        stream: &UnixStream,
+        scope: &DeadlineScope,
+    ) -> Result<OriginalCancelPeer, ArenaError> {
+        if scope.phase != DeadlinePhase::Run {
+            return Err(failure("cancel_scope_phase"));
+        }
+        let index = self
+            .issued_original_runs
+            .iter()
+            .position(|issued| &issued.scope == scope && !issued.cancel_claimed)
+            .ok_or_else(|| failure("cancel_scope_not_issued"))?;
+        let issued = &self.issued_original_runs[index];
+        let peer = OriginalCancelPeer {
+            scope: issued.scope.clone(),
+            pid: issued.pid,
+            identity: issued.identity,
+        };
+        self.verify_cancel_peer(custody, stream, &peer)?;
+        self.issued_original_runs[index].cancel_claimed = true;
+        Ok(peer)
+    }
+
+    /// Recheck the exact socket peer, retained grant owner and direct process
+    /// relationship. A valid peer is not an ACK or proof of physical release.
+    pub(crate) fn verify_cancel_peer(
+        &self,
+        custody: &SpawnCustody,
+        stream: &UnixStream,
+        peer: &OriginalCancelPeer,
+    ) -> Result<(), ArenaError> {
+        if Instant::now() >= self.process_cleanup_until
+            || !self.issued_original_runs.iter().any(|issued| {
+                issued.scope == peer.scope
+                    && issued.pid == peer.pid
+                    && issued.identity == peer.identity
+            })
+        {
+            return Err(failure("cancel_scope_not_owned"));
+        }
+        let (leader, original_leader) =
+            self.fastchess.ok_or_else(|| failure("fastchess_custody"))?;
+        if custody.child().map(|child| child.id()) != Some(leader)
+            || process_identity(leader)? != original_leader
+        {
+            return Err(failure("fastchess_identity_changed"));
+        }
+        let credentials =
+            getsockopt(stream, PeerCredentials).map_err(|_| failure("cancel_peer_credentials"))?;
+        if credentials.uid() != nix::unistd::geteuid().as_raw()
+            || credentials.pid() <= 0
+            || u32::try_from(credentials.pid()).ok() != Some(peer.pid)
+        {
+            return Err(failure("cancel_peer_credentials"));
+        }
+        self.verify_peer(leader, peer.pid, peer.identity)?;
+        if process_identity(leader)? != original_leader {
+            return Err(failure("fastchess_identity_changed"));
+        }
+        Ok(())
+    }
 }
 
 impl DeadlineControl<'static> {
@@ -545,6 +804,7 @@ impl DeadlineControl<'static> {
             fastchess: None,
             admitted: Vec::new(),
             used: Vec::new(),
+            issued_original_runs: Vec::new(),
             peer: None,
         })
     }
