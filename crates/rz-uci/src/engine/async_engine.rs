@@ -1109,8 +1109,7 @@ mod tests {
             }
         };
         slot.run = Some(run);
-        slot.sender.try_send(Event::Line("uci".into())).unwrap();
-        slot.sender.try_send(Event::Line("quit".into())).unwrap();
+        let sender = slot.sender.clone();
         struct TimerGuard<'a>(&'a mut AsyncEngineRun<Vec<u8>, Vec<u8>>);
         impl Drop for TimerGuard<'_> {
             fn drop(&mut self) {
@@ -1135,6 +1134,8 @@ mod tests {
         }
         let mut guard = TimerGuard(slot.original_run_mut().unwrap());
         let run = &mut *guard.0;
+        sender.try_send(Event::Line("uci".into())).unwrap();
+        sender.try_send(Event::Line("quit".into())).unwrap();
         assert_eq!(
             run.drive_until(Instant::now() + Duration::from_secs(2)),
             Some(AsyncServeStatus::OutputQueued)
