@@ -520,6 +520,13 @@ impl SnapshotCacheHint {
 /// Its callbacks must be bounded/nonblocking and do not attest completion.
 #[cfg(target_os = "linux")]
 pub(crate) trait NativeV6Control: Send {
+    /// The actual original execution allocation held by this control owner.
+    /// A missing owner is never accepted as an equivalent declaration.
+    fn original_execution(
+        &self,
+    ) -> Option<&Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>> {
+        None
+    }
     fn poll_run(
         &mut self,
         custody: &crate::process::SpawnCustody,
@@ -534,20 +541,50 @@ pub(crate) trait NativeV6Control: Send {
 
 #[cfg(target_os = "linux")]
 pub(crate) struct NativeV6Supervisor {
-    execution: crate::pals_adaptive_launch::PalsV6ExecutionStart,
+    execution: Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
     control: Arc<Mutex<Box<dyn NativeV6Control>>>,
+}
+
+/// Rejected construction returns the exact original control owner. The
+/// caller retains its own execution Arc because construction only borrows it.
+#[cfg(target_os = "linux")]
+#[must_use = "retain or return the original V6 control owner"]
+pub(crate) struct NativeV6SupervisorRejection {
+    pub(crate) error: ArenaError,
+    pub(crate) control: Box<dyn NativeV6Control>,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for NativeV6SupervisorRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeV6SupervisorRejection")
+            .field("error", &self.error)
+            .field("original_control_retained", &true)
+            .finish()
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl NativeV6Supervisor {
     pub(crate) fn new(
-        execution: crate::pals_adaptive_launch::PalsV6ExecutionStart,
+        execution: &Arc<crate::pals_adaptive_launch::PalsV6ExecutionStart>,
         control: Box<dyn NativeV6Control>,
-    ) -> Self {
-        Self {
-            execution,
-            control: Arc::new(Mutex::new(control)),
+    ) -> Result<Self, NativeV6SupervisorRejection> {
+        if !control
+            .original_execution()
+            .is_some_and(|original| Arc::ptr_eq(original, execution))
+        {
+            return Err(NativeV6SupervisorRejection {
+                error: ArenaError::Integrity(
+                    "V6 control and supervisor execution owners differ".into(),
+                ),
+                control,
+            });
         }
+        Ok(Self {
+            execution: Arc::clone(execution),
+            control: Arc::new(Mutex::new(control)),
+        })
     }
 }
 
