@@ -5,10 +5,14 @@ pub mod diagnostics;
 #[cfg(feature = "pals-adaptive")]
 mod priority_cancel;
 #[cfg(feature = "pals-adaptive")]
+mod priority_close;
+#[cfg(feature = "pals-adaptive")]
 pub use priority_cancel::{
     PriorityCancelAcknowledgment, PriorityCancelApplicationFailure, PriorityCancelHandle,
     PriorityCancelObservation, PriorityCancelPanicAccessError, PriorityCancelRequest,
 };
+#[cfg(feature = "pals-adaptive")]
+pub use priority_close::{PriorityCloseHandle, PriorityCloseObservation};
 mod driver_output;
 use driver_output::DriverOutputEnvelope;
 mod driver_start;
@@ -507,6 +511,8 @@ pub struct EngineProcess {
     go_admission_observer: Option<GoAdmissionObserver>,
     #[cfg(feature = "pals-adaptive")]
     priority_cancel: Option<priority_cancel::PriorityCancelOwner>,
+    #[cfg(feature = "pals-adaptive")]
+    priority_close: Option<priority_close::PriorityCloseOwner>,
 }
 impl EngineProcess {
     /// CPU/PALS evidence is distinct from the legacy evaluator's native
@@ -537,6 +543,8 @@ impl EngineProcess {
             go_admission_observer: None,
             #[cfg(feature = "pals-adaptive")]
             priority_cancel: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_close: None,
         }
     }
     /// Search-only startup. No neural descriptor or evaluator is constructed.
@@ -555,6 +563,8 @@ impl EngineProcess {
             go_admission_observer: None,
             #[cfg(feature = "pals-adaptive")]
             priority_cancel: None,
+            #[cfg(feature = "pals-adaptive")]
+            priority_close: None,
         }
     }
     /// Session validates the declared identity before starting protocol service.
@@ -577,14 +587,33 @@ impl EngineProcess {
     pub fn install_priority_cancel(
         &mut self,
     ) -> Result<PriorityCancelHandle, contract::ContractError> {
-        if self.priority_cancel.is_some() {
+        if self.priority_cancel.is_some() || self.priority_close.is_some() {
             return Err(failure(
                 contract::ErrorCode::InvalidInput,
-                "priority cancel is already installed",
+                "a priority control is already installed",
             ));
         }
         let (owner, handle) = priority_cancel::PriorityCancelOwner::new(self.clock.epoch());
         self.priority_cancel = Some(owner);
+        Ok(handle)
+    }
+
+    /// Install an independent session-level admission close request. A
+    /// recorded request is not a close ACK or physical completion. Until the
+    /// two controls share a recovery protocol they are mutually exclusive,
+    /// avoiding an implicit retry after the other control's cancellation panic.
+    #[cfg(feature = "pals-adaptive")]
+    pub fn install_priority_close(
+        &mut self,
+    ) -> Result<PriorityCloseHandle, contract::ContractError> {
+        if self.priority_close.is_some() || self.priority_cancel.is_some() {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "a priority control is already installed",
+            ));
+        }
+        let (owner, handle) = priority_close::PriorityCloseOwner::new(self.clock.epoch());
+        self.priority_close = Some(owner);
         Ok(handle)
     }
 }
@@ -2876,10 +2905,14 @@ pub fn serve<O: Write, D: Write>(
         go_admission_observer,
         #[cfg(feature = "pals-adaptive")]
         priority_cancel,
+        #[cfg(feature = "pals-adaptive")]
+        priority_close,
     } = process;
     // Keep the unique mailbox owner until all existing shutdown work ends.
     #[cfg(feature = "pals-adaptive")]
     let _priority_owner = priority_cancel;
+    #[cfg(feature = "pals-adaptive")]
+    let _priority_close_owner = priority_close;
     if settings.max_workers == 0
         || settings.shutdown_limit.is_zero()
         || settings.search.max_simulations == 0
@@ -2971,6 +3004,10 @@ pub fn serve<O: Write, D: Write>(
     let timer_flag = Arc::clone(&timer_stop);
     #[cfg(feature = "pals-adaptive")]
     let priority_observer = _priority_owner.as_ref().map(|owner| owner.observer());
+    #[cfg(feature = "pals-adaptive")]
+    let close_observer = _priority_close_owner.as_ref().map(|owner| owner.observer());
+    #[cfg(feature = "pals-adaptive")]
+    let dispatch_close_observer = close_observer.clone();
     let timer = thread::spawn(move || {
         let mut delivered = None;
         while !timer_flag.load(Ordering::Acquire) {
@@ -2978,6 +3015,18 @@ pub fn serve<O: Write, D: Write>(
                 #[cfg(feature = "pals-adaptive")]
                 if let Some(priority) = &priority_observer {
                     priority.apply(&owner);
+                }
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(close) = &close_observer {
+                    if close.apply_under_owner_lock(&owner) {
+                        // A sleeping event consumer can re-check its own
+                        // close policy. A full queue already has events; no
+                        // wake is an ACK or permission to drop output.
+                        let _ = timer_events.try_send(Event::RejectedInput {
+                            code: "OwnerWake",
+                            message: String::new(),
+                        });
+                    }
                 }
                 if owner.pending_bestmove.as_ref().is_some_and(|pending| {
                     Instant::now() >= pending.until || owner.workers.iter().any(Worker::is_finished)
@@ -2999,6 +3048,10 @@ pub fn serve<O: Write, D: Write>(
                 if let Some(priority) = &priority_observer {
                     priority.owner_poisoned();
                 }
+                #[cfg(feature = "pals-adaptive")]
+                if let Some(close) = &close_observer {
+                    close.owner_poisoned();
+                }
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -3017,10 +3070,22 @@ pub fn serve<O: Write, D: Write>(
                 .handle(session, event)
         },
         move |effect| {
-            dispatch_owner
+            let mut owner = dispatch_owner
                 .lock()
-                .map_err(|_| failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned"))?
-                .dispatch(effect, &sender)
+                .map_err(|_| failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned"))?;
+            #[cfg(feature = "pals-adaptive")]
+            if matches!(&effect, Effect::Start { .. })
+                && dispatch_close_observer
+                    .as_ref()
+                    .is_some_and(|close| close.closed_under_owner_lock())
+            {
+                return Err(failure(
+                    contract::ErrorCode::Canceled,
+                    "priority admission is closed",
+                )
+                .into());
+            }
+            owner.dispatch(effect, &sender)
         },
     );
     timer_stop.store(true, Ordering::Release);
@@ -3216,11 +3281,239 @@ mod tests {
         );
         let control = process.install_priority_cancel().unwrap();
         assert!(process.install_priority_cancel().is_err());
+        assert!(process.install_priority_close().is_err());
         drop(process);
         assert!(control.observe().owner_closed);
         assert_eq!(control.request(), PriorityCancelRequest::OwnerClosed);
         assert_eq!(control.observe().acknowledgment, None);
         assert!(!control.observe().physical_completion_observed);
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_close_prevents_queued_start_after_owner_ack() {
+        use std::io;
+        use std::sync::mpsc;
+
+        struct BlockFirstWrite {
+            entered: Option<mpsc::SyncSender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl io::Write for BlockFirstWrite {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    self.release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fixture release"))?;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct CountStarts(Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::search_driver::SearchSessionDriver for CountStarts {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Cpu
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([14; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "close fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn run(
+                &self,
+                _: &Position,
+                _: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Err(crate::search_driver::SearchSessionFailure {
+                    physical_completion: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                    code: "UnexpectedStartFixture",
+                    detail: "fixture started".into(),
+                })
+            }
+        }
+
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(CountStarts(Arc::clone(&starts))),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(84)),
+        );
+        let close = process.install_priority_close().unwrap();
+        assert!(process.install_priority_cancel().is_err());
+        let (sender, events) = mpsc::sync_channel(4);
+        let child_sender = sender.clone();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let child = thread::spawn(move || {
+            let mut output = BlockFirstWrite {
+                entered: Some(entered_tx),
+                release: release_rx,
+            };
+            serve(
+                events,
+                child_sender,
+                &mut output,
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("uci".into())).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        sender.send(Event::Line("go infinite".into())).unwrap();
+        assert_eq!(close.request(), PriorityCancelRequest::Recorded);
+        let until = Instant::now() + Duration::from_secs(3);
+        while close.observe().cancel_acknowledgment.is_none() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let observed = close.observe();
+        let _ = release_tx.send(());
+        let finish_until = Instant::now() + Duration::from_secs(5);
+        while !child.is_finished() && Instant::now() < finish_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(observed.admission_closed);
+        assert_eq!(
+            observed.cancel_acknowledgment,
+            Some(PriorityCancelAcknowledgment::NoActiveSearch)
+        );
+        assert!(!observed.physical_completion_observed);
+        assert!(child.is_finished(), "fixture service did not terminate");
+        assert!(child.join().unwrap().is_err());
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert!(close.observe().owner_closed);
+    }
+
+    #[cfg(feature = "pals-adaptive")]
+    #[test]
+    fn priority_close_waits_for_original_start_lock_then_cancels_that_search() {
+        use std::sync::mpsc;
+
+        struct LockedStart {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            canceled: mpsc::SyncSender<()>,
+        }
+        impl crate::search_driver::SearchSessionDriver for LockedStart {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Cpu
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([15; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "start race fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn supports_ponder_clock(&self) -> bool {
+                let _ = self.entered.send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                false
+            }
+            fn run(
+                &self,
+                _: &Position,
+                context: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !context.control.cancellation.load(Ordering::Acquire)
+                    && Instant::now() < until
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if context.control.cancellation.load(Ordering::Acquire) {
+                    let _ = self.canceled.send(());
+                }
+                Err(crate::search_driver::SearchSessionFailure {
+                    physical_completion: crate::search_driver::DriverPhysicalCompletion::Confirmed,
+                    code: "CloseRaceFixture",
+                    detail: "fixture ended".into(),
+                })
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (canceled_tx, canceled_rx) = mpsc::sync_channel(1);
+        let mut process = EngineProcess::with_search_driver(
+            Arc::new(LockedStart {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                canceled: canceled_tx,
+            }),
+            Arc::new(OwnerRegistry::default()),
+            ProcessClock::new(contract::ProcessEpoch(85)),
+        );
+        let close = process.install_priority_close().unwrap();
+        let (sender, events) = event_channel();
+        let child_sender = sender.clone();
+        let child = thread::spawn(move || {
+            serve(
+                events,
+                child_sender,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                process,
+                EngineSettings::default(),
+            )
+        });
+        sender.send(Event::Line("go infinite".into())).unwrap();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        if entered {
+            let _ = close.request();
+        }
+        let before_release = close.observe();
+        let _ = release_tx.send(());
+        let canceled = canceled_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        let ack_until = Instant::now() + Duration::from_secs(3);
+        while close.observe().cancel_acknowledgment.is_none() && Instant::now() < ack_until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = close.observe();
+        let _ = sender.try_send(Event::Line("quit".into()));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !child.is_finished() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            entered && canceled,
+            "fixture did not start and observe cancellation"
+        );
+        assert!(
+            !before_release.admission_closed,
+            "close cannot pass the held Owner lock"
+        );
+        assert!(after.admission_closed);
+        assert_eq!(
+            after.cancel_acknowledgment,
+            Some(PriorityCancelAcknowledgment::ActiveSearch)
+        );
+        assert!(!after.physical_completion_observed);
+        assert!(child.is_finished(), "fixture service did not terminate");
+        let _ = child.join().unwrap();
     }
 
     #[cfg(feature = "pals-adaptive")]
