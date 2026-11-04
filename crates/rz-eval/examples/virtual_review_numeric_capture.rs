@@ -1191,9 +1191,16 @@ struct SystemCaptureWorker {
 /// the original worker, its lease and its recovery key remains in this process.
 #[cfg(target_os = "linux")]
 fn system_supervisor_socket() -> Result<std::os::unix::net::UnixDatagram> {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     extern "C" {
         fn dup(fd: i32) -> i32;
+        fn getsockopt(
+            fd: i32,
+            level: i32,
+            option: i32,
+            value: *mut std::ffi::c_void,
+            length: *mut u32,
+        ) -> i32;
     }
     let raw = std::env::var("ROVEZERO_CUSTODY_FD")?.parse::<i32>()?;
     if raw < 3 {
@@ -1210,6 +1217,25 @@ fn system_supervisor_socket() -> Result<std::os::unix::net::UnixDatagram> {
     let socket = std::os::unix::net::UnixDatagram::from(duplicate);
     socket.local_addr()?;
     socket.peer_addr()?;
+    let mut kind: i32 = 0;
+    let mut size = std::mem::size_of::<i32>() as u32;
+    // SAFETY: pointers refer to correctly sized writable values and the
+    // descriptor is an owned live socket. Linux SOL_SOCKET=1, SO_TYPE=3.
+    if unsafe {
+        getsockopt(
+            socket.as_raw_fd(),
+            1,
+            3,
+            (&mut kind as *mut i32).cast(),
+            &mut size,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if size != std::mem::size_of::<i32>() as u32 || kind != 5 {
+        return Err("custody transport must be a SOCK_SEQPACKET socket".into());
+    }
     socket.set_nonblocking(true)?;
     Ok(socket)
 }
@@ -1390,6 +1416,16 @@ impl SystemCaptureWorker {
         }
     }
 
+    fn report_recovery_control_failure(count: u32, first: &Option<String>) {
+        if count != 0 {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "RZ_CUSTODY_RECOVERY_CONTROL_FAILURE={}",
+                serde_json::json!({"count":count,"first":first})
+            );
+        }
+    }
+
     fn wait(
         &mut self,
         mut lease: owned_worker::Lease,
@@ -1554,9 +1590,17 @@ impl SystemCaptureWorker {
         let mut pending_release = None;
         let mut released = false;
         let mut quarantine_error = None;
+        let mut transport_readable = true;
+        let mut recovery_failures = 0u32;
+        let mut first_recovery_failure = None;
+        let mut retire_failed = false;
         while Instant::now() < cleanup_until {
             match self.finish(Instant::now()) {
                 Ok(()) => {
+                    Self::report_recovery_control_failure(
+                        recovery_failures,
+                        &first_recovery_failure,
+                    );
                     self.send_release_proof();
                     return Ok(());
                 }
@@ -1571,10 +1615,19 @@ impl SystemCaptureWorker {
                 unknown_sent = true;
             }
             let mut packet = [0u8; 64];
-            match self.supervisor.recv(&mut packet) {
-                Ok(length) if &packet[..length] == b"REOBSERVE" && requests < 32 => {
+            let incoming = if transport_readable {
+                Some(self.supervisor.recv(&mut packet))
+            } else {
+                None
+            };
+            match incoming {
+                Some(Ok(length)) if &packet[..length] == b"REOBSERVE" && requests < 32 => {
                     requests += 1;
                     if self.finish(Instant::now()).is_ok() {
+                        Self::report_recovery_control_failure(
+                            recovery_failures,
+                            &first_recovery_failure,
+                        );
                         self.send_release_proof();
                         return Ok(());
                     }
@@ -1584,24 +1637,39 @@ impl SystemCaptureWorker {
                         && !released
                     {
                         if let Some(key) = self.recovery_key.as_ref() {
-                            pending_observe = key.begin_reobserve(cleanup_until).ok();
+                            match key.begin_reobserve(cleanup_until) {
+                                Ok(pending) => pending_observe = Some(pending),
+                                Err(error) => {
+                                    recovery_failures = recovery_failures.saturating_add(1);
+                                    first_recovery_failure
+                                        .get_or_insert_with(|| format!("begin_reobserve: {error}"));
+                                }
+                            }
+                        } else {
+                            recovery_failures = recovery_failures.saturating_add(1);
+                            first_recovery_failure.get_or_insert_with(|| {
+                                "original recovery key unavailable".to_owned()
+                            });
                         }
                     }
                     self.send_supervisor(b"PENDING");
                 }
-                Ok(_) => {
+                Some(Ok(_)) => {
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "RZ_CUSTODY_TRANSPORT_ERROR=invalid_packet_or_request_limit"
                     );
+                    transport_readable = false;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => {
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Some(Err(error)) => {
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "RZ_CUSTODY_TRANSPORT_ERROR={error}"
                     );
+                    transport_readable = false;
                 }
+                None => {}
             }
             if let Some(observation) = pending_observe.as_mut() {
                 match observation.poll() {
@@ -1609,8 +1677,26 @@ impl SystemCaptureWorker {
                         pending_observe = None;
                         if let Some(key) = self.recovery_key.as_ref() {
                             if let Some(proof) = key.latest_confirmation() {
-                                pending_release = key.begin_release(&proof, cleanup_until).ok();
+                                match key.begin_release(&proof, cleanup_until) {
+                                    Ok(pending) => pending_release = Some(pending),
+                                    Err(error) => {
+                                        recovery_failures = recovery_failures.saturating_add(1);
+                                        first_recovery_failure.get_or_insert_with(|| {
+                                            format!("begin_release: {error}")
+                                        });
+                                    }
+                                }
+                            } else {
+                                recovery_failures = recovery_failures.saturating_add(1);
+                                first_recovery_failure.get_or_insert_with(|| {
+                                    "confirmed observation lacks original key proof".to_owned()
+                                });
                             }
+                        } else {
+                            recovery_failures = recovery_failures.saturating_add(1);
+                            first_recovery_failure.get_or_insert_with(|| {
+                                "original recovery key unavailable".to_owned()
+                            });
                         }
                     }
                     Poll::Ready(rz_eval::worker::PhysicalRecoveryObservation::Unknown) => {
@@ -1631,12 +1717,30 @@ impl SystemCaptureWorker {
                     Poll::Pending => {}
                 }
             }
-            if released
-                && self
-                    .recovery_key
-                    .as_ref()
-                    .is_some_and(|key| matches!(key.finish_confirmed(), Poll::Ready(Ok(()))))
-            {
+            let owner_retired = if released && !retire_failed {
+                match self.recovery_key.as_ref().map(|key| key.finish_confirmed()) {
+                    Some(Poll::Ready(Ok(()))) => true,
+                    Some(Poll::Ready(Err(error))) => {
+                        recovery_failures = recovery_failures.saturating_add(1);
+                        first_recovery_failure
+                            .get_or_insert_with(|| format!("finish_confirmed: {error}"));
+                        retire_failed = true;
+                        false
+                    }
+                    Some(Poll::Pending) => false,
+                    None => {
+                        recovery_failures = recovery_failures.saturating_add(1);
+                        first_recovery_failure
+                            .get_or_insert_with(|| "original recovery key unavailable".to_owned());
+                        retire_failed = true;
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if owner_retired {
+                Self::report_recovery_control_failure(recovery_failures, &first_recovery_failure);
                 self.send_supervisor(b"OWNER_RECOVERED");
                 // The capture error remains an error; this proves only this
                 // exact owner's release, not device-wide completion.
@@ -1654,6 +1758,7 @@ impl SystemCaptureWorker {
         if !unknown_sent {
             self.send_supervisor(b"UNKNOWN");
         }
+        Self::report_recovery_control_failure(recovery_failures, &first_recovery_failure);
         self.send_supervisor(b"UNRESOLVED");
         Err(match quarantine_error {
             Some(error) => Box::new(CaptureAndCleanupFailure {
