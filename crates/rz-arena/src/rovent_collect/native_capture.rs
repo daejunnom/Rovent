@@ -1,6 +1,8 @@
 //! 원 native owner의 submitted callback과 manager 수집기를 연결한다.
 //! 큐에는 검증한 입력만 이동하며, 이 채널 자체는 NN 완료·수락 증거가 아니다.
 use super::producer_v2::{SpeculativeTicketAuthorityV2, SubmittedTeacherQueryV2};
+#[cfg(target_os = "linux")]
+use super::producer_v3::{RoventCapturedInputV3, RoventInputCaptureReservationV3};
 use super::*;
 use rz_search::pals::coordinator::RoleFailure;
 use rz_uci::pals_native::ticketed::{
@@ -200,11 +202,41 @@ enum RegisteredInputCapture {
         ticket: RoleTicketEnvelope,
         admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV2,
     },
+    #[cfg(target_os = "linux")]
+    LockV3 {
+        ticket: RoleTicketEnvelope,
+        reservation: RoventInputCaptureReservationV3,
+        admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    },
 }
 pub(super) enum LockV2RegistrationAttempt {
     Ready,
     Busy(RoventInputCaptureReservationV2),
     Failed(ArenaError, RoventInputCaptureReservationV2),
+}
+#[cfg(target_os = "linux")]
+pub(super) enum LockV3RegistrationAttempt {
+    Ready,
+    Busy(RoventInputCaptureReservationV3),
+    Failed(ArenaError, RoventInputCaptureReservationV3),
+}
+/// The /3 native callback transfers this exact capture with its original
+/// admission. It is input evidence only, not physical completion or a row.
+#[cfg(target_os = "linux")]
+pub(super) struct RoventCapturedLockInputV3 {
+    captured: RoventCapturedInputV3,
+    admission: rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+}
+#[cfg(target_os = "linux")]
+impl RoventCapturedLockInputV3 {
+    pub(super) fn into_original(
+        self,
+    ) -> (
+        RoventCapturedInputV3,
+        rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) {
+        (self.captured, self.admission)
+    }
 }
 /// Created only after the original service context and root admission match.
 /// This is still input capture, not proof of execution or acceptance.
@@ -248,12 +280,16 @@ enum DisabledCaptureRoot {
         first_ticket: RoleTicketEnvelope,
     },
     WholeRoot(rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV2),
+    #[cfg(target_os = "linux")]
+    WholeRootV3(rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV3),
 }
 impl DisabledCaptureRoot {
     fn authority(&self) -> rz_contracts::pals::SearchAuthority {
         match self {
             Self::AfterTicket { admission, .. } => admission.root_admission().authority(),
             Self::WholeRoot(capability) => capability.authority(),
+            #[cfg(target_os = "linux")]
+            Self::WholeRootV3(capability) => capability.authority(),
         }
     }
 }
@@ -269,11 +305,21 @@ pub(super) enum RoventFailedCapturedInput {
     Legacy(RoventCapturedInput),
     SubmittedV1(RoventCapturedInputV2),
     LockV2(RoventCapturedLockInputV2),
+    #[cfg(target_os = "linux")]
+    LockV3(RoventCapturedLockInputV3),
+    #[cfg(target_os = "linux")]
+    LockV3Reservation(RoventInputCaptureReservationV3),
 }
 #[derive(Default)]
 struct CaptureFailureState {
     failure: Option<RoventNativeCaptureFailure>,
     input: Option<RoventFailedCapturedInput>,
+    #[cfg(target_os = "linux")]
+    v3_failures: Vec<(
+        rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+        RoventNativeCaptureFailure,
+        Option<RoventFailedCapturedInput>,
+    )>,
 }
 type CaptureFailure = Arc<Mutex<CaptureFailureState>>;
 #[derive(Clone)]
@@ -291,11 +337,15 @@ pub struct RoventNativeInputObserver {
     sender: mpsc::SyncSender<RoventCapturedInput>,
     submitted_sender: mpsc::SyncSender<RoventCapturedInputV2>,
     lock_v2_sender: mpsc::SyncSender<RoventCapturedLockInputV2>,
+    #[cfg(target_os = "linux")]
+    lock_v3_sender: mpsc::SyncSender<RoventCapturedLockInputV3>,
 }
 pub struct RoventCapturedInputReceiver {
     receiver: mpsc::Receiver<RoventCapturedInput>,
     submitted_receiver: mpsc::Receiver<RoventCapturedInputV2>,
     lock_v2_receiver: mpsc::Receiver<RoventCapturedLockInputV2>,
+    #[cfg(target_os = "linux")]
+    lock_v3_receiver: mpsc::Receiver<RoventCapturedLockInputV3>,
     disconnected: Cell<bool>,
     failure: CaptureFailure,
 }
@@ -311,6 +361,8 @@ pub fn rovent_native_capture_channel() -> (
     let (sender, receiver) = mpsc::sync_channel(16);
     let (submitted_sender, submitted_receiver) = mpsc::sync_channel(16);
     let (lock_v2_sender, lock_v2_receiver) = mpsc::sync_channel(16);
+    #[cfg(target_os = "linux")]
+    let (lock_v3_sender, lock_v3_receiver) = mpsc::sync_channel(16);
     (
         RoventNativeCaptureRegistration {
             registered: Arc::clone(&registered),
@@ -326,11 +378,15 @@ pub fn rovent_native_capture_channel() -> (
             sender,
             submitted_sender,
             lock_v2_sender,
+            #[cfg(target_os = "linux")]
+            lock_v3_sender,
         },
         RoventCapturedInputReceiver {
             receiver,
             submitted_receiver,
             lock_v2_receiver,
+            #[cfg(target_os = "linux")]
+            lock_v3_receiver,
             disconnected: Cell::new(false),
             failure,
         },
@@ -663,6 +719,63 @@ impl RoventNativeCaptureRegistration {
         marker.push(DisabledCaptureRoot::WholeRoot(capability.clone()));
         Ok(true)
     }
+    /// Install the original /3 capability separately from all /2 markers.
+    /// Neither installation nor a late discard proves physical completion.
+    #[cfg(target_os = "linux")]
+    pub(super) fn try_install_whole_root_no_capture_v3(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV3,
+    ) -> Result<bool, ArenaError> {
+        let mut marker = match self.disabled_root.try_lock() {
+            Ok(marker) => marker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 disabled root poisoned"));
+            }
+        };
+        if marker.iter().any(|entry| matches!(entry,
+            DisabledCaptureRoot::WholeRootV3(original) if original.same_original_capability(capability))) {
+            return Ok(true);
+        }
+        check(
+            marker.len() < MAX_RETAINED_DISABLED_ROOTS
+                && !marker
+                    .iter()
+                    .any(|entry| entry.authority() == capability.authority()),
+            "lock-v3 root authority marker duplicate or retained marker capacity",
+        )?;
+        marker.push(DisabledCaptureRoot::WholeRootV3(capability.clone()));
+        Ok(true)
+    }
+
+    /// Retire only the original root marker after its original worker issued
+    /// a sealed physical shutdown witness; ordinary receipts are insufficient.
+    #[cfg(target_os = "linux")]
+    pub(super) fn try_finish_whole_root_no_capture_v3_role_only(
+        &self,
+        capability: &rz_uci::pals_adaptive::RoventNoCaptureRootCapabilityV3,
+        fence: &rz_uci::pals_adaptive::RoventRoleOnlyNoCaptureFenceV3,
+    ) -> Result<bool, ArenaError> {
+        let mut marker = match self.disabled_root.try_lock() {
+            Ok(marker) => marker,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("lock-v3 disabled root poisoned"));
+            }
+        };
+        let index = marker
+            .iter()
+            .position(|entry| {
+                matches!(entry,
+            DisabledCaptureRoot::WholeRootV3(original)
+                if original.same_original_capability(capability)
+                    && original.matches_role_only_fence(fence))
+            })
+            .ok_or_else(|| invalid("lock-v3 original root or worker fence mismatch"))?;
+        marker.remove(index);
+        Ok(true)
+    }
+
     /// The hook calls this only with the original root-run shutdown receipt.
     /// This releases no native owner and does not claim collection success.
     pub(super) fn try_finish_whole_root_no_capture(
@@ -855,6 +968,82 @@ impl RoventNativeCaptureRegistration {
         );
         LockV2RegistrationAttempt::Ready
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn try_register_lock_v3(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        reservation: RoventInputCaptureReservationV3,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> LockV3RegistrationAttempt {
+        if reservation.ticket() != ticket
+            || !reservation.admission().same_original_admission(admission)
+        {
+            return LockV3RegistrationAttempt::Failed(
+                invalid("lock-v3 reservation identity mismatch"),
+                reservation,
+            );
+        }
+        if let Err(error) = admission.try_validate_ticket(ticket) {
+            return if error.kind == rz_uci::pals_adaptive::RoventTicketValidationKindV2::Busy {
+                LockV3RegistrationAttempt::Busy(reservation)
+            } else {
+                LockV3RegistrationAttempt::Failed(invalid(error.error.to_string()), reservation)
+            };
+        }
+        let mut registered = match self.registered.try_lock() {
+            Ok(registered) => registered,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return LockV3RegistrationAttempt::Busy(reservation);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return LockV3RegistrationAttempt::Failed(
+                    invalid("Rovent capture registration poisoned"),
+                    reservation,
+                );
+            }
+        };
+        if let Err(error) = check(
+            registered.len() < 16 && !registered.contains_key(&ticket.id),
+            "capture input registration duplicate/cap",
+        ) {
+            return LockV3RegistrationAttempt::Failed(error, reservation);
+        }
+        registered.insert(
+            ticket.id,
+            RegisteredInputCapture::LockV3 {
+                ticket: *ticket,
+                reservation,
+                admission: admission.clone(),
+            },
+        );
+        LockV3RegistrationAttempt::Ready
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn cancel_unstarted_lock_v3(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<RoventInputCaptureReservationV3>, ArenaError> {
+        let mut registered = self
+            .registered
+            .lock()
+            .map_err(|_| invalid("Rovent capture registration poisoned"))?;
+        match registered.get(&ticket.id) {
+            None => return Ok(None),
+            Some(RegisteredInputCapture::LockV3 {
+                ticket: original,
+                admission: owner,
+                ..
+            }) if original == ticket && owner.same_original_admission(admission) => {}
+            Some(_) => return Err(invalid("lock-v3 cancellation identity mismatch")),
+        }
+        match registered.remove(&ticket.id) {
+            Some(RegisteredInputCapture::LockV3 { reservation, .. }) => Ok(Some(reservation)),
+            _ => unreachable!("checked original lock-v3 registration"),
+        }
+    }
+
     /// 아직 native owner가 읽지 않은 예약만 반환한다. 반환 sequence는
     /// producer.discard_reserved_input에 전달하고 물리 취소는 원 owner가 한다.
     pub fn cancel_unstarted(
@@ -865,6 +1054,14 @@ impl RoventNativeCaptureRegistration {
             .registered
             .lock()
             .map_err(|_| invalid("Rovent capture registration poisoned"))?;
+        #[cfg(target_os = "linux")]
+        check(
+            !matches!(
+                registered.get(&id),
+                Some(RegisteredInputCapture::LockV3 { .. })
+            ),
+            "legacy cancel refuses lock-v3 reservation",
+        )?;
         check(
             !matches!(
                 registered.get(&id),
@@ -882,29 +1079,58 @@ impl RoventNativeCaptureRegistration {
         }))
     }
     pub(super) fn cancel_sequence(&self, id: RequestId) -> Result<Option<u64>, ArenaError> {
-        Ok(self
+        let mut registered = self
             .registered
             .lock()
-            .map_err(|_| invalid("Rovent capture registration poisoned"))?
-            .remove(&id)
-            .and_then(|value| match value {
-                RegisteredInputCapture::Legacy(value) => Some(value.sequence()),
-                RegisteredInputCapture::SubmittedV1(value) => Some(value.sequence()),
-                RegisteredInputCapture::LockV2 {
-                    reservation,
-                    speculative,
-                    ..
-                } => {
-                    if let Some((_, ticket)) = speculative {
-                        ticket.state.store(6, Ordering::Release);
-                    }
-                    Some(reservation.sequence())
+            .map_err(|_| invalid("Rovent capture registration poisoned"))?;
+        #[cfg(target_os = "linux")]
+        check(
+            !matches!(
+                registered.get(&id),
+                Some(RegisteredInputCapture::LockV3 { .. })
+            ),
+            "lock-v3 cancellation requires original admission",
+        )?;
+        Ok(registered.remove(&id).and_then(|value| match value {
+            RegisteredInputCapture::Legacy(value) => Some(value.sequence()),
+            RegisteredInputCapture::SubmittedV1(value) => Some(value.sequence()),
+            RegisteredInputCapture::LockV2 {
+                reservation,
+                speculative,
+                ..
+            } => {
+                if let Some((_, ticket)) = speculative {
+                    ticket.state.store(6, Ordering::Release);
                 }
-                RegisteredInputCapture::LockV2DisabledPrior { .. } => None,
-            }))
+                Some(reservation.sequence())
+            }
+            RegisteredInputCapture::LockV2DisabledPrior { .. } => None,
+            #[cfg(target_os = "linux")]
+            RegisteredInputCapture::LockV3 { .. } => unreachable!("checked lock-v3 cancellation"),
+        }))
     }
 }
 impl RoventCapturedInputReceiver {
+    #[cfg(target_os = "linux")]
+    pub(super) fn try_take_lock_v3(
+        &self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<RoventCapturedLockInputV3>, ArenaError> {
+        if let Some(failure) = self.capture_failure_v3(admission)? {
+            return Err(invalid(format!(
+                "native lock-v3 input capture {:?} failed for {:?}: {:?}",
+                failure.stage, failure.ticket.id, failure.cause
+            )));
+        }
+        match self.lock_v3_receiver.try_recv() {
+            Ok(input) => Ok(Some(input)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.disconnected.set(true);
+                Ok(None)
+            }
+        }
+    }
     /// The first capture error remains available even after the native owner
     /// continues. It is a collection failure, never NN failure evidence.
     pub fn capture_failure(&self) -> Result<Option<RoventNativeCaptureFailure>, ArenaError> {
@@ -920,12 +1146,55 @@ impl RoventCapturedInputReceiver {
     pub(super) fn take_failed_input_for_cleanup(
         &self,
     ) -> Result<Option<RoventFailedCapturedInput>, ArenaError> {
-        Ok(self
+        let mut state = self
             .failure
             .lock()
-            .map_err(|_| invalid("capture failure state poisoned"))?
-            .input
-            .take())
+            .map_err(|_| invalid("capture failure state poisoned"))?;
+        #[cfg(target_os = "linux")]
+        if matches!(
+            state.input,
+            Some(
+                RoventFailedCapturedInput::LockV3(_)
+                    | RoventFailedCapturedInput::LockV3Reservation(_)
+            )
+        ) {
+            return Err(invalid(
+                "lock-v3 failed input requires original admission cleanup",
+            ));
+        }
+        Ok(state.input.take())
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn take_failed_input_for_cleanup_v3(
+        &self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<RoventFailedCapturedInput>, ArenaError> {
+        let mut state = self
+            .failure
+            .lock()
+            .map_err(|_| invalid("capture failure state poisoned"))?;
+        Ok(state.v3_failures.iter_mut().find_map(|(owner, _, input)| {
+            if owner.same_original_admission(admission) {
+                input.take()
+            } else {
+                None
+            }
+        }))
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn capture_failure_v3(
+        &self,
+        admission: &rz_uci::pals_adaptive::RoventCollectionRootAdmissionV3,
+    ) -> Result<Option<RoventNativeCaptureFailure>, ArenaError> {
+        let state = self
+            .failure
+            .lock()
+            .map_err(|_| invalid("capture failure state poisoned"))?;
+        Ok(state.v3_failures.iter().find_map(|(owner, failure, _)| {
+            owner
+                .same_original_admission(admission)
+                .then(|| failure.clone())
+        }))
     }
     /// Transfer queued original captures to the cleanup owner after its actual
     /// native fence. This path never validates or publishes these inputs.
@@ -1070,6 +1339,10 @@ impl RoventNativeInputObserver {
                         DisabledCaptureRoot::WholeRoot(capability) => {
                             capability.validate_native_discard_owner(context).is_ok()
                         }
+                        #[cfg(target_os = "linux")]
+                        DisabledCaptureRoot::WholeRootV3(capability) => {
+                            capability.validate_native_discard_owner(context).is_ok()
+                        }
                     };
                     matching += usize::from(matches);
                 }
@@ -1109,6 +1382,22 @@ impl RoventNativeInputObserver {
                     .validate_native_discard_owner(context)
                     .map_err(|error| RoleFailure::Backend(error.to_string()))?;
             }
+            #[cfg(target_os = "linux")]
+            if let RegisteredInputCapture::LockV3 {
+                ticket: original,
+                admission,
+                ..
+            } = candidate
+            {
+                if original != ticket {
+                    return Err(VirtualReviewCaptureFailure::Required(RoleFailure::Backend(
+                        "lock-v3 capture ticket differs from original registration".into(),
+                    )));
+                }
+                admission
+                    .validate_native_dispatch_owner(context)
+                    .map_err(|error| RoleFailure::Backend(error.to_string()))?;
+            }
             // A retained failed input prevents only another actual capture,
             // which could otherwise overwrite it. A verified no-capture
             // marker is independently safe and must still be consumed.
@@ -1125,6 +1414,41 @@ impl RoventNativeInputObserver {
             registered.remove(&ticket.id).expect("checked registration")
         };
         match reservation {
+            #[cfg(target_os = "linux")]
+            RegisteredInputCapture::LockV3 {
+                reservation,
+                admission,
+                ..
+            } => {
+                let captured = match reservation.capture(
+                    *ticket,
+                    &preparation.view,
+                    &prepared.input,
+                    &prepared.identity,
+                ) {
+                    Ok(captured) => captured,
+                    Err(failure) => {
+                        let (error, reservation) = *failure;
+                        self.failed_input =
+                            Some(RoventFailedCapturedInput::LockV3Reservation(reservation));
+                        return Err(VirtualReviewCaptureFailure::Observation(
+                            RoleFailure::Backend(error.to_string()),
+                        ));
+                    }
+                };
+                let input = RoventCapturedLockInputV3 {
+                    captured,
+                    admission,
+                };
+                match self.lock_v3_sender.try_send(input) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let (cause, input) = send_error(error);
+                        self.failed_input = Some(RoventFailedCapturedInput::LockV3(input));
+                        Err(VirtualReviewCaptureFailure::Observation(cause))
+                    }
+                }
+            }
             RegisteredInputCapture::LockV2DisabledPrior { .. } => Ok(()),
             RegisteredInputCapture::Legacy(reservation) => {
                 let captured = reservation
@@ -1267,6 +1591,31 @@ impl VirtualReviewCollectionObserver for RoventNativeInputObserver {
         let Ok(mut state) = self.failure.try_lock() else {
             return false;
         };
+        #[cfg(target_os = "linux")]
+        {
+            let owner = match self.failed_input.as_ref() {
+                Some(RoventFailedCapturedInput::LockV3(input)) => Some(input.admission.clone()),
+                Some(RoventFailedCapturedInput::LockV3Reservation(reservation)) => {
+                    Some(reservation.admission().clone())
+                }
+                _ => None,
+            };
+            if let Some(owner) = owner {
+                if state.v3_failures.len() >= 256 {
+                    return false;
+                }
+                state.v3_failures.push((
+                    owner,
+                    RoventNativeCaptureFailure {
+                        stage,
+                        ticket: *ticket,
+                        cause: failure.clone(),
+                    },
+                    self.failed_input.take(),
+                ));
+                return true;
+            }
+        }
         if state.failure.is_some() || state.input.is_some() || self.failed_input.is_none() {
             return false;
         }
