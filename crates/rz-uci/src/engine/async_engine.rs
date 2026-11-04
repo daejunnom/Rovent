@@ -399,6 +399,7 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineStartSlot<
             cleanup_failure: None,
             timer_panic: None,
             output_recovery: None,
+            output_snapshot_at_recovery: None,
             _priority_close_owner: close_owner,
             close: self.close.clone(),
             last_exit: None,
@@ -669,6 +670,7 @@ pub struct AsyncEngineRun<O: Write + Send + 'static, D: Write + Send + 'static> 
     cleanup_failure: Option<EngineError>,
     timer_panic: Option<Box<dyn std::any::Any + Send>>,
     output_recovery: Option<Result<OutputRecovery<O, D>, Box<dyn std::any::Any + Send>>>,
+    output_snapshot_at_recovery: Option<OutputSnapshot>,
     _priority_close_owner: priority_close::PriorityCloseOwner,
     close: PriorityCloseHandle,
     last_exit: Option<AsyncServeExit<EngineError>>,
@@ -825,6 +827,7 @@ pub fn start_async<O: Write + Send + 'static, D: Write + Send + 'static>(
         cleanup_failure: None,
         timer_panic: None,
         output_recovery: None,
+        output_snapshot_at_recovery: None,
         _priority_close_owner: close_owner,
         close,
         last_exit: None,
@@ -979,14 +982,20 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
                 EngineWriterRecoveryStatus::WorkerPanicked
             };
         }
+        // Sample the same original owner just before attempting its join.
+        // A false worker_finished sample may race with successful join; it is
+        // retained as observed and is not rewritten into later evidence.
+        let snapshot = self.driver.output().map(AsyncOutputOwner::observation);
         match self.driver.try_finish_output() {
             OutputRecoveryPoll::DriverNotSealed => EngineWriterRecoveryStatus::DriverNotSealed,
             OutputRecoveryPoll::Pending => EngineWriterRecoveryStatus::Pending,
             OutputRecoveryPoll::Recovered(original) => {
+                self.output_snapshot_at_recovery = snapshot;
                 self.output_recovery = Some(Ok(original));
                 EngineWriterRecoveryStatus::Recovered
             }
             OutputRecoveryPoll::WorkerPanicked(payload) => {
+                self.output_snapshot_at_recovery = snapshot;
                 self.output_recovery = Some(Err(payload));
                 EngineWriterRecoveryStatus::WorkerPanicked
             }
@@ -994,6 +1003,9 @@ impl<O: Write + Send + 'static, D: Write + Send + 'static> AsyncEngineRun<O, D> 
                 EngineWriterRecoveryStatus::OriginalRecoveryMissing
             }
         }
+    }
+    pub fn output_snapshot_at_recovery(&self) -> Option<OutputSnapshot> {
+        self.output_snapshot_at_recovery
     }
     pub fn output_recovery(
         &self,
