@@ -221,6 +221,10 @@ fn smoke_sources() -> &'static [(&'static str, &'static [u8])] {
         ),
         ("arena_process", include_bytes!("../../process.rs")),
         (
+            "arena_process_reobserve",
+            include_bytes!("../../process/smoke_reobserve.rs"),
+        ),
+        (
             "smoke_grant_wire",
             include_bytes!("../../../../rz-contracts/src/pals/proxy_entry_smoke_grant_v1.rs"),
         ),
