@@ -4,6 +4,14 @@ use crate::pals_adaptive_startup::{PalsSystemStartupOptionsV6, PinnedPalsSystemS
 
 #[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
 mod cpu_prepare;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod driver_assemble;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod driver_facade;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod driver_lifecycle;
+#[cfg(all(target_os = "linux", feature = "onnx-cuda"))]
+mod driver_prepare;
 
 /// The receipt directory is derived from the exact held startup root, never
 /// from a caller-provided pathname or a different supervisor's writer.
