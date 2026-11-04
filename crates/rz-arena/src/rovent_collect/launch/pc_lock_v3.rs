@@ -293,6 +293,7 @@ pub(crate) struct PcCollectionOwnersV3 {
     cleanup_ceiling: Instant,
     launch_claimed: std::sync::atomic::AtomicBool,
     caller_boundary: std::sync::OnceLock<ValidatedCallerBoundaryV3>,
+    archive_cancellation: std::sync::atomic::AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -344,6 +345,7 @@ impl PcCollectionOwnersV3 {
             cleanup_ceiling,
             launch_claimed: std::sync::atomic::AtomicBool::new(false),
             caller_boundary: std::sync::OnceLock::new(),
+            archive_cancellation: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -686,6 +688,34 @@ impl PcCollectionRunV3 {
     /// does not assert cgroup, output, GPU, or whole-run completion.
     pub(crate) fn before_native_recovered(&self) -> bool {
         self.before_native_recovered
+    }
+
+    /// Cancel only this original run's archival work, not startup or game.
+    /// An already attempted output remains owned and may be unknown.
+    pub(crate) fn cancel_archive(&self) {
+        self.owners
+            .archive_cancellation
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The plan's publication window starts once at output finalization and
+    /// is capped by the original cleanup deadline; callers must retain it.
+    pub(crate) fn publication_deadline(&self, started: Instant) -> Option<Instant> {
+        started
+            .checked_add(std::time::Duration::from_millis(
+                self.owners.inputs.plan().publication_timeout_ms,
+            ))
+            .map(|until| until.min(self.owners.cleanup_ceiling))
+    }
+
+    /// Continue the original game's output closure only after same-owner
+    /// settlement. This can perform synchronous I/O on the calling thread.
+    pub(crate) fn try_output_closure(
+        &self,
+        until: Instant,
+    ) -> Result<super::pc_recovery_v3::PcOutputClosureV3, PcDriverEvidenceErrorV3> {
+        self.recovery
+            .poll_output_closure(until, &self.owners.archive_cancellation)
     }
 
     /// Observe this run's game join independently of physical settlement.

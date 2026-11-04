@@ -10,6 +10,7 @@ use super::pc_managed_prepare_v3::{
     LongGamePreflightErrorV3, ManagedPcPrepareErrorV3, ManagedPcStartErrorV3,
     PreparedLongGamePreflightV3, prepare_long_game_preflight_v3, prepare_managed_pc_v3,
 };
+use super::pc_recovery_v3::PcOutputClosureV3;
 use crate::rovent_collect::pc_worker_v3::{
     PcDriverEvidenceErrorV3, PcDriverPollV3, PcSupervisorNoWorkerProofV3, SupervisorStartCustodyV3,
 };
@@ -98,6 +99,9 @@ enum EntryState {
         original: Box<PcCollectionRunV3>,
         cleanup_until: Instant,
         settled: bool,
+        output_terminal: Option<PcOutputClosureV3>,
+        output_until: Option<Instant>,
+        output_deadline_reached: bool,
         deadline_reached: bool,
         failure: Option<&'static str>,
         panic: Option<Box<dyn Any + Send>>,
@@ -156,6 +160,9 @@ pub fn try_run_managed_pc_entry_v3(
             original: Box::new(run),
             cleanup_until,
             settled: false,
+            output_terminal: None,
+            output_until: None,
+            output_deadline_reached: false,
             deadline_reached: false,
             failure: None,
             panic: None,
@@ -177,6 +184,26 @@ pub fn try_run_managed_pc_entry_v3(
 }
 
 impl ManagedPcEntryResultV3 {
+    /// Cancel only this entry's archive operation. The original game abort,
+    /// startup control, and already attempted output remain independent.
+    /// External CLI cancellation is not connected by this method alone.
+    pub fn cancel_publication(&self) -> bool {
+        match &self.original {
+            EntryState::Run { original, .. } => {
+                original.cancel_archive();
+                true
+            }
+            EntryState::Start {
+                recovered: Some(original),
+                ..
+            } => {
+                original.cancel_archive();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A single bounded poll. The caller owns pacing and may not extend the
     /// original cleanup ceiling; `poll_until` is clamped to that ceiling.
     pub fn try_progress(&mut self, poll_until: Instant) -> ManagedPcEntryProgressV3 {
@@ -370,6 +397,9 @@ impl ManagedPcEntryResultV3 {
             original,
             cleanup_until,
             settled,
+            output_terminal,
+            output_until,
+            output_deadline_reached,
             deadline_reached,
             failure,
             panic,
@@ -377,8 +407,14 @@ impl ManagedPcEntryResultV3 {
         else {
             return ManagedPcEntryProgressV3::Failed;
         };
-        if *settled {
-            return ManagedPcEntryProgressV3::Settled;
+        if let Some(terminal) = *output_terminal {
+            return match terminal {
+                PcOutputClosureV3::Published | PcOutputClosureV3::NoData => {
+                    ManagedPcEntryProgressV3::Settled
+                }
+                PcOutputClosureV3::Timeout => ManagedPcEntryProgressV3::DeadlineReached,
+                _ => ManagedPcEntryProgressV3::Failed,
+            };
         }
         if failure.is_some() || panic.is_some() {
             return ManagedPcEntryProgressV3::Failed;
@@ -391,15 +427,69 @@ impl ManagedPcEntryResultV3 {
         if Instant::now() >= until {
             return ManagedPcEntryProgressV3::Pending;
         }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original.try_settle(until)))
-        {
-            Ok(Ok(true)) => {
-                *settled = true;
-                ManagedPcEntryProgressV3::Settled
+        if !*settled {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                original.try_settle(until)
+            })) {
+                Ok(Ok(true)) => *settled = true,
+                Ok(Ok(false)) if original.before_native_recovered() => {
+                    return ManagedPcEntryProgressV3::Failed;
+                }
+                Ok(Ok(false)) => return ManagedPcEntryProgressV3::Pending,
+                Ok(Err(error)) => {
+                    *failure = Some(error);
+                    return ManagedPcEntryProgressV3::Failed;
+                }
+                Err(payload) => {
+                    *panic = Some(payload);
+                    return ManagedPcEntryProgressV3::Failed;
+                }
             }
-            Ok(Ok(false)) if original.before_native_recovered() => ManagedPcEntryProgressV3::Failed,
-            Ok(Ok(false)) => ManagedPcEntryProgressV3::Pending,
-            Ok(Err(error)) => {
+        }
+        let publication_until = match *output_until {
+            Some(until) => until,
+            None => match original.publication_deadline(Instant::now()) {
+                Some(until) => {
+                    *output_until = Some(until);
+                    until
+                }
+                None => {
+                    *failure = Some("original publication deadline overflow");
+                    return ManagedPcEntryProgressV3::Failed;
+                }
+            },
+        };
+        let publication_expired = Instant::now() >= publication_until;
+        if publication_expired {
+            *output_deadline_reached = true;
+        }
+        let until = until.min(publication_until);
+        // This runs on the original entry thread. A sync syscall already in
+        // progress cannot be preempted by the publication deadline. After that
+        // deadline, only the original timeout/close path can run.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if publication_expired {
+                original.recovery_key().poll_output_timeout()
+            } else {
+                original.try_output_closure(until)
+            }
+        })) {
+            Ok(Ok(PcOutputClosureV3::Pending | PcOutputClosureV3::Progress)) => {
+                ManagedPcEntryProgressV3::Pending
+            }
+            Ok(Ok(terminal)) => {
+                *output_terminal = Some(terminal);
+                match terminal {
+                    PcOutputClosureV3::Published | PcOutputClosureV3::NoData => {
+                        ManagedPcEntryProgressV3::Settled
+                    }
+                    PcOutputClosureV3::Timeout => ManagedPcEntryProgressV3::DeadlineReached,
+                    _ => ManagedPcEntryProgressV3::Failed,
+                }
+            }
+            Ok(Err(
+                PcDriverEvidenceErrorV3::Poisoned(error) | PcDriverEvidenceErrorV3::Invalid(error),
+            )) => {
                 *failure = Some(error);
                 ManagedPcEntryProgressV3::Failed
             }
@@ -535,12 +625,18 @@ impl ManagedPcEntryResultV3 {
                 EntryState::Run {
                     original,
                     settled,
+                    output_terminal,
                     deadline_reached,
                     failure,
                     panic,
                     ..
                 } => {
-                    let native = if *settled {
+                    let native = if matches!(
+                        output_terminal,
+                        Some(PcOutputClosureV3::Published | PcOutputClosureV3::NoData)
+                    ) {
+                        "returned_ok"
+                    } else if *settled {
                         match original
                             .recovery_key()
                             .with_settled(|value| value.native.is_ok())
@@ -572,6 +668,36 @@ impl ManagedPcEntryResultV3 {
                     (stage, settlement, native, first_error, *deadline_reached)
                 }
             };
+        let publication_deadline_elapsed = matches!(
+            &self.original,
+            EntryState::Run {
+                output_deadline_reached: true,
+                ..
+            }
+        );
+        let output_publication = match &self.original {
+            EntryState::Run {
+                output_terminal: Some(PcOutputClosureV3::Published),
+                ..
+            } => "published",
+            EntryState::Run {
+                output_terminal: Some(PcOutputClosureV3::NoData),
+                ..
+            } => "no_data",
+            EntryState::Run {
+                output_terminal: Some(PcOutputClosureV3::Aborted),
+                ..
+            } => "aborted",
+            EntryState::Run {
+                output_terminal: Some(PcOutputClosureV3::Timeout),
+                ..
+            } => "timeout",
+            EntryState::Run {
+                output_terminal: Some(PcOutputClosureV3::Failed),
+                ..
+            } => "failed",
+            _ => "unknown",
+        };
         serde_json::json!({
             "schema":"rz-rovent-managed-pc-entry-observation/1",
             "stage":stage,
@@ -585,19 +711,28 @@ impl ManagedPcEntryResultV3 {
             "no_worker_output_close":no_worker_close,
             "teacher_completion":"unknown",
             "gpu_physical_completion":"unknown",
-            "output_publication":"unknown",
+            "output_publication":output_publication,
+            "publication_deadline_elapsed":publication_deadline_elapsed,
+            "parent_output_lease":"unknown",
+            "external_publication_cancel":"not_connected_by_cli",
             "original_owner_scope":"process_lifetime_only",
             "training_executed":false
         })
     }
 
-    /// Publication and independent physical evidence are not yet available
-    /// through this entry, so even settled custody is not a success result.
+    /// Entry-local success is separate from parent lease, GPU, and game-strength
+    /// acceptance. NoData is reported distinctly from a published corpus.
     pub fn exit_code(&self) -> u8 {
-        if matches!(&self.original, EntryState::LongGamePreflight(Ok(_))) {
-            0
-        } else {
-            1
+        match &self.original {
+            EntryState::LongGamePreflight(Ok(_)) => 0,
+            // The same-owner output closure only emits these statuses after
+            // checking the retained native outcome is Ok and output is closed.
+            EntryState::Run {
+                settled: true,
+                output_terminal: Some(PcOutputClosureV3::Published | PcOutputClosureV3::NoData),
+                ..
+            } => 0,
+            _ => 1,
         }
     }
 }
