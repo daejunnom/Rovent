@@ -162,6 +162,36 @@ pub struct PreparedPcCollectionInputsV3 {
     purpose: CollectionInputsPurposeV3,
 }
 
+/// An original managed output directory and its `chunks` child, retained with
+/// the same pinned plan owner. There is deliberately no constructor here:
+/// the managed supervisor must first supply a verified original handoff.
+/// A pathname, a duplicate hash or an input-snapshot directory is not one.
+#[allow(dead_code)]
+pub(crate) struct ManagedOutputOwnerV3 {
+    inputs: Arc<PreparedPcCollectionInputsV3>,
+    directory: Dir,
+    chunks: Dir,
+}
+
+#[allow(dead_code)]
+impl ManagedOutputOwnerV3 {
+    pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> {
+        &self.inputs
+    }
+
+    pub(crate) fn matches_inputs(&self, inputs: &Arc<PreparedPcCollectionInputsV3>) -> bool {
+        Arc::ptr_eq(&self.inputs, inputs)
+    }
+
+    pub(crate) fn directory(&self) -> &Dir {
+        &self.directory
+    }
+
+    pub(crate) fn chunks(&self) -> &Dir {
+        &self.chunks
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CollectionInputsPurposeV3 {
     Pc,
