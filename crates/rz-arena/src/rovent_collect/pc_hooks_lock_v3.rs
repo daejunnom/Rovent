@@ -308,8 +308,27 @@ impl PcRootQuotaLedgerV3 {
 type PcHandoffV3 = Arc<Mutex<RoventPcCollectionHandoffV3>>;
 type PcObserverV3 = AdaptiveCollectionObserverBoxV3<PcPortQuestion, VirtualReviewTicketOutput>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PcRootDispatchV3 {
+    BeforeDispatch,
+    DispatchingUnknown,
+    Enqueued,
+}
+
+/// Original game abort receipt combined with this slot's pre-dispatch and
+/// no-reservation state. Neither worker nor device completion is implied.
+struct GuardAbortedNoDispatchV3 {
+    abort: super::game_authority_v3::GameRootAbortReceiptV3<PcWorkerSupervisorV3>,
+}
+
 struct PcRootSlotV3 {
     admission: RoventCollectionRootAdmissionV3,
+    game_reservation: Option<super::game_authority_v3::GameRootReservationV3<PcWorkerSupervisorV3>>,
+    game_abort: Option<super::game_authority_v3::GameRootAbortReceiptV3<PcWorkerSupervisorV3>>,
+    guard_aborted: Option<GuardAbortedNoDispatchV3>,
+    game_registered: bool,
+    quota_registered: bool,
+    dispatch: PcRootDispatchV3,
     requested: bool,
     installed: bool,
     unstarted_terminal: bool,
@@ -333,6 +352,59 @@ struct PcRootSlotV3 {
 struct PcBridgeStateV3 {
     roots: Vec<PcRootSlotV3>,
     deferred: Vec<Arc<Mutex<RoventPcDeferredCleanupV3>>>,
+}
+
+impl PcRootSlotV3 {
+    /// Called only with this bridge's state and ledger held in that order.
+    /// The receipt is moved only after every no-dispatch check succeeds.
+    fn seal_guard_aborted_no_dispatch(
+        &mut self,
+        game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>,
+        ledger: &PcRootQuotaLedgerV3,
+    ) -> Result<bool, &'static str> {
+        if self.guard_aborted.is_some() {
+            return self.guard_aborted_no_dispatch_valid(game, ledger);
+        }
+        let Some(abort) = self.game_abort.as_ref() else { return Ok(false); };
+        if !abort.matches_game(game) || !abort.matches_original(&self.admission) {
+            return Err("P-C V3 game abort receipt differs");
+        }
+        if !self.no_dispatch_owners_absent(ledger) || !self.game_registered {
+            return Ok(false);
+        }
+        // No external callback or fallible operation between take and retain.
+        if let Some(abort) = self.game_abort.take() {
+            self.guard_aborted = Some(GuardAbortedNoDispatchV3 { abort });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn no_dispatch_owners_absent(&self, ledger: &PcRootQuotaLedgerV3) -> bool {
+        self.dispatch == PcRootDispatchV3::BeforeDispatch
+            && !self.requested && !self.installed && !self.quota_registered
+            && !self.unstarted_terminal && !self.claimed_unstarted_terminal
+            && self.recovery.is_none() && self.owner.is_none() && self.route.is_none()
+            && self.route_retirement.is_none() && self.stage.is_none() && self.pump.is_none()
+            && self.observer.is_none() && self.worker.is_none() && self.handoff.is_none()
+            && self.joined.is_none() && !self.custody_taken && self.returned.is_none()
+            && self.join_failure.is_none() && self.join_panic.is_none()
+            && !ledger.roots.iter().any(|root|
+                root.admission.same_original_admission(&self.admission)
+                    || root.admission.root_admission().authority() == self.admission.root_admission().authority())
+    }
+
+    fn guard_aborted_no_dispatch_valid(
+        &self,
+        game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>,
+        ledger: &PcRootQuotaLedgerV3,
+    ) -> Result<bool, &'static str> {
+        let Some(proof) = &self.guard_aborted else { return Ok(false); };
+        if !proof.abort.matches_game(game) || !proof.abort.matches_original(&self.admission) {
+            return Err("P-C V3 no-dispatch original receipt differs");
+        }
+        Ok(self.game_registered && self.game_abort.is_none() && self.no_dispatch_owners_absent(ledger))
+    }
 }
 
 /// Same-launch native admission fence. It does not prove teacher, output, or
@@ -912,8 +984,12 @@ impl RoventPcCollectionBridgeV3 {
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(_) => return Err("P-C V3 quota ledger poisoned"),
         };
-        if state.roots.len() != ledger.roots.len() { return Ok(None); }
+        if state.roots.iter().filter(|slot| slot.guard_aborted.is_none()).count() != ledger.roots.len() { return Ok(None); }
         for slot in &state.roots {
+            if slot.guard_aborted.is_some() {
+                if !slot.guard_aborted_no_dispatch_valid(&self.game, &ledger)? { return Ok(None); }
+                continue;
+            }
             let Some(recovery) = &slot.recovery else { return Ok(None); };
             if !slot.requested || !original.owns_recovery(recovery) { return Ok(None); }
             let Some(root) = ledger.roots.iter().find(|root|
@@ -1043,21 +1119,29 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
                     PcQuotaOutcomeV3::Busy | PcQuotaOutcomeV3::Exhausted => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
                     _ => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 duplicate root reservation"), admission)),
                 }
-                state.roots.push(PcRootSlotV3 { admission: admission.clone(), requested: false, installed: false, unstarted_terminal: false, claimed_unstarted_terminal: false, recovery: None,
+                state.roots.push(PcRootSlotV3 { admission: admission.clone(), game_reservation: None, game_abort: None, guard_aborted: None, game_registered: false, quota_registered: true,
+                    dispatch: PcRootDispatchV3::BeforeDispatch, requested: false, installed: false, unstarted_terminal: false, claimed_unstarted_terminal: false, recovery: None,
                     owner: None, route: None, route_retirement: None, stage: None, pump: None, observer: None, worker: None,
                     handoff: None, joined: None, custody_taken: false, returned: None, join_failure: None, join_panic: None });
                 state.roots.len() - 1
             }
         };
         let slot = &mut state.roots[index];
+        if slot.guard_aborted.is_some() || slot.game_abort.is_some() {
+            return Err(failure(AdaptiveManagerError::Invalid("P-C V3 original game admission was aborted"), admission));
+        }
         if slot.unstarted_terminal || slot.claimed_unstarted_terminal {
             return Err(failure(AdaptiveManagerError::Invalid("P-C V3 original root failed before worker startup"), admission));
         }
         if !slot.requested {
+            if slot.dispatch != PcRootDispatchV3::BeforeDispatch {
+                return Err(failure(AdaptiveManagerError::Invalid("P-C V3 original dispatch is unresolved"), admission));
+            }
+            slot.dispatch = PcRootDispatchV3::DispatchingUnknown;
             match self.requests.try_send(admission.clone()) {
-                Ok(()) => slot.requested = true,
-                Err(mpsc::TrySendError::Full(_)) => return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }),
-                Err(mpsc::TrySendError::Disconnected(_)) => return Err(failure(AdaptiveManagerError::Invalid("P-C V3 supervisor queue closed"), admission)),
+                Ok(()) => { slot.dispatch = PcRootDispatchV3::Enqueued; slot.requested = true; },
+                Err(mpsc::TrySendError::Full(_)) => { slot.dispatch = PcRootDispatchV3::BeforeDispatch; return Ok(RoventPcCollectionAdmissionOutcomeV3::Pending { admission }); },
+                Err(mpsc::TrySendError::Disconnected(_)) => { slot.dispatch = PcRootDispatchV3::BeforeDispatch; return Err(failure(AdaptiveManagerError::Invalid("P-C V3 supervisor queue closed"), admission)); },
             }
         }
         if slot.installed { return Ok(RoventPcCollectionAdmissionOutcomeV3::Installed); }
@@ -1181,6 +1265,18 @@ impl RoventPcCollectionHooksV3 for RoventPcCollectionBridgeV3 {
         };
         if !state.deferred.is_empty() { return Ok(None); }
         for slot in &state.roots {
+            if slot.guard_aborted.is_some() {
+                let ledger = match self.ledger.try_lock() {
+                    Ok(value) => value,
+                    Err(TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err(AdaptiveManagerError::Invalid("P-C V3 ledger poisoned")),
+                };
+                match slot.guard_aborted_no_dispatch_valid(&self.game, &ledger) {
+                    Ok(true) => continue,
+                    Ok(false) => return Ok(None),
+                    Err(error) => return Err(AdaptiveManagerError::Invalid(error)),
+                }
+            }
             if slot.claimed_unstarted_terminal {
                 if slot.installed || slot.worker.is_some() || slot.route.is_some()
                     || slot.observer.is_some() || slot.stage.is_some() || slot.pump.is_some() {
