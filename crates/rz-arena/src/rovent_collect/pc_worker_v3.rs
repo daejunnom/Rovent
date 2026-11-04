@@ -73,6 +73,7 @@ pub(crate) struct PcRootRecoveryV3 {
     admission: RoventCollectionRootAdmissionV3,
     received_root: Option<PcReceivedRootV3>,
     stage: Option<Arc<Mutex<TeacherSessionStagingV3>>>,
+    original_scope_identity: Option<Weak<()>>,
     preflight_failure: Option<TeacherPrepareErrorV3>,
     stage_claim_failure: Option<TeacherSessionClaimErrorV3>,
     claimed_unstarted: Option<ClaimedUnstartedV3>,
@@ -112,6 +113,7 @@ pub(crate) struct PcRootRecoveryV3 {
     sealed_abort_before_route: bool,
     sealed_abort_no_scope: bool,
     aborted_pre_route_release: Option<Result<(), &'static str>>,
+    aborted_no_scope_release: Option<Result<(), &'static str>>,
     diagnostics: Vec<(String, TeacherDiagnostics)>,
     prepared: Option<PcPreparedRootV3>,
     custodian: TeacherRecoveryCustodianV3,
@@ -135,6 +137,7 @@ impl PcRootRecoveryV3 {
             admission,
             received_root: None,
             stage: None,
+            original_scope_identity: None,
             preflight_failure: None,
             stage_claim_failure: None,
             claimed_unstarted: None,
@@ -172,6 +175,7 @@ impl PcRootRecoveryV3 {
             sealed_abort_before_route: false,
             sealed_abort_no_scope: false,
             aborted_pre_route_release: None,
+            aborted_no_scope_release: None,
             diagnostics: Vec::new(),
             prepared: None,
             custodian: TeacherRecoveryCustodianV3::new(),
@@ -205,7 +209,7 @@ impl PcRootRecoveryV3 {
     /// Issuing the original no-scope acknowledgement and returning any
     /// reserved quota remain the bridge ledger's separate responsibilities.
     pub(crate) fn seal_aborted_no_scope(&mut self) -> bool {
-        if !self.abort_before_route || self.stage.is_some() || self.preflight_failure.is_some()
+        if !self.abort_before_route || self.stage.is_some() || self.original_scope_identity.is_some() || self.preflight_failure.is_some()
             || self.stage_claim_failure.is_some() || self.claimed_unstarted.is_some()
             || self.unmatched_claim_owner.is_some() || self.route.is_some() || self.receiver.is_some()
             || self.owner.is_some() || self.pump.is_some() || self.closed_custody.is_some()
@@ -689,12 +693,18 @@ impl PcReceivedStageProofV3 {
         if !recovery.stage.as_ref().is_some_and(|original| Arc::ptr_eq(original, stage_owner)) {
             return Err("P-C V3 stage owner differs");
         }
+        let Some(scope_identity) = &recovery.original_scope_identity else {
+            return Err("P-C V3 original scope identity absent");
+        };
+        if !Weak::ptr_eq(scope_identity, &stage.scope_effect_identity_weak()) {
+            return Err("P-C V3 guarded stage identity differs");
+        }
         let proof = Self {
             supervisor: supervisor_identity.clone(),
             bridge: Arc::downgrade(&supervisor.bridge),
             recovery: recovery.original_self.clone(),
             stage: Arc::downgrade(stage_owner),
-            scope_identity: stage.scope_effect_identity_weak(),
+            scope_identity: scope_identity.clone(),
             admission: recovery.admission.clone(),
         };
         match proof.try_revalidate_with_guards(supervisor, recovery)? {
@@ -726,6 +736,7 @@ impl PcReceivedStageProofV3 {
         if !supervisor.matches_original_bridge(&bridge) || !supervisor.owns_recovery(&recovery_owner)
             || !recovery.matches_admission(&self.admission) || !recovery.matches_received_root(&bridge)
             || !recovery.stage.as_ref().is_some_and(|original| Arc::ptr_eq(original, &stage))
+            || !recovery.original_scope_identity.as_ref().is_some_and(|original| Weak::ptr_eq(original, &self.scope_identity))
         {
             return Ok(Some(false));
         }
@@ -753,7 +764,8 @@ impl PcReceivedStageProofV3 {
             Err(_) => return Err("P-C V3 recovery poisoned"),
         };
         if !recovery.matches_admission(&self.admission) || !recovery.matches_received_root(&bridge)
-            || !recovery.stage.as_ref().is_some_and(|original| Arc::ptr_eq(original, &stage)) {
+            || !recovery.stage.as_ref().is_some_and(|original| Arc::ptr_eq(original, &stage))
+            || !recovery.original_scope_identity.as_ref().is_some_and(|original| Weak::ptr_eq(original, &self.scope_identity)) {
             return Ok(Some(false));
         }
         drop(recovery);
@@ -1792,6 +1804,9 @@ impl PcWorkerSupervisorV3 {
             Err(_) => return Err("P-C V3 stage poisoned"),
         };
         let scope_identity = stage_guard.scope_effect_identity_weak();
+        if !root.original_scope_identity.as_ref().is_some_and(|original| Weak::ptr_eq(original, &scope_identity)) {
+            return Err("P-C V3 original scope identity differs");
+        }
         drop(stage_guard);
         let proof = PcReceivedStageProofV3 {
             supervisor: Arc::downgrade(supervisor), bridge: Arc::downgrade(&bridge),
@@ -2046,6 +2061,34 @@ fn prepare_root_step_v3(
         state.abort_before_route = true;
     }
     if state.abort_before_route {
+        if state.stage.is_none() && state.panic.is_none() && state.aborted_no_scope_release.is_none() {
+            // No stage is invented here. The bridge separately proves the
+            // original one-shot no-scope receipt and exact quota ownership.
+            drop(state);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bridge.try_release_aborted_no_scope(&admission, recovery)
+            }));
+            let mut state = recovery.lock().map_err(|_| "P-C V3 recovery poisoned")?;
+            match outcome {
+                Ok(Ok(Some(true))) => state.aborted_no_scope_release = Some(Ok(())),
+                Ok(Ok(None)) => {},
+                Ok(Ok(Some(false))) => {
+                    let error = "P-C V3 no-scope abort release rejected";
+                    state.aborted_no_scope_release = Some(Err(error));
+                    state.failure.get_or_insert_with(|| error.into());
+                }
+                Ok(Err(error)) => {
+                    state.aborted_no_scope_release = Some(Err(error));
+                    state.failure.get_or_insert_with(|| error.into());
+                }
+                Err(payload) => {
+                    state.panic = Some(payload);
+                    state.failure.get_or_insert_with(|| "P-C V3 no-scope abort release panicked".into());
+                    state.aborted_no_scope_release = Some(Err("P-C V3 no-scope abort release panicked"));
+                }
+            }
+            return Ok(PcPrepareStepV3::Pending);
+        }
         // Preserve the exact session and recovery custodian. A claim or spawn
         // with an unknown outcome is never promoted to a no-worker result.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2189,6 +2232,7 @@ fn prepare_root_step_v3(
                 return Ok(PcPrepareStepV3::Failed);
             }
         };
+        state.original_scope_identity = Some(stage.scope_effect_identity_weak());
         state.stage = Some(Arc::new(Mutex::new(stage)));
     }
     let stage = Arc::clone(state.stage.as_ref().expect("stage retained"));
