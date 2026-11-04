@@ -1499,7 +1499,7 @@ impl SystemReceiptWriter {
             .directory
             .open_with(name, &options)
             .map_err(|e| e.to_string())?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(|e| e.to_string())
     }

@@ -209,27 +209,20 @@ fn run_job(
         }
     }
     loop {
-        if output_failure.is_some() {
+        if let Some(failure) = output_failure.take() {
             // Continue draining the still-live child after a consumer failure.
             // The original buffers and output pipe stay owned even on expiry.
             job.read_pos = job.read_len;
             match fill(job, until, cancelled) {
-                Ok(true) => continue,
+                Ok(true) => {
+                    output_failure = Some(failure);
+                    continue;
+                }
                 Ok(false) => {
-                    return observation(
-                        job,
-                        output_failure.expect("checked failure"),
-                        false,
-                        Some(true),
-                    );
+                    return observation(job, failure, false, Some(true));
                 }
                 Err(stop) => {
-                    let mut result = observation(
-                        job,
-                        output_failure.expect("checked failure"),
-                        false,
-                        Some(false),
-                    );
+                    let mut result = observation(job, failure, false, Some(false));
                     result.drain_stop = Some(stop);
                     return result;
                 }

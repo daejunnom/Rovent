@@ -123,7 +123,7 @@ impl Lc0ProfileDirectory {
                 error,
             ))
         })?;
-        let named = fs::symlink_metadata(&root_path).map_err(|error| {
+        let named = fs::symlink_metadata(root_path).map_err(|error| {
             Lc0ProfileCreateError::BeforeCreate(io_failure(
                 "cannot recheck LC0 private output root",
                 error,

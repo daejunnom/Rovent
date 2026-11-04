@@ -342,7 +342,7 @@ impl RoventNnuecSessionDriver {
                 } else {
                     None
                 };
-                let signal = if let Some((actor_slot, native)) = pair {
+                if let Some((actor_slot, native)) = pair {
                     let signal = native.service.signal();
                     if let Some(actor) = actor_slot.as_mut() {
                         actor.request_shutdown();
@@ -367,8 +367,7 @@ impl RoventNnuecSessionDriver {
                     Some(signal)
                 } else {
                     run.signal.clone()
-                };
-                signal
+                }
             },
             |run, signal| match self.storage.try_lock() {
                 Ok(mut slot) => {

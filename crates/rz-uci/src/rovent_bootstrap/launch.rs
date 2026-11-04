@@ -2663,6 +2663,8 @@ fn run_v2_native<'a>(
                 control.clone(),
             )
             .map_err(|rejection| reject_factory(rejection, cleanup_until, &diagnostic))?;
+            // Archive-enabled macro arms install storage on this driver.
+            #[allow(unused_mut)]
             let mut driver = $constructor(
                 prepared,
                 $($extra,)*
