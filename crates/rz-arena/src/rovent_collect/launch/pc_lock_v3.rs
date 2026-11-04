@@ -264,6 +264,8 @@ pub(crate) struct PcCollectionOwnersV3 {
     native: Arc<rz_uci::rovent_bootstrap::launch::RoventPcCollectionLaunchOwnerV3>,
     supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
     driver_custody: Arc<Mutex<SupervisorStartCustodyV3>>,
+    execution_ceiling: Instant,
+    cleanup_ceiling: Instant,
     launch_claimed: std::sync::atomic::AtomicBool,
 }
 
@@ -312,12 +314,20 @@ impl PcCollectionOwnersV3 {
             native,
             supervisor,
             driver_custody,
+            execution_ceiling,
+            cleanup_ceiling,
             launch_claimed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> {
         &self.inputs
+    }
+    pub(crate) fn execution_ceiling(&self) -> Instant {
+        self.execution_ceiling
+    }
+    pub(crate) fn cleanup_ceiling(&self) -> Instant {
+        self.cleanup_ceiling
     }
     pub(crate) fn native(
         &self,
@@ -350,12 +360,18 @@ impl PcCollectionOwnersV3 {
         gate: &rz_uci::rovent_bootstrap::launch::RoventPcCollectionStartGateV3,
         issuer: &crate::rovent_resource_scope::launch::PcCollectionResourceStartIssuerV3,
     ) -> Result<(), &'static str> {
+        if Instant::now() >= self.execution_ceiling {
+            return Err("original collection work deadline expired");
+        }
         let control = self
             .bridge
             .startup()
             .ok_or("original startup control missing")?;
         let proof = issuer.issue(gate, control)?;
         proof.with_start_lease(gate, &self.native, control, |lease| {
+            if Instant::now() >= self.execution_ceiling {
+                return Err("original collection work deadline expired");
+            }
             SupervisorStartCustodyV3::start_verified(
                 &self.driver_custody,
                 &lease,
