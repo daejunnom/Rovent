@@ -21,7 +21,7 @@ use std::{
 /// Borrows the actual launch owner and original child slot; the same smoke,
 /// execution, role channels and duplicate of the pinned proxy FD are retained
 /// together. A caller must retain the original custody after any later spawn.
-pub(super) struct DirectSmokeBinding<'a> {
+pub(crate) struct DirectSmokeBinding<'a> {
     owner: &'a NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
     smoke: &'a Arc<Mutex<ProxyEntryFunctionalSmokeOwnerV1>>,
     execution: &'a Arc<PalsV6ExecutionStart>,
@@ -39,7 +39,7 @@ impl<'a> DirectSmokeBinding<'a> {
     /// All inputs are borrowed so an error leaves the original owner, socket
     /// and custody with the caller. The cloned FD references the same open
     /// proxy file; it is not reopened by pathname.
-    pub(super) fn bind(
+    pub(crate) fn bind(
         owner: &'a NativeLaunchOwner<LockedPalsSystemArenaPairV6>,
         smoke: &'a Arc<Mutex<ProxyEntryFunctionalSmokeOwnerV1>>,
         execution: &'a Arc<PalsV6ExecutionStart>,
@@ -191,13 +191,13 @@ impl<'a> DirectSmokeBinding<'a> {
         Ok(())
     }
 
-    pub(super) fn proxy(&self) -> &Arc<File> {
+    pub(crate) fn proxy(&self) -> &Arc<File> {
         &self.proxy
     }
-    pub(super) fn control(&self) -> &Arc<Mutex<SmokeDeadlineControl>> {
+    pub(crate) fn control(&self) -> &Arc<Mutex<SmokeDeadlineControl>> {
         &self.control
     }
-    pub(super) fn common_arguments(&self) -> &[OsString] {
+    pub(crate) fn common_arguments(&self) -> &[OsString] {
         &self.common_arguments
     }
     pub(super) fn custody(&mut self) -> &mut SpawnCustody {
