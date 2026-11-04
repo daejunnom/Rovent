@@ -20,7 +20,9 @@ use super::teacher::v3_policy_consumer::{
     TeacherProcessedOwnerV3,
 };
 use super::teacher::v3_pump::{
-    TeacherPendingDrainV3, TeacherPumpSetupErrorV3, TeacherPumpStepV3, TeacherPumpV3,
+    TeacherClosedCustodyStartV3, TeacherClosedCustodyV3, TeacherClosedDrainV3,
+    TeacherClosedHandoffV3, TeacherPendingDrainV3, TeacherPumpSetupErrorV3,
+    TeacherPumpStepV3, TeacherPumpV3,
 };
 use super::teacher::v3_session::{
     RoventCollectionTeacherSessionV3, TeacherPrepareErrorV3, TeacherPrepareOwnerV3,
@@ -42,7 +44,7 @@ use rz_uci::rovent_external_launch::{
     TeacherRecoveryCustodianV3,
 };
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -63,6 +65,13 @@ pub(crate) struct PcRootRecoveryV3 {
     receiver: Option<Arc<Mutex<SpeculativeReceiverV3>>>,
     owner: Option<RoventCollectionOwnerLockV3>,
     pump: Option<Arc<Mutex<TeacherPumpV3>>>,
+    closed_custody: Option<TeacherClosedCustodyV3>,
+    closed_custody_setup_unknown: bool,
+    abort_targets_revoked: bool,
+    abort_input_observation: Option<TeacherClosedDrainV3>,
+    abort_handoff_observation: Option<TeacherClosedHandoffV3>,
+    abort_terminal_observation: Option<TeacherPendingDrainV3>,
+    abort_terminal_unknown: bool,
     pipeline: PolicyRowPipelineOwnerV3,
     output: PolicyOutputOwnerV3,
     processed: Option<TeacherProcessedOwnerV3>,
@@ -115,6 +124,13 @@ impl PcRootRecoveryV3 {
             receiver: None,
             owner: None,
             pump: None,
+            closed_custody: None,
+            closed_custody_setup_unknown: false,
+            abort_targets_revoked: false,
+            abort_input_observation: None,
+            abort_handoff_observation: None,
+            abort_terminal_observation: None,
+            abort_terminal_unknown: false,
             pipeline,
             output,
             processed: None,
@@ -172,6 +188,7 @@ impl PcRootRecoveryV3 {
             || self.worker_key.is_some() || self.handoff.is_some()
             || self.route.is_some() || self.receiver.is_some() || self.owner.is_some()
             || self.pump.is_some() || self.pump_setup_unknown || self.pump_setup_failure.is_some()
+            || self.closed_custody.is_some() || self.closed_custody_setup_unknown
             || self.processed.is_some() || self.retained.is_some() || self.consumer.is_some()
             || self.consumer_setup_unknown || self.prepared.is_some() || self.published
             || !self.aggregate.as_ref().is_some_and(|ack| ack.matches_admission(&self.admission))
@@ -193,6 +210,25 @@ impl PcRootRecoveryV3 {
                 .pump
                 .as_ref()
                 .is_some_and(|original| Arc::ptr_eq(original, pump))
+    }
+
+    /// Recheck only this recovery's custody against its original route/pump.
+    /// This does not attest callback fencing, target closure or worker join.
+    pub(crate) fn try_matches_closed_custody(
+        &self,
+        route: &SpeculativeRootV3,
+        pump: &Arc<Mutex<TeacherPumpV3>>,
+    ) -> Result<Option<bool>, &'static str> {
+        if self.closed_custody_setup_unknown || !self.matches_route_pump(route, pump) {
+            return Ok(Some(false));
+        }
+        let Some(custody) = &self.closed_custody else { return Ok(Some(false)); };
+        let pump = match pump.try_lock() {
+            Ok(pump) => pump,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 closed custody pump poisoned"),
+        };
+        Ok(Some(pump.owns_closed_custody(custody)))
     }
     /// This root has no in-flight policy stage. Shared output may still be
     /// held by the game pipeline and is not evidence of durable storage.
@@ -566,47 +602,51 @@ pub(crate) struct PcWorkerSupervisorV3 {
 /// original stage identity. This is not a teacher or physical completion.
 /// It is deliberately nonclone and must remain with its caller on Busy.
 pub(super) struct PcReceivedStageProofV3 {
-    supervisor: Arc<Mutex<PcWorkerSupervisorV3>>,
-    bridge: Arc<RoventPcCollectionBridgeV3>,
-    recovery: Arc<Mutex<PcRootRecoveryV3>>,
-    stage: Arc<Mutex<TeacherSessionStagingV3>>,
+    supervisor: Weak<Mutex<PcWorkerSupervisorV3>>,
+    bridge: Weak<RoventPcCollectionBridgeV3>,
+    recovery: Weak<Mutex<PcRootRecoveryV3>>,
+    stage: Weak<Mutex<TeacherSessionStagingV3>>,
     admission: RoventCollectionRootAdmissionV3,
 }
 
 impl PcReceivedStageProofV3 {
-    pub(super) fn matches_game(&self, game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>) -> bool {
-        Arc::ptr_eq(self.bridge.game_authority(), game)
+    pub(super) fn matches_game(&self, game: &Arc<super::game_authority_v3::GameAuthorityV3<PcWorkerSupervisorV3>>) -> Option<bool> {
+        self.bridge.upgrade().map(|bridge| Arc::ptr_eq(bridge.game_authority(), game))
     }
     pub(super) fn matches_admission(&self, admission: &RoventCollectionRootAdmissionV3) -> bool {
         self.admission.same_original_admission(admission)
     }
-    pub(super) fn matches_recovery(&self, recovery: &Arc<Mutex<PcRootRecoveryV3>>) -> bool {
-        Arc::ptr_eq(&self.recovery, recovery)
+    pub(super) fn matches_recovery(&self, recovery: &Arc<Mutex<PcRootRecoveryV3>>) -> Option<bool> {
+        self.recovery.upgrade().map(|original| Arc::ptr_eq(&original, recovery))
     }
-    pub(super) fn stage(&self) -> &Arc<Mutex<TeacherSessionStagingV3>> { &self.stage }
+    pub(super) fn stage(&self) -> Option<Arc<Mutex<TeacherSessionStagingV3>>> { self.stage.upgrade() }
 
     /// Reobserve the original owners before issuing an effect. This never
     /// locks the supervisor across a blocking call or fabricates a receipt.
     pub(super) fn try_revalidate(&self) -> Result<Option<bool>, &'static str> {
-        let supervisor = match self.supervisor.try_lock() {
+        let supervisor_owner = self.supervisor.upgrade().ok_or("P-C V3 supervisor owner unavailable")?;
+        let bridge = self.bridge.upgrade().ok_or("P-C V3 bridge owner unavailable")?;
+        let recovery_owner = self.recovery.upgrade().ok_or("P-C V3 recovery owner unavailable")?;
+        let stage = self.stage.upgrade().ok_or("P-C V3 stage owner unavailable")?;
+        let supervisor = match supervisor_owner.try_lock() {
             Ok(owner) => owner,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(_) => return Err("P-C V3 supervisor poisoned"),
         };
-        if !supervisor.matches_original_bridge(&self.bridge) || !supervisor.owns_recovery(&self.recovery) {
+        if !supervisor.matches_original_bridge(&bridge) || !supervisor.owns_recovery(&recovery_owner) {
             return Ok(Some(false));
         }
-        let recovery = match self.recovery.try_lock() {
+        let recovery = match recovery_owner.try_lock() {
             Ok(owner) => owner,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(_) => return Err("P-C V3 recovery poisoned"),
         };
-        if !recovery.matches_admission(&self.admission) || !recovery.matches_received_root(&self.bridge)
-            || !recovery.stage.as_ref().is_some_and(|stage| Arc::ptr_eq(stage, &self.stage)) {
+        if !recovery.matches_admission(&self.admission) || !recovery.matches_received_root(&bridge)
+            || !recovery.stage.as_ref().is_some_and(|original| Arc::ptr_eq(original, &stage)) {
             return Ok(Some(false));
         }
         drop(recovery);
-        self.bridge.try_matches_registered_recovery(&self.admission, &self.recovery)
+        bridge.try_matches_registered_recovery(&self.admission, &recovery_owner)
     }
 }
 
@@ -1622,8 +1662,8 @@ impl PcWorkerSupervisorV3 {
         if !root.matches_received_root(&bridge) { return Err("P-C V3 received root owner differs"); }
         let Some(stage) = root.stage.as_ref().map(Arc::clone) else { return Ok(None); };
         let proof = PcReceivedStageProofV3 {
-            supervisor: Arc::clone(supervisor), bridge,
-            recovery: Arc::clone(recovery), stage, admission: root.admission.clone(),
+            supervisor: Arc::downgrade(supervisor), bridge: Arc::downgrade(&bridge),
+            recovery: Arc::downgrade(recovery), stage: Arc::downgrade(&stage), admission: root.admission.clone(),
         };
         drop(root);
         drop(owner);
@@ -2141,6 +2181,37 @@ fn prepare_root_step_v3(
             }
         }
     }
+    if state.closed_custody.is_none() {
+        if state.closed_custody_setup_unknown { return Ok(PcPrepareStepV3::Pending); }
+        let pump = Arc::clone(state.pump.as_ref().expect("pump retained"));
+        let route = state.route.as_ref().expect("route retained").clone();
+        state.closed_custody_setup_unknown = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TeacherClosedCustodyV3::try_new(
+                &pump, &route, inputs.plan().teacher_tickets_per_root as usize,
+            )
+        }));
+        match result {
+            Ok(Ok(TeacherClosedCustodyStartV3::Ready(custody))) => {
+                state.closed_custody = Some(custody);
+                state.closed_custody_setup_unknown = false;
+            }
+            Ok(Ok(TeacherClosedCustodyStartV3::Busy)) => {
+                state.closed_custody_setup_unknown = false;
+                return Ok(PcPrepareStepV3::Pending);
+            }
+            Ok(Err(error)) => {
+                state.closed_custody_setup_unknown = false;
+                state.failure = Some(format!("P-C V3 closed custody setup: {error}"));
+                return Ok(PcPrepareStepV3::Failed);
+            }
+            Err(payload) => {
+                state.panic = Some(payload);
+                state.failure = Some("P-C V3 closed custody setup outcome unknown".into());
+                return Ok(PcPrepareStepV3::Failed);
+            }
+        }
+    }
     if state.processed.is_none() {
         state.processed = Some(
             TeacherProcessedOwnerV3::new(
@@ -2492,18 +2563,31 @@ impl PcRootRecoveryV3 {
     fn request_route_abort(&mut self, deadline: Instant) {
         if let Some(route) = &self.route {
             route.cancel_all();
-            if let Err(error) = route.try_revoke_all_targets() {
-                self.failure.get_or_insert_with(|| format!("P-C V3 abort target revoke: {error}"));
+            match route.try_revoke_all_targets() {
+                Ok(Some(())) => self.abort_targets_revoked = true,
+                Ok(None) => {},
+                Err(error) => { self.failure.get_or_insert_with(|| format!("P-C V3 abort target revoke: {error}")); }
             }
         }
         if let Some(pump) = self.pump.as_ref().map(Arc::clone) {
             if let Ok(mut pump) = pump.try_lock() {
                 pump.close_admission();
-                if let Err(error) = pump.try_closed_drain() {
-                    self.failure.get_or_insert_with(|| format!("P-C V3 abort input drain: {error}"));
+                match pump.try_closed_drain() {
+                    Ok(observation) => self.abort_input_observation = Some(observation),
+                    Err(error) => { self.failure.get_or_insert_with(|| format!("P-C V3 abort input drain: {error}")); }
                 }
-                if let Err(error) = pump.try_drain_pending() {
-                    self.failure.get_or_insert_with(|| format!("P-C V3 abort terminal drain: {error}"));
+                if let (Some(route), Some(custody)) = (&self.route, &self.closed_custody) {
+                    match pump.try_handoff_closed(route, custody) {
+                        Ok(observation) => self.abort_handoff_observation = Some(observation),
+                        Err(error) => { self.failure.get_or_insert_with(|| format!("P-C V3 abort custody handoff: {error}")); }
+                    }
+                }
+                match pump.try_drain_pending() {
+                    Ok(observation) => {
+                        if matches!(observation, TeacherPendingDrainV3::Unknown) { self.abort_terminal_unknown = true; }
+                        self.abort_terminal_observation = Some(observation);
+                    }
+                    Err(error) => { self.abort_terminal_unknown = true; self.failure.get_or_insert_with(|| format!("P-C V3 abort terminal drain: {error}")); }
                 }
             }
         }
