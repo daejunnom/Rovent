@@ -637,6 +637,7 @@ pub(super) struct PcReceivedStageProofV3 {
     bridge: Weak<RoventPcCollectionBridgeV3>,
     recovery: Weak<Mutex<PcRootRecoveryV3>>,
     stage: Weak<Mutex<TeacherSessionStagingV3>>,
+    scope_identity: Weak<()>,
     admission: RoventCollectionRootAdmissionV3,
 }
 
@@ -651,6 +652,39 @@ impl PcReceivedStageProofV3 {
         self.recovery.upgrade().map(|original| Arc::ptr_eq(&original, recovery))
     }
     pub(super) fn stage(&self) -> Option<Arc<Mutex<TeacherSessionStagingV3>>> { self.stage.upgrade() }
+    pub(super) fn matches_scope_source(&self, source: &super::teacher::v3_session::TeacherScopeEffectSourceV3) -> bool {
+        Weak::ptr_eq(&self.scope_identity, &source.identity_weak())
+            && source.matches_admission(&self.admission)
+    }
+
+    /// The caller holds the exact supervisor, recovery and stage guards, and
+    /// supplies the same stage Arc from which its guard was obtained.
+    pub(super) fn try_from_guards(
+        supervisor: &PcWorkerSupervisorV3,
+        recovery: &PcRootRecoveryV3,
+        stage_owner: &Arc<Mutex<TeacherSessionStagingV3>>,
+        stage: &TeacherSessionStagingV3,
+    ) -> Result<Option<Self>, &'static str> {
+        let Some(supervisor_identity) = supervisor.original_self.get() else {
+            return Err("P-C V3 supervisor identity is not bound");
+        };
+        if !recovery.stage.as_ref().is_some_and(|original| Arc::ptr_eq(original, stage_owner)) {
+            return Err("P-C V3 stage owner differs");
+        }
+        let proof = Self {
+            supervisor: supervisor_identity.clone(),
+            bridge: Arc::downgrade(&supervisor.bridge),
+            recovery: recovery.original_self.clone(),
+            stage: Arc::downgrade(stage_owner),
+            scope_identity: stage.scope_effect_identity_weak(),
+            admission: recovery.admission.clone(),
+        };
+        match proof.try_revalidate_with_guards(supervisor, recovery)? {
+            None => Ok(None),
+            Some(true) => Ok(Some(proof)),
+            Some(false) => Err("P-C V3 original guarded stage differs"),
+        }
+    }
 
     /// Revalidate while the caller already holds both original guards. The
     /// two Weak identities were sealed at construction/binding; no guard is
@@ -1734,9 +1768,17 @@ impl PcWorkerSupervisorV3 {
         };
         if !root.matches_received_root(&bridge) { return Err("P-C V3 received root owner differs"); }
         let Some(stage) = root.stage.as_ref().map(Arc::clone) else { return Ok(None); };
+        let stage_guard = match stage.try_lock() {
+            Ok(stage) => stage,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => return Err("P-C V3 stage poisoned"),
+        };
+        let scope_identity = stage_guard.scope_effect_identity_weak();
+        drop(stage_guard);
         let proof = PcReceivedStageProofV3 {
             supervisor: Arc::downgrade(supervisor), bridge: Arc::downgrade(&bridge),
-            recovery: Arc::downgrade(recovery), stage: Arc::downgrade(&stage), admission: root.admission.clone(),
+            recovery: Arc::downgrade(recovery), stage: Arc::downgrade(&stage), scope_identity,
+            admission: root.admission.clone(),
         };
         drop(root);
         drop(owner);
