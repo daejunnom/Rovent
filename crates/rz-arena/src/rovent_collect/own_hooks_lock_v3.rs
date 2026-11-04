@@ -4,6 +4,9 @@
 //! An external supervisor owns preparation, teacher processes, worker joins,
 //! and publication. This bridge does not attest their successful completion.
 
+use super::game_authority_v3::{
+    GameAuthorityV3, GameRootReservationV3, GameStepV3, RootReservationV3,
+};
 use super::launch::PreparedPcCollectionInputsV3;
 use super::native_capture::RoventNativeCaptureRegistration;
 use super::observer_lock_v3::RoventCollectionOwnerLockV3;
@@ -37,6 +40,7 @@ type Custody = RoventBoardCollectionRootCustodyV3<Output>;
 
 struct RootSlot {
     admission: RoventCollectionRootAdmissionV3,
+    reservation: Option<GameRootReservationV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
     requested: bool,
     revoked: Arc<AtomicBool>,
     worker_reserved: bool,
@@ -201,6 +205,7 @@ impl RoventOwnTeacherRouteRetirementV3 {
 /// supervisor is responsible for settling or retaining every root worker.
 pub(crate) struct RoventOwnCollectionBridgeV3 {
     inputs: Arc<PreparedPcCollectionInputsV3>,
+    game: Arc<GameAuthorityV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
     registration: RoventNativeCaptureRegistration,
     startup: OnceLock<RoventStartupControl>,
     pipeline: OnceLock<PolicyRowPipelineOwnerV3>,
@@ -309,11 +314,15 @@ impl RoventOwnCollectionBridgeV3 {
     pub(crate) fn new(
         registration: RoventNativeCaptureRegistration,
         inputs: Arc<PreparedPcCollectionInputsV3>,
+        game: Arc<GameAuthorityV3<super::own_worker_v3::OwnWorkerSupervisorV3>>,
         lock: &rz_experiments::RoventInputLockV3,
         directory: &cap_std::fs::Dir,
         lock_file: &std::fs::File,
     ) -> Result<Arc<Self>, ArenaError> {
         inputs.validate_original_own_boundary(lock, directory, lock_file)?;
+        if !game.matches_inputs(&inputs) {
+            return Err(invalid("Own /3 game original inputs differ"));
+        }
         let maximum_roots = usize::from(inputs.plan().maximum_roots);
         let maximum_workers = usize::from(inputs.plan().maximum_root_workers);
         let maximum_teacher_roots = usize::from(inputs.plan().maximum_simultaneous_teacher_roots);
@@ -334,6 +343,7 @@ impl RoventOwnCollectionBridgeV3 {
         let (request_sender, request_receiver) = mpsc::sync_channel(maximum_roots);
         Ok(Arc::new(Self {
             inputs,
+            game,
             registration,
             startup: OnceLock::new(),
             pipeline: OnceLock::new(),
@@ -385,6 +395,30 @@ impl RoventOwnCollectionBridgeV3 {
     }
     pub(crate) fn inputs(&self) -> &Arc<PreparedPcCollectionInputsV3> {
         &self.inputs
+    }
+
+    pub(crate) fn game(
+        &self,
+    ) -> &Arc<GameAuthorityV3<super::own_worker_v3::OwnWorkerSupervisorV3>> {
+        &self.game
+    }
+
+    /// Sticky game abort closes new admission and requests cancellation for
+    /// each original root. It is not a physical-completion observation.
+    pub(crate) fn try_request_game_abort(&self) -> Result<bool, &'static str> {
+        self.game.request_abort();
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err("Own /3 root custody poisoned"),
+        };
+        for slot in &state.slots {
+            slot.revoked.store(true, Ordering::Release);
+            if let Some(route) = &slot.route {
+                route.cancel_all();
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn capture_registration(&self) -> &RoventNativeCaptureRegistration {
@@ -950,8 +984,39 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
                         owners: Box::new(()),
                     });
                 }
+                let reservation = match self.game.try_reserve_root(&admission) {
+                    RootReservationV3::Reserved(reservation) => reservation,
+                    RootReservationV3::Rejected(GameStepV3::Busy) => {
+                        return Ok(RoventBoardCollectionAdmissionOutcomeV3::Pending { admission });
+                    }
+                    RootReservationV3::Existing => {
+                        return Err(RoventBoardCollectionAdmissionFailureV3 {
+                            error: AdaptiveManagerError::Invalid(
+                                "Own /3 game admission exists without original slot",
+                            ),
+                            admission,
+                            owners: Box::new(()),
+                        });
+                    }
+                    RootReservationV3::Rejected(reason) => {
+                        let detail = match reason {
+                            GameStepV3::Aborted => "Own /3 game admission aborted",
+                            GameStepV3::Closed => "Own /3 game admission closed",
+                            GameStepV3::Capacity => "Own /3 game admission capacity",
+                            GameStepV3::Foreign => "Own /3 game admission owner differs",
+                            GameStepV3::Unknown => "Own /3 game admission unknown",
+                            _ => "Own /3 game admission unexpected state",
+                        };
+                        return Err(RoventBoardCollectionAdmissionFailureV3 {
+                            error: AdaptiveManagerError::Invalid(detail),
+                            admission,
+                            owners: Box::new(()),
+                        });
+                    }
+                };
                 state.slots.push(RootSlot {
                     admission: admission.clone(),
+                    reservation: Some(reservation),
                     requested: false,
                     revoked: Arc::new(AtomicBool::new(false)),
                     worker_reserved: false,
@@ -975,6 +1040,39 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
             }
         };
         let slot = &mut state.slots[index];
+        if let Some(reservation) = slot.reservation.as_mut() {
+            match reservation.commit_registered() {
+                GameStepV3::Ready => {
+                    slot.reservation.take();
+                }
+                GameStepV3::Aborted => {
+                    slot.reservation.take();
+                    slot.revoked.store(true, Ordering::Release);
+                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
+                        admission,
+                    });
+                }
+                GameStepV3::Busy => {
+                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
+                        admission,
+                    });
+                }
+                _ => {
+                    return Err(RoventBoardCollectionAdmissionFailureV3 {
+                        error: AdaptiveManagerError::Invalid("Own /3 game reservation unresolved"),
+                        admission,
+                        owners: Box::new(()),
+                    });
+                }
+            }
+        }
+        if self.game.abort_requested() {
+            slot.revoked.store(true, Ordering::Release);
+            if let Some(route) = &slot.route {
+                route.cancel_all();
+            }
+            return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain { admission });
+        }
         if !slot.requested {
             match self.request_sender.try_send(OwnRootRequestV3 {
                 admission: admission.clone(),
@@ -982,7 +1080,11 @@ impl RoventBoardCollectionHooksV3<Backend> for RoventOwnCollectionBridgeV3 {
             }) {
                 Ok(()) => slot.requested = true,
                 Err(mpsc::TrySendError::Full(_)) => {
-                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::Pending { admission });
+                    // The game reservation and original slot already exist;
+                    // queue contention must not release their session owner.
+                    return Ok(RoventBoardCollectionAdmissionOutcomeV3::PendingUncertain {
+                        admission,
+                    });
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     return Err(RoventBoardCollectionAdmissionFailureV3 {

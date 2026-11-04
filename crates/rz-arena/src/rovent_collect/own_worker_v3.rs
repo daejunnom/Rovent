@@ -245,6 +245,21 @@ pub(crate) struct OwnWorkerSupervisorV3 {
 }
 
 impl OwnWorkerSupervisorV3 {
+    /// Bind this exact externally retained supervisor to its game authority
+    /// before starting the supervisor thread or admitting native roots.
+    pub(crate) fn try_bind_game(supervisor: &Arc<Mutex<Self>>) -> Result<bool, &'static str> {
+        let game = match supervisor.try_lock() {
+            Ok(owner) => Arc::clone(owner.bridge.game()),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err("Own /3 supervisor poisoned"),
+        };
+        match game.try_bind_supervisor(supervisor) {
+            super::game_authority_v3::GameStepV3::Ready
+            | super::game_authority_v3::GameStepV3::Existing => Ok(true),
+            super::game_authority_v3::GameStepV3::Busy => Ok(false),
+            _ => Err("Own /3 game supervisor binding rejected"),
+        }
+    }
     pub(crate) fn new(
         bridge: Arc<RoventOwnCollectionBridgeV3>,
         router: Arc<CaptureRouterV3>,
@@ -276,6 +291,14 @@ impl OwnWorkerSupervisorV3 {
     /// One bounded supervisor pass, never invoked from the native manager.
     /// Failures retain every original root and do not skip its cleanup.
     pub(crate) fn step(&mut self) -> Result<(), String> {
+        if self.bridge.game().abort_requested()
+            && !self
+                .bridge
+                .try_request_game_abort()
+                .map_err(str::to_owned)?
+        {
+            return Ok(());
+        }
         if self.pending_request.is_none()
             && self.roots.len() < usize::from(self.bridge.inputs().plan().maximum_roots)
         {
@@ -293,6 +316,16 @@ impl OwnWorkerSupervisorV3 {
                     .register_pipeline(&pipeline)
                     .map_err(str::to_owned)?;
                 self.pipeline = Some(pipeline);
+            }
+            match self
+                .bridge
+                .game()
+                .try_bind_pipeline(self.pipeline.as_ref().expect("original pipeline retained"))
+            {
+                super::game_authority_v3::GameStepV3::Ready
+                | super::game_authority_v3::GameStepV3::Existing => {}
+                super::game_authority_v3::GameStepV3::Busy => return Ok(()),
+                _ => return Err("Own /3 game pipeline binding rejected".into()),
             }
             for root in &self.roots {
                 match root.try_lock() {
